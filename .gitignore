@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Rust
+/target/
+
+# IDEs
+.vscode/
+.idea/
