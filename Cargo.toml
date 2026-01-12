@@ -1,6 +1,6 @@
 [package]
 name = "motedb"
-version = "0.1.0-beta.1"
+version = "0.1.0"
 edition = "2021"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
 license = "MIT"
