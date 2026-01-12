@@ -1786,8 +1786,8 @@ mod tests {
         
         // Delete
         engine.delete(1u64, 3).unwrap();
-        let value = engine.get(1u64).unwrap().unwrap();
-        assert!(value.deleted);
+        let value = engine.get(1u64).unwrap();
+        assert!(value.is_none(), "Deleted key should return None");
     }
     
     #[test]
