@@ -1,7 +1,18 @@
 [package]
 name = "motedb"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2021"
+description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/motedb/motedb"
+homepage = "https://github.com/motedb/motedb"
+documentation = "https://docs.rs/motedb"
+readme = "docs/README.md"
+keywords = ["database", "embedded", "vector", "multimodal", "ai", "edge"]
+categories = ["database", "embedded", "algorithms"]
+authors = ["motedb <motedb@126.com>"]
+edition = "2021"
+publish = true
 
 [lib]
 name = "motedb"
