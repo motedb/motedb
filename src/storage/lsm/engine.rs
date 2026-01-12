@@ -613,10 +613,10 @@ impl LSMEngine {
         
         // 1. Check active memtable (批量查询，只获取一次锁)
         {
-            println!("🔒 [batch_get] 尝试获取 memtable.read() 锁...");
+            debug_log!("🔒 [batch_get] 尝试获取 memtable.read() 锁...");
             let memtable = self.memtable.read()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            println!("✅ [batch_get] 成功获取 memtable.read() 锁，开始查询 {} 个keys", remaining_keys.len());
+            debug_log!("✅ [batch_get] 成功获取 memtable.read() 锁，开始查询 {} 个keys", remaining_keys.len());
             
             let mut i = 0;
             while i < remaining_keys.len() {
@@ -643,21 +643,21 @@ impl LSMEngine {
                     i += 1;
                 }
             }
-            println!("🔓 [batch_get] 释放 memtable.read() 锁，剩余 {} 个keys未找到", remaining_keys.len());
+            debug_log!("🔓 [batch_get] 释放 memtable.read() 锁，剩余 {} 个keys未找到", remaining_keys.len());
             // 🔓 memtable锁在这里释放
         }
         
         if remaining_keys.is_empty() {
-            println!("✅ [batch_get] 所有keys在active memtable中找到，直接返回");
+            debug_log!("✅ [batch_get] 所有keys在active memtable中找到，直接返回");
             return Ok(results);
         }
         
         // 2. Check immutable queue (批量查询，只获取一次锁)
         {
-            println!("🔒 [batch_get] 尝试获取 immutable.read() 锁...");
+            debug_log!("🔒 [batch_get] 尝试获取 immutable.read() 锁...");
             let immutable = self.immutable.read()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            println!("✅ [batch_get] 成功获取 immutable.read() 锁，immutable queue中有 {} 个memtable", immutable.len());
+            debug_log!("✅ [batch_get] 成功获取 immutable.read() 锁，immutable queue中有 {} 个memtable", immutable.len());
             
             for (mt_idx, memtable) in immutable.iter().rev().enumerate() {
                 println!("  🔍 [batch_get] 查询第 {} 个immutable memtable，剩余 {} 个keys", mt_idx + 1, remaining_keys.len());
@@ -692,12 +692,12 @@ impl LSMEngine {
                     break;
                 }
             }
-            println!("🔓 [batch_get] 释放 immutable.read() 锁，剩余 {} 个keys未找到", remaining_keys.len());
+            debug_log!("🔓 [batch_get] 释放 immutable.read() 锁，剩余 {} 个keys未找到", remaining_keys.len());
             // 🔓 immutable锁在这里释放
         }
         
         if remaining_keys.is_empty() {
-            println!("✅ [batch_get] 所有keys已找到，跳过SSTable查询");
+            debug_log!("✅ [batch_get] 所有keys已找到，跳过SSTable查询");
             return Ok(results);
         }
         
@@ -768,7 +768,7 @@ impl LSMEngine {
             }
         }
         
-        println!("✅ [batch_get] 批量查询完成，返回 {} 个结果，{} 个未找到", 
+        debug_log!("✅ [batch_get] 批量查询完成，返回 {} 个结果，{} 个未找到", 
                  results.iter().filter(|r| r.is_some()).count(), 
                  remaining_keys.len());
         Ok(results)
@@ -874,68 +874,68 @@ impl LSMEngine {
     /// 
     /// This allows Database layer to backfill indexes from flushed data.
     pub fn flush_with_paths(&self) -> Result<Vec<PathBuf>> {
-        println!("💾 [flush] 开始flush操作...");
+        debug_log!("💾 [flush] 开始flush操作...");
         
         // 🔧 检查存储目录是否存在（防止在数据库关闭后flush）
         if !self.storage_dir.exists() {
-            println!("⚠️  [flush] 存储目录不存在，跳过flush: {:?}", self.storage_dir);
+            debug_log!("⚠️  [flush] 存储目录不存在，跳过flush: {:?}", self.storage_dir);
             return Ok(Vec::new());
         }
         
         // Acquire flush lock to prevent concurrent flush operations
-        println!("🔒 [flush] 尝试获取 flush_lock...");
+        debug_log!("🔒 [flush] 尝试获取 flush_lock...");
         let _flush_guard = self.flush_lock.lock()
             .map_err(|_| StorageError::Lock("Flush lock poisoned".into()))?;
-        println!("✅ [flush] 成功获取 flush_lock");
+        debug_log!("✅ [flush] 成功获取 flush_lock");
         
         let mut sstable_paths = Vec::new();
         
         // 1. Force rotate active MemTable (even if not full)
         let has_data = {
-            println!("🔒 [flush] 尝试获取 memtable.read() 锁检查数据...");
+            debug_log!("🔒 [flush] 尝试获取 memtable.read() 锁检查数据...");
             let memtable = self.memtable.read()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             let empty = memtable.is_empty();
-            println!("✅ [flush] memtable is_empty = {}", empty);
-            println!("🔓 [flush] 释放 memtable.read() 锁");
+            debug_log!("✅ [flush] memtable is_empty = {}", empty);
+            debug_log!("🔓 [flush] 释放 memtable.read() 锁");
             !empty
         };
         
         if has_data {
-            println!("📌 [flush] Active memtable有数据，执行rotate...");
+            debug_log!("📌 [flush] Active memtable有数据，执行rotate...");
             self.rotate_memtable()?;  // Blocking until queue has space
-            println!("✅ [flush] rotate_memtable完成");
+            debug_log!("✅ [flush] rotate_memtable完成");
         } else {
-            println!("⚠️  [flush] Active memtable为空，跳过rotate");
+            debug_log!("⚠️  [flush] Active memtable为空，跳过rotate");
         }
         
         // 2. Flush entire immutable queue
-        println!("💾 [flush] 开始flush immutable queue...");
+        debug_log!("💾 [flush] 开始flush immutable queue...");
         loop {
             let has_immutable = {
-                println!("🔒 [flush] 尝试获取 immutable.read() 锁检查队列...");
+                debug_log!("🔒 [flush] 尝试获取 immutable.read() 锁检查队列...");
                 let immutable = self.immutable.read()
                     .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
                 let empty = immutable.is_empty();
-                println!("✅ [flush] immutable queue长度: {}, is_empty = {}", immutable.len(), empty);
-                println!("🔓 [flush] 释放 immutable.read() 锁");
+                debug_log!("✅ [flush] immutable queue长度: {}, is_empty = {}", immutable.len(), empty);
+                debug_log!("🔓 [flush] 释放 immutable.read() 锁");
                 !empty  // 🔥 Check queue not empty
             };
             
             if !has_immutable {
-                println!("✅ [flush] immutable queue已空，flush完成");
+                debug_log!("✅ [flush] immutable queue已空，flush完成");
                 break;  // Queue empty, done
             }
             
             // Flush and collect SSTable path
-            println!("💾 [flush] 开始flush一个immutable memtable...");
+            debug_log!("💾 [flush] 开始flush一个immutable memtable...");
             if let Some(path) = self.flush_immutable_with_path()? {
-                println!("✅ [flush] 成功flush到: {:?}", path);
+                debug_log!("✅ [flush] 成功flush到: {:?}", path);
                 sstable_paths.push(path);
             }
         }
         
-        println!("✅ [flush] 整个flush操作完成，共创建 {} 个SSTables", sstable_paths.len());
+        debug_log!("✅ [flush] 整个flush操作完成，共创建 {} 个SSTables", sstable_paths.len());
         Ok(sstable_paths)
     }
     
@@ -979,33 +979,33 @@ impl LSMEngine {
     fn try_rotate_memtable(&self) -> Result<()> {
         // Quick check: is queue full?
         {
-            println!("🔒 [try_rotate] 尝试获取 immutable.read() 锁检查队列...");
+            debug_log!("🔒 [try_rotate] 尝试获取 immutable.read() 锁检查队列...");
             let immutable = self.immutable.read()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            println!("✅ [try_rotate] 成功获取 immutable.read() 锁，队列长度: {}/{}", 
+            debug_log!("✅ [try_rotate] 成功获取 immutable.read() 锁，队列长度: {}/{}", 
                      immutable.len(), self.max_immutable_slots);
             if immutable.len() >= self.max_immutable_slots {
-                println!("⚠️  [try_rotate] 队列已满，跳过rotate");
+                debug_log!("⚠️  [try_rotate] 队列已满，跳过rotate");
                 // Queue full, skip rotation (non-blocking)
                 return Err(StorageError::Transaction("Immutable queue full".into()));
             }
-            println!("🔓 [try_rotate] 释放 immutable.read() 锁");
+            debug_log!("🔓 [try_rotate] 释放 immutable.read() 锁");
         }
         
         // Acquire both locks for atomic swap
-        println!("🔒 [try_rotate] 尝试获取 memtable.write() 锁...");
+        debug_log!("🔒 [try_rotate] 尝试获取 memtable.write() 锁...");
         let mut memtable_lock = self.memtable.write()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        println!("✅ [try_rotate] 成功获取 memtable.write() 锁");
+        debug_log!("✅ [try_rotate] 成功获取 memtable.write() 锁");
         
-        println!("🔒 [try_rotate] 尝试获取 immutable.write() 锁...");
+        debug_log!("🔒 [try_rotate] 尝试获取 immutable.write() 锁...");
         let mut immutable_lock = self.immutable.write()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        println!("✅ [try_rotate] 成功获取 immutable.write() 锁");
+        debug_log!("✅ [try_rotate] 成功获取 immutable.write() 锁");
         
         // Double-check queue not full (another thread might have added)
         if immutable_lock.len() >= self.max_immutable_slots {
-            println!("⚠️  [try_rotate] 双重检查：队列已满，放弃rotate");
+            debug_log!("⚠️  [try_rotate] 双重检查：队列已满，放弃rotate");
             return Err(StorageError::Transaction("Immutable queue full".into()));
         }
         
@@ -1016,8 +1016,8 @@ impl LSMEngine {
         let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
         immutable_lock.push_back(old_memtable);  // 🔥 Push to queue
         
-        println!("✅ [try_rotate] MemTable rotate成功，新队列长度: {}", immutable_lock.len());
-        println!("🔓 [try_rotate] 释放 immutable.write() 和 memtable.write() 锁");
+        debug_log!("✅ [try_rotate] MemTable rotate成功，新队列长度: {}", immutable_lock.len());
+        debug_log!("🔓 [try_rotate] 释放 immutable.write() 和 memtable.write() 锁");
         
         Ok(())
     }

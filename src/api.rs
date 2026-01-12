@@ -320,7 +320,8 @@ impl Database {
             crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)
         }).collect();
         
-        self.inner.batch_insert_rows(rows?)
+        // 🚀 使用新的 batch_insert_rows_to_table (支持增量索引更新)
+        self.inner.batch_insert_rows_to_table(table_name, rows?)
     }
 
     /// 批量插入带向量的数据（自动构建向量索引）
@@ -342,20 +343,9 @@ impl Database {
     ///
     /// let row_ids = db.batch_insert_with_vectors("documents", rows, &["embedding"])?;
     /// ```
-    pub fn batch_insert_with_vectors(&self, _table_name: &str, rows: Vec<Row>, vector_columns: &[&str]) -> Result<Vec<RowId>> {
-        // 先批量插入行
-        let row_ids = self.inner.batch_insert_rows(rows)?;
-        
-        // 自动触发向量索引构建
-        for col in vector_columns {
-            let index_name = format!("{}_{}", _table_name, col);
-            if self.inner.has_vector_index(&index_name) {
-                // 索引存在时会自动在flush时构建
-                continue;
-            }
-        }
-        
-        Ok(row_ids)
+    pub fn batch_insert_with_vectors(&self, table_name: &str, rows: Vec<Row>, _vector_columns: &[&str]) -> Result<Vec<RowId>> {
+        // 🚀 使用新的 batch_insert_rows_to_table (已包含向量索引增量更新)
+        self.inner.batch_insert_rows_to_table(table_name, rows)
     }
 
     /// 批量插入带向量的数据（使用 HashMap，自动构建向量索引）

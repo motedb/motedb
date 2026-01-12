@@ -648,7 +648,155 @@ impl MoteDB {
     
     // ==================== Batch Operations ====================
     
+    /// Batch insert rows to a specific table with incremental index updates
+    /// 
+    /// **NOTE**: This method updates indexes incrementally for each row, ensuring consistency
+    /// even for small datasets (< 500 rows) that don't trigger batch index building.
+    /// 
+    /// # Example
+    /// ```
+    /// let rows = vec![
+    ///     vec![Value::Integer(1), Value::Text("Alice".into())],
+    ///     vec![Value::Integer(2), Value::Text("Bob".into())],
+    /// ];
+    /// let row_ids = db.batch_insert_rows_to_table("users", rows)?;
+    /// ```
+    pub fn batch_insert_rows_to_table(&self, table_name: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // 1. Get table schema
+        let schema = self.table_registry.get_table(table_name)?;
+        
+        // 2. Validate all rows
+        for (idx, row) in rows.iter().enumerate() {
+            schema.validate_row(row)
+                .map_err(|e| StorageError::InvalidData(format!(
+                    "Row {} validation failed for table '{}': {}",
+                    idx, table_name, e
+                )))?;
+        }
+        
+        // 3. Batch allocate row IDs
+        let mut row_ids = Vec::with_capacity(rows.len());
+        {
+            let mut next_id = self.next_row_id.write();
+            for _ in 0..rows.len() {
+                row_ids.push(*next_id);
+                *next_id += 1;
+            }
+        }
+        
+        // 4. Build WAL records
+        let mut wal_records = Vec::with_capacity(rows.len());
+        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+            wal_records.push(WALRecord::Insert {
+                table_name: table_name.to_string(),
+                row_id: *row_id,
+                partition,
+                data: row.clone(),
+            });
+        }
+        
+        // 5. Batch write WAL (single fsync)
+        self.wal.batch_append(0, wal_records)?;
+        
+        // 6. Write to LSM MemTable
+        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+            let row_data = bincode::serialize(row)?;
+            let value = crate::storage::lsm::Value::new(row_data, *row_id);
+            let composite_key = self.make_composite_key(table_name, *row_id);
+            self.lsm_engine.put(composite_key, value)?;
+        }
+        
+        // 7. 🚀 增量更新所有索引（与 insert_row_to_table 保持一致）
+        debug_log!("[batch_insert_rows_to_table] Updating indexes incrementally for {} rows in table '{}'", rows.len(), table_name);
+        
+        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+            for col_def in &schema.columns {
+                let col_name = &col_def.name;
+                let col_value = row.get(col_def.position);
+                
+                if col_value.is_none() {
+                    continue;
+                }
+                let col_value = col_value.unwrap();
+                
+                // 7.1 Column Index
+                let column_index_name = format!("{}.{}", table_name, col_name);
+                if self.column_indexes.contains_key(&column_index_name) {
+                    if let Err(e) = self.insert_column_value(table_name, col_name, *row_id, col_value) {
+                        eprintln!("[batch_insert] ⚠️ Failed to update column index '{}': {}", column_index_name, e);
+                    }
+                }
+                
+                // 7.2 Vector Index
+                if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
+                    // 🔧 Use index_registry to find the correct user-specified index name
+                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Vector) {
+                        if let crate::types::Value::Vector(vec) = col_value {
+                            if let Err(e) = self.update_vector(*row_id, &index_name, vec) {
+                                eprintln!("[batch_insert] ⚠️ Failed to update vector index '{}': {}", index_name, e);
+                            }
+                        }
+                    }
+                }
+                
+                // 7.3 Text Index
+                if matches!(col_def.col_type, crate::types::ColumnType::Text) {
+                    // 🔧 Use index_registry to find the correct user-specified index name
+                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
+                        if let crate::types::Value::Text(text) = col_value {
+                            if let Err(e) = self.insert_text(*row_id, &index_name, text) {
+                                eprintln!("[batch_insert] ⚠️ Failed to update text index '{}': {}", index_name, e);
+                            }
+                        }
+                    }
+                }
+                
+                // 7.4 Spatial Index
+                if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
+                    // 🔧 Use index_registry to find the correct user-specified index name
+                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
+                        if let crate::types::Value::Spatial(geom) = col_value {
+                            if let Err(e) = self.insert_geometry(*row_id, &index_name, geom.clone()) {
+                                eprintln!("[batch_insert] ⚠️ Failed to update spatial index '{}': {}", index_name, e);
+                            }
+                        }
+                    }
+                }
+                
+                // 7.5 Timestamp Index (legacy single-index architecture, handled by batch build)
+                // Note: Timestamp index uses a different architecture (single BTree index)
+                // and is updated during flush via batch building
+            }
+        }
+        
+        // 8. Increment pending counter
+        {
+            let mut pending = self.pending_updates.write();
+            *pending += rows.len();
+            
+            if *pending >= 1_000 {
+                *pending = 0;
+                drop(pending);
+                
+                let db_clone = self.clone_for_callback();
+                std::thread::spawn(move || {
+                    let _ = db_clone.flush();
+                });
+            }
+        }
+        
+        Ok(row_ids)
+    }
+    
     /// Batch insert rows (10-20x faster than individual inserts)
+    /// 
+    /// **NOTE**: This is the legacy API without table name, kept for backward compatibility.
+    /// For table-aware batch insert with index updates, use `batch_insert_rows_to_table()`.
     /// 
     /// # Example
     /// ```

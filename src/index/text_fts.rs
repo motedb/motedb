@@ -258,7 +258,7 @@ impl TextFTSIndex {
         
         let total_elapsed = batch_start.elapsed();
         
-        println!("    [INSERT TIMING] Total: {:.3}s | Tokenize: {:.3}s | Pending: {:.3}s | Stats: {:.3}s | GlobalPendingTerms: {}",
+        debug_log!("    [INSERT TIMING] Total: {:.3}s | Tokenize: {:.3}s | Pending: {:.3}s | Stats: {:.3}s | GlobalPendingTerms: {}",
             total_elapsed.as_secs_f64(),
             t1_elapsed.as_secs_f64(),
             t2_elapsed.as_secs_f64(),
@@ -660,7 +660,7 @@ impl TextFTSIndex {
         
         let total_elapsed = flush_start.elapsed();
         
-        println!("    [FLUSH TIMING] Total: {:.3}s | Terms: {} | Clone: {:.3}s | BTree-Write: {:.3}s | BTree-Flush: {:.3}s | Clear: {:.3}s | DocLen: {:.3}s | Dict: {:.3}s | Meta: {:.3}s",
+        debug_log!("    [FLUSH TIMING] Total: {:.3}s | Terms: {} | Clone: {:.3}s | BTree-Write: {:.3}s | BTree-Flush: {:.3}s | Clear: {:.3}s | DocLen: {:.3}s | Dict: {:.3}s | Meta: {:.3}s",
             total_elapsed.as_secs_f64(),
             pending_count,
             t1_elapsed.as_secs_f64(),

@@ -30,11 +30,11 @@ impl MoteDB {
             Ordering::Acquire, 
             Ordering::Relaxed
         ).is_err() {
-            eprintln!("[MoteDB::flush] ⚠️  Skipped: Already flushing (防止递归)");
+            debug_log!("[MoteDB::flush] ⚠️  Skipped: Already flushing (防止递归)");
             return Ok(());
         }
         
-        eprintln!("\n[MoteDB::flush] ========== START ==========");
+        debug_log!("\n[MoteDB::flush] ========== START ==========");
         
         // 执行 flush，确保退出时重置标志
         let result = self.flush_impl();
@@ -44,11 +44,11 @@ impl MoteDB {
         
         match &result {
             Ok(_) => {
-                eprintln!("[MoteDB::flush] ========== DONE ✅ ==========\n");
+                debug_log!("[MoteDB::flush] ========== DONE ✅ ==========\n");
             }
             Err(e) => {
-                eprintln!("[MoteDB::flush] ========== FAILED ❌ ==========");
-                eprintln!("[MoteDB::flush] Error: {:?}\n", e);
+                debug_log!("[MoteDB::flush] ========== FAILED ❌ ==========");
+                debug_log!("[MoteDB::flush] Error: {:?}\n", e);
             }
         }
         
@@ -59,7 +59,7 @@ impl MoteDB {
     fn flush_impl(&self) -> Result<()> {
         // 🔧 检查数据库路径是否存在（防止在删除后flush）
         if !self.path.exists() {
-            eprintln!("⚠️  [flush] 数据库目录不存在，跳过flush: {:?}", self.path);
+            debug_log!("⚠️  [flush] 数据库目录不存在，跳过flush: {:?}", self.path);
             return Ok(());
         }
         
@@ -116,31 +116,31 @@ impl MoteDB {
         use std::time::Instant;
         let checkpoint_start = Instant::now();
         
-        println!("[Checkpoint] 🚀 Starting batch index checkpoint...");
+        debug_log!("[Checkpoint] 🚀 Starting batch index checkpoint...");
         
         // 🔥 Step 1: Trigger LSM flush (MemTable → SSTable)
         // This will also trigger batch index building via the callback
         let flush_start = Instant::now();
         self.lsm_engine.flush()?;
-        println!("[Checkpoint]   ✓ LSM flush complete in {:?}", flush_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ LSM flush complete in {:?}", flush_start.elapsed());
         
         // 🔥 Step 2: Rebuild TimestampIndex from LSM (legacy path)
         // TODO: Move this to batch builder in future
         let ts_rebuild_start = Instant::now();
         self.rebuild_timestamp_index()?;
-        println!("[Checkpoint]   ✓ Timestamp index rebuild in {:?}", ts_rebuild_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ Timestamp index rebuild in {:?}", ts_rebuild_start.elapsed());
         
         // 🔥 Step 3: Flush all indexes (persist to disk)
         let index_flush_start = Instant::now();
         self.flush_all_indexes()?;
-        println!("[Checkpoint]   ✓ Index flush complete in {:?}", index_flush_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ Index flush complete in {:?}", index_flush_start.elapsed());
         
         // 🔥 Step 4: Checkpoint WAL (safe to truncate now)
         let wal_checkpoint_start = Instant::now();
         self.wal.checkpoint_all()?;
-        println!("[Checkpoint]   ✓ WAL checkpoint in {:?}", wal_checkpoint_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ WAL checkpoint in {:?}", wal_checkpoint_start.elapsed());
         
-        println!("[Checkpoint] 🎉 Total checkpoint time: {:?}", checkpoint_start.elapsed());
+        debug_log!("[Checkpoint] 🎉 Total checkpoint time: {:?}", checkpoint_start.elapsed());
         Ok(())
     }
     

@@ -48,6 +48,40 @@ impl QueryResult {
             _ => 0,
         }
     }
+    
+    /// Get columns and rows from SELECT result
+    /// Returns None if not a SELECT result
+    pub fn select_rows(&self) -> Option<(&[String], &[Vec<Value>])> {
+        match self {
+            QueryResult::Select { columns, rows } => Some((columns.as_slice(), rows.as_slice())),
+            _ => None,
+        }
+    }
+    
+    /// Get rows as maps (column_name -> value)
+    /// Returns empty vec if not a SELECT result
+    pub fn rows_as_maps(&self) -> Vec<std::collections::HashMap<String, Value>> {
+        match self {
+            QueryResult::Select { columns, rows } => {
+                rows.iter().map(|row| {
+                    columns.iter()
+                        .zip(row.iter())
+                        .map(|(col, val)| (col.clone(), val.clone()))
+                        .collect()
+                }).collect()
+            }
+            _ => vec![],
+        }
+    }
+    
+    /// Get row count for SELECT results
+    pub fn row_count(&self) -> usize {
+        match self {
+            QueryResult::Select { rows, .. } => rows.len(),
+            QueryResult::Modification { affected_rows } => *affected_rows,
+            _ => 0,
+        }
+    }
 }
 
 pub struct QueryExecutor {
@@ -2573,18 +2607,18 @@ impl QueryExecutor {
     
     /// Execute SELECT using vector ORDER BY optimization
     fn execute_vector_order_by_plan(&self, stmt: &SelectStmt, plan: &VectorOrderByPlan) -> Result<QueryResult> {
-        println!("[Executor] ✅ 使用向量索引优化 ORDER BY: {} <-> [...] LIMIT {}", plan.column, plan.k);
+        debug_log!("[Executor] ✅ 使用向量索引优化 ORDER BY: {} <-> [...] LIMIT {}", plan.column, plan.k);
         
         let index_name = format!("{}_{}", plan.table, plan.column);
         
         // 1. 向量搜索获取 Top-K row_ids
         let candidates = self.db.vector_search(&index_name, &plan.query_vector, plan.k)?;
-        println!("[Executor] 🔍 vector_search返回了{}个候选", candidates.len());
+        debug_log!("[Executor] 🔍 vector_search返回了{}个候选", candidates.len());
         
         let row_ids: Vec<u64> = candidates.iter().map(|(id, _dist)| *id).collect();
         
         if !row_ids.is_empty() {
-            println!("[Executor] 🔍 row_ids前5个: {:?}", &row_ids[..5.min(row_ids.len())]);
+            debug_log!("[Executor] 🔍 row_ids前5个: {:?}", &row_ids[..5.min(row_ids.len())]);
         }
         
         if row_ids.is_empty() {
@@ -2600,7 +2634,7 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(&plan.table)?;
         let batch_rows = self.db.get_table_rows_batch(&plan.table, &row_ids)?;
         
-        println!("[Executor] 🔍 get_table_rows_batch返回了{}个行", batch_rows.len());
+        debug_log!("[Executor] 🔍 get_table_rows_batch返回了{}个行", batch_rows.len());
         
         // 3. 转换为SQL行格式（保持向量搜索的顺序）
         let mut sql_rows = Vec::with_capacity(row_ids.len());
@@ -2611,7 +2645,7 @@ impl QueryExecutor {
                 // 🔍 Debug: 打印前3个的row_id和id列
                 if sql_rows.len() < 3 {
                     if let Some(id_value) = sql_row.get("id") {
-                        println!("[Executor] 🔍 row_id={} → id列={:?}", row_id, id_value);
+                        debug_log!("[Executor] 🔍 row_id={} → id列={:?}", row_id, id_value);
                     }
                 }
                 

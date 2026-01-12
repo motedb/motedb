@@ -68,7 +68,7 @@ impl MoteDB {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
                 
-                println!("[create_column_index] 🔍 使用scan_range扫描LSM（方案B）...");
+                debug_log!("[create_column_index] 🔍 使用scan_range扫描LSM（方案B）...");
                 let start_time = std::time::Instant::now();
                 
                 // 计算表的key范围
@@ -123,11 +123,11 @@ impl MoteDB {
                 let scan_time = start_time.elapsed();
                 
                 if indexed_count > 0 {
-                    println!("[create_column_index] 🚀 扫描完成：{} 个值，耗时 {:?}", 
+                    debug_log!("[create_column_index] 🚀 扫描完成：{} 个值，耗时 {:?}", 
                              indexed_count, scan_time);
-                    println!("[create_column_index] ✅ 批量建索引完成！");
+                    debug_log!("[create_column_index] ✅ 批量建索引完成！");
                 } else {
-                    println!("[create_column_index] ⚠️ 未找到任何数据（扫描耗时 {:?}）", scan_time);
+                    debug_log!("[create_column_index] ⚠️ 未找到任何数据（扫描耗时 {:?}）", scan_time);
                 }
             } else {
                 println!("  ✓ Created empty column index '{}' (column not found in schema)", index_name);
@@ -227,14 +227,14 @@ impl MoteDB {
             // 🔓 自动释放
         };
         
-        println!("[query_by_column] 索引查询到 {} 条数据（来自SSTable）", row_ids.len());
+        debug_log!("[query_by_column] 索引查询到 {} 条数据（来自SSTable）", row_ids.len());
         
         // Step 2: Scan MemTable for new data (不持有 column_indexes 锁)
         let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
             col_value == value
         })?;
         
-        println!("[query_by_column] MemTable扫描到 {} 条数据（未索引）", memtable_ids.len());
+        debug_log!("[query_by_column] MemTable扫描到 {} 条数据（未索引）", memtable_ids.len());
         
         // Step 3: Merge and deduplicate
         row_ids.extend(memtable_ids);
@@ -251,10 +251,10 @@ impl MoteDB {
         
         let filtered_count = original_count - row_ids.len();
         if filtered_count > 0 {
-            println!("[query_by_column] 过滤掉 {} 条已删除数据", filtered_count);
+            debug_log!("[query_by_column] 过滤掉 {} 条已删除数据", filtered_count);
         }
         
-        println!("[query_by_column] 最终返回 {} 条有效数据", row_ids.len());
+        debug_log!("[query_by_column] 最终返回 {} 条有效数据", row_ids.len());
         
         Ok(row_ids)
     }
@@ -526,7 +526,7 @@ impl MoteDB {
             Ok(())
         })?;
         
-        println!("[scan_memtable_for_column] 扫描了 {} 条MemTable数据，匹配 {} 条", 
+        debug_log!("[scan_memtable_for_column] 扫描了 {} 条MemTable数据，匹配 {} 条", 
                  scanned_count, matching_ids.len());
         
         Ok(matching_ids)

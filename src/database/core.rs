@@ -321,7 +321,7 @@ impl MoteDB {
 
         // ⭐ 关键修复：将 WAL 恢复的数据写回 LSM Engine
         // 现在 WAL 记录了 table_name，可以正确构建 composite_key
-        println!("[database] 恢复 WAL 记录到 LSM Engine...");
+        debug_log!("[database] 恢复 WAL 记录到 LSM Engine...");
         let mut recovered_count = 0;
         for (_partition, records) in &recovered_records {
             for record in records {
@@ -370,7 +370,7 @@ impl MoteDB {
                 }
             }
         }
-        println!("[database] WAL 恢复完成，恢复了 {} 条记录", recovered_count);
+        debug_log!("[database] WAL 恢复完成，恢复了 {} 条记录", recovered_count);
 
         // Create version store and transaction coordinator
         let version_store = Arc::new(VersionStore::new());

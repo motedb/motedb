@@ -173,7 +173,7 @@ impl DiskANNIndex {
         let graph_cache = (config.search_list_size * 10).max(1000);
         
         // Create SQ8 vector storage
-        println!("[DiskANN] Using SQ8 compression (4x, ~98% accuracy)");
+        debug_log!("[DiskANN] Using SQ8 compression (4x, ~98% accuracy)");
         
         let quantizer = Arc::new(SQ8Quantizer::new(dimension));
         
@@ -232,7 +232,7 @@ impl DiskANNIndex {
             ));
         }
         
-        println!("[DiskANN] Loading SQ8 compressed index");
+        debug_log!("[DiskANN] Loading SQ8 compressed index");
         
         // Load SQ8 quantizer
         let quantizer = Arc::new(SQ8Quantizer::load(&quantizer_path)?);
@@ -301,13 +301,13 @@ impl DiskANNIndex {
             return Ok(());
         }
         
-        println!("[DiskANN] Building index for {} vectors...", vectors.len());
+        debug_log!("[DiskANN] Building index for {} vectors...", vectors.len());
         let start = Instant::now();
         
         // 1. Insert all vectors to disk
         let vector_start = Instant::now();
         self.vectors.batch_insert(vectors.clone())?;
-        println!("[DiskANN] Vectors written in {:?}", vector_start.elapsed());
+        debug_log!("[DiskANN] Vectors written in {:?}", vector_start.elapsed());
         
         let ids: Vec<RowId> = vectors.iter().map(|(id, _)| *id).collect();
         
@@ -315,7 +315,7 @@ impl DiskANNIndex {
         let medoid_id = self.select_medoid(&ids);
         *self.medoid.write() = Some(medoid_id);
         
-        println!("[DiskANN] Selected medoid: {}", medoid_id);
+        debug_log!("[DiskANN] Selected medoid: {}", medoid_id);
         
         // 3. 🔥 召回率优化: 使用智能批量构建策略
         // 原因: 逐个插入是O(N²)复杂度，10万节点需要100亿次操作
@@ -324,15 +324,15 @@ impl DiskANNIndex {
         //   - < 4000节点 → 批量并行构建
         let graph_start = Instant::now();
         self.batch_build_graph(&ids)?;
-        println!("[DiskANN] Graph built in {:?}", graph_start.elapsed());
+        debug_log!("[DiskANN] Graph built in {:?}", graph_start.elapsed());
         
         // 4. 🚀 Flush to disk (会自动清理slack边)
-        println!("[DiskANN] Flushing and cleaning up slack edges...");
+        debug_log!("[DiskANN] Flushing and cleaning up slack edges...");
         let flush_start = Instant::now();
         self.flush()?;
-        println!("[DiskANN] Flushed in {:?}", flush_start.elapsed());
+        debug_log!("[DiskANN] Flushed in {:?}", flush_start.elapsed());
         
-        println!("[DiskANN] Build completed in {:?}", start.elapsed());
+        debug_log!("[DiskANN] Build completed in {:?}", start.elapsed());
         
         Ok(())
     }
@@ -383,13 +383,13 @@ impl DiskANNIndex {
         }
         
         let count = vectors.len();
-        println!("[DiskANN] Batch inserting {} vectors...", count);
+        debug_log!("[DiskANN] Batch inserting {} vectors...", count);
         let start = Instant::now();
         
         // 1. Batch write vectors (single fsync at the end)
         let vector_write_start = Instant::now();
         self.vectors.batch_insert(vectors.to_vec())?;
-        println!("[DiskANN] Vectors written in {:?}", vector_write_start.elapsed());
+        debug_log!("[DiskANN] Vectors written in {:?}", vector_write_start.elapsed());
         
         // 2. Update medoid if needed
         {
@@ -403,7 +403,7 @@ impl DiskANNIndex {
         let graph_build_start = Instant::now();
         let ids: Vec<RowId> = vectors.iter().map(|(id, _)| *id).collect();
         self.batch_build_graph(&ids)?;
-        println!("[DiskANN] Graph built in {:?}", graph_build_start.elapsed());
+        debug_log!("[DiskANN] Graph built in {:?}", graph_build_start.elapsed());
         
         // 🔥 关键修复：在 flush() 之前重置计数器，避免触发重复重建
         *self.total_inserts_since_reorder.write() = 0;
@@ -411,9 +411,9 @@ impl DiskANNIndex {
         // 4. ✅ Single flush at the end (no intermediate flushes)
         let flush_start = Instant::now();
         self.flush()?;
-        println!("[DiskANN] Flushed in {:?}", flush_start.elapsed());
+        debug_log!("[DiskANN] Flushed in {:?}", flush_start.elapsed());
         
-        println!("[DiskANN] Batch insert completed in {:?}", start.elapsed());
+        debug_log!("[DiskANN] Batch insert completed in {:?}", start.elapsed());
         
         // 5. 🚀 智能SSD优化触发策略
         self.try_auto_reorder()?;
@@ -471,9 +471,9 @@ impl DiskANNIndex {
         let num_batches = (new_count + batch_size - 1) / batch_size;
         
         if show_progress {
-            println!("[DiskANN] 🔥 Progressive Batch Build: {} nodes in {} batches", 
+            debug_log!("[DiskANN] 🔥 Progressive Batch Build: {} nodes in {} batches", 
                 new_count, num_batches);
-            println!("[DiskANN] Batch size: {}, efConstruction=400", batch_size);
+            debug_log!("[DiskANN] Batch size: {}, efConstruction=400", batch_size);
         }
         
         // 🚀 分批渐进式构建
@@ -522,7 +522,7 @@ impl DiskANNIndex {
             
             // 并行构建本批节点的边
             if show_progress {
-                println!("[DiskANN] Phase 1: Building batch nodes (parallel)...");
+                debug_log!("[DiskANN] Phase 1: Building batch nodes (parallel)...");
             }
             
             batch.par_iter()
@@ -564,7 +564,7 @@ impl DiskANNIndex {
             
             // Phase 2: 写入前向边
             if show_progress {
-                println!("[DiskANN] Phase 2: Writing forward edges...");
+                debug_log!("[DiskANN] Phase 2: Writing forward edges...");
             }
             
             for entry in temp_graph.iter() {
@@ -573,7 +573,7 @@ impl DiskANNIndex {
             
             // Phase 3: 收集并更新反向边
             if show_progress {
-                println!("[DiskANN] Phase 3: Updating reverse edges...");
+                debug_log!("[DiskANN] Phase 3: Updating reverse edges...");
             }
             
             let reverse_edges: DashMap<RowId, Vec<RowId>> = DashMap::new();
@@ -663,7 +663,7 @@ impl DiskANNIndex {
         use std::sync::atomic::{AtomicUsize, Ordering};
         
         if show_progress {
-            println!("[DiskANN] Incremental batch build: {} new nodes", new_ids.len());
+            debug_log!("[DiskANN] Incremental batch build: {} new nodes", new_ids.len());
         }
         
         let start = std::time::Instant::now();
@@ -694,7 +694,7 @@ impl DiskANNIndex {
         if show_progress {
             let elapsed = start.elapsed();
             let speed = new_ids.len() as f64 / elapsed.as_secs_f64();
-            println!("[DiskANN] Incremental build complete in {:?} ({:.1} v/s)", 
+            debug_log!("[DiskANN] Incremental build complete in {:?} ({:.1} v/s)", 
                 elapsed, speed);
         }
         
@@ -730,9 +730,9 @@ impl DiskANNIndex {
         let num_layers = (total + layer_size - 1) / layer_size;
         
         if show_progress {
-            println!("[DiskANN] 🚀 Layered build: {} nodes → {} layers (size={})", 
+            debug_log!("[DiskANN] 🚀 Layered build: {} nodes → {} layers (size={})", 
                 total, num_layers, layer_size);
-            println!("[DiskANN] Time complexity: O(N log L) = O({} * log {}) vs O(N² log N) = O({} * log {})",
+            debug_log!("[DiskANN] Time complexity: O(N log L) = O({} * log {}) vs O(N² log N) = O({} * log {})",
                 total, layer_size, total*total, total);
         }
         
@@ -810,7 +810,7 @@ impl DiskANNIndex {
             
             // Phase 2: 写入前向边
             if show_progress {
-                println!("[DiskANN] Phase 2: Writing forward edges...");
+                debug_log!("[DiskANN] Phase 2: Writing forward edges...");
             }
             
             for entry in temp_graph.iter() {
@@ -819,7 +819,7 @@ impl DiskANNIndex {
             
             // Phase 3: 收集并更新反向边
             if show_progress {
-                println!("[DiskANN] Phase 3: Updating reverse edges...");
+                debug_log!("[DiskANN] Phase 3: Updating reverse edges...");
             }
             
             let reverse_edges: DashMap<RowId, Vec<RowId>> = DashMap::new();
@@ -885,7 +885,7 @@ impl DiskANNIndex {
             
             // 本层构建完成
             if show_progress {
-                println!("[DiskANN] Layer {}/{} complete in {:?} ({:.1} nodes/sec)", 
+                debug_log!("[DiskANN] Layer {}/{} complete in {:?} ({:.1} nodes/sec)", 
                     layer_idx + 1, num_layers, 
                     layer_start.elapsed(),
                     layer_nodes.len() as f64 / layer_start.elapsed().as_secs_f64());
@@ -899,14 +899,14 @@ impl DiskANNIndex {
         // Phase 2: 反向边更新（批量并行）
         let reverse_start = std::time::Instant::now();
         if show_progress {
-            println!("[DiskANN] Phase 2: Updating reverse edges (parallel)...");
+            debug_log!("[DiskANN] Phase 2: Updating reverse edges (parallel)...");
         }
         
         self.batch_update_reverse_edges(&nodes, show_progress)?;
         
         if show_progress {
-            println!("[DiskANN] Phase 2 complete in {:?}", reverse_start.elapsed());
-            println!("[DiskANN] ✅ Total layered build time: {:?}\n", start_time.elapsed());
+            debug_log!("[DiskANN] Phase 2 complete in {:?}", reverse_start.elapsed());
+            debug_log!("[DiskANN] ✅ Total layered build time: {:?}\n", start_time.elapsed());
         }
         
         Ok(())
@@ -1338,7 +1338,7 @@ impl DiskANNIndex {
         }
         
         if cleaned_count > 0 {
-            println!("[DiskANN] Cleaned {} nodes with slack edges", cleaned_count);
+            debug_log!("[DiskANN] Cleaned {} nodes with slack edges", cleaned_count);
         }
         
         Ok(())
@@ -1392,12 +1392,12 @@ impl DiskANNIndex {
     /// Compact disk files (slow, full rewrite for defragmentation)
     /// Call this periodically (e.g., every 100K inserts)
     pub fn compact_storage(&self) -> Result<()> {
-        println!("[DiskANN] Compacting storage...");
+        debug_log!("[DiskANN] Compacting storage...");
         let start = Instant::now();
         
         self.graph.compact()?;
         
-        println!("[DiskANN] Storage compacted in {:?}", start.elapsed());
+        debug_log!("[DiskANN] Storage compacted in {:?}", start.elapsed());
         Ok(())
     }
     
@@ -1521,7 +1521,7 @@ impl DiskANNIndex {
             inserts_since_reorder >= 100_000;
         
         if should_reorder {
-            println!("[DiskANN] 🎯 Auto-triggering SSD optimization:");
+            debug_log!("[DiskANN] 🎯 Auto-triggering SSD optimization:");
             println!("  - Current size: {}", current_size);
             println!("  - Inserts since last reorder: {}", inserts_since_reorder);
             println!("  - Growth: {:.1}%", 
@@ -1546,7 +1546,7 @@ impl DiskANNIndex {
     /// 
     /// **When to call**: Automatically triggered or manually called
     pub fn reorder_for_ssd(&self) -> Result<()> {
-        println!("[DiskANN] 🚀 Reordering vectors for SSD optimization...");
+        debug_log!("[DiskANN] 🚀 Reordering vectors for SSD optimization...");
         let start = Instant::now();
         
         let medoid_id = match *self.medoid.read() {
@@ -1557,18 +1557,18 @@ impl DiskANNIndex {
         // 1. BFS traversal from medoid to get optimal ordering
         let bfs_order = self.bfs_traversal(medoid_id);
         
-        println!("[DiskANN]   - BFS traversal: {} vectors", bfs_order.len());
+        debug_log!("[DiskANN]   - BFS traversal: {} vectors", bfs_order.len());
         
         // 2. Reorder vectors on disk according to BFS order
         self.vectors.reorder_by_access_pattern(&bfs_order)?;
         
-        println!("[DiskANN]   - Vectors reordered on disk");
+        debug_log!("[DiskANN]   - Vectors reordered on disk");
         
         // 3. Compact graph for better locality
         self.graph.compact()?;
         
-        println!("[DiskANN] ✅ SSD optimization completed in {:?}", start.elapsed());
-        println!("[DiskANN]   - Expected P99 latency improvement: 50-70%");
+        debug_log!("[DiskANN] ✅ SSD optimization completed in {:?}", start.elapsed());
+        debug_log!("[DiskANN]   - Expected P99 latency improvement: 50-70%");
         
         Ok(())
     }
@@ -1608,7 +1608,7 @@ impl DiskANNIndex {
     /// Refine graph quality after batch insertion (optional)
     /// This fixes reverse edges and improves connectivity
     pub fn refine_graph(&self, sample_rate: f32) -> Result<()> {
-        println!("[DiskANN] Refining graph quality...");
+        debug_log!("[DiskANN] Refining graph quality...");
         let start = Instant::now();
         
         let all_ids = self.vectors.ids();
@@ -1624,12 +1624,12 @@ impl DiskANNIndex {
         
         for (i, id) in sampled.iter().enumerate() {
             if i % 1000 == 0 && i > 0 {
-                println!("[DiskANN] Refined {}/{} nodes", i, sample_size);
+                debug_log!("[DiskANN] Refined {}/{} nodes", i, sample_size);
             }
             self.insert_vector_into_graph(*id, medoid_id)?;
         }
         
-        println!("[DiskANN] Graph refinement completed in {:?}", start.elapsed());
+        debug_log!("[DiskANN] Graph refinement completed in {:?}", start.elapsed());
         Ok(())
     }
     
@@ -1845,7 +1845,7 @@ impl DiskANNIndex {
         let num_layers = (total + layer_size - 1) / layer_size;
         
         if show_progress {
-            println!("[DiskANN] 🚀 Layered build: {} nodes → {} layers (size={})", 
+            debug_log!("[DiskANN] 🚀 Layered build: {} nodes → {} layers (size={})", 
                 total, num_layers, layer_size);
         }
         
@@ -1868,7 +1868,7 @@ impl DiskANNIndex {
             let layer_nodes = &nodes[start..end];
             
             if show_progress {
-                println!("[DiskANN] Layer {}/{}: Building {} nodes...", 
+                debug_log!("[DiskANN] Layer {}/{}: Building {} nodes...", 
                     layer_idx + 1, num_layers, layer_nodes.len());
             }
             
@@ -1919,7 +1919,7 @@ impl DiskANNIndex {
             
             // Phase 2: 写入前向边
             if show_progress {
-                println!("[DiskANN] Phase 2: Writing forward edges...");
+                debug_log!("[DiskANN] Phase 2: Writing forward edges...");
             }
             
             for entry in temp_graph.iter() {
@@ -1928,7 +1928,7 @@ impl DiskANNIndex {
             
             // Phase 3: 收集并更新反向边
             if show_progress {
-                println!("[DiskANN] Phase 3: Updating reverse edges...");
+                debug_log!("[DiskANN] Phase 3: Updating reverse edges...");
             }
             
             let reverse_edges: DashMap<RowId, Vec<RowId>> = DashMap::new();
@@ -1997,18 +1997,18 @@ impl DiskANNIndex {
         }  // End of layer loop
         
         if show_progress {
-            println!("[DiskANN] Phase 1 complete: All layers built");
+            debug_log!("[DiskANN] Phase 1 complete: All layers built");
         }
         
         // Phase 2: 反向边更新（批量并行）
         if show_progress {
-            println!("[DiskANN] Phase 2: Updating reverse edges (parallel)...");
+            debug_log!("[DiskANN] Phase 2: Updating reverse edges (parallel)...");
         }
         
         self.batch_update_reverse_edges(&nodes, show_progress)?;
         
         if show_progress {
-            println!("[DiskANN] ✅ Layered build complete!");
+            debug_log!("[DiskANN] ✅ Layered build complete!");
         }
         
         Ok(())

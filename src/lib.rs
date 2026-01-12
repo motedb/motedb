@@ -23,6 +23,18 @@
 // #[global_allocator]
 // static GLOBAL: Jemalloc = Jemalloc;
 
+/// Debug-only logging macro
+/// Only prints in debug builds, silenced in release builds
+#[macro_export]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        {
+            println!($($arg)*);
+        }
+    };
+}
+
 pub mod config;
 pub mod storage;
 pub mod index;

@@ -18,7 +18,7 @@ impl MoteDB {
         let start = Instant::now();
         
         let memtable_len = memtable.len();
-        println!("[BatchIndexBuilder] 🔍 收到Flush回调，MemTable数据量: {}", memtable_len);
+        debug_log!("[BatchIndexBuilder] 🔍 收到Flush回调，MemTable数据量: {}", memtable_len);
         
         if memtable_len == 0 {
             return Ok(());
@@ -27,12 +27,12 @@ impl MoteDB {
         // 🚀 Performance: Skip batch building for small datasets
         const MIN_BATCH_SIZE: usize = 500;
         if memtable_len < MIN_BATCH_SIZE {
-            println!("[BatchIndexBuilder] ⚠️  跳过批量构建（数据量 {} < {}），依赖增量索引", 
+            debug_log!("[BatchIndexBuilder] ⚠️  跳过批量构建（数据量 {} < {}），依赖增量索引", 
                      memtable_len, MIN_BATCH_SIZE);
             return Ok(());
         }
         
-        println!("[BatchIndexBuilder] 🚀 Building indexes from {} flushed rows", memtable_len);
+        debug_log!("[BatchIndexBuilder] 🚀 Building indexes from {} flushed rows", memtable_len);
         
         // Phase 1: Group rows by table_name
         let mut tables_data: HashMap<String, Vec<(RowId, Row)>> = HashMap::new();
@@ -68,7 +68,7 @@ impl MoteDB {
                 .push((row_id, row));
         }
         
-        println!("[BatchIndexBuilder]   ↳ Grouped into {} tables", tables_data.len());
+        debug_log!("[BatchIndexBuilder]   ↳ Grouped into {} tables", tables_data.len());
         
         // Phase 2: Build indexes (parallel if multiple tables)
         let tables_count = tables_data.len();
@@ -100,7 +100,7 @@ impl MoteDB {
             }
         }
         
-        println!("[BatchIndexBuilder] ✅ Batch index building complete in {:?} ({} tables)", start.elapsed(), tables_count);
+        debug_log!("[BatchIndexBuilder] ✅ Batch index building complete in {:?} ({} tables)", start.elapsed(), tables_count);
         Ok(())
     }
     
@@ -139,12 +139,12 @@ impl MoteDB {
         
         let start = Instant::now();
         
-        println!("[BatchIndexBuilder]   📊 Table '{}': {} rows", table_name, rows.len());
+        debug_log!("[BatchIndexBuilder]   📊 Table '{}': {} rows", table_name, rows.len());
         
         let schema = match self.table_registry.get_table(table_name) {
             Ok(s) => s,
             Err(_) => {
-                println!("[BatchIndexBuilder]   ⏭  Skipping table '{}' (no schema registered)", table_name);
+                debug_log!("[BatchIndexBuilder]   ⏭  Skipping table '{}' (no schema registered)", table_name);
                 return Ok(());
             }
         };
@@ -222,7 +222,7 @@ impl MoteDB {
             }
         }
         
-        println!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?} (5 parallel threads)", table_name, start.elapsed());
+        debug_log!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?} (5 parallel threads)", table_name, start.elapsed());
         Ok(())
     }
     
