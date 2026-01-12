@@ -87,8 +87,9 @@ tikv-jemalloc-ctl = "0.5"
 # Command line argument parsing (for examples)
 clap = { version = "4.4", features = ["derive"] }
 
+# Enable jieba tokenizer by default
 [features]
-default = []  # 🎯 默认配置,减小二进制大小
+default = ["tokenizer-jieba"]  # 🎯 默认启用中文分词
 # 🔌 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
