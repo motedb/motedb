@@ -112,7 +112,6 @@ db.commit_transaction(tx_id)?;
 
 - [GitHub 仓库](https://github.com/yourusername/motedb)
 - [API 文档](https://docs.rs/motedb)
-- [示例代码](../examples/)
 
 ## 📝 版本信息
 
