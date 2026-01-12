@@ -11,7 +11,6 @@ readme = "docs/README.md"
 keywords = ["database", "embedded", "vector", "multimodal", "ai", "edge"]
 categories = ["database", "embedded", "algorithms"]
 authors = ["motedb <motedb@126.com>"]
-edition = "2021"
 publish = true
 
 [lib]
