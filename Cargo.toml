@@ -87,22 +87,6 @@ tikv-jemalloc-ctl = "0.5"
 # Command line argument parsing (for examples)
 clap = { version = "4.4", features = ["derive"] }
 
-[[bench]]
-name = "storage_bench"
-harness = false
-
-[[bench]]
-name = "comprehensive_benchmark"
-harness = false
-
-[[bench]]
-name = "simple_benchmark"
-harness = false
-
-[[bench]]
-name = "quick_benchmark"
-harness = false
-
 [features]
 default = []  # 🎯 默认配置,减小二进制大小
 # 🔌 可选分词器插件
