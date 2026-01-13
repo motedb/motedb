@@ -22,8 +22,7 @@
 //!
 //! // 读取时验证 checksum
 //! Checksum::verify(ChecksumType::CRC32C, data, checksum)?;
-//! ```
-
+//! ```text
 use crc32fast::Hasher;
 use std::io::{self, Write};
 

@@ -1,12 +1,12 @@
 //! SSTable: Sorted String Table (persistent storage)
 //!
 //! ## File Format
-//! ```
+//! ```text
 //! [Data Block 1 (compressed)] [Data Block 2 (compressed)] ... [Data Block N]
 //! [Index Block]
 //! [Bloom Filter]
 //! [Footer]
-//! ```
+//! ```text
 //!
 //! ## Compression
 //! - Algorithm: Snappy (fast, ~2.5-3x ratio)

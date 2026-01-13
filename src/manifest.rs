@@ -23,7 +23,7 @@
 //! 4. fsync() MANIFEST
 //! 5. rename(MANIFEST.tmp → MANIFEST-CURRENT)  ← ATOMIC COMMIT POINT
 //! 6. fsync() parent directory
-//! ```
+//! ```text
 //!
 //! **Key Insight**: `rename()` is atomic on POSIX systems!
 //! - Before rename: Old MANIFEST is valid, new files are orphans

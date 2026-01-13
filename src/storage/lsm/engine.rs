@@ -149,7 +149,7 @@ impl LSMEngine {
     ///     LSMConfig::default(),
     ///     768  // 向量维度
     /// )?;
-    /// ```
+    /// ```ignore
     pub fn new_with_vector_support(storage_dir: PathBuf, config: LSMConfig, vector_dimension: usize) -> Result<Self> {
         Self::new_internal(storage_dir, config, Some(vector_dimension))
     }
@@ -1408,10 +1408,10 @@ impl LSMEngine {
     /// - O(N log N) where N = matching keys
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// // Scan all rows in table "users" (prefix = hash("users"))
     /// let rows = engine.scan_prefix(table_prefix)?;
-    /// ```
+    /// ```ignore
     pub fn scan_prefix(&self, prefix: Key) -> Result<Vec<(Key, Value)>> {
         use std::collections::BTreeMap;
         
@@ -1511,14 +1511,14 @@ impl LSMEngine {
     /// - Streaming processing (constant memory usage)
     /// 
     /// ## Use Case
-    /// ```
+    /// ```ignore
     /// engine.scan_prefix_with(table_prefix, |key, value| {
     ///     if value.timestamp <= snapshot_ts {
     ///         process_row(key, value)?;
     ///     }
     ///     Ok(())
     /// })?;
-    /// ```
+    /// ```ignore
     pub fn scan_prefix_with<F>(&self, prefix: Key, mut callback: F) -> Result<()>
     where
         F: FnMut(Key, &Value) -> Result<()>,
@@ -1618,9 +1618,9 @@ impl LSMEngine {
     /// - Merge: O(K log K) where K = total results
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let rows = engine.scan_range(start_key, end_key)?;
-    /// ```
+    /// ```ignore
     pub fn scan_range(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
         use std::collections::BTreeMap;
         

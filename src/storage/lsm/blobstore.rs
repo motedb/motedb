@@ -7,13 +7,12 @@
 //! - Blob files are immutable, GC happens separately
 //!
 //! ## File Format
-//! ```
+//! ```text
 //! [Header (magic + version)] [Blob 1] [Blob 2] ... [Blob N] [Footer]
 //! 
 //! Each Blob:
 //!   [size: u32] [data: Vec<u8>] [crc32: u32]
-//! ```
-
+//! ```text
 use crate::{Result, StorageError};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write, Seek, SeekFrom};

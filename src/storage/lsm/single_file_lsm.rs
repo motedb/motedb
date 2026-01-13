@@ -7,14 +7,13 @@
 //! - Free list for space reclamation
 //!
 //! ## File Layout
-//! ```
+//! ```text
 //! Page 0: Superblock (metadata)
 //! Page 1+: Level 0 data (unsorted, new data)
 //! Page X+: Level 1 data (sorted)
 //! Page Y+: Level 2-6 data (progressively larger)
 //! Free List: Reclaimed pages from compaction
-//! ```
-
+//! ```text
 use crate::{Result, StorageError};
 use crate::storage::file_manager::{FileRefManager, FileHandle};
 use crate::storage::checksum::{Checksum, ChecksumType};

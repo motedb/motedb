@@ -8,12 +8,11 @@
 //! - **Zero-Copy**: Mmap-based persistence
 //!
 //! ## Architecture
-//! ```
+//! ```text
 //! Memory:   [Page Cache] <-LRU-> [Root Page]
 //!              ↓ flush            ↓ serialize
 //! Disk:     [mmap file] -----> [Page 0][Page 1][Page 2]...
-//! ```
-
+//! ```text
 use crate::{Result, StorageError};
 use crate::storage::file_manager::{FileRefManager, FileHandle};
 use std::sync::{Arc, RwLock, Mutex};

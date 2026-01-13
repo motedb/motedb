@@ -39,8 +39,7 @@
 //! │  - CRC32 checksum                    │
 //! │  - Padding                           │
 //! └──────────────────────────────────────┘
-//! ```
-
+//! ```text
 use crate::error::{Result, StorageError};
 use crate::types::RowId;
 use std::path::{Path, PathBuf};

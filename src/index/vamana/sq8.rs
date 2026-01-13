@@ -149,7 +149,7 @@ impl SQ8Quantizer {
     /// - SIMD-friendly operations
     /// 
     /// **Math:**
-    /// ```
+    /// ```ignore
     /// q: f32 query vector
     /// d: SQ8 data vector (codes, min, max)
     /// 
@@ -160,7 +160,7 @@ impl SQ8Quantizer {
     /// - Query: keep f32 (only 1 vector, already in L1 cache)
     /// - Data: stay u8 (thousands of vectors, save bandwidth)
     /// - Partial dequantization: only scale/offset, no full f32 conversion
-    /// ```
+    /// ```ignore
     pub fn asymmetric_distance_cosine(
         &self,
         query: &[f32],

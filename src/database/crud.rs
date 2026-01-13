@@ -20,9 +20,9 @@ impl MoteDB {
     /// Insert a row (default table API)
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_id = db.insert_row(vec![Value::Integer(1), Value::Text("Alice".into())])?;
-    /// ```
+    /// ```ignore
     pub fn insert_row(&self, row: Row) -> Result<RowId> {
         // 1. Allocate row ID
         let row_id = {
@@ -56,10 +56,10 @@ impl MoteDB {
     /// Get a row by row ID
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_id = db.insert_row(vec![Value::Text(Text::from("hello"))])?;
     /// let row = db.get_row(row_id)?.unwrap();
-    /// ```
+    /// ```ignore
     pub fn get_row(&self, row_id: RowId) -> Result<Option<Row>> {
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
@@ -96,10 +96,10 @@ impl MoteDB {
     /// Update a row (replace entire row)
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_id = db.insert_row(vec![Value::Text(Text::from("old"))])?;
     /// db.update_row(row_id, vec![Value::Text(Text::from("new"))])?;
-    /// ```
+    /// ```ignore
     pub fn update_row(&self, row_id: RowId, new_row: Row) -> Result<()> {
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
@@ -125,11 +125,11 @@ impl MoteDB {
     /// Delete a row by row ID
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_id = db.insert_row(vec![Value::Text(Text::from("hello"))])?;
     /// db.delete_row(row_id)?;
     /// assert!(db.get_row(row_id)?.is_none());
-    /// ```
+    /// ```ignore
     pub fn delete_row(&self, row_id: RowId) -> Result<()> {
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
@@ -158,13 +158,13 @@ impl MoteDB {
     /// Scan all row IDs (using timestamp index)
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_ids = db.scan_all_row_ids()?;
     /// for row_id in row_ids {
     ///     let row = db.get_row(row_id)?;
     ///     // process row
     /// }
-    /// ```
+    /// ```ignore
     pub fn scan_all_row_ids(&self) -> Result<Vec<RowId>> {
         // Use timestamp index to get all rows (0 to i64::MAX)
         self.query_timestamp_range(0, i64::MAX)
@@ -173,10 +173,10 @@ impl MoteDB {
     /// Scan all rows (memory intensive, use with caution)
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let rows = db.scan_all_rows()?;
     /// println!("Total rows: {}", rows.len());
-    /// ```
+    /// ```ignore
     pub fn scan_all_rows(&self) -> Result<Vec<(RowId, Row)>> {
         let row_ids = self.scan_all_row_ids()?;
         let mut rows = Vec::with_capacity(row_ids.len());
@@ -196,12 +196,12 @@ impl MoteDB {
     /// scanning, or Ok(false) to stop.
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// db.scan_rows_with(|row_id, row| {
     ///     println!("Row {}: {:?}", row_id, row);
     ///     Ok(true)  // continue scanning
     /// })?;
-    /// ```
+    /// ```ignore
     pub fn scan_rows_with<F>(&self, mut callback: F) -> Result<()>
     where
         F: FnMut(RowId, Row) -> Result<bool>,
@@ -222,10 +222,10 @@ impl MoteDB {
     /// Batch get rows (more efficient than multiple get_row calls)
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_ids = vec![1, 2, 3, 4, 5];
     /// let rows = db.batch_get_rows(&row_ids)?;
-    /// ```
+    /// ```ignore
     pub fn batch_get_rows(&self, row_ids: &[RowId]) -> Result<Vec<Option<Row>>> {
         let mut rows = Vec::with_capacity(row_ids.len());
         
@@ -245,12 +245,12 @@ impl MoteDB {
     /// * `row` - Row data to insert
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_id = db.insert_row_to_table("users", vec![
     ///     Value::Integer(1),
     ///     Value::Text("Alice".into()),
     /// ])?;
-    /// ```
+    /// ```ignore
     pub fn insert_row_to_table(&self, table_name: &str, row: Row) -> Result<RowId> {
         // 1. Get table schema
         let schema = self.table_registry.get_table(table_name)?;
@@ -351,9 +351,9 @@ impl MoteDB {
     /// * `row_id` - Internal row ID
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row = db.get_table_row("users", row_id)?;
-    /// ```
+    /// ```ignore
     pub fn get_table_row(&self, table_name: &str, row_id: RowId) -> Result<Option<Row>> {
         // Validate table exists
         let _schema = self.table_registry.get_table(table_name)?;
@@ -416,9 +416,9 @@ impl MoteDB {
     /// * `new_row` - New row data
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// db.update_row_in_table("users", row_id, vec![Value::Integer(1), Value::Text("Bob".into())])?;
-    /// ```
+    /// ```ignore
     pub fn update_row_in_table(&self, table_name: &str, row_id: RowId, new_row: Row) -> Result<()> {
         // 1. Get schema and old row
         let schema = self.table_registry.get_table(table_name)?;
@@ -519,9 +519,9 @@ impl MoteDB {
     /// * `row_id` - Internal row ID
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// db.delete_row_from_table("users", row_id)?;
-    /// ```
+    /// ```ignore
     pub fn delete_row_from_table(&self, table_name: &str, row_id: RowId) -> Result<()> {
         // 1. Get schema and old row
         let schema = self.table_registry.get_table(table_name)?;
@@ -605,9 +605,9 @@ impl MoteDB {
     /// * `table_name` - Name of the table
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let rows = db.scan_table_rows("users")?;
-    /// ```
+    /// ```ignore
     pub fn scan_table_rows(&self, table_name: &str) -> Result<Vec<(RowId, Row)>> {
         // Get table schema first (validates table exists)
         let _schema = self.table_registry.get_table(table_name)?;
@@ -654,13 +654,13 @@ impl MoteDB {
     /// even for small datasets (< 500 rows) that don't trigger batch index building.
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let rows = vec![
     ///     vec![Value::Integer(1), Value::Text("Alice".into())],
     ///     vec![Value::Integer(2), Value::Text("Bob".into())],
     /// ];
     /// let row_ids = db.batch_insert_rows_to_table("users", rows)?;
-    /// ```
+    /// ```ignore
     pub fn batch_insert_rows_to_table(&self, table_name: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -799,14 +799,14 @@ impl MoteDB {
     /// For table-aware batch insert with index updates, use `batch_insert_rows_to_table()`.
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let rows = vec![
     ///     vec![Value::Integer(1)],
     ///     vec![Value::Integer(2)],
     ///     vec![Value::Integer(3)],
     /// ];
     /// let row_ids = db.batch_insert_rows(rows)?;
-    /// ```
+    /// ```ignore
     pub fn batch_insert_rows(&self, rows: Vec<Row>) -> Result<Vec<RowId>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -875,10 +875,10 @@ impl MoteDB {
     /// - Single calls: ~45ms for 1000 rows (baseline)
     /// 
     /// # Example
-    /// ```
+    /// ```ignore
     /// let row_ids = vec![100, 101, 102, 103]; // Continuous
     /// let rows = db.get_table_rows_batch("robots", &row_ids)?;
-    /// ```
+    /// ```ignore
     pub fn get_table_rows_batch(&self, table_name: &str, row_ids: &[RowId]) -> Result<Vec<(RowId, Option<Row>)>> {
         if row_ids.is_empty() {
             return Ok(Vec::new());

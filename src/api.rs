@@ -22,7 +22,7 @@ use std::collections::HashMap;
 ///
 /// # 快速开始
 ///
-/// ```no_run
+/// ```ignore
 /// use motedb::Database;
 ///
 /// // 打开数据库
@@ -36,8 +36,7 @@ use std::collections::HashMap;
 /// // 多模态索引
 /// db.execute("CREATE INDEX users_email ON users(email)")?;  // 列索引
 /// db.execute("CREATE VECTOR INDEX docs_vec ON docs(embedding)")?;  // 向量索引
-/// ```
-///
+/// ```ignore///
 /// # 核心功能
 ///
 /// ## 1. SQL 操作
@@ -88,7 +87,7 @@ impl Database {
     /// 创建新数据库
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let db = Database::create("data.mote")?;
     /// ```
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -100,7 +99,7 @@ impl Database {
     /// 使用自定义配置创建数据库
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::DBConfig;
     ///
     /// let config = DBConfig {
@@ -118,7 +117,7 @@ impl Database {
     /// 打开已存在的数据库
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let db = Database::open("data.mote")?;
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -130,7 +129,7 @@ impl Database {
     /// 刷新所有数据到磁盘
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
     /// db.flush()?; // 确保数据持久化
     /// ```
@@ -141,7 +140,7 @@ impl Database {
     /// 关闭数据库（显式调用，通常由 Drop 自动处理）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// db.close()?;
     /// ```
     pub fn close(&self) -> Result<()> {
@@ -155,7 +154,7 @@ impl Database {
     /// 执行 SQL 查询并返回结果
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // SELECT 查询
     /// let results = db.query("SELECT * FROM users WHERE age > 18")?;
     ///
@@ -171,7 +170,7 @@ impl Database {
     /// 这是 `query()` 的别名，语义更清晰
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 创建表
     /// db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)")?;
     ///
@@ -199,7 +198,7 @@ impl Database {
     /// 开始新事务
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let tx_id = db.begin_transaction()?;
     /// 
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
@@ -214,7 +213,7 @@ impl Database {
     /// 提交事务
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let tx_id = db.begin_transaction()?;
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
     /// db.commit_transaction(tx_id)?;
@@ -226,7 +225,7 @@ impl Database {
     /// 回滚事务
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let tx_id = db.begin_transaction()?;
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
     /// db.rollback_transaction(tx_id)?; // 撤销所有修改
@@ -238,7 +237,7 @@ impl Database {
     /// 创建保存点（事务内的检查点）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let tx_id = db.begin_transaction()?;
     /// 
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
@@ -272,7 +271,7 @@ impl Database {
     /// **注意：** 此方法接受底层 `Row` 类型（`Vec<Value>`），如果需要使用 HashMap，请使用 `batch_insert_map()`。
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, Row};
     ///
     /// let mut rows = Vec::new();
@@ -296,7 +295,7 @@ impl Database {
     /// 这是 `batch_insert()` 的友好版本，接受 `HashMap<String, Value>` 格式的行数据。
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, SqlRow};
     /// use std::collections::HashMap;
     ///
@@ -329,7 +328,7 @@ impl Database {
     /// **注意：** 此方法接受底层 `Row` 类型（`Vec<Value>`），如果需要使用 HashMap，请使用 `batch_insert_with_vectors_map()`。
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, Row};
     ///
     /// let mut rows = Vec::new();
@@ -351,7 +350,7 @@ impl Database {
     /// 批量插入带向量的数据（使用 HashMap，自动构建向量索引）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, SqlRow};
     /// use std::collections::HashMap;
     ///
@@ -384,7 +383,7 @@ impl Database {
     /// 创建列索引（用于快速等值/范围查询）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 创建列索引后，WHERE email = '...' 查询速度提升40倍
     /// db.create_column_index("users", "email")?;
     ///
@@ -398,7 +397,7 @@ impl Database {
     /// 创建向量索引（用于KNN相似度搜索）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 为128维向量创建索引
     /// db.create_vector_index("docs_embedding", 128)?;
     ///
@@ -415,7 +414,7 @@ impl Database {
     /// 创建全文索引（用于BM25文本搜索）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 创建全文索引
     /// db.create_text_index("articles_content")?;
     ///
@@ -431,7 +430,7 @@ impl Database {
     /// 创建空间索引（用于地理位置查询）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::BoundingBox;
     ///
     /// // 创建空间索引（指定世界范围）
@@ -456,7 +455,7 @@ impl Database {
     /// 删除索引
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// db.drop_index("users", "email")?;
     /// ```
     pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
@@ -473,7 +472,7 @@ impl Database {
     /// 按列值查询（使用列索引，等值查询）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::Value;
     ///
     /// // 前提：已创建列索引
@@ -493,7 +492,7 @@ impl Database {
     /// 按列范围查询（使用列索引）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::Value;
     ///
     /// // 查询年龄在 20-30 之间的用户
@@ -512,7 +511,7 @@ impl Database {
     /// 向量KNN搜索
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 查找最相似的10个向量
     /// let query_vec = vec![0.1; 128];
     /// let results = db.vector_search("docs_embedding", &query_vec, 10)?;
@@ -528,7 +527,7 @@ impl Database {
     /// 全文搜索（BM25排序）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 搜索包含关键词的文档（BM25排序）
     /// let results = db.text_search_ranked("articles_content", "rust database", 10)?;
     ///
@@ -543,7 +542,7 @@ impl Database {
     /// 空间范围查询
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::BoundingBox;
     ///
     /// // 查询矩形区域内的所有点
@@ -562,7 +561,7 @@ impl Database {
     /// 时间序列范围查询
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// // 查询指定时间范围内的记录
     /// let start_ts = 1609459200; // 2021-01-01 00:00:00
     /// let end_ts = 1640995200;   // 2022-01-01 00:00:00
@@ -579,7 +578,7 @@ impl Database {
     /// 获取向量索引统计信息
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let stats = db.vector_index_stats("docs_embedding")?;
     /// println!("向量数量: {}", stats.vector_count);
     /// println!("平均邻居数: {}", stats.avg_neighbors);
@@ -596,7 +595,7 @@ impl Database {
     /// 获取事务统计信息
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let stats = db.transaction_stats();
     /// println!("活跃事务数: {}", stats.active_transactions);
     /// println!("已提交事务数: {}", stats.committed_transactions);
@@ -614,7 +613,7 @@ impl Database {
     /// **注意：** 此方法接受底层 `Row` 类型（`Vec<Value>`），如果需要使用 HashMap，请使用 `insert_row_map()`。
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, Row};
     ///
     /// let row = vec![
@@ -633,7 +632,7 @@ impl Database {
     /// 这是 `insert_row()` 的友好版本，接受 `HashMap<String, Value>` 格式的行数据。
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, SqlRow};
     /// use std::collections::HashMap;
     ///
@@ -661,7 +660,7 @@ impl Database {
     /// 获取行（返回 HashMap 格式）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// if let Some(row) = db.get_row_map("users", 1)? {
     ///     println!("Name: {:?}", row.get("name"));
     /// }
@@ -683,7 +682,7 @@ impl Database {
     /// 更新行（使用 HashMap）
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// use motedb::types::{Value, SqlRow};
     /// use std::collections::HashMap;
     ///

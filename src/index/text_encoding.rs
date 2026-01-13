@@ -71,7 +71,7 @@ pub fn decode_varint(bytes: &[u8]) -> Result<(u64, usize)> {
 /// Encode a posting list with delta compression
 /// 
 /// Format:
-/// ```
+/// ```ignore
 /// [num_docs: varint]
 /// [doc_id_0: varint]
 /// [doc_id_delta_1: varint]
@@ -85,7 +85,7 @@ pub fn decode_varint(bytes: &[u8]) -> Result<(u64, usize)> {
 ///   ...
 ///   [num_positions_for_doc_1: varint]
 ///   ...
-/// ```
+/// ```ignore
 pub fn encode_posting_list(
     doc_ids: &[u64],
     positions: Option<&Vec<Vec<u32>>>,

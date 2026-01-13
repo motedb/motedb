@@ -23,11 +23,11 @@ use std::sync::Arc;
 /// Generic index buffer for all index types (RocksDB-style Immutable Snapshot)
 ///
 /// # Architecture
-/// ```
+/// ```ignore
 /// Index = Active Buffer (writable)
 ///       + Immutable Buffers (flushing)
 ///       + Persistent Structure (flushed data)
-/// ```
+/// ```ignore
 ///
 /// # Concurrency Guarantees
 /// - ✅ Writes never block on flush (switch to new active buffer)
@@ -44,7 +44,7 @@ use std::sync::Arc;
 /// // Text index  
 /// let buffer: IndexMemBuffer<TermId, PostingList> = IndexMemBuffer::new(2048 * 1024); // 2MB
 /// buffer.insert(term_id, posting_list)?;
-/// ```
+/// ```ignore
 pub struct IndexMemBuffer<K, V>
 where
     K: Ord + Clone,

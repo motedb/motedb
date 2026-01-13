@@ -1,7 +1,7 @@
 /// Query Optimizer - Cost-based index selection and query planning
 ///
 /// # Architecture
-/// ```
+/// ```ignore
 /// SELECT * FROM users WHERE age >= 20 AND age <= 30 AND status = 'active'
 ///              ↓
 ///      Optimizer analyzes:
@@ -11,7 +11,7 @@
 ///       4. Cost model: status_idx (50) < age_idx (200)
 ///              ↓
 ///      Selected plan: Use status_idx, then filter by age in-memory
-/// ```
+/// ```ignore
 
 use super::ast::*;
 use crate::database::MoteDB;

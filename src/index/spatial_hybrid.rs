@@ -1,7 +1,7 @@
 //! Advanced Hybrid Spatial Index: Grid + R-Tree with Adaptive Optimizations
 //!
 //! # Architecture
-//! ```
+//! ```text
 //! ┌─────────────────────────────────────────────────────┐
 //! │          Spatial Hybrid Index (Optimized)           │
 //! │                                                     │
@@ -26,7 +26,7 @@
 //! │  │  Auto-flush every 5000 inserts               │  │
 //! │  └──────────────────────────────────────────────┘  │
 //! └─────────────────────────────────────────────────────┘
-//! ```
+//! ```text
 //!
 //! # Optimizations
 //! 1. **Adaptive Grid**: Auto-adjusts cell size based on data density

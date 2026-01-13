@@ -9,7 +9,7 @@
 //! ## 使用方式
 //!
 //! ### 1. 使用内置分词器（无需额外依赖）
-//! ```rust
+//! ```ignore
 //! use motedb::tokenizers::{WhitespaceTokenizer, NgramTokenizer};
 //!
 //! // 空格分词（英文）
@@ -17,14 +17,14 @@
 //!
 //! // N-gram 分词（CJK）
 //! let tokenizer = NgramTokenizer::new(2);  // bigram
-//! ```
+//! ```text
 //!
 //! ### 2. 使用第三方分词器插件（Feature Flag）
 //! ```toml
 //! # Cargo.toml
 //! [dependencies]
 //! motedb = { version = "0.1", features = ["tokenizer-jieba"] }
-//! ```
+//! ```text
 //!
 //! ```rust
 //! use motedb::tokenizers::JiebaTokenizer;
@@ -32,7 +32,7 @@
 //! // 中文分词（Jieba）
 //! let tokenizer = JiebaTokenizer::default();
 //! let tokens = tokenizer.tokenize("我爱自然语言处理");
-//! ```
+//! ```text
 //!
 //! ### 3. 自定义分词器（用户扩展）
 //! ```rust
@@ -56,8 +56,7 @@
 //!         "custom"
 //!     }
 //! }
-//! ```
-
+//! ```text
 // 导出核心 trait 和数据结构
 pub use crate::index::text_types::{Tokenizer, Token, Position};
 
@@ -93,7 +92,7 @@ mod jieba_plugin {
     /// let tokenizer = JiebaTokenizer::default();
     /// let tokens = tokenizer.tokenize("我爱自然语言处理");
     /// // => ["我", "爱", "自然语言", "处理"]
-    /// ```
+    /// ```ignore
     pub struct JiebaTokenizer {
         jieba: Arc<Jieba>,
         mode: JiebaMode,

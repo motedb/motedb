@@ -8,7 +8,7 @@
 //! - **High Performance**: O(log n) operations with LRU page cache
 //!
 //! ## Page Layout (64KB)
-//! ```
+//! ```text
 //! [Header: 16 bytes]
 //!   - is_leaf: 1 byte
 //!   - num_keys: 4 bytes (u32)
@@ -31,13 +31,12 @@
 //!   - child[0]: u64 (page_id)
 //!   - child[1]: u64
 //!   - ...
-//! ```
+//! ```text
 //!
 //! ## Overflow Page Chain
-//! ```
+//! ```text
 //! [next_page_id: u64][data_len: u32][data: bytes...]
-//! ```
-
+//! ```text
 use crate::{Result, StorageError};
 use std::sync::{Arc, RwLock, Mutex};
 use std::path::PathBuf;
