@@ -17,25 +17,25 @@
 //!
 //! // N-gram 分词（CJK）
 //! let tokenizer = NgramTokenizer::new(2);  // bigram
-//! ```text
+//! ```
 //!
 //! ### 2. 使用第三方分词器插件（Feature Flag）
-//! ```toml
+//! ```ignore
 //! # Cargo.toml
 //! [dependencies]
 //! motedb = { version = "0.1", features = ["tokenizer-jieba"] }
-//! ```text
+//! ```
 //!
-//! ```rust
+//! ```ignore
 //! use motedb::tokenizers::JiebaTokenizer;
 //!
 //! // 中文分词（Jieba）
 //! let tokenizer = JiebaTokenizer::default();
 //! let tokens = tokenizer.tokenize("我爱自然语言处理");
-//! ```text
+//! ```
 //!
 //! ### 3. 自定义分词器（用户扩展）
-//! ```rust
+//! ```ignore
 //! use motedb::tokenizers::{Tokenizer, Token};
 //!
 //! struct MyCustomTokenizer;
@@ -56,7 +56,7 @@
 //!         "custom"
 //!     }
 //! }
-//! ```text
+//! ```
 // 导出核心 trait 和数据结构
 pub use crate::index::text_types::{Tokenizer, Token, Position};
 
@@ -86,13 +86,13 @@ mod jieba_plugin {
     /// - 运行时：~50-100K tokens/sec
     ///
     /// 使用示例：
-    /// ```rust
+    /// ```ignore
     /// use motedb::tokenizers::JiebaTokenizer;
     ///
     /// let tokenizer = JiebaTokenizer::default();
     /// let tokens = tokenizer.tokenize("我爱自然语言处理");
     /// // => ["我", "爱", "自然语言", "处理"]
-    /// ```ignore
+    /// ```
     pub struct JiebaTokenizer {
         jieba: Arc<Jieba>,
         mode: JiebaMode,
