@@ -4,7 +4,7 @@
 //! Provides timestamp range query and index rebuild functionality
 
 use crate::types::{Row, RowId};
-use crate::{Result, StorageError};
+use crate::Result;
 
 use crate::database::core::MoteDB;
 

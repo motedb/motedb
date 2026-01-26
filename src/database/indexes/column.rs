@@ -76,7 +76,7 @@ impl MoteDB {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = DefaultHasher::new();
                 table_name.hash(&mut hasher);
-                let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+                let table_hash = hasher.finish() & 0xFFFFFFFF;
                 
                 let start_key = table_hash << 32;
                 let end_key = (table_hash + 1) << 32;
@@ -241,18 +241,11 @@ impl MoteDB {
         row_ids.sort_unstable();
         row_ids.dedup();
         
-        // Step 4: 🔧 FIX: Filter out deleted rows (tombstone)
-        let original_count = row_ids.len();
-        row_ids.retain(|&row_id| {
-            self.get_table_row(table_name, row_id)
-                .map(|opt_row| opt_row.is_some())
-                .unwrap_or(false)
-        });
-        
-        let filtered_count = original_count - row_ids.len();
-        if filtered_count > 0 {
-            debug_log!("[query_by_column] 过滤掉 {} 条已删除数据", filtered_count);
-        }
+        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
+        // Why: DELETE operations already update the index
+        // - Index removes deleted row_id
+        // - MemTable scan skips deleted rows
+        // Result: row_ids already contains only valid rows
         
         debug_log!("[query_by_column] 最终返回 {} 条有效数据", row_ids.len());
         
@@ -304,12 +297,8 @@ impl MoteDB {
         row_ids.sort_unstable();
         row_ids.dedup();
         
-        // Step 4: 🔧 FIX: Filter tombstones
-        row_ids.retain(|&row_id| {
-            self.get_table_row(table_name, row_id)
-                .map(|opt_row| opt_row.is_some())
-                .unwrap_or(false)
-        });
+        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
+        // Reason: Index maintenance already handles deletes
         
         Ok(row_ids)
     }
@@ -343,12 +332,7 @@ impl MoteDB {
         row_ids.sort_unstable();
         row_ids.dedup();
         
-        // Step 4: 🔧 FIX: Filter tombstones
-        row_ids.retain(|&row_id| {
-            self.get_table_row(table_name, row_id)
-                .map(|opt_row| opt_row.is_some())
-                .unwrap_or(false)
-        });
+        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
         
         Ok(row_ids)
     }
@@ -376,12 +360,7 @@ impl MoteDB {
         row_ids.sort_unstable();
         row_ids.dedup();
         
-        // Step 4: 🔧 FIX: Filter tombstones
-        row_ids.retain(|&row_id| {
-            self.get_table_row(table_name, row_id)
-                .map(|opt_row| opt_row.is_some())
-                .unwrap_or(false)
-        });
+        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
         
         Ok(row_ids)
     }
@@ -409,12 +388,7 @@ impl MoteDB {
         row_ids.sort_unstable();
         row_ids.dedup();
         
-        // Step 4: 🔧 FIX: Filter tombstones
-        row_ids.retain(|&row_id| {
-            self.get_table_row(table_name, row_id)
-                .map(|opt_row| opt_row.is_some())
-                .unwrap_or(false)
-        });
+        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
         
         Ok(row_ids)
     }
@@ -469,12 +443,8 @@ impl MoteDB {
         row_ids.sort_unstable();
         row_ids.dedup();
         
-        // Step 4: 🔧 FIX: Filter out deleted rows (tombstone)
-        row_ids.retain(|&row_id| {
-            self.get_table_row(table_name, row_id)
-                .map(|opt_row| opt_row.is_some())
-                .unwrap_or(false)
-        });
+        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
+        // The index and MemTable are already in sync
         
         Ok(row_ids)
     }

@@ -150,7 +150,7 @@ mod jieba_plugin {
         }
 
         /// 加载自定义词典
-        pub fn load_dict(&mut self, dict_path: &str) -> Result<(), String> {
+        pub fn load_dict(&mut self, _dict_path: &str) -> Result<(), String> {
             // jieba-rs 不支持运行时加载词典，需要在构建时处理
             // 这里提供接口占位，实际可通过环境变量或配置文件实现
             Ok(())

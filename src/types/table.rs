@@ -224,7 +224,7 @@ impl TableSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Text, Timestamp, Value};
+    use crate::types::{Timestamp, Value};
 
     #[test]
     fn test_column_def() {

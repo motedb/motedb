@@ -11,7 +11,6 @@ use crate::index::cached_index::CachedIndex; // 🚀 P1: 使用LRU缓存
 use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
@@ -100,10 +99,8 @@ pub struct ColumnValueIndex {
     btree: Arc<RwLock<GenericBTree<IndexKey>>>,
     /// LRU cache for hot values (🚀 P1 optimization)
     lru_cache: Arc<CachedIndex>,
-    /// In-memory cache for hot values (legacy, kept for compatibility)
-    cache: Arc<RwLock<BTreeMap<Vec<u8>, Vec<RowId>>>>,
-    /// Max cache entries
-    max_cache_entries: usize,
+    // 🚀 P0 MEMORY FIX: Removed in-memory BTreeMap cache (causes 8GB leak!)
+    // All lookups now go through LRU cache + B-Tree disk storage
 }
 
 impl ColumnValueIndex {
@@ -131,8 +128,7 @@ impl ColumnValueIndex {
             storage_path,
             btree: Arc::new(RwLock::new(btree)),
             lru_cache: Arc::new(CachedIndex::new(500)), // 🔧 Reduced from 1000 to 500 for P1
-            cache: Arc::new(RwLock::new(BTreeMap::new())),
-            max_cache_entries: 500,  // 🔧 Reduced from 1000 to 500
+            // 🚀 P0: Removed cache initialization (memory leak fix)
         })
     }
     
@@ -162,20 +158,8 @@ impl ColumnValueIndex {
             btree.insert(key, vec![])?;  // Empty value, we only care about the key
         }
         
-        // Update cache
-        {
-            let mut cache = self.cache.write();
-            cache.entry(value_bytes)
-                .or_insert_with(Vec::new)
-                .push(row_id);
-            
-            // Evict if cache too large
-            if cache.len() > self.max_cache_entries {
-                if let Some(first_key) = cache.keys().next().cloned() {
-                    cache.remove(&first_key);
-                }
-            }
-        }
+        // 🚀 P0: Removed cache update (memory leak fix)
+        // All lookups now go through LRU cache + B-Tree
         
         Ok(())
     }
@@ -184,7 +168,6 @@ impl ColumnValueIndex {
     /// 
     /// **Optimization strategy**:
     /// - Sort keys before insertion for better B-Tree locality
-    /// - Batch cache updates to reduce lock contention
     /// - Single flush operation at the end
     /// 
     /// **Expected improvement**: 2-3x faster than sequential inserts
@@ -216,24 +199,7 @@ impl ColumnValueIndex {
             }
         }
         
-        // Step 3: Batch update cache (group by value)
-        {
-            let mut cache = self.cache.write();
-            for (key, value_bytes, _) in &keys {
-                cache.entry(value_bytes.clone())
-                    .or_insert_with(Vec::new)
-                    .push(key.row_id);
-            }
-            
-            // Evict oldest entries if cache is too large
-            while cache.len() > self.max_cache_entries {
-                if let Some(first_key) = cache.keys().next().cloned() {
-                    cache.remove(&first_key);
-                } else {
-                    break;
-                }
-            }
-        }
+        // 🚀 P0: Removed cache update (memory leak fix)
         
         Ok(())
     }
@@ -246,20 +212,13 @@ impl ColumnValueIndex {
             return Ok((*cached_ids).clone());
         }
         
-        let value_bytes = self.value_to_bytes(value)?;
-        
-        // Check legacy cache (for compatibility)
-        {
-            let cache = self.cache.read();
-            if let Some(row_ids) = cache.get(&value_bytes) {
-                // Also update LRU cache
-                self.lru_cache.put(value.clone(), row_ids.clone());
-                return Ok(row_ids.clone());
-            }
-        }
+        // 🚀 P0: Removed legacy cache check (memory leak fix)
+        // All lookups now go directly to B-Tree if not in LRU
         
         // 🚀 P1: Record cache miss
         self.lru_cache.record_miss();
+        
+        let value_bytes = self.value_to_bytes(value)?;
         
         // Use B-Tree range scan to find all entries with matching value
         let mut row_ids = Vec::new();
@@ -290,21 +249,9 @@ impl ColumnValueIndex {
         
         drop(btree);
         
-        // 🚀 P1: Update both caches
+        // 🚀 P1: Update LRU cache only
         if !row_ids.is_empty() {
-            // Update LRU cache
             self.lru_cache.put(value.clone(), row_ids.clone());
-            
-            // Update legacy cache
-            let mut cache = self.cache.write();
-            cache.insert(value_bytes, row_ids.clone());
-            
-            // Evict if cache too large
-            if cache.len() > self.max_cache_entries {
-                if let Some(first_key) = cache.keys().next().cloned() {
-                    cache.remove(&first_key);
-                }
-            }
         }
         
         Ok(row_ids)
@@ -337,6 +284,49 @@ impl ColumnValueIndex {
             // No need to check for tombstones - we use real delete now
             row_ids.push(key.row_id);
         }
+        
+        Ok(row_ids)
+    }
+    
+    /// Scan all entries in order
+    /// 
+    /// Returns row_ids sorted by their corresponding values
+    /// This is useful for ORDER BY optimization on indexed columns
+    pub fn scan_all_row_ids(&self) -> Result<Vec<RowId>> {
+        self.scan_row_ids_with_limit(None)
+    }
+    
+    /// Scan entries with optional limit
+    /// 
+    /// Returns at most `limit` row_ids sorted by their corresponding values
+    /// Early termination significantly reduces I/O for LIMIT queries
+    pub fn scan_row_ids_with_limit(&self, limit: Option<usize>) -> Result<Vec<RowId>> {
+        let btree = self.btree.read();
+        
+        // Create range that covers all possible keys
+        let min_key = IndexKey {
+            value_bytes: vec![],  // Minimum possible value
+            row_id: 0,
+        };
+        
+        let max_key = IndexKey {
+            value_bytes: vec![0xFF; 64],  // Maximum possible value (64 bytes of 0xFF)
+            row_id: RowId::MAX,
+        };
+        
+        // Range scan with optional limit
+        let all_entries = if let Some(limit_count) = limit {
+            // Use optimized range_with_limit for early termination
+            btree.range_with_limit(&min_key, &max_key, limit_count)?
+        } else {
+            // Full scan
+            btree.range(&min_key, &max_key)?
+        };
+        
+        // Extract row_ids
+        let row_ids: Vec<RowId> = all_entries.into_iter()
+            .map(|(key, _)| key.row_id)
+            .collect();
         
         Ok(row_ids)
     }
@@ -520,16 +510,7 @@ impl ColumnValueIndex {
         btree.delete(&key)?;
         drop(btree);
         
-        // Update cache
-        {
-            let mut cache = self.cache.write();
-            if let Some(row_ids) = cache.get_mut(&value_bytes) {
-                row_ids.retain(|&rid| rid != row_id);
-                if row_ids.is_empty() {
-                    cache.remove(&value_bytes);
-                }
-            }
-        }
+        // 🚀 P0: Removed legacy cache update (memory leak fix)
         
         // Invalidate LRU cache for this value
         self.lru_cache.invalidate(value);
@@ -561,22 +542,9 @@ impl ColumnValueIndex {
             }
         }
         
-        // Step 2: Batch update cache
-        {
-            let mut cache = self.cache.write();
-            for (value, row_id) in &items {
-                if let Ok(value_bytes) = self.value_to_bytes(value) {
-                    if let Some(row_ids) = cache.get_mut(&value_bytes) {
-                        row_ids.retain(|&rid| rid != *row_id);
-                        if row_ids.is_empty() {
-                            cache.remove(&value_bytes);
-                        }
-                    }
-                }
-            }
-        }
+        // 🚀 P0: Removed legacy cache update (memory leak fix)
         
-        // Step 3: Batch invalidate LRU cache (only affected values)
+        // Batch invalidate LRU cache (only affected values)
         // Deduplicate values (Value doesn't implement Hash, so use manual dedup)
         let mut unique_values = items.into_iter()
             .map(|(value, _)| value)
@@ -635,20 +603,7 @@ impl ColumnValueIndex {
             }
         }
         
-        // Step 2: Clear cache entries in range
-        {
-            let mut cache = self.cache.write();
-            
-            // Collect keys to remove
-            let keys_to_remove: Vec<Vec<u8>> = cache.keys()
-                .filter(|k| *k >= &start_bytes && *k <= &end_bytes)
-                .cloned()
-                .collect();
-            
-            for key in keys_to_remove {
-                cache.remove(&key);
-            }
-        }
+        // 🚀 P0: Removed legacy cache update (memory leak fix)
         
         // Step 3: Smart LRU cache invalidation (only the range)
         self.lru_cache.invalidate_range(start, end);
@@ -665,10 +620,11 @@ impl ColumnValueIndex {
     
     /// Get index statistics
     pub fn stats(&self) -> IndexStats {
-        let cache = self.cache.read();
+        // 🚀 P0: Use LRU cache stats instead of removed legacy cache
+        let lru_stats = self.lru_cache.stats();
         IndexStats {
-            cached_values: cache.len(),
-            total_row_ids: cache.values().map(|v| v.len()).sum(),
+            cached_values: lru_stats.size,
+            total_row_ids: 0,  // Not tracked in LRU cache
         }
     }
     

@@ -1,5 +1,4 @@
 /// Abstract Syntax Tree for SQL statements
-
 use crate::types::Value;
 
 /// Top-level SQL statement

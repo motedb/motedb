@@ -28,18 +28,15 @@ use std::io::{self, Write};
 
 /// Checksum 类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ChecksumType {
     /// CRC32C (硬件加速，SSE4.2)
+    #[default]
     CRC32C,
     /// 无校验（仅测试用）
     None,
 }
 
-impl Default for ChecksumType {
-    fn default() -> Self {
-        Self::CRC32C
-    }
-}
 
 /// Checksum 计算器
 pub struct Checksum;
@@ -189,6 +186,7 @@ impl Checksum {
 
 /// Checksum 增量构建器（用于流式数据）
 pub struct ChecksumBuilder {
+    #[allow(dead_code)]
     checksum_type: ChecksumType,
     hasher: Option<Hasher>,
 }

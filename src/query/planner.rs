@@ -49,22 +49,22 @@ impl ExecutionPlan {
     
     /// Add a filter operator
     pub fn with_filter(self, predicate: String) -> Self {
-        let filter_plan = Self {
+        
+        Self {
             operator: Operator::Filter { predicate },
             children: vec![self.clone()],
             cost: self.cost + 5.0,
-        };
-        filter_plan
+        }
     }
     
     /// Add a projection operator
     pub fn with_project(self, columns: Vec<String>) -> Self {
-        let project_plan = Self {
+        
+        Self {
             operator: Operator::Project { columns },
             children: vec![self.clone()],
             cost: self.cost + 1.0,
-        };
-        project_plan
+        }
     }
 }
 

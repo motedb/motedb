@@ -44,7 +44,7 @@ use crate::error::{Result, StorageError};
 use crate::types::RowId;
 use std::path::{Path, PathBuf};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom, BufReader, BufWriter};
+use std::io::{Write, Seek, SeekFrom, BufWriter};
 use std::collections::HashSet;
 use memmap2::{Mmap, MmapOptions};
 use super::{Candidate, VectorNode};
@@ -70,6 +70,7 @@ pub struct SSTMetadata {
 
 /// Vamana SST 文件
 pub struct VamanaSSTFile {
+    #[allow(dead_code)]
     path: PathBuf,
     metadata: SSTMetadata,
     mmap: Mmap,
@@ -117,7 +118,7 @@ impl VamanaSSTFile {
         
         // 🆕 Phase 4: 3. 写入删除标记位图（初始全为 0，即未删除）
         let deleted_bitmap_offset = file.stream_position()?;
-        let bitmap_size = ((node_count + 7) / 8) as usize;
+        let bitmap_size = node_count.div_ceil(8) as usize;
         
         // 初始化位图：根据 VectorNode.deleted 字段设置
         let mut bitmap = vec![0u8; bitmap_size];
@@ -181,13 +182,13 @@ impl VamanaSSTFile {
         // 🆕 Phase 4: 读取删除标记位图
         let deleted_bitmap = if metadata.deleted_bitmap_offset > 0 {
             // V4: 从文件读取
-            let bitmap_size = ((metadata.node_count + 7) / 8) as usize;
+            let bitmap_size = metadata.node_count.div_ceil(8) as usize;
             let start = metadata.deleted_bitmap_offset as usize;
             let end = start + bitmap_size;
             mmap[start..end].to_vec()
         } else {
             // V2/V3: 初始化为全 0（无删除）
-            vec![0u8; ((metadata.node_count + 7) / 8) as usize]
+            vec![0u8; metadata.node_count.div_ceil(8) as usize]
         };
         
         Ok(Self {
@@ -248,14 +249,14 @@ impl VamanaSSTFile {
         
         let dim = self.metadata.dimension as usize;
         let index = self.id_to_index.get(&id)
-            .ok_or_else(|| StorageError::InvalidData(format!("ID {} not found", id).into()))?;
+            .ok_or_else(|| StorageError::InvalidData(format!("ID {} not found", id)))?;
         
         let offset = self.metadata.raw_vectors_offset as usize + (*index) * dim * 4;
         
         if offset + dim * 4 > self.mmap.len() {
             return Err(StorageError::Corruption(
                 format!("Raw vector offset out of bounds: {} + {} > {}", 
-                    offset, dim * 4, self.mmap.len()).into()
+                    offset, dim * 4, self.mmap.len())
             ));
         }
         
@@ -278,7 +279,6 @@ impl VamanaSSTFile {
         scales: &[f32],
     ) -> Result<Vec<Candidate>> {
         use std::collections::{BinaryHeap, HashSet};
-        use std::cmp::Reverse;
         
         // 🚀 延迟优化：进一步降低 ef 到 50（性能提升 ~50%）
         let ef = ef.max(k * 3).max(50).min(self.id_to_index.len());
@@ -442,7 +442,7 @@ impl VamanaSSTFile {
         let mut candidates = Vec::with_capacity(self.id_to_index.len());
         
         // 🆕 Phase 4: 过滤已删除节点
-        for (&id, _) in &self.id_to_index {
+        for &id in self.id_to_index.keys() {
             if !self.is_deleted(id) {  // 跳过已删除节点
                 let vec = self.decompress_vector(id, centroid, scales)?;
                 let dist = l2_distance(query, &vec);
@@ -504,7 +504,7 @@ impl VamanaSSTFile {
         
         // 使用映射获取索引
         let index = self.id_to_index.get(&id)
-            .ok_or_else(|| StorageError::InvalidData(format!("ID {} not found in SST", id).into()))?;
+            .ok_or_else(|| StorageError::InvalidData(format!("ID {} not found in SST", id)))?;
         
         let compressed_offset = self.metadata.vectors_offset as usize 
             + dim * 8  // centroid + scales
@@ -513,7 +513,7 @@ impl VamanaSSTFile {
         if compressed_offset + dim > self.mmap.len() {
             return Err(StorageError::Corruption(
                 format!("Vector offset out of bounds: {} + {} > {}", 
-                    compressed_offset, dim, self.mmap.len()).into()
+                    compressed_offset, dim, self.mmap.len())
             ));
         }
         
@@ -536,7 +536,7 @@ impl VamanaSSTFile {
         
         // 使用映射获取索引
         let index = self.id_to_index.get(&id)
-            .ok_or_else(|| StorageError::InvalidData(format!("ID {} not found in SST", id).into()))?;
+            .ok_or_else(|| StorageError::InvalidData(format!("ID {} not found in SST", id)))?;
         
         // 读取节点偏移表
         let offset_table_start = graph_offset;
@@ -545,7 +545,7 @@ impl VamanaSSTFile {
         if offset_pos + 8 > self.mmap.len() {
             return Err(StorageError::Corruption(
                 format!("Offset table out of bounds: {} + 8 > {}", 
-                    offset_pos, self.mmap.len()).into()
+                    offset_pos, self.mmap.len())
             ));
         }
         
@@ -563,7 +563,7 @@ impl VamanaSSTFile {
         if node_offset + 4 > self.mmap.len() {
             return Err(StorageError::Corruption(
                 format!("Node offset out of bounds: {} + 4 > {}", 
-                    node_offset, self.mmap.len()).into()
+                    node_offset, self.mmap.len())
             ));
         }
         
@@ -582,7 +582,7 @@ impl VamanaSSTFile {
         if neighbors_start + degree * 8 > self.mmap.len() {
             return Err(StorageError::Corruption(
                 format!("Neighbors list out of bounds: {} + {} > {}", 
-                    neighbors_start, degree * 8, self.mmap.len()).into()
+                    neighbors_start, degree * 8, self.mmap.len())
             ));
         }
         
@@ -669,7 +669,7 @@ impl VamanaSSTFile {
         
         let mut nodes = Vec::new();
         
-        for (&row_id, _) in &self.id_to_index {
+        for &row_id in self.id_to_index.keys() {
             // 🔥 关键：只导出未删除的节点
             if self.is_deleted(row_id) {
                 continue;
@@ -908,7 +908,7 @@ fn read_id_list(mmap: &[u8], metadata: &SSTMetadata) -> Result<std::collections:
     if offset + id_list_size > mmap.len() {
         return Err(StorageError::Corruption(
             format!("ID list out of bounds: {} + {} > {}", 
-                offset, id_list_size, mmap.len()).into()
+                offset, id_list_size, mmap.len())
         ));
     }
     
@@ -1045,7 +1045,7 @@ fn write_footer<W: Write>(writer: &mut W) -> Result<()> {
     writer.write_all(&checksum.to_le_bytes())?;
     
     // 填充
-    writer.write_all(&vec![0u8; FOOTER_SIZE - 4])?;
+    writer.write_all(&[0u8; FOOTER_SIZE - 4])?;
     
     Ok(())
 }

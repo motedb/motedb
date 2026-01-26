@@ -84,7 +84,7 @@ impl IndexRegistry {
         }
         
         let data = std::fs::read(&self.metadata_path)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
         
         let metadata_list: Vec<IndexMetadata> = bincode::deserialize(&data)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -106,7 +106,7 @@ impl IndexRegistry {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         
         std::fs::write(&self.metadata_path, data)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
         
         Ok(())
     }

@@ -17,16 +17,16 @@ mod compaction;
 mod engine;
 mod bloom;
 mod blobstore;
-mod single_file_lsm;
+mod merging_iterator;  // 🚀 流式合并迭代器
 
-pub use single_file_lsm::{SingleFileLSM, Superblock, LevelMeta, Entry, PAGE_SIZE};  // ✅ Export for index integration
 pub use memtable::MemTable;
 pub use unified_memtable::{UnifiedMemTable, UnifiedEntry};  // 🆕 Export
 pub use sstable::{SSTable, SSTableBuilder, BlockIndex};
 pub use compaction::{CompactionWorker, CompactionConfig, Level, SSTableMeta, CompactionStats};
-pub use engine::LSMEngine;
+pub use engine::{LSMEngine, LSMBatchedIterator};  // 🚀 Export batched iterator
 pub use bloom::BloomFilter;
 pub use blobstore::BlobStore;
+pub use merging_iterator::MergingIterator;  // 🚀 Export merging iterator
 
 /// Key type (row_id as u64)
 /// 
@@ -157,12 +157,23 @@ pub struct LSMConfig {
     
     /// 🆕 SSTable cache size (number of cached SSTable handles, default 8)
     pub sstable_cache_size: usize,
+    
+    /// 🚀 P0: Memory limit for SSTable cache (bytes)
+    /// 
+    /// When total cache size exceeds this limit, LRU eviction is triggered.
+    /// - None = No limit (uses sstable_cache_size only)
+    /// - Some(200MB) = Max 200MB cache memory (recommended for production)
+    /// 
+    /// Calculation: cache_size × avg_sstable_size
+    /// - 8 SSTables × 25MB = 200MB (default)
+    /// - For embedded: 4 SSTables × 10MB = 40MB
+    pub sstable_cache_memory_limit_mb: Option<usize>,
 }
 
 impl Default for LSMConfig {
     fn default() -> Self {
         Self {
-            memtable_size: 4 * 1024 * 1024,    // 🔧 4MB - 足够容纳 5K 条 Row (5000 × 619 = 3.1 MB)
+            memtable_size: 512 * 1024,          // 🚀 P0: 512KB - 激进控制内存（原4MB过大）
             block_size: 64 * 1024,              // 64KB (optimal for compression)
             num_levels: 7,
             level_multiplier: 10,
@@ -172,6 +183,7 @@ impl Default for LSMConfig {
             blob_threshold: 32 * 1024,          // 32KB (separate large values/vectors)
             blob_file_size: 256 * 1024 * 1024,  // 256MB per blob file
             sstable_cache_size: 8,              // 🔧 8个SSTable缓存（减少内存）
+            sstable_cache_memory_limit_mb: Some(200),  // 🚀 P0: 200MB memory limit
         }
     }
 }
@@ -190,6 +202,7 @@ impl LSMConfig {
             blob_threshold: 32 * 1024,
             blob_file_size: 256 * 1024 * 1024,
             sstable_cache_size: 16,             // More cache for reads
+            sstable_cache_memory_limit_mb: Some(400),  // 🚀 P0: 400MB for read-heavy
         }
     }
     
@@ -206,6 +219,7 @@ impl LSMConfig {
             blob_threshold: 32 * 1024,
             blob_file_size: 256 * 1024 * 1024,
             sstable_cache_size: 8,
+            sstable_cache_memory_limit_mb: Some(200),  // 🚀 P0
         }
     }
     
@@ -244,6 +258,7 @@ impl LSMConfig {
             blob_threshold: 16 * 1024,               // 16KB
             blob_file_size: 128 * 1024 * 1024,       // 128MB
             sstable_cache_size: 4,                   // 4 个
+            sstable_cache_memory_limit_mb: Some(40),  // 🚀 P0: 40MB for embedded
         }
     }
     
@@ -262,7 +277,7 @@ impl LSMConfig {
     /// - 内存占用：**-70%** ✅
     pub fn tiny() -> Self {
         Self {
-            memtable_size: 1 * 1024 * 1024,         // 1MB
+            memtable_size: 1024 * 1024,         // 1MB
             block_size: 16 * 1024,                   // 16KB
             num_levels: 5,                           // 5 层
             level_multiplier: 4,                     // 4x
@@ -272,6 +287,7 @@ impl LSMConfig {
             blob_threshold: 8 * 1024,                // 8KB
             blob_file_size: 64 * 1024 * 1024,        // 64MB
             sstable_cache_size: 2,                   // 2 个
+            sstable_cache_memory_limit_mb: Some(20),  // 🚀 P0: 20MB for tiny
         }
     }
     
@@ -301,6 +317,7 @@ impl LSMConfig {
             blob_threshold: 16 * 1024,          // 🔧 16KB（更多数据进Blob）
             blob_file_size: 128 * 1024 * 1024,  // 🔧 128MB（减少Blob文件大小）
             sstable_cache_size: 4,              // 🔧 4个缓存（最小化内存）
+            sstable_cache_memory_limit_mb: Some(100),  // 🚀 P0: 100MB for memory-optimized
         }
     }
     

@@ -407,7 +407,6 @@ impl FreshVamanaGraph {
     /// 图搜索（大规模 + 多起点优化）
     fn graph_search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<Candidate>> {
         use std::collections::{BinaryHeap, HashSet};
-        use std::cmp::Reverse;
         
         // 🚀 延迟优化：进一步降低 ef 到 50（性能提升 ~50%，10k数据召回率仍>95%）
         let ef = ef.max(k * 3).max(50).min(self.nodes.len());

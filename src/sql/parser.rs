@@ -1,5 +1,4 @@
 /// SQL Parser - converts tokens into AST
-
 use super::token::{Token, TokenType};
 use super::ast::*;
 use crate::error::{Result, MoteDBError};
@@ -775,11 +774,7 @@ impl Parser {
                     self.advance();
                     
                     // Check for DISTINCT keyword (COUNT(DISTINCT column))
-                    let distinct = if self.match_token(TokenType::Distinct) {
-                        true
-                    } else {
-                        false
-                    };
+                    let distinct = self.match_token(TokenType::Distinct);
                     
                     let args = if matches!(self.current().token_type, TokenType::RParen) {
                         Vec::new()

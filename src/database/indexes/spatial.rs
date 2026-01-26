@@ -71,7 +71,7 @@ impl MoteDB {
                     use std::hash::{Hash, Hasher};
                     let mut hasher = DefaultHasher::new();
                     table_name.hash(&mut hasher);
-                    let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+                    let table_hash = hasher.finish() & 0xFFFFFFFF;
                     
                     let start_key = table_hash << 32;
                     let end_key = (table_hash + 1) << 32;

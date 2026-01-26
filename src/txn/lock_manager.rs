@@ -82,12 +82,6 @@ impl LockEntry {
             .find(|(tid, _)| *tid == txn_id)
             .map(|(_, mode)| *mode)
     }
-
-    /// Get current lock holders
-    fn get_holders(&self) -> Vec<TransactionId> {
-        let holders = self.holders.read();
-        holders.iter().map(|(tid, _)| *tid).collect()
-    }
 }
 
 /// Lock Manager - manages row-level locks
@@ -159,7 +153,7 @@ impl LockManager {
     /// Add wait-for edge
     fn add_wait_for(&self, waiter: TransactionId, holders: &[TransactionId]) {
         let mut wait_for = self.wait_for.lock();
-        let entry = wait_for.entry(waiter).or_insert_with(HashSet::new);
+        let entry = wait_for.entry(waiter).or_default();
         for &holder in holders {
             if holder != waiter {
                 entry.insert(holder);
@@ -202,7 +196,7 @@ impl LockManager {
             
             // Track lock
             let mut txn_locks = self.txn_locks.lock();
-            txn_locks.entry(txn_id).or_insert_with(HashSet::new).insert(row_id);
+            txn_locks.entry(txn_id).or_default().insert(row_id);
             
             return Ok(());
         }

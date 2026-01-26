@@ -29,18 +29,12 @@ pub type LogSequenceNumber = u64;
 
 /// WAL 配置（简化版，用于内部）
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct WALConfig {
     /// 持久性级别
     pub durability_level: DurabilityLevel,
 }
 
-impl Default for WALConfig {
-    fn default() -> Self {
-        Self {
-            durability_level: DurabilityLevel::default(),
-        }
-    }
-}
 
 impl From<crate::config::WALConfig> for WALConfig {
     fn from(config: crate::config::WALConfig) -> Self {

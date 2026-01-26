@@ -435,7 +435,7 @@ impl BTree {
         let file_size = metadata.len();
         let is_new_file = file_size == 0;
         
-        let (superblock, root_page_id, next_page_id, stats) = if is_new_file {
+        let (_superblock, root_page_id, next_page_id, stats) = if is_new_file {
             // New file: create empty superblock
             // Reserve Page 0 for SuperBlock, data starts from Page 1
             let superblock = SuperBlock {
@@ -561,13 +561,6 @@ impl BTree {
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
         
         Self::write_superblock(&mut file, &superblock)
-    }
-    
-    /// Recalculate statistics by traversing the tree (legacy, now loaded from SuperBlock)
-    fn recalculate_stats(&self) -> Result<()> {
-        // Stats are now loaded from SuperBlock, no need to recalculate
-        // This method kept for compatibility
-        Ok(())
     }
     
     /// Load page from disk or cache
@@ -741,7 +734,7 @@ impl BTree {
                 let page_ref = root_page.read()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
                 // 🔧 Fix: Flush the root page immediately to ensure it's on disk
-                self.flush_page(&*page_ref)?;
+                self.flush_page(&page_ref)?;
             }
             
             // Update root_page_id
@@ -1069,7 +1062,7 @@ impl BTree {
         // Step 3: Remove the promoted key from left child
         // After split_off(mid+1), page.keys = [k0,...,k_mid]
         // Need to remove k_mid
-        if page.keys.len() > 0 {
+        if !page.keys.is_empty() {
             page.keys.pop();  // Remove keys[mid]
         }
         page.num_keys = page.keys.len();
@@ -1147,7 +1140,7 @@ impl BTree {
             
             // Flush the page
             {
-                let page_ref = root_page.read()
+                let _page_ref = root_page.read()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
                 // ⚡ 性能优化：不在 insert 时刷盘，只在 flush() 时批量刷盘
                 // self.flush_page(&*page_ref)?;

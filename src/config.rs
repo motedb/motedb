@@ -239,6 +239,7 @@ impl WALConfig {
 /// - Hybrid: 重要索引实时更新 + 其他索引批量构建
 /// - Realtime: 所有索引实时更新（最低性能，最好的查询实时性）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum IndexUpdateStrategy {
     /// 批量构建模式（默认）：所有索引只在 checkpoint 时批量构建
     /// 
@@ -250,6 +251,7 @@ pub enum IndexUpdateStrategy {
     /// - PRIMARY KEY 索引仍然实时更新（保证查询性能）
     /// - 其他所有索引（vector, spatial, text, secondary columns）延迟构建
     /// - 写入时只写 MemTable，索引构建在 checkpoint 时自动触发
+    #[default]
     BatchOnly,
     
     /// 混合模式（推荐）：重要索引实时更新 + 其他索引批量构建
@@ -306,12 +308,6 @@ pub enum RealtimeIndexType {
     FullText,
 }
 
-impl Default for IndexUpdateStrategy {
-    fn default() -> Self {
-        // 默认使用批量构建模式（最高性能）
-        Self::BatchOnly
-    }
-}
 
 impl IndexUpdateStrategy {
     /// 创建批量构建模式
@@ -394,6 +390,18 @@ pub struct DBConfig {
     /// - Hybrid: Important indexes realtime + others batch (recommended)
     /// - Realtime: All indexes updated immediately (lowest latency)
     pub index_update_strategy: IndexUpdateStrategy,
+    
+    /// 🚀 P0: Query timeout (seconds)
+    /// 
+    /// Maximum time allowed for a single query to execute.
+    /// - None = No timeout (default, may cause long-running queries)
+    /// - Some(30) = 30 seconds timeout (recommended for concurrent workloads)
+    /// 
+    /// When timeout is reached:
+    /// - Query is aborted immediately
+    /// - Returns StorageError::Timeout
+    /// - Releases locks to prevent deadlocks
+    pub query_timeout_secs: Option<u64>,
 }
 
 impl Default for DBConfig {
@@ -405,6 +413,7 @@ impl Default for DBConfig {
             enable_stats: true,
             row_cache_size: None,  // Use default 10000
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
+            query_timeout_secs: None,  // No timeout by default
         }
     }
 }

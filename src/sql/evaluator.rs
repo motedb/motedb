@@ -1,5 +1,4 @@
 /// Expression evaluator - evaluates expressions against rows
-
 use super::ast::{Expr, BinaryOperator, UnaryOperator};
 use crate::error::{Result, MoteDBError};
 use crate::types::{Value, SqlRow};
@@ -375,7 +374,7 @@ impl ExprEvaluator {
         }
     }
     
-    fn eval_function(&self, name: &str, args: &[Expr], distinct: bool, row: &SqlRow) -> Result<Value> {
+    fn eval_function(&self, name: &str, args: &[Expr], _distinct: bool, row: &SqlRow) -> Result<Value> {
         // Note: distinct parameter is only used for aggregate functions like COUNT(DISTINCT)
         // It's ignored for non-aggregate functions
         
@@ -479,7 +478,7 @@ impl ExprEvaluator {
                 if args.len() != 1 {
                     return Err(MoteDBError::InvalidArgument("trim() takes 1 argument".to_string()));
                 }
-                let mut text = match self.eval(&args[0], row)? {
+                let text = match self.eval(&args[0], row)? {
                     Value::Text(s) => s,
                     _ => return Err(MoteDBError::TypeError("trim() requires text argument".to_string())),
                 };
@@ -1018,7 +1017,7 @@ impl ExprEvaluator {
                         let days = secs / 86400;
                         // Simplified month calculation (approximate)
                         let days_in_year = days % 365;
-                        let month = ((days_in_year / 30) + 1).min(12) as i64;
+                        let month = ((days_in_year / 30) + 1).min(12);
                         Ok(Value::Integer(month))
                     }
                     _ => Err(MoteDBError::TypeError("MONTH() requires timestamp argument".to_string())),
@@ -1037,7 +1036,7 @@ impl ExprEvaluator {
                         let days = secs / 86400;
                         // Day within month (approximation)
                         let day = (days % 30) + 1;
-                        Ok(Value::Integer(day as i64))
+                        Ok(Value::Integer(day))
                     }
                     _ => Err(MoteDBError::TypeError("DAY() requires timestamp argument".to_string())),
                 }
@@ -1053,7 +1052,7 @@ impl ExprEvaluator {
                     Value::Timestamp(ts) => {
                         let secs = ts.as_micros() / 1_000_000;
                         let hour = (secs % 86400) / 3600;
-                        Ok(Value::Integer(hour as i64))
+                        Ok(Value::Integer(hour))
                     }
                     _ => Err(MoteDBError::TypeError("HOUR() requires timestamp argument".to_string())),
                 }
@@ -1069,7 +1068,7 @@ impl ExprEvaluator {
                     Value::Timestamp(ts) => {
                         let secs = ts.as_micros() / 1_000_000;
                         let minute = (secs % 3600) / 60;
-                        Ok(Value::Integer(minute as i64))
+                        Ok(Value::Integer(minute))
                     }
                     _ => Err(MoteDBError::TypeError("MINUTE() requires timestamp argument".to_string())),
                 }
@@ -1085,7 +1084,7 @@ impl ExprEvaluator {
                     Value::Timestamp(ts) => {
                         let secs = ts.as_micros() / 1_000_000;
                         let second = secs % 60;
-                        Ok(Value::Integer(second as i64))
+                        Ok(Value::Integer(second))
                     }
                     _ => Err(MoteDBError::TypeError("SECOND() requires timestamp argument".to_string())),
                 }
@@ -1146,7 +1145,7 @@ impl ExprEvaluator {
                         // Unix epoch (1970-01-01) was Thursday (day 4)
                         // Calculate day of week: (days + 4) % 7, then map to 1-7
                         let dow = ((days + 3) % 7) + 1; // +3 because epoch was Thursday (4-1=3)
-                        Ok(Value::Integer(dow as i64))
+                        Ok(Value::Integer(dow))
                     }
                     _ => Err(MoteDBError::TypeError("DAY_OF_WEEK() requires timestamp argument".to_string())),
                 }
@@ -1477,7 +1476,7 @@ impl ExprEvaluator {
     
     /// ST_Distance: Compute 3D Euclidean distance between two spatial points
     fn st_distance(&self, p1: Value, p2: Value) -> Result<Value> {
-        use crate::types::{Geometry, Point};
+        use crate::types::Geometry;
         
         let point1 = match p1 {
             Value::Spatial(Geometry::Point(p)) => p,
@@ -1495,7 +1494,7 @@ impl ExprEvaluator {
     
     /// WITHIN_RADIUS: Check if a point is within radius of a center point
     fn within_radius(&self, point: Value, center: Value, radius: Value) -> Result<Value> {
-        use crate::types::{Geometry, Point};
+        use crate::types::Geometry;
         
         let p = match point {
             Value::Spatial(Geometry::Point(p)) => p,
@@ -1519,7 +1518,7 @@ impl ExprEvaluator {
     
     /// ST_OnTopOf: Check if point p1 is on top of point p2 (p1.y > p2.y)
     fn st_ontopof(&self, p1: Value, p2: Value) -> Result<Value> {
-        use crate::types::{Geometry, Point};
+        use crate::types::Geometry;
         
         let point1 = match p1 {
             Value::Spatial(Geometry::Point(p)) => p,

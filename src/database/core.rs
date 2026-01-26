@@ -17,7 +17,7 @@ use crate::storage::{LSMEngine, LSMConfig};
 use crate::txn::coordinator::TransactionCoordinator;
 use crate::txn::version_store::VersionStore;
 use crate::txn::wal::{WALManager, WALRecord};
-use crate::types::{Row, RowId, BoundingBox};
+use crate::types::RowId;
 use crate::catalog::TableRegistry;
 use crate::cache::RowCache;
 use crate::{Result, StorageError};
@@ -63,11 +63,6 @@ pub struct MoteDB {
     
     /// LSM-Tree storage engine (main data storage)
     pub(crate) lsm_engine: Arc<LSMEngine>,
-
-    /// Primary key index (DEPRECATED: redundant row_id → row_id mapping)
-    /// Kept for backward compatibility, no longer used
-    #[deprecated(note = "Primary key index is redundant and no longer used")]
-    pub(crate) primary_key: Arc<RwLock<HashMap<RowId, RowId>>>,
 
     /// Timestamp index (using BTree for persistent storage)
     pub(crate) timestamp_index: Arc<RwLock<BTree>>,
@@ -118,6 +113,9 @@ pub struct MoteDB {
     /// 🚀 Phase 3+: Index update strategy
     pub(crate) index_update_strategy: crate::config::IndexUpdateStrategy,
     
+    /// 🚀 P0: Query timeout (seconds)
+    pub(crate) query_timeout_secs: Option<u64>,
+    
     /// 🆕 防止递归 flush 的标志
     pub(crate) is_flushing: Arc<AtomicBool>,
 }
@@ -146,9 +144,6 @@ impl MoteDB {
         std::fs::create_dir_all(&wal_path)?;
         let wal_config = crate::txn::wal::WALConfig::from(config.wal_config);
         let wal = Arc::new(WALManager::create_with_config(&wal_path, num_partitions, wal_config)?);
-
-        // Create primary key index (in-memory)
-        let primary_key = Arc::new(RwLock::new(HashMap::new()));
 
         // Create timestamp index with BTree storage (放在 indexes/ 目录)
         std::fs::create_dir_all(&indexes_dir)?;
@@ -183,7 +178,7 @@ impl MoteDB {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             "_default".hash(&mut hasher);
-            let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;  // Take lower 32 bits
+            let table_hash = hasher.finish() & 0xFFFFFFFF;  // Take lower 32 bits
             table_hash_cache.insert("_default".to_string(), table_hash);
         }
 
@@ -191,7 +186,6 @@ impl MoteDB {
             path: db_path,
             wal,
             lsm_engine: lsm_engine.clone(),
-            primary_key,
             timestamp_index,
             next_row_id: Arc::new(RwLock::new(0)),
             num_partitions,
@@ -208,6 +202,7 @@ impl MoteDB {
             row_cache,
             table_hash_cache,
             index_update_strategy: config.index_update_strategy.clone(),  // 🚀 Phase 3+
+            query_timeout_secs: config.query_timeout_secs,  // 🚀 P0
             is_flushing: Arc::new(AtomicBool::new(false)),  // 🆕 防止递归
         };
         
@@ -227,7 +222,6 @@ impl MoteDB {
             path: self.path.clone(),
             wal: self.wal.clone(),
             lsm_engine: self.lsm_engine.clone(),
-            primary_key: self.primary_key.clone(),
             timestamp_index: self.timestamp_index.clone(),
             next_row_id: self.next_row_id.clone(),
             num_partitions: self.num_partitions,
@@ -244,6 +238,7 @@ impl MoteDB {
             row_cache: self.row_cache.clone(),
             table_hash_cache: self.table_hash_cache.clone(),  // 🚀 P1
             index_update_strategy: self.index_update_strategy.clone(),  // 🚀 Phase 3+
+            query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
             is_flushing: self.is_flushing.clone(),  // 🆕 共享 flush 标志
         }
     }
@@ -285,9 +280,6 @@ impl MoteDB {
         // Get total entries from timestamp index (already persisted data)
         let persisted_count = timestamp_idx.len();
         
-        // Primary key index has been removed (redundant: row_id → row_id)
-        // We keep the field for now but don't populate it
-        let primary_key_map = HashMap::new();
         let mut max_row_id = if persisted_count > 0 {
             // Estimate max_row_id from persisted count
             // Since row_ids are sequential starting from 0, max is count-1
@@ -297,11 +289,9 @@ impl MoteDB {
         };
 
         // Replay WAL records (if any uncommitted changes after last checkpoint)
-        for (_partition, records) in &recovered_records {
+        for records in recovered_records.values() {
             for record in records {
                 if let WALRecord::Insert { row_id, data, .. } = record {
-                    // 🔧 Primary Key 已移除（冗余）
-                    // primary_key_map.insert(*row_id, *row_id);
                     max_row_id = max_row_id.max(*row_id);
                     
                     // Also insert into timestamp index
@@ -312,7 +302,6 @@ impl MoteDB {
             }
         }
 
-        let primary_key = Arc::new(RwLock::new(primary_key_map));
         let timestamp_index = Arc::new(RwLock::new(timestamp_idx));
         
         // Open LSM-Tree storage engine (从统一目录)
@@ -323,7 +312,7 @@ impl MoteDB {
         // 现在 WAL 记录了 table_name，可以正确构建 composite_key
         debug_log!("[database] 恢复 WAL 记录到 LSM Engine...");
         let mut recovered_count = 0;
-        for (_partition, records) in &recovered_records {
+        for records in recovered_records.values() {
             for record in records {
                 use std::hash::{Hash, Hasher};
                 match record {
@@ -331,7 +320,7 @@ impl MoteDB {
                         // 构建 composite_key = hash(table_name) << 32 | row_id
                         let mut hasher = std::collections::hash_map::DefaultHasher::new();
                         table_name.hash(&mut hasher);
-                        let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;  // Take lower 32 bits
+                        let table_hash = hasher.finish() & 0xFFFFFFFF;  // Take lower 32 bits
                         let composite_key = (table_hash << 32) | (*row_id & 0xFFFFFFFF);
                         
                         // 将数据恢复到 LSM Engine
@@ -344,7 +333,7 @@ impl MoteDB {
                         // 更新操作：构建 composite_key 并更新
                         let mut hasher = std::collections::hash_map::DefaultHasher::new();
                         table_name.hash(&mut hasher);
-                        let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;  // Take lower 32 bits
+                        let table_hash = hasher.finish() & 0xFFFFFFFF;  // Take lower 32 bits
                         let composite_key = (table_hash << 32) | (*row_id & 0xFFFFFFFF);
                         
                         let row_data = bincode::serialize(new_data)?;
@@ -356,7 +345,7 @@ impl MoteDB {
                         // 删除操作：构建 composite_key 并删除
                         let mut hasher = std::collections::hash_map::DefaultHasher::new();
                         table_name.hash(&mut hasher);
-                        let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;  // Take lower 32 bits
+                        let table_hash = hasher.finish() & 0xFFFFFFFF;  // Take lower 32 bits
                         let composite_key = (table_hash << 32) | (*row_id & 0xFFFFFFFF);
                         
                         let timestamp = std::time::SystemTime::now()
@@ -402,14 +391,14 @@ impl MoteDB {
             // Always register "_default" table
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             "_default".hash(&mut hasher);
-            let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;  // Take lower 32 bits
+            let table_hash = hasher.finish() & 0xFFFFFFFF;  // Take lower 32 bits
             table_hash_cache.insert("_default".to_string(), table_hash);
             
             // Then populate from registry
             for table_name in table_registry.list_tables()? {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 table_name.hash(&mut hasher);
-                let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;  // Take lower 32 bits
+                let table_hash = hasher.finish() & 0xFFFFFFFF;  // Take lower 32 bits
                 table_hash_cache.insert(table_name, table_hash);
             }
         }
@@ -418,7 +407,6 @@ impl MoteDB {
             path: db_path,
             wal,
             lsm_engine: lsm_engine.clone(),
-            primary_key,
             timestamp_index,
             next_row_id: Arc::new(RwLock::new(max_row_id + 1)),
             num_partitions,
@@ -435,6 +423,7 @@ impl MoteDB {
             row_cache,
             table_hash_cache,  // 🚀 P1
             index_update_strategy: crate::config::IndexUpdateStrategy::default(),  // 🚀 Phase 3+ (默认 BatchOnly)
+            query_timeout_secs: None,  // 🚀 P0: 默认无超时（open时使用默认值）
             is_flushing: Arc::new(AtomicBool::new(false)),  // 🆕 防止递归
         };
         

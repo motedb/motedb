@@ -4,7 +4,7 @@
 //! Handles data persistence and durability
 
 use crate::database::core::MoteDB;
-use crate::{Result, StorageError};
+use crate::Result;
 use std::sync::atomic::Ordering;
 
 impl MoteDB {

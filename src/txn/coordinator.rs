@@ -40,20 +40,6 @@ pub struct Savepoint {
     pub read_deltas: HashSet<RowId>,
 }
 
-/// Legacy full snapshot savepoint (deprecated, for backward compatibility)
-#[deprecated(note = "Use delta-based Savepoint instead for better memory efficiency")]
-#[derive(Debug, Clone)]
-pub struct SavepointFullSnapshot {
-    /// Savepoint name
-    pub name: String,
-    
-    /// Full snapshot of write_set at savepoint creation
-    pub write_set_snapshot: HashMap<RowId, (String, Row)>,
-    
-    /// Full snapshot of read_set at savepoint creation  
-    pub read_set_snapshot: HashSet<RowId>,
-}
-
 /// Transaction isolation level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
@@ -453,7 +439,7 @@ impl TransactionCoordinator {
         // For Serializable isolation, check read-write conflicts
         if ctx.isolation_level == IsolationLevel::Serializable {
             let read_set = ctx.read_set.read();
-            let write_set = ctx.write_set.read();
+            let _write_set = ctx.write_set.read();
             
             // Check if any read row has been modified by another transaction
             for row_id in read_set.iter() {

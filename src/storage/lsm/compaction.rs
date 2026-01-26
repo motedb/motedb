@@ -168,13 +168,17 @@ impl Level {
     }
     
     /// Check if compaction is needed
+    /// 
+    /// 🚀 P1 优化：更激进的 L0 compaction 触发策略
+    /// - L0: 2 个文件就触发（原 4 个）
+    /// - 目标：将 L0 SSTable 数量从 425 降低到 < 10
     pub fn needs_compaction(&self) -> bool {
         if self.level == 0 {
             // Check L0 tiered sublevels first
             if let Some(ref sublevels) = self.sublevels {
-                // Any sublevel exceeds its max files?
+                // 🔥 P1: 降低 sublevel 阈值
                 for sublevel in sublevels {
-                    if sublevel.sstables.len() >= sublevel.max_files {
+                    if sublevel.sstables.len() >= 2 {  // 🚀 降低：max_files → 2
                         return true;
                     }
                 }
@@ -182,7 +186,7 @@ impl Level {
             }
             
             // Fallback: L0 trigger by file count (legacy)
-            self.sstables.len() >= 4
+            self.sstables.len() >= 2  // 🚀 P1: 降低阈值 4 → 2
         } else {
             // L1+: trigger by total size
             self.total_size > self.size_threshold

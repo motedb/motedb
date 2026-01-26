@@ -32,13 +32,13 @@ impl TableRegistry {
         // Create directory if it doesn't exist
         if let Some(parent) = persist_path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| StorageError::Io(e))?;
+                .map_err(StorageError::Io)?;
         }
         
         // Try to load existing metadata
         let metadata = if persist_path.exists() {
             let data = fs::read(&persist_path)
-                .map_err(|e| StorageError::Io(e))?;
+                .map_err(StorageError::Io)?;
             let mut meta: RegistryMetadata = bincode::deserialize(&data)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             
@@ -210,7 +210,7 @@ impl TableRegistry {
         let meta = self.metadata.read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        let (table_name, column_name) = meta.index_map.get(index_name)
+        let (table_name, _column_name) = meta.index_map.get(index_name)
             .ok_or_else(|| StorageError::InvalidData(format!(
                 "Index '{}' not found",
                 index_name
@@ -223,7 +223,7 @@ impl TableRegistry {
             )))?;
 
         table.indexes.iter()
-            .find(|idx| &idx.name == index_name)
+            .find(|idx| idx.name == index_name)
             .cloned()
             .ok_or_else(|| StorageError::InvalidData(format!(
                 "Index '{}' not found",
@@ -266,7 +266,7 @@ impl TableRegistry {
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         fs::write(&self.persist_path, data)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
 
         Ok(())
     }
@@ -330,7 +330,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let registry = TableRegistry::new(temp_dir.path()).unwrap();
 
-        let mut schema = TableSchema::new(
+        let schema = TableSchema::new(
             "articles".into(),
             vec![
                 ColumnDef::new("id".into(), ColumnType::Integer, 0),

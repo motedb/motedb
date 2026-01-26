@@ -61,7 +61,6 @@ use std::fs::OpenOptions;
 // ===== Configuration =====
 
 const MAX_RTREE_ENTRIES: usize = 256;  // 每个 cell 最多 256 条
-const MIN_RTREE_ENTRIES: usize = 64;
 const DEFAULT_GRID_SIZE: usize = 32;  // 32x32=1024 cells，每个 cell 平均 ~290 条数据
 const DEFAULT_CACHE_SIZE: usize = 128;  // 缓存 128 个热点 cells
 const ADAPTIVE_THRESHOLD: f32 = 0.95;  // 提高到 95%，极少扩展
@@ -340,14 +339,17 @@ impl MiniRTree {
         }
     }
     
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.entries.len()
     }
     
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
     
+    #[allow(dead_code)]
     fn memory_usage(&self) -> usize {
         self.entries.capacity() * std::mem::size_of::<CompactRTreeEntry>()
     }
@@ -377,22 +379,6 @@ impl PointF32 {
         Self {
             x: point.x as f32,
             y: point.y as f32,
-        }
-    }
-    
-    /// SIMD-accelerated distance calculation
-    #[inline]
-    fn distance(&self, other: &PointF32) -> f32 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-        {
-            simd_distance_x86(self, other)
-        }
-        
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
-        {
-            let dx = self.x - other.x;
-            let dy = self.y - other.y;
-            (dx * dx + dy * dy).sqrt()
         }
     }
 }
@@ -875,7 +861,7 @@ impl SpatialHybridIndex {
         grid.maybe_resize(active_cells, total_entries);
         
         // 增量持久化：每 5000 条自动 flush 到磁盘
-        if total_entries % AUTO_FLUSH_THRESHOLD == 0 {
+        if total_entries.is_multiple_of(AUTO_FLUSH_THRESHOLD) {
             drop(storage);  // 释放写锁
             drop(grid);     // 释放写锁
             let _ = self.flush();  // 持久化，失败不影响插入
@@ -1023,7 +1009,7 @@ impl SpatialHybridIndex {
             rtree_memory: cache_memory,
             total_cells,
             total_entries: self.len(),
-            bytes_per_entry: if self.len() > 0 {
+            bytes_per_entry: if !self.is_empty() {
                 (grid_overhead + cache_memory) / self.len()
             } else {
                 0
@@ -1037,7 +1023,7 @@ impl SpatialHybridIndex {
     /// 详细的内存分析（用于调试）
     pub fn debug_memory_usage(&self) {
         let storage = self.storage.read();
-        let grid = self.grid.read();
+        let _grid = self.grid.read();
         
         println!("╭─────────────────────────────────────╮");
         println!("│  空间索引内存详细分析                │");

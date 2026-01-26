@@ -46,7 +46,7 @@ impl MoteDB {
                     use std::hash::{Hash, Hasher};
                     let mut hasher = DefaultHasher::new();
                     table_name.hash(&mut hasher);
-                    let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+                    let table_hash = hasher.finish() & 0xFFFFFFFF;
                     
                     let start_key = table_hash << 32;
                     let end_key = (table_hash + 1) << 32;
@@ -235,7 +235,7 @@ impl MoteDB {
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             
             std::fs::write(&metadata_path, data)
-                .map_err(|e| StorageError::Io(e))?;
+                .map_err(StorageError::Io)?;
         }
         
         // 🚀 DashMap: 直接遍历并 flush

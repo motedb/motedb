@@ -57,7 +57,7 @@ fn docs_quick_start_example_runs() -> Result<()> {
         )",
     )?;
     db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', 25)")?;
-    let results = db.query("SELECT * FROM users WHERE id = 1")?;
+    let results = db.execute("SELECT * FROM users WHERE id = 1")?.materialize()?;  // ✅ 使用流式 API
     assert_eq!(results.row_count(), 1);
     db.flush()?;
     drop(db);
@@ -82,7 +82,7 @@ fn docs_batch_insert_example_runs() -> Result<()> {
         row.insert("id".into(), Value::Integer(i));
         row.insert("name".into(), Value::Text(format!("User{}", i)));
         row.insert("email".into(), Value::Text(format!("user{}@example.com", i)));
-        row.insert("age".into(), Value::Integer(20 + (i as i64 % 30)));
+        row.insert("age".into(), Value::Integer(20 + (i % 30)));
         rows.push(row);
     }
 
@@ -216,11 +216,11 @@ fn docs_timestamp_example_runs() -> Result<()> {
     for i in 0..50 {
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Integer(i));
-        row.insert("sensor_id".into(), Value::Integer((i % 4) as i64));
+        row.insert("sensor_id".into(), Value::Integer(i % 4));
         row.insert("value".into(), Value::Float((i as f64) * 0.1));
         row.insert(
             "ts".into(),
-            Value::Timestamp(Timestamp::from_secs(1_700_000_000 + i as i64)),
+            Value::Timestamp(Timestamp::from_secs(1_700_000_000 + i)),
         );
         rows.push(row);
     }
@@ -255,7 +255,7 @@ fn docs_transaction_example_runs() -> Result<()> {
     db.rollback_to_savepoint(tx, "after_transfer")?;
     db.commit_transaction(tx)?;
 
-    let results = db.query("SELECT balance FROM accounts ORDER BY id")?;
+    let results = db.execute("SELECT balance FROM accounts ORDER BY id")?.materialize()?;  // ✅ 使用流式 API
     assert_eq!(results.row_count(), 2);
 
     drop(db);

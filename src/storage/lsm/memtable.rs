@@ -106,7 +106,7 @@ impl MemTable {
         let data = self.data.read()
             .expect("MemTable snapshot: lock poisoned (unrecoverable in test)");
         data.iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (*k, v.clone()))
             .collect()
     }
     
@@ -203,7 +203,7 @@ impl Iterator for MemTableIterator {
             .expect("MemTableIterator: lock poisoned (test-only code)");
         let item = data.iter().nth(self.index)?;
         self.index += 1;
-        Some((item.0.clone(), item.1.clone()))
+        Some((*item.0, item.1.clone()))
     }
 }
 

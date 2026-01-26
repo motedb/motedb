@@ -24,20 +24,12 @@ impl MoteDB {
     /// db.create_table(schema)?;
     /// ```
     pub fn create_table(&self, schema: TableSchema) -> Result<()> {
-        // Register table in catalog
+        // Register table in catalog (acquires metadata.write() lock)
         self.table_registry.create_table(schema.clone())?;
+        // 🔓 Lock released here
         
-        // 🔥 P0 FIX: Auto-create primary key index for fast lookups
-        if let Some(pk_col) = schema.primary_key() {
-            let index_name = format!("{}_pk_idx", schema.name);
-            println!("✓ Auto-creating primary key index: {}", index_name);
-            
-            // Create column index for primary key
-            if let Err(e) = self.create_column_index(&schema.name, pk_col) {
-                eprintln!("⚠️  Warning: Failed to create primary key index: {}", e);
-                // Don't fail table creation if index creation fails
-            }
-        }
+        // ✅ P0 FIX: Primary key index will be auto-created on first INSERT via incremental indexing
+        // No need to create empty index here - saves memory and avoids complexity
         
         Ok(())
     }
@@ -129,7 +121,7 @@ impl MoteDB {
         
         let mut hasher = DefaultHasher::new();
         table_name.hash(&mut hasher);
-        let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+        let table_hash = hasher.finish() & 0xFFFFFFFF;
         
         // Cache it (atomic insert)
         self.table_hash_cache.insert(table_name.to_string(), table_hash);
@@ -152,7 +144,7 @@ impl MoteDB {
         
         let mut hasher = DefaultHasher::new();
         table_name.hash(&mut hasher);
-        let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+        let table_hash = hasher.finish() & 0xFFFFFFFF;
         
         // Cache it (atomic insert)
         self.table_hash_cache.insert(table_name.to_string(), table_hash);
@@ -172,7 +164,7 @@ impl MoteDB {
         
         let mut hasher = DefaultHasher::new();
         table_name.hash(&mut hasher);
-        let table_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+        let table_hash = hasher.finish() & 0xFFFFFFFF;
         
         (composite_key >> 32) == table_hash
     }

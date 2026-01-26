@@ -24,9 +24,6 @@ pub enum FileType {
     SpatialIndex,
     /// Blob 文件
     Blob,
-    /// 旧的文本索引 (向后兼容)
-    #[deprecated]
-    TextIndex,
 }
 
 /// 文件元数据
@@ -65,7 +62,6 @@ impl FileMetadata {
             FileType::TimestampIndex => format!("timestamp_idx_{:05}.idx", self.file_id),
             FileType::TextIndexLSM => format!("text_{:05}.lsm", self.file_id),
             FileType::TextIndexDict => format!("text_{:05}.dict", self.file_id),
-            FileType::TextIndex => format!("text_idx_{:05}.idx", self.file_id),
             FileType::VectorIndex => format!("vector_idx_{:05}.idx", self.file_id),
             FileType::SpatialIndex => format!("spatial_idx_{:05}.idx", self.file_id),
             FileType::Blob => format!("blob_{:05}.blob", self.file_id),
@@ -94,7 +90,7 @@ impl Version {
     pub fn add_file(&mut self, meta: FileMetadata) {
         self.files
             .entry(meta.file_type.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(meta);
     }
     

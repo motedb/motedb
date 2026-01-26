@@ -26,9 +26,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "rayon")]
-use rayon::prelude::*;
-
 /// Index statistics
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -61,11 +58,13 @@ impl VectorStorage {
     }
     
     /// 🚀 Get quantized vector for fast distance computation
+    #[allow(dead_code)]
     fn get_quantized(&self, row_id: RowId) -> Option<Arc<QuantizedVector>> {
         self.vectors.get_quantized(row_id)
     }
     
     /// 🚀 Batch get quantized vectors for graph search
+    #[allow(dead_code)]
     fn batch_get_quantized(&self, row_ids: &[RowId]) -> HashMap<RowId, Arc<QuantizedVector>> {
         self.vectors.batch_get_quantized(row_ids)
     }
@@ -445,7 +444,7 @@ impl DiskANNIndex {
         shuffled.shuffle(&mut thread_rng());
         
         let new_count = shuffled.len();
-        let total_count = self.len();  // 🚀 关键：检查总节点数，不只是新增数量
+        let _total_count = self.len();  // 🚀 关键：检查总节点数，不只是新增数量
         let show_progress = true;
         
         // 🔥 方案A改进：分批渐进式构建（避免O(N²)复杂度）
@@ -468,7 +467,7 @@ impl DiskANNIndex {
         // - 召回率：85%+（保持高质量）
         
         let batch_size = 5000;  // 每批5000节点，平衡速度和质量
-        let num_batches = (new_count + batch_size - 1) / batch_size;
+        let num_batches = new_count.div_ceil(batch_size);
         
         if show_progress {
             debug_log!("[DiskANN] 🔥 Progressive Batch Build: {} nodes in {} batches", 
@@ -554,7 +553,7 @@ impl DiskANNIndex {
                     
                     if show_progress {
                         let p = progress.fetch_add(1, Ordering::Relaxed);
-                        if p % 500 == 0 && p > 0 {
+                        if p.is_multiple_of(500) && p > 0 {
                             println!("  Progress: {}/{}", p, batch.len());
                         }
                     }
@@ -584,7 +583,7 @@ impl DiskANNIndex {
                 
                 for &neighbor_id in neighbors {
                     reverse_edges.entry(neighbor_id)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(id);
                 }
             });
@@ -683,7 +682,7 @@ impl DiskANNIndex {
                 
                 if show_progress {
                     let p = progress.fetch_add(1, Ordering::Relaxed);
-                    if p % 500 == 0 && p > 0 {
+                    if p.is_multiple_of(500) && p > 0 {
                         println!("  Progress: {}/{} nodes", p, new_ids.len());
                     }
                 }
@@ -727,7 +726,7 @@ impl DiskANNIndex {
         use dashmap::DashMap;
         
         let total = nodes.len();
-        let num_layers = (total + layer_size - 1) / layer_size;
+        let num_layers = total.div_ceil(layer_size);
         
         if show_progress {
             debug_log!("[DiskANN] 🚀 Layered build: {} nodes → {} layers (size={})", 
@@ -800,7 +799,7 @@ impl DiskANNIndex {
                     
                     if show_progress {
                         let p = progress.fetch_add(1, Ordering::Relaxed);
-                        if p % 500 == 0 && p > 0 {
+                        if p.is_multiple_of(500) && p > 0 {
                             println!("  Progress: {}/{} nodes", p, layer_nodes.len());
                         }
                     }
@@ -830,7 +829,7 @@ impl DiskANNIndex {
                 
                 for &neighbor_id in neighbors {
                     reverse_edges.entry(neighbor_id)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(id);
                 }
             });
@@ -998,13 +997,13 @@ impl DiskANNIndex {
                 for &neighbor_id in neighbors.iter() {
                     // 添加反向边: neighbor_id -> id
                     reverse_edges_to_add.entry(neighbor_id)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(id);
                 }
                 
                 if show_progress {
                     let p = progress.fetch_add(1, Ordering::Relaxed);
-                    if p % 1000 == 0 && p > 0 {
+                    if p.is_multiple_of(1000) && p > 0 {
                         println!("  Reverse edges: {}/{}", p, nodes.len());
                     }
                 }
@@ -1361,7 +1360,7 @@ impl DiskANNIndex {
     /// - 会覆盖现有图结构
     /// - 自动使用最优策略（分层 or 批量）
     pub fn rebuild_full_graph(&self) -> Result<()> {
-        let start = Instant::now();
+        let _start = Instant::now();
         
         let all_ids = self.vectors.ids();
         if all_ids.is_empty() {
@@ -1842,7 +1841,7 @@ impl DiskANNIndex {
         use dashmap::DashMap;
         
         let total = nodes.len();
-        let num_layers = (total + layer_size - 1) / layer_size;
+        let num_layers = total.div_ceil(layer_size);
         
         if show_progress {
             debug_log!("[DiskANN] 🚀 Layered build: {} nodes → {} layers (size={})", 
@@ -1909,7 +1908,7 @@ impl DiskANNIndex {
                     
                     if show_progress {
                         let p = progress.fetch_add(1, Ordering::Relaxed);
-                        if p % 500 == 0 && p > 0 {
+                        if p.is_multiple_of(500) && p > 0 {
                             println!("  Progress: {}/{}", p, layer_nodes.len());
                         }
                     }
@@ -1939,7 +1938,7 @@ impl DiskANNIndex {
                 
                 for &neighbor_id in neighbors {
                     reverse_edges.entry(neighbor_id)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(id);
                 }
             });
@@ -2107,7 +2106,7 @@ impl DiskANNIndex {
         self.graph.set_neighbors(id, neighbor_ids.clone())?;
         // OPTIMIZATION 1: Batch load all neighbor vectors into cache
         // This avoids repeated disk reads during pruning
-        let neighbor_vecs: Vec<_> = neighbor_ids.iter()
+        let _neighbor_vecs: Vec<_> = neighbor_ids.iter()
             .filter_map(|&nid| self.vectors.get(nid).map(|v| (nid, v)))
             .collect();
         
@@ -2167,7 +2166,7 @@ impl DiskANNIndex {
         query: &[f32],
         start_id: RowId,
         beam_width: usize,
-        target_k: usize,
+        _target_k: usize,
     ) -> Result<Vec<Candidate>> {
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new();

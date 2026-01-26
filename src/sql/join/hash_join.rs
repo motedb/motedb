@@ -56,7 +56,7 @@ impl HashJoinExecutor {
                 if let Some(key) = HashKey::from_value(value) {
                     self.hash_table
                         .entry(key)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(row);
                 }
             }

@@ -11,12 +11,11 @@
 
 use crate::database::{MoteDB, TransactionStats};
 use crate::database::indexes::{VectorIndexStats, SpatialIndexStats};
-use crate::sql::{execute_sql, QueryResult};
+use crate::sql::StreamingQueryResult;  // ✅ 只需要 StreamingQueryResult
 use crate::types::{Value, Row, RowId, SqlRow};
 use crate::{Result, DBConfig};
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
 
 /// MoteDB 数据库实例
 ///
@@ -151,44 +150,51 @@ impl Database {
     // 2. SQL 操作（核心功能）
     // ============================================================================
 
-    /// 执行 SQL 查询并返回结果
+    /// 🚀 执行 SQL 查询（流式零内存开销）
+    ///
+    /// 返回流式结果，支持：
+    /// 1. 流式遍历（零内存开销）
+    /// 2. 物化为 Vec（等同于旧的 execute）
     ///
     /// # Examples
     /// ```ignore
-    /// // SELECT 查询
-    /// let results = db.query("SELECT * FROM users WHERE age > 18")?;
+    /// // 方式 1: 流式处理大结果集（推荐）
+    /// let result = db.execute("SELECT * FROM users WHERE age > 18")?;
+    /// result.for_each(|columns, row| {
+    ///     println!("{:?}: {:?}", columns, row);
+    ///     Ok(())
+    /// })?;
     ///
-    /// // 也可以用于其他语句（返回影响行数）
-    /// let result = db.query("INSERT INTO users VALUES (1, 'Alice', 25)")?;
-    /// ```
-    pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        execute_sql(self.inner.clone(), sql)
-    }
-
-    /// 执行 SQL 语句（INSERT/UPDATE/DELETE/CREATE/DROP）
+    /// // 方式 2: 物化为 Vec（兼容旧 API）
+    /// let result = db.execute("SELECT * FROM users")?;
+    /// let materialized = result.materialize()?;
+    /// match materialized {
+    ///     QueryResult::Select { columns, rows } => {
+    ///         println!("Found {} rows", rows.len());
+    ///     }
+    ///     _ => {}
+    /// }
     ///
-    /// 这是 `query()` 的别名，语义更清晰
-    ///
-    /// # Examples
-    /// ```ignore
-    /// // 创建表
+    /// // 其他语句（INSERT/UPDATE/DELETE/CREATE/DROP）
     /// db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)")?;
-    ///
-    /// // 插入数据
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")?;
-    ///
-    /// // 更新数据
     /// db.execute("UPDATE users SET email = 'new@example.com' WHERE id = 1")?;
-    ///
-    /// // 删除数据
     /// db.execute("DELETE FROM users WHERE id = 1")?;
-    ///
-    /// // 创建索引
     /// db.execute("CREATE INDEX users_email ON users(email)")?;
     /// db.execute("CREATE VECTOR INDEX docs_vec ON docs(embedding)")?;
     /// ```
-    pub fn execute(&self, sql: &str) -> Result<QueryResult> {
-        self.query(sql)
+    pub fn execute(&self, sql: &str) -> Result<StreamingQueryResult> {
+        use crate::sql::{Lexer, Parser, QueryExecutor};
+        
+        // 解析 SQL
+        let mut lexer = Lexer::new(sql);
+        let tokens = lexer.tokenize()?;
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse()?;
+        
+        // 流式执行
+        let executor = QueryExecutor::new(self.inner.clone());
+        executor.execute_streaming(statement)
     }
 
     // ============================================================================
@@ -507,6 +513,30 @@ impl Database {
                                  start: &Value, end: &Value) -> Result<Vec<RowId>> {
         self.inner.query_by_column_range(table_name, column_name, start, end)
     }
+    
+    /// 按列范围查询（精确控制边界，使用列索引）
+    ///
+    /// ## 边界语义
+    /// - `start_inclusive`: 下界是否包含（>= vs >）
+    /// - `end_inclusive`: 上界是否包含（<= vs <）
+    ///
+    /// # Examples
+    /// ```ignore
+    /// use motedb::Value;
+    ///
+    /// // 查询 id >= 100 AND id < 200 (左闭右开)
+    /// let row_ids = db.query_by_column_between(
+    ///     "users",
+    ///     "id",
+    ///     &Value::Integer(100), true,
+    ///     &Value::Integer(200), false
+    /// )?;
+    /// ```
+    pub fn query_by_column_between(&self, table_name: &str, column_name: &str,
+                                  start: &Value, start_inclusive: bool,
+                                  end: &Value, end_inclusive: bool) -> Result<Vec<RowId>> {
+        self.inner.query_by_column_between(table_name, column_name, start, start_inclusive, end, end_inclusive)
+    }
 
     /// 向量KNN搜索
     ///
@@ -676,7 +706,12 @@ impl Database {
 
     /// 更新行（底层API，推荐使用 SQL UPDATE）
     pub fn update_row(&self, table_name: &str, row_id: RowId, new_row: Row) -> Result<()> {
-        self.inner.update_row_in_table(table_name, row_id, new_row)
+        // 先获取旧行
+        let old_row = self.inner.get_table_row(table_name, row_id)?
+            .ok_or_else(|| crate::StorageError::InvalidData(
+                format!("Row {} not found in table '{}'", row_id, table_name)
+            ))?;
+        self.inner.update_row_in_table(table_name, row_id, old_row, new_row)
     }
 
     /// 更新行（使用 HashMap）
@@ -693,18 +728,29 @@ impl Database {
     /// db.update_row_map("users", 1, updated_row)?;
     /// ```
     pub fn update_row_map(&self, table_name: &str, row_id: RowId, sql_row: SqlRow) -> Result<()> {
+        // 先获取旧行
+        let old_row = self.inner.get_table_row(table_name, row_id)?
+            .ok_or_else(|| crate::StorageError::InvalidData(
+                format!("Row {} not found in table '{}'", row_id, table_name)
+            ))?;
+        
         // 获取表结构
         let schema = self.inner.get_table_schema(table_name)?;
         
         // 将 SqlRow (HashMap) 转换为 Row (Vec<Value>)
-        let row = crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)?;
+        let new_row = crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)?;
         
-        self.inner.update_row_in_table(table_name, row_id, row)
+        self.inner.update_row_in_table(table_name, row_id, old_row, new_row)
     }
 
     /// 删除行（底层API，推荐使用 SQL DELETE）
     pub fn delete_row(&self, table_name: &str, row_id: RowId) -> Result<()> {
-        self.inner.delete_row_from_table(table_name, row_id)
+        // 先获取旧行
+        let old_row = self.inner.get_table_row(table_name, row_id)?
+            .ok_or_else(|| crate::StorageError::InvalidData(
+                format!("Row {} not found in table '{}'", row_id, table_name)
+            ))?;
+        self.inner.delete_row_from_table(table_name, row_id, old_row)
     }
 
     /// 扫描表的所有行（底层API，推荐使用 SQL SELECT）

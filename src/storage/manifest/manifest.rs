@@ -31,6 +31,7 @@ pub struct Manifest {
     /// 下一个版本号
     next_version: Arc<Mutex<u64>>,
     /// Manifest 文件编号
+    #[allow(dead_code)]
     manifest_number: u64,
 }
 
@@ -164,7 +165,7 @@ impl Manifest {
             
             // 验证文件大小
             let actual_size = fs::metadata(&file_path)
-                .map_err(|e| StorageError::Io(e))?
+                .map_err(StorageError::Io)?
                 .len();
             
             if actual_size != meta.size {
@@ -303,7 +304,7 @@ mod tests {
         // 创建假的测试文件
         let sst_path = temp_dir.path().join("sstable_00001.sst");
         let ts_path = temp_dir.path().join("timestamp_idx_00001.idx");
-        let text_path = temp_dir.path().join("text_idx_00001.idx");
+        let text_path = temp_dir.path().join("text_00001.lsm");
         
         std::fs::write(&sst_path, vec![0u8; 1024]).unwrap();
         std::fs::write(&ts_path, vec![0u8; 512]).unwrap();
@@ -338,8 +339,8 @@ mod tests {
         });
         edit.add_file(FileMetadata {
             file_id: 1,
-            file_type: FileType::TextIndex,
-            path: "text_idx_00001.idx".to_string(),
+            file_type: FileType::TextIndexLSM,
+            path: "text_00001.lsm".to_string(),
             size: 256,
             checksum: text_checksum,
             min_key: None,
@@ -354,7 +355,7 @@ mod tests {
         assert_eq!(version.files.len(), 3);
         assert_eq!(version.files[&FileType::SSTable].len(), 1);
         assert_eq!(version.files[&FileType::TimestampIndex].len(), 1);
-        assert_eq!(version.files[&FileType::TextIndex].len(), 1);
+        assert_eq!(version.files[&FileType::TextIndexLSM].len(), 1);
     }
     
     #[test]

@@ -214,6 +214,12 @@ impl<'de> Deserialize<'de> for PostingList {
     }
 }
 
+impl Default for PostingList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PostingList {
     pub fn new() -> Self {
         Self {
@@ -328,7 +334,7 @@ impl PostingList {
         // For positions
         if let Some(pos) = position {
             if let Some(ref mut pos_map) = self.positions {
-                pos_map.entry(doc_id).or_insert_with(Vec::new).push(pos);
+                pos_map.entry(doc_id).or_default().push(pos);
             }
         }
         
@@ -337,12 +343,12 @@ impl PostingList {
     }
     
     /// Add multiple occurrences of a document (for term frequency)
-    pub fn add_multiple(&mut self, doc_id: DocId, count: u16, positions: Option<Vec<Position>>) {
+    pub fn add_multiple(&mut self, doc_id: DocId, _count: u16, positions: Option<Vec<Position>>) {
         self.doc_ids.insert(doc_id as u32);
         
         if let Some(pos_vec) = positions {
             if let Some(ref mut pos_map) = self.positions {
-                pos_map.entry(doc_id).or_insert_with(Vec::new).extend(pos_vec);
+                pos_map.entry(doc_id).or_default().extend(pos_vec);
             }
         }
     }
@@ -383,7 +389,7 @@ impl PostingList {
         // Merge positions
         if let (Some(ref mut self_pos), Some(ref other_pos)) = (&mut self.positions, &other.positions) {
             for (doc_id, positions) in other_pos {
-                self_pos.entry(*doc_id).or_insert_with(Vec::new).extend(positions);
+                self_pos.entry(*doc_id).or_default().extend(positions);
             }
         }
     }

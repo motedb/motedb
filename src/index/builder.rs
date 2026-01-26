@@ -1,7 +1,6 @@
 /// 统一的批量索引构建接口
 /// 
 /// 所有索引类型都实现此trait，从而统一flush时的批量构建流程
-
 use crate::types::{RowId, Row};
 use crate::error::Result;
 

@@ -261,7 +261,7 @@ impl RecoveryManager {
             match record {
                 WALRecord::Begin { txn_id, .. } => {
                     current_txn = Some(*txn_id);
-                    txn_operations.entry(*txn_id).or_insert_with(Vec::new);
+                    txn_operations.entry(*txn_id).or_default();
                 }
                 WALRecord::Commit { .. } | WALRecord::Rollback { .. } => {
                     current_txn = None;
@@ -272,7 +272,7 @@ impl RecoveryManager {
                     if let Some(txn_id) = current_txn {
                         txn_operations
                             .entry(txn_id)
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(record);
                     }
                 }
@@ -286,18 +286,18 @@ impl RecoveryManager {
                 // Process in reverse order
                 for operation in operations.iter().rev() {
                     match operation {
-                        WALRecord::Insert { row_id, .. } => {
+                        WALRecord::Insert { row_id: _, .. } => {
                             // Undo insert = delete version
                             // Note: In real implementation, should mark as deleted
                             // rather than physically remove
                             undo_count += 1;
                         }
-                        WALRecord::Update { row_id, old_data, .. } => {
+                        WALRecord::Update { row_id: _, old_data: _, .. } => {
                             // Undo update = restore old value
                             // In MVCC, we just don't make the version visible
                             undo_count += 1;
                         }
-                        WALRecord::Delete { row_id, old_data, .. } => {
+                        WALRecord::Delete { row_id: _, old_data: _, .. } => {
                             // Undo delete = re-insert old data
                             // In MVCC, restore the previous version
                             undo_count += 1;

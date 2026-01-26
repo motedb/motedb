@@ -1,19 +1,20 @@
 /// SQL Lexer - converts SQL string into tokens
-
 use super::token::{Token, TokenType};
 use crate::error::{Result, MoteDBError};
 
-pub struct Lexer {
-    input: Vec<char>,
+pub struct Lexer<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
     position: usize,
     line: usize,
     column: usize,
 }
 
-impl Lexer {
-    pub fn new(input: &str) -> Self {
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
         Self {
-            input: input.chars().collect(),
+            input,
+            bytes: input.as_bytes(),
             position: 0,
             line: 1,
             column: 1,
@@ -21,7 +22,9 @@ impl Lexer {
     }
     
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
-        let mut tokens = Vec::new();
+        // 🚀 P1.2: Pre-allocate tokens based on input size
+        let estimated_tokens = self.input.len() / 4 + 10;
+        let mut tokens = Vec::with_capacity(estimated_tokens);
         
         loop {
             let token = self.next_token()?;
@@ -195,13 +198,14 @@ impl Lexer {
         if self.is_eof() {
             '\0'
         } else {
-            self.input[self.position]
+            // 🚀 P1.1: Direct byte access (O(1))
+            self.bytes[self.position] as char
         }
     }
     
     fn peek_char(&self) -> Option<char> {
-        if self.position + 1 < self.input.len() {
-            Some(self.input[self.position + 1])
+        if self.position + 1 < self.bytes.len() {
+            Some(self.bytes[self.position + 1] as char)
         } else {
             None
         }
@@ -209,7 +213,7 @@ impl Lexer {
     
     fn advance(&mut self) {
         if !self.is_eof() {
-            if self.input[self.position] == '\n' {
+            if self.bytes[self.position] == b'\n' {
                 self.line += 1;
                 self.column = 1;
             } else {
@@ -220,7 +224,7 @@ impl Lexer {
     }
     
     fn is_eof(&self) -> bool {
-        self.position >= self.input.len()
+        self.position >= self.bytes.len()
     }
     
     fn skip_whitespace(&mut self) {
@@ -331,7 +335,7 @@ impl Lexer {
         
         // Check if it's a keyword
         TokenType::from_keyword(&value)
-            .unwrap_or_else(|| TokenType::Identifier(value))
+            .unwrap_or(TokenType::Identifier(value))
     }
 }
 

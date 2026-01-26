@@ -9,7 +9,7 @@
 //!   motedb-cli --help             - 显示帮助信息
 
 use motedb::*;
-use motedb::sql::execute_sql;
+use motedb::sql::{Lexer, Parser, QueryExecutor};  // ✅ 使用流式 API
 use std::env;
 use std::io::{self, Write, BufRead};
 use std::sync::Arc;
@@ -193,7 +193,18 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
             // 执行 SQL
             let sql = multiline_sql.trim_end_matches(';').trim();
             
-            match execute_sql(db.clone(), sql) {
+            // ✅ 使用流式 API 并物化
+            let result = (|| -> Result<_> {
+                let mut lexer = Lexer::new(sql);
+                let tokens = lexer.tokenize()?;
+                let mut parser = Parser::new(tokens);
+                let statement = parser.parse()?;
+                let executor = QueryExecutor::new(db.clone());
+                let streaming_result = executor.execute_streaming(statement)?;
+                streaming_result.materialize()
+            })();
+            
+            match result {
                 Ok(result) => {
                     display_result(result);
                 }
@@ -219,8 +230,15 @@ fn execute_single_sql(db_path: Option<PathBuf>, sql: &str) -> Result<()> {
         MoteDB::create(&path)?
     });
     
-    // 执行 SQL
-    let result = execute_sql(db, sql)?;
+    // ✅ 使用流式 API 并物化
+    let mut lexer = Lexer::new(sql);
+    let tokens = lexer.tokenize()?;
+    let mut parser = Parser::new(tokens);
+    let statement = parser.parse()?;
+    let executor = QueryExecutor::new(db);
+    let streaming_result = executor.execute_streaming(statement)?;
+    let result = streaming_result.materialize()?;
+    
     display_result(result);
     
     Ok(())

@@ -333,7 +333,7 @@ impl FreshDiskANNIndex {
             id_to_idx.insert(*id, idx);
         }
         
-        let medoid_idx = *id_to_idx.get(&medoid).ok_or_else(|| {
+        let _medoid_idx = *id_to_idx.get(&medoid).ok_or_else(|| {
             crate::error::StorageError::InvalidData("Medoid not found".into())
         })?;
         
@@ -854,7 +854,7 @@ impl FreshDiskANNIndex {
         
         // 如果结果不够，使用随机节点补充
         if result.len() < search_list_size {
-            for (idx, (id, node)) in nodes.iter().enumerate() {
+            for (id, node) in nodes.iter() {
                 if *id == exclude_id || visited.contains(id) {
                     continue;
                 }
@@ -878,7 +878,7 @@ impl FreshDiskANNIndex {
     /// Phase 7: RobustPrune 算法（多样性邻居选择）
     fn robust_prune(
         &self,
-        query: &[f32],
+        _query: &[f32],
         mut candidates: Vec<(RowId, f32)>,
         max_degree: usize,
         alpha: f32, // 多样性参数
@@ -924,7 +924,7 @@ impl FreshDiskANNIndex {
     }
     
     /// Phase 10: 两轮图优化（增大参数 + RobustPrune）
-    fn rebuild_graph_phase10(&self, nodes: Vec<(RowId, VectorNode)>, medoid: RowId, anchor_points: &[RowId]) -> Result<Vec<(RowId, VectorNode)>> {
+    fn rebuild_graph_phase10(&self, nodes: Vec<(RowId, VectorNode)>, _medoid: RowId, anchor_points: &[RowId]) -> Result<Vec<(RowId, VectorNode)>> {
         // 🔥 Phase 10: 增大 max_degree 到 128
         let max_degree = 128;
         let search_list_size = 1000; // 增大到 1000
@@ -1305,7 +1305,7 @@ impl FreshDiskANNIndex {
         println!("[FreshDiskANN] Selected medoid: {}", medoid);
         
         // 1.3 使用贪婪搜索构建邻居连接
-        let R = self.config.fresh_config.max_degree;
+        let r = self.config.fresh_config.max_degree;
         let _alpha = 1.2; // Vamana的alpha参数
         
         for (row_id, query_vec) in vectors {
@@ -1323,9 +1323,9 @@ impl FreshDiskANNIndex {
                 }
             }
             
-            // 排序并取top-R
+            // 排序并取top-r
             candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            candidates.truncate(R);
+            candidates.truncate(r);
             
             // 添加邻居
             if let Some(node) = graph_data.get_mut(row_id) {

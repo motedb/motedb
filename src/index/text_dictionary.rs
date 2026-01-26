@@ -23,9 +23,6 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Chunk size: number of entries per chunk
-const CHUNK_SIZE: usize = 10_000;
-
 /// Default cache size: number of chunks to keep in memory
 const DEFAULT_CACHE_SIZE: usize = 16;
 
@@ -191,10 +188,8 @@ impl ChunkedDictionary {
             if let Some(chunk) = cache.peek(&chunk_id) {
                 if let Some(term_id) = chunk.get(token) {
                     return Some(term_id);
-                } else {
-                }
-            } else {
-            }
+                } 
+            } 
         }
         
         // Slow path: Try to promote to cache (use get to update LRU)
@@ -203,7 +198,6 @@ impl ChunkedDictionary {
             if let Some(chunk) = cache.get(&chunk_id) {
                 let result = chunk.get(token);
                 return result;
-            } else {
             }
         }
         
@@ -297,7 +291,7 @@ impl ChunkedDictionary {
         
         
         // Check chunk index for prefix match
-        if let Some(prefix) = token.chars().take(2).collect::<String>().is_empty().then(|| token) {
+        if let Some(prefix) = token.chars().take(2).collect::<String>().is_empty().then_some(token) {
             if let Some(&chunk_id) = meta.chunk_index.get(prefix) {
                 return chunk_id;
             }
@@ -305,8 +299,8 @@ impl ChunkedDictionary {
         
         // Use simple hash-based distribution
         let hash = self.hash_token(token);
-        let result = hash % meta.num_chunks.max(1);
-        result
+        
+        hash % meta.num_chunks.max(1)
     }
     
     /// Simple hash function for token
@@ -356,7 +350,6 @@ impl ChunkedDictionary {
                     self.load_chunk(chunk_id)
                         .unwrap_or_else(|_| DictionaryChunk::new(chunk_id))
                 );
-            } else {
             }
         }
         

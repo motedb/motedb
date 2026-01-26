@@ -51,7 +51,7 @@ impl MoteDB {
             };
             
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-            let table_hash = (composite_key >> 32) as u64;
+            let table_hash = composite_key >> 32;
             
             let row: Row = match bincode::deserialize(row_bytes) {
                 Ok(r) => r,
@@ -64,7 +64,7 @@ impl MoteDB {
             let table_name = self.find_table_name_by_hash(table_hash)?;
             
             tables_data.entry(table_name)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((row_id, row));
         }
         
@@ -121,7 +121,7 @@ impl MoteDB {
         for table_name in tables {
             let mut hasher = DefaultHasher::new();
             table_name.hash(&mut hasher);
-            let computed_hash = (hasher.finish() & 0xFFFFFFFF) as u64;
+            let computed_hash = hasher.finish() & 0xFFFFFFFF;
             
             if computed_hash == table_hash {
                 self.table_hash_cache.insert(table_name.clone(), computed_hash);

@@ -6,7 +6,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Arc;
-use crate::{MoteDB, Result};
+use crate::MoteDB;
 
 /// 不透明指针类型
 pub struct MoteDBHandle {
@@ -69,7 +69,20 @@ pub unsafe extern "C" fn motedb_execute(
         Err(_) => return ptr::null_mut(),
     };
     
-    match crate::sql::execute_sql(handle.db.clone(), sql_str) {
+    // ✅ 使用流式 API 并立即物化
+    use crate::sql::{Lexer, Parser, QueryExecutor};
+    
+    let result = (|| -> crate::Result<_> {
+        let mut lexer = Lexer::new(sql_str);
+        let tokens = lexer.tokenize()?;
+        let mut parser = Parser::new(tokens);
+        let statement = parser.parse()?;
+        let executor = QueryExecutor::new(handle.db.clone());
+        let streaming_result = executor.execute_streaming(statement)?;
+        streaming_result.materialize()
+    })();
+    
+    match result {
         Ok(result) => {
             let json = format!("{:?}", result);
             match CString::new(json) {

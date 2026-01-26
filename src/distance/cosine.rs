@@ -2,7 +2,6 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-use std::sync::OnceLock;
 
 /// CPU feature detection cache (initialized once at startup)
 #[cfg(target_arch = "x86_64")]

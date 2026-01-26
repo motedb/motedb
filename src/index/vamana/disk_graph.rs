@@ -73,7 +73,7 @@ impl DiskGraph {
         cache_capacity: usize,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
-        std::fs::create_dir_all(data_dir).map_err(|e| StorageError::Io(e))?;
+        std::fs::create_dir_all(data_dir).map_err(StorageError::Io)?;
         
         let file_path = data_dir.join("graph.bin");
         let mut file = OpenOptions::new()
@@ -82,7 +82,7 @@ impl DiskGraph {
             .write(true)
             .truncate(true)
             .open(&file_path)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
         
         Self::write_header(&mut file, max_degree, 0)?;
         
@@ -113,7 +113,7 @@ impl DiskGraph {
             .read(true)
             .write(true)
             .open(&file_path)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
         
         let (max_degree, node_count) = Self::read_header(&mut file)?;
         let (index, next_offset) = Self::build_index(&mut file, node_count)?;
@@ -378,7 +378,7 @@ impl DiskGraph {
         {
             let mut file = self.file.write();
             Self::write_header(&mut file, self.max_degree, node_count)?;
-            file.sync_all().map_err(|e| StorageError::Io(e))?;
+            file.sync_all().map_err(StorageError::Io)?;
         }
         
         *self.dirty.write() = false;
@@ -397,7 +397,7 @@ impl DiskGraph {
                 .write(true)
                 .truncate(true)
                 .open(&temp_path)
-                .map_err(|e| StorageError::Io(e))?;
+                .map_err(StorageError::Io)?;
             
             let index = self.index.read();
             Self::write_header(&mut temp_file, self.max_degree, index.len())?;
@@ -410,13 +410,13 @@ impl DiskGraph {
                 
                 // Write to temp file
                 temp_file.write_all(&node_id.to_le_bytes())
-                    .map_err(|e| StorageError::Io(e))?;
+                    .map_err(StorageError::Io)?;
                 temp_file.write_all(&(neighbors.len() as u32).to_le_bytes())
-                    .map_err(|e| StorageError::Io(e))?;
+                    .map_err(StorageError::Io)?;
                 
                 for &neighbor in neighbors.iter() {  // ✅ P1: Arc deref via iter()
                     temp_file.write_all(&neighbor.to_le_bytes())
-                        .map_err(|e| StorageError::Io(e))?;
+                        .map_err(StorageError::Io)?;
                 }
                 
                 new_index.insert(node_id, offset);
@@ -425,7 +425,7 @@ impl DiskGraph {
                 offset += record_size as u64;
             }
             
-            temp_file.sync_all().map_err(|e| StorageError::Io(e))?;
+            temp_file.sync_all().map_err(StorageError::Io)?;
             
             drop(index);
             *self.index.write() = new_index;
@@ -434,13 +434,13 @@ impl DiskGraph {
         
         // Replace file
         std::fs::rename(&temp_path, &self.file_path)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
         
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&self.file_path)
-            .map_err(|e| StorageError::Io(e))?;
+            .map_err(StorageError::Io)?;
         
         *self.file.write() = file;
         *self.dirty.write() = false;
@@ -472,34 +472,34 @@ impl DiskGraph {
     // --- Private helpers ---
     
     fn write_header(file: &mut File, max_degree: usize, node_count: usize) -> Result<()> {
-        file.seek(SeekFrom::Start(0)).map_err(|e| StorageError::Io(e))?;
+        file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
         
-        file.write_all(&MAGIC.to_le_bytes()).map_err(|e| StorageError::Io(e))?;
-        file.write_all(&VERSION.to_le_bytes()).map_err(|e| StorageError::Io(e))?;
-        file.write_all(&(max_degree as u32).to_le_bytes()).map_err(|e| StorageError::Io(e))?;
-        file.write_all(&(node_count as u32).to_le_bytes()).map_err(|e| StorageError::Io(e))?;
+        file.write_all(&MAGIC.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&VERSION.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&(max_degree as u32).to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&(node_count as u32).to_le_bytes()).map_err(StorageError::Io)?;
         
         Ok(())
     }
     
     fn read_header(file: &mut File) -> Result<(usize, usize)> {
-        file.seek(SeekFrom::Start(0)).map_err(|e| StorageError::Io(e))?;
+        file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
         
         let mut buf = [0u8; 4];
         
-        file.read_exact(&mut buf).map_err(|e| StorageError::Io(e))?;
+        file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let magic = u32::from_le_bytes(buf);
         if magic != MAGIC {
             return Err(StorageError::InvalidData("Invalid graph file".to_string()));
         }
         
-        file.read_exact(&mut buf).map_err(|e| StorageError::Io(e))?;
+        file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let _version = u32::from_le_bytes(buf);
         
-        file.read_exact(&mut buf).map_err(|e| StorageError::Io(e))?;
+        file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let max_degree = u32::from_le_bytes(buf) as usize;
         
-        file.read_exact(&mut buf).map_err(|e| StorageError::Io(e))?;
+        file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let node_count = u32::from_le_bytes(buf) as usize;
         
         Ok((max_degree, node_count))
@@ -508,13 +508,13 @@ impl DiskGraph {
     fn write_neighbors_at(&self, node_id: RowId, neighbors: &[RowId], offset: u64) -> Result<()> {
         let mut file = self.file.write();
         
-        file.seek(SeekFrom::Start(offset)).map_err(|e| StorageError::Io(e))?;
+        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
         
-        file.write_all(&node_id.to_le_bytes()).map_err(|e| StorageError::Io(e))?;
-        file.write_all(&(neighbors.len() as u32).to_le_bytes()).map_err(|e| StorageError::Io(e))?;
+        file.write_all(&node_id.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&(neighbors.len() as u32).to_le_bytes()).map_err(StorageError::Io)?;
         
         for &neighbor in neighbors {
-            file.write_all(&neighbor.to_le_bytes()).map_err(|e| StorageError::Io(e))?;
+            file.write_all(&neighbor.to_le_bytes()).map_err(StorageError::Io)?;
         }
         
         Ok(())
@@ -523,21 +523,21 @@ impl DiskGraph {
     fn read_neighbors_at(&self, offset: u64) -> Result<Vec<RowId>> {
         let mut file = self.file.write();
         
-        file.seek(SeekFrom::Start(offset)).map_err(|e| StorageError::Io(e))?;
+        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
         
         // Read node_id
         let mut buf8 = [0u8; 8];
-        file.read_exact(&mut buf8).map_err(|e| StorageError::Io(e))?;
+        file.read_exact(&mut buf8).map_err(StorageError::Io)?;
         
         // Read neighbor count
         let mut buf4 = [0u8; 4];
-        file.read_exact(&mut buf4).map_err(|e| StorageError::Io(e))?;
+        file.read_exact(&mut buf4).map_err(StorageError::Io)?;
         let count = u32::from_le_bytes(buf4) as usize;
         
         // Read neighbors
         let mut neighbors = Vec::with_capacity(count);
         for _ in 0..count {
-            file.read_exact(&mut buf8).map_err(|e| StorageError::Io(e))?;
+            file.read_exact(&mut buf8).map_err(StorageError::Io)?;
             neighbors.push(u64::from_le_bytes(buf8));
         }
         
@@ -548,22 +548,22 @@ impl DiskGraph {
         let mut index = HashMap::with_capacity(node_count);
         let mut offset = HEADER_SIZE;
         
-        file.seek(SeekFrom::Start(offset)).map_err(|e| StorageError::Io(e))?;
+        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
         
         for _ in 0..node_count {
             let mut buf8 = [0u8; 8];
-            file.read_exact(&mut buf8).map_err(|e| StorageError::Io(e))?;
+            file.read_exact(&mut buf8).map_err(StorageError::Io)?;
             let node_id = u64::from_le_bytes(buf8);
             
             let mut buf4 = [0u8; 4];
-            file.read_exact(&mut buf4).map_err(|e| StorageError::Io(e))?;
+            file.read_exact(&mut buf4).map_err(StorageError::Io)?;
             let neighbor_count = u32::from_le_bytes(buf4) as usize;
             
             index.insert(node_id, offset);
             
             // Skip neighbors
             file.seek(SeekFrom::Current((neighbor_count * 8) as i64))
-                .map_err(|e| StorageError::Io(e))?;
+                .map_err(StorageError::Io)?;
             
             let record_size = 8 + 4 + (neighbor_count * 8);
             offset += record_size as u64;

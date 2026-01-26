@@ -217,13 +217,11 @@ impl TextFTSIndex {
             
             for token in tokens {
                 let term_id = self.dictionary.get_or_insert(&token.text);
-                term_docs.entry(term_id).or_insert_with(Vec::new).push(doc_id);
+                term_docs.entry(term_id).or_default().push(doc_id);
             }
         }
-        let t1_elapsed = t1.elapsed();
         
         // 2. Accumulate in pending buffer
-        let t2 = Instant::now();
         let mut pending = self.pending_posting_lists.write();
         
         for (term_id, doc_ids) in term_docs {
@@ -236,7 +234,6 @@ impl TextFTSIndex {
             }
         }
         
-        let global_pending_count = pending.len();
         drop(pending);
         
         // Accumulate doc_lengths in memory
@@ -244,27 +241,15 @@ impl TextFTSIndex {
         pending_doc_lens.extend(doc_lengths_batch);
         drop(pending_doc_lens);
         
-        let t2_elapsed = t2.elapsed();
-        
         // 3. Update statistics
-        let t3 = Instant::now();
         self.total_docs += docs.len() as u64;
         self.total_tokens += batch_token_count;
         
         if self.total_docs > 0 {
             self.avg_doc_length = self.total_tokens as f32 / self.total_docs as f32;
         }
-        let t3_elapsed = t3.elapsed();
         
-        let total_elapsed = batch_start.elapsed();
-        
-        debug_log!("    [INSERT TIMING] Total: {:.3}s | Tokenize: {:.3}s | Pending: {:.3}s | Stats: {:.3}s | GlobalPendingTerms: {}",
-            total_elapsed.as_secs_f64(),
-            t1_elapsed.as_secs_f64(),
-            t2_elapsed.as_secs_f64(),
-            t3_elapsed.as_secs_f64(),
-            global_pending_count
-        );
+        // debug_log disabled for Phase A optimization
         
         Ok(())
     }
@@ -380,7 +365,7 @@ impl TextFTSIndex {
         let mut term_docs: HashMap<TermId, Vec<DocId>> = HashMap::new();
         for token in new_tokens {
             let term_id = self.dictionary.get_or_insert(&token.text);
-            term_docs.entry(term_id).or_insert_with(Vec::new).push(doc_id);
+            term_docs.entry(term_id).or_default().push(doc_id);
         }
         
         // Update pending posting lists
@@ -596,9 +581,7 @@ impl TextFTSIndex {
         
         // 🔧 OPTIMIZATION: Use std::mem::take instead of clone (saves ~600KB copy)
         let pending_data = std::mem::take(&mut *pending);
-        let pending_count = pending_data.len();
         drop(pending);
-        let t1_elapsed = t1.elapsed();
         
         // 2. Write to BTree (one segment per term per flush)
         let t2 = Instant::now();
@@ -618,13 +601,13 @@ impl TextFTSIndex {
         }
         
         drop(shard_counters);
-        let t2_elapsed = t2.elapsed();
+        let _t2_elapsed = t2.elapsed();
         
         // 3. Flush BTree
         let t3 = Instant::now();
         btree.flush()?;
         drop(btree);
-        let t3_elapsed = t3.elapsed();
+        let _t3_elapsed = t3.elapsed();
         
         // 4. Clear pending buffer is already done by std::mem::take
         let t4 = Instant::now();
@@ -641,36 +624,26 @@ impl TextFTSIndex {
             shard_counters.retain(|term_id, _| pending_terms.contains(term_id));
         }
         
-        let t4_elapsed = t4.elapsed();
+        let _t4_elapsed = t4.elapsed();
         
         // 5. Write doc_lengths (batched - only every N flushes to reduce I/O)
         let t5 = Instant::now();
         self.flush_doc_lengths_if_needed(false)?;
-        let t5_elapsed = t5.elapsed();
+        let _t5_elapsed = t5.elapsed();
         
         // 6. Save dictionary
         let t6 = Instant::now();
         self.dictionary.flush()?;
-        let t6_elapsed = t6.elapsed();
+        let _t6_elapsed = t6.elapsed();
         
         // 7. Save metadata
         let t7 = Instant::now();
         self.save_metadata()?;
-        let t7_elapsed = t7.elapsed();
+        let _t7_elapsed = t7.elapsed();
         
-        let total_elapsed = flush_start.elapsed();
+        let _total_elapsed = flush_start.elapsed();
         
-        debug_log!("    [FLUSH TIMING] Total: {:.3}s | Terms: {} | Clone: {:.3}s | BTree-Write: {:.3}s | BTree-Flush: {:.3}s | Clear: {:.3}s | DocLen: {:.3}s | Dict: {:.3}s | Meta: {:.3}s",
-            total_elapsed.as_secs_f64(),
-            pending_count,
-            t1_elapsed.as_secs_f64(),
-            t2_elapsed.as_secs_f64(),
-            t3_elapsed.as_secs_f64(),
-            t4_elapsed.as_secs_f64(),
-            t5_elapsed.as_secs_f64(),
-            t6_elapsed.as_secs_f64(),
-            t7_elapsed.as_secs_f64()
-        );
+        // debug_log disabled for Phase A optimization
         
         Ok(())
     }
