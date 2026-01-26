@@ -1325,7 +1325,7 @@ impl MoteDB {
     /// Detect continuous segments in sorted row_ids
     /// 
     /// ## Example
-    /// ```
+    /// ```text
     /// Input:  [100, 101, 102, 105, 106, 200, 201, 202]
     /// Output: [[100,101,102], [105,106], [200,201,202]]
     /// ```
@@ -1366,7 +1366,7 @@ impl MoteDB {
 /// - Deserializing 5/10 columns: 2x faster (400µs → 200µs)
 /// 
 /// ## How it works
-/// ```
+/// ```text
 /// Row format: Vec<Value> = [val1, val2, val3, ...]
 /// 
 /// For each column:
