@@ -200,10 +200,10 @@ impl TextFTSIndex {
             }
         }
         
-        let batch_start = Instant::now();
+        let _batch_start = Instant::now();
         
         // 1. Tokenization phase
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
         let mut batch_token_count = 0u64;
         
         // Build per-term doc lists (lightweight intermediate structure)
@@ -564,7 +564,7 @@ impl TextFTSIndex {
         let flush_start = Instant::now();
         
         // 1. Get pending posting lists (use take to avoid clone)
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
         let mut pending = self.pending_posting_lists.write();
         let is_empty = pending.is_empty();
         

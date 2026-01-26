@@ -66,6 +66,9 @@ rand = "0.8"
 rayon = "1.8"
 dashmap = "6.1.0"  # Concurrent HashMap
 
+# Perfect hash map for O(1) keyword lookup (used by: SQL lexer)
+phf = { version = "0.11", features = ["macros"] }
+
 # 🔌 Optional dependencies: Tokenizer plugins (feature-gated)
 jieba-rs = { version = "0.7", optional = true }
 
@@ -95,6 +98,8 @@ tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
 # 🔍 内存分析（用于性能调优）
 mem-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+# ⚡ 数据并行化（可选，已包含在 dependencies 中）
+rayon = []  # 启用 Rayon 并行处理
 
 [profile.release]
 opt-level = 3  # 🚀 优化性能（3 = 最快，z = 最小）
