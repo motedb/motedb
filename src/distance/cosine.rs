@@ -3,6 +3,9 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "x86_64")]
+use std::sync::OnceLock;
+
 /// CPU feature detection cache (initialized once at startup)
 #[cfg(target_arch = "x86_64")]
 static CPU_FEATURES: OnceLock<CpuFeatures> = OnceLock::new();
@@ -167,10 +170,6 @@ unsafe fn cosine_similarity_sse(a: &[f32], b: &[f32]) -> f32 {
     let chunks = n / 4;
     let remainder = n % 4;
     
-    let mut dot_product = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    
     // SSE并行处理4个元素
     let mut dot_sum = _mm_setzero_ps();
     let mut norm_a_sum = _mm_setzero_ps();
@@ -189,9 +188,9 @@ unsafe fn cosine_similarity_sse(a: &[f32], b: &[f32]) -> f32 {
     }
     
     // 水平求和
-    dot_product = horizontal_sum_sse(dot_sum);
-    norm_a = horizontal_sum_sse(norm_a_sum);
-    norm_b = horizontal_sum_sse(norm_b_sum);
+    let mut dot_product = horizontal_sum_sse(dot_sum);
+    let mut norm_a = horizontal_sum_sse(norm_a_sum);
+    let mut norm_b = horizontal_sum_sse(norm_b_sum);
     
     // 处理剩余元素
     for i in (n - remainder)..n {
