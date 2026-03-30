@@ -5,12 +5,14 @@
 //! - Index type tracking (Column/Vector/Text/Spatial)
 //! - Table/column relationships
 //! - Persistent metadata storage
+//! - Stale marking for indexes that failed to update
 
 use crate::{Result, StorageError};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Index type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -26,18 +28,23 @@ pub enum IndexType {
 pub struct IndexMetadata {
     /// Index name (user-specified or auto-generated)
     pub name: String,
-    
+
     /// Table name
     pub table_name: String,
-    
+
     /// Column name
     pub column_name: String,
-    
+
     /// Index type
     pub index_type: IndexType,
-    
+
     /// Creation timestamp
     pub created_at: u64,
+
+    /// Whether this index is stale (out-of-sync with data).
+    /// Set when an index update fails; cleared on successful rebuild.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl IndexMetadata {
@@ -46,13 +53,14 @@ impl IndexMetadata {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        
+
         Self {
             name,
             table_name,
             column_name,
             index_type,
             created_at,
+            stale: false,
         }
     }
 }
@@ -167,6 +175,45 @@ impl IndexRegistry {
                 format!("{}_{}", table_name, column_name)
             }
         }
+    }
+
+    /// Mark an index as stale (out-of-sync with data).
+    /// Called when an index update fails during insert/update/delete.
+    /// Stale indexes will be skipped during queries until rebuilt.
+    pub fn mark_stale(&self, index_name: &str) {
+        if let Some(mut entry) = self.indexes.get_mut(index_name) {
+            entry.stale = true;
+        }
+        // Best-effort persist (ignore error — will be retried on next save)
+        let _ = self.save();
+    }
+
+    /// Check whether an index is stale.
+    /// Returns `true` if the index exists and is marked stale.
+    /// Returns `false` if the index doesn't exist (not an error — just not tracked).
+    pub fn is_stale(&self, index_name: &str) -> bool {
+        self.indexes.get(index_name)
+            .map(|e| e.stale)
+            .unwrap_or(false)
+    }
+
+    /// Clear stale flag for an index (after successful rebuild).
+    pub fn clear_stale(&self, index_name: &str) {
+        if let Some(mut entry) = self.indexes.get_mut(index_name) {
+            entry.stale = false;
+        }
+        let _ = self.save();
+    }
+
+    /// List all stale indexes for a table (useful during checkpoint rebuild).
+    pub fn list_stale_indexes(&self, table_name: &str) -> Vec<IndexMetadata> {
+        self.indexes.iter()
+            .filter(|entry| {
+                let meta = entry.value();
+                meta.table_name == table_name && meta.stale
+            })
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 }
 

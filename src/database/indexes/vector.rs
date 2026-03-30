@@ -80,14 +80,22 @@ impl MoteDB {
                                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
                                 
                                 // 反序列化行数据
-                                let data_bytes = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                                    crate::storage::lsm::ValueData::Blob(_) => continue,
+                                let data_bytes: Vec<u8> = match &value.data {
+                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                        match self.lsm_engine.resolve_blob(blob_ref) {
+                                            Ok(data) => data,
+                                            Err(e) => {
+                                                eprintln!("[create_vector_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                                continue;
+                                            }
+                                        }
+                                    }
                                 };
-                                
-                                if let Ok(row) = bincode::deserialize::<Row>(data_bytes) {
+
+                                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
                                     if let Some(crate::types::Value::Vector(vec_data)) = row.get(col_position) {
-                                        vectors_to_index.push((row_id, vec_data.clone()));
+                                        vectors_to_index.push((row_id, vec_data.to_vec()));
                                     }
                                 }
                             }

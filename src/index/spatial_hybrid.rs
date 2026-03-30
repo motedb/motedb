@@ -64,7 +64,7 @@ const MAX_RTREE_ENTRIES: usize = 256;  // 每个 cell 最多 256 条
 const DEFAULT_GRID_SIZE: usize = 32;  // 32x32=1024 cells，每个 cell 平均 ~290 条数据
 const DEFAULT_CACHE_SIZE: usize = 128;  // 缓存 128 个热点 cells
 const ADAPTIVE_THRESHOLD: f32 = 0.95;  // 提高到 95%，极少扩展
-const AUTO_FLUSH_THRESHOLD: usize = 5000;
+const AUTO_FLUSH_THRESHOLD: usize = 2000;  // 🚀 P0: 统一与LSM一致，保证数据一致性
 
 /// Configuration for hybrid spatial index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,20 +708,44 @@ impl CellStorage {
     }
     
     /// Flush all dirty cells to mmap
+    /// 
+    /// 🚀 P2 OPTIMIZATION: Avoid cloning RTree by pre-serializing
     fn flush(&mut self) -> Result<()> {
-        // 1. 先写入所有 dirty cells
-        let dirty_cells: Vec<_> = self.hot_cache.iter()
-            .filter(|(_, tree)| tree.is_dirty)
-            .map(|(id, _)| *id)
-            .collect();
+        // 1. 收集 dirty cell IDs 并立即序列化（避免clone大树）
+        let mut serialized_cells = Vec::new();
         
-        for cell_id in dirty_cells {
-            if let Some(tree) = self.hot_cache.get(&cell_id) {
-                // Clone to avoid borrow conflict
-                let tree_clone = tree.clone();
-                self.write_to_mmap(cell_id, &tree_clone)?;
+        for (cell_id, tree) in self.hot_cache.iter() {
+            if tree.is_dirty {
+                // ✅ 直接序列化引用（无需clone整个树）
+                let serialized = bincode::serialize(&*tree)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 
-                // Mark as clean
+                let data = if self.config.enable_compression {
+                    snap::raw::Encoder::new()
+                        .compress_vec(&serialized)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?
+                } else {
+                    serialized
+                };
+                
+                serialized_cells.push((*cell_id, data));
+            }
+        }
+        
+        // 2. 写入mmap（不再持有hot_cache的借用）
+        if let Some(ref mut mmap) = self.mmap_file {
+            for (cell_id, data) in serialized_cells {
+                let size = data.len() as u32;
+                let offset = self.next_offset;
+                
+                // Write to mmap
+                if (offset + size as u64) as usize <= mmap.len() {
+                    mmap[offset as usize..(offset + size as u64) as usize].copy_from_slice(&data);
+                    self.cell_offsets.insert(cell_id, (offset, size));
+                    self.next_offset += size as u64;
+                }
+                
+                // 标记为clean
                 if let Some(tree) = self.hot_cache.get_mut(&cell_id) {
                     tree.is_dirty = false;
                 }
@@ -738,13 +762,23 @@ impl CellStorage {
         
         while self.hot_cache.len() > target_size {
             // Pop LRU (最少使用的)
-            if let Some((cell_id, tree)) = self.hot_cache.pop_lru() {
+            if let Some((cell_id, mut tree)) = self.hot_cache.pop_lru() {
+                // 🚀 P0 FIX: 释放Vec capacity，防止内存泄漏
+                tree.entries.shrink_to_fit();
+                
                 // 确保已写入 mmap
                 if !self.cell_offsets.contains_key(&cell_id) && self.mmap_file.is_some() {
                     let _ = self.write_to_mmap(cell_id, &tree);
                 }
             } else {
                 break;
+            }
+        }
+        
+        // 🚀 P0 FIX: 剩余cache中的tree也要shrink（如果capacity过大）
+        for (_cell_id, tree) in self.hot_cache.iter_mut() {
+            if tree.entries.capacity() > tree.entries.len() * 2 {
+                tree.entries.shrink_to_fit();
             }
         }
         

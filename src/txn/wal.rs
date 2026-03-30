@@ -64,12 +64,13 @@ pub enum WALRecord {
         new_data: Row,
     },
     
-    /// Delete operation: (table_name, row_id, partition_id, old_data)
+    /// Delete operation: (table_name, row_id, partition_id, old_data, timestamp)
     Delete {
         table_name: String,  // ⭐ 添加 table_name
         row_id: RowId,
         partition: PartitionId,
         old_data: Row,  // For undo during rollback
+        timestamp: u64, // Microseconds since UNIX epoch — used for LSM tombstone
     },
     
     /// Transaction begin marker
@@ -608,16 +609,18 @@ impl WALManager {
     /// Log a delete operation
     pub fn log_delete(
         &self,
-        table_name: &str,  // ⭐ 添加 table_name 参数
+        table_name: &str,
         partition: PartitionId,
         row_id: RowId,
         old_data: Row,
+        timestamp: u64,
     ) -> Result<LogSequenceNumber> {
         let record = WALRecord::Delete {
             table_name: table_name.to_string(),
             row_id,
             partition,
             old_data,
+            timestamp,
         };
         
         let mut partitions = self.partitions.write();
@@ -853,7 +856,7 @@ mod tests {
         let wal = WALManager::create(temp_dir.path(), 2).unwrap();
         
         let old_data = vec![Value::Null];
-        let lsn = wal.log_delete("test_table", 0, 1, old_data.clone()).unwrap();
+        let lsn = wal.log_delete("test_table", 0, 1, old_data.clone(), 12345).unwrap();
         
         assert_eq!(lsn, 0);
         
@@ -937,7 +940,7 @@ mod tests {
             
             // T3: Begin, Delete, Commit
             wal.log_begin(0, 3, 2).unwrap();
-            wal.log_delete("test_table", 0, 100, vec![Value::Null]).unwrap();
+            wal.log_delete("test_table", 0, 100, vec![Value::Null], 12345).unwrap();
             wal.log_commit(0, 3, 2000).unwrap();
         }
         
@@ -1052,7 +1055,7 @@ mod tests {
         // T3
         let records3 = vec![
             WALRecord::Begin { txn_id: 3, isolation_level: 2 },
-            WALRecord::Delete { table_name: "test_table".to_string(), row_id: 100, partition: 0, old_data: vec![Value::Null] },
+            WALRecord::Delete { table_name: "test_table".to_string(), row_id: 100, partition: 0, old_data: vec![Value::Null], timestamp: 0 },
             WALRecord::Rollback { txn_id: 3 },
         ];
         wal.batch_append(0, records3).unwrap();

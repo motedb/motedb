@@ -70,6 +70,18 @@ struct Footer {
 }
 
 impl SSTable {
+    /// Read only metadata from an SSTable file (without loading index/bloom)
+    /// Used during startup to discover existing SSTables.
+    pub fn read_metadata<P: AsRef<Path>>(path: P) -> Result<(u64, u64, u64)> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(path)?;
+        let footer = Self::read_footer(&mut file)?;
+        let file_size = file.metadata()?.len();
+        Ok((footer.num_entries, footer.min_timestamp, file_size))
+    }
+
     /// Open an existing SSTable
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -269,15 +281,28 @@ impl SSTable {
     fn read_footer(file: &mut File) -> Result<Footer> {
         let file_size = file.metadata()?.len();
         if file_size < 64 {
-            return Err(StorageError::InvalidData("File too small".into()));
+            return Err(StorageError::InvalidData("SSTable file too small".into()));
         }
-        
+
         // Footer is last 64 bytes
         file.seek(SeekFrom::End(-64))?;
         let mut buf = [0u8; 64];
         file.read_exact(&mut buf)?;
-        
-        Footer::deserialize(&buf)
+
+        let footer = Footer::deserialize(&buf)?;
+
+        // Validate that index and bloom regions fall within file bounds
+        let data_end = file_size - 64; // footer occupies last 64 bytes
+        let index_end = footer.index_offset + footer.index_size as u64;
+        let bloom_end = footer.bloom_offset + footer.bloom_size as u64;
+        if index_end > data_end || bloom_end > data_end {
+            return Err(StorageError::InvalidData(
+                format!("SSTable footer points beyond file: index_end={}, bloom_end={}, data_end={}",
+                        index_end, bloom_end, data_end)
+            ));
+        }
+
+        Ok(footer)
     }
 }
 
@@ -316,18 +341,22 @@ pub struct SSTableBuilder {
 
 impl SSTableBuilder {
     /// Create a new SSTable builder
+    ///
+    /// Writes to a `.sst.tmp` file first for crash safety; `finish()` atomically
+    /// renames it to the final path.
     pub fn new<P: AsRef<Path>>(path: P, config: LSMConfig, estimated_keys: usize) -> Result<Self> {
-        let path_buf = path.as_ref().to_path_buf();
+        let final_path = path.as_ref().to_path_buf();
+        let tmp_path = final_path.with_extension("sst.tmp");
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path_buf)?;
-        
+            .open(&tmp_path)?;
+
         Ok(Self {
             // 🚀 P1 优化：增大 BufWriter 容量到 64KB（减少系统调用）
             writer: BufWriter::with_capacity(64 * 1024, file),
-            path: path_buf,
+            path: final_path,
             current_block: DataBlock::new(),
             index: BlockIndex::new(),
             bloom: BloomFilter::new(estimated_keys, config.bloom_bits_per_key),
@@ -369,30 +398,33 @@ impl SSTableBuilder {
     }
     
     /// Finish building and write footer
+    ///
+    /// Atomically renames the temp file to the final path after fsync,
+    /// ensuring no partially-written SSTable is ever visible.
     pub fn finish(mut self) -> Result<super::compaction::SSTableMeta> {
         // Flush last block
         if !self.current_block.is_empty() {
             self.flush_block()?;
         }
-        
+
         // 🔧 Use tracked min/max keys
         let min_key = self.min_key.unwrap_or_default();
         let max_key = self.max_key.unwrap_or_default();
-        
+
         // Write index
         let index_offset = self.offset;
         let index_data = self.index.serialize()?;
         let index_size = index_data.len() as u32;
         self.writer.write_all(&index_data)?;
         self.offset += index_size as u64;
-        
+
         // Write bloom filter
         let bloom_offset = self.offset;
         let bloom_data = self.bloom.to_bytes();
         let bloom_size = bloom_data.len() as u32;
         self.writer.write_all(&bloom_data)?;
         self.offset += bloom_size as u64;
-        
+
         // Write footer
         let footer = Footer {
             magic: SSTABLE_MAGIC,
@@ -405,17 +437,21 @@ impl SSTableBuilder {
             min_timestamp: if self.min_timestamp == u64::MAX { 0 } else { self.min_timestamp },
             max_timestamp: self.max_timestamp,
         };
-        
+
         let footer_data = footer.serialize()?;
         self.writer.write_all(&footer_data)?;
-        
-        // 🚀 P0 优化：确保数据持久化到磁盘
-        self.writer.flush()?;  // 刷新 BufWriter 到 OS
-        self.writer.get_mut().sync_data()?;  // fsync 数据到磁盘（不同步元数据，更快）
-        
+
+        // Flush + fsync to ensure data is on disk before rename
+        self.writer.flush()?;
+        self.writer.get_mut().sync_data()?;
+
+        // Atomic rename: .sst.tmp → .sst
+        let tmp_path = self.path.with_extension("sst.tmp");
+        std::fs::rename(&tmp_path, &self.path)?;
+
         // Get file size
         let file_size = self.offset + footer_data.len() as u64;
-        
+
         // Return metadata
         Ok(super::compaction::SSTableMeta {
             path: self.path,

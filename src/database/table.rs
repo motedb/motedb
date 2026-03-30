@@ -103,70 +103,38 @@ impl MoteDB {
     }
     
     // ==================== Internal Helper Methods ====================
-    
+
     /// Make composite key from table name and row ID
-    /// 
-    /// Format: [table_hash:32bits][row_id:32bits]
-    /// 
-    /// 🚀 P1: Uses DashMap cache to avoid repeated hash computation
+    ///
+    /// Format: [table_id:32bits][row_id:32bits]
+    ///
+    /// Uses stable sequential table_id from registry (collision-free),
+    /// replacing the old hash-based scheme that had birthday-attack collision risk.
     pub(crate) fn make_composite_key(&self, table_name: &str, row_id: RowId) -> u64 {
-        // Try cache first (lock-free read)
-        if let Some(table_hash) = self.table_hash_cache.get(table_name) {
-            return (*table_hash.value() << 32) | (row_id & 0xFFFFFFFF);
-        }
-        
-        // Cache miss - compute and cache
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        table_name.hash(&mut hasher);
-        let table_hash = hasher.finish() & 0xFFFFFFFF;
-        
-        // Cache it (atomic insert)
-        self.table_hash_cache.insert(table_name.to_string(), table_hash);
-        
-        (table_hash << 32) | (row_id & 0xFFFFFFFF)
+        let table_id = self.table_registry.get_table_id(table_name)
+            .unwrap_or(0); // fallback to 0 for unregistered tables
+        ((table_id as u64) << 32) | (row_id & 0xFFFFFFFF)
     }
-    
+
     /// Compute table prefix (upper 32 bits of composite key)
-    /// 
-    /// 🚀 P1: Uses DashMap cache to avoid repeated hash computation
+    ///
+    /// Uses stable sequential table_id from registry (collision-free).
     pub(crate) fn compute_table_prefix(&self, table_name: &str) -> u64 {
-        // Try cache first (lock-free read)
-        if let Some(table_hash) = self.table_hash_cache.get(table_name) {
-            return *table_hash.value();
-        }
-        
-        // Cache miss - compute and cache
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        table_name.hash(&mut hasher);
-        let table_hash = hasher.finish() & 0xFFFFFFFF;
-        
-        // Cache it (atomic insert)
-        self.table_hash_cache.insert(table_name.to_string(), table_hash);
-        
-        table_hash
+        let table_id = self.table_registry.get_table_id(table_name)
+            .unwrap_or(0);
+        table_id as u64
     }
-    
+
     /// Extract row_id from composite key
     pub(crate) fn extract_row_id(&self, composite_key: u64) -> RowId {
         composite_key & 0xFFFFFFFF
     }
-    
+
     /// Check if composite key belongs to table
     pub(crate) fn key_matches_table(&self, composite_key: u64, table_name: &str) -> bool {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        table_name.hash(&mut hasher);
-        let table_hash = hasher.finish() & 0xFFFFFFFF;
-        
-        (composite_key >> 32) == table_hash
+        let table_id = self.table_registry.get_table_id(table_name)
+            .unwrap_or(0);
+        (composite_key >> 32) == table_id as u64
     }
     
     /// 🚀 P2: Get row cache for statistics and monitoring

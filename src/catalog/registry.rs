@@ -14,6 +14,10 @@ struct RegistryMetadata {
     tables: HashMap<String, TableSchema>,
     /// Index name -> (table_name, column_name)
     index_map: HashMap<String, (String, String)>,
+    /// Next table ID for sequential assignment (replaces hash-based keys)
+    next_table_id: u32,
+    /// Table name -> assigned table_id (stable, collision-free)
+    table_ids: HashMap<String, u32>,
 }
 
 /// Table registry for managing table schemas
@@ -52,6 +56,8 @@ impl TableRegistry {
             RegistryMetadata {
                 tables: HashMap::new(),
                 index_map: HashMap::new(),
+                next_table_id: 1, // 0 reserved for "_default"
+                table_ids: HashMap::new(),
             }
         };
 
@@ -94,6 +100,11 @@ impl TableRegistry {
                 (index.table_name.clone(), index.column_name.clone()),
             );
         }
+
+        // Assign a stable table_id (collision-free, sequential)
+        let table_id = meta.next_table_id;
+        meta.next_table_id += 1;
+        meta.table_ids.insert(schema.name.clone(), table_id);
 
         // Insert table
         meta.tables.insert(schema.name.clone(), schema);
@@ -255,6 +266,54 @@ impl TableRegistry {
             "No vector index found for {}.{}",
             table_name, column_name
         )))
+    }
+
+    /// Get the stable table_id for a table name.
+    ///
+    /// Returns the collision-free sequential ID assigned to this table.
+    /// Used for composite key generation instead of hash.
+    pub fn get_table_id(&self, table_name: &str) -> Result<u32> {
+        let meta = self.metadata.read()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+
+        meta.table_ids.get(table_name)
+            .copied()
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))
+    }
+
+    /// Get table name by table_id (reverse lookup for flush callback).
+    ///
+    /// This is a pure in-memory operation — no LSM scan needed.
+    pub fn get_table_name_by_id(&self, table_id: u32) -> Result<String> {
+        let meta = self.metadata.read()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+
+        for (name, &id) in meta.table_ids.iter() {
+            if id == table_id {
+                return Ok(name.clone());
+            }
+        }
+
+        Err(StorageError::InvalidData(format!(
+            "No table found for id {}",
+            table_id
+        )))
+    }
+
+    /// Get or assign a table_id for the "_default" internal table.
+    ///
+    /// Called during database creation/opening to ensure the implicit
+    /// "_default" table always has a stable id (= 0).
+    pub fn ensure_default_table_id(&self) -> Result<()> {
+        let mut meta = self.metadata.write()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+
+        if !meta.table_ids.contains_key("_default") {
+            meta.table_ids.insert("_default".to_string(), 0);
+        }
+
+        drop(meta);
+        Ok(())
     }
 
     /// Persist metadata to disk

@@ -91,12 +91,20 @@ impl MoteDB {
                             for (composite_key, value) in chunk {
                                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
                                 
-                                let data_bytes = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                                    crate::storage::lsm::ValueData::Blob(_) => continue,
+                                let data_bytes: Vec<u8> = match &value.data {
+                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                        match self.lsm_engine.resolve_blob(blob_ref) {
+                                            Ok(data) => data,
+                                            Err(e) => {
+                                                eprintln!("[create_column_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                                continue;
+                                            }
+                                        }
+                                    }
                                 };
                                 
-                                if let Ok(row) = bincode::deserialize::<Row>(data_bytes) {
+                                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
                                     if let Some(value) = row.get(col_position) {
                                         if let Err(e) = index_arc.write().insert(value, row_id) {
                                             eprintln!("[create_column_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
@@ -148,6 +156,34 @@ impl MoteDB {
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
         
         index_ref.value().write().insert(value, row_id)?;
+        Ok(())
+    }
+    
+    /// 🚀 P2 优化：批量插入列索引值
+    /// 
+    /// ## 性能优化
+    /// - 批量排序 + 批量插入 B-Tree
+    /// - 减少锁竞争（单次加锁）
+    /// - 更好的 B-Tree 局部性
+    /// 
+    /// ## 预期效果
+    /// - 1000 条插入：1000 次加锁 → 1 次加锁
+    /// - 性能提升：2-3 倍
+    pub fn batch_insert_column_values(&self, table_name: &str, column_name: &str, items: Vec<(RowId, Value)>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        
+        let index_name = format!("{}.{}", table_name, column_name);
+        let index_ref = self.column_indexes.get(&index_name)
+            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
+        
+        // Convert to (Value, RowId) for batch_insert API
+        let batch: Vec<(Value, RowId)> = items.into_iter()
+            .map(|(row_id, value)| (value, row_id))
+            .collect();
+        
+        index_ref.value().write().batch_insert(batch)?;
         Ok(())
     }
     
@@ -216,39 +252,19 @@ impl MoteDB {
     /// ```
     pub fn query_by_column(&self, table_name: &str, column_name: &str, value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
-        
-        // Step 1: Query indexed data (SSTable)
-        let mut row_ids = {
+
+        // Query the in-memory B+Tree index directly.
+        // The index is maintained synchronously on INSERT/UPDATE/DELETE,
+        // so it already covers both MemTable and SSTable data — no need
+        // for a redundant MemTable scan.
+        let row_ids = {
             let index_ref = self.column_indexes.get(&index_name)
                 .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-            
+
             let index_guard = index_ref.value().read();
             index_guard.get(value)?
-            // 🔓 自动释放
         };
-        
-        debug_log!("[query_by_column] 索引查询到 {} 条数据（来自SSTable）", row_ids.len());
-        
-        // Step 2: Scan MemTable for new data (不持有 column_indexes 锁)
-        let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
-            col_value == value
-        })?;
-        
-        debug_log!("[query_by_column] MemTable扫描到 {} 条数据（未索引）", memtable_ids.len());
-        
-        // Step 3: Merge and deduplicate
-        row_ids.extend(memtable_ids);
-        row_ids.sort_unstable();
-        row_ids.dedup();
-        
-        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
-        // Why: DELETE operations already update the index
-        // - Index removes deleted row_id
-        // - MemTable scan skips deleted rows
-        // Result: row_ids already contains only valid rows
-        
-        debug_log!("[query_by_column] 最终返回 {} 条有效数据", row_ids.len());
-        
+
         Ok(row_ids)
     }
     
@@ -275,32 +291,14 @@ impl MoteDB {
     /// // Get all users with age < 30
     /// let row_ids = db.query_by_column_less_than("users", "age", &Value::Integer(30))?;
     /// ```
-    pub fn query_by_column_less_than(&self, table_name: &str, column_name: &str, 
+    pub fn query_by_column_less_than(&self, table_name: &str, column_name: &str,
                                     value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        // Step 1: Query indexed data
-        let mut row_ids = {
-            let index_guard = index_ref.value().read();
-            index_guard.query_less_than(value)?
-        };
-        
-        // Step 2: Scan MemTable
-        let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
-            col_value < value
-        })?;
-        
-        // Step 3: Merge
-        row_ids.extend(memtable_ids);
-        row_ids.sort_unstable();
-        row_ids.dedup();
-        
-        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
-        // Reason: Index maintenance already handles deletes
-        
-        Ok(row_ids)
+
+        let index_guard = index_ref.value().read();
+        index_guard.query_less_than(value)
     }
     
     /// 🚀 Query column value index: WHERE col > value
@@ -310,87 +308,36 @@ impl MoteDB {
     /// // Get all users with age > 18
     /// let row_ids = db.query_by_column_greater_than("users", "age", &Value::Integer(18))?;
     /// ```
-    pub fn query_by_column_greater_than(&self, table_name: &str, column_name: &str, 
+    pub fn query_by_column_greater_than(&self, table_name: &str, column_name: &str,
                                        value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        // Step 1: Query indexed data
-        let mut row_ids = {
-            let index_guard = index_ref.value().read();
-            index_guard.query_greater_than(value)?
-        };
-        
-        // Step 2: Scan MemTable
-        let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
-            col_value > value
-        })?;
-        
-        // Step 3: Merge
-        row_ids.extend(memtable_ids);
-        row_ids.sort_unstable();
-        row_ids.dedup();
-        
-        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
-        
-        Ok(row_ids)
+
+        let index_guard = index_ref.value().read();
+        index_guard.query_greater_than(value)
     }
     
     /// 🚀 Query column value index: WHERE col <= value
-    pub fn query_by_column_less_than_or_equal(&self, table_name: &str, column_name: &str, 
+    pub fn query_by_column_less_than_or_equal(&self, table_name: &str, column_name: &str,
                                              value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        // Step 1: Query indexed data
-        let mut row_ids = {
-            let index_guard = index_ref.value().read();
-            index_guard.query_less_than_or_equal(value)?
-        };
-        
-        // Step 2: Scan MemTable
-        let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
-            col_value <= value
-        })?;
-        
-        // Step 3: Merge
-        row_ids.extend(memtable_ids);
-        row_ids.sort_unstable();
-        row_ids.dedup();
-        
-        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
-        
-        Ok(row_ids)
+
+        let index_guard = index_ref.value().read();
+        index_guard.query_less_than_or_equal(value)
     }
     
     /// 🚀 Query column value index: WHERE col >= value
-    pub fn query_by_column_greater_than_or_equal(&self, table_name: &str, column_name: &str, 
+    pub fn query_by_column_greater_than_or_equal(&self, table_name: &str, column_name: &str,
                                                 value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        // Step 1: Query indexed data
-        let mut row_ids = {
-            let index_guard = index_ref.value().read();
-            index_guard.query_greater_than_or_equal(value)?
-        };
-        
-        // Step 2: Scan MemTable
-        let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
-            col_value >= value
-        })?;
-        
-        // Step 3: Merge
-        row_ids.extend(memtable_ids);
-        row_ids.sort_unstable();
-        row_ids.dedup();
-        
-        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
-        
-        Ok(row_ids)
+
+        let index_guard = index_ref.value().read();
+        index_guard.query_greater_than_or_equal(value)
     }
     
     /// 🚀 Query column value index: dual-bound range query with flexible boundaries
@@ -410,43 +357,11 @@ impl MoteDB {
                                   lower_bound: &Value, lower_inclusive: bool,
                                   upper_bound: &Value, upper_inclusive: bool) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
-        
-        // Step 1: Query indexed data (SSTable)
-        let mut row_ids = {
-            let index_ref = self.column_indexes.get(&index_name)
-                .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-            
-            let index_guard = index_ref.value().read();
-            index_guard.query_between(lower_bound, lower_inclusive, upper_bound, upper_inclusive)?
-            // 🔓 自动释放
-        };
-        
-        // Step 2: Scan MemTable for new data (不持有 column_indexes 锁)
-        let memtable_ids = self.scan_memtable_for_column(table_name, column_name, |col_value| {
-            let matches_lower = if lower_inclusive {
-                col_value >= lower_bound
-            } else {
-                col_value > lower_bound
-            };
-            
-            let matches_upper = if upper_inclusive {
-                col_value <= upper_bound
-            } else {
-                col_value < upper_bound
-            };
-            
-            matches_lower && matches_upper
-        })?;
-        
-        // Step 3: Merge and deduplicate
-        row_ids.extend(memtable_ids);
-        row_ids.sort_unstable();
-        row_ids.dedup();
-        
-        // Step 4: ✅ NO TOMBSTONE FILTER NEEDED!
-        // The index and MemTable are already in sync
-        
-        Ok(row_ids)
+        let index_ref = self.column_indexes.get(&index_name)
+            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
+
+        let index_guard = index_ref.value().read();
+        index_guard.query_between(lower_bound, lower_inclusive, upper_bound, upper_inclusive)
     }
     
     /// 🔧 LSM Helper: Scan MemTable for rows matching a column predicate

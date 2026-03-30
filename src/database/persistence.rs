@@ -7,6 +7,25 @@ use crate::database::core::MoteDB;
 use crate::Result;
 use std::sync::atomic::Ordering;
 
+/// Get total size of all files in a directory (helper for checkpoint optimization)
+fn get_directory_size(dir: &std::path::Path) -> Result<u64> {
+    let mut total = 0;
+    
+    if !dir.exists() {
+        return Ok(0);
+    }
+    
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+    
+    Ok(total)
+}
+
 impl MoteDB {
     /// Flush database to disk
     /// 
@@ -95,18 +114,24 @@ impl MoteDB {
         self.flush_text_indexes()?;
         
         // 4. Reset pending counter
-        *self.pending_updates.write() = 0;
+        // 🚀 P0 CRITICAL FIX: 使用原子操作
+        self.pending_updates.store(0, std::sync::atomic::Ordering::Relaxed);
         
         Ok(())
     }
     
     /// Checkpoint (flush WAL and indexes)
     /// 
-    /// # Process
+    /// # Process (Optimized for Embedded)
     /// 1. Trigger LSM flush (MemTable → SSTable)
     /// 2. Rebuild timestamp index from LSM
     /// 3. Flush all indexes (persist to disk)
     /// 4. Checkpoint WAL (safe to truncate now)
+    /// 
+    /// # Optimizations
+    /// - Skip WAL checkpoint if no changes (zero-cost)
+    /// - Minimal memory allocation
+    /// - Fast path for empty databases
     /// 
     /// # Example
     /// ```ignore
@@ -114,33 +139,61 @@ impl MoteDB {
     /// ```
     pub fn checkpoint(&self) -> Result<()> {
         use std::time::Instant;
-        let checkpoint_start = Instant::now();
         
-        debug_log!("[Checkpoint] 🚀 Starting batch index checkpoint...");
+        // 🚀 Fast path: Skip if no pending updates and WAL is empty
+        // 🚀 P0 CRITICAL FIX: 使用原子操作
+        let pending_count = self.pending_updates.load(std::sync::atomic::Ordering::Relaxed);
+        if pending_count == 0 {
+            // Check if WAL is actually empty
+            let wal_dir = self.path.join("wal");
+            if let Ok(wal_size) = get_directory_size(&wal_dir) {
+                if wal_size == 0 {
+                    debug_log!("[Checkpoint] ⚡ Skip: No pending updates, WAL empty");
+                    return Ok(());
+                }
+            }
+        }
+        
+        let checkpoint_start = Instant::now();
+        debug_log!("[Checkpoint] 🚀 Starting checkpoint (pending_updates={})...", pending_count);
         
         // 🔥 Step 1: Trigger LSM flush (MemTable → SSTable)
         // This will also trigger batch index building via the callback
         let flush_start = Instant::now();
         self.lsm_engine.flush()?;
-        debug_log!("[Checkpoint]   ✓ LSM flush complete in {:?}", flush_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ LSM flush: {:?}", flush_start.elapsed());
         
         // 🔥 Step 2: Rebuild TimestampIndex from LSM (legacy path)
         // TODO: Move this to batch builder in future
         let ts_rebuild_start = Instant::now();
         self.rebuild_timestamp_index()?;
-        debug_log!("[Checkpoint]   ✓ Timestamp index rebuild in {:?}", ts_rebuild_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", ts_rebuild_start.elapsed());
         
         // 🔥 Step 3: Flush all indexes (persist to disk)
         let index_flush_start = Instant::now();
         self.flush_all_indexes()?;
-        debug_log!("[Checkpoint]   ✓ Index flush complete in {:?}", index_flush_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ Index flush: {:?}", index_flush_start.elapsed());
         
         // 🔥 Step 4: Checkpoint WAL (safe to truncate now)
         let wal_checkpoint_start = Instant::now();
         self.wal.checkpoint_all()?;
-        debug_log!("[Checkpoint]   ✓ WAL checkpoint in {:?}", wal_checkpoint_start.elapsed());
-        
-        debug_log!("[Checkpoint] 🎉 Total checkpoint time: {:?}", checkpoint_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", wal_checkpoint_start.elapsed());
+
+        // Step 5: Vacuum MVCC version store (remove old versions)
+        let vacuum_start = Instant::now();
+        let current_ts = self.version_store.current_timestamp();
+        match self.version_store.vacuum(current_ts) {
+            Ok(removed) => {
+                if removed > 0 {
+                    debug_log!("[Checkpoint]   ✓ MVCC vacuum: removed {} old versions in {:?}", removed, vacuum_start.elapsed());
+                }
+            }
+            Err(e) => {
+                eprintln!("[Checkpoint]   ⚠️ MVCC vacuum failed: {:?}", e);
+            }
+        }
+
+        debug_log!("[Checkpoint] 🎉 Total: {:?}", checkpoint_start.elapsed());
         Ok(())
     }
     

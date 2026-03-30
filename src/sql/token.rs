@@ -49,8 +49,10 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "show" => TokenType::Show,
     "describe" => TokenType::Describe,
     "tables" => TokenType::Tables,
+    "alter" => TokenType::Alter,
     "integer" => TokenType::Integer,
     "int" => TokenType::Integer,
+    "bigint" => TokenType::BigInt,
     "float" => TokenType::Float,
     "real" => TokenType::Float,
     "double" => TokenType::Float,
@@ -66,6 +68,7 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "bool" => TokenType::Boolean,
     "true" => TokenType::True,
     "false" => TokenType::False,
+    "auto_increment" => TokenType::AutoIncrement,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,9 +120,12 @@ pub enum TokenType {
     Show,     // SHOW
     Describe, // DESCRIBE or DESC
     Tables,   // TABLES
+    Alter,    // ALTER
+    AutoIncrement, // AUTO_INCREMENT
     
     // Data types
     Integer,
+    BigInt,   // 🚀 Phase 4: BIGINT type (i64)
     Float,
     Text,
     Timestamp,

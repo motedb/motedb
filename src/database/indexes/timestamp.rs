@@ -52,12 +52,20 @@ impl MoteDB {
         for row_id in 0..max_row_id {
             let composite_key = (table_hash << 32) | row_id;
             if let Some(value) = self.lsm_engine.get(composite_key)? {
-                let data_bytes = match &value.data {
-                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                    crate::storage::lsm::ValueData::Blob(_) => continue,
+                let data_bytes: Vec<u8> = match &value.data {
+                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                        match self.lsm_engine.resolve_blob(blob_ref) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                eprintln!("[update_timestamp_index_incremental] Failed to resolve blob for row {}: {}", row_id, e);
+                                continue;
+                            }
+                        }
+                    }
                 };
-                
-                if let Ok(row) = bincode::deserialize::<Row>(data_bytes) {
+
+                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
                     if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
                         let ts_micros = ts.as_micros() as u64;
                         

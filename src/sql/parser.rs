@@ -23,9 +23,10 @@ impl Parser {
             TokenType::Delete => Statement::Delete(self.parse_delete()?),
             TokenType::Create => self.parse_create()?,
             TokenType::Drop => self.parse_drop()?,
+            TokenType::Alter => Statement::AlterTable(self.parse_alter_table()?),
             TokenType::Show => self.parse_show()?,
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
-            _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, SHOW, or DESCRIBE")),
+            _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, or DESCRIBE")),
         };
         
         // Optionally consume semicolon
@@ -46,9 +47,12 @@ impl Parser {
         // Parse columns
         let columns = self.parse_select_columns()?;
         
-        // FROM clause
-        self.expect(TokenType::From)?;
-        let from = self.parse_table_ref()?;
+        // FROM clause (optional - for queries like SELECT LAST_INSERT_ID())
+        let from = if self.match_token(TokenType::From) {
+            Some(self.parse_table_ref()?)
+        } else {
+            None
+        };
         
         // WHERE clause (optional)
         let where_clause = if self.match_token(TokenType::Where) {
@@ -426,6 +430,8 @@ impl Parser {
             // Parse constraints
             let mut nullable = true;
             let mut primary_key = false;
+            let mut auto_increment = false;
+            let mut auto_increment_start: Option<i64> = None;
             
             // NOT NULL
             if self.match_token(TokenType::Not) {
@@ -440,11 +446,30 @@ impl Parser {
                 nullable = false;  // PRIMARY KEY implies NOT NULL
             }
             
+            // 🚀 AUTO_INCREMENT (支持 AUTO_INCREMENT 和 AUTO_INCREMENT = N)
+            if self.match_token(TokenType::AutoIncrement) {
+                auto_increment = true;
+                if !primary_key {
+                    return Err(self.error("AUTO_INCREMENT can only be used with PRIMARY KEY"));
+                }
+                // 🚀 Phase 4: INTEGER or BIGINT
+                if data_type != DataType::Integer && data_type != DataType::BigInt {
+                    return Err(self.error("AUTO_INCREMENT can only be used with INTEGER or BIGINT columns"));
+                }
+                
+                // 🚀 Phase 5: 解析起始值 AUTO_INCREMENT = N (可选)
+                if self.match_token(TokenType::Eq) {
+                    auto_increment_start = Some(self.parse_i64()?);
+                }
+            }
+            
             columns.push(ColumnDef {
                 name,
                 data_type,
                 nullable,
                 primary_key,
+                auto_increment,
+                auto_increment_start,
             });
             
             if !self.match_token(TokenType::Comma) {
@@ -458,6 +483,7 @@ impl Parser {
     fn parse_data_type(&mut self) -> Result<DataType> {
         let data_type = match &self.current().token_type {
             TokenType::Integer => DataType::Integer,
+            TokenType::BigInt => DataType::BigInt,
             TokenType::Float => DataType::Float,
             TokenType::Text => DataType::Text,
             TokenType::Boolean => DataType::Boolean,
@@ -754,7 +780,7 @@ impl Parser {
                 }
                 
                 self.expect(TokenType::RBracket)?;
-                Ok(Expr::Literal(Value::Vector(elements)))
+                Ok(Expr::Literal(Value::Vector(crate::types::ArcVec::new(elements))))
             }
             
             // Identifier or function call or qualified column
@@ -983,7 +1009,7 @@ impl Parser {
                 self.expect(TokenType::RBracket)?;
                 
                 // Convert to Value::Vector
-                let floats: Result<Vec<f32>> = values.into_iter().enumerate().map(|(idx, e)| {
+                let floats: Vec<f32> = values.into_iter().enumerate().map(|(idx, e)| {
                     match e {
                         Expr::Literal(Value::Float(f)) => Ok(f as f32),
                         Expr::Literal(Value::Integer(i)) => Ok(i as f32),
@@ -1000,9 +1026,9 @@ impl Parser {
                             Err(self.error(&format!("Vector elements must be numbers (found {:?} at index {})", e, idx)))
                         }
                     }
-                }).collect();
+                }).collect::<Result<Vec<f32>>>()?;
                 
-                Ok(Expr::Literal(Value::Vector(floats?)))
+                Ok(Expr::Literal(Value::Vector(crate::types::ArcVec::new(floats))))
             }
             
             _ => Err(self.error("Expected expression")),
@@ -1186,6 +1212,19 @@ impl Parser {
         }
     }
     
+    /// 🚀 Phase 4: Parse i64 (支持负数)
+    fn parse_i64(&mut self) -> Result<i64> {
+        if let TokenType::Number(n) = self.current().token_type {
+            if n.fract() != 0.0 {
+                return Err(self.error("Expected integer"));
+            }
+            self.advance();
+            Ok(n as i64)
+        } else {
+            Err(self.error("Expected number"))
+        }
+    }
+    
     fn current(&self) -> &Token {
         &self.tokens[self.position]
     }
@@ -1231,6 +1270,34 @@ impl Parser {
             msg, token.line, token.column
         ))
     }
+    
+    /// 🆕 Parse ALTER TABLE statement
+    /// 
+    /// Syntax: ALTER TABLE table_name AUTO_INCREMENT = value
+    fn parse_alter_table(&mut self) -> Result<AlterTableStmt> {
+        self.expect(TokenType::Alter)?;
+        self.expect(TokenType::Table)?;
+        
+        let table = self.parse_identifier()?;
+        
+        // Currently only support AUTO_INCREMENT modification
+        self.expect(TokenType::AutoIncrement)?;
+        self.expect(TokenType::Eq)?;
+        
+        let value = match &self.current().token_type {
+            TokenType::Number(n) => {
+                let value = (*n) as i64;  // Convert f64 to i64
+                self.advance();
+                value
+            }
+            _ => return Err(self.error("Expected integer value for AUTO_INCREMENT")),
+        };
+        
+        Ok(AlterTableStmt {
+            table,
+            action: AlterTableAction::SetAutoIncrement(value),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1251,7 +1318,7 @@ mod tests {
         match stmt {
             Statement::Select(s) => {
                 match &s.from {
-                    TableRef::Table { name, .. } => assert_eq!(name, "users"),
+                    Some(TableRef::Table { name, .. }) => assert_eq!(name, "users"),
                     _ => panic!("Expected simple table reference"),
                 }
                 assert!(matches!(s.columns[0], SelectColumn::Star));
@@ -1266,7 +1333,7 @@ mod tests {
         match stmt {
             Statement::Select(s) => {
                 match &s.from {
-                    TableRef::Table { name, .. } => assert_eq!(name, "users"),
+                    Some(TableRef::Table { name, .. }) => assert_eq!(name, "users"),
                     _ => panic!("Expected simple table reference"),
                 }
                 assert_eq!(s.columns.len(), 2);

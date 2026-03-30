@@ -268,15 +268,19 @@ pub struct CompactionConfig {
 pub struct CompactionWorker {
     /// Storage directory
     storage_dir: PathBuf,
-    
+
     /// Level metadata
     levels: Arc<Mutex<Vec<Level>>>,
-    
+
     /// Configuration
     config: CompactionConfig,
-    
+
     /// Statistics
     stats: Arc<Mutex<CompactionStats>>,
+
+    /// Callback invoked after compaction replaces SSTables.
+    /// Used to invalidate the SSTableCache so readers don't hold stale file handles.
+    post_compaction_cb: Arc<std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>>>,
 }
 
 impl CompactionWorker {
@@ -286,14 +290,95 @@ impl CompactionWorker {
         for level in 0..config.num_levels {
             levels.push(Level::new(level, config));
         }
-        
-        Self {
+
+        let worker = Self {
             storage_dir,
             levels: Arc::new(Mutex::new(levels)),
             config: CompactionConfig {
                 lsm_config: config.clone(),
             },
             stats: Arc::new(Mutex::new(CompactionStats::default())),
+            post_compaction_cb: Arc::new(std::sync::RwLock::new(None)),
+        };
+
+        // Discover existing SSTables on disk
+        if let Err(e) = worker.discover_sstables() {
+            eprintln!("[CompactionWorker] Warning: failed to discover SSTables: {:?}", e);
+        }
+
+        worker
+    }
+
+    /// Discover existing .sst files in the storage directory and register them.
+    /// Called during startup so that previously flushed data is visible to scans.
+    fn discover_sstables(&self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.storage_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()), // Directory doesn't exist yet — nothing to discover
+        };
+
+        let mut discovered: Vec<(usize, SSTableMeta)> = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("sst") {
+                // Parse level from filename: "l{level}_*.sst"
+                let file_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+                let level = if file_name.starts_with('l') {
+                    file_name[1..].split('_').next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                // Read metadata from SSTable footer
+                match crate::storage::lsm::sstable::SSTable::read_metadata(&path) {
+                    Ok((num_entries, min_timestamp, file_size)) => {
+                        let meta = SSTableMeta {
+                            path: path.clone(),
+                            size: file_size,
+                            num_entries,
+                            min_key: 0,
+                            max_key: u64::MAX,
+                            min_timestamp,
+                            max_timestamp: min_timestamp, // Use min as approximation
+                        };
+                        discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
+                    }
+                    Err(e) => {
+                        eprintln!("[CompactionWorker] Warning: skipping corrupt SSTable {:?}: {:?}", path, e);
+                    }
+                }
+            }
+        }
+
+        if !discovered.is_empty() {
+            debug_log!("[CompactionWorker] Discovered {} existing SSTables", discovered.len());
+            let mut levels = self.levels.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+
+            for (level, meta) in discovered {
+                levels[level].add_sstable(meta);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set a callback to invoke after compaction replaces SSTables.
+    /// Used to invalidate SSTableCache so readers don't hold stale file handles.
+    pub fn set_post_compaction_cb(&self, cb: Box<dyn Fn() + Send + Sync>) {
+        let mut guard = self.post_compaction_cb.write().unwrap();
+        *guard = Some(cb);
+    }
+
+    /// Invoke the post-compaction callback (if set).
+    fn invoke_post_compaction(&self) {
+        if let Ok(guard) = self.post_compaction_cb.read() {
+            if let Some(ref cb) = guard.as_ref() {
+                cb();
+            }
         }
     }
     
@@ -419,21 +504,27 @@ impl CompactionWorker {
         
         // Add output file
         levels[level_idx + 1].add_sstable(output_meta);
-        
+
         // Update stats
         let mut stats = self.stats.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         stats.num_compactions += 1;
-        
+
         let bytes_read: u64 = valid_sources.iter().map(|s| s.size).sum::<u64>()
             + valid_overlapping.iter().map(|s| s.size).sum::<u64>();
         stats.bytes_read += bytes_read;
-        
+
         // ✨ Track L1+ compaction stats
         if level_idx >= 1 {
             stats.levelplus_compactions += 1;
         }
-        
+
+        drop(stats);
+        drop(levels);
+
+        // Invalidate SSTableCache so readers don't hold stale file handles
+        self.invoke_post_compaction();
+
         Ok(())
     }
     
@@ -534,21 +625,21 @@ impl CompactionWorker {
             }
         }
         
-        // Tombstone TTL
-        let now = std::time::SystemTime::now()
+        // Tombstone TTL (timestamp is in microseconds since epoch)
+        let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
-        let tombstone_ttl = 86400; // 24 hours
-        
+            .as_micros() as u64;
+        let tombstone_ttl_micros: u64 = 86_400 * 1_000_000; // 24 hours in microseconds
+
         // Merge-sort with deduplication
         let mut last_key: Option<u64> = None;
         let mut last_value: Option<super::Value> = None;
-        
+
         while let Some(entry) = heap.pop() {
             // Check if this is a duplicate key
             if Some(entry.key) == last_key {
-                // Keep entry with highest timestamp
+                // Keep entry with highest timestamp (newest version wins)
                 if let Some(ref mut last) = last_value {
                     if entry.value.timestamp > last.timestamp {
                         *last = entry.value;
@@ -557,12 +648,12 @@ impl CompactionWorker {
             } else {
                 // Write previous key (if exists)
                 if let (Some(key), Some(value)) = (last_key, last_value.take()) {
-                    // Skip old tombstones
-                    if !value.deleted || (now - value.timestamp < tombstone_ttl) {
+                    // Skip tombstones older than TTL
+                    if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                         builder.add(key, value)?;
                     }
                 }
-                
+
                 // Start tracking new key
                 last_key = Some(entry.key);
                 last_value = Some(entry.value);
@@ -580,7 +671,7 @@ impl CompactionWorker {
         
         // Write final key
         if let (Some(key), Some(value)) = (last_key, last_value) {
-            if !value.deleted || (now - value.timestamp < tombstone_ttl) {
+            if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                 builder.add(key, value)?;
             }
         }
@@ -771,11 +862,14 @@ impl CompactionWorker {
         if stats.bytes_read > 0 {
             stats.write_amplification = stats.bytes_written as f64 / stats.bytes_read as f64;
         }
-        
+
+        drop(stats);
+
+        // Invalidate SSTableCache so readers don't hold stale file handles
+        self.invoke_post_compaction();
+
         Ok(())
     }
-    
-    /// ✨ P2 Phase 3.2: Incremental merge (batch size = 2)
     /// 
     /// Instead of merging all N files at once:
     /// - Split into batches of 2
@@ -875,15 +969,15 @@ impl CompactionWorker {
             }
         }
         
-        let now = std::time::SystemTime::now()
+        let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs();
-        let tombstone_ttl = 86400;
-        
+            .as_micros() as u64;
+        let tombstone_ttl_micros: u64 = 86_400 * 1_000_000; // 24 hours in microseconds
+
         let mut last_key: Option<u64> = None;
         let mut last_value: Option<super::Value> = None;
-        
+
         while let Some(entry) = heap.pop() {
             if Some(entry.key) == last_key {
                 if let Some(ref mut last) = last_value {
@@ -893,22 +987,22 @@ impl CompactionWorker {
                 }
             } else {
                 if let (Some(key), Some(value)) = (last_key, last_value.take()) {
-                    if !value.deleted || (now - value.timestamp < tombstone_ttl) {
+                    if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                         builder.add(key, value)?;
                     }
                 }
-                
+
                 last_key = Some(entry.key);
                 last_value = Some(entry.value);
             }
-            
+
             if let Some((key, value)) = iters[entry.iter_idx].next() {
                 heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
             }
         }
-        
+
         if let (Some(key), Some(value)) = (last_key, last_value) {
-            if !value.deleted || (now - value.timestamp < tombstone_ttl) {
+            if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                 builder.add(key, value)?;
             }
         }

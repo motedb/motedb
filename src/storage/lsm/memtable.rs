@@ -60,6 +60,53 @@ impl MemTable {
         Ok(())
     }
     
+    /// 🚀 P2 优化：批量插入（一次加锁，减少锁竞争）
+    /// 
+    /// ## 性能优化
+    /// - 单次加锁插入所有 KV 对
+    /// - 批量更新 size 计数器
+    /// - 减少锁竞争和原子操作次数
+    /// 
+    /// ## 预期效果
+    /// - 1000 条插入：1000 次加锁 → 1 次加锁
+    /// - 性能提升：3-5 倍
+    pub fn batch_put(&self, kvs: &[(Key, Value)]) -> Result<()> {
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        
+        let mut data = self.data.write()
+            .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
+        
+        let mut total_size_change: i64 = 0;
+        
+        for (key, value) in kvs {
+            let key_size = 8;
+            let value_size = value.data.len() + 16;
+            let entry_size = key_size + value_size;
+            
+            // Calculate size change
+            if let Some(old_value) = data.get(key) {
+                let old_size = key_size + old_value.data.len() + 16;
+                total_size_change -= old_size as i64;
+            }
+            
+            data.insert(*key, value.clone());
+            total_size_change += entry_size as i64;
+        }
+        
+        // Batch update size (single atomic operation)
+        if total_size_change > 0 {
+            self.size.fetch_add(total_size_change as usize, Ordering::Relaxed);
+        } else if total_size_change < 0 {
+            self.size.fetch_sub((-total_size_change) as usize, Ordering::Relaxed);
+        }
+        
+        self.next_seq.fetch_add(kvs.len(), Ordering::Relaxed);
+        
+        Ok(())
+    }
+    
     /// Get a value by key
     pub fn get(&self, key: Key) -> Result<Option<Value>> {
         let data = self.data.read()

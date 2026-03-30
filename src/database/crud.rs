@@ -13,6 +13,8 @@ use crate::{Result, StorageError};
 use crate::types::{Row, RowId, PartitionId, Value, SqlRow};
 use crate::txn::wal::WALRecord;
 use super::core::MoteDB;
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 impl MoteDB {
     // ==================== Row-Level CRUD Operations ====================
@@ -133,23 +135,24 @@ impl MoteDB {
     pub fn delete_row(&self, row_id: RowId) -> Result<()> {
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
-        
+
         // 1. Get old row data (needed for WAL)
         let old_row = self.get_row(row_id)?
             .ok_or_else(|| StorageError::InvalidData(format!("Row {} not found", row_id)))?;
-        
+
         // 2. Determine partition
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
-        
-        // 3. Write to WAL first (durability)
-        self.wal.log_delete(table_name, partition, composite_key, old_row)?;
-        
-        // 4. Delete from LSM (using tombstone)
+
+        // 3. Compute timestamp (used by both WAL and LSM)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| StorageError::InvalidData(e.to_string()))?
             .as_micros() as u64;
-        
+
+        // 4. Write to WAL first (durability)
+        self.wal.log_delete(table_name, partition, composite_key, old_row, timestamp)?;
+
+        // 5. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
         
         Ok(())
@@ -251,24 +254,58 @@ impl MoteDB {
     ///     Value::Text("Alice".into()),
     /// ])?;
     /// ```ignore
-    pub fn insert_row_to_table(&self, table_name: &str, row: Row) -> Result<RowId> {
+    pub fn insert_row_to_table(&self, table_name: &str, mut row: Row) -> Result<RowId> {
         // 1. Get table schema
         let schema = self.table_registry.get_table(table_name)?;
         
-        // 2. Validate row
-        schema.validate_row(&row)
-            .map_err(|e| StorageError::InvalidData(format!(
-                "Row validation failed for table '{}': {}",
-                table_name, e
-            )))?;
-        
-        // 3. Allocate row ID
-        let row_id = {
+        // 2. 🚀 P3+4: For AUTO_INCREMENT primary key, use per-table counter
+        let row_id = if schema.is_primary_key_auto_increment() {
+            // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter
+            let counter = self.table_auto_increment
+                .entry(table_name.to_string())
+                .or_insert_with(|| {
+                    // Initialize with schema's start value (default 1)
+                    Arc::new(RwLock::new(schema.get_auto_increment_start()))
+                });
+            
+            let mut next_id = counter.write();
+            
+            // 🚀 Phase 5: Overflow protection (B1)
+            if *next_id >= i64::MAX {
+                return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
+            }
+            
+            let id = *next_id;
+            *next_id += 1;
+            drop(next_id);  // Release lock
+            
+            // Fill AUTO_INCREMENT primary key with id
+            if let Some(pk_col_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_col_name) {
+                    // Ensure row has enough slots
+                    while row.len() <= pk_col.position {
+                        row.push(Value::Null);
+                    }
+                    // Fill in id as primary key value
+                    row[pk_col.position] = Value::Integer(id);
+                }
+            }
+            
+            id as RowId
+        } else {
+            // Non-AUTO_INCREMENT: use global row_id
             let mut next_id = self.next_row_id.write();
             let id = *next_id;
             *next_id += 1;
             id
         };
+        
+        // 3. Validate row
+        schema.validate_row(&row)
+            .map_err(|e| StorageError::InvalidData(format!(
+                "Row validation failed for table '{}': {}",
+                table_name, e
+            )))?;
 
         // 4. Determine partition
         let partition = (row_id % self.num_partitions as u64) as PartitionId;
@@ -283,58 +320,81 @@ impl MoteDB {
         let composite_key = self.make_composite_key(table_name, row_id);
         self.lsm_engine.put(composite_key, value)?;
 
-        // 7. 🚀 增量更新所有索引（INSERT时实时维护）
+        // 7. Update indexes. Collect failures, then mark ALL indexes for this
+        //    table stale if any failure occurred. This ensures consistent
+        //    fallback to full table scan rather than returning partial results.
+        let mut index_errors = Vec::new();
+
         for col_def in &schema.columns {
             let col_name = &col_def.name;
             let col_value = row.get(col_def.position);
-            
+
             if col_value.is_none() {
                 continue;
             }
             let col_value = col_value.unwrap();
-            
-            // 7.1 Column Index（包括主键）
+
+            // 7.1 Column Index
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
                 if let Err(e) = self.insert_column_value(table_name, col_name, row_id, col_value) {
-                    eprintln!("[insert_row] ⚠️ Failed to update column index '{}': {}", column_index_name, e);
+                    eprintln!("[insert_row] Failed to update column index '{}': {}", column_index_name, e);
+                    index_errors.push(column_index_name.clone());
                 }
             }
-            
+
             // 7.2 Vector Index
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.vector_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Vector
+                ) {
                     if let crate::types::Value::Vector(vec) = col_value {
-                        if let Err(e) = self.update_vector(row_id, &index_name, vec) {
-                            eprintln!("[insert_row] ⚠️ Failed to update vector index '{}': {}", index_name, e);
+                        if let Err(e) = self.update_vector(row_id, &index_name, vec.as_slice()) {
+                            eprintln!("[insert_row] Failed to update vector index '{}': {}", index_name, e);
+                            index_errors.push(index_name.clone());
                         }
                     }
                 }
             }
-            
+
             // 7.3 Text Index
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.text_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
                     if let crate::types::Value::Text(text) = col_value {
                         if let Err(e) = self.insert_text(row_id, &index_name, text) {
-                            eprintln!("[insert_row] ⚠️ Failed to update text index '{}': {}", index_name, e);
+                            eprintln!("[insert_row] Failed to update text index '{}': {}", index_name, e);
+                            index_errors.push(index_name.clone());
                         }
                     }
                 }
             }
-            
+
             // 7.4 Spatial Index
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.spatial_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
                     if let crate::types::Value::Spatial(geom) = col_value {
                         if let Err(e) = self.insert_geometry(row_id, &index_name, geom.clone()) {
-                            eprintln!("[insert_row] ⚠️ Failed to update spatial index '{}': {}", index_name, e);
+                            eprintln!("[insert_row] Failed to update spatial index '{}': {}", index_name, e);
+                            index_errors.push(index_name.clone());
                         }
                     }
                 }
+            }
+        }
+
+        // If any index update failed, mark ALL indexes for this table stale
+        // so queries fall back to full scan consistently
+        if !index_errors.is_empty() {
+            eprintln!("[insert_row] {} index updates failed for table '{}', marking all stale",
+                     index_errors.len(), table_name);
+            for idx_name in &index_errors {
+                self.index_registry.mark_stale(idx_name);
+            }
+            // Also mark indexes not directly in the error list
+            for meta in self.index_registry.list_table_indexes(table_name) {
+                self.index_registry.mark_stale(&meta.name);
             }
         }
 
@@ -441,76 +501,97 @@ impl MoteDB {
         // 💡 FIX: Invalidate cache after update (prevent stale reads)
         self.row_cache.invalidate(table_name, row_id);
         
-        // 6. 🚀 增量更新所有索引（UPDATE时实时维护）
+        // 6. Update indexes. Collect failures, then mark ALL stale consistently.
+        let mut index_errors = Vec::new();
+
         for col_def in &schema.columns {
             let col_name = &col_def.name;
             let old_value = old_row.get(col_def.position);
             let new_value = new_row.get(col_def.position);
-            
-            // 跳过没有变化的列
+
+            // Skip unchanged columns
             if old_value == new_value {
                 continue;
             }
-            
+
             // 6.1 Column Index
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
                 if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
                     if let Err(e) = self.update_column_value(table_name, col_name, row_id, old_val, new_val) {
-                        eprintln!("[update_row] ⚠️ Failed to update column index '{}': {}", column_index_name, e);
+                        eprintln!("[update_row] Failed to update column index '{}': {}", column_index_name, e);
+                        index_errors.push(column_index_name.clone());
                     }
                 }
             }
-            
+
             // 6.2 Vector Index
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.vector_indexes.contains_key(&index_name) {
-                    // ✅ 先删除旧向量（清理DiskANN图）
+                    let mut failed = false;
                     if let Err(e) = self.delete_vector(row_id, &index_name) {
-                        eprintln!("[update_row] ⚠️ Failed to delete old vector '{}': {}", index_name, e);
+                        eprintln!("[update_row] Failed to delete old vector '{}': {}", index_name, e);
+                        failed = true;
                     }
-                    
-                    // 再插入新向量
+
                     if let Some(crate::types::Value::Vector(new_vec)) = new_value {
-                        if let Err(e) = self.update_vector(row_id, &index_name, new_vec) {
-                            eprintln!("[update_row] ⚠️ Failed to update vector index '{}': {}", index_name, e);
+                        if let Err(e) = self.update_vector(row_id, &index_name, new_vec.as_slice()) {
+                            eprintln!("[update_row] Failed to update vector index '{}': {}", index_name, e);
+                            failed = true;
                         }
+                    }
+                    if failed {
+                        index_errors.push(index_name.clone());
                     }
                 }
             }
-            
+
             // 6.3 Text Index
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.text_indexes.contains_key(&index_name) {
                     if let (Some(crate::types::Value::Text(old_text)), Some(crate::types::Value::Text(new_text))) = (old_value, new_value) {
                         if let Err(e) = self.update_text(row_id, &index_name, old_text, new_text) {
-                            eprintln!("[update_row] ⚠️ Failed to update text index '{}': {}", index_name, e);
+                            eprintln!("[update_row] Failed to update text index '{}': {}", index_name, e);
+                            index_errors.push(index_name.clone());
                         }
                     }
                 }
             }
-            
+
             // 6.4 Spatial Index
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.spatial_indexes.contains_key(&index_name) {
-                    // ✅ 先删除旧几何体
+                    let mut failed = false;
                     if let Err(e) = self.delete_geometry(row_id, &index_name) {
-                        eprintln!("[update_row] ⚠️ Failed to delete old spatial geometry '{}': {}", index_name, e);
+                        eprintln!("[update_row] Failed to delete old spatial geometry '{}': {}", index_name, e);
+                        failed = true;
                     }
-                    
-                    // 再插入新的
+
                     if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
                         if let Err(e) = self.insert_geometry(row_id, &index_name, new_geom.clone()) {
-                            eprintln!("[update_row] ⚠️ Failed to update spatial index '{}': {}", index_name, e);
+                            eprintln!("[update_row] Failed to update spatial index '{}': {}", index_name, e);
+                            failed = true;
                         }
+                    }
+                    if failed {
+                        index_errors.push(index_name.clone());
                     }
                 }
             }
         }
-        
+
+        // If any index update failed, mark ALL indexes for this table stale
+        if !index_errors.is_empty() {
+            eprintln!("[update_row] {} index updates failed for table '{}', marking all stale",
+                     index_errors.len(), table_name);
+            for meta in self.index_registry.list_table_indexes(table_name) {
+                self.index_registry.mark_stale(&meta.name);
+            }
+        }
+
         Ok(())
     }
     
@@ -528,78 +609,87 @@ impl MoteDB {
     pub fn delete_row_from_table(&self, table_name: &str, row_id: RowId, old_row: Row) -> Result<()> {
         // 1. Get schema (old_row is now passed in to avoid re-loading)
         let schema = self.table_registry.get_table(table_name)?;
-        
-        // 2. 🚀 增量更新所有索引（DELETE时先删除索引）
+
+        // 2. Construct composite key
+        let composite_key = self.make_composite_key(table_name, row_id);
+
+        // 3. Determine partition
+        let partition = (composite_key % self.num_partitions as u64) as PartitionId;
+
+        // 4. Compute timestamp (used by both WAL and LSM)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?
+            .as_micros() as u64;
+
+        // 5. Write to WAL first (durability guarantee)
+        //    WAL must be written BEFORE any mutation so that a crash at any
+        //    point below can be recovered correctly.
+        self.wal.log_delete(table_name, partition, composite_key, old_row.clone(), timestamp)?;
+
+        // 6. Delete from LSM (using tombstone)
+        self.lsm_engine.delete(composite_key, timestamp)?;
+
+        // 7. Invalidate cache (prevent reading deleted data)
+        self.row_cache.invalidate(table_name, row_id);
+
+        // 8. Update indexes (after data is durable).
+        //    If an index deletion fails, the index is marked stale and can be
+        //    rebuilt later. Since indexes are derived data, this is safe.
         for col_def in &schema.columns {
             let col_name = &col_def.name;
             let col_value = old_row.get(col_def.position);
-            
+
             if col_value.is_none() {
                 continue;
             }
             let col_value = col_value.unwrap();
-            
-            // 2.1 Column Index
+
+            // Column Index
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
                 if let Err(e) = self.delete_column_value(table_name, col_name, row_id, col_value) {
-                    eprintln!("[delete_row] ⚠️ Failed to delete from column index '{}': {}", column_index_name, e);
+                    eprintln!("[delete_row] Failed to delete from column index '{}': {}", column_index_name, e);
+                    self.index_registry.mark_stale(&column_index_name);
                 }
             }
-            
-            // 2.2 Vector Index - 显式删除（清理DiskANN图）
+
+            // Vector Index
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.vector_indexes.contains_key(&index_name) {
                     if let Err(e) = self.delete_vector(row_id, &index_name) {
-                        eprintln!("[delete_row] ⚠️ Failed to delete from vector index '{}': {}", index_name, e);
+                        eprintln!("[delete_row] Failed to delete from vector index '{}': {}", index_name, e);
+                        self.index_registry.mark_stale(&index_name);
                     }
                 }
             }
-            
-            // 2.3 Text Index
+
+            // Text Index
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.text_indexes.contains_key(&index_name) {
                     if let crate::types::Value::Text(text) = col_value {
                         if let Err(e) = self.delete_text(row_id, &index_name, text) {
-                            eprintln!("[delete_row] ⚠️ Failed to delete from text index '{}': {}", index_name, e);
+                            eprintln!("[delete_row] Failed to delete from text index '{}': {}", index_name, e);
+                            self.index_registry.mark_stale(&index_name);
                         }
                     }
                 }
             }
-            
-            // 2.4 Spatial Index - 显式删除
+
+            // Spatial Index
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.spatial_indexes.contains_key(&index_name) {
                     if let Err(e) = self.delete_geometry(row_id, &index_name) {
-                        eprintln!("[delete_row] ⚠️ Failed to delete from spatial index '{}': {}", index_name, e);
+                        eprintln!("[delete_row] Failed to delete from spatial index '{}': {}", index_name, e);
+                        self.index_registry.mark_stale(&index_name);
                     }
                 }
             }
         }
-        
-        // 3. Construct composite key
-        let composite_key = self.make_composite_key(table_name, row_id);
-        
-        // 4. Determine partition
-        let partition = (composite_key % self.num_partitions as u64) as PartitionId;
-        
-        // 5. Write to WAL first (durability)
-        self.wal.log_delete(table_name, partition, composite_key, old_row)?;
-        
-        // 6. Delete from LSM (using tombstone)
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| StorageError::InvalidData(e.to_string()))?
-            .as_micros() as u64;
-        
-        self.lsm_engine.delete(composite_key, timestamp)?;
-        
-        // 💡 FIX: Invalidate cache after delete (prevent reading deleted data)
-        self.row_cache.invalidate(table_name, row_id);
-        
+
         Ok(())
     }
     
@@ -902,85 +992,115 @@ impl MoteDB {
         // 5. Batch write WAL (single fsync)
         self.wal.batch_append(0, wal_records)?;
         
-        // 6. Write to LSM MemTable
-        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-            let row_data = bincode::serialize(row)?;
-            let value = crate::storage::lsm::Value::new(row_data, *row_id);
-            let composite_key = self.make_composite_key(table_name, *row_id);
-            self.lsm_engine.put(composite_key, value)?;
+        // 6. 🚀 P2 优化：批量写入 LSM MemTable（单次加锁）
+        {
+            let mut kvs = Vec::with_capacity(rows.len());
+            for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                let row_data = bincode::serialize(row)?;
+                let value = crate::storage::lsm::Value::new(row_data, *row_id);
+                let composite_key = self.make_composite_key(table_name, *row_id);
+                kvs.push((composite_key, value));
+            }
+            self.lsm_engine.batch_put(&kvs)?;
         }
         
-        // 7. 🚀 增量更新所有索引（与 insert_row_to_table 保持一致）
-        debug_log!("[batch_insert_rows_to_table] Updating indexes incrementally for {} rows in table '{}'", rows.len(), table_name);
+        // 7. 🚀 P2 优化：批量更新所有索引（按列聚合，减少锁竞争）
+        debug_log!("[batch_insert_rows_to_table] 🚀 P2: Batch updating indexes for {} rows in table '{}'", rows.len(), table_name);
         
-        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-            for col_def in &schema.columns {
-                let col_name = &col_def.name;
-                let col_value = row.get(col_def.position);
-                
-                if col_value.is_none() {
-                    continue;
-                }
-                let col_value = col_value.unwrap();
-                
-                // 7.1 Column Index
-                let column_index_name = format!("{}.{}", table_name, col_name);
-                if self.column_indexes.contains_key(&column_index_name) {
-                    if let Err(e) = self.insert_column_value(table_name, col_name, *row_id, col_value) {
-                        eprintln!("[batch_insert] ⚠️ Failed to update column index '{}': {}", column_index_name, e);
+        // 7.1 按列聚合数据，批量更新 Column Index
+        for col_def in &schema.columns {
+            let col_name = &col_def.name;
+            let column_index_name = format!("{}.{}", table_name, col_name);
+            
+            if self.column_indexes.contains_key(&column_index_name) {
+                // 收集该列的所有数据
+                let mut column_data: Vec<(RowId, Value)> = Vec::with_capacity(rows.len());
+                for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                    if let Some(col_value) = row.get(col_def.position) {
+                        column_data.push((*row_id, col_value.clone()));
                     }
                 }
                 
-                // 7.2 Vector Index
-                if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                    // 🔧 Use index_registry to find the correct user-specified index name
-                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Vector) {
-                        if let crate::types::Value::Vector(vec) = col_value {
-                            if let Err(e) = self.update_vector(*row_id, &index_name, vec) {
-                                eprintln!("[batch_insert] ⚠️ Failed to update vector index '{}': {}", index_name, e);
-                            }
-                        }
+                // 批量插入列索引
+                if !column_data.is_empty() {
+                    if let Err(e) = self.batch_insert_column_values(table_name, col_name, column_data) {
+                        eprintln!("[batch_insert] ⚠️ Failed to batch update column index '{}': {}", column_index_name, e);
                     }
                 }
-                
-                // 7.3 Text Index
-                if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                    // 🔧 Use index_registry to find the correct user-specified index name
-                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
-                        if let crate::types::Value::Text(text) = col_value {
-                            if let Err(e) = self.insert_text(*row_id, &index_name, text) {
-                                eprintln!("[batch_insert] ⚠️ Failed to update text index '{}': {}", index_name, e);
-                            }
-                        }
-                    }
-                }
-                
-                // 7.4 Spatial Index
-                if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                    // 🔧 Use index_registry to find the correct user-specified index name
-                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
-                        if let crate::types::Value::Spatial(geom) = col_value {
-                            if let Err(e) = self.insert_geometry(*row_id, &index_name, geom.clone()) {
-                                eprintln!("[batch_insert] ⚠️ Failed to update spatial index '{}': {}", index_name, e);
-                            }
-                        }
-                    }
-                }
-                
-                // 7.5 Timestamp Index (legacy single-index architecture, handled by batch build)
-                // Note: Timestamp index uses a different architecture (single BTree index)
-                // and is updated during flush via batch building
             }
+            
+            // 7.2 批量更新 Vector Index
+            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Vector) {
+                    let mut vectors: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(rows.len());
+                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                        if let Some(crate::types::Value::Vector(arc_vec)) = row.get(col_def.position) {
+                            // ArcVec 是 Arc<Vec<f32>> 的包装，需要解引用
+                            vectors.push((*row_id, (*arc_vec.0).clone()));
+                        }
+                    }
+                    
+                    if !vectors.is_empty() {
+                        if let Err(e) = self.batch_insert_vectors(&index_name, &vectors) {
+                            eprintln!("[batch_insert] ⚠️ Failed to batch update vector index '{}': {}", index_name, e);
+                        }
+                    }
+                }
+            }
+            
+            // 7.3 批量更新 Text Index
+            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
+                    let mut texts: Vec<(RowId, String)> = Vec::with_capacity(rows.len());
+                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                        if let Some(crate::types::Value::Text(text)) = row.get(col_def.position) {
+                            texts.push((*row_id, text.clone()));
+                        }
+                    }
+                    
+                    if !texts.is_empty() {
+                        let texts_ref: Vec<(RowId, &str)> = texts.iter()
+                            .map(|(id, s)| (*id, s.as_str()))
+                            .collect();
+                        if let Err(e) = self.batch_insert_texts(&index_name, &texts_ref) {
+                            eprintln!("[batch_insert] ⚠️ Failed to batch update text index '{}': {}", index_name, e);
+                        }
+                    }
+                }
+            }
+            
+            // 7.4 批量更新 Spatial Index
+            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
+                    let mut geometries: Vec<(RowId, crate::types::Geometry)> = Vec::with_capacity(rows.len());
+                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                        if let Some(crate::types::Value::Spatial(geom)) = row.get(col_def.position) {
+                            geometries.push((*row_id, geom.clone()));
+                        }
+                    }
+                    
+                    if !geometries.is_empty() {
+                        if let Err(e) = self.batch_insert_geometries(&index_name, geometries) {
+                            eprintln!("[batch_insert] ⚠️ Failed to batch update spatial index '{}': {}", index_name, e);
+                        }
+                    }
+                }
+            }
+            
+            // 7.5 Timestamp Index (legacy single-index architecture, handled by batch build)
+            // Note: Timestamp index uses a different architecture (single BTree index)
+            // and is updated during flush via batch building
         }
         
         // 8. Increment pending counter
+        // 🚀 P0 CRITICAL FIX: 使用原子操作避免锁竞争
         {
-            let mut pending = self.pending_updates.write();
-            *pending += rows.len();
+            use std::sync::atomic::Ordering;
+            let old_count = self.pending_updates.fetch_add(rows.len(), Ordering::Relaxed);
             
-            if *pending >= 1_000 {
-                *pending = 0;
-                drop(pending);
+            // 每2000条触发flush（与LSM一致）
+            if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
+                println!("[AUTO-FLUSH] Batch insert triggered after {} writes", old_count + rows.len());
                 
                 let db_clone = self.clone_for_callback();
                 std::thread::spawn(move || {
@@ -1036,21 +1156,26 @@ impl MoteDB {
         // 3. Batch write WAL (single fsync)
         self.wal.batch_append(0, wal_records)?;
 
-        // 4. Write to LSM MemTable
-        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-            let row_data = bincode::serialize(row)?;
-            let value = crate::storage::lsm::Value::new(row_data, *row_id);
-            self.lsm_engine.put(*row_id, value)?;
+        // 4. 🚀 P2 优化：批量写入 LSM MemTable（单次加锁）
+        {
+            let mut kvs = Vec::with_capacity(rows.len());
+            for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                let row_data = bincode::serialize(row)?;
+                let value = crate::storage::lsm::Value::new(row_data, *row_id);
+                kvs.push((*row_id, value));
+            }
+            self.lsm_engine.batch_put(&kvs)?;
         }
 
         // 5. Increment pending counter
+        // 🚀 P0 CRITICAL FIX: 使用原子操作避免锁竞争
         {
-            let mut pending = self.pending_updates.write();
-            *pending += rows.len();
+            use std::sync::atomic::Ordering;
+            let old_count = self.pending_updates.fetch_add(rows.len(), Ordering::Relaxed);
             
-            if *pending >= 1_000 {
-                *pending = 0;
-                drop(pending);
+            // 每2000条触发flush（与LSM一致）
+            if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
+                println!("[AUTO-FLUSH] Batch upsert triggered after {} writes", old_count + rows.len());
                 
                 let db_clone = self.clone_for_callback();
                 std::thread::spawn(move || {
@@ -1101,13 +1226,15 @@ impl MoteDB {
     // ==================== Internal Helpers ====================
     
     /// Increment pending updates counter and trigger auto-flush if needed
+    /// 🚀 P0 CRITICAL FIX: 使用原子操作避免锁竞争，解决 CPU 飙升问题
     fn increment_pending_updates(&self) {
-        let mut pending = self.pending_updates.write();
-        *pending += 1;
+        use std::sync::atomic::Ordering;
         
-        if *pending >= 1_000 {
-            *pending = 0;
-            drop(pending);
+        let count = self.pending_updates.fetch_add(1, Ordering::Relaxed);
+        
+        // 每2000条触发一次flush（与LSM一致）
+        if count % 2_000 == 0 && count > 0 {
+            println!("[AUTO-FLUSH] Triggered after {} writes", count);
             
             let db_clone = self.clone_for_callback();
             std::thread::spawn(move || {
@@ -1325,7 +1452,7 @@ impl MoteDB {
     /// Detect continuous segments in sorted row_ids
     /// 
     /// ## Example
-    /// ```text
+    /// ```
     /// Input:  [100, 101, 102, 105, 106, 200, 201, 202]
     /// Output: [[100,101,102], [105,106], [200,201,202]]
     /// ```
@@ -1366,7 +1493,7 @@ impl MoteDB {
 /// - Deserializing 5/10 columns: 2x faster (400µs → 200µs)
 /// 
 /// ## How it works
-/// ```text
+/// ```
 /// Row format: Vec<Value> = [val1, val2, val3, ...]
 /// 
 /// For each column:
@@ -1469,22 +1596,23 @@ impl Iterator for TableRowBatchedIterator {
 }
 
 /// 🚀 表行流式迭代器（真正的 O(1) 内存占用）
-/// 
+///
 /// 逐个返回行数据，不预先加载任何数据到内存。
 pub struct TableRowStreamingIterator {
     lsm_iter: crate::storage::lsm::MergingIterator,
+    #[allow(dead_code)]
     table_name: String,
 }
 
 impl Iterator for TableRowStreamingIterator {
     type Item = Result<(RowId, Row)>;
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         match self.lsm_iter.next() {
             Some(Ok((composite_key, value))) => {
                 // Extract row_id from composite_key
                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-                
+
                 // Extract data
                 let data = match &value.data {
                     crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
@@ -1494,13 +1622,13 @@ impl Iterator for TableRowStreamingIterator {
                         )));
                     }
                 };
-                
+
                 // Deserialize row
                 let row: Row = match bincode::deserialize(data) {
                     Ok(row) => row,
                     Err(e) => return Some(Err(StorageError::Serialization(e.to_string()))),
                 };
-                
+
                 Some(Ok((row_id, row)))
             }
             Some(Err(e)) => Some(Err(e)),

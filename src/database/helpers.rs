@@ -5,21 +5,95 @@
 
 use crate::types::{Row, RowId, Value, TableSchema};
 use crate::{Result, StorageError};
-use std::collections::HashMap;
+
 
 use super::core::MoteDB;
 
 impl MoteDB {
-    /// 🚀 Phase 3: Batch build indexes from flushed MemTable data
-    /// 
-    /// Called by LSM Engine's flush callback with all row data from MemTable
+    /// Batch build indexes from flushed MemTable data
+    ///
+    /// Called by LSM Engine's flush callback with all row data from MemTable.
+    /// After P1.1 (table_id replaces hash), the deadlock is eliminated because
+    /// find_table_name_by_id is a pure in-memory registry lookup — no LSM scan.
     pub(crate) fn batch_build_indexes_from_flush(&self, memtable: &crate::storage::lsm::UnifiedMemTable) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
-        
+
         let memtable_len = memtable.len();
-        debug_log!("[BatchIndexBuilder] 🔍 收到Flush回调，MemTable数据量: {}", memtable_len);
+        debug_log!("[BatchIndexBuilder] Flush callback received, MemTable entries: {}", memtable_len);
+
+        if memtable_len == 0 {
+            return Ok(());
+        }
+
+        // Skip batch building for very small datasets (rely on incremental indexing)
+        const MIN_BATCH_SIZE: usize = 100;
+        if memtable_len < MIN_BATCH_SIZE {
+            debug_log!("[BatchIndexBuilder] Skipping ({} < {}), relying on incremental indexing",
+                     memtable_len, MIN_BATCH_SIZE);
+            return Ok(());
+        }
+
+        debug_log!("[BatchIndexBuilder] Building indexes from {} flushed rows", memtable_len);
+
+        // Phase 1: Group rows by table_name using collision-free table_id
+        let mut tables_data: std::collections::HashMap<String, Vec<(RowId, Row)>> = std::collections::HashMap::new();
+
+        for (composite_key, entry) in memtable.iter() {
+            if entry.deleted {
+                continue;
+            }
+
+            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+            let table_id = (composite_key >> 32) as u32;
+
+            let row_bytes: Vec<u8> = match &entry.data {
+                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                    match self.lsm_engine.resolve_blob(blob_ref) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            eprintln!("[BatchIndexBuilder] Failed to resolve blob for row {}: {}", row_id, e);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let row: Row = match bincode::deserialize(&row_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[BatchIndexBuilder] Failed to deserialize row {}: {}", row_id, e);
+                    continue;
+                }
+            };
+
+            // Pure in-memory lookup — no LSM scan, no deadlock risk
+            let table_name = match self.find_table_name_by_id(table_id) {
+                Ok(name) => name,
+                Err(_) => continue, // Unknown table_id, skip
+            };
+
+            tables_data.entry(table_name)
+                .or_default()
+                .push((row_id, row));
+        }
+
+        debug_log!("[BatchIndexBuilder] Grouped into {} tables", tables_data.len());
+
+        // Phase 2: Build indexes per table
+        for (table_name, rows) in &tables_data {
+            if let Err(e) = self.batch_build_table_indexes(table_name, rows) {
+                eprintln!("[BatchIndexBuilder] Warning: index build failed for table '{}': {:?}", table_name, e);
+                // Don't fail the entire flush — index can be rebuilt later
+            }
+        }
+
+        debug_log!("[BatchIndexBuilder] Batch index building complete in {:?} ({} tables)",
+                 start.elapsed(), tables_data.len());
+        Ok(())
         
+        /* DISABLED CODE - CAUSES DEADLOCKS
         if memtable_len == 0 {
             return Ok(());
         }
@@ -53,7 +127,7 @@ impl MoteDB {
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
             let table_hash = composite_key >> 32;
             
-            let row: Row = match bincode::deserialize(row_bytes) {
+            let row: Row = match bincode::deserialize(&row_bytes) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[BatchIndexBuilder] ⚠️  Failed to deserialize row {}: {}", row_id, e);
@@ -102,34 +176,15 @@ impl MoteDB {
         
         debug_log!("[BatchIndexBuilder] ✅ Batch index building complete in {:?} ({} tables)", start.elapsed(), tables_count);
         Ok(())
+        */
     }
     
-    /// Find table name by hash (reverse lookup)
-    fn find_table_name_by_hash(&self, table_hash: u64) -> Result<String> {
-        // Try cache first (DashMap lock-free read)
-        for entry in self.table_hash_cache.iter() {
-            if *entry.value() == table_hash {
-                return Ok(entry.key().clone());
-            }
-        }
-        
-        // Cache miss - compute and cache
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let tables = self.table_registry.list_tables()?;
-        for table_name in tables {
-            let mut hasher = DefaultHasher::new();
-            table_name.hash(&mut hasher);
-            let computed_hash = hasher.finish() & 0xFFFFFFFF;
-            
-            if computed_hash == table_hash {
-                self.table_hash_cache.insert(table_name.clone(), computed_hash);
-                return Ok(table_name);
-            }
-        }
-        
-        Err(StorageError::Index(format!("Table not found for hash {}", table_hash)))
+    /// Find table name by its stable sequential table_id (reverse lookup).
+    ///
+    /// This is a pure in-memory operation on the TableRegistry's HashMap
+    /// — no LSM scan, no deadlock risk.
+    fn find_table_name_by_id(&self, table_id: u32) -> Result<String> {
+        self.table_registry.get_table_name_by_id(table_id)
     }
     
     /// Batch build all indexes for a specific table
@@ -257,13 +312,13 @@ impl MoteDB {
                     .collect();
                 
                 index.write().insert_batch(&batch_refs)?;
-                println!("[ColumnIndex]   ✓ Built {} entries for column '{}'", 
+                debug_log!("[ColumnIndex]   ✓ Built {} entries for column '{}'", 
                          batch.len(), col_name);
             }
         }
         
         let duration = start.elapsed();
-        println!("[ColumnIndex] Batch build complete in {:?}", duration);
+        debug_log!("[ColumnIndex] Batch build complete in {:?}", duration);
         
         Ok(())
     }
@@ -306,7 +361,7 @@ impl MoteDB {
                     let mut vectors = Vec::new();
                     for (row_id, row) in rows {
                         if let Some(crate::types::Value::Vector(vec)) = row.get(col_def.position) {
-                            vectors.push((*row_id, vec.clone()));
+                            vectors.push((*row_id, vec.to_vec()));
                         }
                     }
                     

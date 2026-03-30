@@ -83,12 +83,20 @@ impl MoteDB {
                             for (composite_key, value) in entries {
                                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
                                 
-                                let data_bytes = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                                    crate::storage::lsm::ValueData::Blob(_) => continue,
+                                let data_bytes: Vec<u8> = match &value.data {
+                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                        match self.lsm_engine.resolve_blob(blob_ref) {
+                                            Ok(data) => data,
+                                            Err(e) => {
+                                                eprintln!("[create_spatial_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                                continue;
+                                            }
+                                        }
+                                    }
                                 };
-                                
-                                if let Ok(row) = bincode::deserialize::<Row>(data_bytes) {
+
+                                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
                                     if let Some(crate::types::Value::Spatial(geom)) = row.get(col_position) {
                                         geometries_to_index.push((row_id, geom.clone()));
                                     }
@@ -171,15 +179,14 @@ impl MoteDB {
         drop(index_guard);
         
         // Incremental persistence: update counter and check if flush needed
+        // 🚀 P0 CRITICAL FIX: 使用原子操作避免锁竞争
         {
-            let mut pending = self.pending_spatial_updates.write();
-            *pending += count;
+            use std::sync::atomic::Ordering;
+            let old_count = self.pending_spatial_updates.fetch_add(count, Ordering::Relaxed);
             
-            // Strategy: consistent threshold with LSM's pending_updates
-            if *pending >= 1_000 {
-                // ✅ Reset counter IMMEDIATELY
-                *pending = 0;
-                drop(pending);
+            // Strategy: consistent threshold with LSM's pending_updates (每2000条flush一次)
+            if old_count / 2_000 != (old_count + count) / 2_000 {
+                println!("[AUTO-FLUSH] Spatial triggered after {} updates", old_count + count);
                 
                 // Trigger incremental flush (background thread)
                 let db_clone = self.clone_for_callback();

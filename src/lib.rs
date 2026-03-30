@@ -53,7 +53,7 @@ pub mod database;
 mod error;
 mod api;  // 内部 API 包装层
 
-pub use config::{DBConfig, DurabilityLevel, LSMConfig, WALConfig};
+pub use config::{DBConfig, DurabilityLevel, LSMConfig, WALConfig, AutoCheckpointConfig};
 pub use error::{Result, StorageError, MoteDBError};
 
 // 主要对外 API (now using modular database)

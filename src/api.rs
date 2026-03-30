@@ -136,6 +136,14 @@ impl Database {
         self.inner.flush()
     }
 
+    /// Checkpoint: flush data + persist indexes + truncate WAL
+    ///
+    /// Stronger durability guarantee than flush() alone.
+    /// Use before closing to ensure full recoverability.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.inner.checkpoint()
+    }
+
     /// 关闭数据库（显式调用，通常由 Drop 自动处理）
     ///
     /// # Examples

@@ -78,6 +78,11 @@ impl VersionStore {
     pub fn allocate_timestamp(&self) -> Timestamp {
         self.timestamp_gen.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// Get the current timestamp (for vacuum)
+    pub fn current_timestamp(&self) -> Timestamp {
+        self.timestamp_gen.load(Ordering::Relaxed)
+    }
     
     /// Insert a new version for a row
     pub fn insert_version(
@@ -240,15 +245,46 @@ impl VersionStore {
         }
     }
     
-    /// Vacuum - remove old versions that are no longer visible to any transaction
+    /// Vacuum - remove old versions that are no longer visible to any transaction.
+    ///
+    /// Also removes entire version chains whose head is a tombstone visible to
+    /// all active transactions (i.e. the row is fully deleted). This prevents
+    /// the DashMap from growing without bound as rows are deleted.
     pub fn vacuum(&self, min_active_timestamp: Timestamp) -> Result<usize> {
         let mut removed = 0;
-        
+        let mut rows_to_remove = Vec::new();
+
         for mut entry in self.versions.iter_mut() {
             let chain = entry.value_mut();
-            removed += chain.vacuum(min_active_timestamp);
+            let chain_removed = chain.vacuum(min_active_timestamp);
+            removed += chain_removed;
+
+            // Check if the chain head is a tombstone that's fully visible.
+            // A tombstone with end_ts == 0 is the latest version and visible
+            // to all transactions at or after its begin_ts.
+            let should_remove = {
+                let head = chain.head.read();
+                if let Some(version) = head.as_ref() {
+                    version.deleted.load(Ordering::Acquire)
+                        && version.end_ts.load(Ordering::Acquire) == 0
+                        && version.begin_ts < min_active_timestamp
+                } else {
+                    // Empty chain — can remove
+                    true
+                }
+            };
+
+            if should_remove {
+                rows_to_remove.push(*entry.key());
+            }
         }
-        
+
+        // Remove fully-deleted rows from the DashMap
+        for row_id in rows_to_remove {
+            self.versions.remove(&row_id);
+            removed += 1;
+        }
+
         Ok(removed)
     }
 }
@@ -276,20 +312,24 @@ impl VersionChain {
         self.version_count.fetch_add(1, Ordering::Relaxed);
     }
     
-    /// Remove versions older than min_timestamp
+    /// Remove versions older than min_timestamp.
+    ///
+    /// If the head is a tombstone and all older versions are vacuumed,
+    /// the chain will have version_count == 1 with only the tombstone remaining.
+    /// The DashMap-level vacuum will then remove the entire entry.
     fn vacuum(&self, min_timestamp: Timestamp) -> usize {
         let mut head = self.head.write();
         let mut removed = 0;
-        
+
         if let Some(first_version) = head.as_mut() {
-            // Keep the first version, vacuum the rest
+            // Vacuum all versions after the first
             removed += Self::vacuum_chain(&mut first_version.next, min_timestamp);
         }
-        
+
         if removed > 0 {
             self.version_count.fetch_sub(removed as u64, Ordering::Relaxed);
         }
-        
+
         removed
     }
     

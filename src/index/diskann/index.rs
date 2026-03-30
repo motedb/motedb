@@ -111,25 +111,29 @@ impl FreshDiskANNIndex {
     
     /// 查询（多层合并）
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<Candidate>> {
-        // 🎯 极致优化：最小化ef和expanded_k，但保证P90性能
+        // Scale ef based on k for better recall
         let ef = if k <= 10 {
-            ef.max(k * 3).max(80)  // K≤10: ef=max(80, 3k) - 提高基线避免P90退化
+            ef.max(k * 3).max(80)
         } else if k <= 30 {
-            ef.max(k * 3).max(100)  // 10<K≤30: ef=max(100, 3k)
+            ef.max(k * 3).max(100)
         } else {
-            ef.max(k * 3).max(120)  // K>30: ef=max(120, 3k)
+            ef.max(k * 3).max(120)
         };
-        
-        // 🎯 极致优化：最小化expanded_k，减少候选数量
-        let num_ssts = self.level1_ssts.len() + if self.merged_index.is_some() { 1 } else { 0 };
-        
-        // 激进但稳定的扩展策略
-        let expanded_k = if num_ssts > 1 {
-            // 多个 SST：k*1.5倍（最少k+30保证质量）
-            ((k * 3) / 2).max(k + 30).min(120)
+
+        // Scale expanded_k dynamically based on dataset size:
+        // - Small (<1K vectors): k*3, cap 200
+        // - Medium (1K-100K): k*5, cap 500
+        // - Large (>100K): k*10, cap 2000
+        let total_vectors = self.fresh_graph.node_count()
+            + self.level1_ssts.iter().map(|s| s.active_node_count()).sum::<usize>()
+            + self.merged_index.as_ref().map(|m| m.active_node_count()).unwrap_or(0);
+
+        let expanded_k = if total_vectors < 1_000 {
+            (k * 3).max(k + 30).min(200)
+        } else if total_vectors < 100_000 {
+            (k * 5).max(k + 50).min(500)
         } else {
-            // 单个 SST：2.5倍
-            ((k * 5) / 2).min(80)
+            (k * 10).max(k + 100).min(2000)
         };
         
         // 1. 查询 Fresh Graph
@@ -1215,7 +1219,7 @@ impl IndexBuilder for FreshDiskANNIndex {
             // 遍历row中的所有列，找到Vector类型
             for value in row.iter() {
                 if let Value::Vector(vec) = value {
-                    vectors.push((*row_id, vec.clone()));
+                    vectors.push((*row_id, vec.to_vec()));
                     break; // 只取第一个向量列
                 }
             }

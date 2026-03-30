@@ -194,13 +194,20 @@ impl MoteDB {
         let snapshot = &ctx.snapshot;
         
         // 1. Scan LSM for all rows in this table (committed data)
+        // Use streaming scan to avoid loading entire table into memory
         let composite_prefix = self.compute_table_prefix(table_name);
+        let start_key = composite_prefix << 32;
+        let end_key = (composite_prefix + 1) << 32;
         let mut results = Vec::new();
-        
-        // Use LSM scan_prefix to get committed rows
-        let lsm_rows = self.lsm_engine.scan_prefix(composite_prefix)?;
-        
-        for (row_id, value) in lsm_rows {
+
+        // Use streaming scan to reduce memory usage
+        let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+
+        for result in lsm_iter {
+            let (composite_key, value) = result?;
+            // Extract row_id from composite_key
+            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
             // MVCC visibility check: only visible if committed before snapshot
             if value.timestamp <= snapshot.timestamp {
                 // Decode row data

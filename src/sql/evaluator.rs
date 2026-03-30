@@ -6,6 +6,7 @@ use crate::database::MoteDB;
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::cell::RefCell;
 
 /// ⚡ Compiled LIKE pattern for fast matching
 #[derive(Debug, Clone)]
@@ -155,6 +156,8 @@ pub struct ExprEvaluator {
     /// ⚡ Pattern cache: pattern string -> compiled pattern
     /// RwLock for concurrent read access (common case)
     pattern_cache: Arc<RwLock<HashMap<String, CompiledPattern>>>,
+    /// 🆕 Store the last AUTO_INCREMENT value inserted (shared with QueryExecutor)
+    pub(crate) last_insert_id: Arc<RefCell<Option<i64>>>,
 }
 
 impl ExprEvaluator {
@@ -162,6 +165,7 @@ impl ExprEvaluator {
         Self { 
             db: None,
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_insert_id: Arc::new(RefCell::new(None)),
         }
     }
     
@@ -169,6 +173,7 @@ impl ExprEvaluator {
         Self { 
             db: Some(db),
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_insert_id: Arc::new(RefCell::new(None)),
         }
     }
     
@@ -379,6 +384,15 @@ impl ExprEvaluator {
         // It's ignored for non-aggregate functions
         
         match name.to_lowercase().as_str() {
+            // 🆕 LAST_INSERT_ID() - returns the last AUTO_INCREMENT value
+            "last_insert_id" => {
+                if !args.is_empty() {
+                    return Err(MoteDBError::InvalidArgument("last_insert_id() takes no arguments".to_string()));
+                }
+                let last_id = *self.last_insert_id.borrow();
+                Ok(Value::Integer(last_id.unwrap_or(0)))
+            }
+            
             // Aggregate functions (will be handled by executor for now)
             "count" | "sum" | "avg" | "min" | "max" => {
                 Err(MoteDBError::NotImplemented(format!("Aggregate function {} not yet implemented", name)))
@@ -1228,6 +1242,7 @@ impl ExprEvaluator {
         match val {
             Value::Bool(b) => Ok(*b),
             Value::Integer(i) => Ok(*i != 0),
+            Value::Float(f) => Ok(*f != 0.0 && !f.is_nan()),  // 🔧 Support Float: non-zero and non-NaN is true
             Value::Null => Ok(false),
             _ => Err(MoteDBError::TypeError("Cannot convert to boolean".to_string())),
         }
@@ -1450,7 +1465,7 @@ impl ExprEvaluator {
     /// Extract vectors from Value types
     fn extract_vectors(&self, left: Value, right: Value) -> Result<(Vec<f32>, Vec<f32>)> {
         let v1 = match left {
-            Value::Vector(v) => v,
+            Value::Vector(v) => v.to_vec(),
             Value::Tensor(t) => {
                 t.as_f32().to_vec()
             }
@@ -1460,7 +1475,7 @@ impl ExprEvaluator {
         };
         
         let v2 = match right {
-            Value::Vector(v) => v,
+            Value::Vector(v) => v.to_vec(),
             Value::Tensor(t) => {
                 t.as_f32().to_vec()
             }

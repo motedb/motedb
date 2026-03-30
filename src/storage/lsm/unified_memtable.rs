@@ -177,6 +177,58 @@ impl UnifiedMemTable {
         Ok(())
     }
     
+    /// 🚀 P2 优化：批量插入（单次加锁）
+    /// 
+    /// ## 性能优化
+    /// - 单次加锁插入所有 KV 对
+    /// - 批量更新 size 计数器
+    /// - 减少锁竞争和原子操作次数
+    /// 
+    /// ## 预期效果
+    /// - 1000 条插入：1000 次加锁 → 1 次加锁
+    /// - 性能提升：3-5 倍
+    pub fn batch_put(&self, kvs: &[(Key, Value)]) -> Result<()> {
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        
+        let mut entries = self.entries.write()
+            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
+        
+        let mut total_size_change: i64 = 0;
+        
+        for (key, value) in kvs {
+            let entry = UnifiedEntry {
+                data: value.data.clone(),
+                vector: None,
+                timestamp: value.timestamp,
+                deleted: value.deleted,
+            };
+            
+            let entry_size = entry.memory_size();
+            
+            // Calculate size change
+            if let Some(old_entry) = entries.get(key) {
+                let old_size = old_entry.memory_size();
+                total_size_change -= old_size as i64;
+            }
+            
+            entries.insert(*key, entry);
+            total_size_change += entry_size as i64;
+        }
+        
+        // Batch update size (single atomic operation)
+        if total_size_change > 0 {
+            self.size.fetch_add(total_size_change as usize, Ordering::Relaxed);
+        } else if total_size_change < 0 {
+            self.size.fetch_sub((-total_size_change) as usize, Ordering::Relaxed);
+        }
+        
+        self.next_seq.fetch_add(kvs.len(), Ordering::Relaxed);
+        
+        Ok(())
+    }
+    
     /// 获取数据
     pub fn get(&self, key: Key) -> Result<Option<UnifiedEntry>> {
         let entries = self.entries.read()

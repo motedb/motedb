@@ -5,6 +5,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum StorageError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -54,6 +55,9 @@ pub enum StorageError {
     
     #[error("Table not found: {0}")]
     TableNotFound(String),
+
+    #[error("Index not found: {0}")]
+    IndexNotFound(String),
     
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
@@ -66,6 +70,10 @@ pub enum StorageError {
     
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+    
+    /// 🚀 Phase 5: AUTO_INCREMENT overflow error
+    #[error("AUTO_INCREMENT overflow for table '{0}': counter has reached i64::MAX")]
+    AutoIncrementOverflow(String),
 }
 
 // Alias for compatibility

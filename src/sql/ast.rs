@@ -12,6 +12,7 @@ pub enum Statement {
     CreateIndex(CreateIndexStmt),
     DropTable(DropTableStmt),
     DropIndex(DropIndexStmt),
+    AlterTable(AlterTableStmt),
     ShowTables,
     DescribeTable(String),  // table name
 }
@@ -21,7 +22,7 @@ pub enum Statement {
 pub struct SelectStmt {
     pub distinct: bool,                    // SELECT DISTINCT
     pub columns: Vec<SelectColumn>,
-    pub from: TableRef,                    // Changed from String to support JOINs
+    pub from: Option<TableRef>,            // Optional FROM clause (for SELECT without tables)
     pub where_clause: Option<Expr>,
     pub group_by: Option<Vec<String>>,     // GROUP BY column_list
     pub having: Option<Expr>,              // HAVING condition
@@ -111,11 +112,17 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    /// 🚀 AUTO_INCREMENT flag
+    pub auto_increment: bool,
+    /// 🚀 Phase 5: AUTO_INCREMENT starting value (e.g., AUTO_INCREMENT = 100)
+    pub auto_increment_start: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataType {
     Integer,
+    /// 🚀 Phase 4: BIGINT for 64-bit integers (supports up to i64::MAX)
+    BigInt,
     Float,
     Text,
     Boolean,
@@ -153,6 +160,20 @@ pub struct DropTableStmt {
 #[derive(Debug, Clone)]
 pub struct DropIndexStmt {
     pub index_name: String,
+}
+
+/// 🆕 ALTER TABLE statement
+#[derive(Debug, Clone)]
+pub struct AlterTableStmt {
+    pub table: String,
+    pub action: AlterTableAction,
+}
+
+/// 🆕 ALTER TABLE actions
+#[derive(Debug, Clone)]
+pub enum AlterTableAction {
+    /// ALTER TABLE table_name AUTO_INCREMENT = value
+    SetAutoIncrement(i64),
 }
 
 /// Expression
@@ -262,7 +283,7 @@ pub enum Expr {
     /// - Used with KNN_DISTANCE() for scoring
     KnnSearch {
         column: String,
-        query_vector: Vec<f32>,
+        query_vector: crate::types::ArcVec,
         k: usize,
     },
     
@@ -276,7 +297,7 @@ pub enum Expr {
     /// - ORDER BY KNN_DISTANCE(embedding, [0.1, 0.2])
     KnnDistance {
         column: String,
-        query_vector: Vec<f32>,
+        query_vector: crate::types::ArcVec,
     },
     
     /// ST_WITHIN spatial range query

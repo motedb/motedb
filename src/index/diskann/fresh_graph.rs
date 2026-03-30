@@ -29,7 +29,7 @@ pub struct FreshGraphConfig {
 impl Default for FreshGraphConfig {
     fn default() -> Self {
         Self {
-            max_nodes: 10000,
+            max_nodes: 2000,              // 🚀 P0: 统一与LSM一致 (2000条)，保证数据一致性
             max_degree: 64,               // 🎯 平衡优化：100→64，减少36%的边（避免过度激进）
             search_list_size: 200,        // 🚀 优化：500→200，减少60%搜索范围
             alpha: 1.2,

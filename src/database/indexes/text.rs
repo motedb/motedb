@@ -4,7 +4,7 @@
 //! Provides full-text search with BM25 ranking
 
 use crate::database::core::MoteDB;
-use crate::types::{Row, RowId};
+use crate::types::RowId;
 use crate::{Result, StorageError};
 use crate::index::text_fts::{TextFTSIndex, TextFTSStats};
 use parking_lot::RwLock;
@@ -27,73 +27,12 @@ impl MoteDB {
         let index_arc = Arc::new(RwLock::new(index));
         self.text_indexes.insert(name.to_string(), index_arc.clone());
         
-        // 🚀 方案B：使用scan_range高性能扫描
-        // name格式: "table_column"
-        let parts: Vec<&str> = name.split('_').collect();
-        if parts.len() >= 2 {
-            let table_name = parts[0];
-            let column_name = parts[1..].join("_");
-            
-            if let Ok(schema) = self.table_registry.get_table(table_name) {
-                if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
-                    let col_position = col_def.position;
-                    
-                    println!("[create_text_index] 🔍 使用scan_range扫描LSM（方案B）...");
-                    let start_time = std::time::Instant::now();
-                    
-                    // 计算表的key范围
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    table_name.hash(&mut hasher);
-                    let table_hash = hasher.finish() & 0xFFFFFFFF;
-                    
-                    let start_key = table_hash << 32;
-                    let end_key = (table_hash + 1) << 32;
-                    
-                    // 一次scan_range扫描所有数据
-                    let mut texts_to_index = Vec::new();
-                    match self.lsm_engine.scan_range(start_key, end_key) {
-                        Ok(entries) => {
-                            for (composite_key, value) in entries {
-                                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-                                
-                                let data_bytes = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                                    crate::storage::lsm::ValueData::Blob(_) => continue,
-                                };
-                                
-                                if let Ok(row) = bincode::deserialize::<Row>(data_bytes) {
-                                    if let Some(crate::types::Value::Text(text)) = row.get(col_position) {
-                                        texts_to_index.push((row_id, text.clone()));
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[create_text_index] ⚠️ scan_range失败: {}", e);
-                        }
-                    }
-                    
-                    let scan_time = start_time.elapsed();
-                    
-                    if !texts_to_index.is_empty() {
-                        println!("[create_text_index] 🚀 扫描完成：{} 条文本，耗时 {:?}", 
-                                 texts_to_index.len(), scan_time);
-                        
-                        let build_time = std::time::Instant::now();
-                        for (row_id, text) in texts_to_index {
-                            if let Err(e) = index_arc.write().insert(row_id, &text) {
-                                eprintln!("[create_text_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
-                            }
-                        }
-                        println!("[create_text_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
-                    } else {
-                        println!("[create_text_index] ⚠️ 未找到任何文本数据（扫描耗时 {:?}）", scan_time);
-                    }
-                }
-            }
-        }
+        // ✅ P0 FIX: 只创建空索引，不在这里回填数据
+        // 原因：
+        // 1. 避免双重扫描（create_text_index + executor各扫一次）
+        // 2. 避免内存爆炸（全量加载到Vec）
+        // 3. 避免锁风暴（100万次写锁）
+        // 回填工作由 executor.rs 负责（使用批量流式处理）
         
         Ok(())
     }
@@ -220,24 +159,10 @@ impl MoteDB {
     
     /// Flush text indexes to disk
     /// 
-    /// Persists all in-memory inverted lists and metadata to disk
+    /// Persists all in-memory inverted lists to disk.
+    /// Note: Index metadata is managed by IndexRegistry (index_metadata.bin),
+    /// no need to save text_indexes_metadata.bin separately.
     pub fn flush_text_indexes(&self) -> Result<()> {
-        // 🚀 DashMap: 收集索引名称并保存 metadata
-        let index_names: Vec<String> = self.text_indexes.iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-        
-        if !index_names.is_empty() {
-            // ⭐ 修复路径：应该是 {db}.mote/text_indexes_metadata.bin
-            let metadata_path = self.path.join("text_indexes_metadata.bin");
-            
-            let data = bincode::serialize(&index_names)
-                .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            
-            std::fs::write(&metadata_path, data)
-                .map_err(StorageError::Io)?;
-        }
-        
         // 🚀 DashMap: 直接遍历并 flush
         for entry in self.text_indexes.iter() {
             entry.value().write().flush()?;

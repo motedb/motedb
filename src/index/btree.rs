@@ -773,22 +773,24 @@ impl BTree {
                 root.num_keys = 1;
                 root.dirty = true;
             }
-            
-            // Flush new root
+
+            // Flush new root to disk (critical: must persist before updating superblock)
             {
                 let page_ref = new_root.read()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
                 let new_root_id = page_ref.page_id;
-                // ⚡ 性能优化：延迟刷盘
-                // self.flush_page(&*page_ref)?;
+                self.flush_page(&*page_ref)?;
                 drop(page_ref);
-                
+
                 // Update root ID
                 let mut root_page_id = self.root_page_id.write()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
                 *root_page_id = new_root_id;
             }
-            
+
+            // Persist the new root_page_id to superblock (crash safety)
+            self.sync_superblock()?;
+
             // Update stats
             let mut stats = self.stats.write()
                 .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
@@ -1109,46 +1111,51 @@ impl BTree {
     }
     
     /// Remove a key-value pair
+    ///
+    /// Traverses from root to the correct leaf node, then deletes the key.
+    /// Note: This is a simplified implementation that does not perform rebalancing
+    /// (merge/redistribute). Underflow is tolerated — the tree remains correct
+    /// for lookups, just potentially unbalanced. Full rebalancing can be added later.
     pub fn remove(&mut self, key: &u64) -> Result<Option<u64>> {
         let root_id = *self.root_page_id.read()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        // 🔧 Fix: Empty tree (root_id == 0)
+
+        // Empty tree (root_id == 0)
         if root_id == 0 {
             return Ok(None);
         }
-        
-        let root_page = self.load_page(root_id)?;
-        let mut page = root_page.write()
+
+        // Find the leaf node containing this key
+        let leaf_id = self.find_leaf_for_key(root_id, *key)?;
+
+        // Delete from the leaf
+        let leaf_arc = self.load_page(leaf_id)?;
+        let mut leaf = leaf_arc.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        if let Ok(idx) = page.keys.binary_search(key) {
-            let old_value = page.values[idx];
-            page.keys.remove(idx);
-            page.values.remove(idx);
-            page.num_keys -= 1;
-            page.dirty = true;
-            
-            // Drop write lock before flushing
-            drop(page);
-            
-            // Update stats
-            let mut stats = self.stats.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            stats.total_keys -= 1;
-            drop(stats);
-            
-            // Flush the page
-            {
-                let _page_ref = root_page.read()
+
+        if !leaf.is_leaf {
+            return Err(StorageError::Index(
+                "find_leaf_for_key returned non-leaf page".into()
+            ));
+        }
+
+        match leaf.keys.binary_search(key) {
+            Ok(idx) => {
+                let old_value = leaf.values[idx];
+                leaf.keys.remove(idx);
+                leaf.values.remove(idx);
+                leaf.num_keys -= 1;
+                leaf.dirty = true;
+                drop(leaf);
+
+                // Update stats
+                let mut stats = self.stats.write()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                // ⚡ 性能优化：不在 insert 时刷盘，只在 flush() 时批量刷盘
-                // self.flush_page(&*page_ref)?;
+                stats.total_keys = stats.total_keys.saturating_sub(1);
+
+                Ok(Some(old_value))
             }
-            
-            Ok(Some(old_value))
-        } else {
-            Ok(None)
+            Err(_) => Ok(None),
         }
     }
     

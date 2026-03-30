@@ -110,7 +110,7 @@ fn docs_vector_index_example_runs() -> Result<()> {
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Integer(i));
         row.insert("title".into(), Value::Text(format!("Doc {}", i)));
-        row.insert("embedding".into(), Value::Vector(vec![i as f32 * 0.1; 4]));
+        row.insert("embedding".into(), Value::Vector(motedb::types::ArcVec::new(vec![i as f32 * 0.1; 4])));
         rows.push(row);
     }
 
@@ -183,7 +183,7 @@ fn docs_spatial_index_example_runs() -> Result<()> {
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Integer(i));
         row.insert("name".into(), Value::Text(format!("POI {}", i)));
-        row.insert("coords".into(), Value::Vector(vec![116.0 + i as f32 * 0.01, 39.0]));
+        row.insert("coords".into(), Value::Vector(motedb::types::ArcVec::new(vec![116.0 + i as f32 * 0.01, 39.0])));
         row.insert("category".into(), Value::Text("restaurant".into()));
         rows.push(row);
     }

@@ -72,7 +72,7 @@ pub enum ScanMethod {
     VectorSearch {
         table: String,
         column: String,
-        query_vector: Vec<f32>,
+        query_vector: crate::types::ArcVec,
         k: usize,
     },
     
@@ -211,7 +211,7 @@ impl QueryOptimizer {
         }
         
         // Extract table name
-        let table_name = match &stmt.from {
+        let table_name = match stmt.from.as_ref().unwrap() {
             TableRef::Table { name, .. } => name.clone(),
             _ => {
                 // For JOINs and subqueries, skip optimization for now
@@ -302,7 +302,7 @@ impl QueryOptimizer {
     ) -> Result<()> {
         // 🔥 P0 FIX: Check for VECTOR_SEARCH function first (highest priority)
         if let Some((column, query_vector, k)) = self.try_extract_vector_search(expr) {
-            self.try_vector_search_plan(table_name, &column, query_vector, k, plans)?;
+            self.try_vector_search_plan(table_name, &column, &query_vector, k, plans)?;
             return Ok(()); // Vector search found, this dominates the query
         }
         
@@ -358,12 +358,37 @@ impl QueryOptimizer {
         plans: &mut Vec<QueryPlan>,
     ) -> Result<()> {
         let index_name = format!("{}.{}", table_name, column);
-        
+
+        // 🚀 Fast path: AUTO_INCREMENT primary key can use direct LSM get (no column index needed)
+        let is_auto_increment_pk = self.db.table_registry.get_table(table_name)
+            .ok()
+            .map(|schema| {
+                schema.primary_key()
+                    .map(|pk| pk == column && schema.is_primary_key_auto_increment())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        if is_auto_increment_pk {
+            // Direct LSM get: O(1) cost, exactly 1 estimated row
+            plans.push(QueryPlan {
+                scan_method: ScanMethod::PointQuery {
+                    table: table_name.to_string(),
+                    column: column.to_string(),
+                    value,
+                },
+                estimated_cost: self.cost_params.index_lookup_cost,
+                estimated_rows: 1,
+                post_filters: vec![],
+            });
+            return Ok(());
+        }
+
         // Check if column index exists
         if !self.db.column_indexes.contains_key(&index_name) {
             return Ok(()); // No index available
         }
-        
+
         // Get or estimate index statistics
         let stats = self.get_index_stats(&index_name)?;
         let estimated_rows = stats.estimate_point_query();
@@ -508,7 +533,7 @@ impl QueryOptimizer {
     
     /// 🔥 Extract VECTOR_SEARCH function from WHERE clause
     /// Pattern: VECTOR_SEARCH(column, [v1, v2, ...], k)
-    fn try_extract_vector_search(&self, expr: &Expr) -> Option<(String, Vec<f32>, usize)> {
+    fn try_extract_vector_search(&self, expr: &Expr) -> Option<(String, crate::types::ArcVec, usize)> {
         match expr {
             Expr::FunctionCall { name, args, .. } if name.to_uppercase() == "VECTOR_SEARCH" => {
                 if args.len() != 3 {
@@ -544,7 +569,7 @@ impl QueryOptimizer {
         &mut self,
         table_name: &str,
         column: &str,
-        query_vector: Vec<f32>,
+        query_vector: &crate::types::ArcVec,
         k: usize,
         plans: &mut Vec<QueryPlan>,
     ) -> Result<()> {
@@ -563,7 +588,7 @@ impl QueryOptimizer {
             scan_method: ScanMethod::VectorSearch {
                 table: table_name.to_string(),
                 column: column.to_string(),
-                query_vector,
+                query_vector: query_vector.clone(),
                 k,
             },
             estimated_cost: cost,
@@ -712,7 +737,7 @@ impl QueryOptimizer {
         };
         
         // Get table name
-        let table_name = match &stmt.from {
+        let table_name = match stmt.from.as_ref().unwrap() {
             TableRef::Table { name, .. } => name,
             _ => return Ok(None),
         };
@@ -745,12 +770,6 @@ impl QueryOptimizer {
                 return Ok(None);
             }
         }
-        
-        println!("[Optimizer] ✅ 检测到主键排序模式: ORDER BY {} {} LIMIT {:?}", 
-                 order_column, 
-                 if order_by.asc { "ASC" } else { "DESC" },
-                 stmt.limit);
-        println!("[Optimizer] ✅ 使用主键索引扫描（避免内存排序）");
         
         let estimated_rows = stmt.limit.unwrap_or_else(|| self.estimate_table_size(table_name));
         
@@ -822,7 +841,7 @@ impl QueryOptimizer {
         }
         
         // 获取表名
-        let table_name = match &stmt.from {
+        let table_name = match stmt.from.as_ref().unwrap() {
             TableRef::Table { name, .. } => name.clone(),
             _ => return Ok(None),
         };
@@ -837,14 +856,11 @@ impl QueryOptimizer {
         }
         
         // 🎯 使用向量索引优化！
-        println!("[Optimizer] ✅ 检测到向量排序模式: ORDER BY {} <-> [...] LIMIT {}", column, limit);
-        println!("[Optimizer] ✅ 使用向量索引: {}", index_name);
-        
         Ok(Some(QueryPlan {
             scan_method: ScanMethod::VectorSearch {
                 table: table_name,
                 column,
-                query_vector,
+                query_vector: query_vector.clone(),
                 k: limit,
             },
             estimated_cost: 0.1,  // 向量搜索非常快 (~0.03ms)
@@ -879,7 +895,7 @@ impl QueryOptimizer {
     /// Optimize aggregate queries to use indexes when possible
     fn optimize_aggregate(&mut self, stmt: &SelectStmt) -> Result<Option<QueryPlan>> {
         // Extract table name
-        let table_name = match &stmt.from {
+        let table_name = match stmt.from.as_ref().unwrap() {
             TableRef::Table { name, .. } => name.clone(),
             _ => return Ok(None),
         };
