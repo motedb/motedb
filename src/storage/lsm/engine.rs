@@ -335,21 +335,6 @@ impl LSMEngine {
                             
                             // 🔥 DEADLOCK FIX: Pop memtable FIRST and drop lock
                             if let Some(memtable) = memtable {
-                                // 🔥 CRITICAL: immutable lock already released at line 308
-                                // Safe to call callback now (callback may call database.scan() → LSM locks)
-                                
-                                // 🔥 NEW: Call flush callback (batch index building)
-                                // This ensures both manual and background flush trigger index building
-                                if let Some(callback_arc) = flush_callback_weak.upgrade() {
-                                    if let Ok(callback_guard) = callback_arc.read() {
-                                        if let Some(ref callback) = *callback_guard {
-                                            if let Err(e) = callback(&memtable) {
-                                                eprintln!("[LSM Flush] ⚠️  Callback error: {:?}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                                
                                 // Generate SSTable ID
                                 let next_sst_id = match next_sst_id_weak.upgrade() {
                                     Some(n) => n,
@@ -413,10 +398,23 @@ impl LSMEngine {
                                     }
                                 }
                                 
+                                // 🔥 NEW: Call flush callback AFTER SSTable is built
+                                // This ensures the immutable queue drains quickly even if
+                                // index building is slow (e.g. in debug builds).
+                                if let Some(callback_arc) = flush_callback_weak.upgrade() {
+                                    if let Ok(callback_guard) = callback_arc.read() {
+                                        if let Some(ref callback) = *callback_guard {
+                                            if let Err(e) = callback(&memtable) {
+                                                eprintln!("[LSM Flush] ⚠️  Callback error: {:?}", e);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Explicitly drop memtable
                                 drop(memtable);
                             }
-                            
+
                             flush_in_progress.store(false, Ordering::Release);
                         }
                     }
@@ -1051,8 +1049,8 @@ impl LSMEngine {
             // 每隔 10ms 检查一次
             thread::sleep(Duration::from_millis(10));
             
-            // 超时保护（30秒）
-            if start_wait.elapsed().as_secs() > 30 {
+            // 超时保护（120秒，debug构建下索引构建可能很慢）
+            if start_wait.elapsed().as_secs() > 120 {
                 return Err(StorageError::Transaction("Flush timeout: background thread may be stuck".into()));
             }
         }
