@@ -12,7 +12,6 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Index type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -51,8 +50,8 @@ impl IndexMetadata {
     pub fn new(name: String, table_name: String, column_name: String, index_type: IndexType) -> Self {
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         Self {
             name,
@@ -104,18 +103,28 @@ impl IndexRegistry {
         Ok(())
     }
     
-    /// Save metadata to disk
+    /// Save metadata to disk (atomic via temp-file rename)
     pub fn save(&self) -> Result<()> {
         let metadata_list: Vec<IndexMetadata> = self.indexes.iter()
             .map(|entry| entry.value().clone())
             .collect();
-        
+
         let data = bincode::serialize(&metadata_list)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        
-        std::fs::write(&self.metadata_path, data)
+
+        // Write to temp file first, then rename for atomicity
+        let tmp_path = self.metadata_path.with_extension("bin.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp_path)
+                .map_err(StorageError::Io)?;
+            std::io::Write::write_all(&mut f, &data)
+                .map_err(StorageError::Io)?;
+            f.sync_all()
+                .map_err(StorageError::Io)?;
+        }
+        std::fs::rename(&tmp_path, &self.metadata_path)
             .map_err(StorageError::Io)?;
-        
+
         Ok(())
     }
     

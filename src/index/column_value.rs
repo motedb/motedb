@@ -90,11 +90,11 @@ impl BTreeKey for IndexKey {
 /// Maps column values to row IDs for fast WHERE lookups.
 pub struct ColumnValueIndex {
     /// Table name
-    table_name: String,
+    _table_name: String,
     /// Column name
     column_name: String,
     /// Storage path
-    storage_path: PathBuf,
+    _storage_path: PathBuf,
     /// B-Tree index (value_bytes+row_id → empty)
     btree: Arc<RwLock<GenericBTree<IndexKey>>>,
     /// LRU cache for hot values (🚀 P1 optimization)
@@ -123,9 +123,9 @@ impl ColumnValueIndex {
         let btree = GenericBTree::with_config(storage_path.clone(), btree_config)?;
         
         Ok(Self {
-            table_name,
+            _table_name: table_name,
             column_name,
-            storage_path,
+            _storage_path: storage_path,
             btree: Arc::new(RwLock::new(btree)),
             lru_cache: Arc::new(CachedIndex::new(500)), // 🔧 Reduced from 1000 to 500 for P1
             // 🚀 P0: Removed cache initialization (memory leak fix)

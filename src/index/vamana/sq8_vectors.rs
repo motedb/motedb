@@ -24,12 +24,12 @@ use std::sync::Arc;
 
 /// SQ8 compressed vector storage
 pub struct SQ8Vectors {
-    data_dir: PathBuf,
+    _data_dir: PathBuf,
     dimension: usize,
     quantizer: Arc<SQ8Quantizer>,
 
     /// Entry size = 8 (row_id) + 4 (min) + 4 (max) + dimension (codes)
-    entry_size: usize,
+    _entry_size: usize,
 
     /// In-memory index: row_id -> file offset
     index: Arc<RwLock<HashMap<RowId, u64>>>,
@@ -71,10 +71,10 @@ impl SQ8Vectors {
             .map_err(StorageError::Io)?;
 
         Ok(Self {
-            data_dir,
+            _data_dir: data_dir,
             dimension,
             quantizer,
-            entry_size,
+            _entry_size: entry_size,
             index: Arc::new(RwLock::new(HashMap::new())),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size).unwrap(),
@@ -127,10 +127,10 @@ impl SQ8Vectors {
         }
 
         Ok(Self {
-            data_dir,
+            _data_dir: data_dir,
             dimension,
             quantizer,
-            entry_size,
+            _entry_size: entry_size,
             index: Arc::new(RwLock::new(index)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size).unwrap(),

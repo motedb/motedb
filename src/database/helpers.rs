@@ -15,6 +15,7 @@ impl MoteDB {
     /// Called by LSM Engine's flush callback with all row data from MemTable.
     /// After P1.1 (table_id replaces hash), the deadlock is eliminated because
     /// find_table_name_by_id is a pure in-memory registry lookup — no LSM scan.
+    #[allow(dead_code)]
     pub(crate) fn batch_build_indexes_from_flush(&self, memtable: &crate::storage::lsm::UnifiedMemTable) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
@@ -183,11 +184,13 @@ impl MoteDB {
     ///
     /// This is a pure in-memory operation on the TableRegistry's HashMap
     /// — no LSM scan, no deadlock risk.
+    #[allow(dead_code)]
     fn find_table_name_by_id(&self, table_id: u32) -> Result<String> {
         self.table_registry.get_table_name_by_id(table_id)
     }
     
     /// Batch build all indexes for a specific table
+    #[allow(dead_code)]
     fn batch_build_table_indexes(&self, table_name: &str, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
         use std::thread;
@@ -282,6 +285,7 @@ impl MoteDB {
     }
     
     /// Batch build column indexes
+    #[allow(dead_code)]
     fn batch_build_column_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
@@ -324,6 +328,7 @@ impl MoteDB {
     }
     
     /// Batch build timestamp indexes
+    #[allow(dead_code)]
     fn batch_build_timestamp_indexes(&self, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
@@ -351,6 +356,7 @@ impl MoteDB {
     }
     
     /// Batch build vector indexes
+    #[allow(dead_code)]
     fn batch_build_vector_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         
         for col_def in &schema.columns {
@@ -376,6 +382,7 @@ impl MoteDB {
     }
     
     /// Batch build spatial indexes
+    #[allow(dead_code)]
     fn batch_build_spatial_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         
         for col_def in &schema.columns {
@@ -401,6 +408,7 @@ impl MoteDB {
     }
     
     /// Batch build text indexes
+    #[allow(dead_code)]
     fn batch_build_text_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         use crate::index::builder::IndexBuilder;
         

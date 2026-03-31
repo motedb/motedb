@@ -367,7 +367,6 @@ impl LSMEngine {
                                     match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable.len()) {
                                         Ok(mut builder) => {
                                             // 🆕 Convert UnifiedEntry → Value
-                                            let mut add_count = 0;
                                             for (key, entry) in memtable.iter() {
                                                 let value = Value {
                                                     data: entry.data,
@@ -376,8 +375,6 @@ impl LSMEngine {
                                                 };
                                                 if let Err(e) = builder.add(key, value) {
                                                     eprintln!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
-                                                } else {
-                                                    add_count += 1;
                                                 }
                                             }
                                             
@@ -1195,6 +1192,7 @@ impl LSMEngine {
     
     /// Internal flush implementation
     /// 🔥 NEW: Pop from front of queue (FIFO)
+    #[allow(dead_code)]
     fn flush_immutable_impl(&self) -> Result<Option<PathBuf>> {
         // Pop one MemTable from front of queue (oldest first)
         let memtable = {
@@ -1266,6 +1264,7 @@ impl LSMEngine {
         Ok(Some(sst_path))
     }
     
+    #[allow(dead_code)]
     fn flush_immutable_with_path(&self) -> Result<Option<PathBuf>> {
         // Try to acquire flush ownership (lock-free)
         if self.flush_in_progress.compare_exchange(

@@ -126,11 +126,13 @@ impl MoteDB {
     }
 
     /// Extract row_id from composite key
+    #[allow(dead_code)]
     pub(crate) fn extract_row_id(&self, composite_key: u64) -> RowId {
         composite_key & 0xFFFFFFFF
     }
 
     /// Check if composite key belongs to table
+    #[allow(dead_code)]
     pub(crate) fn key_matches_table(&self, composite_key: u64, table_name: &str) -> bool {
         let table_id = self.table_registry.get_table_id(table_name)
             .unwrap_or(0);

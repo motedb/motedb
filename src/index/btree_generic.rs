@@ -92,8 +92,8 @@ pub struct GenericBTree<K: BTreeKey> {
     flush_lock: Arc<Mutex<()>>,
     
     /// Storage path
-    storage_path: PathBuf,
-    
+    _storage_path: PathBuf,
+
     /// Configuration
     config: GenericBTreeConfig,
     
@@ -641,7 +641,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             next_page_id: Arc::new(RwLock::new(next_page_id)),
             storage_file: Arc::new(RwLock::new(file)),
             flush_lock: Arc::new(Mutex::new(())),
-            storage_path,
+            _storage_path: storage_path,
             config,
             key_size,
             max_keys,

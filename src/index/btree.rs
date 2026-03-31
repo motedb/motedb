@@ -107,8 +107,8 @@ pub struct BTree {
     flush_lock: Arc<Mutex<()>>,
     
     /// Storage path
-    storage_path: PathBuf,
-    
+    _storage_path: PathBuf,
+
     /// Configuration
     config: BTreeConfig,
     
@@ -498,7 +498,7 @@ impl BTree {
             next_page_id: Arc::new(RwLock::new(next_page_id)),
             storage_file: Arc::new(RwLock::new(file)),
             flush_lock: Arc::new(Mutex::new(())),
-            storage_path,
+            _storage_path: storage_path,
             config,
             stats: Arc::new(RwLock::new(stats)),
             file_manager: None,

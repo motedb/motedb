@@ -120,10 +120,13 @@ impl MoteDB {
         let row_data = bincode::serialize(&new_row)?;
         let value = crate::storage::lsm::Value::new(row_data, composite_key);
         self.lsm_engine.put(composite_key, value)?;
-        
+
+        // 5. Invalidate cache (prevent stale reads)
+        self.row_cache.invalidate(table_name, row_id);
+
         Ok(())
     }
-    
+
     /// Delete a row by row ID
     /// 
     /// # Example
@@ -154,7 +157,10 @@ impl MoteDB {
 
         // 5. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
-        
+
+        // 6. Invalidate cache (prevent reading deleted data)
+        self.row_cache.invalidate(table_name, row_id);
+
         Ok(())
     }
     
@@ -780,7 +786,7 @@ impl MoteDB {
         
         Ok(TableRowBatchedIterator {
             lsm_iter,
-            table_name: table_name.to_string(),
+            _table_name: table_name.to_string(),
         })
     }
     
@@ -1450,9 +1456,9 @@ impl MoteDB {
     }
     
     /// Detect continuous segments in sorted row_ids
-    /// 
+    ///
     /// ## Example
-    /// ```
+    /// ```text
     /// Input:  [100, 101, 102, 105, 106, 200, 201, 202]
     /// Output: [[100,101,102], [105,106], [200,201,202]]
     /// ```
@@ -1493,9 +1499,9 @@ impl MoteDB {
 /// - Deserializing 5/10 columns: 2x faster (400µs → 200µs)
 /// 
 /// ## How it works
-/// ```
+/// ```text
 /// Row format: Vec<Value> = [val1, val2, val3, ...]
-/// 
+///
 /// For each column:
 ///   if required → Deserialize to Value
 ///   else       → Deserialize to IgnoredAny (skip bytes, no allocation)
@@ -1553,7 +1559,7 @@ fn deserialize_partial(
 /// 每次返回一批行数据，避免一次性加载全部数据到内存。
 pub struct TableRowBatchedIterator {
     lsm_iter: crate::storage::lsm::LSMBatchedIterator,
-    table_name: String,
+    _table_name: String,
 }
 
 impl Iterator for TableRowBatchedIterator {

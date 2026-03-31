@@ -199,8 +199,8 @@ impl TextFTSIndex {
             
             if pending_terms >= AUTO_FLUSH_THRESHOLD_TERMS || pending_docs >= AUTO_FLUSH_THRESHOLD_DOCS {
                 // Release read locks
-                drop(pending_terms);
-                drop(pending_docs);
+                let _ = pending_terms;
+                let _ = pending_docs;
                 
                 eprintln!("[TEXT-AUTO-FLUSH] Triggered: {} terms, {} docs", 
                          self.pending_posting_lists.read().len(),
@@ -217,10 +217,10 @@ impl TextFTSIndex {
             }
         }
         
-        let batch_start = Instant::now();
-        
+        let _batch_start = Instant::now();
+
         // 1. Tokenization phase
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
         let mut batch_token_count = 0u64;
         
         // Build per-term doc lists (lightweight intermediate structure)
@@ -589,7 +589,7 @@ impl TextFTSIndex {
         let flush_start = Instant::now();
         
         // 1. Get pending posting lists (use take to avoid clone)
-        let t1 = Instant::now();
+        let _t1 = Instant::now();
         let mut pending = self.pending_posting_lists.write();
         let is_empty = pending.is_empty();
         
@@ -830,6 +830,7 @@ impl TextFTSIndex {
     }
     
     /// 🚀 P0 NEW: 只从主文件加载doc_lengths
+    #[allow(dead_code)]
     fn load_doc_lengths_from_main(&self) -> Result<HashMap<DocId, u32>> {
         let lengths_path = self.storage_dir.join("doclengths.bin");
         

@@ -652,6 +652,7 @@ impl DiskANNIndex {
     /// - 只搜索新节点的邻居
     /// - 并行处理所有新节点
     /// - 性能稳定，不随总节点数增长
+    #[allow(dead_code)]
     fn incremental_batch_build(
         &self,
         new_ids: &[RowId],
@@ -714,6 +715,7 @@ impl DiskANNIndex {
     /// - 第k层：L个节点，搜索空间=kL，复杂度=L*log(kL)
     /// - 总复杂度：Σ L*log(kL) ≈ N*log(N*L/N) = N*log(L)
     /// - 相比全图O(N²log(N))，加速比 = N*log(N)/log(L) ≈ 5-10x
+    #[allow(dead_code)]
     fn layered_build_graph(
         &self,
         mut nodes: Vec<RowId>,
@@ -914,6 +916,7 @@ impl DiskANNIndex {
     /// 🚀 **在子集中搜索（避免全图搜索）**
     /// 
     /// 这是分层构建的核心：只在subset中搜索，大幅减少搜索空间
+    #[allow(dead_code)]
     fn greedy_search_in_subset(
         &self,
         query: &[f32],
@@ -978,6 +981,7 @@ impl DiskANNIndex {
     }
     
     /// 批量更新反向边（复用现有逻辑）
+    #[allow(dead_code)]
     fn batch_update_reverse_edges(&self, nodes: &[RowId], show_progress: bool) -> Result<()> {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1065,6 +1069,7 @@ impl DiskANNIndex {
     
     /// 🚀 **快速插入：只建立前向边，跳过反向边更新**
     /// 用于批量构建时的第一阶段，大幅提升性能
+    #[allow(dead_code)]
     fn insert_forward_edges_only(&self, id: RowId, medoid_id: RowId) -> Result<()> {
         let query_vec = match self.vectors.get(id) {
             Some(v) => v,
@@ -1255,6 +1260,7 @@ impl DiskANNIndex {
     /// - k ≤ 10: beam = max(100, k * 10) （小k高精度）
     /// - k ≤ 100: beam = k * 5 （中k平衡）
     /// - k > 100: beam = k * 2 （大k高效）
+    #[allow(dead_code)]
     fn compute_adaptive_beam_width(&self, k: usize) -> usize {
         if k <= 10 {
             self.config.search_list_size.max(k * 10)
@@ -1829,6 +1835,7 @@ impl DiskANNIndex {
     /// 2. 每层独立并行构建（只在本层内搜索）
     /// 3. 层间建立连接（每层与前一层连接）
     /// 4. 最终优化（可选）
+    #[allow(dead_code)]
     fn layered_build(
         &self,
         mut nodes: Vec<RowId>,
@@ -2072,6 +2079,7 @@ impl DiskANNIndex {
     }
     
     /// Full insertion with reverse edge updates (for compatibility)
+    #[allow(dead_code)]
     fn insert_vector_into_graph_with_reverse_edges(&self, id: RowId, medoid_id: RowId) -> Result<()> {
         let query_vec = match self.vectors.get(id) {
             Some(v) => v,
@@ -2161,6 +2169,7 @@ impl DiskANNIndex {
     /// 1. 自适应Beam width（根据查询规模调整）
     /// 2. 提前终止（连续N轮无改进则停止）
     /// 3. 距离阈值（当前最远距离 vs 候选距离）
+    #[allow(dead_code)]
     fn greedy_search_optimized(
         &self,
         query: &[f32],

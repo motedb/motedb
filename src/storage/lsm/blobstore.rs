@@ -17,7 +17,7 @@ use crate::{Result, StorageError};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use super::BlobRef;
 
 const BLOB_MAGIC: u32 = 0x424C4F42; // "BLOB"

@@ -376,6 +376,7 @@ impl MoteDB {
     /// 
     /// # Returns
     /// Vector of row IDs that match the predicate
+    #[allow(dead_code)]
     fn scan_memtable_for_column<F>(&self, table_name: &str, column_name: &str, predicate: F) -> Result<Vec<RowId>>
     where
         F: Fn(&Value) -> bool,

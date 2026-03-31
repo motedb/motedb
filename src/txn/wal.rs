@@ -122,6 +122,7 @@ struct PartitionWAL {
 
 impl PartitionWAL {
     /// Create a new partition WAL
+    #[allow(dead_code)]
     fn create(path: PathBuf) -> Result<Self> {
         Self::create_with_config(path, WALConfig::default())
     }
@@ -144,6 +145,7 @@ impl PartitionWAL {
     }
 
     /// Open existing partition WAL
+    #[allow(dead_code)]
     fn open(path: PathBuf) -> Result<Self> {
         Self::open_with_config(path, WALConfig::default())
     }
@@ -427,16 +429,17 @@ impl PartitionWAL {
 /// WAL Manager coordinates WAL for all partitions
 pub struct WALManager {
     /// WAL directory
-    base_path: PathBuf,
-    
+    _base_path: PathBuf,
+
     /// Per-partition WALs
     partitions: Arc<RwLock<HashMap<PartitionId, PartitionWAL>>>,
-    
+
     /// Number of partitions
+    #[allow(dead_code)]
     num_partitions: u8,
-    
+
     /// WAL configuration
-    config: WALConfig,
+    _config: WALConfig,
     
     /// 后台刷盘线程（Periodic 模式）
     flush_thread: Option<FlushThread>,
@@ -479,10 +482,10 @@ impl WALManager {
         let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone());
         
         Ok(Self {
-            base_path,
+            _base_path: base_path,
             partitions,
             num_partitions,
-            config,
+            _config: config,
             flush_thread,
         })
     }
@@ -518,14 +521,14 @@ impl WALManager {
         let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone());
         
         Ok(Self {
-            base_path,
+            _base_path: base_path,
             partitions,
             num_partitions,
-            config,
+            _config: config,
             flush_thread,
         })
     }
-    
+
     /// 启动后台刷盘线程（Periodic 模式）
     fn start_flush_thread_if_needed(
         config: &WALConfig,

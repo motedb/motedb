@@ -497,6 +497,7 @@ impl FreshDiskANNIndex {
     }
     
     /// Phase 9: 使用 Vamana 算法重建图（多锚点搜索）- 备用方案
+    #[allow(dead_code)]
     fn rebuild_graph_with_anchors(&self, nodes: Vec<(RowId, VectorNode)>, anchor_points: Vec<RowId>) -> Result<Vec<(RowId, VectorNode)>> {
         // 🔥 Phase 9: 增大 max_degree
         let max_degree = 64; // 从 32 增大到 64
@@ -772,6 +773,7 @@ impl FreshDiskANNIndex {
     }
     
     /// Phase 7: Vamana 贪心搜索（用于构建邻居）- 保留用于向后兼容
+    #[allow(dead_code)]
     fn vamana_greedy_search(
         &self,
         query: &[f32],
@@ -928,6 +930,7 @@ impl FreshDiskANNIndex {
     }
     
     /// Phase 10: 两轮图优化（增大参数 + RobustPrune）
+    #[allow(dead_code)]
     fn rebuild_graph_phase10(&self, nodes: Vec<(RowId, VectorNode)>, _medoid: RowId, anchor_points: &[RowId]) -> Result<Vec<(RowId, VectorNode)>> {
         // 🔥 Phase 10: 增大 max_degree 到 128
         let max_degree = 128;
@@ -1156,6 +1159,7 @@ impl FreshDiskANNIndex {
     }
     
     /// Phase 6: 选择 medoid（距离中心点）- 保留用于向后兼容
+    #[allow(dead_code)]
     fn select_medoid(&self, nodes: &[(RowId, VectorNode)]) -> Result<RowId> {
         // 🔥 Phase 9: 使用 K-Means 选择第一个锚点作为 medoid
         let anchors = self.select_anchor_points(nodes, 1)?;

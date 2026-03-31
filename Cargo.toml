@@ -108,10 +108,6 @@ codegen-units = 1  # 单一代码生成单元（更好的优化）
 strip = true   # 移除符号表（-30% 大小）
 panic = "abort"  # panic 直接 abort（-10% 大小）
 
-[build]
-# 🚀 SIMD 优化：启用 AVX2 指令集（距离计算加速 3-4x）
-rustflags = ["-C", "target-cpu=native"]
-
 [profile.release-small]
 # 🆕 嵌入式模式：优化二进制大小
 inherits = "release"

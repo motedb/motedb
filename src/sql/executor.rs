@@ -3252,7 +3252,7 @@ impl QueryExecutor {
         // AUTO_INCREMENT主键不需要列索引（主键值 = row_id，直接查询）
         if let Some(pk_col) = primary_key_cols.first() {
             if !pk_col.auto_increment {
-                let pk_index_name = format!("{}.{}", stmt.table, pk_col.name);
+                let _pk_index_name = format!("{}.{}", stmt.table, pk_col.name);
                 self.db.create_column_index(&stmt.table, &pk_col.name)?;
             }
         }
@@ -3417,7 +3417,7 @@ impl QueryExecutor {
                     }
                     
                     if !vectors_to_insert.is_empty() {
-                        let backfill_count = self.db.batch_insert_vectors(&index_name, &vectors_to_insert)?;
+                        let _backfill_count = self.db.batch_insert_vectors(&index_name, &vectors_to_insert)?;
                     }
                     
                     // 3️⃣ Register metadata
@@ -3826,6 +3826,7 @@ impl QueryExecutor {
     /// - 不等式: col < value, col > value
     /// 
     /// 返回 (可索引条件列表, 不可索引的剩余表达式)
+    #[allow(dead_code)]
     fn extract_indexable_conditions(&self, expr: &Expr) -> (Vec<IndexableCondition>, Vec<Expr>) {
         let mut indexable = Vec::new();
         let mut non_indexable = Vec::new();
@@ -3836,6 +3837,7 @@ impl QueryExecutor {
     }
     
     /// 递归提取条件（处理 AND 树）
+    #[allow(dead_code)]
     fn extract_conditions_recursive(
         &self,
         expr: &Expr,
@@ -3910,6 +3912,7 @@ impl QueryExecutor {
     /// 1. 优先级：点查询 > 范围查询 > 不等式查询
     /// 2. 检查索引是否存在
     /// 3. 返回 (最优索引条件, 其他条件作为后置过滤)
+    #[allow(dead_code)]
     fn choose_best_index(
         &self,
         conditions: &[IndexableCondition],
@@ -3950,6 +3953,7 @@ impl QueryExecutor {
     }
     
     /// 构建后置过滤表达式（排除已用索引的条件）
+    #[allow(dead_code)]
     fn build_post_filters(
         &self,
         _all_conditions: &[IndexableCondition],

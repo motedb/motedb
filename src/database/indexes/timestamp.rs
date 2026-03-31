@@ -145,6 +145,7 @@ impl MoteDB {
     }
     
     /// Scan LSM MemTable for timestamp range
+    #[allow(dead_code)]
     fn scan_memtable_by_timestamp(&self, start: i64, end: i64) -> Result<Vec<RowId>> {
         self.scan_memtable_by_timestamp_with_profile(start, end).map(|(ids, _)| ids)
     }

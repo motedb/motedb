@@ -23,10 +23,10 @@ pub enum LockMode {
 /// Lock request waiting in queue
 #[derive(Debug)]
 struct LockWaiter {
-    txn_id: TransactionId,
-    mode: LockMode,
-    condvar: Arc<Condvar>,
-    granted: Arc<Mutex<bool>>,
+    _txn_id: TransactionId,
+    _mode: LockMode,
+    _condvar: Arc<Condvar>,
+    _granted: Arc<Mutex<bool>>,
 }
 
 /// Lock entry for a single row
@@ -34,14 +34,14 @@ struct LockEntry {
     /// Current lock holders: (txn_id, lock_mode)
     holders: RwLock<Vec<(TransactionId, LockMode)>>,
     /// Waiting queue
-    waiters: Mutex<VecDeque<LockWaiter>>,
+    _waiters: Mutex<VecDeque<LockWaiter>>,
 }
 
 impl LockEntry {
     fn new() -> Self {
         Self {
             holders: RwLock::new(Vec::new()),
-            waiters: Mutex::new(VecDeque::new()),
+            _waiters: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -96,7 +96,7 @@ pub struct LockManager {
     wait_for: Arc<Mutex<HashMap<TransactionId, HashSet<TransactionId>>>>,
     
     /// Deadlock detection timeout
-    deadlock_timeout: Duration,
+    _deadlock_timeout: Duration,
 }
 
 impl LockManager {
@@ -106,7 +106,7 @@ impl LockManager {
             locks: DashMap::new(),
             txn_locks: Arc::new(Mutex::new(HashMap::new())),
             wait_for: Arc::new(Mutex::new(HashMap::new())),
-            deadlock_timeout: Duration::from_secs(5),
+            _deadlock_timeout: Duration::from_secs(5),
         }
     }
 
@@ -121,6 +121,7 @@ impl LockManager {
     }
 
     /// Check if there's a cycle in the wait-for graph (deadlock detection)
+    #[allow(dead_code)]
     fn has_cycle(&self, start_txn: TransactionId, current_txn: TransactionId, visited: &mut HashSet<TransactionId>) -> bool {
         if current_txn == start_txn && !visited.is_empty() {
             return true;
@@ -145,12 +146,14 @@ impl LockManager {
     }
 
     /// Detect deadlock for a transaction
+    #[allow(dead_code)]
     fn detect_deadlock(&self, txn_id: TransactionId) -> bool {
         let mut visited = HashSet::new();
         self.has_cycle(txn_id, txn_id, &mut visited)
     }
 
     /// Add wait-for edge
+    #[allow(dead_code)]
     fn add_wait_for(&self, waiter: TransactionId, holders: &[TransactionId]) {
         let mut wait_for = self.wait_for.lock();
         let entry = wait_for.entry(waiter).or_default();
