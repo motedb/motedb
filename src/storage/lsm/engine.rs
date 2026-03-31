@@ -1162,7 +1162,7 @@ impl LSMEngine {
             thread::sleep(Duration::from_millis(1));
             wait_count += 1;
             
-            if wait_count > 30000 {
+            if wait_count > 120000 {
                 return Err(StorageError::Transaction("rotate_memtable timeout: deadlock?".into()));
             }
         }

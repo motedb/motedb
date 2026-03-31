@@ -25,7 +25,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
 
 /// Database statistics
@@ -120,7 +120,11 @@ pub struct MoteDB {
     
     /// 🆕 防止递归 flush 的标志
     pub(crate) is_flushing: Arc<AtomicBool>,
-    
+
+    /// 🔒 Checkpoint mutex: prevents concurrent checkpoints (auto + manual)
+    /// which can cause deadlock via timestamp_index write lock contention
+    pub(crate) checkpoint_mutex: Arc<Mutex<()>>,
+
     /// Auto-checkpoint thread (if enabled)
     auto_checkpoint_thread: Option<AutoCheckpointThread>,
 }
@@ -211,15 +215,25 @@ impl MoteDB {
             index_update_strategy: config.index_update_strategy.clone(),
             query_timeout_secs: config.query_timeout_secs,
             is_flushing: Arc::new(AtomicBool::new(false)),
+            checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
         };
         
-        // 🚀 Unified Flush Callback: 统一入口（手动+后台Flush）
-        // 传入 MemTable 引用，零拷贝批量构建所有索引
-        let db_clone = db.clone_for_callback();
-        lsm_engine.set_flush_callback(move |memtable| {
-            db_clone.batch_build_indexes_from_flush(memtable)
-        })?;
+        // 🚀 Unified Flush Callback: DISABLED for v0.1.2 release.
+        //
+        // The callback blocks the background flush thread during index building,
+        // which can cause deadlocks when checkpoint() waits for queue drain
+        // while the background thread is stuck in the callback.
+        //
+        // Index building is handled by checkpoint() → rebuild_timestamp_index() + flush_all_indexes()
+        // This is safe because checkpoint() is always called before close/drop.
+        //
+        // TODO: Re-enable with async callback or separate index-builder thread pool in v0.2.0
+        //
+        // let db_clone = db.clone_for_callback();
+        // lsm_engine.set_flush_callback(move |memtable| {
+        //     db_clone.batch_build_indexes_from_flush(memtable)
+        // })?;
         
         // 🚀 Start auto-checkpoint thread if enabled
         let auto_checkpoint_thread = if let Some(auto_config) = config.auto_checkpoint {
@@ -262,6 +276,7 @@ impl MoteDB {
             index_update_strategy: self.index_update_strategy.clone(),
             query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
             is_flushing: self.is_flushing.clone(),  // 🆕 共享 flush 标志
+            checkpoint_mutex: self.checkpoint_mutex.clone(),
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
         }
     }
@@ -420,16 +435,20 @@ impl MoteDB {
             index_update_strategy: crate::config::IndexUpdateStrategy::default(),
             query_timeout_secs: None,
             is_flushing: Arc::new(AtomicBool::new(false)),
+            checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
         };
-        
-        // 🚀 Unified Flush Callback: 统一入口（手动+后台Flush）
-        // 传入 MemTable 引用，零拷贝批量构建所有索引
-        let db_clone = db.clone_for_callback();
-        lsm_engine.set_flush_callback(move |memtable| {
-            db_clone.batch_build_indexes_from_flush(memtable)
-        })?;
-        
+
+        // ⚠️ Flush callback DISABLED — it blocks the background flush thread,
+        // causing deadlocks when checkpoint() waits for queue drain.
+        // Index building is handled by checkpoint() → rebuild_timestamp_index() instead.
+        // See: helpers.rs batch_build_indexes_from_flush (kept for future use)
+        //
+        // let db_clone = db.clone_for_callback();
+        // lsm_engine.set_flush_callback(move |memtable| {
+        //     db_clone.batch_build_indexes_from_flush(memtable)
+        // })?;
+
         // 🚀 Start auto-checkpoint thread (using default config on open)
         let auto_checkpoint_thread = Some(Self::start_auto_checkpoint_thread(
             db.clone_for_callback(),

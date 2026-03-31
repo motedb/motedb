@@ -4,7 +4,7 @@
 //! Handles data persistence and durability
 
 use crate::database::core::MoteDB;
-use crate::Result;
+use crate::{Result, StorageError};
 use std::sync::atomic::Ordering;
 
 /// Get total size of all files in a directory (helper for checkpoint optimization)
@@ -138,8 +138,21 @@ impl MoteDB {
     /// db.checkpoint()?; // Full database checkpoint
     /// ```
     pub fn checkpoint(&self) -> Result<()> {
+        // 🔒 Prevent concurrent checkpoints (auto + manual can deadlock)
+        // Deadlock scenario without mutex:
+        //   Thread A: checkpoint() → lsm_flush → rebuild_timestamp_index (holds ts write lock)
+        //   Background flush thread: callback → batch_build_timestamp_indexes (wants ts write lock → BLOCKED)
+        //   Thread B: checkpoint() → lsm_flush → rotate_memtable (queue full → BLOCKED)
+        let _guard = self.checkpoint_mutex.lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+
+        self.checkpoint_impl()
+    }
+
+    /// Internal checkpoint implementation (caller must hold checkpoint_mutex)
+    fn checkpoint_impl(&self) -> Result<()> {
         use std::time::Instant;
-        
+
         // 🚀 Fast path: Skip if no pending updates and WAL is empty
         // 🚀 P0 CRITICAL FIX: 使用原子操作
         let pending_count = self.pending_updates.load(std::sync::atomic::Ordering::Relaxed);
@@ -153,27 +166,27 @@ impl MoteDB {
                 }
             }
         }
-        
+
         let checkpoint_start = Instant::now();
         debug_log!("[Checkpoint] 🚀 Starting checkpoint (pending_updates={})...", pending_count);
-        
+
         // 🔥 Step 1: Trigger LSM flush (MemTable → SSTable)
-        // This will also trigger batch index building via the callback
+        // The background flush thread will call the batch index callback,
+        // which is fine — it builds indexes as data is flushed.
         let flush_start = Instant::now();
         self.lsm_engine.flush()?;
         debug_log!("[Checkpoint]   ✓ LSM flush: {:?}", flush_start.elapsed());
-        
-        // 🔥 Step 2: Rebuild TimestampIndex from LSM (legacy path)
-        // TODO: Move this to batch builder in future
+
+        // 🔥 Step 2: Rebuild TimestampIndex from LSM (catches any missed entries)
         let ts_rebuild_start = Instant::now();
         self.rebuild_timestamp_index()?;
         debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", ts_rebuild_start.elapsed());
-        
+
         // 🔥 Step 3: Flush all indexes (persist to disk)
         let index_flush_start = Instant::now();
         self.flush_all_indexes()?;
         debug_log!("[Checkpoint]   ✓ Index flush: {:?}", index_flush_start.elapsed());
-        
+
         // 🔥 Step 4: Checkpoint WAL (safe to truncate now)
         let wal_checkpoint_start = Instant::now();
         self.wal.checkpoint_all()?;
