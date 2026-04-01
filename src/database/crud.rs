@@ -14,8 +14,6 @@ use crate::types::{Row, RowId, PartitionId, Value, SqlRow};
 use crate::txn::wal::WALRecord;
 use super::core::MoteDB;
 use std::sync::Arc;
-use parking_lot::RwLock;
-
 impl MoteDB {
     // ==================== Row-Level CRUD Operations ====================
     
@@ -266,24 +264,19 @@ impl MoteDB {
         
         // 2. 🚀 P3+4: For AUTO_INCREMENT primary key, use per-table counter
         let row_id = if schema.is_primary_key_auto_increment() {
-            // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter
+            // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
             let counter = self.table_auto_increment
                 .entry(table_name.to_string())
                 .or_insert_with(|| {
                     // Initialize with schema's start value (default 1)
-                    Arc::new(RwLock::new(schema.get_auto_increment_start()))
+                    Arc::new(std::sync::atomic::AtomicI64::new(schema.get_auto_increment_start()))
                 });
-            
-            let mut next_id = counter.write();
-            
+
             // 🚀 Phase 5: Overflow protection (B1)
-            if *next_id >= i64::MAX {
+            let id = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if id >= i64::MAX {
                 return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
             }
-            
-            let id = *next_id;
-            *next_id += 1;
-            drop(next_id);  // Release lock
             
             // Fill AUTO_INCREMENT primary key with id
             if let Some(pk_col_name) = schema.primary_key() {
@@ -344,7 +337,7 @@ impl MoteDB {
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
                 if let Err(e) = self.insert_column_value(table_name, col_name, row_id, col_value) {
-                    eprintln!("[insert_row] Failed to update column index '{}': {}", column_index_name, e);
+                    debug_log!("[insert_row] Failed to update column index '{}': {}", column_index_name, e);
                     index_errors.push(column_index_name.clone());
                 }
             }
@@ -358,7 +351,7 @@ impl MoteDB {
                 ) {
                     if let crate::types::Value::Vector(vec) = col_value {
                         if let Err(e) = self.update_vector(row_id, &index_name, vec.as_slice()) {
-                            eprintln!("[insert_row] Failed to update vector index '{}': {}", index_name, e);
+                            debug_log!("[insert_row] Failed to update vector index '{}': {}", index_name, e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -370,7 +363,7 @@ impl MoteDB {
                 if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
                     if let crate::types::Value::Text(text) = col_value {
                         if let Err(e) = self.insert_text(row_id, &index_name, text) {
-                            eprintln!("[insert_row] Failed to update text index '{}': {}", index_name, e);
+                            debug_log!("[insert_row] Failed to update text index '{}': {}", index_name, e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -382,7 +375,7 @@ impl MoteDB {
                 if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
                     if let crate::types::Value::Spatial(geom) = col_value {
                         if let Err(e) = self.insert_geometry(row_id, &index_name, geom.clone()) {
-                            eprintln!("[insert_row] Failed to update spatial index '{}': {}", index_name, e);
+                            debug_log!("[insert_row] Failed to update spatial index '{}': {}", index_name, e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -393,7 +386,7 @@ impl MoteDB {
         // If any index update failed, mark ALL indexes for this table stale
         // so queries fall back to full scan consistently
         if !index_errors.is_empty() {
-            eprintln!("[insert_row] {} index updates failed for table '{}', marking all stale",
+            debug_log!("[insert_row] {} index updates failed for table '{}', marking all stale",
                      index_errors.len(), table_name);
             for idx_name in &index_errors {
                 self.index_registry.mark_stale(idx_name);
@@ -525,7 +518,7 @@ impl MoteDB {
             if self.column_indexes.contains_key(&column_index_name) {
                 if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
                     if let Err(e) = self.update_column_value(table_name, col_name, row_id, old_val, new_val) {
-                        eprintln!("[update_row] Failed to update column index '{}': {}", column_index_name, e);
+                        debug_log!("[update_row] Failed to update column index '{}': {}", column_index_name, e);
                         index_errors.push(column_index_name.clone());
                     }
                 }
@@ -537,13 +530,13 @@ impl MoteDB {
                 if self.vector_indexes.contains_key(&index_name) {
                     let mut failed = false;
                     if let Err(e) = self.delete_vector(row_id, &index_name) {
-                        eprintln!("[update_row] Failed to delete old vector '{}': {}", index_name, e);
+                        debug_log!("[update_row] Failed to delete old vector '{}': {}", index_name, e);
                         failed = true;
                     }
 
                     if let Some(crate::types::Value::Vector(new_vec)) = new_value {
                         if let Err(e) = self.update_vector(row_id, &index_name, new_vec.as_slice()) {
-                            eprintln!("[update_row] Failed to update vector index '{}': {}", index_name, e);
+                            debug_log!("[update_row] Failed to update vector index '{}': {}", index_name, e);
                             failed = true;
                         }
                     }
@@ -559,7 +552,7 @@ impl MoteDB {
                 if self.text_indexes.contains_key(&index_name) {
                     if let (Some(crate::types::Value::Text(old_text)), Some(crate::types::Value::Text(new_text))) = (old_value, new_value) {
                         if let Err(e) = self.update_text(row_id, &index_name, old_text, new_text) {
-                            eprintln!("[update_row] Failed to update text index '{}': {}", index_name, e);
+                            debug_log!("[update_row] Failed to update text index '{}': {}", index_name, e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -572,13 +565,13 @@ impl MoteDB {
                 if self.spatial_indexes.contains_key(&index_name) {
                     let mut failed = false;
                     if let Err(e) = self.delete_geometry(row_id, &index_name) {
-                        eprintln!("[update_row] Failed to delete old spatial geometry '{}': {}", index_name, e);
+                        debug_log!("[update_row] Failed to delete old spatial geometry '{}': {}", index_name, e);
                         failed = true;
                     }
 
                     if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
                         if let Err(e) = self.insert_geometry(row_id, &index_name, new_geom.clone()) {
-                            eprintln!("[update_row] Failed to update spatial index '{}': {}", index_name, e);
+                            debug_log!("[update_row] Failed to update spatial index '{}': {}", index_name, e);
                             failed = true;
                         }
                     }
@@ -591,7 +584,7 @@ impl MoteDB {
 
         // If any index update failed, mark ALL indexes for this table stale
         if !index_errors.is_empty() {
-            eprintln!("[update_row] {} index updates failed for table '{}', marking all stale",
+            debug_log!("[update_row] {} index updates failed for table '{}', marking all stale",
                      index_errors.len(), table_name);
             for meta in self.index_registry.list_table_indexes(table_name) {
                 self.index_registry.mark_stale(&meta.name);
@@ -655,7 +648,7 @@ impl MoteDB {
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
                 if let Err(e) = self.delete_column_value(table_name, col_name, row_id, col_value) {
-                    eprintln!("[delete_row] Failed to delete from column index '{}': {}", column_index_name, e);
+                    debug_log!("[delete_row] Failed to delete from column index '{}': {}", column_index_name, e);
                     self.index_registry.mark_stale(&column_index_name);
                 }
             }
@@ -665,7 +658,7 @@ impl MoteDB {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.vector_indexes.contains_key(&index_name) {
                     if let Err(e) = self.delete_vector(row_id, &index_name) {
-                        eprintln!("[delete_row] Failed to delete from vector index '{}': {}", index_name, e);
+                        debug_log!("[delete_row] Failed to delete from vector index '{}': {}", index_name, e);
                         self.index_registry.mark_stale(&index_name);
                     }
                 }
@@ -677,7 +670,7 @@ impl MoteDB {
                 if self.text_indexes.contains_key(&index_name) {
                     if let crate::types::Value::Text(text) = col_value {
                         if let Err(e) = self.delete_text(row_id, &index_name, text) {
-                            eprintln!("[delete_row] Failed to delete from text index '{}': {}", index_name, e);
+                            debug_log!("[delete_row] Failed to delete from text index '{}': {}", index_name, e);
                             self.index_registry.mark_stale(&index_name);
                         }
                     }
@@ -689,7 +682,7 @@ impl MoteDB {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.spatial_indexes.contains_key(&index_name) {
                     if let Err(e) = self.delete_geometry(row_id, &index_name) {
-                        eprintln!("[delete_row] Failed to delete from spatial index '{}': {}", index_name, e);
+                        debug_log!("[delete_row] Failed to delete from spatial index '{}': {}", index_name, e);
                         self.index_registry.mark_stale(&index_name);
                     }
                 }
@@ -1030,7 +1023,7 @@ impl MoteDB {
                 // 批量插入列索引
                 if !column_data.is_empty() {
                     if let Err(e) = self.batch_insert_column_values(table_name, col_name, column_data) {
-                        eprintln!("[batch_insert] ⚠️ Failed to batch update column index '{}': {}", column_index_name, e);
+                        debug_log!("[batch_insert] Failed to batch update column index '{}': {}", column_index_name, e);
                     }
                 }
             }
@@ -1048,7 +1041,7 @@ impl MoteDB {
                     
                     if !vectors.is_empty() {
                         if let Err(e) = self.batch_insert_vectors(&index_name, &vectors) {
-                            eprintln!("[batch_insert] ⚠️ Failed to batch update vector index '{}': {}", index_name, e);
+                            debug_log!("[batch_insert] Failed to batch update vector index '{}': {}", index_name, e);
                         }
                     }
                 }
@@ -1069,7 +1062,7 @@ impl MoteDB {
                             .map(|(id, s)| (*id, s.as_str()))
                             .collect();
                         if let Err(e) = self.batch_insert_texts(&index_name, &texts_ref) {
-                            eprintln!("[batch_insert] ⚠️ Failed to batch update text index '{}': {}", index_name, e);
+                            debug_log!("[batch_insert] Failed to batch update text index '{}': {}", index_name, e);
                         }
                     }
                 }
@@ -1087,7 +1080,7 @@ impl MoteDB {
                     
                     if !geometries.is_empty() {
                         if let Err(e) = self.batch_insert_geometries(&index_name, geometries) {
-                            eprintln!("[batch_insert] ⚠️ Failed to batch update spatial index '{}': {}", index_name, e);
+                            debug_log!("[batch_insert] Failed to batch update spatial index '{}': {}", index_name, e);
                         }
                     }
                 }
@@ -1106,7 +1099,7 @@ impl MoteDB {
             
             // 每2000条触发flush（与LSM一致）
             if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
-                println!("[AUTO-FLUSH] Batch insert triggered after {} writes", old_count + rows.len());
+                debug_log!("[AUTO-FLUSH] Batch insert triggered after {} writes", old_count + rows.len());
                 
                 let db_clone = self.clone_for_callback();
                 std::thread::spawn(move || {
@@ -1181,7 +1174,7 @@ impl MoteDB {
             
             // 每2000条触发flush（与LSM一致）
             if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
-                println!("[AUTO-FLUSH] Batch upsert triggered after {} writes", old_count + rows.len());
+                debug_log!("[AUTO-FLUSH] Batch upsert triggered after {} writes", old_count + rows.len());
                 
                 let db_clone = self.clone_for_callback();
                 std::thread::spawn(move || {
@@ -1240,7 +1233,7 @@ impl MoteDB {
         
         // 每2000条触发一次flush（与LSM一致）
         if count % 2_000 == 0 && count > 0 {
-            println!("[AUTO-FLUSH] Triggered after {} writes", count);
+            debug_log!("[AUTO-FLUSH] Triggered after {} writes", count);
             
             let db_clone = self.clone_for_callback();
             std::thread::spawn(move || {
@@ -1373,7 +1366,7 @@ impl MoteDB {
         }
         
         // Large dataset: use streaming
-        eprintln!(
+        debug_log!(
             "[Streaming] Processing {} rows in batches of {} (memory-efficient mode)",
             row_ids.len(), STREAMING_BATCH_SIZE
         );
@@ -1387,7 +1380,7 @@ impl MoteDB {
             
             // Optional: Log progress for very large batches
             if row_ids.len() > 20_000 {
-                eprintln!(
+                debug_log!(
                     "[Streaming] Progress: {}/{} rows ({:.1}%)",
                     result.len(), row_ids.len(),
                     (result.len() as f64 / row_ids.len() as f64) * 100.0

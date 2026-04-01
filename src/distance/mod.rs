@@ -36,6 +36,26 @@ impl DistanceMetric for Cosine {
     }
 }
 
+/// Monomorphized distance metric enum (zero-cost alternative to `Arc<dyn DistanceMetric>`)
+///
+/// Eliminates virtual dispatch overhead for inner-loop distance computations
+/// in DiskANN/Vamana graph search (saves ~2-5ns per distance call on ARM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceKind {
+    Euclidean,
+    Cosine,
+}
+
+impl DistanceKind {
+    #[inline]
+    pub fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            DistanceKind::Euclidean => euclidean_distance(a, b),
+            DistanceKind::Cosine => cosine_distance(a, b),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

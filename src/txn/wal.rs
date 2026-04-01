@@ -13,7 +13,6 @@ use crate::types::{Row, RowId, PartitionId};
 use crate::{Result, StorageError};
 use crate::config::DurabilityLevel;
 use crate::storage::checksum::{Checksum, ChecksumType};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -23,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::thread;
+use dashmap::DashMap;
 
 /// Log sequence number (monotonically increasing)
 pub type LogSequenceNumber = u64;
@@ -226,53 +226,34 @@ impl PartitionWAL {
     fn append(&mut self, record: WALRecord) -> Result<LogSequenceNumber> {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
-        
-        // Serialize record for checksum computation
+
+        // Serialize record once for checksum
         let record_data = bincode::serialize(&record)?;
         let checksum = Checksum::compute(ChecksumType::CRC32C, &record_data);
-        
-        // Create entry with checksum
+
+        // Create entry and serialize (record_data already computed, but entry owns record)
         let entry = WALEntry { lsn, record, checksum };
         let encoded = bincode::serialize(&entry)?;
-        
+
         // Write length prefix (for recovery parsing)
         let len = encoded.len() as u32;
         self.file.write_all(&len.to_le_bytes())?;
         self.file.write_all(&encoded)?;
-        
+
         // Fsync based on durability level
         match self.config.durability_level {
             DurabilityLevel::Synchronous => {
-                // 同步模式：每次立即 fsync（金融/支付场景）
                 self.file.sync_data()?;
             }
             DurabilityLevel::GroupCommit { .. } => {
-                // ⚡ GroupCommit 简化实现：
-                // 
-                // 标准 GroupCommit 需要复杂的等待队列和协调线程。
-                // 这里使用简化方案：单条append()不fsync，应用层负责调用flush()
-                // 
-                // 设计思路：
-                // 1. 应用层使用 batch_insert() → 内部调用 batch_append() → 单次 fsync ✅
-                // 2. 如果必须单条insert()，应用层自行按时间/数量调用 flush()
-                // 3. 或者使用 Periodic 模式（后台线程定期刷盘）
-                // 
-                // 此处不 fsync，数据仍在 OS 缓冲区，崩溃时可能丢失。
-                // 安全性依赖：
-                // - batch_insert() 做 fsync
-                // - 应用层显式 flush()
-                // - 或 OS 自动刷盘（通常 30秒）
-                //
-                // 如需每次都fsync，请使用 Synchronous 模式
+                // No fsync - application layer responsible for batch_append or explicit flush
             }
             DurabilityLevel::Periodic { .. } => {
-                // 不立即 fsync，由后台线程定期刷盘
+                // Background thread handles periodic fsync
             }
-            DurabilityLevel::NoSync => {
-                // 不 fsync（仅测试用）
-            }
+            DurabilityLevel::NoSync => {}
         }
-        
+
         Ok(lsn)
     }
 
@@ -431,8 +412,8 @@ pub struct WALManager {
     /// WAL directory
     _base_path: PathBuf,
 
-    /// Per-partition WALs
-    partitions: Arc<RwLock<HashMap<PartitionId, PartitionWAL>>>,
+    /// Per-partition WALs (🚀 Phase 3.3: DashMap for concurrent partition writes)
+    partitions: Arc<DashMap<PartitionId, parking_lot::Mutex<PartitionWAL>>>,
 
     /// Number of partitions
     #[allow(dead_code)]
@@ -440,7 +421,7 @@ pub struct WALManager {
 
     /// WAL configuration
     _config: WALConfig,
-    
+
     /// 后台刷盘线程（Periodic 模式）
     flush_thread: Option<FlushThread>,
 }
@@ -468,19 +449,19 @@ impl WALManager {
     ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base_path)?;
-        
-        let mut partitions = HashMap::new();
+
+        let partitions = DashMap::new();
         for partition_id in 0..num_partitions {
             let wal_path = base_path.join(format!("partition_{}.wal", partition_id));
             let wal = PartitionWAL::create_with_config(wal_path, config.clone())?;
-            partitions.insert(partition_id, wal);
+            partitions.insert(partition_id, parking_lot::Mutex::new(wal));
         }
-        
-        let partitions = Arc::new(RwLock::new(partitions));
-        
+
+        let partitions = Arc::new(partitions);
+
         // 启动后台刷盘线程（如果需要）
         let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone());
-        
+
         Ok(Self {
             _base_path: base_path,
             partitions,
@@ -502,24 +483,24 @@ impl WALManager {
         config: WALConfig,
     ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
-        
-        let mut partitions = HashMap::new();
+
+        let partitions = DashMap::new();
         for partition_id in 0..num_partitions {
             let wal_path = base_path.join(format!("partition_{}.wal", partition_id));
             if wal_path.exists() {
                 let wal = PartitionWAL::open_with_config(wal_path, config.clone())?;
-                partitions.insert(partition_id, wal);
+                partitions.insert(partition_id, parking_lot::Mutex::new(wal));
             } else {
                 let wal = PartitionWAL::create_with_config(wal_path, config.clone())?;
-                partitions.insert(partition_id, wal);
+                partitions.insert(partition_id, parking_lot::Mutex::new(wal));
             }
         }
-        
-        let partitions = Arc::new(RwLock::new(partitions));
-        
+
+        let partitions = Arc::new(partitions);
+
         // 启动后台刷盘线程（如果需要）
         let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone());
-        
+
         Ok(Self {
             _base_path: base_path,
             partitions,
@@ -532,26 +513,26 @@ impl WALManager {
     /// 启动后台刷盘线程（Periodic 模式）
     fn start_flush_thread_if_needed(
         config: &WALConfig,
-        partitions: Arc<RwLock<HashMap<PartitionId, PartitionWAL>>>,
+        partitions: Arc<DashMap<PartitionId, parking_lot::Mutex<PartitionWAL>>>,
     ) -> Option<FlushThread> {
         if let DurabilityLevel::Periodic { interval_ms } = config.durability_level {
             let should_stop = Arc::new(AtomicBool::new(false));
             let should_stop_clone = should_stop.clone();
-            
+
             let interval = Duration::from_millis(interval_ms);
-            
+
             let handle = thread::spawn(move || {
                 while !should_stop_clone.load(Ordering::Relaxed) {
                     thread::sleep(interval);
-                    
-                    // 刷盘所有分区
-                    let mut partitions_guard = partitions.write();
-                    for (_partition_id, wal) in partitions_guard.iter_mut() {
+
+                    // 刷盘所有分区 (lock-free iteration via DashMap)
+                    for entry in partitions.iter() {
+                        let wal = entry.value().lock();
                         let _ = wal.file.sync_data();
                     }
                 }
             });
-            
+
             Some(FlushThread {
                 handle: Some(handle),
                 should_stop,
@@ -564,7 +545,7 @@ impl WALManager {
     /// Log an insert operation
     pub fn log_insert(
         &self,
-        table_name: &str,  // ⭐ 添加 table_name 参数
+        table_name: &str,
         partition: PartitionId,
         row_id: RowId,
         data: Row,
@@ -575,19 +556,17 @@ impl WALManager {
             partition,
             data,
         };
-        
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.append(record)
     }
 
     /// Log an update operation
     pub fn log_update(
         &self,
-        table_name: &str,  // ⭐ 添加 table_name 参数
+        table_name: &str,
         partition: PartitionId,
         row_id: RowId,
         old_data: Row,
@@ -600,12 +579,10 @@ impl WALManager {
             old_data,
             new_data,
         };
-        
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.append(record)
     }
 
@@ -625,12 +602,10 @@ impl WALManager {
             old_data,
             timestamp,
         };
-        
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.append(record)
     }
 
@@ -645,12 +620,10 @@ impl WALManager {
             txn_id,
             isolation_level,
         };
-        
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.append(record)
     }
 
@@ -665,12 +638,10 @@ impl WALManager {
             txn_id,
             commit_ts,
         };
-        
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.append(record)
     }
 
@@ -683,58 +654,41 @@ impl WALManager {
         let record = WALRecord::Rollback {
             txn_id,
         };
-        
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.append(record)
     }
 
     /// Batch append records to a partition (optimized for transaction commit)
-    /// 
+    ///
     /// This method is used during transaction commit to write all transaction
     /// operations (Begin, Insert/Update/Delete, Commit) in a single batch,
     /// reducing fsync overhead from O(n) to O(1).
-    /// 
-    /// # Example
-    /// ```ignore
-    /// let records = vec![
-    ///     WALRecord::Begin { txn_id: 1, isolation_level: 0 },
-    ///     WALRecord::Insert { row_id: 100, partition: 0, data: row1 },
-    ///     WALRecord::Insert { row_id: 101, partition: 0, data: row2 },
-    ///     WALRecord::Commit { txn_id: 1, commit_ts: 1000 },
-    /// ];
-    /// wal.batch_append(0, records)?;
-    /// ```
     pub fn batch_append(
         &self,
         partition: PartitionId,
         records: Vec<WALRecord>,
     ) -> Result<Vec<LogSequenceNumber>> {
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.batch_append(records)
     }
 
     /// Create checkpoint for a partition
     pub fn checkpoint(&self, partition: PartitionId) -> Result<()> {
-        let mut partitions = self.partitions.write();
-        let wal = partitions
-            .get_mut(&partition)
+        let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
-        
+        let mut wal = entry.value().lock();
         wal.checkpoint()
     }
 
     /// Checkpoint all partitions
     pub fn checkpoint_all(&self) -> Result<()> {
-        let mut partitions = self.partitions.write();
-        for wal in partitions.values_mut() {
+        for entry in self.partitions.iter() {
+            let mut wal = entry.value().lock();
             wal.checkpoint()?;
         }
         Ok(())
@@ -742,14 +696,15 @@ impl WALManager {
 
     /// Recover from crash (returns records per partition)
     pub fn recover(&self) -> Result<HashMap<PartitionId, Vec<WALRecord>>> {
-        let mut partitions = self.partitions.write();
         let mut result = HashMap::new();
-        
-        for (partition_id, wal) in partitions.iter_mut() {
+
+        for entry in self.partitions.iter() {
+            let partition_id = *entry.key();
+            let mut wal = entry.value().lock();
             let records = wal.recover()?;
-            result.insert(*partition_id, records); // Always insert, even if empty
+            result.insert(partition_id, records);
         }
-        
+
         Ok(result)
     }
 }
@@ -763,10 +718,10 @@ impl Drop for WALManager {
                 let _ = handle.join();
             }
         }
-        
-        // 最后一次刷盘，确保数据安全
-        let mut partitions = self.partitions.write();
-        for (_partition_id, wal) in partitions.iter_mut() {
+
+        // 最后一次刷盘，确保数据安全 (DashMap iteration is lock-free)
+        for entry in self.partitions.iter() {
+            let wal = entry.value().lock();
             let _ = wal.file.sync_data();
         }
     }

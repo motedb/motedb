@@ -2,7 +2,8 @@
 
 use super::{UnifiedMemTable, SSTable, SSTableBuilder, Key, Value, ValueData, LSMConfig, CompactionWorker, BlobStore};
 use crate::{Result, StorageError};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, Mutex};
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
@@ -311,11 +312,8 @@ impl LSMEngine {
                     };
                     
                     let has_immutable = {
-                        if let Ok(immutable_guard) = immutable.read() {
-                            !immutable_guard.is_empty()
-                        } else {
-                            false
-                        }
+                        let immutable_guard = immutable.read();
+                        !immutable_guard.is_empty()
                     };
                     
                     if has_immutable {
@@ -325,12 +323,10 @@ impl LSMEngine {
                         ).is_ok() {
                             // Pop from front of queue (FIFO)
                             let (memtable, _queue_size_after) = {
-                                let immutable_lock = immutable.write().ok();
-                                immutable_lock.map(|mut lock| {
-                                    let mt = lock.pop_front();
-                                    let size = lock.len();
-                                    (mt, size)
-                                }).unwrap_or((None, 0))
+                                let mut immutable_lock = immutable.write();
+                                let mt = immutable_lock.pop_front();
+                                let size = immutable_lock.len();
+                                (mt, size)
                             };
                             
                             // 🔥 DEADLOCK FIX: Pop memtable FIRST and drop lock
@@ -345,12 +341,10 @@ impl LSMEngine {
                                 };
                                 
                                 let sst_id = {
-                                    let next_id = next_sst_id.write().ok();
-                                    next_id.map(|mut id| {
-                                        let current = *id;
-                                        *id += 1;
-                                        current
-                                    })
+                                    let mut next_id = next_sst_id.write();
+                                    let current = *next_id;
+                                    *next_id += 1;
+                                    Some(current)
                                 };
                                 
                                 if let Some(sst_id) = sst_id {
@@ -399,11 +393,10 @@ impl LSMEngine {
                                 // This ensures the immutable queue drains quickly even if
                                 // index building is slow (e.g. in debug builds).
                                 if let Some(callback_arc) = flush_callback_weak.upgrade() {
-                                    if let Ok(callback_guard) = callback_arc.read() {
-                                        if let Some(ref callback) = *callback_guard {
-                                            if let Err(e) = callback(&memtable) {
-                                                eprintln!("[LSM Flush] ⚠️  Callback error: {:?}", e);
-                                            }
+                                    let callback_guard = callback_arc.read();
+                                    if let Some(ref callback) = *callback_guard {
+                                        if let Err(e) = callback(&memtable) {
+                                            eprintln!("[LSM Flush] ⚠️  Callback error: {:?}", e);
                                         }
                                     }
                                 }
@@ -460,42 +453,45 @@ impl LSMEngine {
         // 🔥 BACKPRESSURE: Wait if active is full AND queue is at max capacity
         let mut backpressure_count = 0;
         loop {
-            let should_rotate = {
-                let memtable = self.memtable.read()
-                    .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-                memtable.should_flush()
-            };
-            
-            if !should_rotate {
-                break; // Active has space, continue
+            // 🚀 Phase 3.1: Combine flush check + insert into single lock acquisition
+            // Fast path: acquire read lock, check flush, and insert in one go
+            {
+                let memtable = self.memtable.read();
+
+                if !memtable.should_flush() {
+                    // Fast path: active has space, insert while holding the lock
+                    memtable.put(key, value)?;
+                    return Ok(());
+                }
+                // Slow path: memtable is full, drop lock and handle rotation
             }
-            
+
             // Check queue capacity before rotating
             let queue_len = {
-                let immutable = self.immutable.read()
-                    .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+                let immutable = self.immutable.read();
                 immutable.len()
             };
-            
+
             if queue_len < self.max_immutable_slots {
                 // Queue has space, try to rotate
                 if self.try_rotate_memtable().is_ok() {
-                    break; // Successfully rotated
+                    // Retry the insert after rotation (new active memtable has space)
+                    continue;
                 }
             }
-            
+
             // Queue is full, apply backpressure
             backpressure_count += 1;
             if backpressure_count == 1 {
-                eprintln!("[LSM] ⚠️  Backpressure: Queue full ({}/{}), waiting for flush...", 
+                eprintln!("[LSM] ⚠️  Backpressure: Queue full ({}/{}), waiting for flush...",
                     queue_len, self.max_immutable_slots);
             } else if backpressure_count % 100 == 0 {
-                eprintln!("[LSM] ⏳ Still waiting: {}ms (queue: {}/{})", 
+                eprintln!("[LSM] ⏳ Still waiting: {}ms (queue: {}/{})",
                     backpressure_count * 10, queue_len, self.max_immutable_slots);
             }
-            
+
             thread::sleep(Duration::from_millis(10));
-            
+
             // Safety: prevent infinite loop (100 seconds timeout)
             if backpressure_count > 10000 {
                 return Err(StorageError::Transaction(
@@ -503,25 +499,13 @@ impl LSMEngine {
                 ));
             }
         }
-        
-        if backpressure_count > 0 {
-            eprintln!("[LSM] ✓ Backpressure resolved after {}ms", backpressure_count * 10);
-        }
-        
-        // Insert into active memtable
-        let memtable = self.memtable.read()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        memtable.put(key, value)?;
-        
-        Ok(())
     }
     
     /// Get a value by key (LSM查询: MemTable -> Immutable -> SSTables -> Blob)
     pub fn get(&self, key: Key) -> Result<Option<Value>> {
         // 1. Check active memtable (newest data)
         let active_result = {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             memtable.get(key)?
             // 🔓 memtable锁在这里释放
         };
@@ -550,8 +534,7 @@ impl LSMEngine {
         // 2. Check immutable queue (reverse order, newer first)
         // ⚠️  CRITICAL: 在持锁期间查询所有memtable，但立即返回结果避免长时间持锁
         let immutable_result = {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             // Search from back (newest) to front (oldest)
             let mut result = None;
@@ -649,11 +632,8 @@ impl LSMEngine {
         
         // 1. Check active memtable (批量查询，只获取一次锁)
         {
-            debug_log!("🔒 [batch_get] 尝试获取 memtable.read() 锁...");
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            debug_log!("✅ [batch_get] 成功获取 memtable.read() 锁，开始查询 {} 个keys", remaining_keys.len());
-            
+            let memtable = self.memtable.read();
+
             let mut i = 0;
             while i < remaining_keys.len() {
                 let (idx, key) = remaining_keys[i];
@@ -679,8 +659,7 @@ impl LSMEngine {
                     i += 1;
                 }
             }
-            debug_log!("🔓 [batch_get] 释放 memtable.read() 锁，剩余 {} 个keys未找到", remaining_keys.len());
-            // 🔓 memtable锁在这里释放
+            // memtable lock released here
         }
         
         if remaining_keys.is_empty() {
@@ -690,11 +669,8 @@ impl LSMEngine {
         
         // 2. Check immutable queue (批量查询，只获取一次锁)
         {
-            debug_log!("🔒 [batch_get] 尝试获取 immutable.read() 锁...");
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            debug_log!("✅ [batch_get] 成功获取 immutable.read() 锁，immutable queue中有 {} 个memtable", immutable.len());
-            
+            let immutable = self.immutable.read();
+
             for (mt_idx, memtable) in immutable.iter().rev().enumerate() {
                 println!("  🔍 [batch_get] 查询第 {} 个immutable memtable，剩余 {} 个keys", mt_idx + 1, remaining_keys.len());
                 let mut i = 0;
@@ -728,8 +704,7 @@ impl LSMEngine {
                     break;
                 }
             }
-            debug_log!("🔓 [batch_get] 释放 immutable.read() 锁，剩余 {} 个keys未找到", remaining_keys.len());
-            // 🔓 immutable锁在这里释放
+            // immutable lock released here
         }
         
         if remaining_keys.is_empty() {
@@ -847,8 +822,7 @@ impl LSMEngine {
             let mut backpressure_count = 0;
             loop {
                 let should_rotate = {
-                    let memtable = self.memtable.read()
-                        .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+                    let memtable = self.memtable.read();
                     memtable.should_flush()
                 };
 
@@ -857,8 +831,7 @@ impl LSMEngine {
                 }
 
                 let queue_len = {
-                    let immutable = self.immutable.read()
-                        .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+                    let immutable = self.immutable.read();
                     immutable.len()
                 };
 
@@ -877,8 +850,7 @@ impl LSMEngine {
                 thread::sleep(Duration::from_millis(10));
             }
 
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             memtable.batch_put(chunk)?;
         }
 
@@ -919,8 +891,7 @@ impl LSMEngine {
         
         // 🔥 Fast path: check if rotation needed (lock-free)
         let should_rotate = {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             memtable.should_flush()
         };
         
@@ -930,8 +901,7 @@ impl LSMEngine {
         }
         
         // Insert into active memtable (never blocks)
-        let memtable = self.memtable.read()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+        let memtable = self.memtable.read();
         memtable.put_with_vector(key, data, vector, timestamp)?;
         
         Ok(())
@@ -946,8 +916,7 @@ impl LSMEngine {
     /// - 查询延迟: ~2ms (内存图 + 数据解引用)
     /// - 无额外查询开销（数据和向量在同一 Entry）
     pub fn vector_search_memtable(&self, query: &[f32], k: usize) -> Result<Vec<(Key, Value, f32)>> {
-        let memtable = self.memtable.read()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+        let memtable = self.memtable.read();
         
         let results = memtable.vector_search(query, k)?;
         
@@ -1001,13 +970,8 @@ impl LSMEngine {
             debug_log!("✅ [flush] 成功获取 flush_lock");
             
             let has_data = {
-                debug_log!("🔒 [flush] 尝试获取 memtable.read() 锁检查数据...");
-                let memtable = self.memtable.read()
-                    .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-                let empty = memtable.is_empty();
-                debug_log!("✅ [flush] memtable is_empty = {}", empty);
-                debug_log!("🔓 [flush] 释放 memtable.read() 锁");
-                !empty
+                let memtable = self.memtable.read();
+                !memtable.is_empty()
             };
             
             if has_data {
@@ -1029,8 +993,7 @@ impl LSMEngine {
         let start_wait = std::time::Instant::now();
         loop {
             let queue_len = {
-                let immutable = self.immutable.read()
-                    .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+                let immutable = self.immutable.read();
                 immutable.len()
             };
             
@@ -1069,8 +1032,7 @@ impl LSMEngine {
     where
         F: Fn(&UnifiedMemTable) -> Result<()> + Send + Sync + 'static,
     {
-        let mut cb = self.flush_callback.write()
-            .map_err(|_| StorageError::Lock("Flush callback lock poisoned".into()))?;
+        let mut cb = self.flush_callback.write();
         *cb = Some(Arc::new(callback));
         Ok(())
     }
@@ -1096,46 +1058,29 @@ impl LSMEngine {
     fn try_rotate_memtable(&self) -> Result<()> {
         // Quick check: is queue full?
         {
-            debug_log!("🔒 [try_rotate] 尝试获取 immutable.read() 锁检查队列...");
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            debug_log!("✅ [try_rotate] 成功获取 immutable.read() 锁，队列长度: {}/{}", 
-                     immutable.len(), self.max_immutable_slots);
+            let immutable = self.immutable.read();
             if immutable.len() >= self.max_immutable_slots {
-                debug_log!("⚠️  [try_rotate] 队列已满，跳过rotate");
                 // Queue full, skip rotation (non-blocking)
                 return Err(StorageError::Transaction("Immutable queue full".into()));
             }
-            debug_log!("🔓 [try_rotate] 释放 immutable.read() 锁");
         }
-        
+
         // Acquire both locks for atomic swap
-        debug_log!("🔒 [try_rotate] 尝试获取 memtable.write() 锁...");
-        let mut memtable_lock = self.memtable.write()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        debug_log!("✅ [try_rotate] 成功获取 memtable.write() 锁");
-        
-        debug_log!("🔒 [try_rotate] 尝试获取 immutable.write() 锁...");
-        let mut immutable_lock = self.immutable.write()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        debug_log!("✅ [try_rotate] 成功获取 immutable.write() 锁");
-        
+        let mut memtable_lock = self.memtable.write();
+        let mut immutable_lock = self.immutable.write();
+
         // Double-check queue not full (another thread might have added)
         if immutable_lock.len() >= self.max_immutable_slots {
-            debug_log!("⚠️  [try_rotate] 双重检查：队列已满，放弃rotate");
             return Err(StorageError::Transaction("Immutable queue full".into()));
         }
-        
-        // 🆕 Create new UnifiedMemTable with same configuration
+
+        // Create new UnifiedMemTable with same configuration
         let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
-        
-        // Atomic swap: active → push to queue back, create new active
+
+        // Atomic swap: active -> push to queue back, create new active
         let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
-        immutable_lock.push_back(old_memtable);  // 🔥 Push to queue
-        
-        debug_log!("✅ [try_rotate] MemTable rotate成功，新队列长度: {}", immutable_lock.len());
-        debug_log!("🔓 [try_rotate] 释放 immutable.write() 和 memtable.write() 锁");
-        
+        immutable_lock.push_back(old_memtable);
+
         Ok(())
     }
     
@@ -1145,8 +1090,7 @@ impl LSMEngine {
         let mut wait_count = 0;
         loop {
             {
-                let immutable = self.immutable.read()
-                    .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+                let immutable = self.immutable.read();
                 if immutable.len() < self.max_immutable_slots {
                     break;
                 }
@@ -1165,10 +1109,8 @@ impl LSMEngine {
         }
         
         // Now rotate
-        let mut memtable_lock = self.memtable.write()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        let mut immutable_lock = self.immutable.write()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+        let mut memtable_lock = self.memtable.write();
+        let mut immutable_lock = self.immutable.write();
         
         // 🆕 Create new UnifiedMemTable with same configuration
         let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
@@ -1196,8 +1138,7 @@ impl LSMEngine {
     fn flush_immutable_impl(&self) -> Result<Option<PathBuf>> {
         // Pop one MemTable from front of queue (oldest first)
         let memtable = {
-            let mut immutable_lock = self.immutable.write()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let mut immutable_lock = self.immutable.write();
             
             match immutable_lock.pop_front() {  // 🔥 Pop from front (FIFO)
                 Some(mem) => mem,
@@ -1211,8 +1152,7 @@ impl LSMEngine {
         // Call callback with MemTable reference (zero-copy, efficient)
         // This allows Database layer to batch build all indexes
         {
-            let callback_guard = self.flush_callback.read()
-                .map_err(|_| StorageError::Lock("Flush callback lock poisoned".into()))?;
+            let callback_guard = self.flush_callback.read();
             if let Some(ref callback) = *callback_guard {
                 // ✅ Pass MemTable reference directly (no data copy)
                 callback(&memtable)?;
@@ -1221,8 +1161,7 @@ impl LSMEngine {
         
         // Generate SSTable ID
         let sst_id = {
-            let mut next_id = self.next_sst_id.write()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let mut next_id = self.next_sst_id.write();
             let id = *next_id;
             *next_id += 1;
             id
@@ -1303,8 +1242,7 @@ impl LSMEngine {
         // 1. Scan immutable queue (oldest to newest, so newer values overwrite)
         // 🔥 NEW: Iterate through entire queue
         {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             // Scan from front (oldest) to back (newest)
             for mem in immutable.iter() {
@@ -1321,8 +1259,7 @@ impl LSMEngine {
         
         // 2. Scan active MemTable (overwrites older values)
         {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             for (k, entry) in entries {
                 if let ValueData::Inline(ref d) = entry.data {
@@ -1370,8 +1307,7 @@ impl LSMEngine {
     {
         // Step 1: 收集所有数据（持锁时间最小化）
         let entries = {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             
             let mut collected = Vec::new();
             let entries = memtable.scan_all()?;
@@ -1420,8 +1356,7 @@ impl LSMEngine {
         
         // 1.1 扫描 immutable queue (等待 flush 的数据)
         {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             for memtable in immutable.iter() {
                 let entries = memtable.scan_all()?;
@@ -1444,8 +1379,7 @@ impl LSMEngine {
         
         // 1.2 扫描 active MemTable (正在写入的数据)
         {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             let entries = memtable.scan_all()?;
             for (k, entry) in entries {
                 // 🔧 FIX: Skip tombstones (deleted entries)
@@ -1491,8 +1425,7 @@ impl LSMEngine {
     where
         F: FnMut(Key, &[u8]) -> Result<()>,
     {
-        let immutable = self.immutable.read()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+        let immutable = self.immutable.read();
         
         for memtable in immutable.iter() {
             let entries = memtable.scan_all()?;
@@ -1516,9 +1449,7 @@ impl LSMEngine {
     
     /// 🆕 Public API: Get immutable queue size
     pub fn immutable_queue_len(&self) -> usize {
-        self.immutable.read()
-            .map(|guard| guard.len())
-            .unwrap_or(0)
+        self.immutable.read().len()
     }
     
     /// 🆕 Scan all keys with a specific prefix (for table scanning)
@@ -1602,8 +1533,7 @@ impl LSMEngine {
         let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
         
         {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             
             for (k, entry) in entries {
@@ -1619,8 +1549,7 @@ impl LSMEngine {
         // Step 2: Collect from Immutable queue
         // 🔥 NEW: Iterate through entire queue (oldest to newest)
         {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             for memtable in immutable.iter() {
                 let entries = memtable.scan(start, end)?;
@@ -1718,8 +1647,7 @@ impl LSMEngine {
         let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
         
         {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             
             for (k, entry) in entries {
@@ -1734,8 +1662,7 @@ impl LSMEngine {
         
         // Step 2: Collect from Immutable queue (serial, moderate data)
         {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             for memtable in immutable.iter() {
                 let entries = memtable.scan(start, end)?;
@@ -1881,8 +1808,7 @@ impl LSMEngine {
         
         // Collect from MemTable
         {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             
             for (k, entry) in entries {
@@ -1897,8 +1823,7 @@ impl LSMEngine {
         
         // Collect from Immutable queue
         {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             for memtable in immutable.iter() {
                 let entries = memtable.scan(start, end)?;
@@ -2001,8 +1926,7 @@ impl LSMEngine {
         
         // Source 1: MemTable（优先级最高，source_id = 0）
         {
-            let memtable = self.memtable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             
             let iter = entries.into_iter().map(|(k, entry)| {
@@ -2018,8 +1942,7 @@ impl LSMEngine {
         
         // Source 2-N: Immutable queue（按时间从旧到新）
         {
-            let immutable = self.immutable.read()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let immutable = self.immutable.read();
             
             for memtable in immutable.iter() {
                 let entries = memtable.scan(start, end)?;

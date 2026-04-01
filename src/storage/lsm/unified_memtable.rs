@@ -12,10 +12,11 @@
 
 use super::{Key, Value, ValueData, LSMConfig};
 use crate::index::diskann::fresh_graph::{FreshVamanaGraph, FreshGraphConfig, VectorNode};
-use crate::distance::{Cosine, DistanceMetric};
+use crate::distance::DistanceKind;
 use crate::{Result, StorageError};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 
 /// Unified Entry (数据 + 向量)
@@ -108,7 +109,7 @@ impl UnifiedMemTable {
             memory_threshold: 20 * 1024 * 1024, // 20MB
         };
         
-        let metric = Arc::new(Cosine) as Arc<dyn DistanceMetric>;
+        let metric = DistanceKind::Cosine;
         let vector_graph = FreshVamanaGraph::new(fresh_config, metric);
         
         Self {
@@ -160,9 +161,8 @@ impl UnifiedMemTable {
     fn put_unified(&self, key: Key, entry: UnifiedEntry) -> Result<()> {
         let entry_size = entry.memory_size();
         
-        let mut entries = self.entries.write()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let mut entries = self.entries.write();
+
         // 如果是更新，先减去旧 entry 的大小
         if let Some(old_entry) = entries.get(&key) {
             let old_size = old_entry.memory_size();
@@ -192,9 +192,8 @@ impl UnifiedMemTable {
             return Ok(());
         }
         
-        let mut entries = self.entries.write()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let mut entries = self.entries.write();
+
         let mut total_size_change: i64 = 0;
         
         for (key, value) in kvs {
@@ -231,9 +230,8 @@ impl UnifiedMemTable {
     
     /// 获取数据
     pub fn get(&self, key: Key) -> Result<Option<UnifiedEntry>> {
-        let entries = self.entries.read()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let entries = self.entries.read();
+
         Ok(entries.get(&key).cloned())
     }
     
@@ -241,14 +239,13 @@ impl UnifiedMemTable {
     pub fn delete(&self, key: Key, timestamp: u64) -> Result<()> {
         let entry = UnifiedEntry::tombstone(timestamp);
         
-        let mut entries = self.entries.write()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let mut entries = self.entries.write();
+
         if let Some(old_entry) = entries.get(&key) {
             let old_size = old_entry.memory_size();
             self.size.fetch_sub(old_size, Ordering::Relaxed);
         }
-        
+
         entries.insert(key, entry.clone());
         self.size.fetch_add(entry.memory_size(), Ordering::Relaxed);
         
@@ -264,6 +261,12 @@ impl UnifiedMemTable {
     pub fn should_flush(&self) -> bool {
         self.size.load(Ordering::Relaxed) >= self.max_size
     }
+
+    /// Lock-free flush check (avoids RwLock acquisition in LSM put() fast path)
+    #[inline]
+    pub fn should_flush_atomic(&self) -> bool {
+        self.size.load(Ordering::Relaxed) >= self.max_size
+    }
     
     /// 获取当前内存占用
     pub fn size(&self) -> usize {
@@ -272,9 +275,7 @@ impl UnifiedMemTable {
     
     /// 获取 entry 数量
     pub fn len(&self) -> usize {
-        self.entries.read()
-            .map(|entries| entries.len())
-            .unwrap_or(0)
+        self.entries.read().len()
     }
     
     /// 检查是否为空
@@ -295,9 +296,8 @@ impl UnifiedMemTable {
         let candidates = graph.search(query, k, ef)?;
         
         // 2. 获取完整的 entry
-        let entries = self.entries.read()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let entries = self.entries.read();
+
         // 🚀 P3 优化：预分配 k 个结果
         let mut results = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -318,8 +318,7 @@ impl UnifiedMemTable {
     
     /// 获取 snapshot（测试用）
     pub fn snapshot(&self) -> Vec<(Key, UnifiedEntry)> {
-        let entries = self.entries.read()
-            .expect("UnifiedMemTable snapshot: lock poisoned (unrecoverable in test)");
+        let entries = self.entries.read();
         entries.iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()
@@ -327,9 +326,8 @@ impl UnifiedMemTable {
     
     /// 范围扫描
     pub fn scan(&self, start: Key, end: Key) -> Result<Vec<(Key, UnifiedEntry)>> {
-        let entries = self.entries.read()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let entries = self.entries.read();
+
         use std::ops::Bound;
         let range = entries.range((
             Bound::Included(&start),
@@ -352,12 +350,11 @@ impl UnifiedMemTable {
     
     /// 全表扫描
     pub fn scan_all(&self) -> Result<Vec<(Key, UnifiedEntry)>> {
-        let entries = self.entries.read()
-            .map_err(|_| StorageError::Lock("UnifiedMemTable lock poisoned".into()))?;
-        
+        let entries = self.entries.read();
+
         // 🚀 P3 优化：预分配容量
         let mut results = Vec::with_capacity(entries.len());
-        
+
         // ⚠️ CRITICAL: 不要过滤 deleted entries（tombstones 需要返回）
         for (k, v) in entries.iter() {
             results.push((*k, v.clone()));
@@ -387,8 +384,7 @@ pub struct UnifiedMemTableIterator {
 
 impl UnifiedMemTableIterator {
     pub fn new(entries: Arc<RwLock<BTreeMap<Key, UnifiedEntry>>>) -> Self {
-        let entries_guard = entries.read()
-            .expect("UnifiedMemTableIterator: lock poisoned (unrecoverable)");
+        let entries_guard = entries.read();
         let entries: Vec<(Key, UnifiedEntry)> = entries_guard.iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();

@@ -92,11 +92,12 @@ clap = { version = "4.4", features = ["derive"] }
 
 # Enable jieba tokenizer by default
 [features]
-default = ["tokenizer-jieba"]  # 🎯 默认启用中文分词
-# 🔌 可选分词器插件
+default = ["tokenizer-jieba"]  # 默认启用中文分词
+default-edge = []  # Edge/IoT preset: no tokenizer, minimal binary size
+# 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
-# 🔍 内存分析（用于性能调优）
+# 内存分析（用于性能调优）
 mem-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 # ⚡ 数据并行化（可选，已包含在 dependencies 中）
 rayon = []  # 启用 Rayon 并行处理

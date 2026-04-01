@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 
 /// Database statistics
 #[derive(Debug, Clone)]
@@ -72,7 +72,7 @@ pub struct MoteDB {
     
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
-    pub(crate) table_auto_increment: Arc<DashMap<String, Arc<RwLock<i64>>>>,
+    pub(crate) table_auto_increment: Arc<DashMap<String, Arc<AtomicI64>>>,
 
     /// Number of partitions
     pub(crate) num_partitions: u8,
@@ -470,7 +470,7 @@ impl MoteDB {
                 
                 db.table_auto_increment.insert(
                     table_name,
-                    Arc::new(RwLock::new(max_id + 1))
+                    Arc::new(AtomicI64::new(max_id + 1))
                 );
             }
         }
@@ -505,8 +505,7 @@ impl MoteDB {
         
         // Update counter
         if let Some(counter_ref) = self.table_auto_increment.get(table_name) {
-            let mut counter = counter_ref.write();
-            *counter = new_value;
+            counter_ref.store(new_value, std::sync::atomic::Ordering::SeqCst);
             debug_log!("[database] ✓ Set AUTO_INCREMENT for '{}' to {}", table_name, new_value);
         }
         

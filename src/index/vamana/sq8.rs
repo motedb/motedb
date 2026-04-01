@@ -20,6 +20,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 /// SQ8 quantizer (per-vector min/max scaling)
 #[derive(Debug, Clone)]
 pub struct SQ8Quantizer {
@@ -220,6 +223,117 @@ impl SQ8Quantizer {
         // Cosine distance = 1 - cosine_similarity
         let cosine_sim = dot_product / (query_norm * data_norm);
         1.0 - cosine_sim.clamp(-1.0, 1.0)
+    }
+
+    /// 🚀 ARM NEON optimized asymmetric SQ8 cosine distance
+    ///
+    /// Processes 16 u8 codes per iteration using NEON intrinsics:
+    /// - vld1q_u8: load 16 bytes
+    /// - vmovl_u8/vmovl_u16: widen u8→u16→u32
+    /// - vcvtq_f32_u32: convert to f32
+    /// - vfmaq_f32: fused multiply-add
+    #[cfg(target_arch = "aarch64")]
+    pub fn asymmetric_distance_cosine_neon(
+        &self,
+        query: &[f32],
+        data: &QuantizedVector,
+    ) -> f32 {
+        if query.len() != self.dimension || data.codes.len() != self.dimension {
+            return f32::MAX;
+        }
+
+        let range = data.max - data.min;
+        if range < 1e-8 {
+            // Fallback to scalar for constant vectors
+            return self.asymmetric_distance_cosine(query, data);
+        }
+
+        let scale = range / 255.0;
+        let n = self.dimension;
+        let chunks = n / 16;
+        let _remainder = n % 16;
+
+        let mut dot_sum1 = unsafe { vdupq_n_f32(0.0) };
+        let mut dot_sum2 = unsafe { vdupq_n_f32(0.0) };
+        let mut qnorm_sum1 = unsafe { vdupq_n_f32(0.0) };
+        let mut qnorm_sum2 = unsafe { vdupq_n_f32(0.0) };
+        let mut dnorm_sum1 = unsafe { vdupq_n_f32(0.0) };
+        let mut dnorm_sum2 = unsafe { vdupq_n_f32(0.0) };
+
+        let scale_vec = unsafe { vdupq_n_f32(scale) };
+        let min_vec = unsafe { vdupq_n_f32(data.min) };
+
+        unsafe {
+            for i in 0..chunks {
+                let offset = i * 16;
+
+                // Load 16 u8 codes and process in two groups of 8
+                let codes = vld1q_u8(data.codes.as_ptr().add(offset));
+
+                // Widen u8→u16 (low 8 and high 8)
+                let codes_u16_low = vmovl_u8(vget_low_u8(codes));
+                let codes_u16_high = vmovl_u8(vget_high_u8(codes));
+
+                // Widen u16→u32 (each produces 2 × float32x4_t)
+                let codes_u32_0 = vmovl_u16(vget_low_u16(codes_u16_low));
+                let codes_u32_1 = vmovl_u16(vget_high_u16(codes_u16_low));
+                let codes_u32_2 = vmovl_u16(vget_low_u16(codes_u16_high));
+                let codes_u32_3 = vmovl_u16(vget_high_u16(codes_u16_high));
+
+                // Convert to f32
+                let d_f32_0 = vcvtq_f32_u32(codes_u32_0);
+                let d_f32_1 = vcvtq_f32_u32(codes_u32_1);
+                let d_f32_2 = vcvtq_f32_u32(codes_u32_2);
+                let d_f32_3 = vcvtq_f32_u32(codes_u32_3);
+
+                // Dequantize: d = code * scale + min
+                let d_0 = vaddq_f32(vmulq_f32(d_f32_0, scale_vec), min_vec);
+                let d_1 = vaddq_f32(vmulq_f32(d_f32_1, scale_vec), min_vec);
+                let d_2 = vaddq_f32(vmulq_f32(d_f32_2, scale_vec), min_vec);
+                let d_3 = vaddq_f32(vmulq_f32(d_f32_3, scale_vec), min_vec);
+
+                // Load query vectors
+                let q_0 = vld1q_f32(query.as_ptr().add(offset));
+                let q_1 = vld1q_f32(query.as_ptr().add(offset + 4));
+                let q_2 = vld1q_f32(query.as_ptr().add(offset + 8));
+                let q_3 = vld1q_f32(query.as_ptr().add(offset + 12));
+
+                // Accumulate dot, query_norm, data_norm
+                dot_sum1 = vfmaq_f32(vfmaq_f32(dot_sum1, q_0, d_0), q_1, d_1);
+                dot_sum2 = vfmaq_f32(vfmaq_f32(dot_sum2, q_2, d_2), q_3, d_3);
+                qnorm_sum1 = vfmaq_f32(vfmaq_f32(qnorm_sum1, q_0, q_0), q_1, q_1);
+                qnorm_sum2 = vfmaq_f32(vfmaq_f32(qnorm_sum2, q_2, q_2), q_3, q_3);
+                dnorm_sum1 = vfmaq_f32(vfmaq_f32(dnorm_sum1, d_0, d_0), d_1, d_1);
+                dnorm_sum2 = vfmaq_f32(vfmaq_f32(dnorm_sum2, d_2, d_2), d_3, d_3);
+            }
+
+            let dot_sum = vaddq_f32(dot_sum1, dot_sum2);
+            let qnorm_sum = vaddq_f32(qnorm_sum1, qnorm_sum2);
+            let dnorm_sum = vaddq_f32(dnorm_sum1, dnorm_sum2);
+
+            let mut dot_product = vaddvq_f32(dot_sum);
+            let mut query_norm_sq = vaddvq_f32(qnorm_sum);
+            let mut data_norm_sq = vaddvq_f32(dnorm_sum);
+
+            // Scalar remainder
+            for i in (chunks * 16)..n {
+                let q = query[i];
+                let d = data.codes[i] as f32 * scale + data.min;
+                dot_product += q * d;
+                query_norm_sq += q * q;
+                data_norm_sq += d * d;
+            }
+
+            let query_norm = query_norm_sq.sqrt();
+            let data_norm = data_norm_sq.sqrt();
+
+            if query_norm < 1e-8 || data_norm < 1e-8 {
+                return 1.0;
+            }
+
+            let cosine_sim = dot_product / (query_norm * data_norm);
+            1.0 - cosine_sim.clamp(-1.0, 1.0)
+        }
     }
     
     /// Fast L2 norm computation (SIMD-friendly)

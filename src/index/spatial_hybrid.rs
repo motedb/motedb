@@ -93,6 +93,14 @@ pub struct SpatialHybridConfig {
     
     /// Enable SIMD optimizations
     pub enable_simd: bool,
+
+    /// Initial mmap file size (bytes). Default 100MB, use 4MB for edge devices.
+    #[serde(default = "default_mmap_initial_size")]
+    pub mmap_initial_size: u64,
+}
+
+fn default_mmap_initial_size() -> u64 {
+    100 * 1024 * 1024
 }
 
 impl Default for SpatialHybridConfig {
@@ -106,6 +114,7 @@ impl Default for SpatialHybridConfig {
             enable_compression: true,
             enable_adaptive: true,
             enable_simd: cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            mmap_initial_size: default_mmap_initial_size(),
         }
     }
 }
@@ -137,6 +146,20 @@ impl SpatialHybridConfig {
     pub fn with_adaptive(mut self, enabled: bool) -> Self {
         self.enable_adaptive = enabled;
         self
+    }
+
+    /// Edge-optimized preset: smaller mmap, fewer grid cells, lower memory
+    pub fn for_edge() -> Self {
+        Self {
+            grid_size: 16,
+            hot_cache_size: 32,
+            enable_mmap: true,
+            mmap_initial_size: 4 * 1024 * 1024, // 4MB (vs 100MB default)
+            enable_compression: true,
+            enable_adaptive: true,
+            enable_simd: cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"),
+            ..Default::default()
+        }
     }
     
     pub fn with_simd(mut self, enabled: bool) -> Self {
@@ -613,7 +636,7 @@ impl CellStorage {
                     .open(path)?;
                 
                 // Pre-allocate 100MB
-                file.set_len(100 * 1024 * 1024)?;
+                file.set_len(config.mmap_initial_size)?;
                 
                 let mmap = unsafe { MmapMut::map_mut(&file)? };
                 Some(mmap)
@@ -958,14 +981,15 @@ impl SpatialHybridIndex {
         // 🚀 P1 优化：预分配容量（估算每个 cell 10 个对象）
         let estimated_capacity = cells_to_query.len() * 10;
         let mut results = Vec::with_capacity(estimated_capacity);
+        // NOTE: write() needed because LruCache::get() requires &mut self
         let mut storage = self.storage.write();
-        
+
         for cell_id in cells_to_query {
             if let Some(tree) = storage.get(cell_id) {
                 tree.range_query(&bbox_f32, &mut results);
             }
         }
-        
+
         results.sort_unstable();
         results.dedup();
         results

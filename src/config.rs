@@ -520,6 +520,34 @@ impl DBConfig {
             ..Default::default()
         }
     }
+
+    /// Edge/IoT optimized configuration for resource-constrained devices
+    ///
+    /// Use case: Embedded devices, IoT sensors, AR glasses, robots
+    /// - WAL: Periodic (50ms), 8MB max - tolerates small data loss window
+    /// - LSM: 4MB memtable - low memory footprint
+    /// - num_partitions: 2 - fewer threads, less overhead
+    /// - row_cache_size: 500 - minimal cache (~500KB)
+    /// - auto_checkpoint: embedded() - infrequent wakeups
+    /// - index_update_strategy: BatchOnly - highest write throughput
+    pub fn for_edge() -> Self {
+        Self {
+            wal_config: WALConfig {
+                durability_level: DurabilityLevel::Periodic { interval_ms: 50 },
+                max_wal_size: 8 * 1024 * 1024, // 8MB
+                ..Default::default()
+            },
+            num_partitions: 2,
+            lsm_config: LSMConfig {
+                memtable_size_limit: 4 * 1024 * 1024, // 4MB
+                ..Default::default()
+            },
+            row_cache_size: Some(500),
+            auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
+            index_update_strategy: IndexUpdateStrategy::BatchOnly,
+            ..Default::default()
+        }
+    }
 }
 
 /// LSM 树配置

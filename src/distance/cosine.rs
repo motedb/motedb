@@ -4,6 +4,8 @@
 use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// CPU feature detection cache (initialized once at startup)
 #[cfg(target_arch = "x86_64")]
@@ -25,21 +27,10 @@ fn get_cpu_features() -> CpuFeatures {
 }
 
 /// Compute cosine similarity between two vectors with SIMD optimization
-///
-/// # Arguments
-/// * `a` - First vector
-/// * `b` - Second vector
-///
-/// # Returns
-/// Cosine similarity in range [-1, 1], where 1 means identical direction
-///
-/// # Panics
-/// Panics if vectors have different dimensions
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "Vector dimensions must match");
 
-    // P2 优化：缓存CPU特性检测，避免重复runtime检测
     #[cfg(target_arch = "x86_64")]
     {
         let features = get_cpu_features();
@@ -51,7 +42,15 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
             cosine_similarity_scalar(a, b)
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        if a.len() >= 4 {
+            unsafe { cosine_similarity_neon(a, b) }
+        } else {
+            cosine_similarity_scalar(a, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         cosine_similarity_scalar(a, b)
     }
@@ -230,6 +229,109 @@ fn compute_cosine_similarity(dot_product: f32, norm_a: f32, norm_b: f32) -> f32 
         // 处理浮点误差，确保在有效范围内
         similarity.clamp(-1.0, 1.0)
     }
+}
+
+/// ARM NEON optimized cosine similarity (4-way loop unroll, 16 floats/iteration)
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn cosine_similarity_neon(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let chunks = n / 16;
+    let remainder = n % 16;
+
+    let mut dot_sum1 = vdupq_n_f32(0.0);
+    let mut dot_sum2 = vdupq_n_f32(0.0);
+    let mut dot_sum3 = vdupq_n_f32(0.0);
+    let mut dot_sum4 = vdupq_n_f32(0.0);
+
+    let mut norm_a_sum1 = vdupq_n_f32(0.0);
+    let mut norm_a_sum2 = vdupq_n_f32(0.0);
+    let mut norm_a_sum3 = vdupq_n_f32(0.0);
+    let mut norm_a_sum4 = vdupq_n_f32(0.0);
+
+    let mut norm_b_sum1 = vdupq_n_f32(0.0);
+    let mut norm_b_sum2 = vdupq_n_f32(0.0);
+    let mut norm_b_sum3 = vdupq_n_f32(0.0);
+    let mut norm_b_sum4 = vdupq_n_f32(0.0);
+
+    // 4-way unrolled loop (16 floats per iteration)
+    for i in 0..chunks {
+        let offset = i * 16;
+
+        let a_vec1 = vld1q_f32(a.as_ptr().add(offset));
+        let b_vec1 = vld1q_f32(b.as_ptr().add(offset));
+        let a_vec2 = vld1q_f32(a.as_ptr().add(offset + 4));
+        let b_vec2 = vld1q_f32(b.as_ptr().add(offset + 4));
+        let a_vec3 = vld1q_f32(a.as_ptr().add(offset + 8));
+        let b_vec3 = vld1q_f32(b.as_ptr().add(offset + 8));
+        let a_vec4 = vld1q_f32(a.as_ptr().add(offset + 12));
+        let b_vec4 = vld1q_f32(b.as_ptr().add(offset + 12));
+
+        dot_sum1 = vfmaq_f32(dot_sum1, a_vec1, b_vec1);
+        dot_sum2 = vfmaq_f32(dot_sum2, a_vec2, b_vec2);
+        dot_sum3 = vfmaq_f32(dot_sum3, a_vec3, b_vec3);
+        dot_sum4 = vfmaq_f32(dot_sum4, a_vec4, b_vec4);
+
+        norm_a_sum1 = vfmaq_f32(norm_a_sum1, a_vec1, a_vec1);
+        norm_a_sum2 = vfmaq_f32(norm_a_sum2, a_vec2, a_vec2);
+        norm_a_sum3 = vfmaq_f32(norm_a_sum3, a_vec3, a_vec3);
+        norm_a_sum4 = vfmaq_f32(norm_a_sum4, a_vec4, a_vec4);
+
+        norm_b_sum1 = vfmaq_f32(norm_b_sum1, b_vec1, b_vec1);
+        norm_b_sum2 = vfmaq_f32(norm_b_sum2, b_vec2, b_vec2);
+        norm_b_sum3 = vfmaq_f32(norm_b_sum3, b_vec3, b_vec3);
+        norm_b_sum4 = vfmaq_f32(norm_b_sum4, b_vec4, b_vec4);
+    }
+
+    // Combine 4-way accumulators
+    let dot_sum = vaddq_f32(
+        vaddq_f32(dot_sum1, dot_sum2),
+        vaddq_f32(dot_sum3, dot_sum4),
+    );
+    let norm_a_sum = vaddq_f32(
+        vaddq_f32(norm_a_sum1, norm_a_sum2),
+        vaddq_f32(norm_a_sum3, norm_a_sum4),
+    );
+    let norm_b_sum = vaddq_f32(
+        vaddq_f32(norm_b_sum1, norm_b_sum2),
+        vaddq_f32(norm_b_sum3, norm_b_sum4),
+    );
+
+    let mut dot_product = vaddvq_f32(dot_sum);
+    let mut norm_a = vaddvq_f32(norm_a_sum);
+    let mut norm_b = vaddvq_f32(norm_b_sum);
+
+    // Process remainder (4 floats at a time)
+    let offset_remainder = chunks * 16;
+    let remainder_chunks = remainder / 4;
+
+    let mut dot_sum_rem = vdupq_n_f32(0.0);
+    let mut norm_a_sum_rem = vdupq_n_f32(0.0);
+    let mut norm_b_sum_rem = vdupq_n_f32(0.0);
+
+    for i in 0..remainder_chunks {
+        let offset = offset_remainder + i * 4;
+        let a_vec = vld1q_f32(a.as_ptr().add(offset));
+        let b_vec = vld1q_f32(b.as_ptr().add(offset));
+
+        dot_sum_rem = vfmaq_f32(dot_sum_rem, a_vec, b_vec);
+        norm_a_sum_rem = vfmaq_f32(norm_a_sum_rem, a_vec, a_vec);
+        norm_b_sum_rem = vfmaq_f32(norm_b_sum_rem, b_vec, b_vec);
+    }
+
+    dot_product += vaddvq_f32(dot_sum_rem);
+    norm_a += vaddvq_f32(norm_a_sum_rem);
+    norm_b += vaddvq_f32(norm_b_sum_rem);
+
+    // Scalar tail (< 4 elements)
+    for i in (offset_remainder + remainder_chunks * 4)..n {
+        dot_product += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+
+    compute_cosine_similarity(dot_product, norm_a, norm_b)
 }
 
 /// AVX2水平求和（P2优化：使用更高效的指令序列）

@@ -2,8 +2,7 @@
 
 use crate::error::Result;
 use crate::types::RowId;
-use crate::distance::DistanceMetric;
-use std::sync::Arc;
+use crate::distance::DistanceKind;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use super::{
@@ -50,7 +49,7 @@ pub struct FreshDiskANNIndex {
     config: FreshDiskANNConfig,
     
     /// 距离度量
-    metric: Arc<dyn DistanceMetric>,
+    metric: DistanceKind,
     
     /// 多层搜索器
     multi_level: MultiLevelSearch,
@@ -61,8 +60,8 @@ pub struct FreshDiskANNIndex {
 
 impl FreshDiskANNIndex {
     /// 创建新索引
-    pub fn create(config: FreshDiskANNConfig, metric: Arc<dyn DistanceMetric>) -> Result<Self> {
-        let fresh_graph = FreshVamanaGraph::new(config.fresh_config.clone(), metric.clone());
+    pub fn create(config: FreshDiskANNConfig, metric: DistanceKind) -> Result<Self> {
+        let fresh_graph = FreshVamanaGraph::new(config.fresh_config.clone(), metric);
         let multi_level = MultiLevelSearch::new();
         let compaction = CompactionStrategy::new(config.compaction_trigger.clone());
         

@@ -6,9 +6,10 @@
 //! - Capacity: 4MB (50K entries)
 
 use super::{Key, Value, LSMConfig};
-use crate::{Result, StorageError};
+use crate::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 
 /// In-memory write buffer
@@ -44,9 +45,8 @@ impl MemTable {
         let value_size = value.data.len() + 16; // data + metadata
         let entry_size = key_size + value_size;
         
-        let mut data = self.data.write()
-            .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
-        
+        let mut data = self.data.write();
+
         // Update size
         if let Some(old_value) = data.get(&key) {
             let old_size = key_size + old_value.data.len() + 16;
@@ -75,9 +75,8 @@ impl MemTable {
             return Ok(());
         }
         
-        let mut data = self.data.write()
-            .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
-        
+        let mut data = self.data.write();
+
         let mut total_size_change: i64 = 0;
         
         for (key, value) in kvs {
@@ -109,9 +108,8 @@ impl MemTable {
     
     /// Get a value by key
     pub fn get(&self, key: Key) -> Result<Option<Value>> {
-        let data = self.data.read()
-            .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
-        
+        let data = self.data.read();
+
         Ok(data.get(&key).cloned())
     }
     
@@ -132,9 +130,7 @@ impl MemTable {
     
     /// Get number of entries
     pub fn len(&self) -> usize {
-        self.data.read()
-            .map(|data| data.len())
-            .unwrap_or(0)  // Fallback if poisoned
+        self.data.read().len()
     }
     
     /// Check if empty
@@ -150,8 +146,7 @@ impl MemTable {
     
     /// Get snapshot of all data (for testing)
     pub fn snapshot(&self) -> Vec<(Key, Value)> {
-        let data = self.data.read()
-            .expect("MemTable snapshot: lock poisoned (unrecoverable in test)");
+        let data = self.data.read();
         data.iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()
@@ -164,9 +159,8 @@ impl MemTable {
     where
         F: FnMut(Key, &Value) -> Result<()>,
     {
-        let data = self.data.read()
-            .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
-        
+        let data = self.data.read();
+
         // Use BTreeMap's range() for efficient range query: O(log n + k)
         use std::ops::Bound;
         let range = data.range((
@@ -205,9 +199,8 @@ impl MemTable {
     where
         F: FnMut(Key, &Value) -> Result<()>,
     {
-        let data = self.data.read()
-            .map_err(|_| StorageError::Lock("MemTable lock poisoned".into()))?;
-        
+        let data = self.data.read();
+
         for (k, v) in data.iter() {
             if !v.deleted {
                 f(*k, v)?;  // ✅ Zero-copy: pass reference
@@ -246,8 +239,7 @@ impl Iterator for MemTableIterator {
     fn next(&mut self) -> Option<Self::Item> {
         // Note: O(n²) complexity - nth() walks from start each time
         // Use MemTableIteratorOptimized for production code
-        let data = self.data.read()
-            .expect("MemTableIterator: lock poisoned (test-only code)");
+        let data = self.data.read();
         let item = data.iter().nth(self.index)?;
         self.index += 1;
         Some((*item.0, item.1.clone()))
@@ -261,8 +253,7 @@ pub struct MemTableIteratorOptimized {
 
 impl MemTableIteratorOptimized {
     pub fn new(data: Arc<RwLock<BTreeMap<Key, Value>>>) -> Self {
-        let data = data.read()
-            .expect("MemTableIteratorOptimized: lock poisoned (unrecoverable)");
+        let data = data.read();
         let entries: Vec<(Key, Value)> = data.iter()
             .map(|(k, v)| (*k, v.clone()))  // ✅ u64 copy is cheap, no clone()
             .collect();

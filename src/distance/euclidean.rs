@@ -2,6 +2,8 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Compute Euclidean distance between two vectors with SIMD optimization
 ///
@@ -42,7 +44,16 @@ pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
         }
     }
     
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        if a.len() >= 4 {
+            unsafe { euclidean_distance_squared_neon(a, b) }
+        } else {
+            euclidean_distance_squared_scalar(a, b)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         euclidean_distance_squared_scalar(a, b)
     }
@@ -122,13 +133,80 @@ unsafe fn euclidean_distance_squared_sse(a: &[f32], b: &[f32]) -> f32 {
 /// 标量版本（无SIMD）
 fn euclidean_distance_squared_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut sum_squared = 0.0f32;
-    
+
     for i in 0..a.len() {
         let diff = a[i] - b[i];
         sum_squared += diff * diff;
     }
-    
+
     sum_squared
+}
+
+/// ARM NEON optimized squared Euclidean distance (4-way loop unroll)
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn euclidean_distance_squared_neon(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let chunks = n / 16;
+    let remainder = n % 16;
+
+    let mut sum1 = vdupq_n_f32(0.0);
+    let mut sum2 = vdupq_n_f32(0.0);
+    let mut sum3 = vdupq_n_f32(0.0);
+    let mut sum4 = vdupq_n_f32(0.0);
+
+    // 4-way unrolled loop (16 floats per iteration)
+    for i in 0..chunks {
+        let offset = i * 16;
+
+        let a_vec1 = vld1q_f32(a.as_ptr().add(offset));
+        let b_vec1 = vld1q_f32(b.as_ptr().add(offset));
+        let a_vec2 = vld1q_f32(a.as_ptr().add(offset + 4));
+        let b_vec2 = vld1q_f32(b.as_ptr().add(offset + 4));
+        let a_vec3 = vld1q_f32(a.as_ptr().add(offset + 8));
+        let b_vec3 = vld1q_f32(b.as_ptr().add(offset + 8));
+        let a_vec4 = vld1q_f32(a.as_ptr().add(offset + 12));
+        let b_vec4 = vld1q_f32(b.as_ptr().add(offset + 12));
+
+        let diff1 = vsubq_f32(a_vec1, b_vec1);
+        let diff2 = vsubq_f32(a_vec2, b_vec2);
+        let diff3 = vsubq_f32(a_vec3, b_vec3);
+        let diff4 = vsubq_f32(a_vec4, b_vec4);
+
+        sum1 = vfmaq_f32(sum1, diff1, diff1);
+        sum2 = vfmaq_f32(sum2, diff2, diff2);
+        sum3 = vfmaq_f32(sum3, diff3, diff3);
+        sum4 = vfmaq_f32(sum4, diff4, diff4);
+    }
+
+    let combined = vaddq_f32(
+        vaddq_f32(sum1, sum2),
+        vaddq_f32(sum3, sum4),
+    );
+    let mut total = vaddvq_f32(combined);
+
+    // Process remainder (4 floats at a time)
+    let offset_remainder = chunks * 16;
+    let remainder_chunks = remainder / 4;
+
+    let mut sum_rem = vdupq_n_f32(0.0);
+    for i in 0..remainder_chunks {
+        let offset = offset_remainder + i * 4;
+        let a_vec = vld1q_f32(a.as_ptr().add(offset));
+        let b_vec = vld1q_f32(b.as_ptr().add(offset));
+        let diff = vsubq_f32(a_vec, b_vec);
+        sum_rem = vfmaq_f32(sum_rem, diff, diff);
+    }
+    total += vaddvq_f32(sum_rem);
+
+    // Scalar tail (< 4 elements)
+    for i in (offset_remainder + remainder_chunks * 4)..n {
+        let diff = a[i] - b[i];
+        total += diff * diff;
+    }
+
+    total
 }
 
 /// AVX2水平求和（优化版本）

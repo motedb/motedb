@@ -8,10 +8,9 @@
 
 use crate::error::{Result, StorageError};
 use crate::types::RowId;
-use crate::distance::DistanceMetric;
+use crate::distance::DistanceKind;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use super::Candidate;
@@ -72,13 +71,13 @@ pub struct FreshVamanaGraph {
     nodes: DashMap<RowId, VectorNode>,
     medoid: AtomicU64,
     config: FreshGraphConfig,
-    metric: Arc<dyn DistanceMetric>,
+    metric: DistanceKind,
     insert_count: AtomicUsize,
     memory_usage: AtomicUsize,
 }
 
 impl FreshVamanaGraph {
-    pub fn new(config: FreshGraphConfig, metric: Arc<dyn DistanceMetric>) -> Self {
+    pub fn new(config: FreshGraphConfig, metric: DistanceKind) -> Self {
         Self {
             nodes: DashMap::new(),
             medoid: AtomicU64::new(0),
@@ -627,12 +626,12 @@ pub struct FreshGraphStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distance::Euclidean;
-    
+    use crate::distance::DistanceKind;
+
     #[test]
     fn test_insert_and_search() {
         let config = FreshGraphConfig::default();
-        let metric = Arc::new(Euclidean);
+        let metric = DistanceKind::Euclidean;
         let graph = FreshVamanaGraph::new(config, metric);
         
         // 插入 50 个向量
