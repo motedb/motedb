@@ -18,7 +18,7 @@ impl MoteDB {
     #[allow(dead_code)]
     pub(crate) fn batch_build_indexes_from_flush(&self, memtable: &crate::storage::lsm::UnifiedMemTable) -> Result<()> {
         use std::time::Instant;
-        let start = Instant::now();
+        let _start = Instant::now();
 
         let memtable_len = memtable.len();
         debug_log!("[BatchIndexBuilder] Flush callback received, MemTable entries: {}", memtable_len);
@@ -91,7 +91,7 @@ impl MoteDB {
         }
 
         debug_log!("[BatchIndexBuilder] Batch index building complete in {:?} ({} tables)",
-                 start.elapsed(), tables_data.len());
+                 _start.elapsed(), tables_data.len());
         Ok(())
         
         /* DISABLED CODE - CAUSES DEADLOCKS
@@ -195,8 +195,8 @@ impl MoteDB {
         use std::time::Instant;
         use std::thread;
         
-        let start = Instant::now();
-        
+        let _start = Instant::now();
+
         debug_log!("[BatchIndexBuilder]   📊 Table '{}': {} rows", table_name, rows.len());
         
         let schema = match self.table_registry.get_table(table_name) {
@@ -280,7 +280,7 @@ impl MoteDB {
             }
         }
         
-        debug_log!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?} (5 parallel threads)", table_name, start.elapsed());
+        debug_log!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?} (5 parallel threads)", table_name, _start.elapsed());
         Ok(())
     }
     
@@ -308,7 +308,7 @@ impl MoteDB {
         };
         
         // 批量插入（不持有 column_indexes 锁）
-        for (index, col_name, batch) in indexes_with_data {
+        for (index, _col_name, batch) in indexes_with_data {
             if !batch.is_empty() {
                 // 转换为引用
                 let batch_refs: Vec<(RowId, &Value)> = batch.iter()
@@ -316,13 +316,13 @@ impl MoteDB {
                     .collect();
                 
                 index.write().insert_batch(&batch_refs)?;
-                debug_log!("[ColumnIndex]   ✓ Built {} entries for column '{}'", 
-                         batch.len(), col_name);
+                debug_log!("[ColumnIndex]   ✓ Built {} entries for column '{}'",
+                         batch.len(), _col_name);
             }
         }
         
-        let duration = start.elapsed();
-        debug_log!("[ColumnIndex] Batch build complete in {:?}", duration);
+        let _duration = start.elapsed();
+        debug_log!("[ColumnIndex] Batch build complete in {:?}", _duration);
         
         Ok(())
     }

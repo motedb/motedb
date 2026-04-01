@@ -65,9 +65,9 @@ impl MoteDB {
             Ok(_) => {
                 debug_log!("[MoteDB::flush] ========== DONE ✅ ==========\n");
             }
-            Err(e) => {
+            Err(_e) => {
                 debug_log!("[MoteDB::flush] ========== FAILED ❌ ==========");
-                debug_log!("[MoteDB::flush] Error: {:?}\n", e);
+                debug_log!("[MoteDB::flush] Error: {:?}\n", _e);
             }
         }
         
@@ -167,38 +167,38 @@ impl MoteDB {
             }
         }
 
-        let checkpoint_start = Instant::now();
+        let _checkpoint_start = Instant::now();
         debug_log!("[Checkpoint] 🚀 Starting checkpoint (pending_updates={})...", pending_count);
 
         // 🔥 Step 1: Trigger LSM flush (MemTable → SSTable)
         // The background flush thread will call the batch index callback,
         // which is fine — it builds indexes as data is flushed.
-        let flush_start = Instant::now();
+        let _flush_start = Instant::now();
         self.lsm_engine.flush()?;
-        debug_log!("[Checkpoint]   ✓ LSM flush: {:?}", flush_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ LSM flush: {:?}", _flush_start.elapsed());
 
         // 🔥 Step 2: Rebuild TimestampIndex from LSM (catches any missed entries)
-        let ts_rebuild_start = Instant::now();
+        let _ts_rebuild_start = Instant::now();
         self.rebuild_timestamp_index()?;
-        debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", ts_rebuild_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", _ts_rebuild_start.elapsed());
 
         // 🔥 Step 3: Flush all indexes (persist to disk)
-        let index_flush_start = Instant::now();
+        let _index_flush_start = Instant::now();
         self.flush_all_indexes()?;
-        debug_log!("[Checkpoint]   ✓ Index flush: {:?}", index_flush_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ Index flush: {:?}", _index_flush_start.elapsed());
 
         // 🔥 Step 4: Checkpoint WAL (safe to truncate now)
-        let wal_checkpoint_start = Instant::now();
+        let _wal_checkpoint_start = Instant::now();
         self.wal.checkpoint_all()?;
-        debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", wal_checkpoint_start.elapsed());
+        debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", _wal_checkpoint_start.elapsed());
 
         // Step 5: Vacuum MVCC version store (remove old versions)
-        let vacuum_start = Instant::now();
+        let _vacuum_start = Instant::now();
         let current_ts = self.version_store.current_timestamp();
         match self.version_store.vacuum(current_ts) {
             Ok(removed) => {
                 if removed > 0 {
-                    debug_log!("[Checkpoint]   ✓ MVCC vacuum: removed {} old versions in {:?}", removed, vacuum_start.elapsed());
+                    debug_log!("[Checkpoint]   ✓ MVCC vacuum: removed {} old versions in {:?}", removed, _vacuum_start.elapsed());
                 }
             }
             Err(e) => {
@@ -206,7 +206,7 @@ impl MoteDB {
             }
         }
 
-        debug_log!("[Checkpoint] 🎉 Total: {:?}", checkpoint_start.elapsed());
+        debug_log!("[Checkpoint] 🎉 Total: {:?}", _checkpoint_start.elapsed());
         Ok(())
     }
     

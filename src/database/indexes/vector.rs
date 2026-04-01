@@ -224,11 +224,11 @@ impl MoteDB {
         // 🔍 Debug: 打印前5个结果
         if !index_results.is_empty() {
             debug_log!("[vector_search] 🔍 DiskANN返回的前5个结果:");
-            for (i, (id, dist)) in index_results.iter().take(5).enumerate() {
-                debug_log!("[vector_search]   {}. id={}, distance={:.4}", i+1, id, dist);
+            for (_i, (_id, _dist)) in index_results.iter().take(5).enumerate() {
+                debug_log!("[vector_search]   {}. id={}, distance={:.4}", _i+1, _id, _dist);
             }
         }
-        
+
         debug_log!("[vector_search] DiskANN index搜索完成，结果数: {}", index_results.len());
         
         // 2. 🆕 Scan memtable for vector data
@@ -298,17 +298,17 @@ impl MoteDB {
         // 3. Merge index_results and memtable_results
         if !memtable_results.is_empty() {
             debug_log!("[vector_search] ⚠️ 合并memtable结果...");
-            let before_len = index_results.len();
+            let _before_len = index_results.len();
             index_results.extend(memtable_results);
-            debug_log!("[vector_search] 合并后: {} -> {} 个结果", before_len, index_results.len());
+            debug_log!("[vector_search] 合并后: {} -> {} 个结果", _before_len, index_results.len());
             
             // Sort by distance and take top-k
             index_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             
             // 🔍 Debug: 打印合并后的前5个
             debug_log!("[vector_search] 🔍 合并排序后前5个:");
-            for (i, (id, dist)) in index_results.iter().take(5).enumerate() {
-                debug_log!("[vector_search]   {}. id={}, distance={:.4}", i+1, id, dist);
+            for (_i, (_id, _dist)) in index_results.iter().take(5).enumerate() {
+                debug_log!("[vector_search]   {}. id={}, distance={:.4}", _i+1, _id, _dist);
             }
         }
         index_results.truncate(k);

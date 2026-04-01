@@ -128,14 +128,14 @@ impl MoteDB {
                     }
                 }
                 
-                let scan_time = start_time.elapsed();
-                
+                let _scan_time = start_time.elapsed();
+
                 if indexed_count > 0 {
-                    debug_log!("[create_column_index] 🚀 扫描完成：{} 个值，耗时 {:?}", 
-                             indexed_count, scan_time);
+                    debug_log!("[create_column_index] 🚀 扫描完成：{} 个值，耗时 {:?}",
+                             indexed_count, _scan_time);
                     debug_log!("[create_column_index] ✅ 批量建索引完成！");
                 } else {
-                    debug_log!("[create_column_index] ⚠️ 未找到任何数据（扫描耗时 {:?}）", scan_time);
+                    debug_log!("[create_column_index] ⚠️ 未找到任何数据（扫描耗时 {:?}）", _scan_time);
                 }
             } else {
                 println!("  ✓ Created empty column index '{}' (column not found in schema)", index_name);

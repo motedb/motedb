@@ -3111,7 +3111,20 @@ impl QueryExecutor {
     /// Execute UPDATE statement
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
-        
+
+        // 🚀 PK fast path: skip full table scan for WHERE pk = value
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
+                let is_pk = schema.primary_key()
+                    .map(|pk| pk == col_name)
+                    .unwrap_or(false);
+
+                if is_pk {
+                    return self.execute_update_pk(&stmt, &schema, &target_value);
+                }
+            }
+        }
+
         // 🚀 Use真正的流式扫描 (O(1) memory)
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
         
@@ -3161,7 +3174,20 @@ impl QueryExecutor {
     /// Execute DELETE statement
     fn execute_delete(&self, stmt: DeleteStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
-        
+
+        // 🚀 PK fast path: skip full table scan for WHERE pk = value
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
+                let is_pk = schema.primary_key()
+                    .map(|pk| pk == col_name)
+                    .unwrap_or(false);
+
+                if is_pk {
+                    return self.execute_delete_pk(&stmt, &schema, &target_value);
+                }
+            }
+        }
+
         // 🚀 Use真正的流式扫描 (O(1) memory)
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
         
@@ -3191,7 +3217,98 @@ impl QueryExecutor {
         
         Ok(QueryResult::Modification { affected_rows })
     }
-    
+
+    /// 🚀 PK fast path for UPDATE: direct lookup instead of full table scan
+    ///
+    /// For `UPDATE t SET ... WHERE pk = value`:
+    /// - AUTO_INCREMENT: direct LSM get by row_id (O(log n))
+    /// - Non-AUTO_INCREMENT: column index lookup then LSM get
+    fn execute_update_pk(
+        &self,
+        stmt: &UpdateStmt,
+        schema: &crate::types::TableSchema,
+        target_value: &Value,
+    ) -> Result<QueryResult> {
+        let pk_col_name = schema.primary_key()
+            .ok_or_else(|| StorageError::InvalidData("No primary key".into()))?;
+
+        // Resolve row_id(s) for the PK value
+        let row_ids = if schema.is_primary_key_auto_increment() {
+            // AUTO_INCREMENT: pk value IS row_id — direct O(1) mapping
+            match target_value {
+                Value::Integer(id) if *id >= 0 => vec![*id as RowId],
+                _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
+            }
+        } else {
+            // Non-AUTO_INCREMENT: use column index to find row_id(s)
+            self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+        };
+
+        let mut affected_rows = 0;
+        for row_id in row_ids {
+            let row = match self.db.get_table_row(&stmt.table, row_id)? {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let mut sql_row = row_to_sql_row(&row, schema)?;
+            for (col_name, expr) in &stmt.assignments {
+                let new_val = if let Expr::Literal(v) = expr {
+                    v.clone()
+                } else {
+                    self.evaluator.eval(expr, &sql_row)?
+                };
+                sql_row.insert(col_name.clone(), new_val);
+            }
+
+            let new_row = sql_row_to_row(&sql_row, schema)?;
+            self.db.update_row_in_table(&stmt.table, row_id, row, new_row)?;
+            affected_rows += 1;
+        }
+
+        Ok(QueryResult::Modification { affected_rows })
+    }
+
+    /// 🚀 PK fast path for DELETE: direct lookup instead of full table scan
+    ///
+    /// For `DELETE FROM t WHERE pk = value`:
+    /// - AUTO_INCREMENT: direct LSM get by row_id (O(log n))
+    /// - Non-AUTO_INCREMENT: column index lookup then LSM get
+    fn execute_delete_pk(
+        &self,
+        stmt: &DeleteStmt,
+        schema: &crate::types::TableSchema,
+        target_value: &Value,
+    ) -> Result<QueryResult> {
+        let pk_col_name = schema.primary_key()
+            .ok_or_else(|| StorageError::InvalidData("No primary key".into()))?;
+
+        // Resolve row_id(s) for the PK value
+        let row_ids = if schema.is_primary_key_auto_increment() {
+            // AUTO_INCREMENT: pk value IS row_id — direct O(1) mapping
+            match target_value {
+                Value::Integer(id) if *id >= 0 => vec![*id as RowId],
+                _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
+            }
+        } else {
+            // Non-AUTO_INCREMENT: use column index to find row_id(s)
+            self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+        };
+
+        let mut affected_rows = 0;
+        for row_id in row_ids {
+            let row = match self.db.get_table_row(&stmt.table, row_id)? {
+                Some(r) => r,
+                None => continue,
+            };
+
+            self.db.delete_row_from_table(&stmt.table, row_id, row)?;
+            affected_rows += 1;
+        }
+
+        Ok(QueryResult::Modification { affected_rows })
+    }
+
     /// Execute CREATE TABLE statement
     fn execute_create_table(&self, stmt: CreateTableStmt) -> Result<QueryResult> {
         // Convert AST column defs to TableSchema
@@ -4522,8 +4639,8 @@ impl QueryExecutor {
                 
                 // 🔍 Debug: 打印前3个的row_id和id列
                 if sql_rows.len() < 3 {
-                    if let Some(id_value) = sql_row.get("id") {
-                        debug_log!("[Executor] 🔍 row_id={} → id列={:?}", row_id, id_value);
+                    if let Some(_id_value) = sql_row.get("id") {
+                        debug_log!("[Executor] 🔍 row_id={} → id列={:?}", row_id, _id_value);
                     }
                 }
                 

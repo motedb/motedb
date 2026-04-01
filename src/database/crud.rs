@@ -336,8 +336,8 @@ impl MoteDB {
             // 7.1 Column Index
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
-                if let Err(e) = self.insert_column_value(table_name, col_name, row_id, col_value) {
-                    debug_log!("[insert_row] Failed to update column index '{}': {}", column_index_name, e);
+                if let Err(_e) = self.insert_column_value(table_name, col_name, row_id, col_value) {
+                    debug_log!("[insert_row] Failed to update column index '{}': {}", column_index_name, _e);
                     index_errors.push(column_index_name.clone());
                 }
             }
@@ -350,8 +350,8 @@ impl MoteDB {
                     crate::database::index_metadata::IndexType::Vector
                 ) {
                     if let crate::types::Value::Vector(vec) = col_value {
-                        if let Err(e) = self.update_vector(row_id, &index_name, vec.as_slice()) {
-                            debug_log!("[insert_row] Failed to update vector index '{}': {}", index_name, e);
+                        if let Err(_e) = self.update_vector(row_id, &index_name, vec.as_slice()) {
+                            debug_log!("[insert_row] Failed to update vector index '{}': {}", index_name, _e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -362,8 +362,8 @@ impl MoteDB {
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
                 if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
                     if let crate::types::Value::Text(text) = col_value {
-                        if let Err(e) = self.insert_text(row_id, &index_name, text) {
-                            debug_log!("[insert_row] Failed to update text index '{}': {}", index_name, e);
+                        if let Err(_e) = self.insert_text(row_id, &index_name, text) {
+                            debug_log!("[insert_row] Failed to update text index '{}': {}", index_name, _e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -374,8 +374,8 @@ impl MoteDB {
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
                 if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
                     if let crate::types::Value::Spatial(geom) = col_value {
-                        if let Err(e) = self.insert_geometry(row_id, &index_name, geom.clone()) {
-                            debug_log!("[insert_row] Failed to update spatial index '{}': {}", index_name, e);
+                        if let Err(_e) = self.insert_geometry(row_id, &index_name, geom.clone()) {
+                            debug_log!("[insert_row] Failed to update spatial index '{}': {}", index_name, _e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -517,8 +517,8 @@ impl MoteDB {
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
                 if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
-                    if let Err(e) = self.update_column_value(table_name, col_name, row_id, old_val, new_val) {
-                        debug_log!("[update_row] Failed to update column index '{}': {}", column_index_name, e);
+                    if let Err(_e) = self.update_column_value(table_name, col_name, row_id, old_val, new_val) {
+                        debug_log!("[update_row] Failed to update column index '{}': {}", column_index_name, _e);
                         index_errors.push(column_index_name.clone());
                     }
                 }
@@ -529,14 +529,14 @@ impl MoteDB {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.vector_indexes.contains_key(&index_name) {
                     let mut failed = false;
-                    if let Err(e) = self.delete_vector(row_id, &index_name) {
-                        debug_log!("[update_row] Failed to delete old vector '{}': {}", index_name, e);
+                    if let Err(_e) = self.delete_vector(row_id, &index_name) {
+                        debug_log!("[update_row] Failed to delete old vector '{}': {}", index_name, _e);
                         failed = true;
                     }
 
                     if let Some(crate::types::Value::Vector(new_vec)) = new_value {
-                        if let Err(e) = self.update_vector(row_id, &index_name, new_vec.as_slice()) {
-                            debug_log!("[update_row] Failed to update vector index '{}': {}", index_name, e);
+                        if let Err(_e) = self.update_vector(row_id, &index_name, new_vec.as_slice()) {
+                            debug_log!("[update_row] Failed to update vector index '{}': {}", index_name, _e);
                             failed = true;
                         }
                     }
@@ -551,8 +551,8 @@ impl MoteDB {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.text_indexes.contains_key(&index_name) {
                     if let (Some(crate::types::Value::Text(old_text)), Some(crate::types::Value::Text(new_text))) = (old_value, new_value) {
-                        if let Err(e) = self.update_text(row_id, &index_name, old_text, new_text) {
-                            debug_log!("[update_row] Failed to update text index '{}': {}", index_name, e);
+                        if let Err(_e) = self.update_text(row_id, &index_name, old_text, new_text) {
+                            debug_log!("[update_row] Failed to update text index '{}': {}", index_name, _e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -564,14 +564,14 @@ impl MoteDB {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.spatial_indexes.contains_key(&index_name) {
                     let mut failed = false;
-                    if let Err(e) = self.delete_geometry(row_id, &index_name) {
-                        debug_log!("[update_row] Failed to delete old spatial geometry '{}': {}", index_name, e);
+                    if let Err(_e) = self.delete_geometry(row_id, &index_name) {
+                        debug_log!("[update_row] Failed to delete old spatial geometry '{}': {}", index_name, _e);
                         failed = true;
                     }
 
                     if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
-                        if let Err(e) = self.insert_geometry(row_id, &index_name, new_geom.clone()) {
-                            debug_log!("[update_row] Failed to update spatial index '{}': {}", index_name, e);
+                        if let Err(_e) = self.insert_geometry(row_id, &index_name, new_geom.clone()) {
+                            debug_log!("[update_row] Failed to update spatial index '{}': {}", index_name, _e);
                             failed = true;
                         }
                     }
@@ -647,8 +647,8 @@ impl MoteDB {
             // Column Index
             let column_index_name = format!("{}.{}", table_name, col_name);
             if self.column_indexes.contains_key(&column_index_name) {
-                if let Err(e) = self.delete_column_value(table_name, col_name, row_id, col_value) {
-                    debug_log!("[delete_row] Failed to delete from column index '{}': {}", column_index_name, e);
+                if let Err(_e) = self.delete_column_value(table_name, col_name, row_id, col_value) {
+                    debug_log!("[delete_row] Failed to delete from column index '{}': {}", column_index_name, _e);
                     self.index_registry.mark_stale(&column_index_name);
                 }
             }
@@ -657,8 +657,8 @@ impl MoteDB {
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.vector_indexes.contains_key(&index_name) {
-                    if let Err(e) = self.delete_vector(row_id, &index_name) {
-                        debug_log!("[delete_row] Failed to delete from vector index '{}': {}", index_name, e);
+                    if let Err(_e) = self.delete_vector(row_id, &index_name) {
+                        debug_log!("[delete_row] Failed to delete from vector index '{}': {}", index_name, _e);
                         self.index_registry.mark_stale(&index_name);
                     }
                 }
@@ -669,8 +669,8 @@ impl MoteDB {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.text_indexes.contains_key(&index_name) {
                     if let crate::types::Value::Text(text) = col_value {
-                        if let Err(e) = self.delete_text(row_id, &index_name, text) {
-                            debug_log!("[delete_row] Failed to delete from text index '{}': {}", index_name, e);
+                        if let Err(_e) = self.delete_text(row_id, &index_name, text) {
+                            debug_log!("[delete_row] Failed to delete from text index '{}': {}", index_name, _e);
                             self.index_registry.mark_stale(&index_name);
                         }
                     }
@@ -681,8 +681,8 @@ impl MoteDB {
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
                 let index_name = format!("{}_{}", table_name, col_name);
                 if self.spatial_indexes.contains_key(&index_name) {
-                    if let Err(e) = self.delete_geometry(row_id, &index_name) {
-                        debug_log!("[delete_row] Failed to delete from spatial index '{}': {}", index_name, e);
+                    if let Err(_e) = self.delete_geometry(row_id, &index_name) {
+                        debug_log!("[delete_row] Failed to delete from spatial index '{}': {}", index_name, _e);
                         self.index_registry.mark_stale(&index_name);
                     }
                 }
@@ -1022,8 +1022,8 @@ impl MoteDB {
                 
                 // 批量插入列索引
                 if !column_data.is_empty() {
-                    if let Err(e) = self.batch_insert_column_values(table_name, col_name, column_data) {
-                        debug_log!("[batch_insert] Failed to batch update column index '{}': {}", column_index_name, e);
+                    if let Err(_e) = self.batch_insert_column_values(table_name, col_name, column_data) {
+                        debug_log!("[batch_insert] Failed to batch update column index '{}': {}", column_index_name, _e);
                     }
                 }
             }
@@ -1040,8 +1040,8 @@ impl MoteDB {
                     }
                     
                     if !vectors.is_empty() {
-                        if let Err(e) = self.batch_insert_vectors(&index_name, &vectors) {
-                            debug_log!("[batch_insert] Failed to batch update vector index '{}': {}", index_name, e);
+                        if let Err(_e) = self.batch_insert_vectors(&index_name, &vectors) {
+                            debug_log!("[batch_insert] Failed to batch update vector index '{}': {}", index_name, _e);
                         }
                     }
                 }
@@ -1061,8 +1061,8 @@ impl MoteDB {
                         let texts_ref: Vec<(RowId, &str)> = texts.iter()
                             .map(|(id, s)| (*id, s.as_str()))
                             .collect();
-                        if let Err(e) = self.batch_insert_texts(&index_name, &texts_ref) {
-                            debug_log!("[batch_insert] Failed to batch update text index '{}': {}", index_name, e);
+                        if let Err(_e) = self.batch_insert_texts(&index_name, &texts_ref) {
+                            debug_log!("[batch_insert] Failed to batch update text index '{}': {}", index_name, _e);
                         }
                     }
                 }
@@ -1079,8 +1079,8 @@ impl MoteDB {
                     }
                     
                     if !geometries.is_empty() {
-                        if let Err(e) = self.batch_insert_geometries(&index_name, geometries) {
-                            debug_log!("[batch_insert] Failed to batch update spatial index '{}': {}", index_name, e);
+                        if let Err(_e) = self.batch_insert_geometries(&index_name, geometries) {
+                            debug_log!("[batch_insert] Failed to batch update spatial index '{}': {}", index_name, _e);
                         }
                     }
                 }

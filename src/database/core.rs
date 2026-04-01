@@ -353,7 +353,7 @@ impl MoteDB {
 
         // Replay WAL records into LSM Engine using stable table_id
         debug_log!("[database] 恢复 WAL 记录到 LSM Engine...");
-        let mut recovered_count = 0;
+        let mut _recovered_count = 0;
         for records in recovered_records.values() {
             for record in records {
                 match record {
@@ -366,7 +366,7 @@ impl MoteDB {
                         let row_data = bincode::serialize(data)?;
                         let value = crate::storage::lsm::Value::new(row_data, composite_key);
                         lsm_engine.put(composite_key, value)?;
-                        recovered_count += 1;
+                        _recovered_count += 1;
                     }
                     WALRecord::Update { table_name, row_id, new_data, .. } => {
                         let table_id = table_registry.get_table_id(table_name)
@@ -376,7 +376,7 @@ impl MoteDB {
                         let row_data = bincode::serialize(new_data)?;
                         let value = crate::storage::lsm::Value::new(row_data, composite_key);
                         lsm_engine.put(composite_key, value)?;
-                        recovered_count += 1;
+                        _recovered_count += 1;
                     }
                     WALRecord::Delete { table_name, row_id, timestamp, .. } => {
                         let table_id = table_registry.get_table_id(table_name)
@@ -384,13 +384,13 @@ impl MoteDB {
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
 
                         lsm_engine.delete(composite_key, *timestamp)?;
-                        recovered_count += 1;
+                        _recovered_count += 1;
                     }
                     _ => {}
                 }
             }
         }
-        debug_log!("[database] WAL 恢复完成，恢复了 {} 条记录", recovered_count);
+        debug_log!("[database] WAL 恢复完成，恢复了 {} 条记录", _recovered_count);
 
         // Create version store and transaction coordinator
         let version_store = Arc::new(VersionStore::new());
@@ -698,8 +698,8 @@ impl MoteDB {
                     Ok(_) => {
                         // WAL size below threshold, skip checkpoint
                     }
-                    Err(e) => {
-                        debug_log!("[AutoCheckpoint] ⚠️  Failed to check WAL size: {:?}", e);
+                    Err(_e) => {
+                        debug_log!("[AutoCheckpoint] ⚠️  Failed to check WAL size: {:?}", _e);
                     }
                 }
             }
@@ -745,17 +745,17 @@ impl MoteDB {
                                 max_id = max_id.max(*id);
                             }
                         }
-                        Err(e) => {
-                            debug_log!("[database] Warning: Error during AUTO_INCREMENT scan: {:?}", e);
+                        Err(_e) => {
+                            debug_log!("[database] Warning: Error during AUTO_INCREMENT scan: {:?}", _e);
                             break;
                         }
                     }
                 }
             }
-            Err(e) => {
+            Err(_e) => {
                 // Table might be empty or not exist yet (first time opening)
                 debug_log!("[database] Warning: Failed to scan table '{}' for AUTO_INCREMENT recovery: {:?}",
-                    table_name, e);
+                    table_name, _e);
             }
         }
         
