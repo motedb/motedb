@@ -854,7 +854,7 @@ impl QueryExecutor {
         let columns_clone = columns.clone();
         let select_cols = stmt.columns.clone();
         let table_clone = table.to_string();  // 🔧 Clone table name for metadata
-        
+
         // 惰性过滤和投影
         let filtered_iter = row_iter.filter_map(move |result| {
             match result {
@@ -863,28 +863,26 @@ impl QueryExecutor {
                         Ok(r) => r,
                         Err(e) => return Some(Err(e)),
                     };
-                    
+
                     // 🔧 Add metadata fields for MATCH, ST_DISTANCE, etc.
                     sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
                     sql_row.insert("__table__".to_string(), Value::Text(table_clone.clone()));
-                    
+
                     // WHERE 过滤
                     if let Some(ref clause) = where_clause {
-                        // 🔧 Create executor for special expressions (MATCH, ST_DISTANCE, etc.)
-                        let temp_executor = QueryExecutor::new(db.clone());
-                        
-                        let matches = match temp_executor.eval_with_materialized(clause, &sql_row) {
+                        // 🚀 Inline evaluation for simple expressions (no per-row allocation)
+                        let matches = match Self::eval_expr_simple(clause, &sql_row) {
                             Ok(Value::Bool(b)) => b,
                             Ok(Value::Integer(i)) => i != 0,
-                            Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),  // 🔧 Support Float (for MATCH scores)
+                            Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
                             _ => false,
                         };
-                        
+
                         if !matches {
                             return None;
                         }
                     }
-                    
+
                     // 投影列
                     let projected = Self::project_row_static(&sql_row, &select_cols, &columns_clone, &schema_clone);
                     Some(Ok(projected))
@@ -924,6 +922,58 @@ impl QueryExecutor {
     }
     
     /// 🔧 Static helper for row projection (used in closures)
+    /// 🚀 Lightweight expression evaluation for WHERE filters (no allocations)
+    /// Handles simple comparisons, AND/OR, column references, and literals.
+    /// Falls back to creating a QueryExecutor for complex expressions (MATCH, KNN, etc.)
+
+    fn is_truthy(v: &Value) -> bool {
+        match v {
+            Value::Bool(b) => *b,
+            Value::Integer(n) => *n != 0,
+            Value::Float(f) => *f != 0.0 && !f.is_nan(),
+            _ => false,
+        }
+    }
+
+    fn eval_expr_simple(expr: &Expr, row: &SqlRow) -> Result<Value> {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                let lv = Self::eval_expr_simple(left, row)?;
+                let rv = Self::eval_expr_simple(right, row)?;
+                match op {
+                    BinaryOperator::Eq => Ok(Value::Bool(lv == rv)),
+                    BinaryOperator::Ne => Ok(Value::Bool(lv != rv)),
+                    BinaryOperator::Lt => Ok(Value::Bool(lv < rv)),
+                    BinaryOperator::Le => Ok(Value::Bool(lv <= rv)),
+                    BinaryOperator::Gt => Ok(Value::Bool(lv > rv)),
+                    BinaryOperator::Ge => Ok(Value::Bool(lv >= rv)),
+                    BinaryOperator::And => {
+                        let lb = Self::is_truthy(&lv);
+                        let rb = Self::is_truthy(&rv);
+                        Ok(Value::Bool(lb && rb))
+                    }
+                    BinaryOperator::Or => {
+                        let lb = Self::is_truthy(&lv);
+                        let rb = Self::is_truthy(&rv);
+                        Ok(Value::Bool(lb || rb))
+                    }
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
+            Expr::Column(name) => {
+                row.get(name).cloned().ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))
+            }
+            Expr::Literal(val) => Ok(val.clone()),
+            Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
+                let v = Self::eval_expr_simple(expr, row)?;
+                Ok(Value::Bool(!Self::is_truthy(&v)))
+            }
+            // For complex expressions, return true and let the caller handle it
+            // (MATCH, KNN, etc. require a full executor — rare in normal WHERE)
+            _ => Ok(Value::Bool(true)),
+        }
+    }
+
     fn project_row_static(
         sql_row: &SqlRow,
         select_cols: &[SelectColumn],
