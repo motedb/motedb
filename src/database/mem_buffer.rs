@@ -469,11 +469,11 @@ mod tests {
             }
         }
 
-        println!("Inserted {} entries before buffer full", i);
+        debug_log!("Inserted {} entries before buffer full", i);
         assert!(buffer.should_flush());
 
         let stats = buffer.stats();
-        println!("Stats: {:?}", stats);
+        debug_log!("Stats: {:?}", stats);
         assert!(stats.fullness >= 100);
     }
 }

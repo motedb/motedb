@@ -1022,7 +1022,7 @@ impl Parser {
                             }
                         }
                         _ => {
-                            eprintln!("🔍 向量解析失败 at index {}: expr = {:?}", idx, e);
+                            debug_log!("🔍 向量解析失败 at index {}: expr = {:?}", idx, e);
                             Err(self.error(&format!("Vector elements must be numbers (found {:?} at index {})", e, idx)))
                         }
                     }

@@ -97,7 +97,7 @@ impl MoteDB {
                                         match self.lsm_engine.resolve_blob(blob_ref) {
                                             Ok(data) => data,
                                             Err(e) => {
-                                                eprintln!("[create_column_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                                debug_log!("[create_column_index] Failed to resolve blob for row {}: {}", row_id, e);
                                                 continue;
                                             }
                                         }
@@ -107,7 +107,7 @@ impl MoteDB {
                                 if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
                                     if let Some(value) = row.get(col_position) {
                                         if let Err(e) = index_arc.write().insert(value, row_id) {
-                                            eprintln!("[create_column_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
+                                            debug_log!("[create_column_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
                                         } else {
                                             indexed_count += 1;
                                         }
@@ -118,13 +118,13 @@ impl MoteDB {
                             // 每4个batch或最后一个batch时flush
                             if (batch_idx + 1) % 4 == 0 || (batch_idx + 1) * BATCH_SIZE >= entries.len() {
                                 if let Err(e) = index_arc.write().flush() {
-                                    eprintln!("[create_column_index] ⚠️ Flush失败: {}", e);
+                                    debug_log!("[create_column_index] ⚠️ Flush失败: {}", e);
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("[create_column_index] ⚠️ scan_range失败: {}", e);
+                        debug_log!("[create_column_index] ⚠️ scan_range失败: {}", e);
                     }
                 }
                 
@@ -138,10 +138,10 @@ impl MoteDB {
                     debug_log!("[create_column_index] ⚠️ 未找到任何数据（扫描耗时 {:?}）", _scan_time);
                 }
             } else {
-                println!("  ✓ Created empty column index '{}' (column not found in schema)", index_name);
+                debug_log!("  ✓ Created empty column index '{}' (column not found in schema)", index_name);
             }
         } else {
-            println!("  ✓ Created empty column index '{}' (table not found)", index_name);
+            debug_log!("  ✓ Created empty column index '{}' (table not found)", index_name);
         }
         
         Ok(())

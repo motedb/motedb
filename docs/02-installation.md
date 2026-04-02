@@ -1,47 +1,47 @@
-# 安装与配置
+# Installation & Configuration
 
-详细的安装说明和数据库配置指南。
+Detailed installation instructions and database configuration guide.
 
-## 系统要求
+## System Requirements
 
-- **Rust**: 1.70 或更高版本
-- **操作系统**: Linux, macOS, Windows
-- **内存**: 推荐 512MB 以上
-- **磁盘**: 取决于数据量
+- **Rust**: 1.70 or later
+- **Operating System**: Linux, macOS, Windows
+- **Memory**: 512MB or more recommended
+- **Disk**: Depends on data volume
 
-## 安装方式
+## Installation Methods
 
-### 方式 1: 使用 Cargo（推荐）
+### Method 1: Using Cargo (Recommended)
 
-在项目的 `Cargo.toml` 中添加依赖：
+Add the dependency in your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
 motedb = "0.1"
 ```
 
-### 方式 2: 从源码构建
+### Method 2: Build from Source
 
 ```bash
-# 克隆仓库
+# Clone the repository
 git clone https://github.com/yourusername/motedb.git
 cd motedb
 
-# 构建项目
+# Build the project
 cargo build --release
 
-# 运行测试
+# Run tests
 cargo test
 
-# 运行示例
+# Run examples
 cargo run --example quick_start --release
 ```
 
-## 基础配置
+## Basic Configuration
 
-### 默认配置
+### Default Configuration
 
-使用默认配置创建数据库：
+Create a database with default settings:
 
 ```rust
 use motedb::Database;
@@ -49,49 +49,49 @@ use motedb::Database;
 let db = Database::open("myapp.mote")?;
 ```
 
-### 自定义配置
+### Custom Configuration
 
-使用 `DBConfig` 自定义数据库配置：
+Customize the database configuration using `DBConfig`:
 
 ```rust
 use motedb::{Database, DBConfig};
 
 let config = DBConfig {
-    // Memtable 大小（MB）
+    // Memtable size (MB)
     memtable_size_mb: 16,
-    
-    // 行缓存大小（条数）
+
+    // Row cache size (number of entries)
     row_cache_size: 10000,
-    
-    // LSM 层级数
+
+    // LSM tree levels
     lsm_max_levels: 4,
-    
-    // 压缩策略
+
+    // Compression strategy
     compression: true,
-    
-    // WAL 启用
+
+    // Enable WAL
     enable_wal: true,
-    
-    // 自动 flush 间隔（秒）
+
+    // Auto-flush interval (seconds)
     auto_flush_interval: 60,
-    
-    // 默认持久化级别
+
+    // Default durability level
     durability_level: motedb::DurabilityLevel::Full,
 };
 
 let db = Database::create_with_config("myapp.mote", config)?;
 ```
 
-## 配置参数详解
+## Configuration Parameters in Detail
 
-### 内存配置
+### Memory Configuration
 
-| 参数 | 默认值 | 说明 | 推荐值 |
+| Parameter | Default | Description | Recommended Value |
 |-----|-------|-----|-------|
-| `memtable_size_mb` | 8 | 内存表大小 | 8-32 MB |
-| `row_cache_size` | 10000 | 行缓存容量 | 1000-50000 |
+| `memtable_size_mb` | 8 | Memtable size | 8-32 MB |
+| `row_cache_size` | 10000 | Row cache capacity | 1000-50000 |
 
-#### 示例：低内存环境
+#### Example: Low Memory Environment
 
 ```rust
 let config = DBConfig {
@@ -101,7 +101,7 @@ let config = DBConfig {
 };
 ```
 
-#### 示例：高性能环境
+#### Example: High Performance Environment
 
 ```rust
 let config = DBConfig {
@@ -111,38 +111,38 @@ let config = DBConfig {
 };
 ```
 
-### 持久化配置
+### Persistence Configuration
 
 #### DurabilityLevel
 
-控制数据持久化保证级别：
+Controls the level of data persistence guarantee:
 
 ```rust
 use motedb::DurabilityLevel;
 
 pub enum DurabilityLevel {
-    /// 无持久化保证（最快，数据可能丢失）
+    /// No persistence guarantee (fastest, data may be lost)
     None,
-    
-    /// 仅内存刷新（较快，进程崩溃可能丢失数据）
+
+    /// Memory-only flush (faster, data may be lost on process crash)
     Memory,
-    
-    /// 完整持久化（最安全，性能稍低）
+
+    /// Full persistence (safest, slightly lower performance)
     Full,
 }
 ```
 
-#### 配置示例
+#### Configuration Examples
 
 ```rust
-// 高性能模式（可能丢失数据）
+// High performance mode (data loss possible)
 let config = DBConfig {
     durability_level: DurabilityLevel::Memory,
     enable_wal: false,
     ..Default::default()
 };
 
-// 安全模式（推荐生产环境）
+// Safe mode (recommended for production)
 let config = DBConfig {
     durability_level: DurabilityLevel::Full,
     enable_wal: true,
@@ -151,37 +151,37 @@ let config = DBConfig {
 };
 ```
 
-### LSM-Tree 配置
+### LSM-Tree Configuration
 
 ```rust
 let config = DBConfig {
-    // LSM 最大层级
+    // LSM maximum levels
     lsm_max_levels: 4,
-    
-    // 启用压缩
+
+    // Enable compression
     compression: true,
-    
-    // Bloom Filter（减少磁盘读取）
+
+    // Bloom Filter (reduces disk reads)
     bloom_filter_bits: 10,
-    
+
     ..Default::default()
 };
 ```
 
-### 索引配置
+### Index Configuration
 
-#### 向量索引
+#### Vector Index
 
 ```rust
-// 在创建向量索引时配置
+// Configure when creating a vector index
 db.execute("CREATE VECTOR INDEX docs_embedding ON documents(embedding)")?;
 
-// 高召回率配置（通过 API）
+// High recall configuration (via API)
 db.create_vector_index("docs_embedding", 128)?;
-// 默认配置: R=32, L=50, alpha=1.2
+// Default configuration: R=32, L=50, alpha=1.2
 ```
 
-#### 空间索引
+#### Spatial Index
 
 ```rust
 use motedb::BoundingBox;
@@ -196,35 +196,35 @@ let bounds = BoundingBox {
 db.create_spatial_index("locations_coords", bounds)?;
 ```
 
-## 性能调优
+## Performance Tuning
 
-### 场景 1: 批量写入优先
+### Scenario 1: Write-Heavy Workloads
 
 ```rust
 let config = DBConfig {
-    memtable_size_mb: 32,       // 增大内存表
-    row_cache_size: 1000,       // 减小缓存
-    enable_wal: false,          // 关闭 WAL（提升写入速度）
+    memtable_size_mb: 32,       // Larger memtable
+    row_cache_size: 1000,       // Smaller cache
+    enable_wal: false,          // Disable WAL (improves write speed)
     durability_level: DurabilityLevel::Memory,
-    auto_flush_interval: 120,   // 延长 flush 间隔
+    auto_flush_interval: 120,   // Longer flush interval
     ..Default::default()
 };
 ```
 
-### 场景 2: 查询优先
+### Scenario 2: Read-Heavy Workloads
 
 ```rust
 let config = DBConfig {
-    memtable_size_mb: 8,        // 标准内存表
-    row_cache_size: 50000,      // 增大缓存
+    memtable_size_mb: 8,        // Standard memtable
+    row_cache_size: 50000,      // Larger cache
     enable_wal: true,
     durability_level: DurabilityLevel::Full,
-    bloom_filter_bits: 12,      // 更大的 Bloom Filter
+    bloom_filter_bits: 12,      // Larger Bloom Filter
     ..Default::default()
 };
 ```
 
-### 场景 3: 平衡模式（推荐）
+### Scenario 3: Balanced Mode (Recommended)
 
 ```rust
 let config = DBConfig {
@@ -238,45 +238,45 @@ let config = DBConfig {
 };
 ```
 
-## 文件结构
+## File Structure
 
-MoteDB 在数据目录下创建以下文件：
+MoteDB creates the following files in the data directory:
 
 ```
 myapp.mote/
-├── manifest.json          # 元数据清单
+├── manifest.json          # Metadata manifest
 ├── wal/                   # Write-Ahead Log
 │   └── 000001.wal
-├── tables/                # 表数据
+├── tables/                # Table data
 │   └── users/
-│       ├── data.sst       # SSTable 数据
-│       └── data.idx       # 索引文件
-├── indexes/               # 索引数据
+│       ├── data.sst       # SSTable data
+│       └── data.idx       # Index files
+├── indexes/               # Index data
 │   ├── users_email.idx
 │   ├── docs_embedding.diskann
 │   └── locations_coords.rtree
-└── checkpoints/           # 检查点
+└── checkpoints/           # Checkpoints
     └── checkpoint_001.dat
 ```
 
-## 环境变量
+## Environment Variables
 
-可选的环境变量配置：
+Optional environment variable configuration:
 
 ```bash
-# 日志级别
+# Log level
 export MOTEDB_LOG_LEVEL=debug
 
-# 数据目录
+# Data directory
 export MOTEDB_DATA_DIR=/var/lib/motedb
 
-# 最大并发连接数
+# Maximum concurrent connections
 export MOTEDB_MAX_CONNECTIONS=100
 ```
 
-## 常见配置问题
+## Common Configuration Issues
 
-### Q1: 如何减少内存占用？
+### Q1: How to reduce memory usage?
 
 ```rust
 let config = DBConfig {
@@ -287,7 +287,7 @@ let config = DBConfig {
 };
 ```
 
-### Q2: 如何提高写入性能？
+### Q2: How to improve write performance?
 
 ```rust
 let config = DBConfig {
@@ -297,14 +297,14 @@ let config = DBConfig {
     ..Default::default()
 };
 
-// 使用批量插入
+// Use batch inserts
 db.batch_insert_map("users", rows)?;
 
-// 定期手动 flush
+// Periodically flush manually
 db.flush()?;
 ```
 
-### Q3: 如何保证数据安全？
+### Q3: How to ensure data safety?
 
 ```rust
 let config = DBConfig {
@@ -314,14 +314,14 @@ let config = DBConfig {
     ..Default::default()
 };
 
-// 关键操作后手动 flush
+// Manually flush after critical operations
 db.execute("INSERT INTO critical_data VALUES (...)")?;
 db.flush()?;
 ```
 
-## 验证安装
+## Verify Installation
 
-运行以下代码验证安装：
+Run the following code to verify the installation:
 
 ```rust
 use motedb::{Database, Result};
@@ -331,21 +331,21 @@ fn main() -> Result<()> {
     db.execute("CREATE TABLE test (id INT, name TEXT)")?;
     db.execute("INSERT INTO test VALUES (1, 'Hello MoteDB')")?;
     let results = db.query("SELECT * FROM test")?;
-    
+
     assert_eq!(results.row_count(), 1);
-    println!("MoteDB 安装成功！");
-    
+    println!("MoteDB installed successfully!");
+
     Ok(())
 }
 ```
 
-## 下一步
+## Next Steps
 
-- [快速开始](./01-quick-start.md) - 学习基础用法
-- [SQL 操作](./03-sql-operations.md) - 了解 SQL 语法
-- [性能优化](./12-performance.md) - 深入性能调优
+- [Quick Start](./01-quick-start.md) - Learn basic usage
+- [SQL Operations](./03-sql-operations.md) - Learn the SQL syntax
+- [Performance Tuning](./12-performance.md) - Deep dive into performance optimization
 
 ---
 
-**上一篇**: [文档首页](./README.md)  
-**下一篇**: [快速开始](./01-quick-start.md)
+**Previous**: [Documentation Home](./README.md)
+**Next**: [Quick Start](./01-quick-start.md)

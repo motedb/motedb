@@ -181,7 +181,7 @@ impl PartitionWAL {
             match file.read_exact(&mut buf) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    eprintln!("WAL open: Detected partial write at end of file");
+                    debug_log!("WAL open: Detected partial write at end of file");
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -210,7 +210,7 @@ impl PartitionWAL {
         }
         
         if corrupted_count > 0 {
-            eprintln!("WAL open: Found {} corrupted records (will skip during recovery)", corrupted_count);
+            debug_log!("WAL open: Found {} corrupted records (will skip during recovery)", corrupted_count);
         }
         
         Ok(Self {
@@ -366,7 +366,7 @@ impl PartitionWAL {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     // Partial write at end of file - skip and continue
-                    eprintln!("WAL recovery: Detected partial write, skipping last incomplete record");
+                    debug_log!("WAL recovery: Detected partial write, skipping last incomplete record");
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -376,7 +376,7 @@ impl PartitionWAL {
             let entry: WALEntry = match bincode::deserialize(&buf) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("WAL recovery: Failed to deserialize entry: {}", e);
+                    debug_log!("WAL recovery: Failed to deserialize entry: {}", e);
                     skipped_corrupted += 1;
                     continue;
                 }
@@ -385,7 +385,7 @@ impl PartitionWAL {
             // Verify checksum
             let record_data = bincode::serialize(&entry.record)?;
             if let Err(e) = Checksum::verify(ChecksumType::CRC32C, &record_data, entry.checksum) {
-                eprintln!("WAL recovery: Checksum verification failed for LSN {}: {}", entry.lsn, e);
+                debug_log!("WAL recovery: Checksum verification failed for LSN {}: {}", entry.lsn, e);
                 skipped_corrupted += 1;
                 continue;
             }
@@ -400,7 +400,7 @@ impl PartitionWAL {
         }
         
         if skipped_corrupted > 0 {
-            eprintln!("WAL recovery: Skipped {} corrupted records", skipped_corrupted);
+            debug_log!("WAL recovery: Skipped {} corrupted records", skipped_corrupted);
         }
         
         Ok(records)

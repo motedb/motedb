@@ -1,22 +1,22 @@
-# 列索引 (Column Index)
+# Column Index
 
-等值/范围查询的首选索引方式，基于列值构建有序结构以加速过滤与 Join。
+The preferred index type for equality and range queries. Builds an ordered structure on column values to accelerate filtering and joins.
 
-## 适用场景
+## When to Use
 
-- 高频 `WHERE column = ?`、`IN (...)`、`BETWEEN ...` 查询
-- 需要加速 Join 条件（主键/外键）
-- 需要在几十万行数据上维持 <10ms 的响应
+- High-frequency `WHERE column = ?`, `IN (...)`, `BETWEEN ...` queries
+- Need to accelerate JOIN conditions (primary key / foreign key)
+- Need to maintain <10ms response times across hundreds of thousands of rows
 
-## 创建索引
+## Creating an Index
 
-### SQL 方式
+### Using SQL
 
 ```sql
 CREATE INDEX users_email ON users(email);
 ```
 
-### API 方式
+### Using the API
 
 ```rust
 use motedb::Database;
@@ -25,7 +25,7 @@ let db = Database::open("data.mote")?;
 db.create_column_index("users", "email")?;
 ```
 
-## 查询示例
+## Query Examples
 
 ```rust
 use motedb::{Database, types::Value};
@@ -44,22 +44,22 @@ let range_ids = db.query_by_column_range(
 )?;
 ```
 
-## 性能基准
+## Performance Benchmarks
 
-| 数据量 | 未建索引 | 建索引后 |
+| Data Size | Without Index | With Index |
 |--------|----------|-----------|
-| 10 万行等值查询 | ~120 ms | **2.8 ms** |
-| 10 万行范围查询 | ~180 ms | **7.5 ms** |
+| 100K rows equality query | ~120 ms | **2.8 ms** |
+| 100K rows range query | ~180 ms | **7.5 ms** |
 
-> 测试环境：Apple M3 Pro / Release build / row_cache_size=10k
+> Test environment: Apple M3 Pro / Release build / row_cache_size=10k
 
-## 批量写入策略
+## Bulk Write Strategy
 
-1. 大规模导入：先 `batch_insert_map()` → 再 `CREATE INDEX`
-2. 持续写入：先建索引，索引自动增量维护
-3. `db.flush()?` 后索引元数据与数据同时落盘
+1. Large-scale import: `batch_insert_map()` first, then `CREATE INDEX`
+2. Continuous writes: create index first; it is maintained incrementally and automatically
+3. After `db.flush()?`, index metadata and data are persisted together
 
-## 运行时监控
+## Runtime Monitoring
 
 ```rust
 use motedb::database::indexes::ColumnIndexStats;
@@ -71,21 +71,21 @@ println!("entry_count={} cache_hit_rate={:.2}%",
 );
 ```
 
-## 最佳实践
+## Best Practices
 
-- 只为高选择性列建索引，避免内存浪费
-- 对日期/时间字段配合时间序列索引（见 `11-timestamp-index.md`）
-- 定期通过 `ANALYZE`（即 `db.execute("ANALYZE")`）刷新统计
+- Only create indexes for high-selectivity columns to avoid wasting memory
+- For date/time fields, combine with the time series index (see `11-timestamp-index.md`)
+- Periodically refresh statistics via `ANALYZE` (i.e., `db.execute("ANALYZE")`)
 
-## 故障排查
+## Troubleshooting
 
-| 现象 | 处理办法 |
+| Symptom | Resolution |
 |------|----------|
-| 查询仍然慢 | 检查是否命中索引（`EXPLAIN SELECT ...`） |
-| 建索引占用大 | 减少列数或调低 `row_cache_size` |
-| 插入阻塞 | 使用批量模式或增大 `memtable_size_mb` |
+| Queries are still slow | Check whether the index is being used (`EXPLAIN SELECT ...`) |
+| Index uses too much memory | Reduce the number of indexed columns or lower `row_cache_size` |
+| Inserts are blocked | Use batch mode or increase `memtable_size_mb` |
 
 ---
 
-- 上一篇：[06 索引概览](./06-indexes-overview.md)
-- 下一篇：[08 向量索引](./08-vector-index.md)
+- Previous: [06 Index Overview](./06-indexes-overview.md)
+- Next: [08 Vector Index](./08-vector-index.md)

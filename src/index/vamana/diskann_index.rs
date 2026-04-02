@@ -507,7 +507,7 @@ impl DiskANNIndex {
             let batch = &sorted_ids[batch_start..batch_end];
             
             if show_progress {
-                println!("\n[DiskANN] === Batch {}/{} === ({} nodes)", 
+                debug_log!("\n[DiskANN] === Batch {}/{} === ({} nodes)",
                     batch_idx + 1, num_batches, batch.len());
             }
             
@@ -554,7 +554,7 @@ impl DiskANNIndex {
                     if show_progress {
                         let p = progress.fetch_add(1, Ordering::Relaxed);
                         if p.is_multiple_of(500) && p > 0 {
-                            println!("  Progress: {}/{}", p, batch.len());
+                            debug_log!("  Progress: {}/{}", p, batch.len());
                         }
                     }
                     
@@ -684,7 +684,7 @@ impl DiskANNIndex {
                 if show_progress {
                     let p = progress.fetch_add(1, Ordering::Relaxed);
                     if p.is_multiple_of(500) && p > 0 {
-                        println!("  Progress: {}/{} nodes", p, new_ids.len());
+                        debug_log!("  Progress: {}/{} nodes", p, new_ids.len());
                     }
                 }
                 
@@ -758,7 +758,7 @@ impl DiskANNIndex {
             let layer_nodes = &nodes[start..end];
             
             if show_progress {
-                println!("\n[DiskANN] === Layer {}/{} === ({} nodes, search_space={} nodes)", 
+                debug_log!("\n[DiskANN] === Layer {}/{} === ({} nodes, search_space={} nodes)",
                     layer_idx + 1, num_layers, layer_nodes.len(), end);
             }
             
@@ -802,7 +802,7 @@ impl DiskANNIndex {
                     if show_progress {
                         let p = progress.fetch_add(1, Ordering::Relaxed);
                         if p.is_multiple_of(500) && p > 0 {
-                            println!("  Progress: {}/{} nodes", p, layer_nodes.len());
+                            debug_log!("  Progress: {}/{} nodes", p, layer_nodes.len());
                         }
                     }
                     
@@ -894,7 +894,7 @@ impl DiskANNIndex {
         }  // End of layer loop
         
         if show_progress {
-            println!("\n[DiskANN] Phase 1 (forward edges) complete in {:?}", start_time.elapsed());
+            debug_log!("\n[DiskANN] Phase 1 (forward edges) complete in {:?}", start_time.elapsed());
         }
         
         // Phase 2: 反向边更新（批量并行）
@@ -1008,7 +1008,7 @@ impl DiskANNIndex {
                 if show_progress {
                     let p = progress.fetch_add(1, Ordering::Relaxed);
                     if p.is_multiple_of(1000) && p > 0 {
-                        println!("  Reverse edges: {}/{}", p, nodes.len());
+                        debug_log!("  Reverse edges: {}/{}", p, nodes.len());
                     }
                 }
                 
@@ -1376,11 +1376,11 @@ impl DiskANNIndex {
         // 🔥 召回率优化: 重新选择最优Medoid（最接近质心）
         // 原因: 增量插入的Medoid（第一个向量）通常不是最优起点
         // 新策略: 在重建时重新计算质心，选择最接近质心的向量
-        eprintln!("[DiskANN::rebuild] 🎯 Recomputing optimal medoid...");
+        debug_log!("[DiskANN::rebuild] 🎯 Recomputing optimal medoid...");
         let new_medoid = self.select_medoid(&all_ids);
         let old_medoid = *self.medoid.read();
         if old_medoid != Some(new_medoid) {
-            eprintln!("[DiskANN::rebuild] Medoid changed: {:?} → {}", old_medoid, new_medoid);
+            debug_log!("[DiskANN::rebuild] Medoid changed: {:?} → {}", old_medoid, new_medoid);
             *self.medoid.write() = Some(new_medoid);
         }
         
@@ -1527,9 +1527,9 @@ impl DiskANNIndex {
         
         if should_reorder {
             debug_log!("[DiskANN] 🎯 Auto-triggering SSD optimization:");
-            println!("  - Current size: {}", current_size);
-            println!("  - Inserts since last reorder: {}", inserts_since_reorder);
-            println!("  - Growth: {:.1}%", 
+            debug_log!("  - Current size: {}", current_size);
+            debug_log!("  - Inserts since last reorder: {}", inserts_since_reorder);
+            debug_log!("  - Growth: {:.1}%",
                 (current_size - last_reorder_size) as f64 / last_reorder_size.max(1) as f64 * 100.0);
             
             self.reorder_for_ssd()?;
@@ -1916,7 +1916,7 @@ impl DiskANNIndex {
                     if show_progress {
                         let p = progress.fetch_add(1, Ordering::Relaxed);
                         if p.is_multiple_of(500) && p > 0 {
-                            println!("  Progress: {}/{}", p, layer_nodes.len());
+                            debug_log!("  Progress: {}/{}", p, layer_nodes.len());
                         }
                     }
                     

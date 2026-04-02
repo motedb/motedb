@@ -208,7 +208,7 @@ mod jieba_plugin {
             let tokenizer = JiebaTokenizer::default();
             let tokens = tokenizer.tokenize("我爱自然语言处理");
             
-            println!("Tokens: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!("Tokens: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
             assert!(!tokens.is_empty());
             assert!(tokens.iter().any(|t| t.text == "自然语言"));
         }
@@ -220,17 +220,17 @@ mod jieba_plugin {
             // 精确模式
             let precise = JiebaTokenizer::default().with_mode(JiebaMode::Precise);
             let tokens = precise.tokenize(text);
-            println!("Precise: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!("Precise: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
 
             // 全模式
             let full = JiebaTokenizer::default().with_mode(JiebaMode::Full);
             let tokens = full.tokenize(text);
-            println!("Full: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!("Full: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
 
             // 搜索模式
             let search = JiebaTokenizer::default().with_mode(JiebaMode::Search);
             let tokens = search.tokenize(text);
-            println!("Search: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!("Search: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
         }
     }
 }
@@ -336,7 +336,7 @@ mod tests {
 
         // 测试可用分词器列表
         let available = TokenizerFactory::available_tokenizers();
-        println!("Available tokenizers: {:?}", available);
+        debug_log!("Available tokenizers: {:?}", available);
         assert!(available.contains(&"whitespace"));
         assert!(available.contains(&"ngram"));
     }

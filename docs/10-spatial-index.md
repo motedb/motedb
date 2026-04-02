@@ -1,8 +1,8 @@
-# 空间索引 (Spatial Index)
+# Spatial Index
 
-使用混合 R-Tree（`SpatialHybridIndex`）为二维坐标提供毫秒级范围查询能力，适用于 LBS、机器人定位、物联网轨迹等场景。
+A hybrid R-Tree (`SpatialHybridIndex`) providing millisecond-level range queries for two-dimensional coordinates, suitable for LBS, robot localization, IoT trajectory tracking, and similar scenarios.
 
-## 数据建模
+## Data Modeling
 
 ```sql
 CREATE TABLE locations (
@@ -13,9 +13,9 @@ CREATE TABLE locations (
 );
 ```
 
-> 向量长度=2，分别表示 `x=longitude`、`y=latitude`
+> Vector length = 2, representing `x=longitude` and `y=latitude` respectively.
 
-## 创建索引
+## Creating an Index
 
 ```rust
 use motedb::{Database, types::BoundingBox};
@@ -25,9 +25,9 @@ let bounds = BoundingBox::new(-180.0, -90.0, 180.0, 90.0);
 db.create_spatial_index("locations_coords", bounds)?;
 ```
 
-索引名推荐：`<table>_<column>`，方便与 `db.spatial_search()` 对应。
+Recommended index naming: `<table>_<column>`, for easy correspondence with `db.spatial_search()`.
 
-## 写入示例
+## Write Example
 
 ```rust
 use motedb::types::{Value, SqlRow};
@@ -47,7 +47,7 @@ db.batch_insert_map("locations", rows)?;
 db.flush()?;
 ```
 
-## 查询 API
+## Query API
 
 ### SQL
 
@@ -66,28 +66,28 @@ let bbox = BoundingBox::new(116.0, 39.0, 117.0, 40.0);
 let ids = db.spatial_search("locations_coords", &bbox)?;
 ```
 
-## 性能
+## Performance
 
-| 数据量 | P95 查询延迟 | 内存 | 构建时间 |
-|--------|--------------|------|----------|
-| 50k 点 | 3.4 ms | 18 MB | 85 ms |
-| 500k 点 | 6.8 ms | 146 MB | 1.1 s |
+| Dataset | P95 Query Latency | Memory | Build Time |
+|---------|-------------------|--------|------------|
+| 50k points | 3.4 ms | 18 MB | 85 ms |
+| 500k points | 6.8 ms | 146 MB | 1.1 s |
 
-## 维护
+## Maintenance
 
-- 定期 `VACUUM SPATIAL INDEX locations_coords` 回收碎片
-- 使用 `db.spatial_index_stats()` 观察树高、节点数、缓存命中率
-- 跨区域数据可拆分为多个索引（按国家/城市划分）
+- Periodically run `VACUUM SPATIAL INDEX locations_coords` to reclaim fragmented space
+- Use `db.spatial_index_stats()` to observe tree height, node count, and cache hit rate
+- Cross-region data can be split into multiple indexes (partitioned by country/city)
 
-## 常见问题
+## Common Issues
 
-| 问题 | 解决方案 |
-|------|----------|
-| 查询结果不完整 | 检查 `BoundingBox` 是否覆盖全部区域；确认坐标顺序 |
-| 精度不足 | 将 `coords` 类型改为 `Value::Spatial(Geometry::Point)`，保留 double 精度 |
-| 写入速度慢 | 批量插入后再建索引；适当增大 `memtable_size_mb` |
+| Issue | Solution |
+|-------|----------|
+| Incomplete query results | Check that `BoundingBox` covers the full area; verify coordinate ordering |
+| Insufficient precision | Change the `coords` type to `Value::Spatial(Geometry::Point)` to retain double precision |
+| Slow write speed | Create the index after batch insertion; increase `memtable_size_mb` appropriately |
 
 ---
 
-- 上一篇：[09 全文索引](./09-text-index.md)
-- 下一篇：[11 时间序列索引](./11-timestamp-index.md)
+- Previous: [09 Text Index](./09-text-index.md)
+- Next: [11 Timestamp Index](./11-timestamp-index.md)

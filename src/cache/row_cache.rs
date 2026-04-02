@@ -384,17 +384,17 @@ impl RowCache {
     /// Print cache statistics
     pub fn print_stats(&self) {
         let stats = self.stats();
-        println!("📊 Row Cache Statistics:");
-        println!("   Hits: {}, Misses: {}", stats.hits, stats.misses);
-        println!("   Hit Rate: {:.2}%", stats.hit_rate() * 100.0);
-        println!("   Size: {}/{} rows", stats.size, stats.capacity);
+        debug_log!("📊 Row Cache Statistics:");
+        debug_log!("   Hits: {}, Misses: {}", stats.hits, stats.misses);
+        debug_log!("   Hit Rate: {:.2}%", stats.hit_rate() * 100.0);
+        debug_log!("   Size: {}/{} rows", stats.size, stats.capacity);
         
         // 🚀 P2: Prefetch stats
         if self.prefetch_config.enabled {
-            println!("🚀 Prefetch Statistics:");
-            println!("   Triggered: {} rows", stats.prefetch_triggered);
-            println!("   Useful: {} rows", stats.prefetch_useful);
-            println!("   Efficiency: {:.2}%", stats.prefetch_efficiency() * 100.0);
+            debug_log!("🚀 Prefetch Statistics:");
+            debug_log!("   Triggered: {} rows", stats.prefetch_triggered);
+            debug_log!("   Useful: {} rows", stats.prefetch_useful);
+            debug_log!("   Efficiency: {:.2}%", stats.prefetch_efficiency() * 100.0);
         }
     }
 }

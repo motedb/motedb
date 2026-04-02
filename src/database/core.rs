@@ -13,7 +13,7 @@ use crate::index::vamana::{DiskANNIndex, VamanaConfig};
 use crate::index::{SpatialHybridIndex, SpatialHybridConfig, BoundingBoxF32};
 use crate::index::text_fts::TextFTSIndex;
 use crate::index::column_value::ColumnValueIndex;
-use crate::storage::{LSMEngine, LSMConfig};
+use crate::storage::LSMEngine;
 use crate::txn::coordinator::TransactionCoordinator;
 use crate::txn::version_store::VersionStore;
 use crate::txn::wal::{WALManager, WALRecord};
@@ -175,7 +175,9 @@ impl MoteDB {
         
         // Create LSM-Tree storage engine
         std::fs::create_dir_all(&lsm_dir)?;
-        let lsm_engine = Arc::new(LSMEngine::new(lsm_dir, LSMConfig::default())?);
+        // Use edge-optimized LSM config if memtable_size_limit differs from default
+        let lsm_config = crate::storage::lsm::LSMConfig::from_db_config(&config.lsm_config);
+        let lsm_engine = Arc::new(LSMEngine::new(lsm_dir, lsm_config)?);
 
         // Create version store and transaction coordinator
         let version_store = Arc::new(VersionStore::new());
@@ -282,17 +284,29 @@ impl MoteDB {
     }
 
     /// Open an existing database
+    /// Open an existing database with default configuration
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with_config(path, DBConfig::default())
+    }
+
+    /// Open an existing database with custom configuration
+    ///
+    /// Use this to apply edge-optimized settings when reopening:
+    /// ```ignore
+    /// let config = DBConfig::for_edge();
+    /// let db = MoteDB::open_with_config("data.mote", config)?;
+    /// ```
+    pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         let path = path.as_ref();
         let db_path = path.with_extension("mote");
-        
+
         // 🎯 统一目录结构：从 {name}.mote/ 目录读取
         let wal_path = db_path.join("wal");
         let lsm_dir = db_path.join("lsm");
         let indexes_dir = db_path.join("indexes");
 
-        // Default number of partitions
-        let num_partitions = 4;
+        // Use config instead of hardcoded default
+        let num_partitions = config.num_partitions;
 
         // Open or create WAL
         let wal = if wal_path.exists() {
@@ -344,7 +358,9 @@ impl MoteDB {
 
         // Open LSM-Tree storage engine
         std::fs::create_dir_all(&lsm_dir)?;
-        let lsm_engine = Arc::new(LSMEngine::new(lsm_dir, LSMConfig::default())?);
+        // Use edge-optimized LSM config if memtable_size_limit differs from default
+        let lsm_config = crate::storage::lsm::LSMConfig::from_db_config(&config.lsm_config);
+        let lsm_engine = Arc::new(LSMEngine::new(lsm_dir, lsm_config)?);
 
         // Load table registry BEFORE WAL replay so we can resolve table_name → table_id
         // for correct composite key construction.
@@ -410,8 +426,8 @@ impl MoteDB {
         let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
         let _ = index_registry.load();  // Ignore error if file doesn't exist
         
-        // 🚀 P1: Create row cache (default 10000 rows)
-        let row_cache = Arc::new(RowCache::new(10000));
+        // 🚀 P1: Create row cache (use config or default 10000)
+        let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
 
         let db = Self {
             path: db_path,
@@ -432,8 +448,8 @@ impl MoteDB {
             table_registry,
             index_registry,
             row_cache,
-            index_update_strategy: crate::config::IndexUpdateStrategy::default(),
-            query_timeout_secs: None,
+            index_update_strategy: config.index_update_strategy.clone(),
+            query_timeout_secs: config.query_timeout_secs,
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
@@ -449,10 +465,12 @@ impl MoteDB {
         //     db_clone.batch_build_indexes_from_flush(memtable)
         // })?;
 
-        // 🚀 Start auto-checkpoint thread (using default config on open)
+        // 🚀 Start auto-checkpoint thread (use config if provided, else default)
+        let auto_checkpoint_config = config.auto_checkpoint
+            .unwrap_or_else(crate::config::AutoCheckpointConfig::default);
         let auto_checkpoint_thread = Some(Self::start_auto_checkpoint_thread(
             db.clone_for_callback(),
-            crate::config::AutoCheckpointConfig::default(),
+            auto_checkpoint_config,
         ));
         
         // Update db with the thread handle
@@ -533,7 +551,7 @@ impl MoteDB {
                                     index_name.to_string(), 
                                     Arc::new(RwLock::new(index))
                                 );
-                                println!("[MoteDB] Loaded vector index: {}", index_name);
+                                debug_log!("[MoteDB] Loaded vector index: {}", index_name);
                             }
                         }
                     }
@@ -568,7 +586,7 @@ impl MoteDB {
                                     index_name.to_string(),
                                     Arc::new(RwLock::new(index))
                                 );
-                                println!("[MoteDB] Loaded spatial index: {}", index_name);
+                                debug_log!("[MoteDB] Loaded spatial index: {}", index_name);
                             }
                         }
                     }
@@ -587,9 +605,9 @@ impl MoteDB {
         let legacy_metadata_path = db_path.join("text_indexes_metadata.bin");
         if legacy_metadata_path.exists() {
             if let Err(e) = std::fs::remove_file(&legacy_metadata_path) {
-                eprintln!("⚠️ Failed to remove legacy text_indexes_metadata.bin: {}", e);
+                debug_log!("⚠️ Failed to remove legacy text_indexes_metadata.bin: {}", e);
             } else {
-                println!("[MoteDB] 🧹 Removed legacy text_indexes_metadata.bin (replaced by index_metadata.bin)");
+                debug_log!("[MoteDB] 🧹 Removed legacy text_indexes_metadata.bin (replaced by index_metadata.bin)");
             }
         }
         
@@ -609,7 +627,7 @@ impl MoteDB {
                                     index_name.to_string(),
                                     Arc::new(RwLock::new(index))
                                 );
-                                println!("[MoteDB] Loaded text index: {}", index_name);
+                                debug_log!("[MoteDB] Loaded text index: {}", index_name);
                             }
                         }
                     }
@@ -689,7 +707,7 @@ impl MoteDB {
                         
                         // Trigger checkpoint
                         if let Err(e) = db.checkpoint() {
-                            eprintln!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
+                            debug_log!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
                         } else {
                             debug_log!("[AutoCheckpoint] ✅ Checkpoint complete");
                             last_checkpoint = Instant::now();
@@ -813,8 +831,8 @@ impl Drop for MoteDB {
         // Ignore errors during drop (logging only)
         // We're shutting down anyway, and panic in drop() is dangerous
         if let Err(e) = self.checkpoint() {
-            eprintln!("[MoteDB::Drop] ⚠️  Failed to checkpoint during drop: {:?}", e);
-            eprintln!("[MoteDB::Drop] ⚠️  WAL files may not be cleaned up");
+            debug_log!("[MoteDB::Drop] ⚠️  Failed to checkpoint during drop: {:?}", e);
+            debug_log!("[MoteDB::Drop] ⚠️  WAL files may not be cleaned up");
         } else {
             debug_log!("[MoteDB::Drop] ✅ Final checkpoint complete, WAL cleaned");
         }

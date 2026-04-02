@@ -57,7 +57,7 @@ impl MoteDB {
                 if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                     let col_position = col_def.position;
                     
-                    println!("[create_vector_index] 🔍 使用scan_range扫描LSM（方案B高性能）...");
+                    debug_log!("[create_vector_index] 🔍 使用scan_range扫描LSM（方案B高性能）...");
                     let start_time = std::time::Instant::now();
                     
                     // 🚀 关键：计算该表的key范围
@@ -86,7 +86,7 @@ impl MoteDB {
                                         match self.lsm_engine.resolve_blob(blob_ref) {
                                             Ok(data) => data,
                                             Err(e) => {
-                                                eprintln!("[create_vector_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                                debug_log!("[create_vector_index] Failed to resolve blob for row {}: {}", row_id, e);
                                                 continue;
                                             }
                                         }
@@ -101,21 +101,21 @@ impl MoteDB {
                             }
                         }
                         Err(e) => {
-                            eprintln!("[create_vector_index] ⚠️ scan_range失败: {}", e);
+                            debug_log!("[create_vector_index] ⚠️ scan_range失败: {}", e);
                         }
                     }
                     
                     let scan_time = start_time.elapsed();
                     
                     if !vectors_to_index.is_empty() {
-                        println!("[create_vector_index] 🚀 扫描完成：{} 个向量，耗时 {:?}", 
+                        debug_log!("[create_vector_index] 🚀 扫描完成：{} 个向量，耗时 {:?}",
                                  vectors_to_index.len(), scan_time);
                         
                         let build_time = std::time::Instant::now();
                         index_arc.write().batch_insert(&vectors_to_index)?;
-                        println!("[create_vector_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
+                        debug_log!("[create_vector_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
                     } else {
-                        println!("[create_vector_index] ⚠️ 未找到任何向量数据（扫描耗时 {:?}）", scan_time);
+                        debug_log!("[create_vector_index] ⚠️ 未找到任何向量数据（扫描耗时 {:?}）", scan_time);
                     }
                 }
             }

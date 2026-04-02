@@ -670,7 +670,7 @@ impl IndexBuilder for ColumnValueIndex {
     fn build_from_memtable(&mut self, _rows: &[(RowId, Row)]) -> Result<()> {
         // ⚠️  此方法不应该直接使用
         // 批量构建应该通过 batch_build_column_indexes 调用 insert_batch
-        println!("[ColumnIndex::{}] ⚠️  build_from_memtable is deprecated, use insert_batch instead", 
+        debug_log!("[ColumnIndex::{}] ⚠️  build_from_memtable is deprecated, use insert_batch instead",
                  self.column_name);
         Ok(())
     }
@@ -684,7 +684,7 @@ impl IndexBuilder for ColumnValueIndex {
         btree.flush()?;
         
         let duration = start.elapsed();
-        println!("[ColumnIndex::{}] Persist: {:?}", self.column_name, duration);
+        debug_log!("[ColumnIndex::{}] Persist: {:?}", self.column_name, duration);
         
         Ok(())
     }

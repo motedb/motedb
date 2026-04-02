@@ -333,7 +333,7 @@ impl<K: BTreeKey> Page<K> {
                 } else if value.len() > OVERFLOW_THRESHOLD {
                     // ERROR: Large value should have been converted before serialize()
                     large_count += 1;
-                    eprintln!("DEBUG serialize: Page {}: Found unconverted large value #{}: {} bytes",
+                    debug_log!("DEBUG serialize: Page {}: Found unconverted large value #{}: {} bytes",
                              self.page_id, large_count, value.len());
                     return Err(StorageError::InvalidData(
                         format!("Page {}: Found unconverted large value ({} bytes) in serialize(). Must convert in write_page() first.",
@@ -346,7 +346,7 @@ impl<K: BTreeKey> Page<K> {
             }
             
             if total_space_needed > PAGE_SIZE {
-                eprintln!("DEBUG serialize: Page {} overflow! {} keys, {} markers, {} normal, {} bytes needed",
+                debug_log!("DEBUG serialize: Page {} overflow! {} keys, {} markers, {} normal, {} bytes needed",
                          self.page_id, self.num_keys, marker_count, normal_count, total_space_needed);
                 return Err(StorageError::InvalidData(
                     format!("Page {} cannot fit {} keys: needs {} bytes but PAGE_SIZE is {}",
@@ -404,7 +404,7 @@ impl<K: BTreeKey> Page<K> {
             // Children section
             for (i, &child) in self.children.iter().enumerate() {
                 if child == 0 || child > 1_000_000_000 {
-                    eprintln!("ERROR serialize: Page {} (internal) has invalid child[{}] = {}",
+                    debug_log!("ERROR serialize: Page {} (internal) has invalid child[{}] = {}",
                              self.page_id, i, child);
                     return Err(StorageError::InvalidData(
                         format!("Invalid child page_id {} at index {} in page {}", child, i, self.page_id)
@@ -1675,7 +1675,7 @@ impl<K: BTreeKey> GenericBTree<K> {
                 };
                 
                 if large_count > 0 {
-                    eprintln!("DEBUG read_page: Page {} from cache has {} UNCONVERTED large values!", 
+                    debug_log!("DEBUG read_page: Page {} from cache has {} UNCONVERTED large values!",
                              page_id, large_count);
                 }
                 
@@ -1696,7 +1696,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         if file_len < required_len {
             // File too small, need to extend it
             if required_len > 1_000_000_000 {
-                println!("WARN: Extending file to {} bytes (page_id={})", required_len, page_id);
+                debug_log!("WARN: Extending file to {} bytes (page_id={})", required_len, page_id);
             }
             file.set_len(required_len).map_err(|e| {
                 StorageError::Io(std::io::Error::other(
@@ -1766,7 +1766,7 @@ mod tests {
         let key1 = 100u32;
         let value1 = b"Hello World".to_vec();
         let result = tree.insert(key1, value1.clone());
-        println!("Insert result for key {}: {:?}", key1, result);
+        debug_log!("Insert result for key {}: {:?}", key1, result);
         
         let key2 = 200u32;
         let value2 = b"Rust BTree".to_vec();
@@ -1774,11 +1774,11 @@ mod tests {
         
         // Flush to disk
         tree.flush().unwrap();
-        println!("Flushed to disk");
+        debug_log!("Flushed to disk");
         
         // Retrieve values
         let result1 = tree.get(&key1);
-        println!("Get result for key {}: {:?}", key1, result1);
+        debug_log!("Get result for key {}: {:?}", key1, result1);
         assert_eq!(result1.unwrap(), Some(value1.clone()));
         
         let result2 = tree.get(&key2).unwrap();

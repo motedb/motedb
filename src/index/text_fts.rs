@@ -202,7 +202,7 @@ impl TextFTSIndex {
                 let _ = pending_terms;
                 let _ = pending_docs;
                 
-                eprintln!("[TEXT-AUTO-FLUSH] Triggered: {} terms, {} docs", 
+                debug_log!("[TEXT-AUTO-FLUSH] Triggered: {} terms, {} docs",
                          self.pending_posting_lists.read().len(),
                          self.pending_doc_lengths.read().len());
                 
@@ -211,7 +211,7 @@ impl TextFTSIndex {
                 // 🚀 P0 NEW: 主动清理shard_counters，避免积累过多历史term
                 self.cleanup_shard_counters();
                 
-                eprintln!("[TEXT-AUTO-FLUSH] After: {} terms, {} docs", 
+                debug_log!("[TEXT-AUTO-FLUSH] After: {} terms, {} docs",
                          self.pending_posting_lists.read().len(),
                          self.pending_doc_lengths.read().len());
             }
@@ -270,7 +270,7 @@ impl TextFTSIndex {
         
         // ✅ 自动flush（每5000个term触发一次）
         if should_auto_flush {
-            println!("[TextFTS] Auto-flushing after 5000 pending terms...");
+            debug_log!("[TextFTS] Auto-flushing after 5000 pending terms...");
             self.flush()?;
         }
         
@@ -695,7 +695,7 @@ impl TextFTSIndex {
         
         let after_count = shard_counters.len();
         if before_count > after_count {
-            println!("    ↳ [CLEANUP] Shard counters: {} → {} (-{} inactive terms)",
+            debug_log!("    ↳ [CLEANUP] Shard counters: {} → {} (-{} inactive terms)",
                      before_count, after_count, before_count - after_count);
         }
     }
@@ -986,7 +986,7 @@ impl IndexBuilder for TextFTSIndex {
             return Ok(());
         }
         
-        println!("[TextFTSIndex] Batch building {} documents", documents.len());
+        debug_log!("[TextFTSIndex] Batch building {} documents", documents.len());
         
         // 🔥 Phase 2: 使用已有的batch_insert方法（高效）
         let doc_refs: Vec<(u64, &str)> = documents.iter()
@@ -996,7 +996,7 @@ impl IndexBuilder for TextFTSIndex {
         self.batch_insert(&doc_refs)?;
         
         let duration = start.elapsed();
-        println!("[TextFTSIndex] Batch build complete in {:?}", duration);
+        debug_log!("[TextFTSIndex] Batch build complete in {:?}", duration);
         
         Ok(())
     }
@@ -1010,7 +1010,7 @@ impl IndexBuilder for TextFTSIndex {
         self.flush()?;
         
         let duration = start.elapsed();
-        println!("[TextFTSIndex] Persist complete in {:?}", duration);
+        debug_log!("[TextFTSIndex] Persist complete in {:?}", duration);
         
         Ok(())
     }

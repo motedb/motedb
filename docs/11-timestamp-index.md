@@ -1,8 +1,8 @@
-# 时间序列索引 (Timestamp Index)
+# Timestamp Index
 
-基于有序时间列与 LSM Range 索引的组合，保证在百万级事件流上仍可维持毫秒级范围查询。
+A combination of ordered time columns and LSM Range indexes, ensuring millisecond-level range queries even on million-level event streams.
 
-## 数据建模
+## Data Modeling
 
 ```sql
 CREATE TABLE sensor_data (
@@ -13,10 +13,10 @@ CREATE TABLE sensor_data (
 );
 ```
 
-- `TIMESTAMP` 存储微秒（`Timestamp::from_micros`）
-- SQL 中使用 `TIMESTAMP '2026-01-11 12:00:00'` 或直接写 epoch
+- `TIMESTAMP` stores microseconds (`Timestamp::from_micros`)
+- In SQL, use `TIMESTAMP '2026-01-11 12:00:00'` or write the epoch directly
 
-## 写入示例
+## Write Example
 
 ```rust
 use motedb::{Database, types::{SqlRow, Value, Timestamp}};
@@ -37,7 +37,7 @@ for i in 0..10_000 {
 db.batch_insert_map("sensor_data", rows)?;
 ```
 
-## 查询 API
+## Query API
 
 ### SQL
 
@@ -54,7 +54,7 @@ GROUP BY sensor_id;
 let rows = db.query_timestamp_range(1600000100, 1600000500)?;
 ```
 
-## 与列索引协同
+## Combining with Column Indexes
 
 ```sql
 SELECT *
@@ -65,30 +65,30 @@ ORDER BY ts DESC
 LIMIT 100;
 ```
 
-建议为 `sensor_id` 建列索引，时间列自动使用时间序列索引。
+It is recommended to create a column index on `sensor_id`; the time column automatically uses the timestamp index.
 
-## 性能基准
+## Performance Benchmarks
 
-| 数据量 | 范围宽度 | 延迟 | 内存 |
-|--------|----------|------|------|
-| 1e6 行 | 1 小时 | 5.2 ms | 60 MB |
-| 1e6 行 | 1 天 | 8.4 ms | 60 MB |
+| Dataset | Range Width | Latency | Memory |
+|---------|-------------|---------|--------|
+| 1e6 rows | 1 hour | 5.2 ms | 60 MB |
+| 1e6 rows | 1 day | 8.4 ms | 60 MB |
 
-## 最佳实践
+## Best Practices
 
-- 写入以时间递增顺序批量提交，避免碎片
-- 定期 `COMPACT TABLE sensor_data` 减少跨层查找
-- 结合 `DurabilityLevel::Full` 保障写入安全
+- Batch commits in time-ascending order to avoid fragmentation
+- Periodically run `COMPACT TABLE sensor_data` to reduce cross-level lookups
+- Combine with `DurabilityLevel::Full` to ensure write safety
 
-## 故障排查
+## Troubleshooting
 
-| 现象 | 说明 |
-|------|------|
-| 查询慢 | 检查是否排序字段缺失索引；确认时间单位（秒 vs 微秒） |
-| 数据缺失 | 确保插入时使用 `Timestamp::from_*`，避免 Int/Float 混用 |
-| 范围交错 | 对 out-of-order 数据启用写入缓冲或按分区写入 |
+| Symptom | Explanation |
+|---------|-------------|
+| Slow queries | Check whether the sort field is missing an index; verify time units (seconds vs. microseconds) |
+| Missing data | Ensure `Timestamp::from_*` is used during insertion; avoid mixing Int/Float types |
+| Range interleaving | Enable write buffering for out-of-order data, or write by partition |
 
 ---
 
-- 上一篇：[10 空间索引](./10-spatial-index.md)
-- 下一篇：[12 性能优化](./12-performance.md)
+- Previous: [10 Spatial Index](./10-spatial-index.md)
+- Next: [12 Performance Optimization](./12-performance.md)

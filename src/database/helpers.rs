@@ -54,7 +54,7 @@ impl MoteDB {
                     match self.lsm_engine.resolve_blob(blob_ref) {
                         Ok(data) => data,
                         Err(e) => {
-                            eprintln!("[BatchIndexBuilder] Failed to resolve blob for row {}: {}", row_id, e);
+                            debug_log!("[BatchIndexBuilder] Failed to resolve blob for row {}: {}", row_id, e);
                             continue;
                         }
                     }
@@ -64,7 +64,7 @@ impl MoteDB {
             let row: Row = match bincode::deserialize(&row_bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[BatchIndexBuilder] Failed to deserialize row {}: {}", row_id, e);
+                    debug_log!("[BatchIndexBuilder] Failed to deserialize row {}: {}", row_id, e);
                     continue;
                 }
             };
@@ -85,7 +85,7 @@ impl MoteDB {
         // Phase 2: Build indexes per table
         for (table_name, rows) in &tables_data {
             if let Err(e) = self.batch_build_table_indexes(table_name, rows) {
-                eprintln!("[BatchIndexBuilder] Warning: index build failed for table '{}': {:?}", table_name, e);
+                debug_log!("[BatchIndexBuilder] Warning: index build failed for table '{}': {:?}", table_name, e);
                 // Don't fail the entire flush — index can be rebuilt later
             }
         }
@@ -120,7 +120,7 @@ impl MoteDB {
             let row_bytes = match &entry.data {
                 crate::storage::lsm::ValueData::Inline(bytes) => bytes,
                 crate::storage::lsm::ValueData::Blob(_) => {
-                    eprintln!("[BatchIndexBuilder] ⚠️  Blob not supported for index building yet");
+                    debug_log!("[BatchIndexBuilder] ⚠️  Blob not supported for index building yet");
                     continue;
                 }
             };
@@ -131,7 +131,7 @@ impl MoteDB {
             let row: Row = match bincode::deserialize(&row_bytes) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[BatchIndexBuilder] ⚠️  Failed to deserialize row {}: {}", row_id, e);
+                    debug_log!("[BatchIndexBuilder] ⚠️  Failed to deserialize row {}: {}", row_id, e);
                     continue;
                 }
             };
@@ -165,7 +165,7 @@ impl MoteDB {
                 match handle.join() {
                     Ok(Ok(())) => {},
                     Ok(Err(e)) => {
-                        eprintln!("[BatchIndexBuilder] ⚠️  Table {} build failed: {}", idx, e);
+                        debug_log!("[BatchIndexBuilder] ⚠️  Table {} build failed: {}", idx, e);
                         return Err(e);
                     }
                     Err(_) => {
@@ -271,7 +271,7 @@ impl MoteDB {
             match handle.join() {
                 Ok(Ok(())) => {},
                 Ok(Err(e)) => {
-                    eprintln!("[BatchIndexBuilder] ⚠️  Index type {} build failed: {}", idx, e);
+                    debug_log!("[BatchIndexBuilder] ⚠️  Index type {} build failed: {}", idx, e);
                     return Err(e);
                 }
                 Err(_) => {
@@ -349,7 +349,7 @@ impl MoteDB {
         }
         
         if count > 0 {
-            println!("[TimestampIndex] Batch built {} entries in {:?}", count, start.elapsed());
+            debug_log!("[TimestampIndex] Batch built {} entries in {:?}", count, start.elapsed());
         }
         
         Ok(())

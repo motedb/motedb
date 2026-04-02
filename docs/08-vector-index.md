@@ -1,14 +1,14 @@
-# 向量索引 (Vector Index)
+# Vector Index
 
-基于 FreshDiskANN + LSM 融合架构的近似最近邻索引，适用于 RAG、推荐、语义检索等场景。
+An approximate nearest neighbor index based on a FreshDiskANN + LSM hybrid architecture, suitable for RAG, recommendation systems, semantic search, and similar scenarios.
 
-## 核心能力
+## Core Capabilities
 
-- 支持 L2、内积、余弦距离（SQL 中分别使用 `<->`、`<#>`、`<=>`）
-- 在线/离线混合构建：批量导入后一次性构建，或实时增量更新
-- 内置缓存与分区策略，单机 128 维向量可达 95%+ 召回
+- Supports L2, inner product, and cosine distance (using `<->`, `<#>`, `<=>` respectively in SQL)
+- Online/offline hybrid construction: build once after batch import, or update incrementally in real time
+- Built-in caching and partitioning strategies; achieves 95%+ recall for 128-dimensional vectors on a single machine
 
-## 创建索引
+## Creating an Index
 
 ```sql
 CREATE TABLE documents (
@@ -20,7 +20,7 @@ CREATE TABLE documents (
 CREATE VECTOR INDEX docs_embedding ON documents(embedding);
 ```
 
-或通过 API：
+Or via the API:
 
 ```rust
 use motedb::Database;
@@ -29,7 +29,7 @@ let db = Database::open("docs.mote")?;
 db.create_vector_index("docs_embedding", 128)?;
 ```
 
-## 数据导入
+## Data Import
 
 ```rust
 use motedb::{Database, types::{SqlRow, Value}};
@@ -47,10 +47,10 @@ for i in 0..1000 {
 db.batch_insert_with_vectors_map("documents", rows, &["embedding"])?;
 ```
 
-## 查询示例
+## Query Examples
 
 ```rust
-// L2 距离
+// L2 distance
 db.query(r#"
     SELECT id, title
     FROM documents
@@ -58,7 +58,7 @@ db.query(r#"
     LIMIT 10
 "#)?;
 
-// 内积排序
+// Inner product ordering
 db.query(r#"
     SELECT id, title
     FROM documents
@@ -67,28 +67,28 @@ db.query(r#"
 "#)?;
 ```
 
-也可直接调用 API：
+You can also call the API directly:
 
 ```rust
 let candidates = db.vector_search("docs_embedding", &query_vec, 10)?;
 ```
 
-## 性能与资源
+## Performance and Resources
 
-| 数据量 | 召回@10 | P95 延迟 | 内存 | 构建耗时 |
-|--------|---------|----------|------|-----------|
-| 100k × 128 维 | 95.2% | 4.7 ms | 210 MB | 38 s |
-| 1M × 768 维 | 93.8% | 8.9 ms | 1.7 GB | 11 min |
+| Dataset | Recall@10 | P95 Latency | Memory | Build Time |
+|---------|-----------|-------------|--------|------------|
+| 100k x 128-dim | 95.2% | 4.7 ms | 210 MB | 38 s |
+| 1M x 768-dim | 93.8% | 8.9 ms | 1.7 GB | 11 min |
 
-> 参数：R=32, L=50, PQ 关闭，Apple M3 Pro (Release)
+> Parameters: R=32, L=50, PQ disabled, Apple M3 Pro (Release)
 
-## 调优建议
+## Tuning Recommendations
 
-- **召回优先**：增大 `R` 或 `alpha`，或开启多批 rerank
-- **吞吐优先**：减小 `L`、使用 PQ 压缩、启用批内 SIMD
-- **持久化**：`db.flush()?` 会将向量索引元数据与图结构刷盘
+- **Prioritize recall**: increase `R` or `alpha`, or enable multi-batch reranking
+- **Prioritize throughput**: decrease `L`, use PQ compression, enable intra-batch SIMD
+- **Persistence**: `db.flush()?` flushes vector index metadata and graph structure to disk
 
-## 监控与维护
+## Monitoring and Maintenance
 
 ```rust
 use motedb::database::indexes::VectorIndexStats;
@@ -97,18 +97,18 @@ let stats: VectorIndexStats = db.vector_index_stats("docs_embedding")?;
 println!("vectors={} avg_neighbors={:.1}", stats.total_vectors, stats.avg_neighbors);
 ```
 
-- 定期运行 `VACUUM INDEX docs_embedding`（或 `db.execute` 调用）回收孤立节点
-- 结合 `transaction_stats()` 监控写入期间的锁等待
+- Periodically run `VACUUM INDEX docs_embedding` (or call via `db.execute`) to reclaim orphaned nodes
+- Use `transaction_stats()` to monitor lock contention during writes
 
-## 常见问题
+## Common Issues
 
-| 问题 | 解决方案 |
-|------|----------|
-| 查询召回降低 | 确认建索引时维度与数据一致；适当增大 `R/L` |
-| 构建耗时长 | 使用 `batch_insert_with_vectors_map()` 合并写入；关闭 PQ |
-| 内存超限 | 开启 PQ 或增大 `bloom_filter_bits` 减少冗余缓存 |
+| Issue | Solution |
+|-------|----------|
+| Decreased query recall | Verify that the index dimensions match the data; increase `R/L` appropriately |
+| Long build time | Use `batch_insert_with_vectors_map()` to batch writes; disable PQ |
+| Memory limit exceeded | Enable PQ or increase `bloom_filter_bits` to reduce redundant caching |
 
 ---
 
-- 上一篇：[07 列索引](./07-column-index.md)
-- 下一篇：[09 全文索引](./09-text-index.md)
+- Previous: [07 Column Index](./07-column-index.md)
+- Next: [09 Text Index](./09-text-index.md)

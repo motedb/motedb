@@ -2,7 +2,7 @@
 
 use super::{UnifiedMemTable, SSTable, SSTableBuilder, Key, Value, ValueData, LSMConfig, CompactionWorker, BlobStore};
 use crate::{Result, StorageError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Condvar};
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::PathBuf;
@@ -124,7 +124,13 @@ pub struct LSMEngine {
     /// 🔧 Background thread handles (for graceful shutdown)
     compaction_thread: Option<JoinHandle<()>>,
     flush_thread: Option<JoinHandle<()>>,
-    
+
+    /// 🚀 Edge optimization: Condvar for event-driven flush (replaces 10ms polling)
+    flush_wakeup: Arc<(Mutex<bool>, Condvar)>,
+
+    /// 🚀 Edge optimization: Condvar for event-driven compaction (replaces 500ms polling)
+    compaction_wakeup: Arc<(Mutex<bool>, Condvar)>,
+
     /// 🚀 Unified Flush Callback
     /// Callback: &UnifiedMemTable -> Result<()>
     /// Called during flush to enable batch index building
@@ -203,6 +209,8 @@ impl LSMEngine {
             compaction_thread: None,
             flush_thread: None,
             flush_callback: Arc::new(RwLock::new(None)),
+            flush_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
+            compaction_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
         };
 
         // Wire post-compaction callback to clear SSTableCache
@@ -216,6 +224,7 @@ impl LSMEngine {
         // 🔥 Start background compaction thread with Weak references
         let compaction_worker_weak = Arc::downgrade(&engine.compaction_worker);
         let shutdown_weak = Arc::downgrade(&engine.shutdown);
+        let compaction_wakeup = engine.compaction_wakeup.clone();
         
         let compaction_thread = thread::spawn(move || {
             let mut consecutive_no_work = 0;
@@ -231,8 +240,13 @@ impl LSMEngine {
                     break;
                 }
                 
-                // 🚀 P1: 更频繁的 compaction 检查（500ms）
-                thread::sleep(Duration::from_millis(500));
+                // 🚀 Edge optimization: event-driven via condvar (replaces 500ms polling)
+                // Sleeps until notified or 30s timeout (near-zero CPU when idle)
+                {
+                    let (lock, cvar) = &*compaction_wakeup;
+                    let guard = lock.lock().unwrap();
+                    let _ = cvar.wait_timeout(guard, Duration::from_secs(30));
+                }
                 
                 // Upgrade Weak to Arc for compaction work
                 let compaction_worker = match compaction_worker_weak.upgrade() {
@@ -246,7 +260,7 @@ impl LSMEngine {
                         let mut rounds = 0;
                         while let Ok(true) = compaction_worker.needs_compaction() {
                             if let Err(e) = compaction_worker.run_compaction() {
-                                eprintln!("❌ Compaction error: {:?}", e);
+                                debug_log!("❌ Compaction error: {:?}", e);
                                 break;
                             }
                             rounds += 1;
@@ -259,7 +273,7 @@ impl LSMEngine {
                     Ok(false) => {
                         consecutive_no_work += 1;
                     }
-                    Err(e) => eprintln!("❌ Compaction check error: {:?}", e),
+                    Err(e) => { debug_log!("❌ Compaction check error: {:?}", e); }
                 }
                 
                 if consecutive_no_work > 60 {
@@ -277,7 +291,9 @@ impl LSMEngine {
         let next_sst_id_weak = Arc::downgrade(&engine.next_sst_id);
         let compaction_worker_weak = Arc::downgrade(&engine.compaction_worker);
         let flush_callback_weak = Arc::downgrade(&engine.flush_callback); // 🔥 NEW: Callback for index building
-        
+        let flush_wakeup = engine.flush_wakeup.clone(); // 🚀 Condvar for event-driven flush
+        let compaction_wakeup_for_flush = engine.compaction_wakeup.clone(); // Notify compaction after SST build
+
         let flush_thread = thread::Builder::new()
             .name("lsm-flush".to_string())
             .spawn(move || {
@@ -290,13 +306,11 @@ impl LSMEngine {
                         break;
                     }
                 };
-                
+
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                
-                thread::sleep(Duration::from_millis(10));  // Check every 10ms
-                
+
                 // Quick lock-free check
                 let flush_in_progress = match flush_in_progress_weak.upgrade() {
                     Some(f) => f,
@@ -352,7 +366,7 @@ impl LSMEngine {
                                     
                                     // 🔧 确保存储目录存在（防止目录被删除导致flush失败）
                                     if !storage_dir_clone.exists() {
-                                        eprintln!("[LSM Flush] ⚠️  Storage directory deleted, skipping flush");
+                                        debug_log!("[LSM Flush] ⚠️  Storage directory deleted, skipping flush");
                                         flush_in_progress.store(false, Ordering::Release);
                                         break;
                                     }
@@ -368,7 +382,7 @@ impl LSMEngine {
                                                     deleted: entry.deleted,
                                                 };
                                                 if let Err(e) = builder.add(key, value) {
-                                                    eprintln!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
+                                                    debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
                                                 }
                                             }
                                             
@@ -377,14 +391,20 @@ impl LSMEngine {
                                                     if let Some(worker) = compaction_worker_weak.upgrade() {
                                                         let _ = worker.register_sstable(meta);
                                                     }
+                                                    // 🚀 Wake compaction thread (new SSTable registered)
+                                                    {
+                                                        let (lock, cvar) = &*compaction_wakeup_for_flush;
+                                                        if let Ok(mut guard) = lock.lock() { *guard = true; }
+                                                        cvar.notify_all();
+                                                    }
                                                 }
                                                 Err(e) => {
-                                                    eprintln!("[LSM Flush] ❌ Failed to finish SSTable_{}: {:?}", sst_id, e);
+                                                    debug_log!("[LSM Flush] ❌ Failed to finish SSTable_{}: {:?}", sst_id, e);
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("[LSM Flush] ❌ Failed to create SSTable builder: {:?}", e);
+                                            debug_log!("[LSM Flush] ❌ Failed to create SSTable builder: {:?}", e);
                                         }
                                     }
                                 }
@@ -396,7 +416,7 @@ impl LSMEngine {
                                     let callback_guard = callback_arc.read();
                                     if let Some(ref callback) = *callback_guard {
                                         if let Err(e) = callback(&memtable) {
-                                            eprintln!("[LSM Flush] ⚠️  Callback error: {:?}", e);
+                                            debug_log!("[LSM Flush] ⚠️  Callback error: {:?}", e);
                                         }
                                     }
                                 }
@@ -409,11 +429,21 @@ impl LSMEngine {
                         }
                     }
                 }
+
+                // 🚀 Edge optimization: event-driven wait (replaces busy polling)
+                // Sleeps until notified (new immutable pushed) or 5s timeout
+                {
+                    let (lock, cvar) = &*flush_wakeup;
+                    let mut guard = lock.lock().unwrap();
+                    // Reset the flag before waiting
+                    *guard = false;
+                    let _ = cvar.wait_timeout(guard, Duration::from_secs(5));
+                }
             }
             }));  // end catch_unwind
             
             if let Err(e) = result {
-                eprintln!("[LSM Flush Thread] ❌ PANIC: {:?}", e);
+                debug_log!("[LSM Flush Thread] ❌ PANIC: {:?}", e);
             }
         }).expect("Failed to spawn flush thread");
         
@@ -483,10 +513,10 @@ impl LSMEngine {
             // Queue is full, apply backpressure
             backpressure_count += 1;
             if backpressure_count == 1 {
-                eprintln!("[LSM] ⚠️  Backpressure: Queue full ({}/{}), waiting for flush...",
+                debug_log!("[LSM] ⚠️  Backpressure: Queue full ({}/{}), waiting for flush...",
                     queue_len, self.max_immutable_slots);
             } else if backpressure_count % 100 == 0 {
-                eprintln!("[LSM] ⏳ Still waiting: {}ms (queue: {}/{})",
+                debug_log!("[LSM] ⏳ Still waiting: {}ms (queue: {}/{})",
                     backpressure_count * 10, queue_len, self.max_immutable_slots);
             }
 
@@ -626,7 +656,7 @@ impl LSMEngine {
     /// - 减少锁竞争：N次get() → 1次batch_get()
     /// - 避免读者饥饿：减少与flush线程的锁竞争
     pub fn batch_get(&self, keys: &[Key]) -> Result<Vec<Option<Value>>> {
-        println!("🔍 [batch_get] 开始批量查询 {} 个keys", keys.len());
+        debug_log!("🔍 [batch_get] 开始批量查询 {} 个keys", keys.len());
         let mut results = vec![None; keys.len()];
         let mut remaining_keys: Vec<(usize, Key)> = keys.iter().enumerate().map(|(i, &k)| (i, k)).collect();
         
@@ -672,7 +702,7 @@ impl LSMEngine {
             let immutable = self.immutable.read();
 
             for (mt_idx, memtable) in immutable.iter().rev().enumerate() {
-                println!("  🔍 [batch_get] 查询第 {} 个immutable memtable，剩余 {} 个keys", mt_idx + 1, remaining_keys.len());
+                debug_log!("  🔍 [batch_get] 查询第 {} 个immutable memtable，剩余 {} 个keys", mt_idx + 1, remaining_keys.len());
                 let mut i = 0;
                 while i < remaining_keys.len() {
                     let (idx, key) = remaining_keys[i];
@@ -700,7 +730,7 @@ impl LSMEngine {
                 }
                 
                 if remaining_keys.is_empty() {
-                    println!("  ✅ [batch_get] 所有keys已找到，提前退出immutable查询");
+                    debug_log!("  ✅ [batch_get] 所有keys已找到，提前退出immutable查询");
                     break;
                 }
             }
@@ -713,9 +743,9 @@ impl LSMEngine {
         }
         
         // 3. Check SSTables (对剩余的keys进行查询)
-        println!("🔍 [batch_get] 开始查询SSTables，剩余 {} 个keys", remaining_keys.len());
+        debug_log!("🔍 [batch_get] 开始查询SSTables，剩余 {} 个keys", remaining_keys.len());
         let sstable_metas = self.compaction_worker.get_all_sstables()?;
-        println!("  📂 [batch_get] 共有 {} 个SSTables", sstable_metas.len());
+        debug_log!("  📂 [batch_get] 共有 {} 个SSTables", sstable_metas.len());
         
         for level in 0..self.config.num_levels {
             let level_sstables: Vec<_> = sstable_metas.iter()
@@ -726,7 +756,7 @@ impl LSMEngine {
                 continue;
             }
             
-            println!("  🔍 [batch_get] 查询Level {} ({} 个SSTables)", level, level_sstables.len());
+            debug_log!("  🔍 [batch_get] 查询Level {} ({} 个SSTables)", level, level_sstables.len());
             
             // 🚀 P3+: 批量查询每个SSTable（使用 batch_get）
             for meta in level_sstables.iter().rev() {
@@ -782,7 +812,7 @@ impl LSMEngine {
                 // 🔓 SSTable锁在这里释放（批量处理完成）
                 
                 if remaining_keys.is_empty() {
-                    println!("  ✅ [batch_get] 所有keys已找到，提前退出Level {}", level);
+                    debug_log!("  ✅ [batch_get] 所有keys已找到，提前退出Level {}", level);
                     break;
                 }
             }
@@ -1081,6 +1111,15 @@ impl LSMEngine {
         let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
         immutable_lock.push_back(old_memtable);
 
+        // 🚀 Wake up flush thread to process the new immutable
+        {
+            let (lock, cvar) = &*self.flush_wakeup;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = true;
+            }
+            cvar.notify_all();
+        }
+
         Ok(())
     }
     
@@ -1095,7 +1134,7 @@ impl LSMEngine {
                     break;
                 }
                 if wait_count % 1000 == 0 && wait_count > 0 {
-                    eprintln!("[rotate_memtable] ⏳ Waiting {}ms (queue: {}/{})", 
+                    debug_log!("[rotate_memtable] ⏳ Waiting {}ms (queue: {}/{})",
                         wait_count, immutable.len(), self.max_immutable_slots);
                 }
             }
@@ -1199,7 +1238,16 @@ impl LSMEngine {
         
         // Register SSTable with compaction worker
         self.compaction_worker.register_sstable(meta)?;
-        
+
+        // 🚀 Wake up compaction thread (new SSTable may need compaction)
+        {
+            let (lock, cvar) = &*self.compaction_wakeup;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = true;
+            }
+            cvar.notify_all();
+        }
+
         Ok(Some(sst_path))
     }
     
@@ -1594,7 +1642,7 @@ impl LSMEngine {
             let entries = match sstable.scan(start, end) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    eprintln!("[scan_range] Warning: SSTable scan failed for {:?}: {:?}", path, e);
+                    debug_log!("[scan_range] Warning: SSTable scan failed for {:?}: {:?}", path, e);
                     continue;
                 }
             };
@@ -2000,6 +2048,19 @@ impl Drop for LSMEngine {
         
         // 🔧 Step 1: Signal background threads to shutdown
         self.shutdown.store(true, Ordering::Relaxed);
+
+        // 🚀 Wake up both threads so they see the shutdown flag immediately
+        {
+            let (lock, cvar) = &*self.flush_wakeup;
+            if let Ok(mut guard) = lock.lock() { *guard = true; }
+            cvar.notify_all();
+        }
+        {
+            let (lock, cvar) = &*self.compaction_wakeup;
+            if let Ok(mut guard) = lock.lock() { *guard = true; }
+            cvar.notify_all();
+        }
+
         debug_log!("[LSMEngine::Drop] ✓ Shutdown signal sent");
         
         // 🔧 Step 2: Wait for background threads to exit FIRST
@@ -2019,7 +2080,7 @@ impl Drop for LSMEngine {
         // 🔧 Step 3: Now safe to flush (no competing threads)
         debug_log!("[LSMEngine::Drop] 💾 Performing final flush...");
         if let Err(e) = self.flush() {
-            eprintln!("[LSMEngine::Drop] ⚠️  Final flush failed: {:?}", e);
+            debug_log!("[LSMEngine::Drop] ⚠️  Final flush failed: {:?}", e);
         } else {
             debug_log!("[LSMEngine::Drop] ✓ Final flush complete");
         }

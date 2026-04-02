@@ -1,25 +1,25 @@
-# SQL 操作
+# SQL Operations
 
-MoteDB 完整 SQL 支持，包含 DDL、DML、查询、聚合、JOIN 等功能。
+MoteDB provides full SQL support, including DDL, DML, queries, aggregation, JOINs, and more.
 
-## 核心 API
+## Core API
 
 ```rust
-// 执行 SQL（INSERT/UPDATE/DELETE/CREATE/DROP）
+// Execute SQL (INSERT/UPDATE/DELETE/CREATE/DROP)
 db.execute(sql: &str) -> Result<QueryResult>
 
-// 查询 SQL（SELECT）
+// Query SQL (SELECT)
 db.query(sql: &str) -> Result<QueryResult>
 ```
 
-两者实际上是同一个函数的别名，都可以执行任何 SQL 语句。
+Both are aliases for the same function and can execute any SQL statement.
 
-## DDL（数据定义语言）
+## DDL (Data Definition Language)
 
 ### CREATE TABLE
 
 ```rust
-// 基础表
+// Basic table
 db.execute("CREATE TABLE users (
     id INT,
     name TEXT,
@@ -29,7 +29,7 @@ db.execute("CREATE TABLE users (
     is_active BOOL
 )")?;
 
-// 带向量字段
+// With vector field
 db.execute("CREATE TABLE documents (
     id INT,
     title TEXT,
@@ -38,7 +38,7 @@ db.execute("CREATE TABLE documents (
     created_at TIMESTAMP
 )")?;
 
-// 带空间字段
+// With spatial field
 db.execute("CREATE TABLE locations (
     id INT,
     name TEXT,
@@ -53,48 +53,48 @@ db.execute("CREATE TABLE locations (
 db.execute("DROP TABLE users")?;
 ```
 
-### 支持的数据类型
+### Supported Data Types
 
-| 类型 | 说明 | 示例 |
+| Type | Description | Example |
 |-----|-----|-----|
-| `INT` | 64位整数 | `42` |
-| `FLOAT` | 64位浮点数 | `3.14` |
-| `TEXT` | 字符串 | `'Hello'` |
-| `BOOL` | 布尔值 | `TRUE`, `FALSE` |
-| `VECTOR(n)` | n维向量 | `[0.1, 0.2, 0.3]` |
-| `TIMESTAMP` | Unix时间戳 | `1609459200` |
+| `INT` | 64-bit integer | `42` |
+| `FLOAT` | 64-bit floating point | `3.14` |
+| `TEXT` | String | `'Hello'` |
+| `BOOL` | Boolean | `TRUE`, `FALSE` |
+| `VECTOR(n)` | n-dimensional vector | `[0.1, 0.2, 0.3]` |
+| `TIMESTAMP` | Unix timestamp | `1609459200` |
 
-## DML（数据操作语言）
+## DML (Data Manipulation Language)
 
 ### INSERT
 
-#### 单行插入
+#### Single Row Insert
 
 ```rust
 db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', 25, 50000.0, TRUE)")?;
 ```
 
-#### 多行插入
+#### Multi-Row Insert
 
 ```rust
-db.execute("INSERT INTO users VALUES 
+db.execute("INSERT INTO users VALUES
     (2, 'Bob', 'bob@example.com', 30, 60000.0, TRUE),
     (3, 'Carol', 'carol@example.com', 28, 55000.0, FALSE)")?;
 ```
 
-#### 指定列插入
+#### Insert with Specified Columns
 
 ```rust
 db.execute("INSERT INTO users (id, name, email) VALUES (4, 'Dave', 'dave@example.com')")?;
 ```
 
-#### 插入向量数据
+#### Insert Vector Data
 
 ```rust
-// 使用数组语法
+// Using array syntax
 db.execute("INSERT INTO documents VALUES (
-    1, 
-    'Rust Tutorial', 
+    1,
+    'Rust Tutorial',
     'Learn Rust programming...',
     [0.1, 0.2, 0.3, ..., 0.5],
     1609459200
@@ -104,78 +104,78 @@ db.execute("INSERT INTO documents VALUES (
 ### UPDATE
 
 ```rust
-// 更新单个字段
+// Update a single field
 db.execute("UPDATE users SET age = 26 WHERE name = 'Alice'")?;
 
-// 更新多个字段
+// Update multiple fields
 db.execute("UPDATE users SET age = 31, salary = 65000.0 WHERE id = 2")?;
 
-// 条件更新
+// Conditional update
 db.execute("UPDATE users SET is_active = FALSE WHERE age < 20")?;
 ```
 
 ### DELETE
 
 ```rust
-// 删除特定行
+// Delete specific rows
 db.execute("DELETE FROM users WHERE id = 3")?;
 
-// 条件删除
+// Conditional delete
 db.execute("DELETE FROM users WHERE age < 18 OR is_active = FALSE")?;
 
-// 删除所有行
+// Delete all rows
 db.execute("DELETE FROM users")?;
 ```
 
-## SELECT 查询
+## SELECT Queries
 
-### 基础查询
+### Basic Queries
 
 ```rust
-// 查询所有列
+// Query all columns
 let results = db.query("SELECT * FROM users")?;
 
-// 查询特定列
+// Query specific columns
 let results = db.query("SELECT name, email FROM users")?;
 
-// 带条件查询
+// Query with conditions
 let results = db.query("SELECT * FROM users WHERE age > 25")?;
 ```
 
-### WHERE 条件
+### WHERE Conditions
 
-支持的运算符：
+Supported operators:
 
-| 运算符 | 说明 | 示例 |
+| Operator | Description | Example |
 |-------|-----|-----|
-| `=` | 等于 | `WHERE age = 25` |
-| `!=`, `<>` | 不等于 | `WHERE age != 30` |
-| `>`, `>=` | 大于（等于） | `WHERE age > 18` |
-| `<`, `<=` | 小于（等于） | `WHERE salary <= 50000` |
-| `AND` | 逻辑与 | `WHERE age > 18 AND is_active = TRUE` |
-| `OR` | 逻辑或 | `WHERE age < 20 OR age > 60` |
-| `IN` | 范围匹配 | `WHERE id IN (1, 2, 3)` |
-| `LIKE` | 模式匹配 | `WHERE name LIKE '%Alice%'` |
+| `=` | Equal to | `WHERE age = 25` |
+| `!=`, `<>` | Not equal to | `WHERE age != 30` |
+| `>`, `>=` | Greater than (or equal to) | `WHERE age > 18` |
+| `<`, `<=` | Less than (or equal to) | `WHERE salary <= 50000` |
+| `AND` | Logical AND | `WHERE age > 18 AND is_active = TRUE` |
+| `OR` | Logical OR | `WHERE age < 20 OR age > 60` |
+| `IN` | Range matching | `WHERE id IN (1, 2, 3)` |
+| `LIKE` | Pattern matching | `WHERE name LIKE '%Alice%'` |
 
-#### 示例
+#### Examples
 
 ```rust
-// 复合条件
+// Compound conditions
 let results = db.query("
-    SELECT * FROM users 
-    WHERE age >= 25 AND age <= 35 
+    SELECT * FROM users
+    WHERE age >= 25 AND age <= 35
     AND is_active = TRUE
 ")?;
 
-// IN 查询
+// IN query
 let results = db.query("
-    SELECT * FROM users 
+    SELECT * FROM users
     WHERE id IN (1, 2, 3, 5, 8)
 ")?;
 
-// LIKE 模糊查询
+// LIKE fuzzy match
 let results = db.query("
-    SELECT * FROM users 
+    SELECT * FROM users
     WHERE email LIKE '%@example.com'
 ")?;
 ```
@@ -183,61 +183,61 @@ let results = db.query("
 ### ORDER BY
 
 ```rust
-// 升序
+// Ascending order
 let results = db.query("SELECT * FROM users ORDER BY age ASC")?;
 
-// 降序
+// Descending order
 let results = db.query("SELECT * FROM users ORDER BY salary DESC")?;
 
-// 多列排序
+// Multi-column sort
 let results = db.query("
-    SELECT * FROM users 
+    SELECT * FROM users
     ORDER BY age DESC, name ASC
 ")?;
 ```
 
-### LIMIT 和 OFFSET
+### LIMIT and OFFSET
 
 ```rust
-// 限制返回行数
+// Limit the number of returned rows
 let results = db.query("SELECT * FROM users LIMIT 10")?;
 
-// 分页查询
+// Paginated query
 let results = db.query("SELECT * FROM users LIMIT 10 OFFSET 20")?;
 
-// 组合使用
+// Combined usage
 let results = db.query("
-    SELECT * FROM users 
-    WHERE age > 18 
-    ORDER BY created_at DESC 
+    SELECT * FROM users
+    WHERE age > 18
+    ORDER BY created_at DESC
     LIMIT 50
 ")?;
 ```
 
-## 聚合函数
+## Aggregate Functions
 
-### 支持的聚合函数
+### Supported Aggregate Functions
 
-| 函数 | 说明 | 示例 |
+| Function | Description | Example |
 |-----|-----|-----|
-| `COUNT(*)` | 计数 | `SELECT COUNT(*) FROM users` |
-| `SUM(col)` | 求和 | `SELECT SUM(salary) FROM users` |
-| `AVG(col)` | 平均值 | `SELECT AVG(age) FROM users` |
-| `MIN(col)` | 最小值 | `SELECT MIN(age) FROM users` |
-| `MAX(col)` | 最大值 | `SELECT MAX(salary) FROM users` |
+| `COUNT(*)` | Count rows | `SELECT COUNT(*) FROM users` |
+| `SUM(col)` | Sum values | `SELECT SUM(salary) FROM users` |
+| `AVG(col)` | Average value | `SELECT AVG(age) FROM users` |
+| `MIN(col)` | Minimum value | `SELECT MIN(age) FROM users` |
+| `MAX(col)` | Maximum value | `SELECT MAX(salary) FROM users` |
 
-### 示例
+### Examples
 
 ```rust
-// 总数
+// Total count
 let result = db.query("SELECT COUNT(*) as total FROM users")?;
 
-// 平均值
+// Average value
 let result = db.query("SELECT AVG(age) as avg_age FROM users")?;
 
-// 多个聚合
+// Multiple aggregates
 let result = db.query("
-    SELECT 
+    SELECT
         COUNT(*) as total,
         AVG(age) as avg_age,
         MIN(age) as min_age,
@@ -250,21 +250,21 @@ let result = db.query("
 ### GROUP BY
 
 ```rust
-// 按单列分组
+// Group by a single column
 let result = db.query("
     SELECT category, COUNT(*) as count
     FROM products
     GROUP BY category
 ")?;
 
-// 按多列分组
+// Group by multiple columns
 let result = db.query("
     SELECT category, is_active, AVG(price) as avg_price
     FROM products
     GROUP BY category, is_active
 ")?;
 
-// 带 HAVING 过滤
+// With HAVING filter
 let result = db.query("
     SELECT category, COUNT(*) as count
     FROM products
@@ -273,7 +273,7 @@ let result = db.query("
 ")?;
 ```
 
-## JOIN 查询
+## JOIN Queries
 
 ### INNER JOIN
 
@@ -295,11 +295,11 @@ let result = db.query("
 ")?;
 ```
 
-### 多表 JOIN
+### Multi-Table JOIN
 
 ```rust
 let result = db.query("
-    SELECT 
+    SELECT
         users.name,
         orders.order_id,
         products.product_name
@@ -310,9 +310,9 @@ let result = db.query("
 ")?;
 ```
 
-## 子查询
+## Subqueries
 
-### WHERE 子查询
+### WHERE Subquery
 
 ```rust
 let result = db.query("
@@ -320,7 +320,7 @@ let result = db.query("
     WHERE age > (SELECT AVG(age) FROM users)
 ")?;
 
-// IN 子查询
+// IN subquery
 let result = db.query("
     SELECT * FROM products
     WHERE category_id IN (
@@ -329,7 +329,7 @@ let result = db.query("
 ")?;
 ```
 
-### FROM 子查询
+### FROM Subquery
 
 ```rust
 let result = db.query("
@@ -344,56 +344,56 @@ let result = db.query("
 ")?;
 ```
 
-## 索引操作
+## Index Operations
 
-### 创建索引
+### Creating Indexes
 
 ```rust
-// 列索引
+// Column index
 db.execute("CREATE INDEX users_email ON users(email)")?;
 
-// 向量索引
+// Vector index
 db.execute("CREATE VECTOR INDEX docs_embedding ON documents(embedding)")?;
 
-// 全文索引
+// Full-text index
 db.execute("CREATE TEXT INDEX articles_content ON articles(content)")?;
 
-// 空间索引
+// Spatial index
 db.execute("CREATE SPATIAL INDEX locations_coords ON locations(coords)")?;
 ```
 
-### 删除索引
+### Dropping Indexes
 
 ```rust
 db.execute("DROP INDEX users_email ON users")?;
 ```
 
-### 查看索引
+### Viewing Indexes
 
 ```rust
 let result = db.query("SHOW INDEXES FROM users")?;
 ```
 
-## 特殊操作
+## Special Operations
 
-### 向量搜索
+### Vector Search
 
 ```rust
-// 使用 <-> 运算符（L2距离）
+// Using the <-> operator (L2 distance)
 let result = db.query("
     SELECT * FROM documents
     ORDER BY embedding <-> [0.1, 0.2, ..., 0.5]
     LIMIT 10
 ")?;
 
-// 使用 <#> 运算符（内积）
+// Using the <#> operator (inner product)
 let result = db.query("
     SELECT * FROM documents
     ORDER BY embedding <#> [0.1, 0.2, ..., 0.5]
     LIMIT 10
 ")?;
 
-// 使用 <=> 运算符（余弦距离）
+// Using the <=> operator (cosine distance)
 let result = db.query("
     SELECT * FROM documents
     ORDER BY embedding <=> [0.1, 0.2, ..., 0.5]
@@ -401,16 +401,16 @@ let result = db.query("
 ")?;
 ```
 
-### 全文搜索
+### Full-Text Search
 
 ```rust
-// MATCH 函数
+// MATCH function
 let result = db.query("
     SELECT * FROM articles
     WHERE MATCH(content, 'rust database')
 ")?;
 
-// 带 BM25 分数
+// With BM25 score
 let result = db.query("
     SELECT *, BM25_SCORE(content, 'rust database') as score
     FROM articles
@@ -420,16 +420,16 @@ let result = db.query("
 ")?;
 ```
 
-### 空间查询
+### Spatial Queries
 
 ```rust
-// ST_WITHIN 函数
+// ST_WITHIN function
 let result = db.query("
     SELECT * FROM locations
     WHERE ST_WITHIN(coords, 116.0, 39.0, 117.0, 40.0)
 ")?;
 
-// ST_DISTANCE 函数
+// ST_DISTANCE function
 let result = db.query("
     SELECT *, ST_DISTANCE(coords, 116.4, 39.9) as distance
     FROM locations
@@ -438,21 +438,21 @@ let result = db.query("
 ")?;
 ```
 
-## 解析查询结果
+## Parsing Query Results
 
 ```rust
 let results = db.query("SELECT * FROM users WHERE age > 25")?;
 
-// 获取列信息
+// Get column information
 println!("Columns: {:?}", results.columns);
 
-// 遍历行
+// Iterate over rows
 for row_map in results.rows_as_maps() {
-    // 获取字段值
+    // Get field values
     if let Some(name) = row_map.get("name") {
         println!("Name: {:?}", name);
     }
-    
+
     if let Some(age) = row_map.get("age") {
         if let motedb::Value::Integer(age_val) = age {
             println!("Age: {}", age_val);
@@ -460,25 +460,25 @@ for row_map in results.rows_as_maps() {
     }
 }
 
-// 获取行数
+// Get row count
 println!("Total rows: {}", results.row_count());
 ```
 
-## 最佳实践
+## Best Practices
 
-1. **使用参数化查询**（避免 SQL 注入）
-2. **创建合适的索引**（提升查询性能）
-3. **使用 LIMIT**（限制返回数据量）
-4. **避免 SELECT ***（明确指定需要的列）
-5. **使用事务**（保证数据一致性）
+1. **Use parameterized queries** (prevent SQL injection)
+2. **Create appropriate indexes** (improve query performance)
+3. **Use LIMIT** (restrict the amount of returned data)
+4. **Avoid SELECT *** (explicitly specify the columns you need)
+5. **Use transactions** (ensure data consistency)
 
-## 下一步
+## Next Steps
 
-- [批量操作](./04-batch-operations.md) - 高性能批量插入
-- [索引系统](./06-indexes-overview.md) - 深入了解索引
-- [API 参考](./14-api-reference.md) - 完整 API 文档
+- [Batch Operations](./04-batch-operations.md) - High-performance batch inserts
+- [Index System](./06-indexes-overview.md) - Deep dive into indexes
+- [API Reference](./14-api-reference.md) - Complete API documentation
 
 ---
 
-**上一篇**: [快速开始](./01-quick-start.md)  
-**下一篇**: [批量操作](./04-batch-operations.md)
+**Previous**: [Quick Start](./01-quick-start.md)
+**Next**: [Batch Operations](./04-batch-operations.md)

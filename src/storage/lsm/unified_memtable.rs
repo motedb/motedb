@@ -466,7 +466,7 @@ mod tests {
         for (row_id, entry, distance) in results {
             assert!(!entry.deleted);
             assert!(entry.vector.is_some());
-            println!("Found row_id={}, distance={:.4}", row_id, distance);
+            debug_log!("Found row_id={}, distance={:.4}", row_id, distance);
         }
     }
     
@@ -484,7 +484,7 @@ mod tests {
         
         let size_after = memtable.size();
         assert!(size_after > 0);
-        println!("Memory size: {} bytes", size_after);
+        debug_log!("Memory size: {} bytes", size_after);
         
         // 应该约等于: 4 (data) + 512 (vector) + 16 (metadata) = 532 bytes
         assert!(size_after >= 500 && size_after <= 600);

@@ -1,8 +1,8 @@
-# 事务管理 (Transactions)
+# Transaction Management
 
-MoteDB 采用 MVCC + WAL 架构，提供 BEGIN / COMMIT / ROLLBACK / SAVEPOINT/ RELEASE 等完整能力，默认所有 SQL 语句都在隐式事务中执行，可通过 API 获得更细粒度控制。
+MoteDB uses an MVCC + WAL architecture, providing full support for BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE. By default, all SQL statements execute within implicit transactions. Finer-grained control is available through the API.
 
-## 快速示例
+## Quick Example
 
 ```rust
 use motedb::Database;
@@ -16,18 +16,18 @@ db.execute("UPDATE accounts SET balance = balance + 100 WHERE id = 2")?;
 db.commit_transaction(tx)?;
 ```
 
-## API 对照
+## API Reference
 
-| 功能 | SQL | Rust API |
+| Feature | SQL | Rust API |
 |------|-----|----------|
-| 开始事务 | `BEGIN` | `db.begin_transaction()` |
-| 提交事务 | `COMMIT` | `db.commit_transaction(tx_id)` |
-| 回滚事务 | `ROLLBACK` | `db.rollback_transaction(tx_id)` |
-| 保存点 | `SAVEPOINT sp1` | `db.savepoint(tx_id, "sp1")` |
-| 回滚到保存点 | `ROLLBACK TO sp1` | `db.rollback_to_savepoint(tx_id, "sp1")` |
-| 释放保存点 | `RELEASE sp1` | `db.release_savepoint(tx_id, "sp1")` |
+| Begin transaction | `BEGIN` | `db.begin_transaction()` |
+| Commit transaction | `COMMIT` | `db.commit_transaction(tx_id)` |
+| Rollback transaction | `ROLLBACK` | `db.rollback_transaction(tx_id)` |
+| Savepoint | `SAVEPOINT sp1` | `db.savepoint(tx_id, "sp1")` |
+| Rollback to savepoint | `ROLLBACK TO sp1` | `db.rollback_to_savepoint(tx_id, "sp1")` |
+| Release savepoint | `RELEASE sp1` | `db.release_savepoint(tx_id, "sp1")` |
 
-## 保存点示例
+## Savepoint Example
 
 ```rust
 let tx = db.begin_transaction()?;
@@ -36,22 +36,22 @@ db.execute("INSERT INTO orders VALUES (1001, 'Alice')")?;
 db.savepoint(tx, "after_alice")?;
 
 db.execute("INSERT INTO orders VALUES (1002, 'Bob')")?;
-db.rollback_to_savepoint(tx, "after_alice")?; // 仅撤销 Bob
+db.rollback_to_savepoint(tx, "after_alice")?; // Only undo Bob
 
-db.commit_transaction(tx)?; // Alice 保留
+db.commit_transaction(tx)?; // Alice is retained
 ```
 
-## 自动提交模式
+## Auto-commit Mode
 
-- 默认每条 SQL 自动提交
-- 使用 `BEGIN` 或 API `begin_transaction()` 进入显式事务
-- Drop `Database` 时会自动 `flush()`，未提交的事务将回滚
+- Each SQL statement is automatically committed by default
+- Use `BEGIN` or the API `begin_transaction()` to enter an explicit transaction
+- Dropping the `Database` instance triggers an automatic `flush()`; uncommitted transactions will be rolled back
 
-## 并发与隔离
+## Concurrency and Isolation
 
-- MVCC：读操作不会阻塞写操作
-- 写-写冲突：第二个事务在 `commit` 时检测版本冲突并回滚
-- 建议配合 `transaction_stats()` 监控活跃事务与冲突率
+- MVCC: Read operations do not block write operations
+- Write-write conflicts: The second transaction detects a version conflict at `commit` time and rolls back
+- It is recommended to use `transaction_stats()` to monitor active transactions and conflict rates
 
 ```rust
 let stats = db.transaction_stats();
@@ -63,25 +63,25 @@ println!("active={} committed={} aborted={}"
 
 ## WAL & Checkpoint
 
-- 事务提交 → WAL 先落盘 → LSM 合并 → Checkpoint
-- 对性能敏感场景可在 `DBConfig` 中将 `durability_level` 调整为 `Memory`
-- 生产环境推荐 `DurabilityLevel::Full + enable_wal = true`
+- Transaction commit -> WAL writes to disk first -> LSM compaction -> Checkpoint
+- For latency-sensitive scenarios, set `durability_level` to `Memory` in `DBConfig`
+- For production environments, `DurabilityLevel::Full + enable_wal = true` is recommended
 
-## 性能建议
+## Performance Recommendations
 
-- 批量写入放在同一个事务（减少 WAL flush）
-- 只在需要时使用保存点，避免过多元数据
-- Long-running 查询建议在副本或快照上执行
+- Group bulk writes in a single transaction (reduces WAL flushes)
+- Use savepoints only when needed to avoid excessive metadata overhead
+- For long-running queries, consider executing on a replica or snapshot
 
-## 故障排查
+## Troubleshooting
 
-| 问题 | 解决方案 |
+| Problem | Solution |
 |------|----------|
-| 事务提交慢 | 调整 `memtable_size_mb`、批量 flush、检查磁盘 IO |
-| 经常回滚 | 监控 `stats.total_aborted`，优化冲突热点列 |
-| 恢复失败 | 确认 WAL 目录权限 / 空间充足，执行 `db.execute("CHECKPOINT")` |
+| Slow transaction commits | Adjust `memtable_size_mb`, batch flush, check disk I/O |
+| Frequent rollbacks | Monitor `stats.total_aborted`, optimize conflict hot-spot columns |
+| Recovery failure | Verify WAL directory permissions / available disk space, run `db.execute("CHECKPOINT")` |
 
 ---
 
-- 上一篇：[04 批量操作](./04-batch-operations.md)
-- 下一篇：[06 索引概览](./06-indexes-overview.md)
+- Previous: [04 Batch Operations](./04-batch-operations.md)
+- Next: [06 Index Overview](./06-indexes-overview.md)

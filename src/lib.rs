@@ -32,6 +32,10 @@ macro_rules! debug_log {
         {
             println!($($arg)*);
         }
+        #[cfg(not(debug_assertions))]
+        let _ = || {
+            let _ = format_args!($($arg)*);
+        };
     };
 }
 

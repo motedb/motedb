@@ -1,40 +1,40 @@
-# MoteDB 文档
+# MoteDB Documentation
 
-全球首款面向具身智能场景的 AI 原生嵌入式数据库。
+The world's first AI-native embedded database designed for embodied intelligence scenarios.
 
-是专为家庭机器人、AR 眼镜、工业机械臂等边缘设备设计的嵌入式数据库，原生支持向量、文本、时序、空间坐标的统一存储与查询。MoteDB 将多模态数据类型作为第一类公民，提供低延迟的在线检索、强一致的数据语义，以及面向具身智能感知与决策的查询扩展。
-## 📚 文档目录
+It is an embedded database purpose-built for edge devices such as home robots, AR glasses, and industrial robotic arms, with native support for unified storage and querying of vectors, text, time series, and spatial coordinates. MoteDB treats multimodal data types as first-class citizens, providing low-latency online retrieval, strongly consistent data semantics, and query extensions tailored for embodied intelligence perception and decision-making.
+## 📚 Documentation Index
 
-### 快速开始
-- **快速开始指南**: [./01-quick-start.md](./01-quick-start.md) - 5分钟入门 MoteDB
-- **安装配置**: [./02-installation.md](./02-installation.md) - 安装、配置与部署参数
+### Getting Started
+- **Quick Start Guide**: [./01-quick-start.md](./01-quick-start.md) - Get started with MoteDB in 5 minutes
+- **Installation & Configuration**: [./02-installation.md](./02-installation.md) - Installation, configuration, and deployment parameters
 
-### 核心功能
-- **SQL 操作**: [./03-sql-operations.md](./03-sql-operations.md) - 完整 SQL 语法与查询模板
-- **批量操作**: [./04-batch-operations.md](./04-batch-operations.md) - 高性能批量写入（10-20× 提升）
-- **事务管理**: [./05-transactions.md](./05-transactions.md) - MVCC、WAL、保存点用法
-- **API 参考**: [./14-api-reference.md](./14-api-reference.md) - 所有公开 API 与示例
+### Core Features
+- **SQL Operations**: [./03-sql-operations.md](./03-sql-operations.md) - Complete SQL syntax and query templates
+- **Batch Operations**: [./04-batch-operations.md](./04-batch-operations.md) - High-performance batch writes (10-20x improvement)
+- **Transaction Management**: [./05-transactions.md](./05-transactions.md) - MVCC, WAL, and savepoint usage
+- **API Reference**: [./14-api-reference.md](./14-api-reference.md) - All public APIs with examples
 
-### 索引系统
-- **索引概览**: [./06-indexes-overview.md](./06-indexes-overview.md) - 五大索引如何协同
-- **列索引**: [./07-column-index.md](./07-column-index.md) - 等值/范围查询
-- **向量索引**: [./08-vector-index.md](./08-vector-index.md) - FreshDiskANN & rerank
-- **全文索引**: [./09-text-index.md](./09-text-index.md) - BM25 与分词插件
-- **空间索引**: [./10-spatial-index.md](./10-spatial-index.md) - R-Tree 与地理查询
-- **时间序列索引**: [./11-timestamp-index.md](./11-timestamp-index.md) - 范围扫描与压缩
+### Index System
+- **Index Overview**: [./06-indexes-overview.md](./06-indexes-overview.md) - How the five index types work together
+- **Column Index**: [./07-column-index.md](./07-column-index.md) - Equality and range queries
+- **Vector Index**: [./08-vector-index.md](./08-vector-index.md) - FreshDiskANN & rerank
+- **Full-Text Index**: [./09-text-index.md](./09-text-index.md) - BM25 and tokenization plugins
+- **Spatial Index**: [./10-spatial-index.md](./10-spatial-index.md) - R-Tree and geospatial queries
+- **Time Series Index**: [./11-timestamp-index.md](./11-timestamp-index.md) - Range scans and compression
 
-### 高级主题
-- **性能优化**: [./12-performance.md](./12-performance.md) - 配置、调优与监控
-- **数据类型**: [./13-data-types.md](./13-data-types.md) - `Value` 枚举与 Schema 设计
+### Advanced Topics
+- **Performance Tuning**: [./12-performance.md](./12-performance.md) - Configuration, tuning, and monitoring
+- **Data Types**: [./13-data-types.md](./13-data-types.md) - `Value` enum and schema design
 
-### 最佳实践
-- **生产经验**: [./15-best-practices.md](./15-best-practices.md) - 架构、写入、索引策略
-- **常见问题**: [./16-faq.md](./16-faq.md) - 调试、部署与故障排查
+### Best Practices
+- **Production Experience**: [./15-best-practices.md](./15-best-practices.md) - Architecture, writes, and indexing strategies
+- **FAQ**: [./16-faq.md](./16-faq.md) - Debugging, deployment, and troubleshooting
 
-## 🚀 核心特性
+## 🚀 Core Features
 
-### 1. **SQL 引擎**
-完整 SQL 支持，包含子查询、聚合、JOIN、索引管理。
+### 1. **SQL Engine**
+Full SQL support, including subqueries, aggregation, JOINs, and index management.
 
 ```rust
 let db = Database::open("data.mote")?;
@@ -43,22 +43,22 @@ db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")?;
 let results = db.query("SELECT * FROM users WHERE id = 1")?;
 ```
 
-### 2. **多模态索引**
-五大索引类型支持不同数据场景：
+### 2. **Multimodal Indexes**
+Five index types supporting different data scenarios:
 
-| 索引类型 | 用途 | 性能提升 |
+| Index Type | Use Case | Performance Boost |
 |---------|------|---------|
-| 列索引 (COLUMN) | 等值/范围查询 | 40x |
-| 向量索引 (VECTOR) | KNN 相似度搜索 | 100x |
-| 全文索引 (TEXT) | BM25 文本搜索 | 50x |
-| 空间索引 (SPATIAL) | 地理位置查询 | 30x |
-| 时间序列 (TIMESTAMP) | 时间范围查询 | 20x |
+| Column Index (COLUMN) | Equality/range queries | 40x |
+| Vector Index (VECTOR) | KNN similarity search | 100x |
+| Full-Text Index (TEXT) | BM25 text search | 50x |
+| Spatial Index (SPATIAL) | Geospatial queries | 30x |
+| Time Series (TIMESTAMP) | Time range queries | 20x |
 
-### 3. **高性能批量操作**
-批量插入比逐行插入快 10-20 倍：
+### 3. **High-Performance Batch Operations**
+Batch inserts are 10-20x faster than row-by-row inserts:
 
 ```rust
-// 批量插入 10000 条数据
+// Batch insert 10,000 records
 let mut rows = Vec::new();
 for i in 0..10000 {
     let mut row = HashMap::new();
@@ -68,11 +68,11 @@ for i in 0..10000 {
 }
 
 let row_ids = db.batch_insert_map("users", rows)?;
-// 吞吐量: 737,112 rows/sec
+// Throughput: 737,112 rows/sec
 ```
 
-### 4. **MVCC 事务**
-完整的事务支持，包含 Savepoint：
+### 4. **MVCC Transactions**
+Full transaction support, including savepoints:
 
 ```rust
 let tx_id = db.begin_transaction()?;
@@ -81,44 +81,44 @@ db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
 db.savepoint(tx_id, "sp1")?;
 
 db.execute("INSERT INTO users VALUES (2, 'Bob', 30)")?;
-db.rollback_to_savepoint(tx_id, "sp1")?; // 只回滚 Bob
+db.rollback_to_savepoint(tx_id, "sp1")?; // Only rolls back Bob
 
 db.commit_transaction(tx_id)?;
 ```
 
-## 🎯 适用场景
+## 🎯 Use Cases
 
-- **嵌入式 AI 应用**: 机器人、边缘计算设备
-- **向量数据库**: RAG、语义搜索、推荐系统
-- **时空数据**: 地理位置、传感器数据
-- **全文搜索**: 文档检索、日志分析
-- **实时分析**: 时间序列数据
+- **Embedded AI Applications**: Robots, edge computing devices
+- **Vector Database**: RAG, semantic search, recommendation systems
+- **Spatiotemporal Data**: Geospatial locations, sensor data
+- **Full-Text Search**: Document retrieval, log analysis
+- **Real-Time Analytics**: Time series data
 
-## 📊 性能指标
+## 📊 Performance Metrics
 
-- **批量插入**: 737,112 rows/sec (10000条)
-- **向量搜索**: 延迟 < 5ms (召回率 95%)
-- **列索引查询**: 提升 40 倍
-- **内存占用**: 核心数据结构 < 100MB
-- **事务吞吐**: 10000 TPS
+- **Batch Insert**: 737,112 rows/sec (10,000 records)
+- **Vector Search**: Latency < 5ms (95% recall)
+- **Column Index Query**: 40x improvement
+- **Memory Usage**: Core data structures < 100MB
+- **Transaction Throughput**: 10,000 TPS
 
-## 💡 推荐使用方式
+## 💡 Recommended Usage
 
-1. **主要使用 SQL API** - 简洁、强大、易用
-2. **批量操作优先** - 使用 `batch_insert_map()` 而非逐行插入
-3. **合理使用索引** - 根据查询模式选择合适的索引类型
-4. **启用事务** - 保证数据一致性
+1. **Use the SQL API primarily** - concise, powerful, and easy to use
+2. **Prefer batch operations** - use `batch_insert_map()` instead of row-by-row inserts
+3. **Use indexes wisely** - choose the appropriate index type based on your query patterns
+4. **Enable transactions** - ensure data consistency
 
-## 🔗 快速链接
+## 🔗 Quick Links
 
-- [GitHub 仓库](https://github.com/yourusername/motedb)
-- [API 文档](https://docs.rs/motedb)
+- [GitHub Repository](https://github.com/yourusername/motedb)
+- [API Documentation](https://docs.rs/motedb)
 
-## 📝 版本信息
+## 📝 Version Information
 
-当前文档对应版本: v0.1.0  
-最后更新: 2026-01-11
+Documentation version: v0.1.0
+Last updated: 2026-01-11
 
 ---
 
-**下一步**: 阅读 [快速开始指南](./01-quick-start.md) 开始使用 MoteDB
+**Next**: Read the [Quick Start Guide](./01-quick-start.md) to begin using MoteDB

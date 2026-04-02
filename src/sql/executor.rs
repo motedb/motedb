@@ -699,7 +699,7 @@ impl QueryExecutor {
             let batch_results = match db.lsm_engine.batch_get(&keys) {
                 Ok(results) => results,
                 Err(e) => {
-                    eprintln!("[range_streaming] batch_get failed: {:?}", e);
+                    debug_log!("[range_streaming] batch_get failed: {:?}", e);
                     return vec![Err(e)];
                 }
             };
@@ -1177,7 +1177,7 @@ impl QueryExecutor {
                         
                         if selectivity < SELECTIVITY_THRESHOLD {
                             // ✅ Low selectivity (< 10%): Use index (faster!)
-                            eprintln!(
+                            debug_log!(
                                 "[Smart Index] Using INDEX SCAN: {} rows / {} total = {:.1}% selectivity",
                                 result_count, table_count, selectivity * 100.0
                             );
@@ -1221,7 +1221,7 @@ impl QueryExecutor {
                         (sql_rows, prefixed_schema)
                         } else {
                             // 🚀 High selectivity (>= 15%): Use真正的流式扫描 (O(1) memory!)
-                            eprintln!(
+                            debug_log!(
                                 "[Smart Index] Using STREAMING SCAN: {} rows / {} total = {:.1}% selectivity (>= 15%)",
                                 result_count, table_count, selectivity * 100.0
                             );
@@ -3050,7 +3050,7 @@ impl QueryExecutor {
         
         if has_vector_column && prepared_rows.len() > 1 {
             // 🚀 批量插入路径：提升向量索引质量
-            eprintln!("[SQL] 🔥 Batch inserting {} rows with vector columns...", prepared_rows.len());
+            debug_log!("[SQL] 🔥 Batch inserting {} rows with vector columns...", prepared_rows.len());
             
             // 提取所有row_id和向量数据
             let mut vector_batches: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>> = 
@@ -3078,14 +3078,14 @@ impl QueryExecutor {
             // 批量插入向量到索引（使用公开API）
             // 🔧 修复：如果索引不存在，跳过（稍后通过CREATE INDEX构建）
             for (index_name, batch) in vector_batches {
-                eprintln!("[SQL]   ↳ Batch indexing {} vectors to '{}'...", batch.len(), index_name);
+                debug_log!("[SQL]   ↳ Batch indexing {} vectors to '{}'...", batch.len(), index_name);
                 let insert_start = std::time::Instant::now();
                 match self.db.batch_update_vectors(&index_name, batch) {
                     Ok(_) => {
-                        eprintln!("[SQL]   ✓ Indexed in {:?}", insert_start.elapsed());
+                        debug_log!("[SQL]   ✓ Indexed in {:?}", insert_start.elapsed());
                     },
                     Err(e) if e.to_string().contains("not found") => {
-                        eprintln!("[SQL]   ⚠️  Index '{}' not found, skipping (will be built by CREATE INDEX)", index_name);
+                        debug_log!("[SQL]   ⚠️  Index '{}' not found, skipping (will be built by CREATE INDEX)", index_name);
                     },
                     Err(e) => return Err(e),
                 }
@@ -3490,7 +3490,7 @@ impl QueryExecutor {
                             let mut index = index_arc.write();
                             for (row_id, text) in texts_in_batch {
                                 if let Err(e) = index.insert(row_id, text) {
-                                    eprintln!("⚠️ Failed to backfill text index for row {}: {}", row_id, e);
+                                    debug_log!("⚠️ Failed to backfill text index for row {}: {}", row_id, e);
                                 } else {
                                     backfill_count += 1;
                                 }
@@ -3501,7 +3501,7 @@ impl QueryExecutor {
                 }
                 
                 if backfill_count > 0 {
-                    eprintln!("Built text index in {:?}, indexed {} rows", start_time.elapsed(), backfill_count);
+                    debug_log!("Built text index in {:?}, indexed {} rows", start_time.elapsed(), backfill_count);
                 }
                 
                 // 3️⃣ Register metadata
@@ -3566,7 +3566,7 @@ impl QueryExecutor {
                     let (row_id, row) = result?;
                     if let Some(Value::Spatial(geometry)) = row.get(column_pos) {
                         if let Err(e) = self.db.insert_geometry(row_id, &index_name, geometry.clone()) {
-                            eprintln!("⚠️ Failed to backfill spatial index for row {}: {}", row_id, e);
+                            debug_log!("⚠️ Failed to backfill spatial index for row {}: {}", row_id, e);
                         } else {
                             backfill_count += 1;
                         }
@@ -3574,7 +3574,7 @@ impl QueryExecutor {
                 }
                 
                 if backfill_count > 0 {
-                    eprintln!("Backfilled {} rows into spatial index '{}'", backfill_count, index_name);
+                    debug_log!("Backfilled {} rows into spatial index '{}'", backfill_count, index_name);
                 }
                 
                 // 3️⃣ Register metadata

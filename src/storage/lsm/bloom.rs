@@ -281,7 +281,7 @@ mod tests {
         }
         
         let fpr = false_positives as f64 / test_count as f64;
-        println!("False positive rate: {:.2}%", fpr * 100.0);
+        debug_log!("False positive rate: {:.2}%", fpr * 100.0);
         
         // Should be around 1% (allow up to 3% for small sample)
         assert!(fpr < 0.03, "FPR too high: {:.2}%", fpr * 100.0);

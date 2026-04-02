@@ -58,7 +58,7 @@ impl MoteDB {
                         match self.lsm_engine.resolve_blob(blob_ref) {
                             Ok(data) => data,
                             Err(e) => {
-                                eprintln!("[update_timestamp_index_incremental] Failed to resolve blob for row {}: {}", row_id, e);
+                                debug_log!("[update_timestamp_index_incremental] Failed to resolve blob for row {}: {}", row_id, e);
                                 continue;
                             }
                         }

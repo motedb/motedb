@@ -1693,7 +1693,7 @@ mod tests {
             assert_eq!(result, Some(i * 10), "Key {} missing or wrong", i);
         }
         
-        println!("Stats: {:?}", btree.stats());
+        debug_log!("Stats: {:?}", btree.stats());
     }
     
     #[test]

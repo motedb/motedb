@@ -171,7 +171,7 @@ impl FreshVamanaGraph {
         
         self.insert_count.fetch_add(batch_size, Ordering::Relaxed);
         
-        eprintln!("[FreshGraph] 批量插入 {} 个向量: 插入={:?}, 建图={:?}, 总计={:?}", 
+        debug_log!("[FreshGraph] 批量插入 {} 个向量: 插入={:?}, 建图={:?}, 总计={:?}",
             batch_size, insert_time, graph_time, start.elapsed());
         
         Ok(())
@@ -213,7 +213,7 @@ impl FreshVamanaGraph {
             self.batch_build_graph_parallel(&node_ids, max_degree)?;
         }
         
-        eprintln!("[FreshGraph] 批量构建图完成：{} 个节点，耗时: {:?}", 
+        debug_log!("[FreshGraph] 批量构建图完成：{} 个节点，耗时: {:?}",
             node_count, start.elapsed());
         
         Ok(())
@@ -273,7 +273,7 @@ impl FreshVamanaGraph {
             })
             .collect();
         
-        eprintln!("[FreshGraph] 预加载 {} 个向量", vectors.len());
+        debug_log!("[FreshGraph] 预加载 {} 个向量", vectors.len());
         
         // 🚀 Phase 2: 并行计算每个节点的邻居（自动SIMD优化）
         let neighbors_list: Vec<_> = vectors.par_iter()
@@ -299,7 +299,7 @@ impl FreshVamanaGraph {
             })
             .collect();
         
-        eprintln!("[FreshGraph] 计算 {} 个节点的邻居（自动SIMD优化）", neighbors_list.len());
+        debug_log!("[FreshGraph] 计算 {} 个节点的邻居（自动SIMD优化）", neighbors_list.len());
         
         // 🚀 Phase 3: 批量更新邻居列表
         for (node_id, neighbors) in neighbors_list {

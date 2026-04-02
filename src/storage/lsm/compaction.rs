@@ -303,7 +303,7 @@ impl CompactionWorker {
 
         // Discover existing SSTables on disk
         if let Err(e) = worker.discover_sstables() {
-            eprintln!("[CompactionWorker] Warning: failed to discover SSTables: {:?}", e);
+            debug_log!("[CompactionWorker] Warning: failed to discover SSTables: {:?}", e);
         }
 
         worker
@@ -347,7 +347,7 @@ impl CompactionWorker {
                         discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
                     }
                     Err(e) => {
-                        eprintln!("[CompactionWorker] Warning: skipping corrupt SSTable {:?}: {:?}", path, e);
+                        debug_log!("[CompactionWorker] Warning: skipping corrupt SSTable {:?}: {:?}", path, e);
                     }
                 }
             }
@@ -544,7 +544,7 @@ impl CompactionWorker {
                 Ok(sstable) => all_inputs.push(sstable),
                 Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     // File disappeared between filter and open (rare race condition)
-                    eprintln!("⚠️ SSTable disappeared during open: {:?}", meta.path);
+                    debug_log!("⚠️ SSTable disappeared during open: {:?}", meta.path);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -901,7 +901,7 @@ impl CompactionWorker {
             match SSTable::open(&meta.path) {
                 Ok(sstable) => all_inputs.push(sstable),
                 Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("⚠️ SSTable disappeared during open: {:?}", meta.path);
+                    debug_log!("⚠️ SSTable disappeared during open: {:?}", meta.path);
                     continue;
                 }
                 Err(e) => return Err(e),

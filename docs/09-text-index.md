@@ -1,15 +1,15 @@
-# 全文索引 (Text Index)
+# Text Index
 
-基于自研 BM25 + 可插拔分词器的全文检索引擎，支持中文、英文及 n-gram token。
+A full-text search engine based on a custom BM25 implementation with pluggable tokenizers, supporting Chinese, English, and n-gram tokens.
 
-## 特性概览
+## Feature Overview
 
-- BM25 排序 + TF/IDF 统计
-- Tokenizer 插件：Whitespace、N-Gram、Jieba（通过 `tokenizers` 模块扩展）
-- 语法：`MATCH(column, 'query')` + `BM25_SCORE`
-- 支持与 SQL 条件组合 (WHERE、ORDER BY、LIMIT)
+- BM25 ranking + TF/IDF statistics
+- Tokenizer plugins: Whitespace, N-Gram, Jieba (extensible via the `tokenizers` module)
+- Syntax: `MATCH(column, 'query')` + `BM25_SCORE`
+- Supports combination with SQL conditions (WHERE, ORDER BY, LIMIT)
 
-## 建表与索引
+## Table Creation and Indexing
 
 ```sql
 CREATE TABLE articles (
@@ -22,7 +22,7 @@ CREATE TABLE articles (
 CREATE TEXT INDEX articles_content ON articles(content);
 ```
 
-## 查询范式
+## Query Patterns
 
 ```sql
 SELECT id, title, BM25_SCORE(content, 'rust database') AS score
@@ -32,7 +32,7 @@ ORDER BY score DESC
 LIMIT 20;
 ```
 
-API 风格：
+API style:
 
 ```rust
 let hits = db.text_search_ranked("articles_content", "rust database", 20)?;
@@ -41,15 +41,15 @@ for (row_id, score) in hits {
 }
 ```
 
-## 数据导入与刷新
+## Data Import and Refresh
 
-- 标准 `INSERT`/`batch_insert_map()` 即可；全文索引会监听 WAL 更新并增量合并
-- 大规模导入可以：
+- Standard `INSERT` / `batch_insert_map()` works; the full-text index listens for WAL updates and merges incrementally
+- For large-scale imports:
   1. `batch_insert_map()`
   2. `db.execute("REBUILD TEXT INDEX articles_content")`
   3. `db.flush()?`
 
-## Tokenizer 配置
+## Tokenizer Configuration
 
 ```sql
 CREATE TEXT INDEX articles_content
@@ -57,19 +57,19 @@ ON articles(content)
 USING TOKENIZER ngram(2);
 ```
 
-可选项：
-- `whitespace`（默认）
+Available options:
+- `whitespace` (default)
 - `ngram(n)`
-- `jieba`（需启用插件）
+- `jieba` (requires plugin enabled)
 
-## 性能指标
+## Performance Metrics
 
-| 语料 | QPS | 平均延迟 | 索引体积 |
-|------|-----|----------|----------|
-| 10k 中文段落 | 2.1k | 3.8 ms | 6.8 MB |
-| 100k 英文段落 | 1.4k | 6.2 ms | 41 MB |
+| Corpus | QPS | Avg Latency | Index Size |
+|--------|-----|-------------|------------|
+| 10k Chinese paragraphs | 2.1k | 3.8 ms | 6.8 MB |
+| 100k English paragraphs | 1.4k | 6.2 ms | 41 MB |
 
-## 排序与过滤
+## Sorting and Filtering
 
 ```sql
 SELECT id, title
@@ -80,21 +80,21 @@ ORDER BY published_at DESC
 LIMIT 10;
 ```
 
-## 调优建议
+## Tuning Recommendations
 
-- **召回优先**：增大 n-gram、保留停用词
-- **性能优先**：启用前缀压缩、定期 `VACUUM TEXT INDEX`
-- **多语言**：通过 `tokenizers` 模块注册自定义分词器
+- **Prioritize recall**: increase n-gram size, keep stop words
+- **Prioritize performance**: enable prefix compression, periodically run `VACUUM TEXT INDEX`
+- **Multi-language**: register custom tokenizers via the `tokenizers` module
 
-## 故障排查
+## Troubleshooting
 
-| 现象 | 解决方法 |
-|------|----------|
-| 查询无结果 | 确认 `MATCH` 字段与索引字段一致；检查停用词表 |
-| 索引体积过大 | 启用分段压缩，或对长文本预截断 |
-| 分词错误 | 切换 Tokenizer，或更新插件词典 |
+| Symptom | Solution |
+|---------|----------|
+| No query results | Verify that the `MATCH` field matches the indexed field; check the stop word list |
+| Index size too large | Enable segment compression, or pre-truncate long texts |
+| Incorrect tokenization | Switch tokenizer, or update the plugin dictionary |
 
 ---
 
-- 上一篇：[08 向量索引](./08-vector-index.md)
-- 下一篇：[10 空间索引](./10-spatial-index.md)
+- Previous: [08 Vector Index](./08-vector-index.md)
+- Next: [10 Spatial Index](./10-spatial-index.md)

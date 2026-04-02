@@ -63,7 +63,7 @@ impl MoteDB {
                 if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                     let col_position = col_def.position;
                     
-                    println!("[create_spatial_index] 🔍 使用scan_range扫描LSM（方案B）...");
+                    debug_log!("[create_spatial_index] 🔍 使用scan_range扫描LSM（方案B）...");
                     let start_time = std::time::Instant::now();
                     
                     // 计算表的key范围
@@ -89,7 +89,7 @@ impl MoteDB {
                                         match self.lsm_engine.resolve_blob(blob_ref) {
                                             Ok(data) => data,
                                             Err(e) => {
-                                                eprintln!("[create_spatial_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                                debug_log!("[create_spatial_index] Failed to resolve blob for row {}: {}", row_id, e);
                                                 continue;
                                             }
                                         }
@@ -104,25 +104,25 @@ impl MoteDB {
                             }
                         }
                         Err(e) => {
-                            eprintln!("[create_spatial_index] ⚠️ scan_range失败: {}", e);
+                            debug_log!("[create_spatial_index] ⚠️ scan_range失败: {}", e);
                         }
                     }
                     
                     let scan_time = start_time.elapsed();
                     
                     if !geometries_to_index.is_empty() {
-                        println!("[create_spatial_index] 🚀 扫描完成：{} 个几何对象，耗时 {:?}", 
+                        debug_log!("[create_spatial_index] 🚀 扫描完成：{} 个几何对象，耗时 {:?}",
                                  geometries_to_index.len(), scan_time);
                         
                         let build_time = std::time::Instant::now();
                         for (row_id, geom) in geometries_to_index {
                             if let Err(e) = index_arc.write().insert(row_id, geom) {
-                                eprintln!("[create_spatial_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
+                                debug_log!("[create_spatial_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
                             }
                         }
-                        println!("[create_spatial_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
+                        debug_log!("[create_spatial_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
                     } else {
-                        println!("[create_spatial_index] ⚠️ 未找到任何几何数据（扫描耗时 {:?}）", scan_time);
+                        debug_log!("[create_spatial_index] ⚠️ 未找到任何几何数据（扫描耗时 {:?}）", scan_time);
                     }
                 }
             }
@@ -186,7 +186,7 @@ impl MoteDB {
             
             // Strategy: consistent threshold with LSM's pending_updates (每2000条flush一次)
             if old_count / 2_000 != (old_count + count) / 2_000 {
-                println!("[AUTO-FLUSH] Spatial triggered after {} updates", old_count + count);
+                debug_log!("[AUTO-FLUSH] Spatial triggered after {} updates", old_count + count);
                 
                 // Trigger incremental flush (background thread)
                 let db_clone = self.clone_for_callback();
@@ -296,7 +296,7 @@ impl MoteDB {
         if let Some(index_ref) = self.spatial_indexes.get(name) {
             index_ref.value().read().debug_memory_usage();
         } else {
-            println!("空间索引 '{}' 不存在", name);
+            debug_log!("空间索引 '{}' 不存在", name);
         }
     }
 }

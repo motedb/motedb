@@ -288,7 +288,7 @@ impl TransactionCoordinator {
         // Push to savepoint stack
         ctx.savepoints.write().push(savepoint);
         
-        eprintln!("[Savepoint] Created delta savepoint '{}' for txn {} (mem: 0 bytes)", name, txn_id);
+        debug_log!("[Savepoint] Created delta savepoint '{}' for txn {} (mem: 0 bytes)", name, txn_id);
         
         Ok(())
     }
@@ -373,7 +373,7 @@ impl TransactionCoordinator {
         // Remove this savepoint and all later ones
         savepoints.truncate(position);
         
-        eprintln!("[Savepoint] Rolled back to '{}' in txn {} (undid {} ops)", 
+        debug_log!("[Savepoint] Rolled back to '{}' in txn {} (undid {} ops)",
                   name, txn_id, undo_count);
         
         Ok(())
@@ -404,7 +404,7 @@ impl TransactionCoordinator {
         
         savepoints.remove(position);
         
-        eprintln!("[Savepoint] Released savepoint '{}' in txn {}", name, txn_id);
+        debug_log!("[Savepoint] Released savepoint '{}' in txn {}", name, txn_id);
         
         Ok(())
     }

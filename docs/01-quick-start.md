@@ -1,35 +1,35 @@
-# 快速开始
+# Quick Start
 
-5 分钟快速上手 MoteDB，了解核心功能和使用方法。
+Get started with MoteDB in 5 minutes and learn about its core features and usage.
 
-## 安装
+## Installation
 
-在 `Cargo.toml` 中添加依赖：
+Add the dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
 motedb = "0.1"
 ```
 
-## 基础用法
+## Basic Usage
 
-### 1. 创建数据库
+### 1. Create a Database
 
 ```rust
 use motedb::{Database, Result};
 
 fn main() -> Result<()> {
-    // 创建或打开数据库
+    // Create or open a database
     let db = Database::open("myapp.mote")?;
-    
+
     Ok(())
 }
 ```
 
-### 2. 创建表
+### 2. Create Tables
 
 ```rust
-// 创建用户表
+// Create a users table
 db.execute("CREATE TABLE users (
     id INT,
     name TEXT,
@@ -37,7 +37,7 @@ db.execute("CREATE TABLE users (
     age INT
 )")?;
 
-// 创建文档表（包含向量字段）
+// Create a documents table (with a vector field)
 db.execute("CREATE TABLE documents (
     id INT,
     title TEXT,
@@ -46,27 +46,27 @@ db.execute("CREATE TABLE documents (
 )")?;
 ```
 
-### 3. 插入数据
+### 3. Insert Data
 
-#### 方式 1: SQL 插入（推荐）
+#### Method 1: SQL Insert (Recommended)
 
 ```rust
-// 单行插入
+// Single row insert
 db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', 25)")?;
 
-// 批量插入（SQL）
-db.execute("INSERT INTO users VALUES 
+// Batch insert (SQL)
+db.execute("INSERT INTO users VALUES
     (2, 'Bob', 'bob@example.com', 30),
     (3, 'Carol', 'carol@example.com', 28)")?;
 ```
 
-#### 方式 2: API 批量插入（高性能）
+#### Method 2: API Batch Insert (High Performance)
 
 ```rust
 use motedb::types::{Value, SqlRow};
 use std::collections::HashMap;
 
-// 批量插入（比 SQL 快 10-20 倍）
+// Batch insert (10-20x faster than SQL)
 let mut rows = Vec::new();
 for i in 0..1000 {
     let mut row = HashMap::new();
@@ -81,90 +81,90 @@ let row_ids = db.batch_insert_map("users", rows)?;
 println!("Inserted {} rows", row_ids.len());
 ```
 
-### 4. 查询数据
+### 4. Query Data
 
 ```rust
-// 简单查询
+// Simple query
 let results = db.query("SELECT * FROM users WHERE age > 25")?;
 println!("Found {} users", results.row_count());
 
-// 遍历结果
+// Iterate over results
 for row_map in results.rows_as_maps() {
     if let Some(name) = row_map.get("name") {
         println!("Name: {:?}", name);
     }
 }
 
-// 聚合查询
+// Aggregate query
 let avg_result = db.query("SELECT AVG(age) as avg_age FROM users")?;
 ```
 
-### 5. 更新和删除
+### 5. Update and Delete
 
 ```rust
-// 更新数据
+// Update data
 db.execute("UPDATE users SET age = 26 WHERE name = 'Alice'")?;
 
-// 删除数据
+// Delete data
 db.execute("DELETE FROM users WHERE age < 20")?;
 ```
 
-## 创建索引
+## Creating Indexes
 
-索引可以大幅提升查询性能。
+Indexes can significantly improve query performance.
 
-### 列索引（等值/范围查询）
+### Column Index (Equality/Range Queries)
 
 ```rust
-// 创建列索引（性能提升 40 倍）
+// Create a column index (40x performance improvement)
 db.execute("CREATE INDEX users_email ON users(email)")?;
 
-// 查询会自动使用索引
+// Queries will automatically use the index
 let results = db.query("SELECT * FROM users WHERE email = 'alice@example.com'")?;
 ```
 
-### 向量索引（相似度搜索）
+### Vector Index (Similarity Search)
 
 ```rust
-// 创建向量索引
+// Create a vector index
 db.execute("CREATE VECTOR INDEX docs_embedding ON documents(embedding)")?;
 
-// 向量 KNN 搜索
-let query = "SELECT * FROM documents 
-             ORDER BY embedding <-> [0.1, 0.2, ..., 0.5] 
+// Vector KNN search
+let query = "SELECT * FROM documents
+             ORDER BY embedding <-> [0.1, 0.2, ..., 0.5]
              LIMIT 10";
 let results = db.query(query)?;
 ```
 
-### 全文索引（文本搜索）
+### Full-Text Index (Text Search)
 
 ```rust
-// 创建全文索引
+// Create a full-text index
 db.execute("CREATE TEXT INDEX articles_content ON articles(content)")?;
 
-// BM25 全文搜索
+// BM25 full-text search
 let results = db.query(
     "SELECT * FROM articles WHERE MATCH(content, 'rust database')"
 )?;
 ```
 
-## 事务支持
+## Transaction Support
 
 ```rust
-// 开始事务
+// Begin a transaction
 let tx_id = db.begin_transaction()?;
 
 db.execute("INSERT INTO users VALUES (100, 'Dave', 'dave@example.com', 35)")?;
 db.execute("INSERT INTO users VALUES (101, 'Eve', 'eve@example.com', 32)")?;
 
-// 提交事务
+// Commit the transaction
 db.commit_transaction(tx_id)?;
 
-// 或者回滚
+// Or rollback
 // db.rollback_transaction(tx_id)?;
 ```
 
-### Savepoint（事务内检查点）
+### Savepoints (Transaction Checkpoints)
 
 ```rust
 let tx_id = db.begin_transaction()?;
@@ -173,22 +173,22 @@ db.execute("INSERT INTO users VALUES (200, 'Frank', 'frank@example.com', 40)")?;
 db.savepoint(tx_id, "sp1")?;
 
 db.execute("INSERT INTO users VALUES (201, 'Grace', 'grace@example.com', 38)")?;
-db.rollback_to_savepoint(tx_id, "sp1")?; // 只回滚 Grace
+db.rollback_to_savepoint(tx_id, "sp1")?; // Only rolls back Grace
 
-db.commit_transaction(tx_id)?; // Frank 会被保留
+db.commit_transaction(tx_id)?; // Frank will be preserved
 ```
 
-## 持久化
+## Persistence
 
 ```rust
-// 手动刷新到磁盘
+// Manually flush to disk
 db.flush()?;
 
-// 关闭数据库（自动刷新）
+// Close the database (auto-flushes)
 db.close()?;
 ```
 
-## 完整示例
+## Complete Example
 
 ```rust
 use motedb::{Database, Result};
@@ -196,18 +196,18 @@ use motedb::types::{Value, SqlRow};
 use std::collections::HashMap;
 
 fn main() -> Result<()> {
-    // 1. 打开数据库
+    // 1. Open the database
     let db = Database::open("demo.mote")?;
-    
-    // 2. 创建表
+
+    // 2. Create a table
     db.execute("CREATE TABLE products (
         id INT,
         name TEXT,
         price FLOAT,
         category TEXT
     )")?;
-    
-    // 3. 批量插入数据
+
+    // 3. Batch insert data
     let mut rows = Vec::new();
     for i in 0..100 {
         let mut row = HashMap::new();
@@ -220,55 +220,55 @@ fn main() -> Result<()> {
         rows.push(row);
     }
     db.batch_insert_map("products", rows)?;
-    
-    // 4. 创建索引
+
+    // 4. Create an index
     db.execute("CREATE INDEX products_category ON products(category)")?;
-    
-    // 5. 查询数据
+
+    // 5. Query data
     let results = db.query("SELECT * FROM products WHERE category = 'Electronics' AND price < 200")?;
     println!("Found {} products", results.row_count());
-    
-    // 6. 聚合查询
+
+    // 6. Aggregate query
     let avg_result = db.query("SELECT category, AVG(price) as avg_price FROM products GROUP BY category")?;
     for row_map in avg_result.rows_as_maps() {
-        println!("Category: {:?}, Avg Price: {:?}", 
-            row_map.get("category"), 
+        println!("Category: {:?}, Avg Price: {:?}",
+            row_map.get("category"),
             row_map.get("avg_price"));
     }
-    
-    // 7. 持久化
+
+    // 7. Persist data
     db.flush()?;
-    
+
     Ok(())
 }
 ```
 
-## 性能提示
+## Performance Tips
 
-1. **批量操作优先**: 使用 `batch_insert_map()` 而非逐行插入（快 10-20 倍）
-2. **合理使用索引**: 对频繁查询的列创建索引（性能提升 40 倍）
-3. **使用事务**: 多个操作放在一个事务中提高性能
-4. **定期 flush**: 确保数据持久化
+1. **Prefer batch operations**: Use `batch_insert_map()` instead of row-by-row inserts (10-20x faster)
+2. **Use indexes wisely**: Create indexes on frequently queried columns (40x performance improvement)
+3. **Use transactions**: Group multiple operations in a single transaction for better performance
+4. **Flush periodically**: Ensure data persistence
 
-## 下一步
+## Next Steps
 
-- [SQL 操作详解](./03-sql-operations.md) - 学习完整 SQL 语法
-- [批量操作指南](./04-batch-operations.md) - 高性能批量插入技巧
-- [索引系统](./06-indexes-overview.md) - 深入了解五大索引类型
-- [API 参考](./14-api-reference.md) - 完整 API 文档
+- [SQL Operations Guide](./03-sql-operations.md) - Learn the complete SQL syntax
+- [Batch Operations Guide](./04-batch-operations.md) - High-performance batch insert techniques
+- [Index System](./06-indexes-overview.md) - Deep dive into the five index types
+- [API Reference](./14-api-reference.md) - Complete API documentation
 
-## 常见问题
+## FAQ
 
-**Q: 如何选择使用 SQL 还是 API？**  
-A: 优先使用 SQL API，除非需要极致性能的批量插入，才使用 `batch_insert_map()`。
+**Q: Should I use SQL or the API?**
+A: Prefer the SQL API, unless you need maximum-performance batch inserts, in which case use `batch_insert_map()`.
 
-**Q: 索引什么时候创建？**  
-A: 数据插入后创建索引，或者插入前创建（会自动增量更新）。
+**Q: When should I create indexes?**
+A: You can create indexes after data insertion, or create them before insertion (they will be incrementally updated automatically).
 
-**Q: 如何保证数据不丢失？**  
-A: 使用事务 + 定期 `flush()`，或在关键操作后调用 `flush()`。
+**Q: How do I ensure no data is lost?**
+A: Use transactions combined with periodic `flush()` calls, or call `flush()` after critical operations.
 
 ---
 
-**上一篇**: [安装配置](./02-installation.md)  
-**下一篇**: [SQL 操作](./03-sql-operations.md)
+**Previous**: [Installation & Configuration](./02-installation.md)
+**Next**: [SQL Operations](./03-sql-operations.md)

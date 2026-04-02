@@ -1,42 +1,42 @@
-# 索引系统概览
+# Index System Overview
 
-MoteDB 支持五大索引类型，针对不同查询场景进行优化。
+MoteDB supports five major index types, each optimized for different query scenarios.
 
-## 索引类型总览
+## Index Types Summary
 
-| 索引类型 | 用途 | 性能提升 | 适用场景 |
+| Index Type | Use Case | Performance Boost | Applicable Scenarios |
 |---------|------|---------|---------|
-| [列索引](#列索引-column) | 等值/范围查询 | 40x | WHERE 条件、JOIN |
-| [向量索引](#向量索引-vector) | KNN 相似度搜索 | 100x | RAG、推荐系统 |
-| [全文索引](#全文索引-text) | BM25 文本搜索 | 50x | 文档检索、日志分析 |
-| [空间索引](#空间索引-spatial) | 地理位置查询 | 30x | LBS、轨迹分析 |
-| [时间序列](#时间序列-timestamp) | 时间范围查询 | 20x | 日志、传感器数据 |
+| [Column Index](#column-index-column) | Equality/range queries | 40x | WHERE clauses, JOINs |
+| [Vector Index](#vector-index-vector) | KNN similarity search | 100x | RAG, recommendation systems |
+| [Full-text Index](#full-text-index-text) | BM25 text search | 50x | Document retrieval, log analysis |
+| [Spatial Index](#spatial-index-spatial) | Geolocation queries | 30x | LBS, trajectory analysis |
+| [Time Series](#time-series-index-timestamp) | Time range queries | 20x | Logs, sensor data |
 
-## 列索引 (COLUMN)
+## Column Index (COLUMN)
 
-### 概述
-基于 LSM-Tree 的列索引，支持快速等值查询和范围查询。
+### Overview
+LSM-Tree-based column index supporting fast equality and range queries.
 
-### 创建索引
+### Creating an Index
 
 ```rust
-// 方式 1: SQL
+// Method 1: SQL
 db.execute("CREATE INDEX users_email ON users(email)")?;
 
-// 方式 2: API
+// Method 2: API
 db.create_column_index("users", "email")?;
 ```
 
-### 使用场景
+### Use Cases
 
 ```rust
-// WHERE 等值查询（性能提升 40 倍）
+// WHERE equality query (40x performance boost)
 db.query("SELECT * FROM users WHERE email = 'alice@example.com'")?;
 
-// WHERE 范围查询
+// WHERE range query
 db.query("SELECT * FROM users WHERE age >= 20 AND age <= 30")?;
 
-// JOIN 查询优化
+// JOIN query optimization
 db.query("
     SELECT u.name, o.order_id
     FROM users u
@@ -45,76 +45,76 @@ db.query("
 ")?;
 ```
 
-### 性能数据
-- **等值查询**: 40x 提升（100ms → 2.5ms）
-- **范围查询**: 25x 提升
-- **内存占用**: 约 500KB/10000 行
+### Performance Data
+- **Equality query**: 40x improvement (100ms -> 2.5ms)
+- **Range query**: 25x improvement
+- **Memory usage**: ~500KB per 10,000 rows
 
-**详细文档**: [列索引详解](./07-column-index.md)
+**Detailed documentation**: [Column Index Guide](./07-column-index.md)
 
-## 向量索引 (VECTOR)
+## Vector Index (VECTOR)
 
-### 概述
-基于 DiskANN 的向量索引，支持高性能 KNN 相似度搜索。
+### Overview
+DiskANN-based vector index supporting high-performance KNN similarity search.
 
-### 创建索引
+### Creating an Index
 
 ```rust
-// 方式 1: SQL
+// Method 1: SQL
 db.execute("CREATE VECTOR INDEX docs_embedding ON documents(embedding)")?;
 
-// 方式 2: API
+// Method 2: API
 db.create_vector_index("docs_embedding", 128)?;
 ```
 
-### 使用场景
+### Use Cases
 
 ```rust
-// KNN 搜索（找最相似的 10 个向量）
+// KNN search (find the 10 most similar vectors)
 db.query("
     SELECT * FROM documents
     ORDER BY embedding <-> [0.1, 0.2, ..., 0.5]
     LIMIT 10
 ")?;
 
-// 支持三种距离度量
-// <->  L2 距离（欧氏距离）
-// <#>  内积（Inner Product）
-// <=>  余弦距离（Cosine Distance）
+// Three supported distance metrics
+// <->  L2 Distance (Euclidean)
+// <#>  Inner Product
+// <=>  Cosine Distance
 ```
 
-### 性能数据
-- **查询延迟**: < 5ms（100K 向量）
-- **召回率**: 95%+（@k=10）
-- **吞吐量**: 74,761 vectors/sec（批量插入）
+### Performance Data
+- **Query latency**: < 5ms (100K vectors)
+- **Recall**: 95%+ (@k=10)
+- **Throughput**: 74,761 vectors/sec (bulk insert)
 
-**详细文档**: [向量索引详解](./08-vector-index.md)
+**Detailed documentation**: [Vector Index Guide](./08-vector-index.md)
 
-## 全文索引 (TEXT)
+## Full-text Index (TEXT)
 
-### 概述
-基于 BM25 算法的全文索引，支持中英文分词和关键词搜索。
+### Overview
+BM25 algorithm-based full-text index supporting Chinese and English tokenization and keyword search.
 
-### 创建索引
+### Creating an Index
 
 ```rust
-// 方式 1: SQL
+// Method 1: SQL
 db.execute("CREATE TEXT INDEX articles_content ON articles(content)")?;
 
-// 方式 2: API
+// Method 2: API
 db.create_text_index("articles_content")?;
 ```
 
-### 使用场景
+### Use Cases
 
 ```rust
-// 全文搜索
+// Full-text search
 db.query("
     SELECT * FROM articles
     WHERE MATCH(content, 'rust database')
 ")?;
 
-// 带 BM25 分数排序
+// Sorted by BM25 score
 db.query("
     SELECT *, BM25_SCORE(content, 'rust database') as score
     FROM articles
@@ -124,24 +124,24 @@ db.query("
 ")?;
 ```
 
-### 性能数据
-- **查询延迟**: < 10ms（10000 文档）
-- **索引大小**: 约 6.78MB（10000 文档）
-- **支持中英文分词**: jieba 分词器
+### Performance Data
+- **Query latency**: < 10ms (10,000 documents)
+- **Index size**: ~6.78MB (10,000 documents)
+- **Chinese and English tokenization**: jieba tokenizer
 
-**详细文档**: [全文索引详解](./09-text-index.md)
+**Detailed documentation**: [Full-text Index Guide](./09-text-index.md)
 
-## 空间索引 (SPATIAL)
+## Spatial Index (SPATIAL)
 
-### 概述
-基于 R-Tree 的空间索引，支持二维空间范围查询。
+### Overview
+R-Tree-based spatial index supporting two-dimensional spatial range queries.
 
-### 创建索引
+### Creating an Index
 
 ```rust
 use motedb::BoundingBox;
 
-// 定义空间范围
+// Define spatial bounds
 let bounds = BoundingBox {
     min_x: -180.0,
     min_y: -90.0,
@@ -149,24 +149,24 @@ let bounds = BoundingBox {
     max_y: 90.0,
 };
 
-// 方式 1: SQL（需先通过 API 指定 bounds）
+// Method 1: SQL (requires bounds to be set via API first)
 db.create_spatial_index("locations_coords", bounds)?;
 db.execute("CREATE SPATIAL INDEX locations_coords ON locations(coords)")?;
 
-// 方式 2: API
+// Method 2: API
 db.create_spatial_index("locations_coords", bounds)?;
 ```
 
-### 使用场景
+### Use Cases
 
 ```rust
-// 矩形范围查询
+// Bounding box range query
 db.query("
     SELECT * FROM locations
     WHERE ST_WITHIN(coords, 116.0, 39.0, 117.0, 40.0)
 ")?;
 
-// 距离查询
+// Distance query
 db.query("
     SELECT *, ST_DISTANCE(coords, 116.4, 39.9) as distance
     FROM locations
@@ -175,22 +175,22 @@ db.query("
 ")?;
 ```
 
-### 性能数据
-- **查询延迟**: < 5ms（50000 点）
-- **批量插入**: 50000 点 ~85ms
-- **内存占用**: 约 2MB（50000 点）
+### Performance Data
+- **Query latency**: < 5ms (50,000 points)
+- **Bulk insert**: 50,000 points in ~85ms
+- **Memory usage**: ~2MB (50,000 points)
 
-**详细文档**: [空间索引详解](./10-spatial-index.md)
+**Detailed documentation**: [Spatial Index Guide](./10-spatial-index.md)
 
-## 时间序列索引 (TIMESTAMP)
+## Time Series Index (TIMESTAMP)
 
-### 概述
-专为时间序列数据优化的索引，支持高效时间范围查询。
+### Overview
+Index optimized for time series data, supporting efficient time range queries.
 
-### 创建索引
+### Creating an Index
 
 ```rust
-// 在表中包含 TIMESTAMP 字段即可自动支持
+// Automatically supported when a table includes a TIMESTAMP field
 db.execute("CREATE TABLE sensor_data (
     id INT,
     sensor_id INT,
@@ -199,38 +199,38 @@ db.execute("CREATE TABLE sensor_data (
 )")?;
 ```
 
-### 使用场景
+### Use Cases
 
 ```rust
-// 时间范围查询
+// Time range query
 db.query("
     SELECT * FROM sensor_data
-    WHERE timestamp >= 1609459200 
+    WHERE timestamp >= 1609459200
       AND timestamp <= 1640995200
 ")?;
 
-// 结合聚合
+// Combined with aggregation
 db.query("
-    SELECT 
+    SELECT
         sensor_id,
         AVG(value) as avg_value,
         COUNT(*) as count
     FROM sensor_data
-    WHERE timestamp >= 1609459200 
+    WHERE timestamp >= 1609459200
       AND timestamp <= 1640995200
     GROUP BY sensor_id
 ")?;
 ```
 
-### 性能数据
-- **查询延迟**: < 8ms（100000 数据点）
-- **范围查询**: 20x 提升
+### Performance Data
+- **Query latency**: < 8ms (100,000 data points)
+- **Range query**: 20x improvement
 
-**详细文档**: [时间序列索引详解](./11-timestamp-index.md)
+**Detailed documentation**: [Time Series Index Guide](./11-timestamp-index.md)
 
-## 索引选择指南
+## Index Selection Guide
 
-### 场景 1: 用户管理系统
+### Scenario 1: User Management System
 
 ```rust
 db.execute("CREATE TABLE users (
@@ -240,13 +240,13 @@ db.execute("CREATE TABLE users (
     created_at TIMESTAMP
 )")?;
 
-// 创建列索引（email 频繁用于 WHERE）
+// Create column index (email is frequently used in WHERE)
 db.execute("CREATE INDEX users_email ON users(email)")?;
 
-// 时间戳自动支持时间范围查询
+// TIMESTAMP field automatically supports time range queries
 ```
 
-### 场景 2: 文档检索系统（RAG）
+### Scenario 2: Document Retrieval System (RAG)
 
 ```rust
 db.execute("CREATE TABLE documents (
@@ -257,14 +257,14 @@ db.execute("CREATE TABLE documents (
     created_at TIMESTAMP
 )")?;
 
-// 向量索引（语义搜索）
+// Vector index (semantic search)
 db.execute("CREATE VECTOR INDEX docs_embedding ON documents(embedding)")?;
 
-// 全文索引（关键词搜索）
+// Full-text index (keyword search)
 db.execute("CREATE TEXT INDEX docs_content ON documents(content)")?;
 ```
 
-### 场景 3: LBS 应用
+### Scenario 3: LBS Application
 
 ```rust
 db.execute("CREATE TABLE pois (
@@ -274,18 +274,18 @@ db.execute("CREATE TABLE pois (
     coords VECTOR(2)
 )")?;
 
-// 空间索引（地理位置查询）
-let bounds = BoundingBox { 
-    min_x: -180.0, min_y: -90.0, 
-    max_x: 180.0, max_y: 90.0 
+// Spatial index (geolocation queries)
+let bounds = BoundingBox {
+    min_x: -180.0, min_y: -90.0,
+    max_x: 180.0, max_y: 90.0
 };
 db.create_spatial_index("pois_coords", bounds)?;
 
-// 列索引（类别筛选）
+// Column index (category filtering)
 db.execute("CREATE INDEX pois_category ON pois(category)")?;
 ```
 
-### 场景 4: IoT 传感器数据
+### Scenario 4: IoT Sensor Data
 
 ```rust
 db.execute("CREATE TABLE sensor_readings (
@@ -296,80 +296,80 @@ db.execute("CREATE TABLE sensor_readings (
     timestamp TIMESTAMP
 )")?;
 
-// 列索引（按传感器 ID 查询）
+// Column index (query by sensor ID)
 db.execute("CREATE INDEX readings_sensor ON sensor_readings(sensor_id)")?;
 
-// 空间索引（按位置查询）
+// Spatial index (query by location)
 db.create_spatial_index("readings_location", bounds)?;
 
-// 时间戳（时间范围查询）自动支持
+// TIMESTAMP (time range queries) automatically supported
 ```
 
-## 索引管理
+## Index Management
 
-### 查看索引
+### View Indexes
 
 ```rust
 let result = db.query("SHOW INDEXES FROM users")?;
 ```
 
-### 删除索引
+### Drop an Index
 
 ```rust
 db.execute("DROP INDEX users_email ON users")?;
 ```
 
-### 索引统计
+### Index Statistics
 
 ```rust
-// 向量索引统计
+// Vector index statistics
 let stats = db.vector_index_stats("docs_embedding")?;
-println!("向量数量: {}", stats.total_vectors);
+println!("Total vectors: {}", stats.total_vectors);
 
-// 空间索引统计
+// Spatial index statistics
 let stats = db.spatial_index_stats("locations_coords")?;
-println!("空间点数量: {}", stats.total_entries);
+println!("Total spatial points: {}", stats.total_entries);
 ```
 
-## 性能对比
+## Performance Comparison
 
-### 无索引 vs 有索引
+### Without Index vs. With Index
 
 ```rust
-// 测试数据：10000 条记录
+// Test data: 10,000 records
 
-// ❌ 无索引查询：100ms（全表扫描）
+// Without index: 100ms (full table scan)
 db.query("SELECT * FROM users WHERE email = 'alice@example.com'")?;
 
-// ✅ 有列索引：2.5ms（性能提升 40 倍）
+// With column index: 2.5ms (40x performance improvement)
 db.execute("CREATE INDEX users_email ON users(email)")?;
 db.query("SELECT * FROM users WHERE email = 'alice@example.com'")?;
 ```
 
-### 批量插入性能
+### Bulk Insert Performance
 
-| 数据类型 | 数据量 | 插入时间 | 吞吐量 |
+| Data Type | Count | Insert Time | Throughput |
 |---------|-------|---------|--------|
-| 普通数据 | 10000 | 14ms | 737,112 rows/sec |
-| 向量数据(128维) | 1000 | 13ms | 74,761 vectors/sec |
-| 空间数据 | 50000 | 85ms | 588,235 points/sec |
+| Regular data | 10,000 | 14ms | 737,112 rows/sec |
+| Vector data (128-dim) | 1,000 | 13ms | 74,761 vectors/sec |
+| Spatial data | 50,000 | 85ms | 588,235 points/sec |
 
-## 最佳实践
+## Best Practices
 
-1. **先插入数据，后创建索引**（大数据集）
-2. **合理使用索引**：不是越多越好，索引会占用内存
-3. **定期查看统计信息**：监控索引性能
-4. **批量操作优先**：使用 `batch_insert_map()` 提升性能
+1. **Insert data first, create indexes later** (for large datasets)
+2. **Use indexes judiciously**: more is not always better; indexes consume memory
+3. **Regularly review statistics**: monitor index performance
+4. **Prefer batch operations**: use `batch_insert_map()` for better performance
 
-## 下一步
+## Next Steps
 
-- [列索引详解](./07-column-index.md)
-- [向量索引详解](./08-vector-index.md)
-- [全文索引详解](./09-text-index.md)
-- [空间索引详解](./10-spatial-index.md)
-- [时间序列索引详解](./11-timestamp-index.md)
+- [Column Index Guide](./07-column-index.md)
+- [Vector Index Guide](./08-vector-index.md)
+- [Full-text Index Guide](./09-text-index.md)
+- [Spatial Index Guide](./10-spatial-index.md)
+- [Time Series Index Guide](./11-timestamp-index.md)
 
 ---
 
-**上一篇**: [事务管理](./05-transactions.md)  
-**下一篇**: [列索引](./07-column-index.md)
+**Previous**: [Transaction Management](./05-transactions.md)
+**Next**: [Column Index](./07-column-index.md)

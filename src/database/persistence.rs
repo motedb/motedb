@@ -202,7 +202,7 @@ impl MoteDB {
                 }
             }
             Err(e) => {
-                eprintln!("[Checkpoint]   ⚠️ MVCC vacuum failed: {:?}", e);
+                debug_log!("[Checkpoint]   ⚠️ MVCC vacuum failed: {:?}", e);
             }
         }
 

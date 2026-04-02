@@ -284,7 +284,7 @@ impl BlobStore {
             let computed_crc = crc32fast::hash(&data);
             if stored_crc != computed_crc {
                 // CRC mismatch — this entry is corrupt. Stop here.
-                eprintln!("[BlobStore] ⚠️ CRC mismatch in blob file {}, truncating to offset {}", last_file_id, valid_offset);
+                debug_log!("[BlobStore] CRC mismatch in blob file {}, truncating to offset {}", last_file_id, valid_offset);
                 break;
             }
 
@@ -299,7 +299,7 @@ impl BlobStore {
             // Truncate to last valid entry
             let file = OpenOptions::new().write(true).open(&path)?;
             file.set_len(valid_offset)?;
-            eprintln!("[BlobStore] Recovered blob file {}: truncated from {} to {} bytes",
+            debug_log!("[BlobStore] Recovered blob file {}: truncated from {} to {} bytes",
                      last_file_id, file_size, valid_offset);
         }
 

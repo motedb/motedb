@@ -1,56 +1,56 @@
-# 常见问题 (FAQ)
+# Frequently Asked Questions (FAQ)
 
-## 写入 & 事务
+## Writes & Transactions
 
-**Q: 为什么批量插入更快？**  
-A: `batch_insert_map()` 会一次性构建 `Row` 并批量写入 MemTable，WAL 只 flush 一次，吞吐可达 737k rows/sec。
+**Q: Why is batch insertion faster?**
+A: `batch_insert_map()` constructs `Row` objects in bulk and writes them to the MemTable in one pass. WAL is flushed only once, achieving throughput up to 737k rows/sec.
 
-**Q: 事务卡住怎么办？**  
-A: 检查 `transaction_stats()` 是否存在大量 `active_transactions`，必要时中止长事务或提升 `memtable_size_mb`。
+**Q: What should I do if a transaction is stuck?**
+A: Check `transaction_stats()` for a large number of `active_transactions`. If needed, abort long-running transactions or increase `memtable_size_mb`.
 
-## 索引
+## Indexes
 
-**Q: 创建索引后查询仍然慢？**  
-A: 使用 `EXPLAIN SELECT` 查看执行计划，确认 WHERE 列与索引列一致；必要时 `ANALYZE` 更新统计。
+**Q: Queries are still slow after creating an index?**
+A: Use `EXPLAIN SELECT` to inspect the execution plan and confirm that the WHERE columns match the indexed columns. Run `ANALYZE` to update statistics if necessary.
 
-**Q: 向量索引召回率低？**  
-A: 确保 `Vector` 维度与建索引时一致，增大 `R/L` 或在 SQL 层增加 rerank。
+**Q: Low recall from vector index?**
+A: Ensure the `Vector` dimensions match those used at index creation time. Increase `R/L` parameters or add a reranking step at the SQL layer.
 
-**Q: 全文索引体积过大？**  
-A: 启用 `ngram`、压缩长文本或定期 `VACUUM TEXT INDEX`。
+**Q: Full-text index is too large?**
+A: Enable `ngram`, compress long texts, or run `VACUUM TEXT INDEX` periodically.
 
-## 数据类型
+## Data Types
 
-**Q: 如何插入时间戳？**  
-A: 使用 `Value::Timestamp(Timestamp::from_secs(...))` 或 SQL 的整数 epoch；内部统一为微秒。
+**Q: How do I insert a timestamp?**
+A: Use `Value::Timestamp(Timestamp::from_secs(...))` or an integer epoch value in SQL. Internally, all values are normalized to microseconds.
 
-**Q: 坐标用什么类型？**  
-A: 推荐 `VECTOR(2)` 或 `Value::Spatial(Geometry::Point)`，并结合 `create_spatial_index()`。
+**Q: What type should I use for coordinates?**
+A: Use `VECTOR(2)` or `Value::Spatial(Geometry::Point)`, combined with `create_spatial_index()`.
 
-## 持久化
+## Persistence
 
-**Q: flush 与 checkpoint 有什么区别？**  
-A: `flush` 将 MemTable/WAL 写入 SST；`checkpoint` 固定 manifest + 元数据，方便恢复。
+**Q: What is the difference between flush and checkpoint?**
+A: `flush` writes the MemTable/WAL to SST files; `checkpoint` persists the manifest and metadata for recovery purposes.
 
-**Q: 可以关闭 WAL 吗？**  
-A: 可以，但会牺牲崩溃恢复能力，仅在可接受数据丢失时使用，并确保定期备份。
+**Q: Can I disable WAL?**
+A: Yes, but this sacrifices crash recovery. Only use this when data loss is acceptable, and ensure you take regular backups.
 
-## 调试
+## Debugging
 
-**Q: 如何确认索引是否生效？**  
-A: `SHOW INDEXES FROM <table>` 查看；`EXPLAIN` 可显示使用的索引名称。
+**Q: How can I verify that an index is being used?**
+A: Run `SHOW INDEXES FROM <table>` to list indexes. Use `EXPLAIN` to display which index names are used in the query plan.
 
-**Q: 如何查看当前内存/索引状态？**  
-A: `vector_index_stats()` / `spatial_index_stats()` / `transaction_stats()` 等 API。
+**Q: How can I check current memory and index status?**
+A: Use the `vector_index_stats()` / `spatial_index_stats()` / `transaction_stats()` APIs.
 
-## 部署
+## Deployment
 
-**Q: 推荐的部署方式？**  
-A: 单机模式直接嵌入应用；需要 HA 时建议配合上层复制框架。内存 <10MB、磁盘按表划分目录即可。
+**Q: What is the recommended deployment approach?**
+A: For single-machine setups, embed MoteDB directly in your application. For HA requirements, use an upper-layer replication framework. Memory <10MB is sufficient to start; organize disk by table directories.
 
-**Q: 如何备份？**  
-A: quiesce 应用 → `db.flush()?` → 复制整个 `.mote` 目录 + `manifest` + `wal/`。
+**Q: How do I back up?**
+A: Quiesce the application -> `db.flush()?` -> copy the entire `.mote` directory + `manifest` + `wal/`.
 
 ---
 
-如未覆盖，可在 issue 中提供重现步骤或参考 `examples/` 目录。
+If your question is not covered here, please open an issue with reproduction steps or refer to the `examples/` directory.

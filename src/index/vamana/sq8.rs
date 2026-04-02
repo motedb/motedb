@@ -470,9 +470,9 @@ mod tests {
         let original_size = 128 * 4; // f32
         let compressed_size = qvec.size(); // u8 + min/max
 
-        println!("Original: {} bytes", original_size);
-        println!("Compressed: {} bytes", compressed_size);
-        println!(
+        debug_log!("Original: {} bytes", original_size);
+        debug_log!("Compressed: {} bytes", compressed_size);
+        debug_log!(
             "Compression ratio: {:.2}x",
             original_size as f32 / compressed_size as f32
         );
@@ -507,7 +507,7 @@ mod tests {
         let error = (dist1 - traditional_dist1).abs();
         assert!(error < 0.05, "Asymmetric distance error too large: {}", error);
         
-        println!("Asymmetric dist: {:.4}, Traditional dist: {:.4}, Error: {:.4}", 
+        debug_log!("Asymmetric dist: {:.4}, Traditional dist: {:.4}, Error: {:.4}",
                  dist1, traditional_dist1, error);
     }
     

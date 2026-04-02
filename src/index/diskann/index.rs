@@ -169,14 +169,14 @@ impl FreshDiskANNIndex {
     
     /// Flush Fresh Graph 到 SST
     fn flush_fresh_graph(&mut self) -> Result<()> {
-        println!("[FreshDiskANN] Flushing Fresh Graph to L1 SST...");
+        debug_log!("[FreshDiskANN] Flushing Fresh Graph to L1 SST...");
         
         // 1. 导出 Fresh Graph 的所有节点
         let nodes = self.fresh_graph.export_nodes()?;
         let medoid = self.fresh_graph.medoid();
         
         if nodes.is_empty() {
-            println!("[FreshDiskANN] Fresh Graph is empty, skip flush");
+            debug_log!("[FreshDiskANN] Fresh Graph is empty, skip flush");
             return Ok(());
         }
         
@@ -187,7 +187,7 @@ impl FreshDiskANNIndex {
         // 3. 创建 SST 文件
         let sst_file = VamanaSSTFile::create(&sst_path, nodes, medoid)?;
         
-        println!(
+        debug_log!(
             "[FreshDiskANN] Created L1 SST: {:?}, {} nodes",
             sst_path,
             sst_file.metadata().node_count
@@ -209,7 +209,7 @@ impl FreshDiskANNIndex {
     
     /// Compaction: L1 → L2 (真正的图合并 + 图重建)
     fn compact_l1_to_l2(&mut self) -> Result<()> {
-        println!("[FreshDiskANN] Compacting {} L1 SSTs to L2...", self.level1_ssts.len());
+        debug_log!("[FreshDiskANN] Compacting {} L1 SSTs to L2...", self.level1_ssts.len());
         
         if self.level1_ssts.is_empty() {
             return Ok(());
@@ -239,14 +239,14 @@ impl FreshDiskANNIndex {
             all_nodes.extend(l2_nodes);
         }
         
-        println!(
+        debug_log!(
             "[FreshDiskANN] Compaction: collected {} active nodes (removed {} tombstones)",
             active_after,
             total_before - active_after
         );
         
         if all_nodes.is_empty() {
-            println!("[FreshDiskANN] No active nodes after compaction, skip");
+            debug_log!("[FreshDiskANN] No active nodes after compaction, skip");
             return Ok(());
         }
         
@@ -259,7 +259,7 @@ impl FreshDiskANNIndex {
         }
         
         let merged_nodes: Vec<_> = dedup_map.into_iter().collect();
-        println!("[FreshDiskANN] After dedup: {} unique nodes", merged_nodes.len());
+        debug_log!("[FreshDiskANN] After dedup: {} unique nodes", merged_nodes.len());
         
         // 🚀 Phase 9: 选择多个锚点（用于图重建的起始点）
         // 🎯 平衡优化：使用8个锚点（平衡性能与质量）
@@ -267,16 +267,16 @@ impl FreshDiskANNIndex {
         let anchor_points = self.select_anchor_points(&merged_nodes, num_anchors)?;
         let primary_medoid = anchor_points[0]; // 第一个锚点作为主 medoid
         
-        println!("[FreshDiskANN] Selected {} anchor points, primary medoid: {}", 
+        debug_log!("[FreshDiskANN] Selected {} anchor points, primary medoid: {}",
             anchor_points.len(), primary_medoid);
-        println!("  Anchor points: {:?}", anchor_points);
+        debug_log!("  Anchor points: {:?}", anchor_points);
         
         // 🚀 Phase 9: 图重建（使用 Vamana 算法 + 多锚点搜索）
-        println!("[FreshDiskANN] Phase 9: Rebuilding graph with multi-anchor Vamana (conservative)...");
+        debug_log!("[FreshDiskANN] Phase 9: Rebuilding graph with multi-anchor Vamana (conservative)...");
         let rebuild_start = std::time::Instant::now();
         // 🔥 先用主 medoid 构建基础图，然后再优化
         let rebuilt_nodes = self.rebuild_graph_with_medoid_fallback(merged_nodes, primary_medoid, &anchor_points)?;
-        println!(
+        debug_log!(
             "[FreshDiskANN] Graph rebuild completed in {:.2?}",
             rebuild_start.elapsed()
         );
@@ -291,7 +291,7 @@ impl FreshDiskANNIndex {
         
         let new_l2 = VamanaSSTFile::create(&l2_path, rebuilt_nodes, primary_medoid)?;
         
-        println!(
+        debug_log!(
             "[FreshDiskANN] L2 merged index created: {:?}, {} nodes",
             l2_path,
             new_l2.metadata().node_count
@@ -302,14 +302,14 @@ impl FreshDiskANNIndex {
             let path = sst.path().to_path_buf();
             drop(sst);
             if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("[FreshDiskANN] Failed to remove L1 SST {:?}: {}", path, e);
+                debug_log!("[FreshDiskANN] Failed to remove L1 SST {:?}: {}", path, e);
             }
         }
         
         // 7. 更新 L2 index
         self.merged_index = Some(new_l2);
         
-        println!("[FreshDiskANN] Compaction complete");
+        debug_log!("[FreshDiskANN] Compaction complete");
         Ok(())
     }
     
@@ -326,7 +326,7 @@ impl FreshDiskANNIndex {
             "Phase 9"
         };
         
-        println!("[FreshDiskANN] {}: Graph rebuild (max_degree={}, search_list={})",
+        debug_log!("[FreshDiskANN] {}: Graph rebuild (max_degree={}, search_list={})",
             phase, max_degree, search_list_size);
         
         // 1. 创建 id -> index 映射
@@ -349,7 +349,7 @@ impl FreshDiskANNIndex {
         let mut graph: Vec<Vec<RowId>> = vec![Vec::new(); node_count];
         
         // 🔥 Phase 9: Bootstrap Phase - 随机初始化图（必须！）
-        println!("[FreshDiskANN] Phase 9: Bootstrap - Random initialization...");
+        debug_log!("[FreshDiskANN] Phase 9: Bootstrap - Random initialization...");
         let bootstrap_neighbors = 20; // 增加到 20 个邻居
         
         use rand::Rng;
@@ -373,16 +373,16 @@ impl FreshDiskANNIndex {
         }
         
         let bootstrap_avg_degree: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-        println!("  Bootstrap complete: avg degree = {:.2}", bootstrap_avg_degree);
-        
+        debug_log!("  Bootstrap complete: avg degree = {:.2}", bootstrap_avg_degree);
+
         // 3. Round 1 - 使用多锚点搜索构建基础图
-        println!("[FreshDiskANN] Round 1: Building base graph with top-k...");
+        debug_log!("[FreshDiskANN] Round 1: Building base graph with top-k...");
         
         for (i, (id, node)) in nodes.iter().enumerate() {
             if (i + 1) % 1000 == 0 {
-                println!("  Round 1: {} / {} nodes...", i + 1, node_count);
+                debug_log!("  Round 1: {} / {} nodes...", i + 1, node_count);
             }
-            
+
             // 从多个锚点并行搜索
             let candidates = self.multi_anchor_greedy_search(
                 &node.vector,
@@ -407,15 +407,15 @@ impl FreshDiskANNIndex {
         }
         
         let avg_degree_round1: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-        println!("  Round 1 complete: avg degree = {:.2}", avg_degree_round1);
+        debug_log!("  Round 1 complete: avg degree = {:.2}", avg_degree_round1);
         
         // 4. Round 2 - RobustPrune 优化（仅在 Phase 10 模式）
         if max_degree >= 100 && search_list_size >= 500 {
-            println!("[FreshDiskANN] Round 2: RobustPrune optimization...");
+            debug_log!("[FreshDiskANN] Round 2: RobustPrune optimization...");
             
             for (i, (id, node)) in nodes.iter().enumerate() {
                 if (i + 1) % 1000 == 0 {
-                    println!("  Round 2: {} / {} nodes...", i + 1, node_count);
+                    debug_log!("  Round 2: {} / {} nodes...", i + 1, node_count);
                 }
                 
                 let candidates = self.multi_anchor_greedy_search(
@@ -475,13 +475,13 @@ impl FreshDiskANNIndex {
             }
             
             let avg_degree_round2: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-            println!("  Round 2 complete: avg degree = {:.2}", avg_degree_round2);
+            debug_log!("  Round 2 complete: avg degree = {:.2}", avg_degree_round2);
         }
         
         // 5. 最终统计
         let empty_neighbors = graph.iter().filter(|g| g.is_empty()).count();
         let avg_degree_final: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-        println!("  Final graph: avg degree = {:.2}, empty = {}", avg_degree_final, empty_neighbors);
+        debug_log!("  Final graph: avg degree = {:.2}, empty = {}", avg_degree_final, empty_neighbors);
         
         // 6. 将图转换回节点列表
         let mut rebuilt_nodes = Vec::with_capacity(node_count);
@@ -491,7 +491,7 @@ impl FreshDiskANNIndex {
             rebuilt_nodes.push((id, updated_node));
         }
         
-        println!("[FreshDiskANN] Graph rebuild complete!");
+        debug_log!("[FreshDiskANN] Graph rebuild complete!");
         Ok(rebuilt_nodes)
     }
     
@@ -502,10 +502,10 @@ impl FreshDiskANNIndex {
         let max_degree = 64; // 从 32 增大到 64
         let node_count = nodes.len();
         
-        println!(
+        debug_log!(
             "[FreshDiskANN] Phase 9: Rebuilding graph with multi-anchor Vamana...",
         );
-        println!(
+        debug_log!(
             "  Nodes: {}, Max Degree: {} (increased from 32), Anchors: {}",
             node_count, max_degree, anchor_points.len()
         );
@@ -526,13 +526,13 @@ impl FreshDiskANNIndex {
             return Err(crate::error::StorageError::InvalidData("No valid anchor points".into()));
         }
         
-        println!("  Using {} anchor indices: {:?}", anchor_indices.len(), &anchor_indices[..anchor_indices.len().min(5)]);
+        debug_log!("  Using {} anchor indices: {:?}", anchor_indices.len(), &anchor_indices[..anchor_indices.len().min(5)]);
         
         // 2. 初始化所有节点的邻居为空
         let mut graph: Vec<Vec<RowId>> = vec![Vec::new(); node_count];
         
         // 🔥 Phase 9: Bootstrap Phase - 随机初始化图（必须！）
-        println!("[FreshDiskANN] Phase 9: Bootstrap - Random initialization...");
+        debug_log!("[FreshDiskANN] Phase 9: Bootstrap - Random initialization...");
         let bootstrap_neighbors = 20; // 增加到 20 个邻居
         
         use rand::Rng;
@@ -556,15 +556,15 @@ impl FreshDiskANNIndex {
         }
         
         let bootstrap_avg_degree: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-        println!("  Bootstrap complete: avg degree = {:.2}", bootstrap_avg_degree);
+        debug_log!("  Bootstrap complete: avg degree = {:.2}", bootstrap_avg_degree);
         
         // 3. 使用 Vamana 算法为每个节点构建邻居（第一轮优化）
-        println!("[FreshDiskANN] Phase 9: Round 1 - Multi-anchor Vamana optimization...");
+        debug_log!("[FreshDiskANN] Phase 9: Round 1 - Multi-anchor Vamana optimization...");
         let search_list_size = (max_degree as f32 * 2.0) as usize; // 增大到 2.0 × R
         
         for (i, (id, node)) in nodes.iter().enumerate() {
             if (i + 1) % 1000 == 0 {
-                println!("  Round 1: {} / {} nodes...", i + 1, node_count);
+                debug_log!("  Round 1: {} / {} nodes...", i + 1, node_count);
             }
             
             // 🔥 Phase 9 关键：从多个锚点并行搜索，然后合并结果
@@ -592,7 +592,7 @@ impl FreshDiskANNIndex {
             
             // 调试：检查剪枝结果
             if i < 5 {
-                println!("  Node {} candidates: {}, pruned: {}", i, candidates_count2, pruned_neighbors.len());
+                debug_log!("  Node {} candidates: {}, pruned: {}", i, candidates_count2, pruned_neighbors.len());
             }
             
             graph[i] = pruned_neighbors.clone();
@@ -635,7 +635,7 @@ impl FreshDiskANNIndex {
             }
         }
         
-        println!("[FreshDiskANN] Round 1 complete!");
+        debug_log!("[FreshDiskANN] Round 1 complete!");
         
         // 4. 将图转换回节点列表
         let mut rebuilt_nodes = Vec::with_capacity(node_count);
@@ -645,7 +645,7 @@ impl FreshDiskANNIndex {
             rebuilt_nodes.push((id, updated_node));
         }
         
-        println!("[FreshDiskANN] Vamana graph rebuild complete!");
+        debug_log!("[FreshDiskANN] Vamana graph rebuild complete!");
         Ok(rebuilt_nodes)
     }
     
@@ -936,8 +936,8 @@ impl FreshDiskANNIndex {
         let search_list_size = 1000; // 增大到 1000
         let node_count = nodes.len();
         
-        println!("[FreshDiskANN] Phase 10: Two-round graph optimization...");
-        println!("  Nodes: {}, Max Degree: 128, Search List: 1000, Anchors: {}", 
+        debug_log!("[FreshDiskANN] Phase 10: Two-round graph optimization...");
+        debug_log!("  Nodes: {}, Max Degree: 128, Search List: 1000, Anchors: {}",
             node_count, anchor_points.len());
         
         // 1. 创建 id -> index 映射
@@ -954,7 +954,7 @@ impl FreshDiskANNIndex {
         // 2. Bootstrap - 随机初始化图
         let mut graph: Vec<Vec<RowId>> = vec![Vec::new(); node_count];
         
-        println!("[FreshDiskANN] Phase 10: Bootstrap initialization...");
+        debug_log!("[FreshDiskANN] Phase 10: Bootstrap initialization...");
         let bootstrap_neighbors = 30; // 增加到 30
         
         use rand::Rng;
@@ -974,14 +974,14 @@ impl FreshDiskANNIndex {
         }
         
         let bootstrap_avg_degree: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-        println!("  Bootstrap complete: avg degree = {:.2}", bootstrap_avg_degree);
+        debug_log!("  Bootstrap complete: avg degree = {:.2}", bootstrap_avg_degree);
         
         // 3. Round 1 - 直接取 top-k
-        println!("[FreshDiskANN] Phase 10 Round 1: Building base graph...");
+        debug_log!("[FreshDiskANN] Phase 10 Round 1: Building base graph...");
         
         for (i, (id, node)) in nodes.iter().enumerate() {
             if (i + 1) % 1000 == 0 {
-                println!("  Round 1: {} / {} nodes...", i + 1, node_count);
+                debug_log!("  Round 1: {} / {} nodes...", i + 1, node_count);
             }
             
             let candidates = self.multi_anchor_greedy_search(
@@ -1007,14 +1007,14 @@ impl FreshDiskANNIndex {
         }
         
         let avg_degree_round1: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
-        println!("  Round 1 complete: avg degree = {:.2}", avg_degree_round1);
+        debug_log!("  Round 1 complete: avg degree = {:.2}", avg_degree_round1);
         
         // 4. Round 2 - RobustPrune 优化
-        println!("[FreshDiskANN] Phase 10 Round 2: RobustPrune optimization...");
-        
+        debug_log!("[FreshDiskANN] Phase 10 Round 2: RobustPrune optimization...");
+
         for (i, (id, node)) in nodes.iter().enumerate() {
             if (i + 1) % 1000 == 0 {
-                println!("  Round 2: {} / {} nodes...", i + 1, node_count);
+                debug_log!("  Round 2: {} / {} nodes...", i + 1, node_count);
             }
             
             let candidates = self.multi_anchor_greedy_search(
@@ -1042,7 +1042,7 @@ impl FreshDiskANNIndex {
         
         let avg_degree_final: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
         let empty_neighbors = graph.iter().filter(|g| g.is_empty()).count();
-        println!("  Round 2 complete: avg degree = {:.2}, empty = {}", avg_degree_final, empty_neighbors);
+        debug_log!("  Round 2 complete: avg degree = {:.2}, empty = {}", avg_degree_final, empty_neighbors);
         
         // 5. 将图转换回节点列表
         let mut rebuilt_nodes = Vec::with_capacity(node_count);
@@ -1052,7 +1052,7 @@ impl FreshDiskANNIndex {
             rebuilt_nodes.push((id, updated_node));
         }
         
-        println!("[FreshDiskANN] Phase 10 graph rebuild complete!");
+        debug_log!("[FreshDiskANN] Phase 10 graph rebuild complete!");
         Ok(rebuilt_nodes)
     }
     
@@ -1064,7 +1064,7 @@ impl FreshDiskANNIndex {
         
         let k = k.min(nodes.len());
         
-        println!("[FreshDiskANN] Phase 9: Selecting {} anchor points using K-Means...", k);
+        debug_log!("[FreshDiskANN] Phase 9: Selecting {} anchor points using K-Means...", k);
         
         // 🔥 K-Means 聚类
         let dim = nodes[0].1.vector.len();
@@ -1126,11 +1126,11 @@ impl FreshDiskANNIndex {
                 centers[c_idx] = new_center;
             }
             
-            println!("  K-Means iteration {}: {} non-empty clusters", iter + 1, 
+            debug_log!("  K-Means iteration {}: {} non-empty clusters", iter + 1,
                 clusters.iter().filter(|c| !c.is_empty()).count());
             
             if converged {
-                println!("  Converged after {} iterations", iter + 1);
+                debug_log!("  Converged after {} iterations", iter + 1);
                 break;
             }
         }
@@ -1153,7 +1153,7 @@ impl FreshDiskANNIndex {
             anchor_points.push(best_id);
         }
         
-        println!("[FreshDiskANN] Selected {} anchor points: {:?}", anchor_points.len(), anchor_points);
+        debug_log!("[FreshDiskANN] Selected {} anchor points: {:?}", anchor_points.len(), anchor_points);
         Ok(anchor_points)
     }
     
@@ -1232,16 +1232,16 @@ impl IndexBuilder for FreshDiskANNIndex {
             return Ok(());
         }
         
-        println!("[FreshDiskANN] Batch building {} vectors", vectors.len());
+        debug_log!("[FreshDiskANN] Batch building {} vectors", vectors.len());
         
         // 🔥 Phase 2: 根据数量选择策略
         if vectors.len() >= 1000 {
             // ✅ 大批量：使用标准Vamana批量构建（最优）
-            println!("[FreshDiskANN] Using batch Vamana build (>= 1000 vectors)");
+            debug_log!("[FreshDiskANN] Using batch Vamana build (>= 1000 vectors)");
             self.batch_vamana_build(&vectors)?;
         } else {
             // ⚡ 小批量：增量插入到Fresh Graph
-            println!("[FreshDiskANN] Using incremental insert (< 1000 vectors)");
+            debug_log!("[FreshDiskANN] Using incremental insert (< 1000 vectors)");
             for (row_id, vec) in vectors {
                 self.fresh_graph.insert(row_id, vec)?;
             }
@@ -1253,7 +1253,7 @@ impl IndexBuilder for FreshDiskANNIndex {
         }
         
         let duration = start.elapsed();
-        println!("[FreshDiskANN] Batch build complete in {:?}", duration);
+        debug_log!("[FreshDiskANN] Batch build complete in {:?}", duration);
         
         Ok(())
     }
@@ -1269,7 +1269,7 @@ impl IndexBuilder for FreshDiskANNIndex {
         }
         
         let duration = start.elapsed();
-        println!("[FreshDiskANN] Persist complete in {:?}", duration);
+        debug_log!("[FreshDiskANN] Persist complete in {:?}", duration);
         
         Ok(())
     }
@@ -1309,7 +1309,7 @@ impl FreshDiskANNIndex {
         
         // 1.2 选择medoid（中心点）
         let medoid = self.select_medoid_from_batch(vectors)?;
-        println!("[FreshDiskANN] Selected medoid: {}", medoid);
+        debug_log!("[FreshDiskANN] Selected medoid: {}", medoid);
         
         // 1.3 使用贪婪搜索构建邻居连接
         let r = self.config.fresh_config.max_degree;
@@ -1347,7 +1347,7 @@ impl FreshDiskANNIndex {
         }
         
         let duration = start.elapsed();
-        println!("[FreshDiskANN] Batch Vamana build: {} vectors in {:?}", 
+        debug_log!("[FreshDiskANN] Batch Vamana build: {} vectors in {:?}",
             vectors.len(), duration);
         
         Ok(())

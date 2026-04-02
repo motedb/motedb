@@ -1083,20 +1083,20 @@ impl SpatialHybridIndex {
         let storage = self.storage.read();
         let _grid = self.grid.read();
         
-        println!("╭─────────────────────────────────────╮");
-        println!("│  空间索引内存详细分析                │");
-        println!("╰─────────────────────────────────────╯");
+        debug_log!("╭─────────────────────────────────────╮");
+        debug_log!("│  空间索引内存详细分析                │");
+        debug_log!("╰─────────────────────────────────────╯");
         
         // Grid 结构
         let grid_size = std::mem::size_of::<AdaptiveGrid>();
-        println!("  Grid 结构: {} bytes", grid_size);
+        debug_log!("  Grid 结构: {} bytes", grid_size);
         
         // Hot cache
         let cache_len = storage.hot_cache.len();
         let cache_cap = storage.hot_cache.cap().get();
-        println!("\n  Hot Cache:");
-        println!("  ├─ 容量: {}", cache_cap);
-        println!("  ├─ 当前: {}", cache_len);
+        debug_log!("\n  Hot Cache:");
+        debug_log!("  ├─ 容量: {}", cache_cap);
+        debug_log!("  ├─ 当前: {}", cache_len);
         
         let mut total_entries = 0;
         let mut total_vec_mem = 0;
@@ -1106,21 +1106,21 @@ impl SpatialHybridIndex {
         }
         
         let struct_mem = cache_len * std::mem::size_of::<MiniRTree>();
-        println!("  ├─ 结构体内存: {:.2} MB", struct_mem as f64 / 1024.0 / 1024.0);
-        println!("  ├─ Vec 堆内存: {:.2} MB", total_vec_mem as f64 / 1024.0 / 1024.0);
-        println!("  └─ 总条目数: {}", total_entries);
+        debug_log!("  ├─ 结构体内存: {:.2} MB", struct_mem as f64 / 1024.0 / 1024.0);
+        debug_log!("  ├─ Vec 堆内存: {:.2} MB", total_vec_mem as f64 / 1024.0 / 1024.0);
+        debug_log!("  └─ 总条目数: {}", total_entries);
         
         // HashMap
         let hashmap_len = storage.cell_offsets.len();
         let hashmap_mem = hashmap_len * (std::mem::size_of::<GridCellId>() + std::mem::size_of::<(u64, u32)>());
-        println!("\n  Cell Offsets HashMap:");
-        println!("  ├─ 条目数: {}", hashmap_len);
-        println!("  └─ 内存: {:.2} MB", hashmap_mem as f64 / 1024.0 / 1024.0);
+        debug_log!("\n  Cell Offsets HashMap:");
+        debug_log!("  ├─ 条目数: {}", hashmap_len);
+        debug_log!("  └─ 内存: {:.2} MB", hashmap_mem as f64 / 1024.0 / 1024.0);
         
         // 总计
         let total_mem = grid_size + struct_mem + total_vec_mem + hashmap_mem;
-        println!("\n  总计: {:.2} MB", total_mem as f64 / 1024.0 / 1024.0);
-        println!("  每条数据: {:.1} bytes\n", total_mem as f64 / self.len() as f64);
+        debug_log!("\n  总计: {:.2} MB", total_mem as f64 / 1024.0 / 1024.0);
+        debug_log!("  每条数据: {:.1} bytes\n", total_mem as f64 / self.len() as f64);
     }
     
     /// Save index to disk with full metadata persistence
@@ -1369,7 +1369,7 @@ mod tests {
         }
         
         let stats = index.memory_usage();
-        println!("Adaptive grid size: {}", stats.grid_size);
+        debug_log!("Adaptive grid size: {}", stats.grid_size);
         
         // Grid should have adapted
         assert!(stats.grid_size >= 16);
@@ -1388,7 +1388,7 @@ mod tests {
         }
         
         let stats = index.memory_usage();
-        println!("Memory stats: {:?}", stats);
+        debug_log!("Memory stats: {:?}", stats);
         
         let total_memory = stats.grid_overhead + stats.rtree_memory;
         assert!(total_memory < 200_000);
@@ -1479,14 +1479,14 @@ impl IndexBuilder for SpatialHybridIndex {
             return Ok(());
         }
         
-        println!("[SpatialIndex] Batch building {} geometries", geometries.len());
+        debug_log!("[SpatialIndex] Batch building {} geometries", geometries.len());
         
         // 🔥 Phase 2: 使用STR批量加载算法（Sort-Tile-Recursive）
         // 这比逐个插入效率高10倍
         self.str_bulk_load(&geometries)?;
         
         let duration = start.elapsed();
-        println!("[SpatialIndex] Batch build complete in {:?}", duration);
+        debug_log!("[SpatialIndex] Batch build complete in {:?}", duration);
         
         Ok(())
     }
@@ -1500,7 +1500,7 @@ impl IndexBuilder for SpatialHybridIndex {
         self.flush()?;
         
         let duration = start.elapsed();
-        println!("[SpatialIndex] Persist complete in {:?}", duration);
+        debug_log!("[SpatialIndex] Persist complete in {:?}", duration);
         
         Ok(())
     }

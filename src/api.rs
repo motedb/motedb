@@ -125,6 +125,19 @@ impl Database {
         })
     }
 
+    /// Open an existing database with custom configuration
+    ///
+    /// Use this to apply edge-optimized settings when reopening:
+    /// ```ignore
+    /// let config = DBConfig::for_edge();
+    /// let db = Database::open_with_config("data.mote", config)?;
+    /// ```
+    pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(MoteDB::open_with_config(path, config)?),
+        })
+    }
+
     /// 刷新所有数据到磁盘
     ///
     /// # Examples
