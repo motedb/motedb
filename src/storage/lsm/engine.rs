@@ -297,39 +297,40 @@ impl LSMEngine {
         let flush_thread = thread::Builder::new()
             .name("lsm-flush".to_string())
             .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
+                // Wrap each iteration in catch_unwind so the thread survives panics
+                let iter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // 🔧 Check shutdown signal
                 let shutdown = match shutdown_weak.upgrade() {
                     Some(s) => s,
                     None => {
-                        break;
+                        return false; // signal: break loop
                     }
                 };
 
                 if shutdown.load(Ordering::Relaxed) {
-                    break;
+                    return false; // signal: break loop
                 }
 
                 // Quick lock-free check
                 let flush_in_progress = match flush_in_progress_weak.upgrade() {
                     Some(f) => f,
-                    None => break,
+                    None => return false,
                 };
-                
+
                 if !flush_in_progress.load(Ordering::Acquire) {
                     let immutable = match immutable_weak.upgrade() {
                         Some(i) => i,
                         None => {
-                            break;
+                            return false;
                         }
                     };
-                    
+
                     let has_immutable = {
                         let immutable_guard = immutable.read();
                         !immutable_guard.is_empty()
                     };
-                    
+
                     if has_immutable {
                         // Try to flush (inline implementation to avoid circular reference)
                         if flush_in_progress.compare_exchange(
@@ -342,7 +343,7 @@ impl LSMEngine {
                                 let size = immutable_lock.len();
                                 (mt, size)
                             };
-                            
+
                             // 🔥 DEADLOCK FIX: Pop memtable FIRST and drop lock
                             if let Some(memtable) = memtable {
                                 // Generate SSTable ID
@@ -350,27 +351,27 @@ impl LSMEngine {
                                     Some(n) => n,
                                     None => {
                                         flush_in_progress.store(false, Ordering::Release);
-                                        break;
+                                        return false;
                                     }
                                 };
-                                
+
                                 let sst_id = {
                                     let mut next_id = next_sst_id.write();
                                     let current = *next_id;
                                     *next_id += 1;
                                     Some(current)
                                 };
-                                
+
                                 if let Some(sst_id) = sst_id {
                                     let sst_path = storage_dir_clone.join(format!("l0_{:06}.sst", sst_id));
-                                    
-                                    // 🔧 确保存储目录存在（防止目录被删除导致flush失败）
+
+                                    // 🔧 Ensure storage directory exists
                                     if !storage_dir_clone.exists() {
                                         debug_log!("[LSM Flush] ⚠️  Storage directory deleted, skipping flush");
                                         flush_in_progress.store(false, Ordering::Release);
-                                        break;
+                                        return false;
                                     }
-                                    
+
                                     // Build SSTable
                                     match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable.len()) {
                                         Ok(mut builder) => {
@@ -385,7 +386,7 @@ impl LSMEngine {
                                                     debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
                                                 }
                                             }
-                                            
+
                                             match builder.finish() {
                                                 Ok(meta) => {
                                                     if let Some(worker) = compaction_worker_weak.upgrade() {
@@ -408,7 +409,7 @@ impl LSMEngine {
                                         }
                                     }
                                 }
-                                
+
                                 // 🔥 NEW: Call flush callback AFTER SSTable is built
                                 // This ensures the immutable queue drains quickly even if
                                 // index building is slow (e.g. in debug builds).
@@ -439,11 +440,22 @@ impl LSMEngine {
                     *guard = false;
                     let _ = cvar.wait_timeout(guard, Duration::from_secs(5));
                 }
-            }
-            }));  // end catch_unwind
-            
-            if let Err(e) = result {
-                debug_log!("[LSM Flush Thread] ❌ PANIC: {:?}", e);
+                true // signal: continue loop
+                }));  // end catch_unwind for this iteration
+
+                match iter_result {
+                    Ok(should_continue) => {
+                        if !should_continue {
+                            break;
+                        }
+                    }
+                    Err(panic_payload) => {
+                        debug_log!("[LSM Flush Thread] ❌ PANIC in iteration: {:?}", panic_payload);
+                        // Thread survives — continue to next iteration
+                        // Brief sleep to avoid tight panic loop
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
             }
         }).expect("Failed to spawn flush thread");
         

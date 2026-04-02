@@ -27,9 +27,9 @@ impl BloomFilter {
     /// - `num_keys`: Expected number of keys
     /// - `bits_per_key`: Bits allocated per key (typically 10 for 1% FPR)
     pub fn new(num_keys: usize, bits_per_key: usize) -> Self {
-        let num_bits = num_keys * bits_per_key;
+        let num_bits = (num_keys * bits_per_key).max(64); // At least 64 bits to avoid div-by-zero
         let num_bytes = num_bits.div_ceil(8);
-        
+
         // Optimal number of hash functions: k = (m/n) * ln(2)
         // Where m = total bits, n = number of keys
         let num_hashes = ((bits_per_key as f64) * 0.693).ceil() as u32;
@@ -54,15 +54,17 @@ impl BloomFilter {
     
     /// Insert a key
     pub fn insert(&mut self, key: &[u8]) {
+        if self.num_bits == 0 { return; }
         for i in 0..self.num_hashes {
             let hash = self.hash(key, i);
             let bit_pos = (hash as usize) % self.num_bits;
             self.set_bit(bit_pos);
         }
     }
-    
+
     /// Check if key might exist (may have false positives)
     pub fn may_contain(&self, key: &[u8]) -> bool {
+        if self.num_bits == 0 { return false; }
         for i in 0..self.num_hashes {
             let hash = self.hash(key, i);
             let bit_pos = (hash as usize) % self.num_bits;
@@ -97,6 +99,7 @@ impl BloomFilter {
     /// // results[i] = true if keys[i] might exist
     /// ```
     pub fn may_contain_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
+        if self.num_bits == 0 { return vec![false; keys.len()]; }
         let mut results = vec![false; keys.len()];
         
         // 🚀 优化：预分配哈希缓存（减少重复计算）
