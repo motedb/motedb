@@ -3172,6 +3172,22 @@ impl QueryExecutor {
                 if is_pk {
                     return self.execute_update_pk(&stmt, &schema, &target_value);
                 }
+
+                // 🚀 Column index fast path: use index to find matching rows
+                if let Some(index_name) = self.db.index_registry.find_by_column(
+                    &stmt.table, &col_name,
+                    crate::database::index_metadata::IndexType::Column
+                ) {
+                    if let Some(index) = self.db.column_indexes.get(&index_name) {
+                        let matching_row_ids = index.value().read()
+                            .get(&target_value)
+                            .unwrap_or_default();
+                        if matching_row_ids.is_empty() {
+                            return Ok(QueryResult::Modification { affected_rows: 0 });
+                        }
+                        return self.execute_update_by_row_ids(&stmt, &schema, &matching_row_ids);
+                    }
+                }
             }
         }
 
@@ -3234,6 +3250,22 @@ impl QueryExecutor {
 
                 if is_pk {
                     return self.execute_delete_pk(&stmt, &schema, &target_value);
+                }
+
+                // 🚀 Column index fast path: use index to find matching rows
+                if let Some(index_name) = self.db.index_registry.find_by_column(
+                    &stmt.table, &col_name,
+                    crate::database::index_metadata::IndexType::Column
+                ) {
+                    if let Some(index) = self.db.column_indexes.get(&index_name) {
+                        let matching_row_ids = index.value().read()
+                            .get(&target_value)
+                            .unwrap_or_default();
+                        if matching_row_ids.is_empty() {
+                            return Ok(QueryResult::Modification { affected_rows: 0 });
+                        }
+                        return self.execute_delete_by_row_ids(&stmt, &schema, &matching_row_ids);
+                    }
                 }
             }
         }
@@ -3347,6 +3379,59 @@ impl QueryExecutor {
 
         let mut affected_rows = 0;
         for row_id in row_ids {
+            let row = match self.db.get_table_row(&stmt.table, row_id)? {
+                Some(r) => r,
+                None => continue,
+            };
+
+            self.db.delete_row_from_table(&stmt.table, row_id, row)?;
+            affected_rows += 1;
+        }
+
+        Ok(QueryResult::Modification { affected_rows })
+    }
+
+    /// 🚀 Column index fast path for UPDATE: lookup by row_ids from index
+    fn execute_update_by_row_ids(
+        &self,
+        stmt: &UpdateStmt,
+        schema: &crate::types::TableSchema,
+        row_ids: &[RowId],
+    ) -> Result<QueryResult> {
+        let mut affected_rows = 0;
+        for &row_id in row_ids {
+            let row = match self.db.get_table_row(&stmt.table, row_id)? {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let mut sql_row = row_to_sql_row(&row, schema)?;
+            for (col_name, expr) in &stmt.assignments {
+                let new_val = if let Expr::Literal(v) = expr {
+                    v.clone()
+                } else {
+                    self.evaluator.eval(expr, &sql_row)?
+                };
+                sql_row.insert(col_name.clone(), new_val);
+            }
+
+            let new_row = sql_row_to_row(&sql_row, schema)?;
+            self.db.update_row_in_table(&stmt.table, row_id, row, new_row)?;
+            affected_rows += 1;
+        }
+
+        Ok(QueryResult::Modification { affected_rows })
+    }
+
+    /// 🚀 Column index fast path for DELETE: lookup by row_ids from index
+    fn execute_delete_by_row_ids(
+        &self,
+        stmt: &DeleteStmt,
+        schema: &crate::types::TableSchema,
+        row_ids: &[RowId],
+    ) -> Result<QueryResult> {
+        let mut affected_rows = 0;
+        for &row_id in row_ids {
             let row = match self.db.get_table_row(&stmt.table, row_id)? {
                 Some(r) => r,
                 None => continue,
