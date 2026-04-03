@@ -849,7 +849,7 @@ impl QueryExecutor {
         
         // Clone what we need for the closure
         let where_clause = stmt.where_clause.clone();
-        let db = self.db.clone();
+        let _db = self.db.clone();
         let schema_clone = schema.clone();
         let columns_clone = columns.clone();
         let select_cols = stmt.columns.clone();
@@ -3427,7 +3427,7 @@ impl QueryExecutor {
     fn execute_delete_by_row_ids(
         &self,
         stmt: &DeleteStmt,
-        schema: &crate::types::TableSchema,
+        _schema: &crate::types::TableSchema,
         row_ids: &[RowId],
     ) -> Result<QueryResult> {
         let mut affected_rows = 0;
