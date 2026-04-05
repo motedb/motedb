@@ -265,12 +265,15 @@ impl MoteDB {
         // 2. 🚀 P3+4: For AUTO_INCREMENT primary key, use per-table counter
         let row_id = if schema.is_primary_key_auto_increment() {
             // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
-            let counter = self.table_auto_increment
-                .entry(table_name.to_string())
-                .or_insert_with(|| {
-                    // Initialize with schema's start value (default 1)
-                    Arc::new(std::sync::atomic::AtomicI64::new(schema.get_auto_increment_start()))
-                });
+            // Edge optimization: RwLock<HashMap> with entry API
+            let counter = {
+                let mut guard = self.table_auto_increment.write();
+                guard.entry(table_name.to_string())
+                    .or_insert_with(|| {
+                        Arc::new(std::sync::atomic::AtomicI64::new(schema.get_auto_increment_start()))
+                    })
+                    .clone()
+            };
 
             // 🚀 Phase 5: Overflow protection (B1)
             let id = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -324,6 +327,17 @@ impl MoteDB {
         //    fallback to full table scan rather than returning partial results.
         let mut index_errors = Vec::new();
 
+        // 🚀 Pre-compute which columns have active indexes (avoid format!() per column per row)
+        let indexed_columns: std::collections::HashSet<String> = {
+            let prefix = format!("{}.", table_name);
+            self.column_indexes.iter()
+                .filter_map(|entry| {
+                    let key = entry.key();
+                    key.strip_prefix(&prefix).map(|s| s.to_string())
+                })
+                .collect()
+        };
+
         for col_def in &schema.columns {
             let col_name = &col_def.name;
             let col_value = row.get(col_def.position);
@@ -333,12 +347,11 @@ impl MoteDB {
             }
             let col_value = col_value.unwrap();
 
-            // 7.1 Column Index
-            let column_index_name = format!("{}.{}", table_name, col_name);
-            if self.column_indexes.contains_key(&column_index_name) {
+            // 7.1 Column Index (use pre-computed set instead of format!())
+            if indexed_columns.contains(col_name.as_str()) {
                 if let Err(_e) = self.insert_column_value(table_name, col_name, row_id, col_value) {
-                    debug_log!("[insert_row] Failed to update column index '{}': {}", column_index_name, _e);
-                    index_errors.push(column_index_name.clone());
+                    debug_log!("[insert_row] Failed to update column index '{}': {}", col_name, _e);
+                    index_errors.push(format!("{}.{}", table_name, col_name));
                 }
             }
 
@@ -503,6 +516,17 @@ impl MoteDB {
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
         let mut index_errors = Vec::new();
 
+        // 🚀 Pre-compute indexed columns
+        let indexed_columns: std::collections::HashSet<String> = {
+            let prefix = format!("{}.", table_name);
+            self.column_indexes.iter()
+                .filter_map(|entry| {
+                    let key = entry.key();
+                    key.strip_prefix(&prefix).map(|s| s.to_string())
+                })
+                .collect()
+        };
+
         for col_def in &schema.columns {
             let col_name = &col_def.name;
             let old_value = old_row.get(col_def.position);
@@ -513,13 +537,12 @@ impl MoteDB {
                 continue;
             }
 
-            // 6.1 Column Index
-            let column_index_name = format!("{}.{}", table_name, col_name);
-            if self.column_indexes.contains_key(&column_index_name) {
+            // 6.1 Column Index (use pre-computed set)
+            if indexed_columns.contains(col_name.as_str()) {
                 if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
                     if let Err(_e) = self.update_column_value(table_name, col_name, row_id, old_val, new_val) {
-                        debug_log!("[update_row] Failed to update column index '{}': {}", column_index_name, _e);
-                        index_errors.push(column_index_name.clone());
+                        debug_log!("[update_row] Failed to update column index '{}': {}", col_name, _e);
+                        index_errors.push(format!("{}.{}", table_name, col_name));
                     }
                 }
             }
@@ -635,6 +658,18 @@ impl MoteDB {
         // 8. Update indexes (after data is durable).
         //    If an index deletion fails, the index is marked stale and can be
         //    rebuilt later. Since indexes are derived data, this is safe.
+
+        // 🚀 Pre-compute indexed columns
+        let indexed_columns: std::collections::HashSet<String> = {
+            let prefix = format!("{}.", table_name);
+            self.column_indexes.iter()
+                .filter_map(|entry| {
+                    let key = entry.key();
+                    key.strip_prefix(&prefix).map(|s| s.to_string())
+                })
+                .collect()
+        };
+
         for col_def in &schema.columns {
             let col_name = &col_def.name;
             let col_value = old_row.get(col_def.position);
@@ -644,12 +679,11 @@ impl MoteDB {
             }
             let col_value = col_value.unwrap();
 
-            // Column Index
-            let column_index_name = format!("{}.{}", table_name, col_name);
-            if self.column_indexes.contains_key(&column_index_name) {
+            // Column Index (use pre-computed set)
+            if indexed_columns.contains(col_name.as_str()) {
                 if let Err(_e) = self.delete_column_value(table_name, col_name, row_id, col_value) {
-                    debug_log!("[delete_row] Failed to delete from column index '{}': {}", column_index_name, _e);
-                    self.index_registry.mark_stale(&column_index_name);
+                    debug_log!("[delete_row] Failed to delete from column index '{}': {}", col_name, _e);
+                    self.index_registry.mark_stale(&format!("{}.{}", table_name, col_name));
                 }
             }
 
@@ -1007,11 +1041,21 @@ impl MoteDB {
         debug_log!("[batch_insert_rows_to_table] 🚀 P2: Batch updating indexes for {} rows in table '{}'", rows.len(), table_name);
         
         // 7.1 按列聚合数据，批量更新 Column Index
+        // 🚀 Pre-compute indexed columns (avoid format!() per column)
+        let indexed_columns: std::collections::HashSet<String> = {
+            let prefix = format!("{}.", table_name);
+            self.column_indexes.iter()
+                .filter_map(|entry| {
+                    let key = entry.key();
+                    key.strip_prefix(&prefix).map(|s| s.to_string())
+                })
+                .collect()
+        };
+
         for col_def in &schema.columns {
             let col_name = &col_def.name;
-            let column_index_name = format!("{}.{}", table_name, col_name);
-            
-            if self.column_indexes.contains_key(&column_index_name) {
+
+            if indexed_columns.contains(col_name.as_str()) {
                 // 收集该列的所有数据
                 let mut column_data: Vec<(RowId, Value)> = Vec::with_capacity(rows.len());
                 for (row_id, row) in row_ids.iter().zip(rows.iter()) {
@@ -1023,7 +1067,7 @@ impl MoteDB {
                 // 批量插入列索引
                 if !column_data.is_empty() {
                     if let Err(_e) = self.batch_insert_column_values(table_name, col_name, column_data) {
-                        debug_log!("[batch_insert] Failed to batch update column index '{}': {}", column_index_name, _e);
+                        debug_log!("[batch_insert] Failed to batch update column index '{}': {}", col_name, _e);
                     }
                 }
             }

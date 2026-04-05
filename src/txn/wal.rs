@@ -94,7 +94,8 @@ pub enum WALRecord {
     Checkpoint { lsn: LogSequenceNumber },
 }
 
-/// WAL entry with LSN and checksum
+/// WAL entry with LSN and checksum (legacy format, kept for compatibility)
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WALEntry {
     lsn: LogSequenceNumber,
@@ -162,23 +163,38 @@ impl PartitionWAL {
         let mut last_checkpoint = 0;
         let mut corrupted_count = 0;
         
-        // Simple recovery: read all records
+        // Simple recovery: read all records with new header format
         file.seek(SeekFrom::Start(0))?;
-        
+
         loop {
-            // Read length prefix
+            // Read total length prefix
             let mut len_buf = [0u8; 4];
             match file.read_exact(&mut len_buf) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
-            
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut buf = vec![0u8; len];
-            
-            // Detect partial writes
-            match file.read_exact(&mut buf) {
+
+            let _total_len = u32::from_le_bytes(len_buf) as usize;
+
+            // Read header: [u64 lsn][u32 checksum][u32 record_len] = 16 bytes
+            let mut header = [0u8; 16];
+            match file.read_exact(&mut header) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    debug_log!("WAL open: Detected partial write (header)");
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            let lsn = u64::from_le_bytes(header[0..8].try_into().unwrap());
+            let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
+            let record_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+            // Read record data
+            let mut record_data = vec![0u8; record_len];
+            match file.read_exact(&mut record_data) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     debug_log!("WAL open: Detected partial write at end of file");
@@ -186,26 +202,19 @@ impl PartitionWAL {
                 }
                 Err(e) => return Err(e.into()),
             }
-            
-            // Deserialize and verify
-            let entry: WALEntry = match bincode::deserialize(&buf) {
-                Ok(e) => e,
-                Err(_) => {
-                    corrupted_count += 1;
-                    continue;
-                }
-            };
-            
-            // Verify checksum
-            let record_data = bincode::serialize(&entry.record)?;
-            if Checksum::verify(ChecksumType::CRC32C, &record_data, entry.checksum).is_err() {
+
+            // Verify checksum (directly on record_data, no re-serialization)
+            if Checksum::verify(ChecksumType::CRC32C, &record_data, checksum).is_err() {
                 corrupted_count += 1;
                 continue;
             }
-            
-            next_lsn = entry.lsn + 1;
-            if let WALRecord::Checkpoint { lsn } = entry.record {
-                last_checkpoint = lsn;
+
+            next_lsn = lsn + 1;
+            // Deserialize record to check for Checkpoint
+            if let Ok(record) = bincode::deserialize::<WALRecord>(&record_data) {
+                if let WALRecord::Checkpoint { lsn: cp_lsn } = record {
+                    last_checkpoint = cp_lsn;
+                }
             }
         }
         
@@ -227,18 +236,19 @@ impl PartitionWAL {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
 
-        // Serialize record once for checksum
+        // 🚀 P0: Serialize once, write header + data
         let record_data = bincode::serialize(&record)?;
         let checksum = Checksum::compute(ChecksumType::CRC32C, &record_data);
 
-        // Create entry and serialize (record_data already computed, but entry owns record)
-        let entry = WALEntry { lsn, record, checksum };
-        let encoded = bincode::serialize(&entry)?;
+        // Layout: [u32 total_len][u64 lsn][u32 checksum][u32 record_len][record_data]
+        let header_size = 4 + 8 + 4 + 4; // 20 bytes
+        let total_len = (header_size + record_data.len()) as u32;
 
-        // Write length prefix (for recovery parsing)
-        let len = encoded.len() as u32;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&encoded)?;
+        self.file.write_all(&total_len.to_le_bytes())?;
+        self.file.write_all(&lsn.to_le_bytes())?;
+        self.file.write_all(&checksum.to_le_bytes())?;
+        self.file.write_all(&(record_data.len() as u32).to_le_bytes())?;
+        self.file.write_all(&record_data)?;
 
         // Fsync based on durability level
         match self.config.durability_level {
@@ -278,22 +288,25 @@ impl PartitionWAL {
         let mut lsns = Vec::with_capacity(records.len());
         let mut buffer = Vec::new();
         
-        // 1. Serialize all records to buffer (in-memory, fast)
+        // 1. Serialize all records to buffer (in-memory, fast, single serialize each)
         for record in records {
             let lsn = self.next_lsn;
             self.next_lsn += 1;
             lsns.push(lsn);
-            
-            // Compute checksum for record
+
+            // 🚀 Single serialize per record
             let record_data = bincode::serialize(&record)?;
             let checksum = Checksum::compute(ChecksumType::CRC32C, &record_data);
-            
-            let entry = WALEntry { lsn, record, checksum };
-            let encoded = bincode::serialize(&entry)?;
-            
-            // Write length prefix
-            buffer.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            buffer.extend_from_slice(&encoded);
+
+            // Header: [u32 total_len][u64 lsn][u32 checksum][u32 record_len]
+            let header_size = 4 + 8 + 4 + 4; // 20 bytes
+            let total_len = (header_size + record_data.len()) as u32;
+
+            buffer.extend_from_slice(&total_len.to_le_bytes());
+            buffer.extend_from_slice(&lsn.to_le_bytes());
+            buffer.extend_from_slice(&checksum.to_le_bytes());
+            buffer.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&record_data);
         }
         
         // 2. Single write operation (append 模式自动追加)
@@ -346,59 +359,72 @@ impl PartitionWAL {
         let mut records = Vec::new();
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(0))?;
-        
+
         let mut skipped_corrupted = 0;
-        
+
         loop {
-            // Read length prefix
+            // Read total length prefix
             let mut len_buf = [0u8; 4];
             match file.read_exact(&mut len_buf) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e.into()),
             }
-            
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut buf = vec![0u8; len];
-            
-            // Partial write detection
-            match file.read_exact(&mut buf) {
+
+            let _total_len = u32::from_le_bytes(len_buf) as usize;
+
+            // Read header: [u64 lsn][u32 checksum][u32 record_len] = 16 bytes
+            let mut header = [0u8; 16];
+            match file.read_exact(&mut header) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Partial write at end of file - skip and continue
-                    debug_log!("WAL recovery: Detected partial write, skipping last incomplete record");
+                    debug_log!("WAL recovery: Detected partial write (header), skipping");
                     break;
                 }
                 Err(e) => return Err(e.into()),
             }
-            
-            // Deserialize entry
-            let entry: WALEntry = match bincode::deserialize(&buf) {
-                Ok(e) => e,
+
+            let lsn = u64::from_le_bytes(header[0..8].try_into().unwrap());
+            let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
+            let record_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+            // Read record data
+            let mut record_data = vec![0u8; record_len];
+            match file.read_exact(&mut record_data) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    debug_log!("WAL recovery: Detected partial write (record), skipping");
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            // Verify checksum directly on record_data (no re-serialization needed!)
+            if let Err(e) = Checksum::verify(ChecksumType::CRC32C, &record_data, checksum) {
+                debug_log!("WAL recovery: Checksum verification failed for LSN {}: {}", lsn, e);
+                skipped_corrupted += 1;
+                continue;
+            }
+
+            // Deserialize record
+            let record: WALRecord = match bincode::deserialize(&record_data) {
+                Ok(r) => r,
                 Err(e) => {
-                    debug_log!("WAL recovery: Failed to deserialize entry: {}", e);
+                    debug_log!("WAL recovery: Failed to deserialize record: {}", e);
                     skipped_corrupted += 1;
                     continue;
                 }
             };
-            
-            // Verify checksum
-            let record_data = bincode::serialize(&entry.record)?;
-            if let Err(e) = Checksum::verify(ChecksumType::CRC32C, &record_data, entry.checksum) {
-                debug_log!("WAL recovery: Checksum verification failed for LSN {}: {}", entry.lsn, e);
-                skipped_corrupted += 1;
-                continue;
-            }
-            
+
             // Only include records after last checkpoint (>= for LSN starting at 0)
-            if entry.lsn >= self.last_checkpoint {
+            if lsn >= self.last_checkpoint {
                 // Skip the checkpoint record itself
-                if !matches!(entry.record, WALRecord::Checkpoint { .. }) {
-                    records.push(entry.record);
+                if !matches!(record, WALRecord::Checkpoint { .. }) {
+                    records.push(record);
                 }
             }
         }
-        
+
         if skipped_corrupted > 0 {
             debug_log!("WAL recovery: Skipped {} corrupted records", skipped_corrupted);
         }

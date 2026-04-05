@@ -26,6 +26,36 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Edge optimization: conditional parallelism
+/// When rayon is disabled, falls back to serial iteration
+#[cfg(feature = "rayon")]
+#[allow(unused_imports)]
+use rayon::prelude::*;
+
+/// Serial fallback trait for when rayon is disabled
+/// Provides `.par_iter()` → `.iter()` for seamless migration
+#[cfg(not(feature = "rayon"))]
+trait SerialParIter<T> {
+    fn par_iter(&self) -> std::slice::Iter<'_, T>;
+}
+
+#[cfg(not(feature = "rayon"))]
+impl<T> SerialParIter<T> for [T] {
+    fn par_iter(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+}
+
+#[cfg(not(feature = "rayon"))]
+trait SerialParBridge: Iterator + Sized {
+    fn par_bridge(self) -> Self {
+        self
+    }
+}
+
+#[cfg(not(feature = "rayon"))]
+impl<I: Iterator> SerialParBridge for I {}
+
 /// Index statistics
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -476,6 +506,7 @@ impl DiskANNIndex {
         }
         
         // 🚀 分批渐进式构建
+        #[cfg(feature = "rayon")]
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use dashmap::DashMap;
@@ -659,6 +690,7 @@ impl DiskANNIndex {
         medoid_id: RowId,
         show_progress: bool,
     ) -> Result<()> {
+        #[cfg(feature = "rayon")]
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         
@@ -723,6 +755,7 @@ impl DiskANNIndex {
         layer_size: usize,
         show_progress: bool,
     ) -> Result<()> {
+        #[cfg(feature = "rayon")]
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use dashmap::DashMap;
@@ -983,6 +1016,7 @@ impl DiskANNIndex {
     /// 批量更新反向边（复用现有逻辑）
     #[allow(dead_code)]
     fn batch_update_reverse_edges(&self, nodes: &[RowId], show_progress: bool) -> Result<()> {
+        #[cfg(feature = "rayon")]
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use dashmap::DashMap;
@@ -1843,6 +1877,7 @@ impl DiskANNIndex {
         layer_size: usize,
         show_progress: bool,
     ) -> Result<()> {
+        #[cfg(feature = "rayon")]
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use dashmap::DashMap;

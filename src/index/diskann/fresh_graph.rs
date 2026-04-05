@@ -15,6 +15,23 @@ use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use super::Candidate;
 
+/// Edge optimization: conditional parallelism
+#[cfg(feature = "rayon")]
+#[allow(unused_imports)]
+use rayon::prelude::*;
+
+#[cfg(not(feature = "rayon"))]
+trait SerialParIter<T> {
+    fn par_iter(&self) -> std::slice::Iter<'_, T>;
+}
+
+#[cfg(not(feature = "rayon"))]
+impl<T> SerialParIter<T> for [T] {
+    fn par_iter(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+}
+
 /// Fresh Graph 配置
 #[derive(Debug, Clone)]
 pub struct FreshGraphConfig {
@@ -264,6 +281,7 @@ impl FreshVamanaGraph {
     /// 3. 避免重复访问 DashMap
     /// 4. ✨ 自动使用 SIMD 优化（通过 DistanceMetric）
     fn batch_build_graph_parallel(&self, node_ids: &[RowId], max_degree: usize) -> Result<()> {
+        #[cfg(feature = "rayon")]
         use rayon::prelude::*;
         
         // 🚀 Phase 1: 预加载所有向量到内存（避免重复查询 DashMap）

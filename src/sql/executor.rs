@@ -5,7 +5,7 @@ use super::row_converter::{row_to_sql_row, sql_row_to_row, rows_to_sql_rows};
 use crate::database::MoteDB;
 use crate::error::{Result, MoteDBError};
 use crate::{StorageError};
-use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId};
+use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId, Row};
 use std::sync::Arc;
 use std::cell::RefCell;
 
@@ -575,8 +575,7 @@ impl QueryExecutor {
             let row = self.db.get_table_row(table, row_id)?;
             let result_rows: Vec<Result<Vec<Value>>> = match row {
                 Some(row) => {
-                    let sql_row = row_to_sql_row(&row, &schema)?;
-                    let projected = Self::project_row_static(&sql_row, &stmt.columns, &columns, &schema);
+                    let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
                     vec![Ok(projected)]
                 }
                 None => vec![],
@@ -1017,7 +1016,46 @@ impl QueryExecutor {
                 .collect()
         }
     }
-    
+
+    /// 🚀 P0 Optimization: Direct row projection (skips HashMap conversion)
+    ///
+    /// For PK point queries, the old path was:
+    ///   Row(Vec<Value>) → SqlRow(HashMap) → project → Vec<Value>
+    ///   = N clones + N HashMap inserts + N lookups
+    ///
+    /// New path:
+    ///   Row(Vec<Value>) → direct index → Vec<Value>
+    ///   = M clones (M = selected columns, no HashMap)
+    fn project_row_direct(
+        row: &Row,
+        select_cols: &[SelectColumn],
+        columns: &[String],
+        schema: &TableSchema,
+    ) -> Vec<Value> {
+        if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::Star) {
+            // SELECT * — return all columns in schema order (cheap clone)
+            row.iter().cloned().collect()
+        } else {
+            // Explicit columns — use column position as index into Vec
+            columns.iter().zip(select_cols.iter())
+                .map(|(_alias, col_spec)| {
+                    let col_name = match col_spec {
+                        SelectColumn::Column(name) => name,
+                        SelectColumn::ColumnWithAlias(name, _) => name,
+                        SelectColumn::Star => return Value::Null,
+                        SelectColumn::Expr(_, _) => return Value::Null,
+                    };
+                    // Look up column position in schema (O(1) via column_map HashMap)
+                    if let Some(pos) = schema.get_column_position(col_name) {
+                        row.get(pos).cloned().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect()
+        }
+    }
+
     /// Internal SELECT execution (takes &SelectStmt to allow reuse in subqueries)
     fn execute_select_internal(&self, stmt: &SelectStmt) -> Result<QueryResult> {
         // 🆕 FAST PATH -4: SELECT without FROM clause (e.g., SELECT LAST_INSERT_ID())
@@ -1263,12 +1301,12 @@ impl QueryExecutor {
                             *sql_row = new_sql_row;
                         }
                         
-                        let mut prefixed_schema = schema.clone();
+                        let mut prefixed_schema = (*schema).clone();
                         for col in &mut prefixed_schema.columns {
                             col.name = format!("{}.{}", prefix, col.name);
                         }
                         
-                        (sql_rows, prefixed_schema)
+                        (sql_rows, Arc::new(prefixed_schema))
                         } else {
                             // 🚀 High selectivity (>= 15%): Use真正的流式扫描 (O(1) memory!)
                             debug_log!(
@@ -1331,12 +1369,12 @@ impl QueryExecutor {
                                 *sql_row = new_sql_row;
                             }
                             
-                            let mut prefixed_schema = schema.clone();
+                            let mut prefixed_schema = (*schema).clone();
                             for col in &mut prefixed_schema.columns {
                                 col.name = format!("{}.{}", prefix, col.name);
                             }
                             
-                            (filtered_rows, prefixed_schema)
+                            (filtered_rows, Arc::new(prefixed_schema))
                         }
                     } else {
                         // No index, use table scan
@@ -1388,12 +1426,12 @@ impl QueryExecutor {
                                     *sql_row = new_sql_row;
                                 }
                                 
-                                let mut prefixed_schema = schema.clone();
+                                let mut prefixed_schema = (*schema).clone();
                                 for col in &mut prefixed_schema.columns {
                                     col.name = format!("{}.{}", prefix, col.name);
                                 }
-                                
-                                (sql_rows, prefixed_schema)
+
+                                (sql_rows, Arc::new(prefixed_schema))
                             }
                             Err(_) => {
                                 // Fallback to table scan
@@ -1460,12 +1498,12 @@ impl QueryExecutor {
                                     *sql_row = new_sql_row;
                                 }
                                 
-                                let mut prefixed_schema = schema.clone();
+                                let mut prefixed_schema = (*schema).clone();
                                 for col in &mut prefixed_schema.columns {
                                     col.name = format!("{}.{}", prefix, col.name);
                                 }
-                                
-                                (sql_rows, prefixed_schema)
+
+                                (sql_rows, Arc::new(prefixed_schema))
                             }
                             Err(_) => {
                                 // Fallback to table scan
@@ -1743,12 +1781,12 @@ impl QueryExecutor {
     
     /// Execute FROM clause - handles single table or JOINs
     /// Returns all rows with combined schema
-    fn execute_from(&self, table_ref: &TableRef) -> Result<(Vec<(u64, SqlRow)>, TableSchema)> {
+    fn execute_from(&self, table_ref: &TableRef) -> Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)> {
         self.execute_from_with_limit(table_ref, None)
     }
-    
+
     /// 🚀 P0 OPTIMIZATION: Execute FROM clause with limit passed to storage layer
-    fn execute_from_with_limit(&self, table_ref: &TableRef, limit: Option<usize>) -> Result<(Vec<(u64, SqlRow)>, TableSchema)> {
+    fn execute_from_with_limit(&self, table_ref: &TableRef, limit: Option<usize>) -> Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)> {
         match table_ref {
             TableRef::Table { name, alias } => {
                 // Single table - use table-specific scan with limit
@@ -1787,12 +1825,12 @@ impl QueryExecutor {
                 }
                 
                 // Update schema column names
-                let mut prefixed_schema = schema.clone();
+                let mut prefixed_schema = (*schema).clone();
                 for col in &mut prefixed_schema.columns {
                     col.name = format!("{}.{}", prefix, col.name);
                 }
-                
-                Ok((sql_rows, prefixed_schema))
+
+                Ok((sql_rows, Arc::new(prefixed_schema)))
             }
             TableRef::Subquery { query, alias } => {
                 // Execute subquery
@@ -1861,7 +1899,7 @@ impl QueryExecutor {
                             col.name = format!("{}.{}", alias, base_name);
                         }
                         
-                        Ok((sql_rows, schema))
+                        Ok((sql_rows, Arc::new(schema)))
                     }
                     _ => Err(MoteDBError::Query("Subquery must be a SELECT".into())),
                 }
@@ -1872,7 +1910,7 @@ impl QueryExecutor {
                 let (right_rows, right_schema) = self.execute_from(right)?;
                 
                 // Combine schemas
-                let mut combined_schema = left_schema.clone();
+                let mut combined_schema = (*left_schema).clone();
                 combined_schema.columns.extend(right_schema.columns.clone());
                 
                 // Perform JOIN based on type
@@ -1883,7 +1921,7 @@ impl QueryExecutor {
                     JoinType::Full => self.full_join(&left_rows, &right_rows, on_condition)?,
                 };
                 
-                Ok((joined_rows, combined_schema))
+                Ok((joined_rows, Arc::new(combined_schema)))
             }
         }
     }

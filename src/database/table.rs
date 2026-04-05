@@ -5,6 +5,7 @@
 
 use crate::types::{TableSchema, IndexDef, RowId};
 use crate::{Result, StorageError};
+use std::sync::Arc;
 
 use super::core::MoteDB;
 
@@ -54,7 +55,7 @@ impl MoteDB {
     /// let schema = db.get_table_schema("users")?;
     /// println!("Table has {} columns", schema.column_count());
     /// ```
-    pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
+    pub fn get_table_schema(&self, table_name: &str) -> Result<Arc<TableSchema>> {
         self.table_registry.get_table(table_name)
     }
     

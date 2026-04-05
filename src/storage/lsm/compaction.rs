@@ -15,6 +15,7 @@ use super::{SSTable, SSTableBuilder, LSMConfig, Key};
 use crate::{Result, StorageError};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use parking_lot::RwLock;
 use std::fs;
 
 /// Compaction statistics
@@ -281,6 +282,11 @@ pub struct CompactionWorker {
     /// Callback invoked after compaction replaces SSTables.
     /// Used to invalidate the SSTableCache so readers don't hold stale file handles.
     post_compaction_cb: Arc<std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>>>,
+
+    /// 🚀 P0 Optimization: Cached snapshot of all SSTable metadata
+    /// Readers access this via cheap Arc clone (no Mutex contention).
+    /// Updated atomically after register_sstable() and run_compaction().
+    sstable_snapshot: RwLock<Option<Arc<Vec<SSTableMeta>>>>,
 }
 
 impl CompactionWorker {
@@ -299,6 +305,7 @@ impl CompactionWorker {
             },
             stats: Arc::new(Mutex::new(CompactionStats::default())),
             post_compaction_cb: Arc::new(std::sync::RwLock::new(None)),
+            sstable_snapshot: RwLock::new(None),
         };
 
         // Discover existing SSTables on disk
@@ -386,10 +393,13 @@ impl CompactionWorker {
     pub fn register_sstable(&self, meta: SSTableMeta) -> Result<()> {
         let mut levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
+
         // Always add to L0
         levels[0].add_sstable(meta);
-        
+
+        // 🚀 Invalidate snapshot so next read rebuilds it
+        self.invalidate_snapshot();
+
         Ok(())
     }
     
@@ -402,16 +412,40 @@ impl CompactionWorker {
     }
     
     /// Get all SSTables across all levels (for query)
+    ///
+    /// 🚀 P0 Optimization: Uses cached snapshot (Arc clone = cheap).
+    /// Falls back to building from levels on first call or after invalidation.
     pub fn get_all_sstables(&self) -> Result<Vec<SSTableMeta>> {
+        // Fast path: read cached snapshot (no Mutex on levels needed)
+        {
+            let snap = self.sstable_snapshot.read();
+            if let Some(ref arc_vec) = *snap {
+                return Ok((**arc_vec).clone());
+            }
+        }
+
+        // Slow path: build snapshot from levels and cache it
         let levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
+
         let mut all_sstables = Vec::new();
         for level in levels.iter() {
             all_sstables.extend(level.sstables.iter().cloned());
         }
-        
+
+        // Cache for future reads
+        {
+            let mut snap = self.sstable_snapshot.write();
+            *snap = Some(Arc::new(all_sstables.clone()));
+        }
+
         Ok(all_sstables)
+    }
+
+    /// 🚀 P0: Invalidate cached SSTable snapshot (called after register/run_compaction)
+    fn invalidate_snapshot(&self) {
+        let mut snap = self.sstable_snapshot.write();
+        *snap = None;
     }
     
     /// Run one round of compaction
@@ -521,6 +555,9 @@ impl CompactionWorker {
 
         drop(stats);
         drop(levels);
+
+        // 🚀 Invalidate snapshot so next read rebuilds it
+        self.invalidate_snapshot();
 
         // Invalidate SSTableCache so readers don't hold stale file handles
         self.invoke_post_compaction();
@@ -865,12 +902,15 @@ impl CompactionWorker {
 
         drop(stats);
 
+        // 🚀 Invalidate snapshot so next read rebuilds it
+        self.invalidate_snapshot();
+
         // Invalidate SSTableCache so readers don't hold stale file handles
         self.invoke_post_compaction();
 
         Ok(())
     }
-    /// 
+    ///
     /// Instead of merging all N files at once:
     /// - Split into batches of 2
     /// - Merge each batch independently

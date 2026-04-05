@@ -140,13 +140,13 @@ impl TableRegistry {
         Ok(())
     }
 
-    /// Get table schema
-    pub fn get_table(&self, table_name: &str) -> Result<TableSchema> {
+    /// Get table schema (returns Arc — cheap clone, no full struct copy)
+    pub fn get_table(&self, table_name: &str) -> Result<Arc<TableSchema>> {
         let meta = self.metadata.read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         meta.tables.get(table_name)
-            .cloned()
+            .map(|s| Arc::new(s.clone()))
             .ok_or_else(|| StorageError::InvalidData(format!(
                 "Table '{}' not found",
                 table_name

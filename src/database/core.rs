@@ -72,7 +72,8 @@ pub struct MoteDB {
     
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
-    pub(crate) table_auto_increment: Arc<DashMap<String, Arc<AtomicI64>>>,
+    /// Edge optimization: RwLock<HashMap> instead of DashMap (write-once-per-table, then atomic)
+    pub(crate) table_auto_increment: Arc<RwLock<HashMap<String, Arc<AtomicI64>>>>,
 
     /// Number of partitions
     pub(crate) num_partitions: u8,
@@ -201,7 +202,7 @@ impl MoteDB {
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
             next_row_id: Arc::new(RwLock::new(0)),
-            table_auto_increment: Arc::new(DashMap::new()),
+            table_auto_increment: Arc::new(RwLock::new(HashMap::new())),
             num_partitions,
             txn_coordinator,
             version_store,
@@ -435,7 +436,7 @@ impl MoteDB {
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
             next_row_id: Arc::new(RwLock::new(max_row_id + 1)),
-            table_auto_increment: Arc::new(DashMap::new()),
+            table_auto_increment: Arc::new(RwLock::new(HashMap::new())),
             num_partitions,
             txn_coordinator,
             version_store,
@@ -486,7 +487,7 @@ impl MoteDB {
                 debug_log!("[database] 🔄 Recovered AUTO_INCREMENT counter for '{}': next_id = {}", 
                     table_name, max_id + 1);
                 
-                db.table_auto_increment.insert(
+                db.table_auto_increment.write().insert(
                     table_name,
                     Arc::new(AtomicI64::new(max_id + 1))
                 );
@@ -515,14 +516,15 @@ impl MoteDB {
     /// Returns error if table doesn't exist or doesn't have AUTO_INCREMENT
     pub fn set_auto_increment_value(&self, table_name: &str, new_value: i64) -> Result<()> {
         // Verify table has AUTO_INCREMENT
-        if !self.table_auto_increment.contains_key(table_name) {
+        let guard = self.table_auto_increment.read();
+        if !guard.contains_key(table_name) {
             return Err(MoteDBError::InvalidArgument(
                 format!("Table {} does not have AUTO_INCREMENT", table_name)
             ));
         }
-        
-        // Update counter
-        if let Some(counter_ref) = self.table_auto_increment.get(table_name) {
+
+        // Update counter (atomic — no write lock needed, just read lock for lookup)
+        if let Some(counter_ref) = guard.get(table_name) {
             counter_ref.store(new_value, std::sync::atomic::Ordering::SeqCst);
             debug_log!("[database] ✓ Set AUTO_INCREMENT for '{}' to {}", table_name, new_value);
         }

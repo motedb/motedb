@@ -1,6 +1,6 @@
 [package]
 name = "motedb"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
 license = "MIT"
@@ -35,9 +35,6 @@ crc32fast = "1.4"
 # High-performance locks (used throughout: indexes, storage, transactions)
 parking_lot = "0.12"
 
-# Lock-free data structures (future use: planned for concurrent operations)
-crossbeam = "0.8"
-
 # LRU cache (used by: btree, spatial, text_dictionary, cached_index, row_cache)
 lru = "0.12"
 
@@ -54,7 +51,6 @@ serde_json = "1.0"  # JSON for manifest and metadata
 
 # Error handling (used throughout)
 thiserror = "1.0"
-anyhow = "1.0"
 
 # System calls for durability (used by: btree, diskann, manifest, WAL)
 libc = "0.2"
@@ -62,8 +58,9 @@ libc = "0.2"
 # Random number generation (used by: tests, evaluator RANDOM(), benchmarks)
 rand = "0.8"
 
-# Data parallelism (used throughout: batch operations, indexing)
-rayon = "1.8"
+# Data parallelism (used by: diskann, sstable parallel scan)
+# Edge builds can disable rayon for smaller binary (saves ~200KB)
+rayon = { version = "1.8", optional = true }
 dashmap = "6.1.0"  # Concurrent HashMap
 
 # Perfect hash map for O(1) keyword lookup (used by: SQL lexer)
@@ -92,15 +89,15 @@ clap = { version = "4.4", features = ["derive"] }
 
 # Enable jieba tokenizer by default
 [features]
-default = ["tokenizer-jieba"]  # 默认启用中文分词
-default-edge = []  # Edge/IoT preset: no tokenizer, minimal binary size
+default = ["tokenizer-jieba", "rayon"]  # Full build: jieba + parallelism
+default-edge = []  # Edge/IoT minimal: no tokenizer, no rayon (smallest binary)
 # 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
 # 内存分析（用于性能调优）
 mem-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
-# ⚡ 数据并行化（可选，已包含在 dependencies 中）
-rayon = []  # 启用 Rayon 并行处理
+# ⚡ 数据并行化（可选，减少二进制大小 ~200KB）
+rayon = ["dep:rayon"]  # 启用 Rayon 并行处理
 
 [profile.release]
 opt-level = 3  # 🚀 优化性能（3 = 最快，z = 最小）
