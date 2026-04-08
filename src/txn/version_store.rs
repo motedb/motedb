@@ -19,7 +19,7 @@ pub type Timestamp = u64;
 /// Version Store - manages all row versions
 pub struct VersionStore {
     /// Row ID -> Version Chain
-    versions: DashMap<RowId, VersionChain>,
+    pub(crate) versions: DashMap<RowId, VersionChain>,
     
     /// Global timestamp generator
     timestamp_gen: Arc<AtomicU64>,
@@ -28,7 +28,7 @@ pub struct VersionStore {
 /// Version Chain - linked list of versions for a single row
 pub struct VersionChain {
     /// Head of the version chain (newest version)
-    head: Arc<RwLock<Option<Box<RowVersion>>>>,
+    pub(crate) head: Arc<RwLock<Option<Box<RowVersion>>>>,
     
     /// Number of versions in the chain
     version_count: AtomicU64,
@@ -101,13 +101,11 @@ impl VersionStore {
             next: None,
         });
         
-        // OPTIMIZATION: Two-step approach to avoid holding DashMap lock during prepend
-        // Step 1: Ensure chain exists
-        if !self.versions.contains_key(&row_id) {
-            self.versions.insert(row_id, VersionChain::new());
-        }
-        
-        // Step 2: Get chain and prepend (DashMap lock released between steps)
+        // Use entry() API for atomic get-or-insert (prevents TOCTOU race where
+        // two threads could both observe contains_key=false and one overwrites
+        // the other's chain with an empty one, losing all prior versions)
+        self.versions.entry(row_id).or_insert_with(VersionChain::new);
+
         if let Some(chain) = self.versions.get(&row_id) {
             chain.prepend(new_version);
         }

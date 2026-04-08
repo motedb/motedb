@@ -50,13 +50,8 @@ impl MoteDB {
     /// let row_id = db.insert_in_transaction(txn, timestamp)?;
     /// ```
     pub fn insert_in_transaction(&self, txn_id: TransactionId, timestamp: i64) -> Result<RowId> {
-        // 1. Allocate row ID
-        let row_id = {
-            let mut next_id = self.next_row_id.write();
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        // 1. Allocate row ID (lock-free atomic)
+        let row_id = self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // 2. Build row data
         let row: Row = vec![Value::Timestamp(Timestamp::from_micros(timestamp))];
@@ -105,13 +100,8 @@ impl MoteDB {
             ))
         })?;
         
-        // 2. Allocate row ID
-        let row_id = {
-            let mut next_id = self.next_row_id.write();
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        // 2. Allocate row ID (lock-free atomic)
+        let row_id = self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
         // 3. Add to transaction's write set (with table_name metadata)
         let ctx = self.txn_coordinator.get_context(txn_id)?;
@@ -277,35 +267,51 @@ impl MoteDB {
     pub fn commit_transaction_full(&self, txn_id: TransactionId) -> Result<()> {
         let ctx = self.txn_coordinator.get_context(txn_id)?;
         let write_set = ctx.write_set.read().clone();
-        
+
         if write_set.is_empty() {
             // Empty transaction, just mark as committed
             let _commit_ts = self.txn_coordinator.commit(txn_id)?;
             return Ok(());
         }
-        
-        // Step 1: WAL logging (durability first)
+
+        // Step 1: Batch WAL logging (single write + fsync for all rows)
+        // Group records by partition for efficient batch_append
+        let mut partition_records: std::collections::HashMap<PartitionId, Vec<crate::txn::wal::WALRecord>> =
+            std::collections::HashMap::new();
+
         for (row_id, (table_name, row_data)) in &write_set {
             let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-            self.wal.log_insert(table_name, partition, *row_id, row_data.clone())?;
+            partition_records.entry(partition).or_default().push(
+                crate::txn::wal::WALRecord::Insert {
+                    table_name: table_name.clone(),
+                    row_id: *row_id,
+                    partition,
+                    data: row_data.clone(),
+                }
+            );
         }
-        
+
+        for (partition, records) in partition_records {
+            self.wal.batch_append(partition, records)?;
+        }
+
         // Step 2: Transaction validation & Version Store commit
         let commit_ts = self.txn_coordinator.commit(txn_id)?;
-        
-        // Step 3: Write to LSM Engine (persistent storage)
-        for (row_id, (table_name, row_data)) in &write_set {
-            // Serialize and write to LSM
-            let row_bytes = bincode::serialize(&row_data)?;
-            let value = crate::storage::lsm::Value::new(row_bytes, commit_ts);
-            let composite_key = self.make_composite_key(table_name, *row_id);
-            
-            self.lsm_engine.put(composite_key, value)?;
+
+        // Step 3: Batch LSM Engine write (single lock acquisition via batch_put)
+        {
+            let mut kvs: Vec<(u64, crate::storage::lsm::Value)> = Vec::with_capacity(write_set.len());
+            for (row_id, (table_name, row_data)) in &write_set {
+                let row_bytes = bincode::serialize(row_data)?;
+                let value = crate::storage::lsm::Value::new(row_bytes, commit_ts);
+                let composite_key = self.make_composite_key(table_name, *row_id);
+                kvs.push((composite_key, value));
+            }
+            self.lsm_engine.batch_put(&kvs)?;
         }
-        
-        // Step 4: Update in-memory indexes (Primary Key only for real-time queries)
+
+        // Step 4: Update in-memory indexes (Primary Key + timestamp)
         for (row_id, (table_name, row_data)) in &write_set {
-            // Only update PRIMARY KEY index immediately
             if let Ok(schema) = self.table_registry.get_table(table_name) {
                 if let Some(pk_col) = schema.primary_key() {
                     let index_name = format!("{}.{}", table_name, pk_col);
@@ -318,13 +324,12 @@ impl MoteDB {
                     }
                 }
             }
-            
-            // Update timestamp index if present
+
             if let Some(Value::Timestamp(ts)) = row_data.first() {
                 self.timestamp_index.write().insert(ts.as_micros() as u64, *row_id)?;
             }
         }
-        
+
         Ok(())
     }
     

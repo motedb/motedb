@@ -361,6 +361,97 @@ impl QueryExecutor {
     ///     Ok(())
     /// })?;
     /// ```
+    /// Execute a statement by reference (avoids cloning the AST).
+    ///
+    /// For SELECT: only clones the SelectStmt (cheap relative to full query).
+    /// For other statements: clones only the specific variant needed.
+    pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
+        match stmt {
+            Statement::Select(s) => self.execute_select_streaming(s.clone()),
+            Statement::Insert(i) => {
+                let result = self.execute_insert(i.clone())?;
+                Ok(StreamingQueryResult::Modification {
+                    affected_rows: result.affected_rows(),
+                })
+            }
+            Statement::Update(u) => {
+                let result = self.execute_update(u.clone())?;
+                Ok(StreamingQueryResult::Modification {
+                    affected_rows: result.affected_rows(),
+                })
+            }
+            Statement::Delete(d) => {
+                let result = self.execute_delete(d.clone())?;
+                Ok(StreamingQueryResult::Modification {
+                    affected_rows: result.affected_rows(),
+                })
+            }
+            Statement::CreateTable(c) => {
+                let result = self.execute_create_table(c.clone())?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Table created".to_string(),
+                    },
+                })
+            }
+            Statement::CreateIndex(c) => {
+                let result = self.execute_create_index(c.clone())?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Index created".to_string(),
+                    },
+                })
+            }
+            Statement::DropTable(d) => {
+                let result = self.execute_drop_table(d.clone())?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Table dropped".to_string(),
+                    },
+                })
+            }
+            Statement::DropIndex(d) => {
+                let result = self.execute_drop_index(d.clone())?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Index dropped".to_string(),
+                    },
+                })
+            }
+            Statement::ShowTables => {
+                let result = self.execute_show_tables()?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Tables shown".to_string(),
+                    },
+                })
+            }
+            Statement::DescribeTable(table_name) => {
+                let result = self.execute_describe_table(table_name.clone())?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Table described".to_string(),
+                    },
+                })
+            }
+            Statement::AlterTable(a) => {
+                let result = self.execute_alter_table(a.clone())?;
+                Ok(StreamingQueryResult::Definition {
+                    message: match result {
+                        QueryResult::Definition { message } => message,
+                        _ => "Table altered".to_string(),
+                    },
+                })
+            }
+        }
+    }
+
     pub fn execute_streaming(&self, stmt: Statement) -> Result<StreamingQueryResult> {
         match stmt {
             Statement::Select(s) => self.execute_select_streaming(s),
@@ -4472,7 +4563,28 @@ impl QueryExecutor {
                     
                     let row = bincode::deserialize::<crate::types::Row>(data)
                         .map_err(|e| StorageError::InvalidData(format!("Deserialization failed: {}", e)))?;
-                    
+
+                    // 🚀 Fast path for SELECT *: skip HashMap conversion entirely
+                    //     Direct positional projection from Vec<Value> — saves 2*N HashMap
+                    //     inserts + N format!() calls for prefix rewriting.
+                    let is_select_star = stmt.columns.len() == 1
+                        && matches!(stmt.columns[0], SelectColumn::Star);
+
+                    if is_select_star {
+                        let column_names: Vec<String> = schema.columns.iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        let result_row: Vec<Value> = schema.columns.iter()
+                            .map(|col| row.get(col.position).cloned().unwrap_or(Value::Null))
+                            .collect();
+
+                        return Ok(Some(QueryResult::Select {
+                            columns: column_names,
+                            rows: vec![result_row],
+                        }));
+                    }
+
+                    // Slow path: column projection needs HashMap-based SqlRow
                     // Convert to SqlRow
                     let sql_row = row_to_sql_row(&row, &schema)?;
                     
@@ -4549,7 +4661,25 @@ impl QueryExecutor {
                 
                 let row = bincode::deserialize::<crate::types::Row>(data)
                     .map_err(|e| StorageError::InvalidData(format!("Deserialization failed: {}", e)))?;
-                
+
+                // 🚀 Fast path for SELECT *: skip HashMap conversion entirely
+                let is_select_star = stmt.columns.len() == 1
+                    && matches!(stmt.columns[0], SelectColumn::Star);
+
+                if is_select_star {
+                    let column_names: Vec<String> = schema.columns.iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let result_row: Vec<Value> = schema.columns.iter()
+                        .map(|col| row.get(col.position).cloned().unwrap_or(Value::Null))
+                        .collect();
+
+                    return Ok(Some(QueryResult::Select {
+                        columns: column_names,
+                        rows: vec![result_row],
+                    }));
+                }
+
                 // 转换为 SqlRow
                 let sql_row = row_to_sql_row(&row, &schema)?;
                 

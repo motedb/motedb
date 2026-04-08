@@ -34,33 +34,44 @@ pub struct MemTableScanProfile {
 }
 
 impl MoteDB {
-    /// Rebuild timestamp index from LSM storage
-    /// 
-    /// Scans all rows and rebuilds the timestamp index incrementally
+    /// Rebuild timestamp index from LSM storage (incremental, range-scan optimized)
+    ///
+    /// Uses LSM range scan instead of N point lookups — O(SSTable_count) instead of O(N).
+    /// Only processes entries with timestamp > max_indexed_ts.
     pub fn rebuild_timestamp_index(&self) -> Result<()> {
+        use std::time::Instant;
+        let start = Instant::now();
+
         // Get max indexed timestamp to avoid reprocessing
         let max_indexed_ts = self.timestamp_index.read().max_key()?.unwrap_or(0);
-        
-        // Scan LSM for all entries
+
+        // Use LSM range scan for each known table (O(SSTable_count), not O(N))
         let mut entries_to_index = Vec::new();
-        
-        let table_name = "_default";
-        let composite_key_base = self.make_composite_key(table_name, 0);
-        let table_hash = composite_key_base >> 32;
-        
-        let max_row_id = *self.next_row_id.read();
-        for row_id in 0..max_row_id {
-            let composite_key = (table_hash << 32) | row_id;
-            if let Some(value) = self.lsm_engine.get(composite_key)? {
+
+        for table_name in self.table_registry.list_tables()? {
+            let prefix = self.compute_table_prefix(&table_name);
+            let start_key = prefix << 32;
+            let end_key = (prefix + 1) << 32;
+
+            let scan_iter = match self.lsm_engine.scan_range_streaming(start_key, end_key) {
+                Ok(iter) => iter,
+                Err(_) => continue,
+            };
+
+            for result in scan_iter {
+                let (composite_key, value) = match result {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
                 let data_bytes: Vec<u8> = match &value.data {
                     crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
                     crate::storage::lsm::ValueData::Blob(blob_ref) => {
                         match self.lsm_engine.resolve_blob(blob_ref) {
                             Ok(data) => data,
-                            Err(e) => {
-                                debug_log!("[update_timestamp_index_incremental] Failed to resolve blob for row {}: {}", row_id, e);
-                                continue;
-                            }
+                            Err(_) => continue,
                         }
                     }
                 };
@@ -68,7 +79,6 @@ impl MoteDB {
                 if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
                     if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
                         let ts_micros = ts.as_micros() as u64;
-                        
                         if ts_micros > max_indexed_ts {
                             entries_to_index.push((ts_micros, row_id));
                         }
@@ -76,15 +86,17 @@ impl MoteDB {
                 }
             }
         }
-        
+
         // Batch insert into index
-        if !entries_to_index.is_empty() {
+        let count = entries_to_index.len();
+        if count > 0 {
             let mut ts_index = self.timestamp_index.write();
             for (timestamp, row_id) in entries_to_index {
                 ts_index.insert(timestamp, row_id)?;
             }
+            debug_log!("[rebuild_timestamp_index] Added {} entries in {:?}", count, start.elapsed());
         }
-        
+
         Ok(())
     }
     

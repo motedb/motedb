@@ -307,7 +307,7 @@ impl TransactionCoordinator {
     /// 3. Remove savepoint[position..end] from stack
     pub fn rollback_to_savepoint(&self, txn_id: TransactionId, name: &str) -> Result<()> {
         let ctx = self.get_context(txn_id)?;
-        
+
         // Check if transaction is active
         let state = ctx.state.load(Ordering::Acquire);
         if state != TransactionState::Active as u8 {
@@ -315,33 +315,47 @@ impl TransactionCoordinator {
                 format!("Transaction {} is not active", txn_id)
             ));
         }
-        
-        let mut savepoints = ctx.savepoints.write();
-        
-        // Find the savepoint by name
-        let position = savepoints.iter().position(|sp| sp.name == name)
-            .ok_or_else(|| StorageError::Transaction(
-                format!("Savepoint '{}' not found in transaction {}", name, txn_id)
-            ))?;
-        
-        // 🚀 Collect all deltas from savepoints AFTER this one (in reverse order)
-        let mut all_deltas = Vec::new();
-        for sp in savepoints.iter().skip(position + 1).rev() {
-            // Reverse the deltas within each savepoint too
-            for delta in sp.write_deltas.iter().rev() {
+
+        // Phase 1: Collect undo data from savepoints, then DROP savepoints lock.
+        // This prevents deadlock with record_write_delta() which acquires
+        // savepoints.write() (callers may hold write_set.read()).
+        let (position, all_deltas, read_deltas) = {
+            let savepoints = ctx.savepoints.write();
+
+            // Find the savepoint by name
+            let position = savepoints.iter().position(|sp| sp.name == name)
+                .ok_or_else(|| StorageError::Transaction(
+                    format!("Savepoint '{}' not found in transaction {}", name, txn_id)
+                ))?;
+
+            // Collect all deltas from savepoints AFTER this one (in reverse order)
+            let mut all_deltas = Vec::new();
+            for sp in savepoints.iter().skip(position + 1).rev() {
+                for delta in sp.write_deltas.iter().rev() {
+                    all_deltas.push(delta.clone());
+                }
+            }
+
+            // Also include deltas from the target savepoint itself
+            for delta in savepoints[position].write_deltas.iter().rev() {
                 all_deltas.push(delta.clone());
             }
-        }
-        
-        // Also include deltas from the target savepoint itself
-        for delta in savepoints[position].write_deltas.iter().rev() {
-            all_deltas.push(delta.clone());
-        }
-        
-        // 🚀 Apply undo operations (P3.3 COW: Arc clone is cheap)
+
+            // Collect read deltas for undo
+            let mut read_deltas = Vec::new();
+            for sp in savepoints.iter().skip(position).rev() {
+                for row_id in &sp.read_deltas {
+                    read_deltas.push(*row_id);
+                }
+            }
+
+            (position, all_deltas, read_deltas)
+        }; // savepoints lock dropped here — safe to acquire write_set/write
+
+        // Phase 2: Apply undo operations (P3.3 COW: Arc clone is cheap)
         let mut write_set = ctx.write_set.write();
         let mut read_set = ctx.read_set.write();
-        
+
         let mut undo_count = 0;
         for delta in all_deltas {
             match delta {
@@ -362,20 +376,24 @@ impl TransactionCoordinator {
                 }
             }
         }
-        
+
         // Undo read_set changes
-        for sp in savepoints.iter().skip(position).rev() {
-            for row_id in &sp.read_deltas {
-                read_set.remove(row_id);
-            }
+        for row_id in &read_deltas {
+            read_set.remove(row_id);
         }
-        
-        // Remove this savepoint and all later ones
-        savepoints.truncate(position);
-        
+
+        drop(write_set);
+        drop(read_set);
+
+        // Phase 3: Truncate savepoints (re-acquire after dropping write_set/read_set)
+        {
+            let mut savepoints = ctx.savepoints.write();
+            savepoints.truncate(position);
+        }
+
         debug_log!("[Savepoint] Rolled back to '{}' in txn {} (undid {} ops)",
                   name, txn_id, undo_count);
-        
+
         Ok(())
     }
     
@@ -436,21 +454,46 @@ impl TransactionCoordinator {
     
     /// Validate write set for conflicts
     fn validate_write_set(&self, ctx: &TransactionContext) -> Result<()> {
-        // For Serializable isolation, check read-write conflicts
-        if ctx.isolation_level == IsolationLevel::Serializable {
-            let read_set = ctx.read_set.read();
-            let _write_set = ctx.write_set.read();
-            
-            // Check if any read row has been modified by another transaction
-            for row_id in read_set.iter() {
-                // Check if row was modified after our snapshot
-                if let Ok(Some(_)) = self.version_store.get_visible_version(*row_id, &ctx.snapshot) {
-                    // Additional validation logic here
-                    // For now, we allow it
+        let write_set = ctx.write_set.read();
+
+        // Write-write conflict detection: check if any row in our write_set
+        // has been modified by another transaction after our snapshot.
+        for row_id in write_set.keys() {
+            if let Some(chain) = self.version_store.versions.get(row_id) {
+                let head = chain.head.read();
+                if let Some(version) = head.as_ref() {
+                    if version.begin_ts > ctx.snapshot.timestamp
+                        && version.txn_id != ctx.txn_id
+                    {
+                        return Err(StorageError::Transaction(
+                            format!("Write-write conflict on row {} in txn {}", row_id, ctx.txn_id)
+                        ));
+                    }
                 }
             }
         }
-        
+
+        drop(write_set);
+
+        // For Serializable isolation, also check read-write conflicts
+        if ctx.isolation_level == IsolationLevel::Serializable {
+            let read_set = ctx.read_set.read();
+            for row_id in read_set.iter() {
+                if let Some(chain) = self.version_store.versions.get(row_id) {
+                    let head = chain.head.read();
+                    if let Some(version) = head.as_ref() {
+                        if version.begin_ts > ctx.snapshot.timestamp
+                            && version.txn_id != ctx.txn_id
+                        {
+                            return Err(StorageError::Transaction(
+                                format!("Read-write conflict on row {} in txn {}", row_id, ctx.txn_id)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
     

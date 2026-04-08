@@ -19,7 +19,6 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 /// MoteDB 数据库实例
 ///
@@ -81,7 +80,8 @@ use std::sync::Mutex;
 pub struct Database {
     inner: Arc<MoteDB>,
     /// 🚀 Prepared statement cache: SQL string → parsed Statement
-    stmt_cache: Arc<Mutex<LruCache<String, Statement>>>,
+    /// Uses RwLock for concurrent reads + Arc<Statement> for O(1) clone on cache hit
+    stmt_cache: Arc<parking_lot::RwLock<LruCache<String, Arc<Statement>>>>,
 }
 
 impl Database {
@@ -98,7 +98,7 @@ impl Database {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(MoteDB::create(path)?),
-            stmt_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
         })
     }
 
@@ -117,7 +117,7 @@ impl Database {
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(MoteDB::create_with_config(path, config)?),
-            stmt_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
         })
     }
 
@@ -130,7 +130,7 @@ impl Database {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(MoteDB::open(path)?),
-            stmt_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
         })
     }
 
@@ -144,7 +144,7 @@ impl Database {
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(MoteDB::open_with_config(path, config)?),
-            stmt_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
         })
     }
 
@@ -165,6 +165,12 @@ impl Database {
     /// Use before closing to ensure full recoverability.
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.checkpoint()
+    }
+
+    /// Full checkpoint with index rebuild (slower but thorough).
+    /// Used internally on shutdown to ensure index completeness.
+    pub fn checkpoint_full(&self) -> Result<()> {
+        self.inner.checkpoint_full()
     }
 
     /// 关闭数据库（显式调用，通常由 Drop 自动处理）
@@ -218,22 +224,33 @@ impl Database {
         use crate::sql::{Lexer, Parser, QueryExecutor};
 
         // 🚀 Prepared statement cache: skip re-parsing on repeated queries
-        let statement = {
-            let mut cache = self.stmt_cache.lock().unwrap();
-            if let Some(stmt) = cache.get(sql) {
-                stmt.clone()
+        let statement: Arc<Statement> = {
+            // Fast path: read lock for cache hits (concurrent with other readers)
+            // Note: LruCache::peek() doesn't update LRU position but avoids write lock
+            let read_cache = self.stmt_cache.read();
+            if let Some(stmt) = read_cache.peek(sql) {
+                Arc::clone(stmt) // O(1) Arc clone instead of full AST clone
             } else {
-                let mut lexer = Lexer::new(sql);
-                let tokens = lexer.tokenize()?;
-                let mut parser = Parser::new(tokens);
-                let stmt = parser.parse()?;
-                cache.put(sql.to_string(), stmt.clone());
-                stmt
+                drop(read_cache);
+                // Slow path: write lock for cache misses
+                let mut cache = self.stmt_cache.write();
+                // Double-check (another thread may have inserted)
+                if let Some(stmt) = cache.get(sql) {
+                    Arc::clone(stmt)
+                } else {
+                    let mut lexer = Lexer::new(sql);
+                    let tokens = lexer.tokenize()?;
+                    let mut parser = Parser::new(tokens);
+                    let stmt = parser.parse()?;
+                    let stmt_arc = Arc::new(stmt);
+                    cache.put(sql.to_string(), Arc::clone(&stmt_arc));
+                    stmt_arc
+                }
             }
         };
 
         let executor = QueryExecutor::new(self.inner.clone());
-        executor.execute_streaming(statement)
+        executor.execute_streaming_ref(&statement)
     }
 
     // ============================================================================

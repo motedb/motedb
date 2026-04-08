@@ -9,6 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// Bloom filter for SSTable
+#[derive(Clone, Debug)]
 pub struct BloomFilter {
     /// Bit array
     bits: Vec<u8>,

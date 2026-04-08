@@ -12,9 +12,11 @@
 //! - 优化: 减少层数、提高level_multiplier
 
 use super::{SSTable, SSTableBuilder, LSMConfig, Key};
+use super::bloom::BloomFilter;
 use crate::{Result, StorageError};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use parking_lot::RwLock;
 use std::fs;
 
@@ -90,24 +92,29 @@ pub struct TieredSublevel {
 pub struct SSTableMeta {
     /// File path
     pub path: PathBuf,
-    
+
     /// File size
     pub size: u64,
-    
+
     /// Number of entries
     pub num_entries: u64,
-    
+
     /// Min key
     pub min_key: Key,
-    
+
     /// Max key
     pub max_key: Key,
-    
+
     /// Min timestamp
     pub min_timestamp: u64,
-    
+
     /// Max timestamp
     pub max_timestamp: u64,
+
+    /// Bloom filter for lock-free pre-check (avoids SSTableCache mutex).
+    /// Populated during flush/compaction; None for SSTables discovered at startup
+    /// (loaded lazily on first access via SSTableCache).
+    pub bloom_filter: Option<Arc<BloomFilter>>,
 }
 
 impl Level {
@@ -280,8 +287,9 @@ pub struct CompactionWorker {
     stats: Arc<Mutex<CompactionStats>>,
 
     /// Callback invoked after compaction replaces SSTables.
-    /// Used to invalidate the SSTableCache so readers don't hold stale file handles.
-    post_compaction_cb: Arc<std::sync::RwLock<Option<Box<dyn Fn() + Send + Sync>>>>,
+    /// Receives the paths of SSTables that were removed, so the cache can
+    /// evict only those entries instead of clearing entirely.
+    post_compaction_cb: Arc<std::sync::RwLock<Option<Box<dyn Fn(&[PathBuf]) + Send + Sync>>>>,
 
     /// 🚀 P0 Optimization: Cached snapshot of all SSTable metadata
     /// Readers access this via cheap Arc clone (no Mutex contention).
@@ -350,6 +358,7 @@ impl CompactionWorker {
                             max_key: u64::MAX,
                             min_timestamp,
                             max_timestamp: min_timestamp, // Use min as approximation
+                            bloom_filter: None, // Loaded lazily via SSTableCache
                         };
                         discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
                     }
@@ -374,17 +383,18 @@ impl CompactionWorker {
     }
 
     /// Set a callback to invoke after compaction replaces SSTables.
-    /// Used to invalidate SSTableCache so readers don't hold stale file handles.
-    pub fn set_post_compaction_cb(&self, cb: Box<dyn Fn() + Send + Sync>) {
+    /// The callback receives the paths of SSTables that were removed by compaction.
+    /// Used to selectively invalidate SSTableCache entries.
+    pub fn set_post_compaction_cb(&self, cb: Box<dyn Fn(&[PathBuf]) + Send + Sync>) {
         let mut guard = self.post_compaction_cb.write().unwrap();
         *guard = Some(cb);
     }
 
-    /// Invoke the post-compaction callback (if set).
-    fn invoke_post_compaction(&self) {
+    /// Invoke the post-compaction callback (if set) with the removed SSTable paths.
+    fn invoke_post_compaction(&self, removed_paths: &[PathBuf]) {
         if let Ok(guard) = self.post_compaction_cb.read() {
             if let Some(ref cb) = guard.as_ref() {
-                cb();
+                cb(removed_paths);
             }
         }
     }
@@ -413,14 +423,14 @@ impl CompactionWorker {
     
     /// Get all SSTables across all levels (for query)
     ///
-    /// 🚀 P0 Optimization: Uses cached snapshot (Arc clone = cheap).
-    /// Falls back to building from levels on first call or after invalidation.
-    pub fn get_all_sstables(&self) -> Result<Vec<SSTableMeta>> {
-        // Fast path: read cached snapshot (no Mutex on levels needed)
+    /// 🚀 Returns Arc clone (O(1)) instead of cloning the entire Vec.
+    /// Uses cached snapshot to avoid Mutex on levels.
+    pub fn get_all_sstables(&self) -> Result<Arc<Vec<SSTableMeta>>> {
+        // Fast path: read cached snapshot (O(1) Arc clone, no Mutex on levels needed)
         {
             let snap = self.sstable_snapshot.read();
             if let Some(ref arc_vec) = *snap {
-                return Ok((**arc_vec).clone());
+                return Ok(Arc::clone(arc_vec));
             }
         }
 
@@ -434,12 +444,13 @@ impl CompactionWorker {
         }
 
         // Cache for future reads
+        let arc_vec = Arc::new(all_sstables);
         {
             let mut snap = self.sstable_snapshot.write();
-            *snap = Some(Arc::new(all_sstables.clone()));
+            *snap = Some(Arc::clone(&arc_vec));
         }
 
-        Ok(all_sstables)
+        Ok(arc_vec)
     }
 
     /// 🚀 P0: Invalidate cached SSTable snapshot (called after register/run_compaction)
@@ -509,33 +520,40 @@ impl CompactionWorker {
         // Update levels
         let mut levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
+
+        // Collect all removed SSTable paths for selective cache eviction
+        let mut removed_paths: Vec<PathBuf> = Vec::with_capacity(sources.len() + overlapping.len());
+
         // Remove source files (only those that actually existed)
         for source in &valid_sources {
             levels[level_idx].remove_sstable(&source.path);
+            removed_paths.push(source.path.clone());
             let _ = fs::remove_file(&source.path);
         }
-        
+
         // Also clean up metadata for files that didn't exist
         for source in &sources {
             if !valid_sources.iter().any(|v| v.path == source.path) {
                 levels[level_idx].remove_sstable(&source.path);
+                removed_paths.push(source.path.clone());
             }
         }
-        
+
         // Remove overlapping files (only those that actually existed)
         for overlap in &valid_overlapping {
             levels[level_idx + 1].remove_sstable(&overlap.path);
+            removed_paths.push(overlap.path.clone());
             let _ = fs::remove_file(&overlap.path);
         }
-        
+
         // Also clean up metadata for files that didn't exist
         for overlap in &overlapping {
             if !valid_overlapping.iter().any(|v| v.path == overlap.path) {
                 levels[level_idx + 1].remove_sstable(&overlap.path);
+                removed_paths.push(overlap.path.clone());
             }
         }
-        
+
         // Add output file
         levels[level_idx + 1].add_sstable(output_meta);
 
@@ -559,8 +577,8 @@ impl CompactionWorker {
         // 🚀 Invalidate snapshot so next read rebuilds it
         self.invalidate_snapshot();
 
-        // Invalidate SSTableCache so readers don't hold stale file handles
-        self.invoke_post_compaction();
+        // Selectively evict only removed SSTables from cache (not a full clear)
+        self.invoke_post_compaction(&removed_paths);
 
         Ok(())
     }
@@ -804,61 +822,66 @@ impl CompactionWorker {
         let target_sublevel = sublevel_idx + 1;
         let compact_to_l1 = target_sublevel >= 3;  // L0.2 → L1
         
+        // Collect all removed SSTable paths for selective cache eviction
+        let mut removed_paths: Vec<PathBuf> = Vec::new();
+
         if compact_to_l1 {
             // Full compaction to L1 (include overlapping files)
             let levels = self.levels.lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            
+
             let overlapping = levels[0].get_overlapping(&levels[1], &valid_sources);
             drop(levels);
-            
+
             let valid_overlapping: Vec<_> = overlapping.iter()
                 .filter(|s| s.path.exists())
                 .cloned()
                 .collect();
-            
+
             // Merge to L1
             let output_meta = self.merge_sstables(1, &valid_sources, &valid_overlapping)?;
-            
+
             // Update levels
             let mut levels = self.levels.lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            
+
             // Remove from L0 sublevel
             if let Some(ref mut sublevels) = levels[0].sublevels {
                 if sublevel_idx < sublevels.len() {
                     sublevels[sublevel_idx].sstables.clear();
                 }
             }
-            
+
             // Remove from L0 main list
             for source in &valid_sources {
                 levels[0].remove_sstable(&source.path);
+                removed_paths.push(source.path.clone());
                 let _ = std::fs::remove_file(&source.path);
             }
-            
+
             // Remove overlapping from L1
             for overlap in &valid_overlapping {
                 levels[1].remove_sstable(&overlap.path);
+                removed_paths.push(overlap.path.clone());
                 let _ = std::fs::remove_file(&overlap.path);
             }
-            
+
             // Add to L1
             levels[1].add_sstable(output_meta);
         } else {
             // ✨ Incremental merge to next sublevel (P2 Phase 3.2)
             let output_metas = self.incremental_merge(&valid_sources, sublevel_idx)?;
-            
+
             // Update sublevels
             let mut levels = self.levels.lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            
+
             // Remove from source sublevel and add to target sublevel
             if let Some(ref mut sublevels) = levels[0].sublevels {
                 if sublevel_idx < sublevels.len() {
                     sublevels[sublevel_idx].sstables.clear();
                 }
-                
+
                 // Add to target sublevel
                 if target_sublevel < sublevels.len() {
                     for meta in &output_metas {
@@ -866,26 +889,27 @@ impl CompactionWorker {
                     }
                 }
             }
-            
+
             // Update main list (separate from sublevels borrow)
             for meta in output_metas {
                 levels[0].sstables.push(meta);
             }
-            
+
             // Remove source files
             for source in &valid_sources {
+                removed_paths.push(source.path.clone());
                 let _ = std::fs::remove_file(&source.path);
             }
         }
-        
+
         // Update stats
         let mut stats = self.stats.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         stats.num_compactions += 1;
-        
+
         let bytes_read: u64 = valid_sources.iter().map(|s| s.size).sum();
         stats.bytes_read += bytes_read;
-        
+
         // ✨ Track tiered compaction stats
         if compact_to_l1 {
             stats.l0_to_l1_compactions += 1;
@@ -894,7 +918,7 @@ impl CompactionWorker {
             // Estimate bytes saved by delaying L1 compaction
             stats.bytes_saved += bytes_read;
         }
-        
+
         // Update write amplification
         if stats.bytes_read > 0 {
             stats.write_amplification = stats.bytes_written as f64 / stats.bytes_read as f64;
@@ -905,8 +929,8 @@ impl CompactionWorker {
         // 🚀 Invalidate snapshot so next read rebuilds it
         self.invalidate_snapshot();
 
-        // Invalidate SSTableCache so readers don't hold stale file handles
-        self.invoke_post_compaction();
+        // Selectively evict only removed SSTables from cache (not a full clear)
+        self.invoke_post_compaction(&removed_paths);
 
         Ok(())
     }

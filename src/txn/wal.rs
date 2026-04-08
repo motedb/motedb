@@ -335,19 +335,24 @@ impl PartitionWAL {
         if self.next_lsn == 0 {
             return Ok(());
         }
-        
+
         let lsn = self.next_lsn - 1;
         self.append(WALRecord::Checkpoint { lsn })?;
         self.last_checkpoint = lsn;
-        
-        // Truncate WAL file after checkpoint
+
+        // Ensure checkpoint record is durable BEFORE truncating.
+        // Without this sync, a crash after set_len(0) but before sync_all()
+        // could leave an empty WAL, losing uncommitted records.
+        self.file.sync_all()?;
+
+        // Now safe to truncate — checkpoint is durable
         self.file.set_len(0)?;
         self.file.sync_all()?;
-        
+
         // Reset counters
         self.next_lsn = 0;
         self.last_checkpoint = 0;
-        
+
         Ok(())
     }
 

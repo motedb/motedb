@@ -1,6 +1,6 @@
 //! LSM-Tree Engine (main interface)
 
-use super::{UnifiedMemTable, SSTable, SSTableBuilder, Key, Value, ValueData, LSMConfig, CompactionWorker, BlobStore};
+use super::{UnifiedMemTable, SSTable, SSTableBuilder, Key, Value, ValueData, LSMConfig, CompactionWorker, BlobStore, BloomFilter};
 use crate::{Result, StorageError};
 use std::sync::{Arc, Mutex, Condvar};
 use parking_lot::RwLock;
@@ -14,9 +14,17 @@ use std::collections::VecDeque;
 type FlushCallback = Arc<dyn Fn(&UnifiedMemTable) -> Result<()> + Send + Sync>;
 type KVIterator = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
 
-/// True LRU cache for SSTable handles
+/// Cached SSTable entry with separate bloom filter for lock-free pre-checking
+struct CachedSSTable {
+    /// Bloom filter (can be checked without acquiring SSTable mutex)
+    bloom: Arc<BloomFilter>,
+    /// SSTable handle (requires mutex to access)
+    handle: Arc<Mutex<SSTable>>,
+}
+
+/// True LRU cache for SSTable handles (with bloom filter alongside)
 struct SSTableCache {
-    cache: Mutex<lru::LruCache<PathBuf, Arc<Mutex<SSTable>>>>,
+    cache: Mutex<lru::LruCache<PathBuf, CachedSSTable>>,
 }
 
 impl SSTableCache {
@@ -28,29 +36,52 @@ impl SSTableCache {
             )),
         }
     }
-    
-    fn get_or_open(&self, path: &PathBuf) -> Result<Arc<Mutex<SSTable>>> {
+
+    fn get_or_open(&self, path: &PathBuf) -> Result<CachedSSTable> {
         let mut cache = self.cache.lock()
             .map_err(|_| StorageError::Lock("Cache lock poisoned".into()))?;
-        
+
         // Check if already cached (this also updates LRU position)
-        if let Some(sstable) = cache.get(path) {
-            return Ok(sstable.clone());
+        if let Some(cached) = cache.get(path) {
+            return Ok(CachedSSTable {
+                bloom: cached.bloom.clone(),
+                handle: cached.handle.clone(),
+            });
         }
-        
-        // Open new SSTable
+
+        // Open new SSTable and extract bloom filter
         let sstable = SSTable::open(path)?;
+        let bloom = Arc::new(sstable.bloom_filter().clone());
         let sstable_arc = Arc::new(Mutex::new(sstable));
-        
-        // LRU cache automatically evicts least recently used entry when full
-        cache.put(path.clone(), sstable_arc.clone());
-        
-        Ok(sstable_arc)
+
+        let cached = CachedSSTable {
+            bloom: bloom.clone(),
+            handle: sstable_arc.clone(),
+        };
+        cache.put(path.clone(), CachedSSTable {
+            bloom,
+            handle: sstable_arc,
+        });
+
+        Ok(cached)
     }
-    
+
     fn clear(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
+        }
+    }
+
+    /// Evict only the given SSTable paths from the cache.
+    /// Entries not in `removed_paths` remain cached and usable.
+    fn evict(&self, removed_paths: &[PathBuf]) {
+        if removed_paths.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            for path in removed_paths {
+                cache.pop(path);
+            }
         }
     }
 }
@@ -213,11 +244,11 @@ impl LSMEngine {
             compaction_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
         };
 
-        // Wire post-compaction callback to clear SSTableCache
+        // Wire post-compaction callback to evict only removed SSTables from cache
         {
             let cache = engine.sstable_cache.clone();
-            engine.compaction_worker.set_post_compaction_cb(Box::new(move || {
-                cache.clear();
+            engine.compaction_worker.set_post_compaction_cb(Box::new(move |removed_paths: &[PathBuf]| {
+                cache.evict(removed_paths);
             }));
         }
 
@@ -427,6 +458,16 @@ impl LSMEngine {
                             }
 
                             flush_in_progress.store(false, Ordering::Release);
+
+                            // Notify anyone waiting in flush() that the immutable
+                            // queue has been drained.
+                            {
+                                let (lock, cvar) = &*flush_wakeup;
+                                if let Ok(mut guard) = lock.lock() {
+                                    *guard = true;
+                                }
+                                cvar.notify_all();
+                            }
                         }
                     }
                 }
@@ -627,18 +668,35 @@ impl LSMEngine {
                 if key < meta.min_key || key > meta.max_key {
                     continue;
                 }
-                
+
+                // 🚀 Lock-free bloom filter pre-check from SSTableMeta
+                //    Avoids SSTableCache mutex acquisition for ~90% of SSTables.
+                //    If bloom is not in meta (startup discovery), fall through to get_or_open.
+                if let Some(ref bloom) = meta.bloom_filter {
+                    if !bloom.may_contain(&key.to_be_bytes()) {
+                        continue;
+                    }
+                }
+
                 // Use cached SSTable handle (避免每次打开文件)
                 // ⭐ 处理 compaction 导致的文件删除：如果文件已被 compaction 删除，跳过该文件
-                let sstable_arc = match self.sstable_cache.get_or_open(&meta.path) {
-                    Ok(arc) => arc,
+                let cached = match self.sstable_cache.get_or_open(&meta.path) {
+                    Ok(cached) => cached,
                     Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                         // 文件被 compaction 删除了，跳过
                         continue;
                     }
                     Err(e) => return Err(e),  // 其他错误需要返回
                 };
-                let mut sstable = sstable_arc.lock()
+
+                // 🚀 Lock-free bloom filter pre-check (for metas without bloom)
+                //    If meta had bloom, this is a redundant check but cheap.
+                if meta.bloom_filter.is_none() && !cached.bloom.may_contain(&key.to_be_bytes()) {
+                    continue;
+                }
+
+                // Bloom says "maybe present" — acquire SSTable handle
+                let mut sstable = cached.handle.lock()
                     .map_err(|_| StorageError::Lock("SSTable lock poisoned".into()))?;
                 
                 if let Some(mut value) = sstable.get(key)? {
@@ -783,16 +841,16 @@ impl LSMEngine {
                 }
                 
                 // Use cached SSTable handle
-                let sstable_arc = match self.sstable_cache.get_or_open(&meta.path) {
-                    Ok(arc) => arc,
+                let cached = match self.sstable_cache.get_or_open(&meta.path) {
+                    Ok(cached) => cached,
                     Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                         continue; // 文件已删除，跳过
                     }
                     Err(e) => return Err(e),
                 };
-                
+
                 // 🔥 P3+: 批量查询（使用 SSTable::batch_get）
-                let mut sstable = sstable_arc.lock()
+                let mut sstable = cached.handle.lock()
                     .map_err(|_| StorageError::Lock("SSTable lock poisoned".into()))?;
                 
                 // 提取 keys（只保留 key，不包含 idx）
@@ -930,23 +988,38 @@ impl LSMEngine {
                 data = ValueData::Blob(blob_ref);
             }
         }
-        
-        // 🔥 Fast path: check if rotation needed (lock-free)
-        let should_rotate = {
-            let memtable = self.memtable.read();
-            memtable.should_flush()
-        };
-        
-        if should_rotate {
-            // Try to rotate (non-blocking if immutable slot is occupied)
-            let _ = self.try_rotate_memtable();
+
+        // Same backpressure logic as put() to prevent OOM
+        let mut backpressure_count = 0;
+        loop {
+            {
+                let memtable = self.memtable.read();
+
+                if !memtable.should_flush() {
+                    memtable.put_with_vector(key, data, vector, timestamp)?;
+                    return Ok(());
+                }
+            }
+
+            let queue_len = {
+                let immutable = self.immutable.read();
+                immutable.len()
+            };
+
+            if queue_len < self.max_immutable_slots {
+                if self.try_rotate_memtable().is_ok() {
+                    continue;
+                }
+            }
+
+            backpressure_count += 1;
+            if backpressure_count > 10000 {
+                return Err(StorageError::Transaction(
+                    "LSM backpressure timeout in put_with_vector".into()
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        
-        // Insert into active memtable (never blocks)
-        let memtable = self.memtable.read();
-        memtable.put_with_vector(key, data, vector, timestamp)?;
-        
-        Ok(())
     }
     
     /// 🆕 Vector search in MemTable (returns complete row data)
@@ -1028,32 +1101,41 @@ impl LSMEngine {
             // 🔥 flush_guard dropped here, lock released
         }
         
-        // 2. Wait for background thread to flush the queue
-        // ✅ 后台线程会自动处理 immutable queue，主线程只需等待队列变空
-        // 🔥 CRITICAL: flush_lock is already released, won't block background thread
-        debug_log!("💾 [flush] 等待后台线程flush immutable queue...");
+        // 2. Wait for background thread to flush the queue using condvar
+        // The background flush thread notifies flush_wakeup after draining each
+        // immutable memtable, so we wake up immediately instead of polling.
+        debug_log!("💾 [flush] 等待后台线程flush immutable queue (condvar)...");
         let start_wait = std::time::Instant::now();
-        loop {
-            let queue_len = {
-                let immutable = self.immutable.read();
-                immutable.len()
-            };
-            
-            if queue_len == 0 {
-                // Queue is empty, but the background thread may still be writing the SSTable.
-                // Brief sleep to allow SSTable registration to complete before returning.
-                // This ensures get() calls after flush() will find the data in SSTables.
-                thread::sleep(Duration::from_millis(50));
-                debug_log!("✅ [flush] immutable queue已空，flush完成 (耗时: {:?})", start_wait.elapsed());
-                break;
-            }
-            
-            // 每隔 10ms 检查一次
-            thread::sleep(Duration::from_millis(10));
-            
-            // 超时保护（120秒，debug构建下索引构建可能很慢）
-            if start_wait.elapsed().as_secs() > 120 {
-                return Err(StorageError::Transaction("Flush timeout: background thread may be stuck".into()));
+        {
+            let (lock, cvar) = &*self.flush_wakeup;
+            let mut guard = lock.lock()
+                .map_err(|_| StorageError::Lock("flush_wakeup lock poisoned".into()))?;
+
+            loop {
+                let queue_len = {
+                    let immutable = self.immutable.read();
+                    immutable.len()
+                };
+
+                if queue_len == 0 {
+                    break;
+                }
+
+                // Timeout protection (120s; debug builds may be slow at index construction)
+                if start_wait.elapsed().as_secs() > 120 {
+                    return Err(StorageError::Transaction(
+                        "Flush timeout: background thread may be stuck".into(),
+                    ));
+                }
+
+                // Wait for the background thread to signal that it has drained an entry.
+                let result = cvar.wait_timeout(guard, Duration::from_millis(100));
+                match result {
+                    Ok((timeout_guard, _timed_out)) => guard = timeout_guard,
+                    Err(_) => {
+                        return Err(StorageError::Lock("flush_wakeup lock poisoned".into()));
+                    }
+                }
             }
         }
         
@@ -1640,12 +1722,12 @@ impl LSMEngine {
             }
             
             // Use cache to get SSTable
-            let sstable_arc = match self.sstable_cache.get_or_open(path) {
-                Ok(sst) => sst,
+            let cached = match self.sstable_cache.get_or_open(path) {
+                Ok(cached) => cached,
                 Err(_) => continue, // Skip if can't open (e.g., being compacted)
             };
-            
-            let mut sstable = match sstable_arc.lock() {
+
+            let mut sstable = match cached.handle.lock() {
                 Ok(sst) => sst,
                 Err(_) => continue, // Skip if lock poisoned
             };
@@ -1750,8 +1832,8 @@ impl LSMEngine {
                 }
                 
                 // Open SSTable (thread-safe cache)
-                let sstable_arc = self.sstable_cache.get_or_open(path).ok()?;
-                let mut sstable = sstable_arc.lock().ok()?;
+                let cached = self.sstable_cache.get_or_open(path).ok()?;
+                let mut sstable = cached.handle.lock().ok()?;
                 
                 // Scan SSTable
                 sstable.scan(start, end).ok()
@@ -1791,8 +1873,8 @@ impl LSMEngine {
         // For now, return all SSTables (could optimize to filter by key range)
         let sstable_metas = self.compaction_worker.get_all_sstables()?;
         
-        Ok(sstable_metas.into_iter()
-            .map(|meta| meta.path)
+        Ok(sstable_metas.iter()
+            .map(|meta| meta.path.clone())
             .collect())
     }
     
@@ -1820,7 +1902,7 @@ impl LSMEngine {
         
         let mut estimated_count = 0usize;
         
-        for meta in sstable_metas {
+        for meta in sstable_metas.iter() {
             // Check if SSTable key range overlaps with [start, end)
             if meta.min_key < end && meta.max_key >= start {
                 // Overlap detected, add entry count
@@ -1907,12 +1989,12 @@ impl LSMEngine {
                 continue;
             }
             
-            let sstable_arc = match self.sstable_cache.get_or_open(path) {
-                Ok(sst) => sst,
+            let cached = match self.sstable_cache.get_or_open(path) {
+                Ok(cached) => cached,
                 Err(_) => continue,
             };
-            
-            let mut sstable = match sstable_arc.lock() {
+
+            let mut sstable = match cached.handle.lock() {
                 Ok(sst) => sst,
                 Err(_) => continue,
             };
@@ -2027,15 +2109,13 @@ impl LSMEngine {
                 continue;
             }
             
-            // 🔧 注意：这里需要克隆 SSTable 的数据，因为迭代器需要 'static 生命周期
-            // 在真实实现中，应该使用 Arc<SSTable> 来避免克隆
-            let sstable_arc = match self.sstable_cache.get_or_open(path) {
-                Ok(sst) => sst,
+            let cached = match self.sstable_cache.get_or_open(path) {
+                Ok(cached) => cached,
                 Err(_) => continue,
             };
-            
+
             let entries = {
-                let mut sstable = match sstable_arc.lock() {
+                let mut sstable = match cached.handle.lock() {
                     Ok(sst) => sst,
                     Err(_) => continue,
                 };

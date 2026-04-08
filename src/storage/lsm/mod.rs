@@ -182,7 +182,7 @@ impl Default for LSMConfig {
             enable_compression: true,
             blob_threshold: 32 * 1024,          // 32KB (separate large values/vectors)
             blob_file_size: 256 * 1024 * 1024,  // 256MB per blob file
-            sstable_cache_size: 8,              // 🔧 8个SSTable缓存（减少内存）
+            sstable_cache_size: 128,            // 🚀 128 SSTable cache (avoid eviction thrashing at 50K+ rows)
             sstable_cache_memory_limit_mb: Some(200),  // 🚀 P0: 200MB memory limit
         }
     }
@@ -212,7 +212,7 @@ impl LSMConfig {
             enable_compression: true,
             blob_threshold: 32 * 1024,
             blob_file_size: 256 * 1024 * 1024,
-            sstable_cache_size: 16,             // More cache for reads
+            sstable_cache_size: 256,            // 🚀 256 SSTable cache for read-heavy
             sstable_cache_memory_limit_mb: Some(400),  // 🚀 P0: 400MB for read-heavy
         }
     }
@@ -229,7 +229,7 @@ impl LSMConfig {
             enable_compression: true,
             blob_threshold: 32 * 1024,
             blob_file_size: 256 * 1024 * 1024,
-            sstable_cache_size: 8,
+            sstable_cache_size: 64,             // 🚀 64 SSTable cache for write-heavy
             sstable_cache_memory_limit_mb: Some(200),  // 🚀 P0
         }
     }
@@ -268,7 +268,7 @@ impl LSMConfig {
             enable_compression: true,
             blob_threshold: 16 * 1024,               // 16KB
             blob_file_size: 128 * 1024 * 1024,       // 128MB
-            sstable_cache_size: 4,                   // 4 个
+            sstable_cache_size: 32,                  // 🚀 32 SSTable cache for embedded
             sstable_cache_memory_limit_mb: Some(40),  // 🚀 P0: 40MB for embedded
         }
     }
@@ -297,7 +297,7 @@ impl LSMConfig {
             enable_compression: true,
             blob_threshold: 8 * 1024,                // 8KB
             blob_file_size: 64 * 1024 * 1024,        // 64MB
-            sstable_cache_size: 2,                   // 2 个
+            sstable_cache_size: 8,                   // 🚀 8 SSTable cache for tiny
             sstable_cache_memory_limit_mb: Some(20),  // 🚀 P0: 20MB for tiny
         }
     }

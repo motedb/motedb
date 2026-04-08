@@ -124,21 +124,20 @@ impl RowCache {
     pub fn get(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
         let key = (table_name.to_string(), row_id);
 
-        let mut cache = self.cache.write();
-
-        if let Some(row) = cache.get(&key) {
-            // Cache hit — clone Arc before dropping lock
+        // Fast path: read lock + peek (avoids write-lock contention on read-heavy workloads)
+        let cache = self.cache.read();
+        if let Some(row) = cache.peek(&key) {
             let result = Arc::clone(row);
             self.hits.fetch_add(1, Ordering::Relaxed);
             drop(cache);
             self.update_access_pattern(table_name, row_id);
-            Some(result)
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            drop(cache);
-            self.update_access_pattern(table_name, row_id);
-            None
+            return Some(result);
         }
+
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        drop(cache);
+        self.update_access_pattern(table_name, row_id);
+        None
     }
 
     /// 🚀 P2: Update access pattern and detect sequential scans

@@ -18,12 +18,25 @@ struct RegistryMetadata {
     next_table_id: u32,
     /// Table name -> assigned table_id (stable, collision-free)
     table_ids: HashMap<String, u32>,
+    /// Reverse lookup: table_id -> table_name (avoids linear scan)
+    #[serde(default)]
+    id_to_name: HashMap<u32, String>,
+    /// Persisted AUTO_INCREMENT counters: table_name -> last assigned value
+    /// Avoids full table scan on startup for crash recovery.
+    #[serde(default)]
+    auto_increment_counters: HashMap<String, i64>,
 }
 
 /// Table registry for managing table schemas
 pub struct TableRegistry {
     /// Metadata (protected by RwLock)
     metadata: Arc<RwLock<RegistryMetadata>>,
+    /// Schema cache: avoids cloning entire TableSchema on every query.
+    /// Invalidated on any DDL change. Uses parking_lot for concurrent reads.
+    schema_cache: parking_lot::RwLock<HashMap<String, Arc<TableSchema>>>,
+    /// Table ID cache: avoids acquiring metadata lock for every composite key construction.
+    /// Invalidated on CREATE TABLE / DROP TABLE. Uses parking_lot for lock-free reads.
+    table_id_cache: parking_lot::RwLock<HashMap<String, u32>>,
     /// Persistence file path
     persist_path: PathBuf,
 }
@@ -50,7 +63,14 @@ impl TableRegistry {
             for schema in meta.tables.values_mut() {
                 schema.rebuild_column_map();
             }
-            
+
+            // Rebuild reverse id_to_name map if missing (backward compat)
+            if meta.id_to_name.is_empty() && !meta.table_ids.is_empty() {
+                for (name, &id) in &meta.table_ids {
+                    meta.id_to_name.insert(id, name.clone());
+                }
+            }
+
             meta
         } else {
             RegistryMetadata {
@@ -58,11 +78,15 @@ impl TableRegistry {
                 index_map: HashMap::new(),
                 next_table_id: 1, // 0 reserved for "_default"
                 table_ids: HashMap::new(),
+                id_to_name: HashMap::new(),
+                auto_increment_counters: HashMap::new(),
             }
         };
 
         Ok(Self {
             metadata: Arc::new(RwLock::new(metadata)),
+            schema_cache: parking_lot::RwLock::new(HashMap::new()),
+            table_id_cache: parking_lot::RwLock::new(HashMap::new()),
             persist_path,
         })
     }
@@ -105,12 +129,18 @@ impl TableRegistry {
         let table_id = meta.next_table_id;
         meta.next_table_id += 1;
         meta.table_ids.insert(schema.name.clone(), table_id);
+        meta.id_to_name.insert(table_id, schema.name.clone());
 
         // Insert table
         meta.tables.insert(schema.name.clone(), schema);
 
         // Persist to disk
         drop(meta);
+
+        // Invalidate schema cache (new table may affect lookups)
+        self.schema_cache.write().clear();
+        self.table_id_cache.write().clear();
+
         self.persist()?;
 
         Ok(())
@@ -133,24 +163,56 @@ impl TableRegistry {
             meta.index_map.remove(&index.name);
         }
 
+        // Remove from id maps
+        if let Some(id) = meta.table_ids.remove(table_name) {
+            meta.id_to_name.remove(&id);
+        }
+
         // Persist to disk
         drop(meta);
+
+        // Invalidate schema cache (dropped table)
+        self.schema_cache.write().remove(table_name);
+        self.table_id_cache.write().remove(table_name);
+
         self.persist()?;
 
         Ok(())
     }
 
-    /// Get table schema (returns Arc — cheap clone, no full struct copy)
+    /// Get table schema (returns Arc clone — O(1) refcount bump via schema cache)
+    ///
+    /// On first access, the schema is cloned into an Arc and cached.
+    /// Subsequent calls return a cheap Arc::clone (atomic refcount bump).
+    /// Cache is invalidated on any DDL change.
     pub fn get_table(&self, table_name: &str) -> Result<Arc<TableSchema>> {
+        // Fast path: check schema cache (cheap read lock, no struct cloning)
+        {
+            let cache = self.schema_cache.read();
+            if let Some(cached) = cache.get(table_name) {
+                return Ok(Arc::clone(cached));
+            }
+        }
+
+        // Slow path: read from metadata, populate cache
         let meta = self.metadata.read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        meta.tables.get(table_name)
-            .map(|s| Arc::new(s.clone()))
+        let schema = meta.tables.get(table_name)
             .ok_or_else(|| StorageError::InvalidData(format!(
                 "Table '{}' not found",
                 table_name
-            )))
+            )))?;
+
+        let arc_schema = Arc::new(schema.clone());
+
+        // Populate cache (write lock only for insertion)
+        {
+            let mut cache = self.schema_cache.write();
+            cache.entry(table_name.to_string()).or_insert(Arc::clone(&arc_schema));
+        }
+
+        Ok(arc_schema)
     }
 
     /// List all tables
@@ -170,6 +232,7 @@ impl TableRegistry {
 
     /// Add index to existing table
     pub fn add_index(&self, index: IndexDef) -> Result<()> {
+        let table_name = index.table_name.clone();
         let mut meta = self.metadata.write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
@@ -211,6 +274,10 @@ impl TableRegistry {
 
         // Persist to disk
         drop(meta);
+
+        // Invalidate schema cache (index added — schema changed)
+        self.schema_cache.write().remove(&table_name);
+
         self.persist()?;
 
         Ok(())
@@ -272,32 +339,47 @@ impl TableRegistry {
     ///
     /// Returns the collision-free sequential ID assigned to this table.
     /// Used for composite key generation instead of hash.
+    ///
+    /// Uses a parking_lot cache for lock-free reads after warm-up.
     pub fn get_table_id(&self, table_name: &str) -> Result<u32> {
+        // Fast path: check cache (parking_lot read lock, near-zero overhead)
+        {
+            let cache = self.table_id_cache.read();
+            if let Some(&id) = cache.get(table_name) {
+                return Ok(id);
+            }
+        }
+
+        // Slow path: acquire metadata lock, populate cache
         let meta = self.metadata.read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        meta.table_ids.get(table_name)
+        let id = meta.table_ids.get(table_name)
             .copied()
-            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
+
+        // Populate cache
+        {
+            let mut cache = self.table_id_cache.write();
+            cache.entry(table_name.to_string()).or_insert(id);
+        }
+
+        Ok(id)
     }
 
     /// Get table name by table_id (reverse lookup for flush callback).
     ///
-    /// This is a pure in-memory operation — no LSM scan needed.
+    /// Uses reverse index for O(1) lookup instead of linear scan.
     pub fn get_table_name_by_id(&self, table_id: u32) -> Result<String> {
         let meta = self.metadata.read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        for (name, &id) in meta.table_ids.iter() {
-            if id == table_id {
-                return Ok(name.clone());
-            }
-        }
-
-        Err(StorageError::InvalidData(format!(
-            "No table found for id {}",
-            table_id
-        )))
+        meta.id_to_name.get(&table_id)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidData(format!(
+                "No table found for id {}",
+                table_id
+            )))
     }
 
     /// Get or assign a table_id for the "_default" internal table.
@@ -314,6 +396,34 @@ impl TableRegistry {
 
         drop(meta);
         Ok(())
+    }
+
+    /// Get persisted AUTO_INCREMENT counter for a table.
+    ///
+    /// Returns the last assigned value, or None if not persisted.
+    /// Used during startup to avoid full table scan for counter recovery.
+    pub fn get_auto_increment_counter(&self, table_name: &str) -> Option<i64> {
+        let meta = self.metadata.read().ok()?;
+        meta.auto_increment_counters.get(table_name).copied()
+    }
+
+    /// Update persisted AUTO_INCREMENT counter for a table.
+    ///
+    /// Called after each insert that uses AUTO_INCREMENT.
+    /// The counter is batch-persisted during checkpoint for efficiency.
+    pub fn update_auto_increment_counter(&self, table_name: &str, value: i64) -> Result<()> {
+        let mut meta = self.metadata.write()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+        meta.auto_increment_counters.insert(table_name.to_string(), value);
+        drop(meta);
+        // Note: don't persist on every update — too expensive.
+        // Caller (checkpoint) will persist periodically.
+        Ok(())
+    }
+
+    /// Persist AUTO_INCREMENT counters to disk (called during checkpoint).
+    pub fn persist_auto_increment_counters(&self) -> Result<()> {
+        self.persist()
     }
 
     /// Persist metadata to disk

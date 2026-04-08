@@ -25,12 +25,7 @@ impl MoteDB {
     /// ```ignore
     pub fn insert_row(&self, row: Row) -> Result<RowId> {
         // 1. Allocate row ID
-        let row_id = {
-            let mut next_id = self.next_row_id.write();
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        let row_id = self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Use "_default" table with composite key format
         let table_name = "_default";
@@ -280,6 +275,9 @@ impl MoteDB {
             if id >= i64::MAX {
                 return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
             }
+
+            // P2: Update persisted counter (lazy — persisted during checkpoint)
+            let _ = self.table_registry.update_auto_increment_counter(table_name, id);
             
             // Fill AUTO_INCREMENT primary key with id
             if let Some(pk_col_name) = schema.primary_key() {
@@ -295,11 +293,8 @@ impl MoteDB {
             
             id as RowId
         } else {
-            // Non-AUTO_INCREMENT: use global row_id
-            let mut next_id = self.next_row_id.write();
-            let id = *next_id;
-            *next_id += 1;
-            id
+            // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
+            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
         
         // 3. Validate row
@@ -1000,16 +995,13 @@ impl MoteDB {
                 )))?;
         }
         
-        // 3. Batch allocate row IDs
+        // 3. Batch allocate row IDs (lock-free atomic batch)
         let mut row_ids = Vec::with_capacity(rows.len());
-        {
-            let mut next_id = self.next_row_id.write();
-            for _ in 0..rows.len() {
-                row_ids.push(*next_id);
-                *next_id += 1;
-            }
+        let start_id = self.next_row_id.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..rows.len() {
+            row_ids.push(start_id + i as u64);
         }
-        
+
         // 4. Build WAL records
         let mut wal_records = Vec::with_capacity(rows.len());
         for (row_id, row) in row_ids.iter().zip(rows.iter()) {
@@ -1174,14 +1166,11 @@ impl MoteDB {
             return Ok(Vec::new());
         }
 
-        // 1. Batch allocate row IDs
+        // 1. Batch allocate row IDs (lock-free atomic batch)
         let mut row_ids = Vec::with_capacity(rows.len());
-        {
-            let mut next_id = self.next_row_id.write();
-            for _ in 0..rows.len() {
-                row_ids.push(*next_id);
-                *next_id += 1;
-            }
+        let start_id = self.next_row_id.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..rows.len() {
+            row_ids.push(start_id + i as u64);
         }
 
         // 2. Build WAL records

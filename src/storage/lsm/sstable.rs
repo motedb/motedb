@@ -23,6 +23,7 @@ use crate::{Result, StorageError};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom, BufWriter, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Magic number for SSTable files (ASCII "LSMT")
 const SSTABLE_MAGIC: u32 = 0x4C534D54;
@@ -114,7 +115,12 @@ impl SSTable {
         })
     }
     
-    /// Get a value by key
+    /// Get a reference to the bloom filter for lock-free pre-checking
+    pub fn bloom_filter(&self) -> &BloomFilter {
+        &self.bloom
+    }
+
+    /// Get a value by key (assumes bloom check was already done externally)
     pub fn get(&mut self, key: Key) -> Result<Option<Value>> {
         // Convert u64 key to bytes for bloom filter and block search
         let key_bytes = key.to_be_bytes();
@@ -461,6 +467,7 @@ impl SSTableBuilder {
             max_key,
             min_timestamp: if self.min_timestamp == u64::MAX { 0 } else { self.min_timestamp },
             max_timestamp: self.max_timestamp,
+            bloom_filter: Some(Arc::new(self.bloom)),
         })
     }
     

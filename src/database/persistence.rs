@@ -139,25 +139,30 @@ impl MoteDB {
     /// ```
     pub fn checkpoint(&self) -> Result<()> {
         // 🔒 Prevent concurrent checkpoints (auto + manual can deadlock)
-        // Deadlock scenario without mutex:
-        //   Thread A: checkpoint() → lsm_flush → rebuild_timestamp_index (holds ts write lock)
-        //   Background flush thread: callback → batch_build_timestamp_indexes (wants ts write lock → BLOCKED)
-        //   Thread B: checkpoint() → lsm_flush → rotate_memtable (queue full → BLOCKED)
         let _guard = self.checkpoint_mutex.lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
 
-        self.checkpoint_impl()
+        self.checkpoint_impl(false)
+    }
+
+    /// Full checkpoint with index rebuild (used on shutdown/drop)
+    pub fn checkpoint_full(&self) -> Result<()> {
+        let _guard = self.checkpoint_mutex.lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+
+        self.checkpoint_impl(true)
     }
 
     /// Internal checkpoint implementation (caller must hold checkpoint_mutex)
-    fn checkpoint_impl(&self) -> Result<()> {
+    ///
+    /// `rebuild_indexes`: if true, rebuild timestamp index from LSM (slow but thorough).
+    ///                    If false, skip rebuild — rely on async pipeline for incremental updates.
+    fn checkpoint_impl(&self, rebuild_indexes: bool) -> Result<()> {
         use std::time::Instant;
 
         // 🚀 Fast path: Skip if no pending updates and WAL is empty
-        // 🚀 P0 CRITICAL FIX: 使用原子操作
         let pending_count = self.pending_updates.load(std::sync::atomic::Ordering::Relaxed);
         if pending_count == 0 {
-            // Check if WAL is actually empty
             let wal_dir = self.path.join("wal");
             if let Ok(wal_size) = get_directory_size(&wal_dir) {
                 if wal_size == 0 {
@@ -168,26 +173,27 @@ impl MoteDB {
         }
 
         let _checkpoint_start = Instant::now();
-        debug_log!("[Checkpoint] 🚀 Starting checkpoint (pending_updates={})...", pending_count);
+        debug_log!("[Checkpoint] 🚀 Starting {}checkpoint (pending_updates={})...",
+            if rebuild_indexes { "full " } else { "" }, pending_count);
 
-        // 🔥 Step 1: Trigger LSM flush (MemTable → SSTable)
-        // The background flush thread will call the batch index callback,
-        // which is fine — it builds indexes as data is flushed.
+        // Step 1: Trigger LSM flush (MemTable → SSTable)
         let _flush_start = Instant::now();
         self.lsm_engine.flush()?;
         debug_log!("[Checkpoint]   ✓ LSM flush: {:?}", _flush_start.elapsed());
 
-        // 🔥 Step 2: Rebuild TimestampIndex from LSM (catches any missed entries)
-        let _ts_rebuild_start = Instant::now();
-        self.rebuild_timestamp_index()?;
-        debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", _ts_rebuild_start.elapsed());
+        // Step 2: Rebuild timestamp index (only in full checkpoint)
+        if rebuild_indexes {
+            let _ts_rebuild_start = Instant::now();
+            self.rebuild_timestamp_index()?;
+            debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", _ts_rebuild_start.elapsed());
+        }
 
-        // 🔥 Step 3: Flush all indexes (persist to disk)
+        // Step 3: Flush all indexes (persist to disk)
         let _index_flush_start = Instant::now();
         self.flush_all_indexes()?;
         debug_log!("[Checkpoint]   ✓ Index flush: {:?}", _index_flush_start.elapsed());
 
-        // 🔥 Step 4: Checkpoint WAL (safe to truncate now)
+        // Step 4: Checkpoint WAL (safe to truncate now)
         let _wal_checkpoint_start = Instant::now();
         self.wal.checkpoint_all()?;
         debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", _wal_checkpoint_start.elapsed());
@@ -204,6 +210,15 @@ impl MoteDB {
             Err(e) => {
                 debug_log!("[Checkpoint]   ⚠️ MVCC vacuum failed: {:?}", e);
             }
+        }
+
+        // Reset pending counters
+        self.pending_updates.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.pending_spatial_updates.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Step 6: Persist AUTO_INCREMENT counters to catalog
+        if let Err(e) = self.table_registry.persist_auto_increment_counters() {
+            debug_log!("[Checkpoint]   ⚠️ Failed to persist AUTO_INCREMENT counters: {:?}", e);
         }
 
         debug_log!("[Checkpoint] 🎉 Total: {:?}", _checkpoint_start.elapsed());

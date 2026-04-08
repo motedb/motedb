@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
 /// Database statistics
 #[derive(Debug, Clone)]
@@ -67,8 +67,8 @@ pub struct MoteDB {
     /// Timestamp index (using BTree for persistent storage)
     pub(crate) timestamp_index: Arc<RwLock<BTree>>,
 
-    /// Next row ID
-    pub(crate) next_row_id: Arc<RwLock<RowId>>,
+    /// Next row ID (lock-free atomic counter)
+    pub(crate) next_row_id: Arc<AtomicU64>,
     
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
@@ -128,13 +128,34 @@ pub struct MoteDB {
 
     /// Auto-checkpoint thread (if enabled)
     auto_checkpoint_thread: Option<AutoCheckpointThread>,
+
+    /// Async index build pipeline: sender (None if pipeline disabled)
+    index_build_tx: Option<std::sync::mpsc::Sender<IndexBuildBatch>>,
+
+    /// Background index builder thread
+    index_builder_thread: Option<IndexBuilderThread>,
 }
 
 /// Auto-checkpoint background thread
 struct AutoCheckpointThread {
     /// Thread handle
     handle: Option<std::thread::JoinHandle<()>>,
-    
+
+    /// Stop signal
+    should_stop: Arc<AtomicBool>,
+}
+
+/// Index build job sent through the async pipeline
+struct IndexBuildBatch {
+    /// Rows grouped by table_name
+    tables_data: std::collections::HashMap<String, Vec<(RowId, crate::types::Row)>>,
+}
+
+/// Background index builder thread
+struct IndexBuilderThread {
+    /// Thread handle
+    handle: Option<std::thread::JoinHandle<()>>,
+
     /// Stop signal
     should_stop: Arc<AtomicBool>,
 }
@@ -196,12 +217,12 @@ impl MoteDB {
         // Ensure "_default" table has a stable table_id (= 0)
         table_registry.ensure_default_table_id()?;
 
-        let db = Self {
+        let mut db = Self {
             path: db_path,
             wal,
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
-            next_row_id: Arc::new(RwLock::new(0)),
+            next_row_id: Arc::new(AtomicU64::new(0)),
             table_auto_increment: Arc::new(RwLock::new(HashMap::new())),
             num_partitions,
             txn_coordinator,
@@ -220,23 +241,27 @@ impl MoteDB {
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
+            index_build_tx: None,
+            index_builder_thread: None,
         };
-        
-        // 🚀 Unified Flush Callback: DISABLED for v0.1.2 release.
-        //
-        // The callback blocks the background flush thread during index building,
-        // which can cause deadlocks when checkpoint() waits for queue drain
-        // while the background thread is stuck in the callback.
-        //
-        // Index building is handled by checkpoint() → rebuild_timestamp_index() + flush_all_indexes()
-        // This is safe because checkpoint() is always called before close/drop.
-        //
-        // TODO: Re-enable with async callback or separate index-builder thread pool in v0.2.0
-        //
-        // let db_clone = db.clone_for_callback();
-        // lsm_engine.set_flush_callback(move |memtable| {
-        //     db_clone.batch_build_indexes_from_flush(memtable)
-        // })?;
+
+        // 🚀 P1: Async Index Build Pipeline
+        // Extract rows from memtable in the flush callback, send through a bounded channel.
+        // A dedicated index builder thread receives and builds indexes asynchronously.
+        // This eliminates deadlock: the flush thread never blocks on index locks.
+        let (index_build_tx, index_builder_thread) =
+            Self::start_index_builder_pipeline(db.clone_for_callback());
+        db.index_build_tx = Some(index_build_tx);
+        db.index_builder_thread = Some(index_builder_thread);
+
+        // Set flush callback: extracts rows from memtable → sends through channel (non-blocking)
+        {
+            let tx = db.index_build_tx.clone().unwrap();
+            let registry = db.table_registry.clone();
+            db.lsm_engine.set_flush_callback(move |memtable| {
+                Self::extract_and_send_index_batch(memtable, &tx, &registry)
+            })?;
+        }
         
         // 🚀 Start auto-checkpoint thread if enabled
         let auto_checkpoint_thread = if let Some(auto_config) = config.auto_checkpoint {
@@ -281,6 +306,8 @@ impl MoteDB {
             is_flushing: self.is_flushing.clone(),  // 🆕 共享 flush 标志
             checkpoint_mutex: self.checkpoint_mutex.clone(),
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
+            index_build_tx: None,  // Don't clone sender (only owned by original)
+            index_builder_thread: None,  // Don't clone thread (only owned by original)
         }
     }
 
@@ -430,12 +457,12 @@ impl MoteDB {
         // 🚀 P1: Create row cache (use config or default 10000)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
 
-        let db = Self {
+        let mut db = Self {
             path: db_path,
             wal,
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
-            next_row_id: Arc::new(RwLock::new(max_row_id + 1)),
+            next_row_id: Arc::new(AtomicU64::new(max_row_id + 1)),
             table_auto_increment: Arc::new(RwLock::new(HashMap::new())),
             num_partitions,
             txn_coordinator,
@@ -454,28 +481,29 @@ impl MoteDB {
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
+            index_build_tx: None,
+            index_builder_thread: None,
         };
 
-        // ⚠️ Flush callback DISABLED — it blocks the background flush thread,
-        // causing deadlocks when checkpoint() waits for queue drain.
-        // Index building is handled by checkpoint() → rebuild_timestamp_index() instead.
-        // See: helpers.rs batch_build_indexes_from_flush (kept for future use)
-        //
-        // let db_clone = db.clone_for_callback();
-        // lsm_engine.set_flush_callback(move |memtable| {
-        //     db_clone.batch_build_indexes_from_flush(memtable)
-        // })?;
+        // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
+        let (index_build_tx, index_builder_thread) =
+            Self::start_index_builder_pipeline(db.clone_for_callback());
+        db.index_build_tx = Some(index_build_tx);
+        db.index_builder_thread = Some(index_builder_thread);
 
-        // 🚀 Start auto-checkpoint thread (use config if provided, else default)
-        let auto_checkpoint_config = config.auto_checkpoint
-            .unwrap_or_else(crate::config::AutoCheckpointConfig::default);
-        let auto_checkpoint_thread = Some(Self::start_auto_checkpoint_thread(
-            db.clone_for_callback(),
-            auto_checkpoint_config,
-        ));
-        
-        // Update db with the thread handle
-        let mut db = db;
+        {
+            let tx = db.index_build_tx.clone().unwrap();
+            let registry = db.table_registry.clone();
+            db.lsm_engine.set_flush_callback(move |memtable| {
+                Self::extract_and_send_index_batch(memtable, &tx, &registry)
+            })?;
+        }
+
+        // 🚀 Start auto-checkpoint thread (only if config provided, matching create behavior)
+        let auto_checkpoint_thread = config.auto_checkpoint.map(|cfg| {
+            Self::start_auto_checkpoint_thread(db.clone_for_callback(), cfg)
+        });
+
         db.auto_checkpoint_thread = auto_checkpoint_thread;
         
         // 🚀 Phase 5: Recover AUTO_INCREMENT counters (B3: Crash Recovery)
@@ -636,8 +664,114 @@ impl MoteDB {
                 }
             }
         }
-        
+
         Ok(indexes)
+    }
+
+    // ==================== P1: Async Index Build Pipeline ====================
+
+    /// Start the async index builder pipeline.
+    ///
+    /// Returns (sender, thread handle). The sender is given to the LSM flush callback.
+    /// The builder thread receives batches and builds indexes in the background.
+    fn start_index_builder_pipeline(
+        db: Self,
+    ) -> (std::sync::mpsc::Sender<IndexBuildBatch>, IndexBuilderThread) {
+        let (tx, rx) = std::sync::mpsc::channel::<IndexBuildBatch>();
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let should_stop_clone = should_stop.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("index-builder".into())
+            .spawn(move || {
+                debug_log!("[IndexBuilder] 🚀 Background thread started");
+                while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(batch) => {
+                            for (table_name, rows) in &batch.tables_data {
+                                if let Err(e) = db.batch_build_table_indexes(table_name, rows) {
+                                    debug_log!("[IndexBuilder] ⚠️ Index build failed for '{}': {:?}",
+                                        table_name, e);
+                                }
+                            }
+                            debug_log!("[IndexBuilder] ✅ Processed batch ({} tables)",
+                                batch.tables_data.len());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            debug_log!("[IndexBuilder] Channel disconnected, exiting");
+                            break;
+                        }
+                    }
+                }
+                debug_log!("[IndexBuilder] 👋 Background thread stopped");
+            })
+            .expect("Failed to spawn index-builder thread");
+
+        (tx, IndexBuilderThread {
+            handle: Some(handle),
+            should_stop,
+        })
+    }
+
+    /// Extract rows from a flushed memtable and send through the channel.
+    ///
+    /// This is the LSM flush callback. It only extracts and sends —
+    /// the flush thread never blocks on index locks.
+    fn extract_and_send_index_batch(
+        memtable: &crate::storage::lsm::UnifiedMemTable,
+        tx: &std::sync::mpsc::Sender<IndexBuildBatch>,
+        registry: &crate::catalog::TableRegistry,
+    ) -> crate::Result<()> {
+        let memtable_len = memtable.len();
+        if memtable_len == 0 || memtable_len < 100 {
+            return Ok(());
+        }
+
+        // Extract: group rows by table_id → table_name
+        let mut tables_data: std::collections::HashMap<String, Vec<(RowId, crate::types::Row)>> =
+            std::collections::HashMap::new();
+
+        for (composite_key, entry) in memtable.iter() {
+            if entry.deleted {
+                continue;
+            }
+            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
+            let row_bytes: Vec<u8> = match &entry.data {
+                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                crate::storage::lsm::ValueData::Blob(_) => {
+                    // Can't resolve blobs here; checkpoint's rebuild will catch these
+                    continue;
+                }
+            };
+
+            let row: crate::types::Row = match bincode::deserialize(&row_bytes) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Resolve table_id → table_name via registry (pure in-memory, no LSM scan)
+            let table_id = (composite_key >> 32) as u32;
+            let table_name = if table_id == 0 {
+                "_default".to_string()
+            } else {
+                match registry.get_table_name_by_id(table_id) {
+                    Ok(name) => name,
+                    Err(_) => continue, // Unknown table_id, skip
+                }
+            };
+
+            tables_data.entry(table_name).or_default().push((row_id, row));
+        }
+
+        if !tables_data.is_empty() {
+            if let Err(e) = tx.send(IndexBuildBatch { tables_data }) {
+                debug_log!("[FlushCallback] ⚠️ Failed to send index batch: {:?}", e);
+            }
+        }
+
+        Ok(())
     }
     
     /// Start auto-checkpoint background thread
@@ -733,29 +867,33 @@ impl MoteDB {
         }
     }
     
-    /// 🚀 Phase 5: Recover AUTO_INCREMENT counter from existing data (B3)
-    /// 
-    /// Scans table rows to find maximum AUTO_INCREMENT ID value.
-    /// This is called during database open() to restore counter state after crash.
+    /// 🚀 Phase 5: Recover AUTO_INCREMENT counter (B3: Crash Recovery)
+    ///
+    /// Fast path: Read persisted counter from catalog.bin (O(1)).
+    /// Slow path: Full table scan (fallback if counter not persisted).
     fn recover_auto_increment_counter(
         &self,
         table_name: &str,
         schema: &crate::types::TableSchema,
     ) -> Result<i64> {
+        // Fast path: use persisted counter from catalog.bin
+        if let Some(persisted_max) = self.table_registry.get_auto_increment_counter(table_name) {
+            debug_log!("[database] ⚡ Recovered AUTO_INCREMENT for '{}' from catalog: {}", table_name, persisted_max);
+            return Ok(persisted_max);
+        }
+
+        // Slow path: scan all rows to find max ID
         use crate::types::Value;
-        
-        // Get primary key column position
+
         let pk_col_name = schema.primary_key()
             .ok_or_else(|| StorageError::InvalidData(
                 format!("Table '{}' has no primary key", table_name)
             ))?;
         let pk_col = schema.get_column(pk_col_name)
             .ok_or_else(|| StorageError::ColumnNotFound(pk_col_name.to_string()))?;
-        
-        // Start from schema's start value - 1 (will be incremented to start value if no data)
+
         let mut max_id = schema.get_auto_increment_start() - 1;
-        
-        // Scan all rows in the table (streaming to avoid loading entire table into memory)
+
         match self.scan_table_rows_streaming(table_name) {
             Ok(iter) => {
                 for result in iter {
@@ -773,12 +911,11 @@ impl MoteDB {
                 }
             }
             Err(_e) => {
-                // Table might be empty or not exist yet (first time opening)
                 debug_log!("[database] Warning: Failed to scan table '{}' for AUTO_INCREMENT recovery: {:?}",
                     table_name, _e);
             }
         }
-        
+
         Ok(max_id)
     }
 }
@@ -813,7 +950,20 @@ fn get_directory_size(dir: &std::path::Path) -> Result<u64> {
 /// clean shutdown even if user forgets to call checkpoint().
 impl Drop for MoteDB {
     fn drop(&mut self) {
-        // 🛑 Step 1: Stop auto-checkpoint thread first
+        // 🛑 Step 1: Stop index builder thread (drop sender to signal end, then join)
+        if let Some(mut thread) = self.index_builder_thread.take() {
+            debug_log!("[MoteDB::Drop] 🛑 Stopping index builder thread...");
+            // Drop sender to signal the thread to exit
+            self.index_build_tx = None;
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = thread.handle.take() {
+                let _ = handle.join();
+            }
+            debug_log!("[MoteDB::Drop] ✅ Index builder thread stopped");
+        }
+        self.index_build_tx = None;
+
+        // 🛑 Step 2: Stop auto-checkpoint thread
         if let Some(mut thread) = self.auto_checkpoint_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-checkpoint thread...");
             thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -822,7 +972,7 @@ impl Drop for MoteDB {
             }
             debug_log!("[MoteDB::Drop] ✅ Auto-checkpoint thread stopped");
         }
-        
+
         // ⚠️ CRITICAL: Always checkpoint on drop to:
         // 1. Persist all data safely
         // 2. Truncate WAL files (prevent accumulation)
@@ -832,7 +982,7 @@ impl Drop for MoteDB {
         
         // Ignore errors during drop (logging only)
         // We're shutting down anyway, and panic in drop() is dangerous
-        if let Err(e) = self.checkpoint() {
+        if let Err(e) = self.checkpoint_full() {
             debug_log!("[MoteDB::Drop] ⚠️  Failed to checkpoint during drop: {:?}", e);
             debug_log!("[MoteDB::Drop] ⚠️  WAL files may not be cleaned up");
         } else {
