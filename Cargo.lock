@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ahash",
  "bincode",

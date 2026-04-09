@@ -16,8 +16,18 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-/// Row cache key: (table_name, row_id)
-pub type CacheKey = (String, RowId);
+/// Row cache key: (table_hash, row_id) — avoids String allocation per lookup
+pub type CacheKey = (u64, RowId);
+
+/// FNV-1a hash for table names — fast, no allocation
+fn table_hash(name: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in name.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 /// Access pattern tracker for sequential detection
 #[derive(Debug, Clone)]
@@ -122,7 +132,7 @@ impl RowCache {
     ///
     /// 🚀 Optimization: Single write-lock for cache, stats use atomics (no lock)
     pub fn get(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
-        let key = (table_name.to_string(), row_id);
+        let key = (table_hash(table_name), row_id);
 
         // Fast path: read lock + peek (avoids write-lock contention on read-heavy workloads)
         let cache = self.cache.read();
@@ -222,7 +232,7 @@ impl RowCache {
 
     /// Put a row into cache
     pub fn put(&self, table_name: String, row_id: RowId, row: Row) {
-        let key = (table_name, row_id);
+        let key = (table_hash(&table_name), row_id);
         let row_arc = Arc::new(row);
 
         let mut cache = self.cache.write();
@@ -233,9 +243,10 @@ impl RowCache {
     /// Batch put rows into cache
     pub fn put_batch(&self, table_name: &str, rows: Vec<(RowId, Row)>) {
         let mut cache = self.cache.write();
+        let thash = table_hash(table_name);
 
         for (row_id, row) in rows {
-            let key = (table_name.to_string(), row_id);
+            let key = (thash, row_id);
             cache.put(key, Arc::new(row));
         }
         self.size.store(cache.len(), Ordering::Relaxed);
@@ -243,7 +254,7 @@ impl RowCache {
 
     /// Invalidate a single row
     pub fn invalidate(&self, table_name: &str, row_id: RowId) {
-        let key = (table_name.to_string(), row_id);
+        let key = (table_hash(table_name), row_id);
 
         let mut cache = self.cache.write();
         cache.pop(&key);
@@ -253,10 +264,11 @@ impl RowCache {
     /// Invalidate all rows for a table
     pub fn invalidate_table(&self, table_name: &str) {
         let mut cache = self.cache.write();
+        let thash = table_hash(table_name);
 
         let keys_to_remove: Vec<CacheKey> = cache
             .iter()
-            .filter(|(key, _)| key.0 == table_name)
+            .filter(|(key, _)| key.0 == thash)
             .map(|(key, _)| key.clone())
             .collect();
 

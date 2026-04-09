@@ -118,6 +118,21 @@ impl PartialOrd for Value {
     }
 }
 
+impl Value {
+    /// Convert to a hashable string key for use in HashMap/DashMap lookups.
+    /// Handles f64 by converting to bits (lossless).
+    pub fn to_hash_key(&self) -> String {
+        match self {
+            Value::Integer(i) => format!("i:{}", i),
+            Value::Float(f) => format!("f:{}", f.to_bits()),
+            Value::Text(s) => format!("t:{}", s),
+            Value::Bool(b) => format!("b:{}", b),
+            Value::Timestamp(t) => format!("ts:{}", t.as_micros()),
+            _ => format!("{:?}", self),
+        }
+    }
+}
+
 /// A row contains multiple values (for storage engine)
 pub type Row = Vec<Value>;
 

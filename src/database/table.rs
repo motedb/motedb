@@ -5,6 +5,7 @@
 
 use crate::types::{TableSchema, IndexDef, RowId};
 use crate::{Result, StorageError};
+use dashmap::DashMap;
 use std::sync::Arc;
 
 use super::core::MoteDB;
@@ -28,10 +29,24 @@ impl MoteDB {
         // Register table in catalog (acquires metadata.write() lock)
         self.table_registry.create_table(schema.clone())?;
         // 🔓 Lock released here
-        
-        // ✅ P0 FIX: Primary key index will be auto-created on first INSERT via incremental indexing
-        // No need to create empty index here - saves memory and avoids complexity
-        
+
+        // 🚀 Auto-create column index for PRIMARY KEY (if not AUTO_INCREMENT)
+        // AUTO_INCREMENT PKs don't need a column index because PK value == row_id.
+        // Non-AUTO_INCREMENT PKs need an index for point queries to be O(log N) instead of O(N).
+        if let Some(pk_col) = schema.primary_key() {
+            if !schema.is_primary_key_auto_increment() {
+                // Create disk-based column index (for persistence + range queries)
+                if let Err(e) = self.create_column_index(&schema.name, pk_col) {
+                    eprintln!("[WARN] Failed to auto-create PK index for {}.{}: {}",
+                        schema.name, pk_col, e);
+                }
+
+                // Create in-memory PK lookup (for O(1) PK → row_id resolution)
+                // This bypasses the disk-based B-Tree column index which has ~1.5ms latency per lookup.
+                self.pk_lookup.insert(schema.name.clone(), Arc::new(DashMap::new()));
+            }
+        }
+
         Ok(())
     }
     

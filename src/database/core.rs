@@ -72,8 +72,9 @@ pub struct MoteDB {
     
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
-    /// Edge optimization: RwLock<HashMap> instead of DashMap (write-once-per-table, then atomic)
-    pub(crate) table_auto_increment: Arc<RwLock<HashMap<String, Arc<AtomicI64>>>>,
+    /// 🚀 Optimized: DashMap for lock-free reads after first insert per table.
+    ///    First insert acquires shard lock, subsequent inserts are lock-free (AtomicI64 only).
+    pub(crate) table_auto_increment: Arc<DashMap<String, Arc<AtomicI64>>>,
 
     /// Number of partitions
     pub(crate) num_partitions: u8,
@@ -103,6 +104,12 @@ pub struct MoteDB {
     
     /// 🚀 Column value indexes (for WHERE optimization) - 使用 DashMap 提升并发性能
     pub column_indexes: Arc<DashMap<String, Arc<RwLock<ColumnValueIndex>>>>,
+
+    /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
+    /// Bypasses disk-based column index for O(1) PK → row_id resolution.
+    /// Only populated for non-AUTO_INCREMENT primary keys.
+    /// Uses String keys (via Value::to_hash_key()) to avoid f64 Eq/Hash issues.
+    pub(crate) pk_lookup: Arc<DashMap<String, Arc<DashMap<String, RowId>>>>,
     
     /// Table registry (catalog)
     pub(crate) table_registry: Arc<TableRegistry>,
@@ -223,7 +230,7 @@ impl MoteDB {
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
             next_row_id: Arc::new(AtomicU64::new(0)),
-            table_auto_increment: Arc::new(RwLock::new(HashMap::new())),
+            table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
             version_store,
@@ -233,6 +240,7 @@ impl MoteDB {
             spatial_indexes: Arc::new(DashMap::new()),
             text_indexes: Arc::new(DashMap::new()),
             column_indexes: Arc::new(DashMap::new()),
+            pk_lookup: Arc::new(DashMap::new()),
             table_registry,
             index_registry,
             row_cache,
@@ -298,6 +306,7 @@ impl MoteDB {
             spatial_indexes: self.spatial_indexes.clone(),
             text_indexes: self.text_indexes.clone(),
             column_indexes: self.column_indexes.clone(),
+            pk_lookup: self.pk_lookup.clone(),
             table_registry: self.table_registry.clone(),
             index_registry: self.index_registry.clone(),  // 🆕
             row_cache: self.row_cache.clone(),
@@ -463,7 +472,7 @@ impl MoteDB {
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
             next_row_id: Arc::new(AtomicU64::new(max_row_id + 1)),
-            table_auto_increment: Arc::new(RwLock::new(HashMap::new())),
+            table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
             version_store,
@@ -473,6 +482,7 @@ impl MoteDB {
             spatial_indexes: Arc::new(Self::hashmap_to_dashmap(spatial_indexes)),
             text_indexes: Arc::new(Self::hashmap_to_dashmap(text_indexes)),
             column_indexes: Arc::new(DashMap::new()),
+            pk_lookup: Arc::new(DashMap::new()),
             table_registry,
             index_registry,
             row_cache,
@@ -515,7 +525,7 @@ impl MoteDB {
                 debug_log!("[database] 🔄 Recovered AUTO_INCREMENT counter for '{}': next_id = {}", 
                     table_name, max_id + 1);
                 
-                db.table_auto_increment.write().insert(
+                db.table_auto_increment.insert(
                     table_name,
                     Arc::new(AtomicI64::new(max_id + 1))
                 );
@@ -544,20 +554,15 @@ impl MoteDB {
     /// Returns error if table doesn't exist or doesn't have AUTO_INCREMENT
     pub fn set_auto_increment_value(&self, table_name: &str, new_value: i64) -> Result<()> {
         // Verify table has AUTO_INCREMENT
-        let guard = self.table_auto_increment.read();
-        if !guard.contains_key(table_name) {
-            return Err(MoteDBError::InvalidArgument(
-                format!("Table {} does not have AUTO_INCREMENT", table_name)
-            ));
-        }
-
-        // Update counter (atomic — no write lock needed, just read lock for lookup)
-        if let Some(counter_ref) = guard.get(table_name) {
+        if let Some(counter_ref) = self.table_auto_increment.get(table_name) {
             counter_ref.store(new_value, std::sync::atomic::Ordering::SeqCst);
             debug_log!("[database] ✓ Set AUTO_INCREMENT for '{}' to {}", table_name, new_value);
+            Ok(())
+        } else {
+            Err(MoteDBError::InvalidArgument(
+                format!("Table {} does not have AUTO_INCREMENT", table_name)
+            ))
         }
-        
-        Ok(())
     }
     
     /// Load existing vector indexes from disk

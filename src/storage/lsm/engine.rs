@@ -23,25 +23,38 @@ struct CachedSSTable {
 }
 
 /// True LRU cache for SSTable handles (with bloom filter alongside)
+/// 🚀 Uses parking_lot::RwLock with peek/get pattern:
+///    - Cache hits: read lock only (concurrent reads)
+///    - Cache misses: write lock (rare after warm-up)
 struct SSTableCache {
-    cache: Mutex<lru::LruCache<PathBuf, CachedSSTable>>,
+    cache: RwLock<lru::LruCache<PathBuf, CachedSSTable>>,
 }
 
 impl SSTableCache {
     fn new(max_size: usize) -> Self {
         use std::num::NonZeroUsize;
         Self {
-            cache: Mutex::new(lru::LruCache::new(
+            cache: RwLock::new(lru::LruCache::new(
                 NonZeroUsize::new(max_size).unwrap()
             )),
         }
     }
 
     fn get_or_open(&self, path: &PathBuf) -> Result<CachedSSTable> {
-        let mut cache = self.cache.lock()
-            .map_err(|_| StorageError::Lock("Cache lock poisoned".into()))?;
+        // Fast path: read lock + peek (doesn't update LRU, but avoids write lock)
+        {
+            let cache = self.cache.read();
+            if let Some(cached) = cache.peek(path) {
+                return Ok(CachedSSTable {
+                    bloom: cached.bloom.clone(),
+                    handle: cached.handle.clone(),
+                });
+            }
+        }
 
-        // Check if already cached (this also updates LRU position)
+        // Slow path: write lock for cache miss (open SSTable + insert)
+        let mut cache = self.cache.write();
+        // Double-check after acquiring write lock (another thread may have inserted)
         if let Some(cached) = cache.get(path) {
             return Ok(CachedSSTable {
                 bloom: cached.bloom.clone(),
@@ -67,9 +80,7 @@ impl SSTableCache {
     }
 
     fn clear(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
-        }
+        self.cache.write().clear();
     }
 
     /// Evict only the given SSTable paths from the cache.
@@ -78,10 +89,9 @@ impl SSTableCache {
         if removed_paths.is_empty() {
             return;
         }
-        if let Ok(mut cache) = self.cache.lock() {
-            for path in removed_paths {
-                cache.pop(path);
-            }
+        let mut cache = self.cache.write();
+        for path in removed_paths {
+            cache.pop(path);
         }
     }
 }

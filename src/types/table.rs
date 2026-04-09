@@ -1,6 +1,7 @@
 /// Table metadata and schema definitions for SQL engine integration
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Column data type
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,7 +136,7 @@ pub struct TableSchema {
     /// Primary key column name (optional)
     pub primary_key_column: Option<String>,
     /// 🚀 AUTO_INCREMENT flag for primary key (optimization hint)
-    /// 
+    ///
     /// When true:
     /// - Primary key value == row_id (always)
     /// - No need to maintain column index for primary key
@@ -148,6 +149,9 @@ pub struct TableSchema {
     /// Column name -> position mapping
     #[serde(skip)]
     column_map: HashMap<String, usize>,
+    /// 🚀 Cached column names (avoids cloning N Strings per SELECT *)
+    #[serde(skip)]
+    pub column_names_cache: Option<Arc<Vec<String>>>,
 }
 
 impl TableSchema {
@@ -166,7 +170,20 @@ impl TableSchema {
             primary_key_auto_increment: false,
             auto_increment_start: None,
             column_map,
+            column_names_cache: None,
         }
+    }
+
+    /// Get cached column names (zero-alloc after first build)
+    ///
+    /// Returns Vec<String> clone. The cache is lazily built on first call.
+    /// Safe for concurrent use: the Option is only set once (None → Some).
+    pub fn column_names(&self) -> Vec<String> {
+        if let Some(ref cache) = self.column_names_cache {
+            return (**cache).clone();
+        }
+        // Fallback: build on the fly (only happens before rebuild_column_map)
+        self.columns.iter().map(|c| c.name.clone()).collect()
     }
     
     /// Create a new table schema with primary key
@@ -246,6 +263,9 @@ impl TableSchema {
         for col in &self.columns {
             self.column_map.insert(col.name.clone(), col.position);
         }
+        // 🚀 Rebuild column names cache
+        let names: Vec<String> = self.columns.iter().map(|c| c.name.clone()).collect();
+        self.column_names_cache = Some(Arc::new(names));
     }
 
     /// Validate a row against this schema

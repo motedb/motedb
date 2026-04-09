@@ -260,13 +260,13 @@ impl MoteDB {
         // 2. 🚀 P3+4: For AUTO_INCREMENT primary key, use per-table counter
         let row_id = if schema.is_primary_key_auto_increment() {
             // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
-            // Edge optimization: RwLock<HashMap> with entry API
+            // 🚀 Optimized: DashMap — first insert per table acquires shard lock, then lock-free
             let counter = {
-                let mut guard = self.table_auto_increment.write();
-                guard.entry(table_name.to_string())
+                self.table_auto_increment.entry(table_name.to_string())
                     .or_insert_with(|| {
                         Arc::new(std::sync::atomic::AtomicI64::new(schema.get_auto_increment_start()))
                     })
+                    .value()
                     .clone()
             };
 
@@ -341,6 +341,15 @@ impl MoteDB {
                 continue;
             }
             let col_value = col_value.unwrap();
+
+            // 🚀 In-memory PK lookup (O(1) resolution, bypasses disk-based B-Tree)
+            if let Some(pk_name) = schema.primary_key() {
+                if col_name == pk_name && !schema.is_primary_key_auto_increment() {
+                    if let Some(lookup) = self.pk_lookup.get(table_name) {
+                        lookup.insert(col_value.to_hash_key(), row_id);
+                    }
+                }
+            }
 
             // 7.1 Column Index (use pre-computed set instead of format!())
             if indexed_columns.contains(col_name.as_str()) {

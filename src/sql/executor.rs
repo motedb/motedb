@@ -367,7 +367,7 @@ impl QueryExecutor {
     /// For other statements: clones only the specific variant needed.
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         match stmt {
-            Statement::Select(s) => self.execute_select_streaming(s.clone()),
+            Statement::Select(s) => self.execute_select_streaming_ref(s),
             Statement::Insert(i) => {
                 let result = self.execute_insert(i.clone())?;
                 Ok(StreamingQueryResult::Modification {
@@ -545,14 +545,14 @@ impl QueryExecutor {
         self.execute_select_internal(&stmt)
     }
     
-    /// 🚀 Execute SELECT statement (streaming version)
-    /// 
-    /// Returns an iterator instead of Vec for zero-memory overhead.
-    /// Now uses query optimizer for index selection!
-    fn execute_select_streaming(&self, stmt: SelectStmt) -> Result<StreamingQueryResult> {
+    /// 🚀 Execute SELECT statement (streaming version, zero-clone)
+    ///
+    /// Takes &SelectStmt — no cloning of the AST at all.
+    /// This is the primary entry point from the statement cache.
+    fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
         // Aggregate queries (COUNT, SUM, etc.) require materialization — fall back
         if self.has_aggregates(&stmt.columns) {
-            let result = self.execute_select_internal(&stmt)?;
+            let result = self.execute_select_internal(stmt)?;
             return match result {
                 QueryResult::Select { columns, rows } => {
                     Ok(StreamingQueryResult::SelectStreaming {
@@ -571,7 +571,7 @@ impl QueryExecutor {
         // Handle JOIN/Subquery by falling back to materialization
         match stmt.from.as_ref().unwrap() {
             TableRef::Join { .. } | TableRef::Subquery { .. } => {
-                let result = self.execute_select_internal(&stmt)?;
+                let result = self.execute_select_internal(stmt)?;
                 return match result {
                     QueryResult::Select { columns, rows } => {
                         Ok(StreamingQueryResult::SelectStreaming {
@@ -588,27 +588,23 @@ impl QueryExecutor {
             }
             _ => {}
         }
-        
+
         // 🔥 核心改进：使用查询优化器生成执行计划
-        let plan = self.optimizer.borrow_mut().optimize_select(&stmt)?;
-        
+        let plan = self.optimizer.borrow_mut().optimize_select(stmt)?;
+
         // 根据执行计划选择流式扫描方法
         match plan.scan_method {
             super::optimizer::ScanMethod::PointQuery { ref table, ref column, ref value } => {
-                // 点查询：使用列索引
-                self.execute_point_query_streaming(&stmt, table, column, value)
+                self.execute_point_query_streaming(stmt, table, column, value)
             }
             super::optimizer::ScanMethod::RangeQuery { ref table, ref column, ref start, start_inclusive, ref end, end_inclusive } => {
-                // 范围查询：使用列索引（with boundary flags）
-                self.execute_range_query_streaming(&stmt, table, column, start, start_inclusive, end, end_inclusive)
+                self.execute_range_query_streaming(stmt, table, column, start, start_inclusive, end, end_inclusive)
             }
             super::optimizer::ScanMethod::FullScan { ref table } => {
-                // 全表扫描：使用现有实现
-                self.execute_full_scan_streaming(&stmt, table)
+                self.execute_full_scan_streaming(stmt, table)
             }
             _ => {
-                // 其他扫描方法暂时回退到物化
-                let result = self.execute_select_internal(&stmt)?;
+                let result = self.execute_select_internal(stmt)?;
                 match result {
                     QueryResult::Select { columns, rows } => {
                         Ok(StreamingQueryResult::SelectStreaming {
@@ -625,6 +621,11 @@ impl QueryExecutor {
             }
         }
     }
+
+    /// Execute SELECT streaming (owned version — clones into ref version)
+    fn execute_select_streaming(&self, stmt: SelectStmt) -> Result<StreamingQueryResult> {
+        self.execute_select_streaming_ref(&stmt)
+    }
     
     /// 🔥 点查询流式扫描（使用列索引）
     /// 
@@ -640,10 +641,57 @@ impl QueryExecutor {
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
         // 🚀 Fast path for AUTO_INCREMENT primary key: skip column index, use direct LSM get
-        let is_auto_increment_pk = schema.primary_key()
+        let is_pk = schema.primary_key()
             .map(|pk| pk == column)
-            .unwrap_or(false)
-            && schema.is_primary_key_auto_increment();
+            .unwrap_or(false);
+
+        let is_auto_increment_pk = is_pk && schema.is_primary_key_auto_increment();
+
+        // 🚀 Fast path for non-AUTO_INCREMENT PK: use in-memory PK lookup
+        // Bypasses disk-based column index (1.5ms → <5µs)
+        let is_non_auto_pk = is_pk && !schema.is_primary_key_auto_increment();
+
+        if is_non_auto_pk {
+            // In-memory PK lookup: O(1) HashMap instead of disk B-Tree
+            let key = value.to_hash_key();
+            let row_id = if let Some(lookup) = self.db.pk_lookup.get(table) {
+                lookup.get(&key).map(|r| *r.value())
+            } else {
+                None
+            };
+
+            match row_id {
+                Some(rid) => {
+                    let row = self.db.get_table_row(table, rid)?;
+                    let result_rows: Vec<Result<Vec<Value>>> = match row {
+                        Some(row) => {
+                            let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
+                            vec![Ok(projected)]
+                        }
+                        None => vec![],
+                    };
+                    return Ok(StreamingQueryResult::SelectStreaming {
+                        columns,
+                        rows: Box::new(result_rows.into_iter()),
+                        order_by: stmt.order_by.clone(),
+                        limit: stmt.limit,
+                        offset: stmt.offset,
+                        distinct: stmt.distinct,
+                    });
+                }
+                None => {
+                    // PK value not found — return empty
+                    return Ok(StreamingQueryResult::SelectStreaming {
+                        columns,
+                        rows: Box::new(std::iter::empty()),
+                        order_by: stmt.order_by.clone(),
+                        limit: stmt.limit,
+                        offset: stmt.offset,
+                        distinct: stmt.distinct,
+                    });
+                }
+            }
+        }
 
         if is_auto_increment_pk {
             // Direct LSM get by row_id — no column index needed
@@ -994,8 +1042,8 @@ impl QueryExecutor {
     /// 🔧 Helper: 构建 SELECT 列列表
     fn build_select_columns(&self, select_cols: &[SelectColumn], schema: &TableSchema) -> Result<Vec<String>> {
         let columns = if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::Star) {
-            // SELECT *
-            schema.columns.iter().map(|c| c.name.clone()).collect()
+            // 🚀 SELECT *: use cached column names (zero-alloc after first build)
+            schema.column_names()
         } else {
             // 显式列名或表达式
             select_cols.iter().enumerate().map(|(idx, col)| {
@@ -3451,8 +3499,17 @@ impl QueryExecutor {
                 _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
             }
         } else {
-            // Non-AUTO_INCREMENT: use column index to find row_id(s)
-            self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+            // Non-AUTO_INCREMENT: use in-memory PK lookup first (O(1)), fallback to disk index
+            let pk_key = target_value.to_hash_key();
+            if let Some(lookup) = self.db.pk_lookup.get(&stmt.table) {
+                if let Some(rid) = lookup.get(&pk_key) {
+                    vec![*rid.value()]
+                } else {
+                    vec![]
+                }
+            } else {
+                self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+            }
         };
 
         let mut affected_rows = 0;
@@ -3502,8 +3559,17 @@ impl QueryExecutor {
                 _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
             }
         } else {
-            // Non-AUTO_INCREMENT: use column index to find row_id(s)
-            self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+            // Non-AUTO_INCREMENT: use in-memory PK lookup first (O(1)), fallback to disk index
+            let pk_key = target_value.to_hash_key();
+            if let Some(lookup) = self.db.pk_lookup.get(&stmt.table) {
+                if let Some(rid) = lookup.get(&pk_key) {
+                    vec![*rid.value()]
+                } else {
+                    vec![]
+                }
+            } else {
+                self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+            }
         };
 
         let mut affected_rows = 0;
