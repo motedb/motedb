@@ -348,8 +348,8 @@ impl Database {
     /// let row_ids = db.batch_insert("users", rows)?;
     /// println!("Inserted {} rows", row_ids.len());
     /// ```
-    pub fn batch_insert(&self, _table_name: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
-        self.inner.batch_insert_rows(rows)
+    pub fn batch_insert(&self, table_name: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        self.inner.batch_insert_rows_to_table(table_name, rows)
     }
 
     /// 批量插入行（使用 HashMap，比逐行插入快10-20倍）
@@ -470,7 +470,7 @@ impl Database {
     /// let results = db.query(query)?;
     /// ```
     pub fn create_vector_index(&self, index_name: &str, dimension: usize) -> Result<()> {
-        self.inner.create_vector_index(index_name, dimension)
+        self.inner.create_vector_index(index_name, dimension, None)
     }
 
     /// 创建全文索引（用于BM25文本搜索）
@@ -739,8 +739,8 @@ impl Database {
     }
 
     /// 获取行（底层API，推荐使用 SQL SELECT）
-    pub fn get_row(&self, row_id: RowId) -> Result<Option<Row>> {
-        self.inner.get_row(row_id)
+    pub fn get_row(&self, table_name: &str, row_id: RowId) -> Result<Option<Row>> {
+        self.inner.get_table_row(table_name, row_id)
     }
 
     /// 获取行（返回 HashMap 格式）
@@ -752,7 +752,7 @@ impl Database {
     /// }
     /// ```
     pub fn get_row_map(&self, table_name: &str, row_id: RowId) -> Result<Option<SqlRow>> {
-        if let Some(row) = self.inner.get_row(row_id)? {
+        if let Some(row) = self.inner.get_table_row(table_name, row_id)? {
             let schema = self.inner.get_table_schema(table_name)?;
             Ok(Some(crate::sql::row_converter::row_to_sql_row(&row, &schema)?))
         } else {

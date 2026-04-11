@@ -108,8 +108,8 @@ pub struct MoteDB {
     /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
     /// Bypasses disk-based column index for O(1) PK → row_id resolution.
     /// Only populated for non-AUTO_INCREMENT primary keys.
-    /// Uses String keys (via Value::to_hash_key()) to avoid f64 Eq/Hash issues.
-    pub(crate) pk_lookup: Arc<DashMap<String, Arc<DashMap<String, RowId>>>>,
+    /// Bounded by LRU eviction — falls back to disk index on cache miss.
+    pub(crate) pk_lookup: Arc<DashMap<String, Arc<crate::database::pk_cache::PkLookupCache>>>,
     
     /// Table registry (catalog)
     pub(crate) table_registry: Arc<TableRegistry>,
@@ -122,9 +122,12 @@ pub struct MoteDB {
 
     /// 🚀 Phase 3+: Index update strategy
     pub(crate) index_update_strategy: crate::config::IndexUpdateStrategy,
-    
+
     /// 🚀 P0: Query timeout (seconds)
     pub(crate) query_timeout_secs: Option<u64>,
+
+    /// PK lookup cache capacity per table (LRU eviction)
+    pub(crate) pk_lookup_capacity: usize,
     
     /// 🆕 防止递归 flush 的标志
     pub(crate) is_flushing: Arc<AtomicBool>,
@@ -246,6 +249,7 @@ impl MoteDB {
             row_cache,
             index_update_strategy: config.index_update_strategy.clone(),
             query_timeout_secs: config.query_timeout_secs,
+            pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
@@ -312,6 +316,7 @@ impl MoteDB {
             row_cache: self.row_cache.clone(),
             index_update_strategy: self.index_update_strategy.clone(),
             query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
+            pk_lookup_capacity: self.pk_lookup_capacity,
             is_flushing: self.is_flushing.clone(),  // 🆕 共享 flush 标志
             checkpoint_mutex: self.checkpoint_mutex.clone(),
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
@@ -449,19 +454,18 @@ impl MoteDB {
         let version_store = Arc::new(VersionStore::new());
         let txn_coordinator = Arc::new(TransactionCoordinator::new(version_store.clone()));
 
-        // Load existing vector indexes
-        let vector_indexes = Self::load_vector_indexes(&db_path)?;
+        // 🆕 Load index metadata registry first (needed for metric info)
+        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
+        let _ = index_registry.load();  // Ignore error if file doesn't exist
+
+        // Load existing vector indexes (using metric from registry)
+        let vector_indexes = Self::load_vector_indexes(&db_path, &index_registry)?;
         
         // Load existing spatial indexes
         let spatial_indexes = Self::load_spatial_indexes(&db_path)?;
         
         // Load existing text indexes
         let text_indexes = Self::load_text_indexes(&db_path)?;
-        
-        // 🆕 Load index metadata registry
-        // (table_registry already loaded above, before WAL replay)
-        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
-        let _ = index_registry.load();  // Ignore error if file doesn't exist
         
         // 🚀 P1: Create row cache (use config or default 10000)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
@@ -488,6 +492,7 @@ impl MoteDB {
             row_cache,
             index_update_strategy: config.index_update_strategy.clone(),
             query_timeout_secs: config.query_timeout_secs,
+            pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             auto_checkpoint_thread: None,
@@ -566,9 +571,9 @@ impl MoteDB {
     }
     
     /// Load existing vector indexes from disk
-    fn load_vector_indexes(db_path: &Path) -> Result<HashMap<String, Arc<RwLock<DiskANNIndex>>>> {
+    fn load_vector_indexes(db_path: &Path, index_registry: &crate::database::index_metadata::IndexRegistry) -> Result<HashMap<String, Arc<RwLock<DiskANNIndex>>>> {
         let mut indexes = HashMap::new();
-        
+
         // 🎯 从统一目录加载：{db}.mote/indexes/vector_*/
         let indexes_dir = db_path.join("indexes");
         if indexes_dir.exists() {
@@ -578,22 +583,30 @@ impl MoteDB {
                         if name.starts_with("vector_") {
                             let index_name = name.strip_prefix("vector_").unwrap();
                             let index_path = entry.path();
-                            
-                            // Try to load the index
-                            let config = VamanaConfig::default();
+
+                            // Resolve metric from metadata registry
+                            let distance_kind = index_registry.get(index_name)
+                                .and_then(|meta| meta.metric.clone())
+                                .map(|m| match m.as_str() {
+                                    "cosine" => crate::distance::DistanceKind::Cosine,
+                                    _ => crate::distance::DistanceKind::Euclidean,
+                                })
+                                .unwrap_or(crate::distance::DistanceKind::Euclidean);
+
+                            let config = VamanaConfig::default().with_metric(distance_kind);
                             if let Ok(index) = DiskANNIndex::load(&index_path, config) {
                                 indexes.insert(
-                                    index_name.to_string(), 
+                                    index_name.to_string(),
                                     Arc::new(RwLock::new(index))
                                 );
-                                debug_log!("[MoteDB] Loaded vector index: {}", index_name);
+                                debug_log!("[MoteDB] Loaded vector index: {} (metric={:?})", index_name, distance_kind);
                             }
                         }
                     }
                 }
             }
         }
-        
+
         Ok(indexes)
     }
     

@@ -846,8 +846,11 @@ impl QueryOptimizer {
             _ => return Ok(None),
         };
         
-        // 检查是否存在向量索引
-        let index_name = format!("{}_{}", table_name, column);
+        // 检查是否存在向量索引（使用 index_registry 支持自定义索引名）
+        let index_name = self.db.index_registry.find_by_column(
+            &table_name, &column,
+            crate::database::index_metadata::IndexType::Vector
+        ).unwrap_or_else(|| format!("{}_{}", table_name, column));
         let has_vector_index = self.db.has_vector_index(&index_name);
         
         if !has_vector_index {

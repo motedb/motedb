@@ -138,6 +138,8 @@ pub struct CreateIndexStmt {
     pub table: String,
     pub column: String,
     pub index_type: IndexType,
+    /// Distance metric for vector indexes ("l2" or "cosine")
+    pub metric: Option<String>,
 }
 
 #[derive(Debug, Clone)]

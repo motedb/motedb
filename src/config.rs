@@ -376,12 +376,22 @@ pub struct DBConfig {
     pub enable_stats: bool,
     
     /// 🚀 P1: Row cache size (number of rows, None = use default 10000)
-    /// 
+    ///
     /// Memory usage: ~1KB/row × cache_size
     /// - 10000 rows ≈ 10MB (default)
     /// - 50000 rows ≈ 50MB (high traffic)
     /// - 1000 rows ≈ 1MB (memory-constrained)
     pub row_cache_size: Option<usize>,
+
+    /// PK lookup cache capacity (number of entries per table)
+    ///
+    /// This bounds the in-memory PK→RowId mapping. When exceeded, least-recently-used
+    /// entries are evicted and queries fall back to the disk-based column index.
+    ///
+    /// Memory usage: ~80 bytes/entry × capacity
+    /// - 50000 (default) ≈ 4MB per table
+    /// - 10000 ≈ 800KB per table (memory-constrained)
+    pub pk_lookup_capacity: usize,
     
     /// 🚀 Phase 3+: Index update strategy
     /// 
@@ -481,6 +491,7 @@ impl Default for DBConfig {
             lsm_config: LSMConfig::default(),
             enable_stats: true,
             row_cache_size: None,  // Use default 10000
+            pk_lookup_capacity: 50_000,  // ~4MB per table
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
             query_timeout_secs: None,  // No timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
@@ -543,6 +554,7 @@ impl DBConfig {
                 ..Default::default()
             },
             row_cache_size: Some(500),
+            pk_lookup_capacity: 10_000,  // ~800KB per table (memory-constrained)
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             ..Default::default()
@@ -566,7 +578,7 @@ pub struct LSMConfig {
 impl Default for LSMConfig {
     fn default() -> Self {
         Self {
-            memtable_size_limit: 64 * 1024 * 1024, // 64MB
+            memtable_size_limit: 4 * 1024 * 1024, // 4MB (stable memory for embedded use)
             level0_compaction_threshold: 4,
             bloom_filter_false_positive_rate: 0.01, // 1%
         }

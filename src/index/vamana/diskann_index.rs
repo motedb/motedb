@@ -14,7 +14,7 @@ use super::disk_graph::DiskGraph;
 use super::sq8::{SQ8Quantizer, QuantizedVector};
 use super::sq8_vectors::SQ8Vectors;
 use super::pruner::{robust_prune, Candidate};
-use crate::distance::{Cosine, DistanceMetric};
+use crate::distance::DistanceKind;
 use crate::types::RowId;
 use crate::{Result, StorageError};
 use parking_lot::RwLock;
@@ -100,9 +100,22 @@ impl VectorStorage {
     }
     
     /// 🚀 Compute distance using optimized SQ8 asymmetric distance
-    fn distance(&self, query: &[f32], row_id: RowId, _metric: &Cosine) -> f32 {
+    fn distance(&self, query: &[f32], row_id: RowId, metric: DistanceKind) -> f32 {
         if let Some(qvec) = self.vectors.get_quantized(row_id) {
-            self.quantizer.asymmetric_distance_cosine(query, &qvec)
+            match metric {
+                DistanceKind::Euclidean => {
+                    #[cfg(target_arch = "aarch64")]
+                    { self.quantizer.asymmetric_distance_l2_neon(query, &qvec) }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    { self.quantizer.asymmetric_distance_l2(query, &qvec) }
+                }
+                DistanceKind::Cosine => {
+                    #[cfg(target_arch = "aarch64")]
+                    { self.quantizer.asymmetric_distance_cosine_neon(query, &qvec) }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    { self.quantizer.asymmetric_distance_cosine(query, &qvec) }
+                }
+            }
         } else {
             f32::MAX
         }
@@ -175,7 +188,7 @@ pub struct DiskANNIndex {
     config: VamanaConfig,
     
     /// Distance metric
-    metric: Arc<Cosine>,
+    metric: DistanceKind,
     
     /// Cached stats (timestamp, stats)
     cached_stats: Arc<RwLock<Option<(Instant, IndexStats)>>>,
@@ -232,8 +245,8 @@ impl DiskANNIndex {
             vectors,
             graph,
             medoid: Arc::new(RwLock::new(None)),
+            metric: config.metric,
             config,
-            metric: Arc::new(Cosine),
             cached_stats: Arc::new(RwLock::new(None)),
             last_reorder_size: Arc::new(RwLock::new(0)),
             total_inserts_since_reorder: Arc::new(RwLock::new(0)),
@@ -304,8 +317,8 @@ impl DiskANNIndex {
             vectors,
             graph,
             medoid: Arc::new(RwLock::new(medoid)),
+            metric: config.metric,
             config,
-            metric: Arc::new(Cosine),
             cached_stats: Arc::new(RwLock::new(None)),
             last_reorder_size: Arc::new(RwLock::new(initial_size)),
             total_inserts_since_reorder: Arc::new(RwLock::new(0)),
@@ -966,7 +979,7 @@ impl DiskANNIndex {
         let mut candidates = BinaryHeap::new();
         
         // Start
-        let dist = self.vectors.distance(query, start_id, &self.metric);
+        let dist = self.vectors.distance(query, start_id, self.metric);
         candidates.push(Reverse(Candidate {
             id: start_id,
             distance: dist,
@@ -990,7 +1003,7 @@ impl DiskANNIndex {
                 for neighbor_id in prefetch_ids {
                     visited.insert(neighbor_id);
                     
-                    let dist = self.vectors.distance(query, neighbor_id, &self.metric);
+                    let dist = self.vectors.distance(query, neighbor_id, self.metric);
                     
                     candidates.push(Reverse(Candidate {
                         id: neighbor_id,
@@ -2216,7 +2229,7 @@ impl DiskANNIndex {
         let mut candidates = BinaryHeap::new();
         
         // Start with start_id
-        let dist = self.vectors.distance(query, start_id, &self.metric);
+        let dist = self.vectors.distance(query, start_id, self.metric);
         candidates.push(Reverse(Candidate {
             id: start_id,
             distance: dist,
@@ -2267,7 +2280,7 @@ impl DiskANNIndex {
                 for neighbor_id in prefetch_ids {
                     visited.insert(neighbor_id);
                     
-                    let dist = self.vectors.distance(query, neighbor_id, &self.metric);
+                    let dist = self.vectors.distance(query, neighbor_id, self.metric);
                     
                     // 🚀 Threshold pruning: 只添加有希望的候选
                     if dist < worst_distance_in_beam || candidates.len() < beam_width {
@@ -2305,7 +2318,7 @@ impl DiskANNIndex {
         
         // Start with start_id
         // 🚀 OPTIMIZED: Use optimized distance method
-        let dist = self.vectors.distance(query, start_id, &self.metric);
+        let dist = self.vectors.distance(query, start_id, self.metric);
         candidates.push(Reverse(Candidate {
             id: start_id,
             distance: dist,
@@ -2353,7 +2366,7 @@ impl DiskANNIndex {
                     visited.insert(neighbor_id);
                     
                     // 🚀 OPTIMIZED: Direct SQ8 distance (no decompression)
-                    let dist = self.vectors.distance(query, neighbor_id, &self.metric);
+                    let dist = self.vectors.distance(query, neighbor_id, self.metric);
                     
                     candidates.push(Reverse(Candidate {
                         id: neighbor_id,

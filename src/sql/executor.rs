@@ -590,6 +590,49 @@ impl QueryExecutor {
         }
 
         // 🔥 核心改进：使用查询优化器生成执行计划
+        // 🚀 Fast path: Text search and spatial queries must go through execute_select_internal
+        // which has the optimized index pushdown paths. The streaming path only handles
+        // FullScan which would be O(N) for these queries.
+        if let Some(ref where_clause) = stmt.where_clause {
+            if Self::expr_needs_materialized_path(where_clause) {
+                let result = self.execute_select_internal(stmt)?;
+                return match result {
+                    QueryResult::Select { columns, rows } => {
+                        Ok(StreamingQueryResult::SelectStreaming {
+                            columns,
+                            rows: Box::new(rows.into_iter().map(Ok)),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+            }
+        }
+
+        // 🚀 Fast path: ORDER BY ST_DISTANCE should use spatial KNN index
+        // Check if ORDER BY contains ST_DISTANCE or a column alias referencing ST_DISTANCE
+        if let Some(ref order_by) = stmt.order_by {
+            if order_by.iter().any(|ob| Self::expr_is_or_aliases_st_distance(&ob.expr, &stmt.columns)) {
+                let result = self.execute_select_internal(stmt)?;
+                return match result {
+                    QueryResult::Select { columns, rows } => {
+                        Ok(StreamingQueryResult::SelectStreaming {
+                            columns,
+                            rows: Box::new(rows.into_iter().map(Ok)),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                        })
+                    }
+                    _ => unreachable!(),
+                };
+            }
+        }
+
         let plan = self.optimizer.borrow_mut().optimize_select(stmt)?;
 
         // 根据执行计划选择流式扫描方法
@@ -626,7 +669,38 @@ impl QueryExecutor {
     fn execute_select_streaming(&self, stmt: SelectStmt) -> Result<StreamingQueryResult> {
         self.execute_select_streaming_ref(&stmt)
     }
-    
+
+    /// Check if an expression contains MATCH, ST_WITHIN, or ST_KNN that needs
+    /// the materialized execution path with index pushdown fast paths.
+    fn expr_needs_materialized_path(expr: &Expr) -> bool {
+        match expr {
+            Expr::Match { .. } | Expr::StWithin { .. } | Expr::StKnn { .. } => true,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_needs_materialized_path(left) || Self::expr_needs_materialized_path(right)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if ORDER BY expression is ST_DISTANCE or aliases a SELECT column that is ST_DISTANCE
+    fn expr_is_or_aliases_st_distance(expr: &Expr, select_cols: &[SelectColumn]) -> bool {
+        match expr {
+            Expr::StDistance { .. } => true,
+            Expr::Column(alias) => {
+                for col in select_cols {
+                    match col {
+                        SelectColumn::Expr(e, Some(a)) if a == alias => {
+                            return matches!(e, Expr::StDistance { .. });
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// 🔥 点查询流式扫描（使用列索引）
     /// 
     /// ⚠️ 注意：这个方法通常只返回少量行（点查询），不需要批量优化
@@ -652,45 +726,37 @@ impl QueryExecutor {
         let is_non_auto_pk = is_pk && !schema.is_primary_key_auto_increment();
 
         if is_non_auto_pk {
-            // In-memory PK lookup: O(1) HashMap instead of disk B-Tree
+            // In-memory PK lookup: O(1) LRU cache instead of disk B-Tree
             let key = value.to_hash_key();
-            let row_id = if let Some(lookup) = self.db.pk_lookup.get(table) {
-                lookup.get(&key).map(|r| *r.value())
-            } else {
-                None
-            };
+            let row_id = self.resolve_pk_with_cache(table, &key, column, value)?;
 
-            match row_id {
-                Some(rid) => {
-                    let row = self.db.get_table_row(table, rid)?;
-                    let result_rows: Vec<Result<Vec<Value>>> = match row {
-                        Some(row) => {
-                            let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
-                            vec![Ok(projected)]
-                        }
-                        None => vec![],
-                    };
-                    return Ok(StreamingQueryResult::SelectStreaming {
-                        columns,
-                        rows: Box::new(result_rows.into_iter()),
-                        order_by: stmt.order_by.clone(),
-                        limit: stmt.limit,
-                        offset: stmt.offset,
-                        distinct: stmt.distinct,
-                    });
-                }
-                None => {
-                    // PK value not found — return empty
-                    return Ok(StreamingQueryResult::SelectStreaming {
-                        columns,
-                        rows: Box::new(std::iter::empty()),
-                        order_by: stmt.order_by.clone(),
-                        limit: stmt.limit,
-                        offset: stmt.offset,
-                        distinct: stmt.distinct,
-                    });
-                }
+            if let Some(rid) = row_id {
+                let row = self.db.get_table_row(table, rid)?;
+                let result_rows: Vec<Result<Vec<Value>>> = match row {
+                    Some(row) => {
+                        let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
+                        vec![Ok(projected)]
+                    }
+                    None => vec![],
+                };
+                return Ok(StreamingQueryResult::SelectStreaming {
+                    columns,
+                    rows: Box::new(result_rows.into_iter()),
+                    order_by: stmt.order_by.clone(),
+                    limit: stmt.limit,
+                    offset: stmt.offset,
+                    distinct: stmt.distinct,
+                });
             }
+            // PK not found — return empty
+            return Ok(StreamingQueryResult::SelectStreaming {
+                columns,
+                rows: Box::new(std::iter::empty()),
+                order_by: stmt.order_by.clone(),
+                limit: stmt.limit,
+                offset: stmt.offset,
+                distinct: stmt.distinct,
+            });
         }
 
         if is_auto_increment_pk {
@@ -1106,8 +1172,26 @@ impl QueryExecutor {
                 let v = Self::eval_expr_simple(expr, row)?;
                 Ok(Value::Bool(!Self::is_truthy(&v)))
             }
-            // For complex expressions, return true and let the caller handle it
-            // (MATCH, KNN, etc. require a full executor — rare in normal WHERE)
+            // For complex expressions that require the materialized path,
+            // return the pre-computed result if available, otherwise false.
+            // These expressions should never reach eval_expr_simple — they are
+            // redirected to execute_select_internal by expr_needs_materialized_path().
+            // The false fallback is a safety net to avoid returning wrong results.
+            Expr::StWithin { .. } => {
+                Ok(row.get("__spatial_within__").cloned().unwrap_or(Value::Bool(false)))
+            }
+            Expr::StKnn { .. } => {
+                Ok(row.get("__spatial_knn__").cloned().unwrap_or(Value::Bool(false)))
+            }
+            Expr::StDistance { .. } => {
+                // ST_DISTANCE is a function, not a predicate — cannot evaluate in simple path
+                Ok(row.get("__spatial_distance__").cloned().unwrap_or(Value::Float(0.0)))
+            }
+            Expr::Match { .. } => {
+                // If we have a pre-computed score, non-zero means match
+                let has_score = row.keys().any(|k| k.starts_with("__text_score_"));
+                Ok(Value::Bool(has_score))
+            }
             _ => Ok(Value::Bool(true)),
         }
     }
@@ -1253,13 +1337,24 @@ impl QueryExecutor {
         if let Some(plan) = self.try_optimize_vector_order_by(stmt)? {
             return self.execute_vector_order_by_plan(stmt, &plan);
         }
-        
+
+        // 🚀 FAST PATH -1b: Spatial ORDER BY ST_DISTANCE optimization
+        // Pattern: SELECT ... FROM table ORDER BY ST_DISTANCE(col, x, y) LIMIT k
+        // → Use spatial KNN index (50x faster than full scan + per-row distance calc)
+        if let Some(result) = self.try_optimize_spatial_order_by(stmt)? {
+            return Ok(result);
+        }
+
         // 🚀 FAST PATH 0: Vector search optimization (P0)
         // Pattern: SELECT * FROM table WHERE VECTOR_SEARCH(column, [...], k)
         if let Some(ref where_clause) = stmt.where_clause {
             if let Some((table_name, col_name, query_vector, k)) = self.try_extract_vector_search(where_clause, stmt.from.as_ref().unwrap()) {
                 // ⚡ Ultra-fast path: Use vector index directly
-                let index_name = format!("{}_{}", table_name, col_name);
+                // Resolve index name via registry (supports custom index names)
+                let index_name = self.db.index_registry.find_by_column(
+                    &table_name, &col_name,
+                    crate::database::index_metadata::IndexType::Vector
+                ).unwrap_or_else(|| format!("{}_{}", table_name, col_name));
                 match self.db.vector_search(&index_name, &query_vector, k) {
                     Ok(results) => {
                         // Load rows for the result row_ids
@@ -1305,7 +1400,30 @@ impl QueryExecutor {
                 }
             }
         }
-        
+
+        // 🚀 FAST PATH 0a: Text Search (MATCH AGAINST) optimization
+        // Pattern: SELECT ... FROM table WHERE MATCH(col) AGAINST('query') [ORDER BY score] [LIMIT k]
+        // → Use text index directly (50x faster than full table scan + per-row search_ranked)
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let Some(result) = self.try_text_search_fast_path(stmt, where_clause, table_name)? {
+                    return Ok(result);
+                }
+            }
+        }
+
+        // 🚀 FAST PATH 0b: Spatial (ST_WITHIN / ST_KNN) optimization
+        // Pattern: SELECT ... FROM table WHERE ST_WITHIN(col, ...) [LIMIT k]
+        //          SELECT ... FROM table WHERE ST_KNN(col, ...) [LIMIT k]
+        // → Use spatial index directly (50x faster than full table scan + per-row spatial query)
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let Some(result) = self.try_spatial_fast_path(stmt, where_clause, table_name)? {
+                    return Ok(result);
+                }
+            }
+        }
+
         // 🚀 FAST PATH 1: Aggregate query optimization (P0-2)
         // Pattern: SELECT COUNT(*) FROM table [WHERE indexed_col = value]
         if self.has_only_count_aggregate(&stmt.columns) && stmt.group_by.is_none() {
@@ -2523,6 +2641,12 @@ impl QueryExecutor {
             }
             
             Expr::Match { column, query } => {
+                // 🚀 Fast path: use pre-computed score if available (from text search fast path)
+                let score_key = format!("__text_score_{}__", column);
+                if let Some(Value::Float(score)) = row.get(&score_key) {
+                    return Ok(Value::Float(*score));
+                }
+
                 // Get row_id from the row
                 let row_id = row.get("__row_id__")
                     .and_then(|v| match v {
@@ -2530,7 +2654,7 @@ impl QueryExecutor {
                     _ => None,
                 })
                 .ok_or_else(|| MoteDBError::Query("MATCH requires __row_id__ in row".into()))?;
-            
+
             // 🔧 Get table name from row
             let table_name = row.get("__table__")
                 .and_then(|v| match v {
@@ -2619,6 +2743,10 @@ impl QueryExecutor {
             }
             
             Expr::StWithin { column, min_x, min_y, max_x, max_y } => {
+                // 🚀 Fast path: if we're in the spatial fast path, this row is already confirmed to be within bbox
+                if row.get("__spatial_within__").is_some() {
+                    return Ok(Value::Bool(true));
+                }
                 // ST_WITHIN returns Bool - true if point is within bounding box
                 let row_id = row.get("__row_id__")
                     .and_then(|v| match v {
@@ -2660,6 +2788,10 @@ impl QueryExecutor {
             }
             
             Expr::StDistance { column, x, y } => {
+                // 🚀 Fast path: use pre-computed distance if available (from spatial KNN ORDER BY)
+                if let Some(Value::Float(dist)) = row.get("__spatial_distance__") {
+                    return Ok(Value::Float(*dist));
+                }
                 // ST_DISTANCE returns Float - Euclidean distance
                 // Get point value from row
                 let point_value = self.get_column_value(row, column)
@@ -2680,6 +2812,10 @@ impl QueryExecutor {
             }
             
             Expr::StKnn { column, x, y, k } => {
+                // 🚀 Fast path: if we're in the spatial KNN fast path, this row is already in top-k
+                if row.get("__spatial_knn__").is_some() {
+                    return Ok(Value::Bool(true));
+                }
                 // ST_KNN returns Bool - true if this point is in top-k nearest neighbors
                 let row_id = row.get("__row_id__")
                     .and_then(|v| match v {
@@ -3482,6 +3618,36 @@ impl QueryExecutor {
     /// For `UPDATE t SET ... WHERE pk = value`:
     /// - AUTO_INCREMENT: direct LSM get by row_id (O(log n))
     /// - Non-AUTO_INCREMENT: column index lookup then LSM get
+    /// Resolve PK value to RowId using pk_lookup cache.
+    /// On cache miss, falls back to disk-based column index and refills the cache.
+    /// This ensures that repeated lookups for the same PK value are fast (O(1) after first access).
+    fn resolve_pk_with_cache(
+        &self,
+        table: &str,
+        pk_hash_key: &str,
+        pk_col_name: &str,
+        pk_value: &Value,
+    ) -> Result<Option<RowId>> {
+        // Try LRU cache first
+        if let Some(lookup) = self.db.pk_lookup.get(table) {
+            if let Some(rid) = lookup.get(pk_hash_key) {
+                return Ok(Some(rid));
+            }
+        }
+
+        // Cache miss — fall back to disk-based column index
+        let row_ids = self.db.query_by_column(table, pk_col_name, pk_value)?;
+
+        // Refill cache from disk result so next lookup is O(1)
+        if let Some(&rid) = row_ids.first() {
+            if let Some(lookup) = self.db.pk_lookup.get(table) {
+                lookup.insert(pk_hash_key.to_string(), rid);
+            }
+        }
+
+        Ok(row_ids.into_iter().next())
+    }
+
     fn execute_update_pk(
         &self,
         stmt: &UpdateStmt,
@@ -3499,16 +3665,11 @@ impl QueryExecutor {
                 _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
             }
         } else {
-            // Non-AUTO_INCREMENT: use in-memory PK lookup first (O(1)), fallback to disk index
+            // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
             let pk_key = target_value.to_hash_key();
-            if let Some(lookup) = self.db.pk_lookup.get(&stmt.table) {
-                if let Some(rid) = lookup.get(&pk_key) {
-                    vec![*rid.value()]
-                } else {
-                    vec![]
-                }
-            } else {
-                self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+            match self.resolve_pk_with_cache(&stmt.table, &pk_key, pk_col_name, target_value)? {
+                Some(rid) => vec![rid],
+                None => vec![],
             }
         };
 
@@ -3559,16 +3720,11 @@ impl QueryExecutor {
                 _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
             }
         } else {
-            // Non-AUTO_INCREMENT: use in-memory PK lookup first (O(1)), fallback to disk index
+            // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
             let pk_key = target_value.to_hash_key();
-            if let Some(lookup) = self.db.pk_lookup.get(&stmt.table) {
-                if let Some(rid) = lookup.get(&pk_key) {
-                    vec![*rid.value()]
-                } else {
-                    vec![]
-                }
-            } else {
-                self.db.query_by_column(&stmt.table, pk_col_name, target_value)?
+            match self.resolve_pk_with_cache(&stmt.table, &pk_key, pk_col_name, target_value)? {
+                Some(rid) => vec![rid],
+                None => vec![],
             }
         };
 
@@ -3846,7 +4002,7 @@ impl QueryExecutor {
             IndexType::Vector => {
                 // 1️⃣ Create empty vector index
                 if let ColumnType::Tensor(dim) = column.col_type {
-                    self.db.create_vector_index(&index_name, dim)?;
+                    self.db.create_vector_index(&index_name, dim, stmt.metric.as_deref())?;
                     
                     // 2️⃣ Backfill existing data (critical fix!)
                     let column_pos = schema.get_column_position(&stmt.column)
@@ -3868,12 +4024,13 @@ impl QueryExecutor {
                     }
                     
                     // 3️⃣ Register metadata
-                    let metadata = crate::database::index_metadata::IndexMetadata::new(
+                    let mut metadata = crate::database::index_metadata::IndexMetadata::new(
                         index_name.clone(),
                         stmt.table.clone(),
                         stmt.column.clone(),
                         crate::database::index_metadata::IndexType::Vector,
                     );
+                    metadata.metric = stmt.metric.clone();
                     self.db.index_registry.register(metadata)?;
                 } else {
                     unreachable!("Already validated column type");
@@ -3982,6 +4139,11 @@ impl QueryExecutor {
             }
             IndexType::Column => {
                 self.db.column_indexes.remove(index_name);
+                // Also remove the "table.column" alias if it exists
+                let alias = format!("{}.{}", meta.table_name, meta.column_name);
+                if alias != *index_name {
+                    self.db.column_indexes.remove(&alias);
+                }
             }
         }
 
@@ -4242,7 +4404,443 @@ impl QueryExecutor {
             _ => None,
         }
     }
-    
+
+    /// 🚀 FAST PATH 0a: Text search (MATCH AGAINST) — single index lookup
+    ///
+    /// Detects WHERE MATCH(col) AGAINST('query') and uses the text index directly
+    /// instead of scanning all rows and calling search_ranked() per row.
+    fn try_text_search_fast_path(
+        &self,
+        stmt: &SelectStmt,
+        where_clause: &Expr,
+        table_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        // Extract MATCH expression from WHERE clause
+        let (column, query) = match where_clause {
+            Expr::Match { column, query } => (column.clone(), query.clone()),
+            // Handle AND: MATCH(...) AND other_conditions — only if MATCH is the dominant filter
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                // Try both sides for a MATCH expression
+                if let Expr::Match { column, query } = left.as_ref() {
+                    (column.clone(), query.clone())
+                } else if let Expr::Match { column, query } = right.as_ref() {
+                    (column.clone(), query.clone())
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        // Find text index for this column
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name, &column,
+            crate::database::index_metadata::IndexType::Text
+        ) {
+            Some(name) => name,
+            None => return Ok(None), // No text index — fall back to normal path
+        };
+
+        if !self.db.text_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        // Determine limit (use LIMIT from query, or default to top 1000 for scoring)
+        let limit = stmt.limit.unwrap_or(1000);
+
+        // ⚡ Single index lookup — get top-k row_ids with BM25 scores
+        let results = match self.db.text_search_ranked(&index_name, &query, limit) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        if results.is_empty() {
+            return Ok(Some(QueryResult::Select {
+                columns: vec![],
+                rows: vec![],
+            }));
+        }
+
+        // Load rows for matching row_ids
+        let schema = self.db.get_table_schema(table_name)?;
+        let mut sql_rows = Vec::with_capacity(results.len());
+
+        for (row_id, score) in &results {
+            if let Ok(Some(row)) = self.db.get_table_row(table_name, *row_id) {
+                let mut sql_row = row_to_sql_row(&row, &schema)?;
+                // Add metadata
+                sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
+                sql_row.insert("__table__".to_string(), Value::Text(table_name.to_string()));
+                // Pre-compute MATCH score so SELECT MATCH(...) AGAINST works
+                sql_row.insert(format!("__text_score_{}__", column), Value::Float(*score as f64));
+                // Qualified names
+                let old_row = std::mem::take(&mut sql_row);
+                let mut qualified = SqlRow::new();
+                qualified.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
+                qualified.insert("__table__".to_string(), Value::Text(table_name.to_string()));
+                qualified.insert(format!("__text_score_{}__", column), Value::Float(*score as f64));
+                for (col_name, val) in old_row.into_iter() {
+                    let qname = Self::make_qualified_name(table_name, &col_name);
+                    qualified.insert(qname, val);
+                }
+                sql_rows.push((*row_id, qualified));
+            }
+        }
+
+        // Handle ORDER BY score DESC — results are already sorted by BM25 score descending
+        // Check if ORDER BY is compatible (DESC or absent)
+        let order_compatible = stmt.order_by.as_ref().map_or(true, |ob| {
+            // If ORDER BY exists, it must be DESC (which matches BM25 ranking)
+            ob.len() == 1 && !ob[0].asc
+        });
+
+        if !order_compatible {
+            // Non-compatible ORDER BY — fall back to normal path
+            return Ok(None);
+        }
+
+        let (column_names, result_rows) = self.project_text_search_columns(
+            stmt, &sql_rows, &schema, &column, &results
+        )?;
+
+        Ok(Some(QueryResult::Select {
+            columns: column_names,
+            rows: result_rows,
+        }))
+    }
+
+    /// Project columns for text search fast path, handling MATCH score columns
+    fn project_text_search_columns(
+        &self,
+        stmt: &SelectStmt,
+        rows: &[(u64, SqlRow)],
+        schema: &TableSchema,
+        match_column: &str,
+        scores: &[(RowId, f32)],
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        // Build score lookup
+        let score_map: std::collections::HashMap<u64, f64> = scores.iter()
+            .map(|(id, s)| (*id, *s as f64))
+            .collect();
+
+        let (column_names, result_rows) = if stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star) {
+            // SELECT *
+            let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let projected: Vec<Vec<Value>> = rows.iter().map(|(_, row)| {
+                schema.columns.iter()
+                    .map(|col| row.get(&col.name).cloned().unwrap_or(Value::Null))
+                    .collect()
+            }).collect();
+            (col_names, projected)
+        } else {
+            // Specific columns — handle MATCH expressions
+            let col_names: Vec<String> = stmt.columns.iter().map(|col| match col {
+                SelectColumn::Star => "*".to_string(),
+                SelectColumn::Column(name) => name.clone(),
+                SelectColumn::ColumnWithAlias(_, alias) => alias.clone(),
+                SelectColumn::Expr(_, Some(alias)) => alias.clone(),
+                SelectColumn::Expr(expr, None) => format!("{:?}", expr),
+            }).collect();
+
+            let projected: Vec<Vec<Value>> = rows.iter().map(|(row_id, row)| {
+                stmt.columns.iter().map(|col| {
+                    match col {
+                        SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                            row.get(name).cloned().or_else(|| {
+                                if !name.contains('.') {
+                                    row.iter()
+                                        .find(|(k, _)| k.ends_with(&format!(".{}", name)))
+                                        .map(|(_, v)| v.clone())
+                                } else {
+                                    None
+                                }
+                            }).unwrap_or(Value::Null)
+                        }
+                        SelectColumn::Expr(expr, _) => {
+                            // Check if this is a MATCH expression for our column
+                            if let Expr::Match { column, .. } = expr {
+                                if column == match_column {
+                                    return score_map.get(row_id)
+                                        .map(|s| Value::Float(*s))
+                                        .unwrap_or(Value::Float(0.0));
+                                }
+                            }
+                            self.eval_with_materialized(expr, row).unwrap_or(Value::Null)
+                        }
+                        SelectColumn::Star => Value::Null,
+                    }
+                }).collect()
+            }).collect();
+            (col_names, projected)
+        };
+
+        Ok((column_names, result_rows))
+    }
+
+    /// 🚀 FAST PATH 0b: Spatial (ST_WITHIN / ST_KNN) — single index lookup
+    ///
+    /// Detects WHERE ST_WITHIN(col, ...) or WHERE ST_KNN(col, ...) and uses
+    /// the spatial index directly instead of scanning all rows.
+    fn try_spatial_fast_path(
+        &self,
+        stmt: &SelectStmt,
+        where_clause: &Expr,
+        table_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        match where_clause {
+            Expr::StWithin { column, min_x, min_y, max_x, max_y } => {
+                self.execute_spatial_within_fast(stmt, table_name, column, *min_x, *min_y, *max_x, *max_y)
+            }
+            Expr::StKnn { column, x, y, k } => {
+                self.execute_spatial_knn_fast(stmt, table_name, column, *x, *y, *k)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// 🚀 FAST PATH -1b: ORDER BY ST_DISTANCE(col, x, y) LIMIT k
+    /// Detects ORDER BY ST_DISTANCE and uses spatial KNN index instead of full scan.
+    fn try_optimize_spatial_order_by(&self, stmt: &SelectStmt) -> Result<Option<QueryResult>> {
+        let order_by = match &stmt.order_by {
+            Some(o) if o.len() == 1 => &o[0],
+            _ => return Ok(None),
+        };
+        let limit = match stmt.limit {
+            Some(k) if k > 0 => k,
+            _ => return Ok(None),
+        };
+        // Must be ASC for distance (closer first)
+        if !order_by.asc {
+            return Ok(None);
+        }
+        // WHERE must be absent or trivially true
+        if stmt.where_clause.is_some() {
+            return Ok(None);
+        }
+
+        // Match ORDER BY ST_DISTANCE(column, x, y) or ORDER BY alias where alias refers to ST_DISTANCE
+        let (column, x, y) = match &order_by.expr {
+            Expr::StDistance { column, x, y } => (column.clone(), *x, *y),
+            Expr::Column(alias) => {
+                // Look up alias in SELECT columns to find the ST_DISTANCE expression
+                let mut found = None;
+                for col in &stmt.columns {
+                    match col {
+                        SelectColumn::Expr(expr, Some(a)) if a == alias => {
+                            if let Expr::StDistance { column, x, y } = expr {
+                                found = Some((column.clone(), *x, *y));
+                            }
+                            break;
+                        }
+                        SelectColumn::ColumnWithAlias(_, a) if a == alias => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                match found {
+                    Some(v) => v,
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        let table_name = match stmt.from.as_ref().unwrap() {
+            TableRef::Table { name, .. } => name.clone(),
+            _ => return Ok(None),
+        };
+
+        // Find spatial index for this column
+        let index_name = match self.db.index_registry.find_by_column(
+            &table_name, &column,
+            crate::database::index_metadata::IndexType::Spatial
+        ) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+        if !self.db.spatial_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        // Use KNN query
+        let point = crate::types::Point { x, y };
+        let results = match self.db.spatial_knn_query(&index_name, &point, limit) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        if results.is_empty() {
+            return Ok(Some(QueryResult::Select { columns: vec![], rows: vec![] }));
+        }
+
+        // Load rows and project
+        let schema = self.db.get_table_schema(&table_name)?;
+        let dist_map: std::collections::HashMap<u64, f64> = results.iter().cloned().collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|(id, _)| id).collect();
+
+        let mut sql_rows = Vec::with_capacity(row_ids.len());
+        for &row_id in &row_ids {
+            if let Ok(Some(row)) = self.db.get_table_row(&table_name, row_id) {
+                let mut sql_row = row_to_sql_row(&row, &schema)?;
+                sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                if let Some(d) = dist_map.get(&row_id) {
+                    sql_row.insert("__spatial_distance__".to_string(), Value::Float(*d));
+                }
+                let old_row = std::mem::take(&mut sql_row);
+                let mut qualified = SqlRow::new();
+                qualified.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                qualified.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                if let Some(d) = dist_map.get(&row_id) {
+                    qualified.insert("__spatial_distance__".to_string(), Value::Float(*d));
+                }
+                for (col_name, val) in old_row.into_iter() {
+                    let qname = Self::make_qualified_name(&table_name, &col_name);
+                    qualified.insert(qname, val);
+                }
+                sql_rows.push((row_id, qualified));
+            }
+        }
+
+        let (column_names, result_rows) = self.project_columns(&stmt.columns, &sql_rows, &schema)?;
+        Ok(Some(QueryResult::Select {
+            columns: column_names,
+            rows: result_rows,
+        }))
+    }
+
+    /// Execute ST_WITHIN using spatial index directly
+    fn execute_spatial_within_fast(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        column: &str,
+        min_x: f64, min_y: f64, max_x: f64, max_y: f64,
+    ) -> Result<Option<QueryResult>> {
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name, column,
+            crate::database::index_metadata::IndexType::Spatial
+        ) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        if !self.db.spatial_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        let bbox = crate::types::BoundingBox { min_x, min_y, max_x, max_y };
+        let row_ids = match self.db.spatial_range_query(&index_name, &bbox) {
+            Ok(ids) => ids,
+            Err(_) => return Ok(None),
+        };
+
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, None, true)
+    }
+
+    /// Execute ST_KNN using spatial index directly
+    fn execute_spatial_knn_fast(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        column: &str,
+        x: f64, y: f64, k: usize,
+    ) -> Result<Option<QueryResult>> {
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name, column,
+            crate::database::index_metadata::IndexType::Spatial
+        ) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        if !self.db.spatial_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        let point = crate::types::Point { x, y };
+        let results = match self.db.spatial_knn_query(&index_name, &point, k) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        // Extract row_ids and build distance map
+        let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
+        let dist_map: std::collections::HashMap<u64, f64> = results.into_iter().collect();
+
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, Some(&dist_map), false)
+    }
+
+    /// Load rows by row_ids and project columns for spatial fast path
+    fn load_and_project_spatial_rows(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        row_ids: &[RowId],
+        dist_map: Option<&std::collections::HashMap<u64, f64>>,
+        is_within: bool,
+    ) -> Result<Option<QueryResult>> {
+        if row_ids.is_empty() {
+            return Ok(Some(QueryResult::Select {
+                columns: vec![],
+                rows: vec![],
+            }));
+        }
+
+        let schema = self.db.get_table_schema(table_name)?;
+        let limit = stmt.limit.unwrap_or(row_ids.len());
+        let row_ids_to_load = &row_ids[..row_ids.len().min(limit)];
+
+        // 🚀 Use batch loading instead of per-row get_table_row
+        let batch_rows = self.db.get_table_rows_batch(table_name, row_ids_to_load)?;
+
+        let mut sql_rows = Vec::with_capacity(batch_rows.len());
+        for (row_id, row_opt) in batch_rows {
+            if let Some(row) = row_opt {
+                let mut sql_row = row_to_sql_row(&row, &schema)?;
+                sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                sql_row.insert("__table__".to_string(), Value::Text(table_name.to_string()));
+                if is_within {
+                    sql_row.insert("__spatial_within__".to_string(), Value::Bool(true));
+                } else {
+                    sql_row.insert("__spatial_knn__".to_string(), Value::Bool(true));
+                }
+                if let Some(dm) = dist_map {
+                    if let Some(d) = dm.get(&row_id) {
+                        sql_row.insert("__spatial_distance__".to_string(), Value::Float(*d));
+                    }
+                }
+                let old_row = std::mem::take(&mut sql_row);
+                let mut qualified = SqlRow::new();
+                qualified.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                qualified.insert("__table__".to_string(), Value::Text(table_name.to_string()));
+                if is_within {
+                    qualified.insert("__spatial_within__".to_string(), Value::Bool(true));
+                } else {
+                    qualified.insert("__spatial_knn__".to_string(), Value::Bool(true));
+                }
+                if let Some(dm) = dist_map {
+                    if let Some(d) = dm.get(&row_id) {
+                        qualified.insert("__spatial_distance__".to_string(), Value::Float(*d));
+                    }
+                }
+                for (col_name, val) in old_row.into_iter() {
+                    let qname = Self::make_qualified_name(table_name, &col_name);
+                    qualified.insert(qname, val);
+                }
+                sql_rows.push((row_id, qualified));
+            }
+        }
+
+        let (column_names, result_rows) = self.project_columns(&stmt.columns, &sql_rows, &schema)?;
+
+        Ok(Some(QueryResult::Select {
+            columns: column_names,
+            rows: result_rows,
+        }))
+    }
+
     fn to_bool(&self, val: &Value) -> Result<bool> {
         match val {
             Value::Bool(b) => Ok(*b),
@@ -4972,8 +5570,12 @@ impl QueryExecutor {
     /// Execute SELECT using vector ORDER BY optimization
     fn execute_vector_order_by_plan(&self, stmt: &SelectStmt, plan: &VectorOrderByPlan) -> Result<QueryResult> {
         debug_log!("[Executor] ✅ 使用向量索引优化 ORDER BY: {} <-> [...] LIMIT {}", plan.column, plan.k);
-        
-        let index_name = format!("{}_{}", plan.table, plan.column);
+
+        // Resolve index name via registry (supports custom index names)
+        let index_name = self.db.index_registry.find_by_column(
+            &plan.table, &plan.column,
+            crate::database::index_metadata::IndexType::Vector
+        ).unwrap_or_else(|| format!("{}_{}", plan.table, plan.column));
         
         // 1. 向量搜索获取 Top-K row_ids
         let candidates = self.db.vector_search(&index_name, &plan.query_vector, plan.k)?;

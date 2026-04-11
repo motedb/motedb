@@ -590,12 +590,53 @@ impl Parser {
             // No USING clause, use the index_type determined at the beginning
             index_type
         };
-        
+
+        // Parse optional WITH clause: WITH (metric = 'l2' | 'cosine')
+        let mut metric = None;
+        let token_type = self.current().token_type.clone();
+        if let TokenType::Identifier(ref id) = token_type {
+            if id.to_uppercase() == "WITH" {
+                self.advance(); // consume WITH
+                self.expect(TokenType::LParen)?;
+
+                // Parse key = value pairs
+                loop {
+                    let key = self.parse_identifier()?;
+                    let key_upper = key.to_uppercase();
+                    self.expect(TokenType::Eq)?;
+
+                    match key_upper.as_str() {
+                        "METRIC" => {
+                            let value = self.parse_identifier()?;
+                            let value_lower = value.to_lowercase();
+                            match value_lower.as_str() {
+                                "l2" | "euclidean" => metric = Some("l2".to_string()),
+                                "cosine" => metric = Some("cosine".to_string()),
+                                _ => return Err(MoteDBError::ParseError(
+                                    format!("Unknown metric '{}'. Use 'l2' or 'cosine'", value)
+                                )),
+                            }
+                        }
+                        _ => return Err(MoteDBError::ParseError(
+                            format!("Unknown WITH option '{}'. Supported: metric", key)
+                        )),
+                    }
+
+                    if !self.match_token(TokenType::Comma) {
+                        break;
+                    }
+                }
+
+                self.expect(TokenType::RParen)?;
+            }
+        }
+
         Ok(CreateIndexStmt {
             index_name,
             table,
             column,
             index_type: final_index_type,
+            metric,
         })
     }
     

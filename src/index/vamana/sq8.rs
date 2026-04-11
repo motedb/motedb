@@ -225,6 +225,45 @@ impl SQ8Quantizer {
         1.0 - cosine_sim.clamp(-1.0, 1.0)
     }
 
+    /// 🚀 **OPTIMIZED: Asymmetric SQ8 L2 (Euclidean) distance**
+    ///
+    /// Computes squared L2 distance between f32 query and SQ8 data vector.
+    /// Returns squared distance (no sqrt) for faster comparison/sorting.
+    pub fn asymmetric_distance_l2(
+        &self,
+        query: &[f32],
+        data: &QuantizedVector,
+    ) -> f32 {
+        if query.len() != self.dimension || data.codes.len() != self.dimension {
+            return f32::MAX;
+        }
+
+        // Handle constant vector (zero range)
+        let range = data.max - data.min;
+        if range < 1e-8 {
+            // Constant vector: L2² = dim * (query_i - constant)²
+            let c = data.min;
+            let mut sum_sq = 0.0f32;
+            for &q in query.iter() {
+                let diff = q - c;
+                sum_sq += diff * diff;
+            }
+            return sum_sq;
+        }
+
+        let scale = range / 255.0;
+        let mut sum_sq = 0.0f32;
+
+        for i in 0..self.dimension {
+            let q = query[i];
+            let d = data.codes[i] as f32 * scale + data.min;
+            let diff = q - d;
+            sum_sq += diff * diff;
+        }
+
+        sum_sq
+    }
+
     /// 🚀 ARM NEON optimized asymmetric SQ8 cosine distance
     ///
     /// Processes 16 u8 codes per iteration using NEON intrinsics:
@@ -336,6 +375,87 @@ impl SQ8Quantizer {
         }
     }
     
+    /// 🚀 ARM NEON optimized asymmetric SQ8 L2 (squared Euclidean) distance
+    #[cfg(target_arch = "aarch64")]
+    pub fn asymmetric_distance_l2_neon(
+        &self,
+        query: &[f32],
+        data: &QuantizedVector,
+    ) -> f32 {
+        if query.len() != self.dimension || data.codes.len() != self.dimension {
+            return f32::MAX;
+        }
+
+        let range = data.max - data.min;
+        if range < 1e-8 {
+            return self.asymmetric_distance_l2(query, data);
+        }
+
+        let scale = range / 255.0;
+        let n = self.dimension;
+        let chunks = n / 16;
+
+        let mut sum1 = unsafe { vdupq_n_f32(0.0) };
+        let mut sum2 = unsafe { vdupq_n_f32(0.0) };
+
+        let scale_vec = unsafe { vdupq_n_f32(scale) };
+        let min_vec = unsafe { vdupq_n_f32(data.min) };
+
+        unsafe {
+            for i in 0..chunks {
+                let offset = i * 16;
+
+                let codes = vld1q_u8(data.codes.as_ptr().add(offset));
+
+                let codes_u16_low = vmovl_u8(vget_low_u8(codes));
+                let codes_u16_high = vmovl_u8(vget_high_u8(codes));
+
+                let codes_u32_0 = vmovl_u16(vget_low_u16(codes_u16_low));
+                let codes_u32_1 = vmovl_u16(vget_high_u16(codes_u16_low));
+                let codes_u32_2 = vmovl_u16(vget_low_u16(codes_u16_high));
+                let codes_u32_3 = vmovl_u16(vget_high_u16(codes_u16_high));
+
+                let d_f32_0 = vcvtq_f32_u32(codes_u32_0);
+                let d_f32_1 = vcvtq_f32_u32(codes_u32_1);
+                let d_f32_2 = vcvtq_f32_u32(codes_u32_2);
+                let d_f32_3 = vcvtq_f32_u32(codes_u32_3);
+
+                // Dequantize: d = code * scale + min
+                let d_0 = vaddq_f32(vmulq_f32(d_f32_0, scale_vec), min_vec);
+                let d_1 = vaddq_f32(vmulq_f32(d_f32_1, scale_vec), min_vec);
+                let d_2 = vaddq_f32(vmulq_f32(d_f32_2, scale_vec), min_vec);
+                let d_3 = vaddq_f32(vmulq_f32(d_f32_3, scale_vec), min_vec);
+
+                let q_0 = vld1q_f32(query.as_ptr().add(offset));
+                let q_1 = vld1q_f32(query.as_ptr().add(offset + 4));
+                let q_2 = vld1q_f32(query.as_ptr().add(offset + 8));
+                let q_3 = vld1q_f32(query.as_ptr().add(offset + 12));
+
+                // diff = q - d, accumulate diff²
+                let diff_0 = vsubq_f32(q_0, d_0);
+                let diff_1 = vsubq_f32(q_1, d_1);
+                let diff_2 = vsubq_f32(q_2, d_2);
+                let diff_3 = vsubq_f32(q_3, d_3);
+
+                sum1 = vfmaq_f32(vfmaq_f32(sum1, diff_0, diff_0), diff_1, diff_1);
+                sum2 = vfmaq_f32(vfmaq_f32(sum2, diff_2, diff_2), diff_3, diff_3);
+            }
+
+            let total = vaddq_f32(sum1, sum2);
+            let mut result = vaddvq_f32(total);
+
+            // Scalar remainder
+            for i in (chunks * 16)..n {
+                let q = query[i];
+                let d = data.codes[i] as f32 * scale + data.min;
+                let diff = q - d;
+                result += diff * diff;
+            }
+
+            result
+        }
+    }
+
     /// Fast L2 norm computation (SIMD-friendly)
     #[inline]
     fn fast_norm(vec: &[f32]) -> f32 {

@@ -53,77 +53,84 @@ impl MoteDB {
         self.spatial_indexes.insert(name.to_string(), index_arc.clone());
         
         // 🚀 方案B：使用scan_range高性能扫描
-        // name格式: "table_column"
-        let parts: Vec<&str> = name.split('_').collect();
-        if parts.len() >= 2 {
-            let table_name = parts[0];
-            let column_name = parts[1..].join("_");
-            
-            if let Ok(schema) = self.table_registry.get_table(table_name) {
-                if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
-                    let col_position = col_def.position;
-                    
-                    debug_log!("[create_spatial_index] 🔍 使用scan_range扫描LSM（方案B）...");
-                    let start_time = std::time::Instant::now();
-                    
-                    // 计算表的key范围
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    table_name.hash(&mut hasher);
-                    let table_hash = hasher.finish() & 0xFFFFFFFF;
-                    
-                    let start_key = table_hash << 32;
-                    let end_key = (table_hash + 1) << 32;
-                    
-                    // 一次scan_range扫描所有数据
-                    let mut geometries_to_index = Vec::new();
-                    match self.lsm_engine.scan_range(start_key, end_key) {
-                        Ok(entries) => {
-                            for (composite_key, value) in entries {
-                                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-                                
-                                let data_bytes: Vec<u8> = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
-                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
-                                        match self.lsm_engine.resolve_blob(blob_ref) {
-                                            Ok(data) => data,
-                                            Err(e) => {
-                                                debug_log!("[create_spatial_index] Failed to resolve blob for row {}: {}", row_id, e);
-                                                continue;
-                                            }
+        // Resolve table_name and column_name from index_registry (supports custom names)
+        let resolved = self.index_registry.resolve_index_name(name);
+        let (table_name, column_name): (&str, String) = match &resolved {
+            Some((t, c)) => (t.as_str(), c.clone()),
+            None => {
+                let parts: Vec<&str> = name.split('_').collect();
+                if parts.len() >= 2 {
+                    (parts[0], parts[1..].join("_"))
+                } else {
+                    return Ok(());
+                }
+            }
+        };
+
+        if let Ok(schema) = self.table_registry.get_table(table_name) {
+            if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
+                let col_position = col_def.position;
+
+                debug_log!("[create_spatial_index] 🔍 使用scan_range扫描LSM（方案B）...");
+                let start_time = std::time::Instant::now();
+
+                // 计算表的key范围
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                table_name.hash(&mut hasher);
+                let table_hash = hasher.finish() & 0xFFFFFFFF;
+
+                let start_key = table_hash << 32;
+                let end_key = (table_hash + 1) << 32;
+
+                // 一次scan_range扫描所有数据
+                let mut geometries_to_index = Vec::new();
+                match self.lsm_engine.scan_range(start_key, end_key) {
+                    Ok(entries) => {
+                        for (composite_key, value) in entries {
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
+                            let data_bytes: Vec<u8> = match &value.data {
+                                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                                crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                    match self.lsm_engine.resolve_blob(blob_ref) {
+                                        Ok(data) => data,
+                                        Err(e) => {
+                                            debug_log!("[create_spatial_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                            continue;
                                         }
                                     }
-                                };
+                                }
+                            };
 
-                                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
-                                    if let Some(crate::types::Value::Spatial(geom)) = row.get(col_position) {
-                                        geometries_to_index.push((row_id, geom.clone()));
-                                    }
+                            if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
+                                if let Some(crate::types::Value::Spatial(geom)) = row.get(col_position) {
+                                    geometries_to_index.push((row_id, geom.clone()));
                                 }
                             }
                         }
-                        Err(e) => {
-                            debug_log!("[create_spatial_index] ⚠️ scan_range失败: {}", e);
+                    }
+                    Err(e) => {
+                        debug_log!("[create_spatial_index] ⚠️ scan_range失败: {}", e);
+                    }
+                }
+
+                let scan_time = start_time.elapsed();
+
+                if !geometries_to_index.is_empty() {
+                    debug_log!("[create_spatial_index] 🚀 扫描完成：{} 个几何对象，耗时 {:?}",
+                             geometries_to_index.len(), scan_time);
+
+                    let build_time = std::time::Instant::now();
+                    for (row_id, geom) in geometries_to_index {
+                        if let Err(e) = index_arc.write().insert(row_id, geom) {
+                            debug_log!("[create_spatial_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
                         }
                     }
-                    
-                    let scan_time = start_time.elapsed();
-                    
-                    if !geometries_to_index.is_empty() {
-                        debug_log!("[create_spatial_index] 🚀 扫描完成：{} 个几何对象，耗时 {:?}",
-                                 geometries_to_index.len(), scan_time);
-                        
-                        let build_time = std::time::Instant::now();
-                        for (row_id, geom) in geometries_to_index {
-                            if let Err(e) = index_arc.write().insert(row_id, geom) {
-                                debug_log!("[create_spatial_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
-                            }
-                        }
-                        debug_log!("[create_spatial_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
-                    } else {
-                        debug_log!("[create_spatial_index] ⚠️ 未找到任何几何数据（扫描耗时 {:?}）", scan_time);
-                    }
+                    debug_log!("[create_spatial_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
+                } else {
+                    debug_log!("[create_spatial_index] ⚠️ 未找到任何几何数据（扫描耗时 {:?}）", scan_time);
                 }
             }
         }

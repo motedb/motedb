@@ -44,6 +44,10 @@ pub struct IndexMetadata {
     /// Set when an index update fails; cleared on successful rebuild.
     #[serde(default)]
     pub stale: bool,
+
+    /// Distance metric for vector indexes ("l2" or "cosine")
+    #[serde(default)]
+    pub metric: Option<String>,
 }
 
 impl IndexMetadata {
@@ -60,6 +64,7 @@ impl IndexMetadata {
             index_type,
             created_at,
             stale: false,
+            metric: None,
         }
     }
 }
@@ -169,11 +174,17 @@ impl IndexRegistry {
         self.indexes.iter()
             .find(|entry| {
                 let meta = entry.value();
-                meta.table_name == table_name 
+                meta.table_name == table_name
                     && meta.column_name == column_name
                     && meta.index_type == index_type
             })
             .map(|entry| entry.key().clone())
+    }
+
+    /// Get table_name and column_name from index name
+    pub fn resolve_index_name(&self, index_name: &str) -> Option<(String, String)> {
+        self.indexes.get(index_name)
+            .map(|entry| (entry.value().table_name.clone(), entry.value().column_name.clone()))
     }
     
     /// Generate default index name

@@ -22,6 +22,7 @@ pub mod persistence;
 pub mod transaction;
 pub mod mem_buffer;
 pub mod index_metadata;
+pub mod pk_cache;
 
 // Re-export main types
 pub use core::{MoteDB, DatabaseStats, VectorIndexStats, SpatialIndexStats};

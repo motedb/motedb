@@ -5,7 +5,6 @@
 
 use crate::types::{TableSchema, IndexDef, RowId};
 use crate::{Result, StorageError};
-use dashmap::DashMap;
 use std::sync::Arc;
 
 use super::core::MoteDB;
@@ -42,8 +41,9 @@ impl MoteDB {
                 }
 
                 // Create in-memory PK lookup (for O(1) PK → row_id resolution)
-                // This bypasses the disk-based B-Tree column index which has ~1.5ms latency per lookup.
-                self.pk_lookup.insert(schema.name.clone(), Arc::new(DashMap::new()));
+                // Bounded by LRU eviction — falls back to disk index on cache miss.
+                let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(self.pk_lookup_capacity));
+                self.pk_lookup.insert(schema.name.clone(), pk_cache);
             }
         }
 
@@ -60,7 +60,11 @@ impl MoteDB {
     /// db.drop_table("users")?;
     /// ```
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
-        self.table_registry.drop_table(table_name)
+        self.table_registry.drop_table(table_name)?;
+        // Clean up per-table caches
+        self.pk_lookup.remove(table_name);
+        self.table_auto_increment.remove(table_name);
+        Ok(())
     }
     
     /// Get table schema

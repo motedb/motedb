@@ -1,19 +1,24 @@
 //! Vamana configuration parameters
 
+use crate::distance::DistanceKind;
+
 /// Vamana index configuration
 #[derive(Debug, Clone)]
 pub struct VamanaConfig {
     /// Maximum degree (R parameter) - max neighbors per node
     pub max_degree: usize,
-    
+
     /// Search list size during construction (L parameter)
     pub search_list_size: usize,
-    
+
     /// Alpha parameter for pruning (typically 1.2)
     pub alpha: f32,
-    
+
     /// Beam width for search
     pub beam_width: usize,
+
+    /// Distance metric (L2 or Cosine)
+    pub metric: DistanceKind,
 }
 
 impl Default for VamanaConfig {
@@ -23,6 +28,7 @@ impl Default for VamanaConfig {
             search_list_size: 180,  // 🔧 折中: 128 → 180 (介于128和256之间)
             alpha: 1.2,
             beam_width: 48,         // 🔧 折中: 32 → 48 (介于32和64之间)
+            metric: DistanceKind::Euclidean,  // 默认 L2（和 SQL <-> 一致）
         }
     }
 }
@@ -35,7 +41,14 @@ impl VamanaConfig {
             search_list_size,
             alpha,
             beam_width: max_degree / 2,
+            metric: DistanceKind::Euclidean,
         }
+    }
+
+    /// Create configuration with specific metric
+    pub fn with_metric(mut self, metric: DistanceKind) -> Self {
+        self.metric = metric;
+        self
     }
 
     /// Create configuration optimized for embedded environments
@@ -54,6 +67,7 @@ impl VamanaConfig {
             search_list_size: max_degree * 2,
             alpha: 1.2,
             beam_width: max_degree / 2,
+            metric: DistanceKind::Euclidean,
         }
     }
 
@@ -72,6 +86,7 @@ impl VamanaConfig {
             search_list_size: max_degree * 3,
             alpha: 1.2,
             beam_width: max_degree,
+            metric: DistanceKind::Euclidean,
         }
     }
 }

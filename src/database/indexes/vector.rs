@@ -33,68 +33,83 @@ impl MoteDB {
     /// ```ignore
     /// db.create_vector_index("products_embedding", 768)?;
     /// ```
-    pub fn create_vector_index(&self, name: &str, dimension: usize) -> Result<()> {
+    pub fn create_vector_index(&self, name: &str, dimension: usize, metric: Option<&str>) -> Result<()> {
         // 🎯 统一路径：{db}.mote/indexes/vector_{name}/
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
         let index_dir = indexes_dir.join(format!("vector_{}", name));
         std::fs::create_dir_all(&index_dir)?;
-        
-        let config = VamanaConfig::default();
+
+        // Parse metric parameter
+        let distance_kind = match metric {
+            Some("cosine") => crate::distance::DistanceKind::Cosine,
+            _ => crate::distance::DistanceKind::Euclidean,  // default L2
+        };
+
+        let config = VamanaConfig::default().with_metric(distance_kind);
         let index = DiskANNIndex::create(&index_dir, dimension, config)?;
         let index_arc = Arc::new(RwLock::new(index));
         self.vector_indexes.insert(name.to_string(), index_arc.clone());
         
         // 🚀 方案B：使用scan_range高性能扫描
-        // name格式: "table_column"，需要解析出表名和列名
-        let parts: Vec<&str> = name.split('_').collect();
-        if parts.len() >= 2 {
-            let table_name = parts[0];
-            let column_name = parts[1..].join("_");
-            
-            // 获取列在schema中的位置
-            if let Ok(schema) = self.table_registry.get_table(table_name) {
-                if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
-                    let col_position = col_def.position;
-                    
-                    debug_log!("[create_vector_index] 🔍 使用scan_range扫描LSM（方案B高性能）...");
-                    let start_time = std::time::Instant::now();
-                    
-                    // 🚀 关键：计算该表的key范围
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    table_name.hash(&mut hasher);
-                    let table_hash = hasher.finish() & 0xFFFFFFFF;
-                    
-                    // composite_key格式: [table_hash:32位][row_id:32位]
-                    let start_key = table_hash << 32;              // table的起始key
-                    let end_key = (table_hash + 1) << 32;          // table的结束key
-                    
-                    // 🚀 高性能：一次scan_range扫描所有数据
-                    let mut vectors_to_index = Vec::new();
-                    match self.lsm_engine.scan_range(start_key, end_key) {
-                        Ok(entries) => {
-                            for (composite_key, value) in entries {
-                                // 提取row_id
-                                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-                                
-                                // 反序列化行数据
-                                let data_bytes: Vec<u8> = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
-                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
-                                        match self.lsm_engine.resolve_blob(blob_ref) {
-                                            Ok(data) => data,
-                                            Err(e) => {
-                                                debug_log!("[create_vector_index] Failed to resolve blob for row {}: {}", row_id, e);
-                                                continue;
-                                            }
+        // Resolve table_name and column_name from index_registry (supports custom names)
+        let resolved = self.index_registry.resolve_index_name(name);
+        let (table_name, column_name): (&str, String) = match &resolved {
+            Some((t, c)) => (t.as_str(), c.clone()),
+            None => {
+                // Fallback: parse "table_column" format
+                let parts: Vec<&str> = name.split('_').collect();
+                if parts.len() >= 2 {
+                    (parts[0], parts[1..].join("_"))
+                } else {
+                    return Ok(());
+                }
+            }
+        };
+
+        // 获取列在schema中的位置
+        if let Ok(schema) = self.table_registry.get_table(table_name) {
+            if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
+                let col_position = col_def.position;
+
+                debug_log!("[create_vector_index] 🔍 使用scan_range扫描LSM（方案B高性能）...");
+                let start_time = std::time::Instant::now();
+
+                // 🚀 关键：计算该表的key范围
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                table_name.hash(&mut hasher);
+                let table_hash = hasher.finish() & 0xFFFFFFFF;
+
+                // composite_key格式: [table_hash:32位][row_id:32位]
+                let start_key = table_hash << 32;              // table的起始key
+                let end_key = (table_hash + 1) << 32;          // table的结束key
+
+                // 🚀 高性能：一次scan_range扫描所有数据
+                let mut vectors_to_index = Vec::new();
+                match self.lsm_engine.scan_range(start_key, end_key) {
+                    Ok(entries) => {
+                        for (composite_key, value) in entries {
+                            // 提取row_id
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
+                            // 反序列化行数据
+                            let data_bytes: Vec<u8> = match &value.data {
+                                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                                crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                    match self.lsm_engine.resolve_blob(blob_ref) {
+                                        Ok(data) => data,
+                                        Err(e) => {
+                                            debug_log!("[create_vector_index] Failed to resolve blob for row {}: {}", row_id, e);
+                                            continue;
                                         }
                                     }
-                                };
+                                }
+                            };
 
-                                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
-                                    if let Some(crate::types::Value::Vector(vec_data)) = row.get(col_position) {
+                            if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
+                                if let Some(crate::types::Value::Vector(vec_data)) = row.get(col_position) {
                                         vectors_to_index.push((row_id, vec_data.to_vec()));
                                     }
                                 }
@@ -106,11 +121,11 @@ impl MoteDB {
                     }
                     
                     let scan_time = start_time.elapsed();
-                    
+
                     if !vectors_to_index.is_empty() {
                         debug_log!("[create_vector_index] 🚀 扫描完成：{} 个向量，耗时 {:?}",
                                  vectors_to_index.len(), scan_time);
-                        
+
                         let build_time = std::time::Instant::now();
                         index_arc.write().batch_insert(&vectors_to_index)?;
                         debug_log!("[create_vector_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
@@ -119,11 +134,10 @@ impl MoteDB {
                     }
                 }
             }
-        }
-        
+
         Ok(())
     }
-    
+
     /// Update vector for a row
     /// 
     /// # Example
@@ -232,16 +246,20 @@ impl MoteDB {
         debug_log!("[vector_search] DiskANN index搜索完成，结果数: {}", index_results.len());
         
         // 2. 🆕 Scan memtable for vector data
-        // Extract table name and column name from index_name (format: "table_column")
-        let parts: Vec<&str> = index_name.split('_').collect();
-        if parts.len() < 2 {
-            // If parsing fails, just return index results (backward compatible)
-            index_results.truncate(k);
-            return Ok(index_results);
-        }
-        
-        let table_name = parts[0];
-        let column_name = parts[1..].join("_");
+        // Resolve table_name and column_name from index_registry (supports custom names)
+        let resolved = self.index_registry.resolve_index_name(index_name);
+        let (table_name, column_name): (&str, String) = match &resolved {
+            Some((t, c)) => (t.as_str(), c.clone()),
+            None => {
+                // Fallback: parse "table_column" format
+                let parts: Vec<&str> = index_name.split('_').collect();
+                if parts.len() < 2 {
+                    index_results.truncate(k);
+                    return Ok(index_results);
+                }
+                (parts[0], parts[1..].join("_"))
+            }
+        };
         
         // Get column position from table registry
         let col_position = match self.table_registry.get_table(table_name) {
@@ -261,10 +279,17 @@ impl MoteDB {
         let col_position = col_position.unwrap();
         
         // Scan memtable for vectors in this column
+        // Only scan entries belonging to the correct table
+        let table_prefix = self.table_registry.get_table_id(table_name)
+            .unwrap_or(0) as u64;
         let mut memtable_results = Vec::new();
         self.lsm_engine.scan_memtable_incremental_with(|composite_key, row_bytes| {
-            // 🔧 FIX: Extract real row_id from composite_key
-            // composite_key format: [table_hash:32bits][row_id:32bits]
+            // Filter by table prefix (upper 32 bits)
+            let entry_prefix = composite_key >> 32;
+            if entry_prefix != table_prefix {
+                return Ok(()); // Skip entries from other tables
+            }
+
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
             
             // Parse row to get vector value at col_position

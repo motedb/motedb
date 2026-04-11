@@ -352,6 +352,8 @@ impl MoteDB {
             }
 
             // 7.1 Column Index (use pre-computed set instead of format!())
+
+            // 7.1 Column Index (use pre-computed set instead of format!())
             if indexed_columns.contains(col_name.as_str()) {
                 if let Err(_e) = self.insert_column_value(table_name, col_name, row_id, col_value) {
                     debug_log!("[insert_row] Failed to update column index '{}': {}", col_name, _e);
@@ -658,6 +660,19 @@ impl MoteDB {
 
         // 7. Invalidate cache (prevent reading deleted data)
         self.row_cache.invalidate(table_name, row_id);
+
+        // 7.1 Remove from PK lookup cache (prevents stale lookups)
+        if let Some(pk_name) = schema.primary_key() {
+            if !schema.is_primary_key_auto_increment() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    if let Some(pk_value) = old_row.get(pk_col.position) {
+                        if let Some(lookup) = self.pk_lookup.get(table_name) {
+                            lookup.remove(&pk_value.to_hash_key());
+                        }
+                    }
+                }
+            }
+        }
 
         // 8. Update indexes (after data is durable).
         //    If an index deletion fails, the index is marked stale and can be
@@ -1069,6 +1084,9 @@ impl MoteDB {
                 if !column_data.is_empty() {
                     if let Err(_e) = self.batch_insert_column_values(table_name, col_name, column_data) {
                         debug_log!("[batch_insert] Failed to batch update column index '{}': {}", col_name, _e);
+                        // Mark index stale so queries fall back to full scan instead of using incomplete data
+                        let idx_name = format!("{}.{}", table_name, col_name);
+                        self.index_registry.mark_stale(&idx_name);
                     }
                 }
             }
@@ -1087,6 +1105,7 @@ impl MoteDB {
                     if !vectors.is_empty() {
                         if let Err(_e) = self.batch_insert_vectors(&index_name, &vectors) {
                             debug_log!("[batch_insert] Failed to batch update vector index '{}': {}", index_name, _e);
+                            self.index_registry.mark_stale(&index_name);
                         }
                     }
                 }
@@ -1108,6 +1127,7 @@ impl MoteDB {
                             .collect();
                         if let Err(_e) = self.batch_insert_texts(&index_name, &texts_ref) {
                             debug_log!("[batch_insert] Failed to batch update text index '{}': {}", index_name, _e);
+                            self.index_registry.mark_stale(&index_name);
                         }
                     }
                 }
@@ -1126,6 +1146,7 @@ impl MoteDB {
                     if !geometries.is_empty() {
                         if let Err(_e) = self.batch_insert_geometries(&index_name, geometries) {
                             debug_log!("[batch_insert] Failed to batch update spatial index '{}': {}", index_name, _e);
+                            self.index_registry.mark_stale(&index_name);
                         }
                     }
                 }
