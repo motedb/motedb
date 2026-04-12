@@ -194,9 +194,16 @@ impl MoteDB {
         debug_log!("[Checkpoint]   ✓ Index flush: {:?}", _index_flush_start.elapsed());
 
         // Step 4: Checkpoint WAL (safe to truncate now)
-        let _wal_checkpoint_start = Instant::now();
-        self.wal.checkpoint_all()?;
-        debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", _wal_checkpoint_start.elapsed());
+        // CRITICAL: Only truncate WAL if immutable queue is empty.
+        // If immutable queue has data (flush failed), WAL must be preserved for recovery.
+        let immutable_queue_len = self.lsm_engine.immutable_queue_len();
+        if immutable_queue_len == 0 {
+            let _wal_checkpoint_start = Instant::now();
+            self.wal.checkpoint_all()?;
+            debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", _wal_checkpoint_start.elapsed());
+        } else {
+            debug_log!("[Checkpoint]   ⚠️ WAL NOT truncated: immutable queue has {} items (data safety)", immutable_queue_len);
+        }
 
         // Step 5: Vacuum MVCC version store (remove old versions)
         let _vacuum_start = Instant::now();

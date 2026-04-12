@@ -180,7 +180,9 @@ impl Database {
     /// db.close()?;
     /// ```
     pub fn close(&self) -> Result<()> {
-        self.flush()
+        // Full checkpoint (flush + index persist + WAL truncate)
+        // NOT just flush — close should ensure clean restart
+        self.inner.checkpoint_full()
     }
 
     // ============================================================================

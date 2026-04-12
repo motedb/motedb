@@ -381,32 +381,35 @@ fn test_300k_restart_durability() {
     let db_path = dir.path().to_path_buf();
 
     const M: usize = 50_000;
+    let count_before: i64;
 
-    // Phase 1: Write
-    let db = Database::create(&db_path).expect("create db");
-    exec(&db, "CREATE TABLE t8 (id INTEGER PRIMARY KEY, val TEXT, ts INTEGER)");
+    // Phase 1: Write (scoped so db is fully dropped before reopen)
+    {
+        let db = Database::create(&db_path).expect("create db");
+        exec(&db, "CREATE TABLE t8 (id INTEGER PRIMARY KEY, val TEXT, ts INTEGER)");
 
-    let t = std::time::Instant::now();
-    for i in 1..=M as i64 {
-        exec(&db, &format!("INSERT INTO t8 VALUES ({}, 'v_{}', {})", i, i, 1700000000 + i));
-    }
-    print_elapsed(&format!("INSERT {} rows (pre-restart)", M), M, t.elapsed().as_millis() as u64);
+        let t = std::time::Instant::now();
+        for i in 1..=M as i64 {
+            exec(&db, &format!("INSERT INTO t8 VALUES ({}, 'v_{}', {})", i, i, 1700000000 + i));
+        }
+        print_elapsed(&format!("INSERT {} rows (pre-restart)", M), M, t.elapsed().as_millis() as u64);
 
-    // UPDATE: id=1, 4, 7, 10, ..., 100 → step_by(3) from 1
-    for i in (1..=100i64).step_by(3) {
-        exec(&db, &format!("UPDATE t8 SET val = 'modified' WHERE id = {}", i));
-    }
+        // UPDATE: id=1, 4, 7, 10, ..., 100 → step_by(3) from 1
+        for i in (1..=100i64).step_by(3) {
+            exec(&db, &format!("UPDATE t8 SET val = 'modified' WHERE id = {}", i));
+        }
 
-    let count_before = count_rows(&db, "t8");
-    // 验证 UPDATE 生效：id=1 被改了
-    let r1_before = select_row(&db, "SELECT * FROM t8 WHERE id = 1").unwrap();
-    assert_eq!(r1_before[1], Value::Text("modified".into()), "id=1 should be modified before close");
-    // id=2 没改
-    let r2_before = select_row(&db, "SELECT * FROM t8 WHERE id = 2").unwrap();
-    assert_eq!(r2_before[1], Value::Text("v_2".into()), "id=2 should be v_2 before close");
+        count_before = count_rows(&db, "t8");
+        // 验证 UPDATE 生效：id=1 被改了
+        let r1_before = select_row(&db, "SELECT * FROM t8 WHERE id = 1").unwrap();
+        assert_eq!(r1_before[1], Value::Text("modified".into()), "id=1 should be modified before close");
+        // id=2 没改
+        let r2_before = select_row(&db, "SELECT * FROM t8 WHERE id = 2").unwrap();
+        assert_eq!(r2_before[1], Value::Text("v_2".into()), "id=2 should be v_2 before close");
 
-    db.checkpoint().expect("checkpoint");
-    db.close().expect("close");
+        db.checkpoint().expect("checkpoint");
+        db.close().expect("close");
+    } // db dropped here → background threads stopped, files released
 
     // Phase 2: Reopen + Verify
     let db2 = Database::open(&db_path).expect("open db after restart");

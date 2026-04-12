@@ -338,6 +338,12 @@ impl BlobFile {
     }
     
     fn write_blob(&mut self, data: &[u8]) -> Result<BlobRef> {
+        // Prevent u32 overflow for blob size
+        if data.len() > u32::MAX as usize {
+            return Err(crate::StorageError::InvalidData(
+                format!("Blob too large: {} bytes (max {})", data.len(), u32::MAX)
+            ));
+        }
         let size = data.len() as u32;
         let offset = self.offset;
         

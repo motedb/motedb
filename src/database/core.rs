@@ -456,7 +456,10 @@ impl MoteDB {
 
         // 🆕 Load index metadata registry first (needed for metric info)
         let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
-        let _ = index_registry.load();  // Ignore error if file doesn't exist
+        if let Err(e) = index_registry.load() {
+            debug_log!("[database] ⚠️ Failed to load index_metadata: {:?}. Indexes will need rebuild.", e);
+            // Not fatal — indexes can be rebuilt, but user should be warned
+        }
 
         // Load existing vector indexes (using metric from registry)
         let vector_indexes = Self::load_vector_indexes(&db_path, &index_registry)?;

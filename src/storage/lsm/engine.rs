@@ -413,59 +413,75 @@ impl LSMEngine {
                                         return false;
                                     }
 
-                                    // Build SSTable
-                                    match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable.len()) {
-                                        Ok(mut builder) => {
-                                            // 🆕 Convert UnifiedEntry → Value
-                                            for (key, entry) in memtable.iter() {
-                                                let value = Value {
-                                                    data: entry.data,
-                                                    timestamp: entry.timestamp,
-                                                    deleted: entry.deleted,
-                                                };
-                                                if let Err(e) = builder.add(key, value) {
-                                                    debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
+                                    // Build SSTable with retry on failure (data loss prevention)
+                                    let mut flush_success = false;
+                                    for attempt in 0..3 {
+                                        match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable.len()) {
+                                            Ok(mut builder) => {
+                                                // 🆕 Convert UnifiedEntry → Value
+                                                for (key, entry) in memtable.iter() {
+                                                    let value = Value {
+                                                        data: entry.data,
+                                                        timestamp: entry.timestamp,
+                                                        deleted: entry.deleted,
+                                                    };
+                                                    if let Err(e) = builder.add(key, value) {
+                                                        debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
+                                                    }
+                                                }
+
+                                                match builder.finish() {
+                                                    Ok(meta) => {
+                                                        if let Some(worker) = compaction_worker_weak.upgrade() {
+                                                            let _ = worker.register_sstable(meta);
+                                                        }
+                                                        // 🚀 Wake compaction thread (new SSTable registered)
+                                                        {
+                                                            let (lock, cvar) = &*compaction_wakeup_for_flush;
+                                                            if let Ok(mut guard) = lock.lock() { *guard = true; }
+                                                            cvar.notify_all();
+                                                        }
+                                                        flush_success = true;
+                                                        break;
+                                                    }
+                                                    Err(e) => {
+                                                        debug_log!("[LSM Flush] ❌ Failed to finish SSTable_{} (attempt {}): {:?}", sst_id, attempt + 1, e);
+                                                    }
                                                 }
                                             }
+                                            Err(e) => {
+                                                debug_log!("[LSM Flush] ❌ Failed to create SSTable builder (attempt {}): {:?}", attempt + 1, e);
+                                            }
+                                        }
+                                        // Wait before retry
+                                        if attempt < 2 {
+                                            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
+                                        }
+                                    }
 
-                                            match builder.finish() {
-                                                Ok(meta) => {
-                                                    if let Some(worker) = compaction_worker_weak.upgrade() {
-                                                        let _ = worker.register_sstable(meta);
-                                                    }
-                                                    // 🚀 Wake compaction thread (new SSTable registered)
-                                                    {
-                                                        let (lock, cvar) = &*compaction_wakeup_for_flush;
-                                                        if let Ok(mut guard) = lock.lock() { *guard = true; }
-                                                        cvar.notify_all();
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    debug_log!("[LSM Flush] ❌ Failed to finish SSTable_{}: {:?}", sst_id, e);
+                                    if flush_success {
+                                        // 🔥 Call flush callback AFTER SSTable is successfully built
+                                        if let Some(callback_arc) = flush_callback_weak.upgrade() {
+                                            let callback_guard = callback_arc.read();
+                                            if let Some(ref callback) = *callback_guard {
+                                                if let Err(e) = callback(&memtable) {
+                                                    debug_log!("[LSM Flush] ⚠️  Callback error: {:?}", e);
                                                 }
                                             }
                                         }
-                                        Err(e) => {
-                                            debug_log!("[LSM Flush] ❌ Failed to create SSTable builder: {:?}", e);
+
+                                        // Explicitly drop memtable (data is now in SSTable)
+                                        drop(memtable);
+                                    } else {
+                                        // CRITICAL: Put memtable back to front of queue to prevent data loss
+                                        debug_log!("[LSM Flush] 🚨 CRITICAL: SSTable write failed after 3 attempts, putting memtable back to queue!");
+                                        {
+                                            let mut immutable_lock = immutable.write();
+                                            immutable_lock.push_front(memtable);
                                         }
                                     }
                                 }
-
-                                // 🔥 NEW: Call flush callback AFTER SSTable is built
-                                // This ensures the immutable queue drains quickly even if
-                                // index building is slow (e.g. in debug builds).
-                                if let Some(callback_arc) = flush_callback_weak.upgrade() {
-                                    let callback_guard = callback_arc.read();
-                                    if let Some(ref callback) = *callback_guard {
-                                        if let Err(e) = callback(&memtable) {
-                                            debug_log!("[LSM Flush] ⚠️  Callback error: {:?}", e);
-                                        }
-                                    }
-                                }
-
-                                // Explicitly drop memtable
-                                drop(memtable);
-                            }
+                            } // end if let Some(memtable)
 
                             flush_in_progress.store(false, Ordering::Release);
 

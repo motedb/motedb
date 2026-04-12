@@ -133,20 +133,23 @@ impl IndexRegistry {
         Ok(())
     }
     
-    /// Register a new index
+    /// Register a new index (atomic: check + insert via DashMap entry API)
     pub fn register(&self, metadata: IndexMetadata) -> Result<()> {
-        // Check if index name already exists
-        if self.indexes.contains_key(&metadata.name) {
-            return Err(StorageError::Index(format!(
-                "Index '{}' already exists",
-                metadata.name
-            )));
+        use dashmap::mapref::entry::Entry;
+
+        match self.indexes.entry(metadata.name.clone()) {
+            Entry::Occupied(_) => {
+                Err(StorageError::Index(format!(
+                    "Index '{}' already exists",
+                    metadata.name
+                )))
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(metadata);
+                self.save()?;
+                Ok(())
+            }
         }
-        
-        self.indexes.insert(metadata.name.clone(), metadata);
-        self.save()?;
-        
-        Ok(())
     }
     
     /// Remove an index

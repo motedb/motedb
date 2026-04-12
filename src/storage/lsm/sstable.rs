@@ -120,6 +120,34 @@ impl SSTable {
         &self.bloom
     }
 
+    /// Read a block from disk, verify CRC32, return the data portion (without CRC).
+    /// Block format on disk: [block_data] [crc32: 4 bytes LE]
+    fn read_block(&mut self, offset: u64, size: u32) -> Result<Vec<u8>> {
+        if size < 4 {
+            return Err(crate::StorageError::InvalidData(
+                format!("Block too small at offset {}: {} bytes", offset, size)
+            ));
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; size as usize];
+        self.file.read_exact(&mut buf)?;
+
+        // Split data and CRC
+        let data_len = buf.len() - 4;
+        let data = &buf[..data_len];
+        let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+
+        let computed_crc = crc32fast::hash(data);
+        if stored_crc != computed_crc {
+            return Err(crate::StorageError::InvalidData(
+                format!("CRC32 mismatch at offset {}: expected {:08x}, got {:08x}. Data may be corrupted!",
+                    offset, stored_crc, computed_crc)
+            ));
+        }
+
+        Ok(data.to_vec())
+    }
+
     /// Get a value by key (assumes bloom check was already done externally)
     pub fn get(&mut self, key: Key) -> Result<Option<Value>> {
         // Convert u64 key to bytes for bloom filter and block search
@@ -136,10 +164,8 @@ impl SSTable {
             None => return Ok(None),
         };
         
-        // Read and search block
-        self.file.seek(SeekFrom::Start(block_entry.1))?;
-        let mut block_buf = vec![0u8; block_entry.2 as usize];
-        self.file.read_exact(&mut block_buf)?;
+        // Read and search block (with CRC verification)
+        let block_buf = self.read_block(block_entry.1, block_entry.2)?;
         
         let block = DataBlock::deserialize(&block_buf)?;
         Ok(block.get(&key_bytes))
@@ -188,11 +214,9 @@ impl SSTable {
                 None => continue,
             };
             
-            // Read and search block
-            self.file.seek(SeekFrom::Start(block_entry.1))?;
-            let mut block_buf = vec![0u8; block_entry.2 as usize];
-            self.file.read_exact(&mut block_buf)?;
-            
+            // Read and search block (with CRC verification)
+            let block_buf = self.read_block(block_entry.1, block_entry.2)?;
+
             let block = DataBlock::deserialize(&block_buf)?;
             results[idx] = block.get(&key_bytes);
         }
@@ -214,11 +238,8 @@ impl SSTable {
         // Scan blocks
         for i in start_idx..self.index.entries.len() {
             let (_, offset, size) = &self.index.entries[i];
-            
-            self.file.seek(SeekFrom::Start(*offset))?;
-            let mut block_buf = vec![0u8; *size as usize];
-            self.file.read_exact(&mut block_buf)?;
-            
+
+            let block_buf = self.read_block(*offset, *size)?;
             let block = DataBlock::deserialize(&block_buf)?;
             
             for (k, v) in block.entries.iter() {
@@ -242,13 +263,14 @@ impl SSTable {
         // Estimate capacity based on footer
         let estimated_size = (self.footer.num_entries as usize).min(10000);
         let mut results = Vec::with_capacity(estimated_size);
-        
-        // Scan all blocks
-        for (_first_key, offset, size) in &self.index.entries {
-            self.file.seek(SeekFrom::Start(*offset))?;
-            let mut block_buf = vec![0u8; *size as usize];
-            self.file.read_exact(&mut block_buf)?;
-            
+
+        // Scan all blocks (collect offsets to avoid borrow conflict)
+        let block_entries: Vec<_> = self.index.entries.iter()
+            .map(|(_k, o, s)| (*o, *s))
+            .collect();
+
+        for (offset, size) in block_entries {
+            let block_buf = self.read_block(offset, size)?;
             let block = DataBlock::deserialize(&block_buf)?;
             
             // Add all entries from this block
@@ -485,12 +507,14 @@ impl SSTableBuilder {
         let block_data = self.current_block.serialize_compressed(self.config.enable_compression)?;
         let block_size = block_data.len() as u32;
         
-        // Record in index
-        self.index.entries.push((first_key, self.offset, block_size));
-        
-        // Write to file
+        // Record in index (block_size includes CRC)
+        self.index.entries.push((first_key, self.offset, block_size + 4));
+
+        // Write to file: block_data + CRC32
         self.writer.write_all(&block_data)?;
-        self.offset += block_size as u64;
+        let crc = crc32fast::hash(&block_data);
+        self.writer.write_all(&crc.to_le_bytes())?;
+        self.offset += block_size as u64 + 4;
         
         // Reset block
         self.current_block = DataBlock::new();
@@ -667,6 +691,9 @@ impl DataBlock {
             offset += 8;
             
             // Read value metadata
+            if offset + 10 > data.len() {
+                return Err(StorageError::InvalidData("Insufficient data for value metadata".into()));
+            }
             let timestamp = u64::from_le_bytes([
                 data[offset], data[offset+1], data[offset+2], data[offset+3],
                 data[offset+4], data[offset+5], data[offset+6], data[offset+7],
@@ -674,24 +701,35 @@ impl DataBlock {
             offset += 8;
             let deleted = data[offset] != 0;
             offset += 1;
-            
+
             // Read value data (inline or blob)
             let value_type = data[offset];
             offset += 1;
-            
+
             let value_data = match value_type {
                 0 => {
                     // Inline
+                    if offset + 4 > data.len() {
+                        return Err(StorageError::InvalidData("Insufficient data for value length".into()));
+                    }
                     let value_len = u32::from_le_bytes([
                         data[offset], data[offset+1], data[offset+2], data[offset+3]
                     ]) as usize;
                     offset += 4;
+                    if offset + value_len > data.len() {
+                        return Err(StorageError::InvalidData(
+                            format!("Value data exceeds block: need {} bytes, have {}", value_len, data.len() - offset)
+                        ));
+                    }
                     let inline_data = data[offset..offset+value_len].to_vec();
                     offset += value_len;
                     ValueData::Inline(inline_data)
                 }
                 1 => {
                     // Blob reference
+                    if offset + 16 > data.len() {
+                        return Err(StorageError::InvalidData("Insufficient data for blob reference".into()));
+                    }
                     let file_id = u32::from_le_bytes([
                         data[offset], data[offset+1], data[offset+2], data[offset+3]
                     ]);
@@ -791,10 +829,22 @@ impl BlockIndex {
     }
     
     fn deserialize(data: &[u8]) -> Result<Self> {
+        if data.len() < 4 {
+            return Err(StorageError::InvalidData("BlockIndex too small".into()));
+        }
+
         let mut offset = 0;
-        
+
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         offset += 4;
+
+        // Bounds check: 4 bytes header + num_entries * 20 bytes per entry
+        let expected_size = 4 + num_entries * 20;
+        if data.len() < expected_size {
+            return Err(StorageError::InvalidData(
+                format!("BlockIndex truncated: expected {} bytes, got {}", expected_size, data.len())
+            ));
+        }
         
         let mut entries = Vec::with_capacity(num_entries);
         
@@ -965,23 +1015,34 @@ impl SSTableIterator {
         })
     }
     
-    /// Load next block into memory
+    /// Load next block into memory (with CRC verification)
     fn load_next_block(&mut self) -> Result<bool> {
         if self.current_block_idx >= self.index_entries.len() {
             return Ok(false); // No more blocks
         }
-        
+
         let (_, offset, size) = self.index_entries[self.current_block_idx];
-        
-        // Seek to block position
+
+        // Read block with CRC verification
         self.file.seek(SeekFrom::Start(offset))?;
-        
-        // Read block data
-        let mut block_buf = vec![0u8; size as usize];
-        self.file.read_exact(&mut block_buf)?;
-        
-        // Deserialize block
-        let block = DataBlock::deserialize(&block_buf)?;
+        let mut buf = vec![0u8; size as usize];
+        self.file.read_exact(&mut buf)?;
+
+        // Verify CRC32 (last 4 bytes)
+        if buf.len() < 4 {
+            return Err(crate::StorageError::InvalidData("Block too small for CRC".into()));
+        }
+        let data_len = buf.len() - 4;
+        let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+        let computed_crc = crc32fast::hash(&buf[..data_len]);
+        if stored_crc != computed_crc {
+            return Err(crate::StorageError::InvalidData(
+                format!("CRC32 mismatch in iterator block at offset {}: expected {:08x}, got {:08x}", offset, stored_crc, computed_crc)
+            ));
+        }
+
+        // Deserialize block (without CRC bytes)
+        let block = DataBlock::deserialize(&buf[..data_len])?;
         
         // Replace current block entries
         self.current_block_entries = block.entries;
