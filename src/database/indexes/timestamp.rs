@@ -107,6 +107,7 @@ impl MoteDB {
     /// let row_ids = db.query_timestamp_range(1000, 2000)?;
     /// ```
     pub fn query_timestamp_range(&self, start: i64, end: i64) -> Result<Vec<RowId>> {
+        ensure_open!(self);
         self.query_timestamp_range_with_profile(start, end).map(|(ids, _)| ids)
     }
     

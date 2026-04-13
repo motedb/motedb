@@ -706,6 +706,24 @@ impl IndexBuilder for ColumnValueIndex {
     }
 }
 
+impl ColumnValueIndex {
+    /// 批量插入（优化的接口）
+    ///
+    /// 用于批量索引构建
+    pub fn insert_batch(&mut self, batch: &[(RowId, &Value)]) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // 🚀 批量插入到B-Tree
+        for (row_id, value) in batch {
+            self.insert(value, *row_id)?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,43 +733,25 @@ mod tests {
     fn test_column_value_index_basic() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_index.idx");
-        
+
         let mut index = ColumnValueIndex::create(
             &path,
             "users".to_string(),
             "age".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
-        
+
         // Insert some values
         index.insert(&Value::Integer(25), 1)?;
         index.insert(&Value::Integer(30), 2)?;
         index.insert(&Value::Integer(25), 3)?;
-        
+
         // Point query
         let row_ids = index.get(&Value::Integer(25))?;
         assert_eq!(row_ids.len(), 2);
         assert!(row_ids.contains(&1));
         assert!(row_ids.contains(&3));
-        
-        Ok(())
-    }
-}
 
-impl ColumnValueIndex {
-    /// 批量插入（优化的接口）
-    /// 
-    /// 用于批量索引构建
-    pub fn insert_batch(&mut self, batch: &[(RowId, &Value)]) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        
-        // 🚀 批量插入到B-Tree
-        for (row_id, value) in batch {
-            self.insert(value, *row_id)?;
-        }
-        
         Ok(())
     }
 }

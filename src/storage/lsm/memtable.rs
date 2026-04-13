@@ -291,19 +291,19 @@ mod tests {
         let retrieved = memtable.get(key).unwrap().unwrap();
         assert_eq!(retrieved.data, value.data);
         assert_eq!(retrieved.timestamp, 1);
-        assert_eq!(retrieved.deleted, false);
+        assert!(!retrieved.deleted);
     }
-    
+
     #[test]
     fn test_delete() {
         let memtable = create_memtable();
-        
+
         let key = 12345u64;  // ✅ u64 key
         memtable.put(key, Value::new(b"value".to_vec(), 1)).unwrap();
         memtable.delete(key, 2).unwrap();
-        
+
         let retrieved = memtable.get(key).unwrap().unwrap();
-        assert_eq!(retrieved.deleted, true);
+        assert!(retrieved.deleted);
         assert_eq!(retrieved.timestamp, 2);
     }
     
@@ -318,30 +318,28 @@ mod tests {
         memtable.put(key, value).unwrap();
         
         assert!(memtable.size() > 0);
-        
+
         // Update should replace old value
         let new_value = Value::new(b"new_value".to_vec(), 2);
         memtable.put(key, new_value).unwrap();
-        
+
         assert!(memtable.size() > 0);
     }
     
     #[test]
     fn test_should_flush() {
-        let mut config = LSMConfig::default();
-        config.memtable_size = 100; // Small size for testing
+        let config = LSMConfig { memtable_size: 100, ..Default::default() };
         let memtable = MemTable::new(&config);
-        
-        assert_eq!(memtable.should_flush(), false);
-        
+
+        assert!(!memtable.should_flush());
+
         // Insert data until flush is needed
-        for i in 0..10 {
-            let key = i as u64;  // ✅ u64 key
+        for i in 0..10u64 {
             let value = Value::new(vec![0u8; 20], i);
-            memtable.put(key, value).unwrap();
+            memtable.put(i, value).unwrap();
         }
-        
-        assert_eq!(memtable.should_flush(), true);
+
+        assert!(memtable.should_flush());
     }
     
     #[test]

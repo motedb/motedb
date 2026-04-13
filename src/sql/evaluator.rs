@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 /// ⚡ Compiled LIKE pattern for fast matching
 #[derive(Debug, Clone)]
@@ -157,23 +158,23 @@ pub struct ExprEvaluator {
     /// RwLock for concurrent read access (common case)
     pattern_cache: Arc<RwLock<HashMap<String, CompiledPattern>>>,
     /// 🆕 Store the last AUTO_INCREMENT value inserted (shared with QueryExecutor)
-    pub(crate) last_insert_id: Arc<RefCell<Option<i64>>>,
+    pub(crate) last_insert_id: Rc<RefCell<Option<i64>>>,
 }
 
 impl ExprEvaluator {
     pub fn new() -> Self {
-        Self { 
+        Self {
             db: None,
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
-            last_insert_id: Arc::new(RefCell::new(None)),
+            last_insert_id: Rc::new(RefCell::new(None)),
         }
     }
-    
+
     pub fn with_db(db: Arc<MoteDB>) -> Self {
-        Self { 
+        Self {
             db: Some(db),
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
-            last_insert_id: Arc::new(RefCell::new(None)),
+            last_insert_id: Rc::new(RefCell::new(None)),
         }
     }
     
@@ -1369,6 +1370,7 @@ impl ExprEvaluator {
         self.like_match_recursive(&text_chars, &pattern_chars, 0, 0)
     }
     
+    #[allow(clippy::only_used_in_recursion)]
     fn like_match_recursive(&self, text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
         // End of pattern
         if pi >= pattern.len() {

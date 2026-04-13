@@ -269,7 +269,7 @@ impl RowCache {
         let keys_to_remove: Vec<CacheKey> = cache
             .iter()
             .filter(|(key, _)| key.0 == thash)
-            .map(|(key, _)| key.clone())
+            .map(|(key, _)| *key)
             .collect();
 
         for key in keys_to_remove {
@@ -337,9 +337,7 @@ mod tests {
     fn test_row_cache_basic() {
         let cache = RowCache::new(100);
 
-        let mut row = Row::new();
-        row.push(Value::Integer(1));
-        row.push(Value::Text("test".to_string()));
+        let row = vec![Value::Integer(1), Value::Text("test".to_string())];
 
         assert!(cache.get("users", 1).is_none());
 
@@ -358,8 +356,7 @@ mod tests {
     fn test_row_cache_invalidation() {
         let cache = RowCache::new(100);
 
-        let mut row = Row::new();
-        row.push(Value::Integer(1));
+        let row = vec![Value::Integer(1)];
 
         cache.put("users".to_string(), 1, row.clone());
         assert!(cache.get("users", 1).is_some());
@@ -373,16 +370,14 @@ mod tests {
         let cache = RowCache::new(3);
 
         for i in 1..=3 {
-            let mut row = Row::new();
-            row.push(Value::Integer(i));
+            let row = vec![Value::Integer(i)];
             cache.put("users".to_string(), i as u64, row);
         }
 
         let stats = cache.stats();
         assert_eq!(stats.size, 3);
 
-        let mut row = Row::new();
-        row.push(Value::Integer(4));
+        let row = vec![Value::Integer(4)];
         cache.put("users".to_string(), 4, row);
 
         let stats = cache.stats();

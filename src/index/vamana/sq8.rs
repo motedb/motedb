@@ -202,10 +202,9 @@ impl SQ8Quantizer {
         let mut data_norm_sq = 0.0f32;
         
         // SIMD-friendly loop (all operations fused)
-        for i in 0..self.dimension {
-            let q = query[i];
-            let d = data.codes[i] as f32 * scale + data.min;
-            
+        for (&q, &code) in query.iter().zip(data.codes.iter()) {
+            let d = code as f32 * scale + data.min;
+
             dot_product += q * d;
             query_norm_sq += q * q;
             data_norm_sq += d * d;
@@ -254,9 +253,8 @@ impl SQ8Quantizer {
         let scale = range / 255.0;
         let mut sum_sq = 0.0f32;
 
-        for i in 0..self.dimension {
-            let q = query[i];
-            let d = data.codes[i] as f32 * scale + data.min;
+        for (&q, &code) in query.iter().zip(data.codes.iter()) {
+            let d = code as f32 * scale + data.min;
             let diff = q - d;
             sum_sq += diff * diff;
         }
@@ -355,9 +353,8 @@ impl SQ8Quantizer {
             let mut data_norm_sq = vaddvq_f32(dnorm_sum);
 
             // Scalar remainder
-            for i in (chunks * 16)..n {
-                let q = query[i];
-                let d = data.codes[i] as f32 * scale + data.min;
+            for (&q, &code) in query[chunks * 16..].iter().zip(&data.codes[chunks * 16..]) {
+                let d = code as f32 * scale + data.min;
                 dot_product += q * d;
                 query_norm_sq += q * q;
                 data_norm_sq += d * d;
@@ -445,9 +442,8 @@ impl SQ8Quantizer {
             let mut result = vaddvq_f32(total);
 
             // Scalar remainder
-            for i in (chunks * 16)..n {
-                let q = query[i];
-                let d = data.codes[i] as f32 * scale + data.min;
+            for (&q, &code) in query[chunks * 16..].iter().zip(&data.codes[chunks * 16..]) {
+                let d = code as f32 * scale + data.min;
                 let diff = q - d;
                 result += diff * diff;
             }
@@ -546,8 +542,8 @@ mod tests {
         let qvec = quantizer.quantize(&vector).unwrap();
         let reconstructed = quantizer.dequantize(&qvec);
 
-        for i in 0..3 {
-            assert!((reconstructed[i] - 5.0).abs() < 0.01);
+        for val in reconstructed.iter().take(3) {
+            assert!((val - 5.0).abs() < 0.01);
         }
     }
 

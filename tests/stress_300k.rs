@@ -87,7 +87,7 @@ fn test_300k_insert_integrity() {
 
     // 中间行
     let mid = select_row(&db, "SELECT * FROM t1 WHERE id = 150000").expect("id=150000");
-    assert_eq!(mid[3], Value::Integer(20 + (150000 % 60)));
+    assert_eq!(mid[3], Value::Integer(20));
 
     // 不存在的行
     assert!(select_row(&db, "SELECT * FROM t1 WHERE id = 999999").is_none());

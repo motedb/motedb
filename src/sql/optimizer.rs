@@ -416,6 +416,7 @@ impl QueryOptimizer {
     /// ## 边界语义
     /// - `start_inclusive`: 下界是否包含（>= vs >）
     /// - `end_inclusive`: 上界是否包含（<= vs <）
+    #[allow(clippy::too_many_arguments)]
     fn try_range_query_plan(
         &mut self,
         table_name: &str,
@@ -489,39 +490,41 @@ impl QueryOptimizer {
                         _ => None,
                     };
                     
-                    if col1.is_some() && col2.is_some() && col1 == col2 {
-                        let col_name = col1.expect("col1 already checked to be Some").clone();
-                        
-                        // Extract start and end values (with inclusivity flags)
-                        let (val1, is_lower1, inclusive1) = match (l1.as_ref(), op1, r1.as_ref()) {
-                            (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, true)),
-                            (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, false)),
-                            (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, true)),
-                            (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, false)),
-                            (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, true)),
-                            (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, false)),
-                            (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, true)),
-                            (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, false)),
-                            _ => None,
-                        }?;
-                        
-                        let (val2, is_lower2, inclusive2) = match (l2.as_ref(), op2, r2.as_ref()) {
-                            (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, true)),
-                            (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, false)),
-                            (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, true)),
-                            (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, false)),
-                            (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, true)),
-                            (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, false)),
-                            (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, true)),
-                            (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, false)),
-                            _ => None,
-                        }?;
-                        
-                        // One should be lower bound, one should be upper bound
-                        if is_lower1 && !is_lower2 {
-                            return Some((col_name, val1, inclusive1, val2, inclusive2));
-                        } else if !is_lower1 && is_lower2 {
-                            return Some((col_name, val2, inclusive2, val1, inclusive1));
+                    if let (Some(c1), Some(c2)) = (&col1, &col2) {
+                        if c1 == c2 {
+                            let col_name = (*c1).clone();
+
+                            // Extract start and end values (with inclusivity flags)
+                            let (val1, is_lower1, inclusive1) = match (l1.as_ref(), op1, r1.as_ref()) {
+                                (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, true)),
+                                (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, false)),
+                                (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, true)),
+                                (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, false)),
+                                (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, true)),
+                                (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, false)),
+                                (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, true)),
+                                (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, false)),
+                                _ => None,
+                            }?;
+
+                            let (val2, is_lower2, inclusive2) = match (l2.as_ref(), op2, r2.as_ref()) {
+                                (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, true)),
+                                (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, false)),
+                                (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, true)),
+                                (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, false)),
+                                (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, true)),
+                                (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, false)),
+                                (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, true)),
+                                (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, false)),
+                                _ => None,
+                            }?;
+
+                            // One should be lower bound, one should be upper bound
+                            if is_lower1 && !is_lower2 {
+                                return Some((col_name, val1, inclusive1, val2, inclusive2));
+                            } else if !is_lower1 && is_lower2 {
+                                return Some((col_name, val2, inclusive2, val1, inclusive1));
+                            }
                         }
                     }
                 }
@@ -689,6 +692,7 @@ impl QueryOptimizer {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     
@@ -810,7 +814,7 @@ impl QueryOptimizer {
         // 解析 ORDER BY 表达式
         let (column, query_vector, asc) = match &order_by.expr {
             // 匹配: column <-> [vector] (L2Distance)
-            Expr::BinaryOp { op, left, right } if matches!(op, BinaryOperator::L2Distance | BinaryOperator::CosineDistance) => {
+            Expr::BinaryOp { op: BinaryOperator::L2Distance | BinaryOperator::CosineDistance, left, right } => {
                 match (&**left, &**right) {
                     (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
                         (col.clone(), vec.clone(), order_by.asc)

@@ -430,7 +430,7 @@ mod tests {
         let b: Vec<f32> = (0..1000).map(|i| (i as f32).cos()).collect();
         
         let sim = cosine_similarity(&a, &b);
-        assert!(sim >= -1.0 && sim <= 1.0);
+        assert!((-1.0..=1.0).contains(&sim));
     }
 
     #[test]
@@ -440,7 +440,7 @@ mod tests {
         let b = vec![-1e10_f32, 1e10_f32, 2000.0];
         
         let sim = cosine_similarity(&a, &b);
-        assert!(sim >= -1.0 && sim <= 1.0, "Similarity {} out of range", sim);
+        assert!((-1.0..=1.0).contains(&sim), "Similarity {} out of range", sim);
         assert!(sim.is_finite(), "Similarity is not finite: {}", sim);
         
         // Should be negative due to opposite directions
@@ -463,7 +463,7 @@ mod tests {
         let b = vec![2e-10, 4e-10, 6e-10];
         
         let dist = cosine_distance(&a, &b);
-        assert!(dist >= 0.0 && dist <= 2.0);
+        assert!((0.0..=2.0).contains(&dist));
         assert!(dist.is_finite());
     }
 
@@ -476,7 +476,7 @@ mod tests {
         let sim = cosine_similarity(&a, &b);
         
         // Verify result is reasonable
-        assert!(sim >= -1.0 && sim <= 1.0);
+        assert!((-1.0..=1.0).contains(&sim));
         assert!(sim.is_finite());
     }
 }

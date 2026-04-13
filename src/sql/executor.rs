@@ -8,6 +8,13 @@ use crate::{StorageError};
 use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId, Row};
 use std::sync::Arc;
 use std::cell::RefCell;
+use std::rc::Rc;
+
+#[allow(clippy::type_complexity)]
+type FromScanResult = Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)>;
+
+#[allow(clippy::type_complexity)]
+type RowPredicate = Option<Box<dyn Fn(&SqlRow) -> bool + Send + Sync>>;
 
 /// 🚀 索引下推：可索引的条件类型
 #[allow(dead_code)]
@@ -316,14 +323,14 @@ pub struct QueryExecutor {
     evaluator: ExprEvaluator,
     optimizer: RefCell<super::optimizer::QueryOptimizer>,
     /// Store the last AUTO_INCREMENT value inserted (shared with evaluator)
-    last_insert_id: Arc<RefCell<Option<i64>>>,
+    last_insert_id: Rc<RefCell<Option<i64>>>,
 }
 
 impl QueryExecutor {
     pub fn new(db: Arc<MoteDB>) -> Self {
-        let last_insert_id = Arc::new(RefCell::new(None));
+        let last_insert_id = Rc::new(RefCell::new(None));
         let mut evaluator = ExprEvaluator::with_db(db.clone());
-        evaluator.last_insert_id = Arc::clone(&last_insert_id);
+        evaluator.last_insert_id = Rc::clone(&last_insert_id);
         
         Self {
             evaluator,
@@ -858,6 +865,7 @@ impl QueryExecutor {
     /// ## 边界正确性
     /// - `start_inclusive`: 下界是否包含（>= vs >）
     /// - `end_inclusive`: 上界是否包含（<= vs <）
+    #[allow(clippy::too_many_arguments)]
     fn execute_range_query_streaming(
         &self,
         stmt: &SelectStmt,
@@ -1006,30 +1014,30 @@ impl QueryExecutor {
         let select_cols = stmt.columns.clone();
         let columns_clone = columns.clone();
         
-        let rows_iter = lsm_iter.filter_map(move |result| {
+        let rows_iter = lsm_iter.map(move |result| {
             // 处理迭代器错误
             let (_key, value_data) = match result {
                 Ok(kv) => kv,
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Err(e),
             };
-            
+
             // 反序列化行
             let data = match &value_data.data {
                 crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                _ => return Some(Err(StorageError::InvalidData("Unexpected blob".into()))),
+                _ => return Err(StorageError::InvalidData("Unexpected blob".into())),
             };
-            
+
             match bincode::deserialize::<crate::types::Row>(data) {
                 Ok(row) => {
                     match row_to_sql_row(&row, &schema_clone) {
                         Ok(sql_row) => {
                             let projected = Self::project_row_static(&sql_row, &select_cols, &columns_clone, &schema_clone);
-                            Some(Ok(projected))
+                            Ok(projected)
                         }
-                        Err(e) => Some(Err(e)),
+                        Err(e) => Err(e),
                     }
                 }
-                Err(e) => Some(Err(StorageError::InvalidData(format!("Deserialization failed: {}", e)))),
+                Err(e) => Err(StorageError::InvalidData(format!("Deserialization failed: {}", e))),
             }
         });
         
@@ -1129,7 +1137,6 @@ impl QueryExecutor {
     /// 🚀 Lightweight expression evaluation for WHERE filters (no allocations)
     /// Handles simple comparisons, AND/OR, column references, and literals.
     /// Falls back to creating a QueryExecutor for complex expressions (MATCH, KNN, etc.)
-
     fn is_truthy(v: &Value) -> bool {
         match v {
             Value::Bool(b) => *b,
@@ -1257,7 +1264,7 @@ impl QueryExecutor {
     ) -> Vec<Value> {
         if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::Star) {
             // SELECT * — return all columns in schema order (cheap clone)
-            row.iter().cloned().collect()
+            row.to_vec()
         } else {
             // Explicit columns — use column position as index into Vec
             columns.iter().zip(select_cols.iter())
@@ -2024,6 +2031,7 @@ impl QueryExecutor {
     }
     
     /// Check if expression contains aggregates (recursive)
+    #[allow(clippy::only_used_in_recursion)]
     fn expr_has_aggregates(&self, expr: &Expr) -> bool {
         match expr {
             Expr::FunctionCall { name, .. } => {
@@ -2038,12 +2046,12 @@ impl QueryExecutor {
     
     /// Execute FROM clause - handles single table or JOINs
     /// Returns all rows with combined schema
-    fn execute_from(&self, table_ref: &TableRef) -> Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)> {
+    fn execute_from(&self, table_ref: &TableRef) -> FromScanResult {
         self.execute_from_with_limit(table_ref, None)
     }
 
     /// 🚀 P0 OPTIMIZATION: Execute FROM clause with limit passed to storage layer
-    fn execute_from_with_limit(&self, table_ref: &TableRef, limit: Option<usize>) -> Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)> {
+    fn execute_from_with_limit(&self, table_ref: &TableRef, limit: Option<usize>) -> FromScanResult {
         match table_ref {
             TableRef::Table { name, alias } => {
                 // Single table - use table-specific scan with limit
@@ -3618,9 +3626,9 @@ impl QueryExecutor {
     /// For `UPDATE t SET ... WHERE pk = value`:
     /// - AUTO_INCREMENT: direct LSM get by row_id (O(log n))
     /// - Non-AUTO_INCREMENT: column index lookup then LSM get
-    /// Resolve PK value to RowId using pk_lookup cache.
-    /// On cache miss, falls back to disk-based column index and refills the cache.
-    /// This ensures that repeated lookups for the same PK value are fast (O(1) after first access).
+    ///   Resolve PK value to RowId using pk_lookup cache.
+    ///   On cache miss, falls back to disk-based column index and refills the cache.
+    ///   This ensures that repeated lookups for the same PK value are fast (O(1) after first access).
     fn resolve_pk_with_cache(
         &self,
         table: &str,
@@ -4256,39 +4264,41 @@ impl QueryExecutor {
                             _ => None,
                         };
                         
-                        if col1.is_some() && col2.is_some() && col1 == col2 {
-                            let col_name = col1.expect("col1 already checked to be Some").clone();
-                            
-                            // Extract bounds with operators
-                            let (val1, is_lower1, op1_normalized) = match (l1.as_ref(), op1, r1.as_ref()) {
-                                (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Ge)),
-                                (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Gt)),
-                                (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Ge)),
-                                (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Gt)),
-                                (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Le)),
-                                (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Lt)),
-                                (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Le)),
-                                (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Lt)),
-                                _ => None,
-                            }?;
-                            
-                            let (val2, is_lower2, op2_normalized) = match (l2.as_ref(), op2, r2.as_ref()) {
-                                (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Ge)),
-                                (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Gt)),
-                                (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Ge)),
-                                (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Gt)),
-                                (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Le)),
-                                (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Lt)),
-                                (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Le)),
-                                (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Lt)),
-                                _ => None,
-                            }?;
-                            
-                            // One should be lower bound, one should be upper bound
-                            if is_lower1 && !is_lower2 {
-                                return Some((col_name, val1, op1_normalized, val2, op2_normalized));
-                            } else if !is_lower1 && is_lower2 {
-                                return Some((col_name, val2, op2_normalized, val1, op1_normalized));
+                        if let (Some(c1), Some(c2)) = (&col1, &col2) {
+                            if c1 == c2 {
+                                let col_name = (*c1).clone();
+
+                                // Extract bounds with operators
+                                let (val1, is_lower1, op1_normalized) = match (l1.as_ref(), op1, r1.as_ref()) {
+                                    (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Ge)),
+                                    (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Gt)),
+                                    (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Ge)),
+                                    (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Gt)),
+                                    (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Le)),
+                                    (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Lt)),
+                                    (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Le)),
+                                    (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Lt)),
+                                    _ => None,
+                                }?;
+
+                                let (val2, is_lower2, op2_normalized) = match (l2.as_ref(), op2, r2.as_ref()) {
+                                    (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Ge)),
+                                    (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, BinaryOperator::Gt)),
+                                    (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Ge)),
+                                    (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, BinaryOperator::Gt)),
+                                    (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Le)),
+                                    (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, BinaryOperator::Lt)),
+                                    (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Le)),
+                                    (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, BinaryOperator::Lt)),
+                                    _ => None,
+                                }?;
+
+                                // One should be lower bound, one should be upper bound
+                                if is_lower1 && !is_lower2 {
+                                    return Some((col_name, val1, op1_normalized, val2, op2_normalized));
+                                } else if !is_lower1 && is_lower2 {
+                                    return Some((col_name, val2, op2_normalized, val1, op1_normalized));
+                                }
                             }
                         }
                     }
@@ -4489,7 +4499,7 @@ impl QueryExecutor {
 
         // Handle ORDER BY score DESC — results are already sorted by BM25 score descending
         // Check if ORDER BY is compatible (DESC or absent)
-        let order_compatible = stmt.order_by.as_ref().map_or(true, |ob| {
+        let order_compatible = stmt.order_by.as_ref().is_none_or(|ob| {
             // If ORDER BY exists, it must be DESC (which matches BM25 ranking)
             ob.len() == 1 && !ob[0].asc
         });
@@ -4711,6 +4721,7 @@ impl QueryExecutor {
     }
 
     /// Execute ST_WITHIN using spatial index directly
+    #[allow(clippy::too_many_arguments)]
     fn execute_spatial_within_fast(
         &self,
         stmt: &SelectStmt,
@@ -4883,6 +4894,7 @@ impl QueryExecutor {
     
     /// 递归提取条件（处理 AND 树）
     #[allow(dead_code)]
+    #[allow(clippy::only_used_in_recursion)]
     fn extract_conditions_recursive(
         &self,
         expr: &Expr,
@@ -5017,7 +5029,8 @@ impl QueryExecutor {
     /// - age >= 18 AND age <= 65 → |row| row.get("age") >= 18 && row.get("age") <= 65
     /// 
     /// Returns None for complex expressions (falls back to interpreter)
-    fn compile_simple_comparison(&self, expr: &Expr) -> Option<Box<dyn Fn(&SqlRow) -> bool + Send + Sync>> {
+    #[allow(clippy::only_used_in_recursion)]
+    fn compile_simple_comparison(&self, expr: &Expr) -> RowPredicate {
         match expr {
             // Simple binary comparison: col op value
             Expr::BinaryOp { left, op, right } => {
@@ -5531,7 +5544,7 @@ impl QueryExecutor {
         // 解析 ORDER BY 表达式
         let (column, query_vector, asc) = match &order_by.expr {
             // 匹配: column <-> [vector] (L2Distance)
-            Expr::BinaryOp { op, left, right } if matches!(op, BinaryOperator::L2Distance | BinaryOperator::CosineDistance) => {
+            Expr::BinaryOp { op: BinaryOperator::L2Distance | BinaryOperator::CosineDistance, left, right } => {
                 match (&**left, &**right) {
                     (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
                         (col.clone(), vec.clone(), order_by.asc)

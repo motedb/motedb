@@ -19,7 +19,7 @@ fn create_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect(&format!("SQL: {}", sql)).materialize().expect("materialize")
+    db.execute(sql).unwrap_or_else(|_| panic!("SQL: {}", sql)).materialize().expect("materialize")
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {

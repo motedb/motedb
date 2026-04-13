@@ -42,6 +42,7 @@ impl MoteDB {
     /// db.flush()?; // Persist all in-memory data
     /// ```
     pub fn flush(&self) -> Result<()> {
+        ensure_open!(self);
         // 🔥 防止递归 flush (检查并设置标志)
         if self.is_flushing.compare_exchange(
             false, 
@@ -138,6 +139,7 @@ impl MoteDB {
     /// db.checkpoint()?; // Full database checkpoint
     /// ```
     pub fn checkpoint(&self) -> Result<()> {
+        ensure_open!(self);
         // 🔒 Prevent concurrent checkpoints (auto + manual can deadlock)
         let _guard = self.checkpoint_mutex.lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
@@ -147,6 +149,7 @@ impl MoteDB {
 
     /// Full checkpoint with index rebuild (used on shutdown/drop)
     pub fn checkpoint_full(&self) -> Result<()> {
+        ensure_open!(self);
         let _guard = self.checkpoint_mutex.lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
 

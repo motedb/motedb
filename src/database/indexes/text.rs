@@ -18,6 +18,7 @@ impl MoteDB {
     /// db.create_text_index("articles_content")?;
     /// ```
     pub fn create_text_index(&self, name: &str) -> Result<()> {
+        ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/text_{name}/
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
@@ -116,6 +117,7 @@ impl MoteDB {
     /// let doc_ids = db.text_search("articles_content", "rust database")?;
     /// ```
     pub fn text_search(&self, index_name: &str, query: &str) -> Result<Vec<RowId>> {
+        ensure_open!(self);
         let index_ref = self.text_indexes.get(index_name)
             .ok_or_else(|| StorageError::Index(format!("Text index '{}' not found", index_name)))?;
         

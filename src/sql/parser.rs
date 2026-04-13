@@ -803,7 +803,6 @@ impl Parser {
                             TokenType::Minus => {
                                 self.advance();
                                 if let TokenType::Number(n) = self.current().token_type {
-                                    let n = n;
                                     self.advance();
                                     -(n as f32)
                                 } else {
@@ -1055,7 +1054,7 @@ impl Parser {
                         Expr::Literal(Value::Float(f)) => Ok(f as f32),
                         Expr::Literal(Value::Integer(i)) => Ok(i as f32),
                         // 🔧 支持负数：-1.0 会被解析成 UnaryOp
-                        Expr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Minus) => {
+                        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
                             match *expr {
                                 Expr::Literal(Value::Float(f)) => Ok(-(f as f32)),
                                 Expr::Literal(Value::Integer(i)) => Ok(-(i as f32)),

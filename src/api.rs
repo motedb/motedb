@@ -175,14 +175,28 @@ impl Database {
 
     /// 关闭数据库（显式调用，通常由 Drop 自动处理）
     ///
+    /// Sets the closed flag so all subsequent operations return `DatabaseClosed` error.
+    /// Idempotent: safe to call multiple times.
+    ///
     /// # Examples
     /// ```ignore
     /// db.close()?;
+    /// // All subsequent operations will return an error
     /// ```
     pub fn close(&self) -> Result<()> {
+        // Idempotent: if already closed, just return Ok
+        if self.inner.is_closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
         // Full checkpoint (flush + index persist + WAL truncate)
         // NOT just flush — close should ensure clean restart
-        self.inner.checkpoint_full()
+        let result = self.inner.checkpoint_full();
+
+        // Set closed flag AFTER checkpoint (so checkpoint itself can run)
+        self.inner.is_closed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        result
     }
 
     // ============================================================================
@@ -817,9 +831,9 @@ impl Database {
     }
 }
 
-// 自动在 Drop 时刷新数据
+// 自动在 Drop 时关闭数据库
 impl Drop for Database {
     fn drop(&mut self) {
-        let _ = self.inner.flush();
+        let _ = self.close();
     }
 }

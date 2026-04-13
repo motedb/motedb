@@ -193,11 +193,12 @@ impl LSMConfig {
     /// Maps the 3 user-facing fields from config::LSMConfig, All other
     /// fields keep their storage-layer defaults.
     pub fn from_db_config(db_config: &crate::config::LSMConfig) -> Self {
-        let mut base = Self::default();
-        base.memtable_size = db_config.memtable_size_limit;
-        base.l0_compaction_trigger = db_config.level0_compaction_threshold;
-        base.bloom_bits_per_key = db_config.bloom_filter_false_positive_rate as usize;
-        base
+        Self {
+            memtable_size: db_config.memtable_size_limit,
+            l0_compaction_trigger: db_config.level0_compaction_threshold,
+            bloom_bits_per_key: db_config.bloom_filter_false_positive_rate as usize,
+            ..Self::default()
+        }
     }
 
     /// Optimized config for read-heavy workloads

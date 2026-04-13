@@ -31,7 +31,7 @@ fn select_maps(db: &Database, sql: &str) -> Vec<std::collections::HashMap<String
             rows.into_iter()
                 .map(|row| {
                     columns.iter()
-                        .zip(row.into_iter())
+                        .zip(row)
                         .map(|(col, val)| (col.clone(), val))
                         .collect()
                 })

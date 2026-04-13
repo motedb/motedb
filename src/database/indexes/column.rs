@@ -46,6 +46,7 @@ impl MoteDB {
     /// // Now queries like WHERE email = 'foo@bar.com' are 40x faster
     /// ```
     pub fn create_column_index_with_name(&self, table_name: &str, column_name: &str, index_name: &str) -> Result<()> {
+        ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/column_{index_name}.idx
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
@@ -251,6 +252,7 @@ impl MoteDB {
     /// let row_ids = db.query_by_column("users", "email", &Value::Text("foo@bar.com".into()))?;
     /// ```
     pub fn query_by_column(&self, table_name: &str, column_name: &str, value: &Value) -> Result<Vec<RowId>> {
+        ensure_open!(self);
         let index_name = format!("{}.{}", table_name, column_name);
 
         // Query the in-memory B+Tree index directly.

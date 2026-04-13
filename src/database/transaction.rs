@@ -30,6 +30,7 @@ impl MoteDB {
     /// db.commit_transaction(txn)?;
     /// ```
     pub fn begin_transaction(&self) -> Result<TransactionId> {
+        ensure_open!(self);
         self.txn_coordinator.begin(IsolationLevel::ReadCommitted)
     }
 
@@ -40,6 +41,7 @@ impl MoteDB {
     /// let txn = db.begin_transaction_with_isolation(IsolationLevel::Serializable)?;
     /// ```
     pub fn begin_transaction_with_isolation(&self, isolation: IsolationLevel) -> Result<TransactionId> {
+        ensure_open!(self);
         self.txn_coordinator.begin(isolation)
     }
 
@@ -50,6 +52,7 @@ impl MoteDB {
     /// let row_id = db.insert_in_transaction(txn, timestamp)?;
     /// ```
     pub fn insert_in_transaction(&self, txn_id: TransactionId, timestamp: i64) -> Result<RowId> {
+        ensure_open!(self);
         // 1. Allocate row ID (lock-free atomic)
         let row_id = self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -91,6 +94,7 @@ impl MoteDB {
         table_name: &str,
         row: Row,
     ) -> Result<RowId> {
+        ensure_open!(self);
         // 1. Get table schema and validate
         let schema = self.table_registry.get_table(table_name)?;
         schema.validate_row(&row).map_err(|e| {
@@ -129,6 +133,7 @@ impl MoteDB {
     /// let row_ids = db.query_in_transaction(txn, 0, 1000000)?;
     /// ```
     pub fn query_in_transaction(&self, txn_id: TransactionId, start: i64, end: i64) -> Result<Vec<RowId>> {
+        ensure_open!(self);
         let ctx = self.txn_coordinator.get_context(txn_id)?;
         let snapshot = &ctx.snapshot;
 
@@ -180,6 +185,7 @@ impl MoteDB {
         txn_id: TransactionId,
         table_name: &str,
     ) -> Result<Vec<(RowId, Row)>> {
+        ensure_open!(self);
         let ctx = self.txn_coordinator.get_context(txn_id)?;
         let snapshot = &ctx.snapshot;
         
@@ -228,6 +234,7 @@ impl MoteDB {
     /// db.commit_transaction(txn)?;
     /// ```
     pub fn commit_transaction(&self, txn_id: TransactionId) -> Result<()> {
+        ensure_open!(self);
         let ctx = self.txn_coordinator.get_context(txn_id)?;
         let write_set = ctx.write_set.read().clone();
 
@@ -265,6 +272,7 @@ impl MoteDB {
     /// db.commit_transaction_full(txn)?;
     /// ```
     pub fn commit_transaction_full(&self, txn_id: TransactionId) -> Result<()> {
+        ensure_open!(self);
         let ctx = self.txn_coordinator.get_context(txn_id)?;
         let write_set = ctx.write_set.read().clone();
 
@@ -340,6 +348,7 @@ impl MoteDB {
     /// db.rollback_transaction(txn)?;
     /// ```
     pub fn rollback_transaction(&self, txn_id: TransactionId) -> Result<()> {
+        ensure_open!(self);
         self.txn_coordinator.rollback(txn_id)
     }
     

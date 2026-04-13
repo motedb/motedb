@@ -339,23 +339,23 @@ impl FreshDiskANNIndex {
         let _medoid_idx = *id_to_idx.get(&medoid).ok_or_else(|| {
             crate::error::StorageError::InvalidData("Medoid not found".into())
         })?;
-        
+
         // 转换 anchor_points 为 indices
         let anchor_indices: Vec<usize> = anchor_points.iter()
             .filter_map(|&id| id_to_idx.get(&id).copied())
             .collect();
-        
+
         // 2. 初始化所有节点的邻居为空
         let mut graph: Vec<Vec<RowId>> = vec![Vec::new(); node_count];
-        
+
         // 🔥 Phase 9: Bootstrap Phase - 随机初始化图（必须！）
         debug_log!("[FreshDiskANN] Phase 9: Bootstrap - Random initialization...");
         let bootstrap_neighbors = 20; // 增加到 20 个邻居
-        
+
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        
-        for i in 0..node_count {
+
+        for (i, neighbors) in graph.iter_mut().enumerate() {
             // 随机选择 bootstrap_neighbors 个邻居
             let mut random_neighbors = Vec::new();
             for _ in 0..bootstrap_neighbors.min(node_count - 1) {
@@ -364,12 +364,12 @@ impl FreshDiskANNIndex {
                     random_neighbors.push(nodes[random_idx].0);
                 }
             }
-            
+
             // 去重
             random_neighbors.sort();
             random_neighbors.dedup();
-            
-            graph[i] = random_neighbors;
+
+            *neighbors = random_neighbors;
         }
         
         let bootstrap_avg_degree: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
@@ -527,18 +527,18 @@ impl FreshDiskANNIndex {
         }
         
         debug_log!("  Using {} anchor indices: {:?}", anchor_indices.len(), &anchor_indices[..anchor_indices.len().min(5)]);
-        
+
         // 2. 初始化所有节点的邻居为空
         let mut graph: Vec<Vec<RowId>> = vec![Vec::new(); node_count];
-        
+
         // 🔥 Phase 9: Bootstrap Phase - 随机初始化图（必须！）
         debug_log!("[FreshDiskANN] Phase 9: Bootstrap - Random initialization...");
         let bootstrap_neighbors = 20; // 增加到 20 个邻居
-        
+
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        
-        for i in 0..node_count {
+
+        for (i, neighbors) in graph.iter_mut().enumerate() {
             // 随机选择 bootstrap_neighbors 个邻居
             let mut random_neighbors = Vec::new();
             for _ in 0..bootstrap_neighbors.min(node_count - 1) {
@@ -547,12 +547,12 @@ impl FreshDiskANNIndex {
                     random_neighbors.push(nodes[random_idx].0);
                 }
             }
-            
+
             // 去重
             random_neighbors.sort();
             random_neighbors.dedup();
-            
-            graph[i] = random_neighbors;
+
+            *neighbors = random_neighbors;
         }
         
         let bootstrap_avg_degree: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
@@ -650,6 +650,7 @@ impl FreshDiskANNIndex {
     }
     
     /// Phase 9: 多锚点贪心搜索（从多个起点并行搜索，合并结果）
+    #[allow(clippy::too_many_arguments)]
     fn multi_anchor_greedy_search(
         &self,
         query: &[f32],
@@ -678,19 +679,19 @@ impl FreshDiskANNIndex {
         
         impl Eq for SearchCandidate {}
         
-        impl PartialOrd for SearchCandidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                // 反转比较，实现最小堆
-                other.distance.partial_cmp(&self.distance)
-            }
-        }
-        
         impl Ord for SearchCandidate {
             fn cmp(&self, other: &Self) -> Ordering {
-                self.partial_cmp(other).unwrap_or(Ordering::Equal)
+                // 反转比较，实现最小堆
+                other.distance.partial_cmp(&self.distance).unwrap_or(Ordering::Equal)
             }
         }
-        
+
+        impl PartialOrd for SearchCandidate {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
         // 🔥 Phase 9: 从所有锚点开始搜索
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new();
@@ -773,6 +774,7 @@ impl FreshDiskANNIndex {
     
     /// Phase 7: Vamana 贪心搜索（用于构建邻居）- 保留用于向后兼容
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     fn vamana_greedy_search(
         &self,
         query: &[f32],
@@ -800,20 +802,20 @@ impl FreshDiskANNIndex {
         }
         
         impl Eq for SearchCandidate {}
-        
-        impl PartialOrd for SearchCandidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                // 反转比较，实现最小堆
-                other.distance.partial_cmp(&self.distance)
-            }
-        }
-        
+
         impl Ord for SearchCandidate {
             fn cmp(&self, other: &Self) -> Ordering {
-                self.partial_cmp(other).unwrap_or(Ordering::Equal)
+                // 反转比较，实现最小堆
+                other.distance.partial_cmp(&self.distance).unwrap_or(Ordering::Equal)
             }
         }
-        
+
+        impl PartialOrd for SearchCandidate {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
         // 🔥 Phase 7: 使用 medoid 作为起始点
         let start_id = nodes[medoid_idx].0;
         let start_dist = self.compute_distance(query, &nodes[medoid_idx].1.vector);
@@ -956,11 +958,11 @@ impl FreshDiskANNIndex {
         
         debug_log!("[FreshDiskANN] Phase 10: Bootstrap initialization...");
         let bootstrap_neighbors = 30; // 增加到 30
-        
+
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        
-        for i in 0..node_count {
+
+        for (i, neighbors) in graph.iter_mut().enumerate() {
             let mut random_neighbors = Vec::new();
             for _ in 0..bootstrap_neighbors.min(node_count - 1) {
                 let random_idx = rng.gen_range(0..node_count);
@@ -970,7 +972,7 @@ impl FreshDiskANNIndex {
             }
             random_neighbors.sort();
             random_neighbors.dedup();
-            graph[i] = random_neighbors;
+            *neighbors = random_neighbors;
         }
         
         let bootstrap_avg_degree: f32 = graph.iter().map(|g| g.len()).sum::<usize>() as f32 / node_count as f32;
@@ -1113,8 +1115,8 @@ impl FreshDiskANNIndex {
                     }
                 }
                 
-                for d in 0..dim {
-                    new_center[d] /= cluster.len() as f32;
+                for v in &mut new_center {
+                    *v /= cluster.len() as f32;
                 }
                 
                 // 检查是否收敛

@@ -23,12 +23,6 @@ fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
     db.execute(sql).expect("execute SQL").materialize().expect("materialize")
 }
 
-fn print_header(title: &str) {
-    println!("\n{}", "=".repeat(80));
-    println!("  {}", title);
-    println!("{}", "=".repeat(80));
-}
-
 fn print_result(name: &str, ops: usize, elapsed_ms: u64) {
     let per_op_us = if ops > 0 { (elapsed_ms as f64 * 1000.0) / ops as f64 } else { 0.0 };
     let throughput = if elapsed_ms > 0 { ops as f64 / (elapsed_ms as f64 / 1000.0) } else { f64::INFINITY };
@@ -267,7 +261,7 @@ fn stress_mixed_crud() {
         }
 
         // Phase 2: UPDATE (1/3)
-        let updates = N / 3;
+        let _updates = N / 3;
         for i in (1..=N as i64).step_by(3) {
             exec(&db, &format!(
                 "UPDATE orders SET status = 'shipped', amount = amount + 10 WHERE id = {}", i
@@ -275,7 +269,7 @@ fn stress_mixed_crud() {
         }
 
         // Phase 3: DELETE (1/5)
-        let deletes = N / 5;
+        let _deletes = N / 5;
         for i in (1..=N as i64).step_by(5) {
             exec(&db, &format!("DELETE FROM orders WHERE id = {}", i));
         }

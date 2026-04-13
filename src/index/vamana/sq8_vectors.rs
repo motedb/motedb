@@ -489,9 +489,9 @@ mod tests {
         assert_eq!(v1.len(), 4);
 
         // Check accuracy
-        let expected = vec![1.0, 2.0, 3.0, 4.0];
-        for i in 0..4 {
-            assert!((v1[i] - expected[i]).abs() < 0.1);
+        let expected = [1.0, 2.0, 3.0, 4.0];
+        for (a, &b) in v1.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 0.1);
         }
 
         // Flush and reload

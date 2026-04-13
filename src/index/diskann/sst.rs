@@ -261,9 +261,9 @@ impl VamanaSSTFile {
         }
         
         let mut vector = vec![0.0f32; dim];
-        for i in 0..dim {
+        for (i, v) in vector.iter_mut().enumerate() {
             let bytes = &self.mmap[offset + i * 4..offset + (i + 1) * 4];
-            vector[i] = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            *v = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         
         Ok(vector)
@@ -353,6 +353,7 @@ impl VamanaSSTFile {
     }
     
     /// 从单个起点进行图搜索
+    #[allow(clippy::too_many_arguments)]
     fn graph_search_from_point(
         &self,
         query: &[f32],
@@ -943,8 +944,8 @@ fn write_sq8_vectors<W: Write>(writer: &mut W, nodes: &[(RowId, VectorNode)]) ->
     // 计算质心
     let mut centroid = vec![0.0f32; dim];
     for (_, node) in nodes {
-        for i in 0..dim {
-            centroid[i] += node.vector[i];
+        for (c, &v) in centroid.iter_mut().zip(node.vector.iter()) {
+            *c += v;
         }
     }
     for v in &mut centroid {
@@ -955,9 +956,9 @@ fn write_sq8_vectors<W: Write>(writer: &mut W, nodes: &[(RowId, VectorNode)]) ->
     let mut max_abs = vec![0.0f32; dim];
     
     for (_, node) in nodes {
-        for i in 0..dim {
-            let shifted = node.vector[i] - centroid[i];
-            max_abs[i] = max_abs[i].max(shifted.abs());
+        for (ma, (&v, &c)) in max_abs.iter_mut().zip(node.vector.iter().zip(centroid.iter())) {
+            let shifted = v - c;
+            *ma = ma.max(shifted.abs());
         }
     }
     

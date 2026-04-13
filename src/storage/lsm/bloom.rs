@@ -34,7 +34,7 @@ impl BloomFilter {
         // Optimal number of hash functions: k = (m/n) * ln(2)
         // Where m = total bits, n = number of keys
         let num_hashes = ((bits_per_key as f64) * 0.693).ceil() as u32;
-        let num_hashes = num_hashes.max(1).min(30); // Clamp to reasonable range
+        let num_hashes = num_hashes.clamp(1, 30); // Clamp to reasonable range
         
         Self {
             bits: vec![0u8; num_bytes],

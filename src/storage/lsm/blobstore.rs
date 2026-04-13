@@ -163,11 +163,10 @@ impl BlobStore {
                                 continue;
                             }
                             // Delete if no live references to this file
-                            if !live_file_ids.contains(&file_id) {
-                                if std::fs::remove_file(entry.path()).is_ok() {
+                            if !live_file_ids.contains(&file_id)
+                                && std::fs::remove_file(entry.path()).is_ok() {
                                     removed += 1;
                                 }
-                            }
                         }
                     }
                 }

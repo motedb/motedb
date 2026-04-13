@@ -177,9 +177,9 @@ impl DiskGraph {
         let index = self.index.read();
         let mut degrees: Vec<(RowId, usize)> = index
             .keys()
-            .filter_map(|&id| {
+            .map(|&id| {
                 let degree = self.neighbors(id).len();
-                Some((id, degree))
+                (id, degree)
             })
             .collect();
         

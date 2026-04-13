@@ -13,6 +13,16 @@
 //! - `mem_buffer`: Universal MemBuffer for all indexes
 //! - `index_metadata`: Index metadata management
 
+/// Check if the database is closed, return error if so.
+/// Called at the entry point of all public operations.
+macro_rules! ensure_open {
+    ($self:expr) => {
+        if $self.is_closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::StorageError::InvalidData("Database is closed".into()));
+        }
+    };
+}
+
 pub mod core;
 pub mod crud;
 pub mod table;

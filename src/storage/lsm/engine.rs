@@ -270,13 +270,8 @@ impl LSMEngine {
         let compaction_thread = thread::spawn(move || {
             let mut consecutive_no_work = 0;
             
-            loop {
+            while let Some(shutdown) = shutdown_weak.upgrade() {
                 // 🔧 Check shutdown signal (upgrade Weak to Arc)
-                let shutdown = match shutdown_weak.upgrade() {
-                    Some(s) => s,
-                    None => break,  // Engine dropped, exit gracefully
-                };
-                
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
@@ -961,11 +956,10 @@ impl LSMEngine {
                     immutable.len()
                 };
 
-                if queue_len < self.max_immutable_slots {
-                    if self.try_rotate_memtable().is_ok() {
+                if queue_len < self.max_immutable_slots
+                    && self.try_rotate_memtable().is_ok() {
                         break;
                     }
-                }
 
                 backpressure_count += 1;
                 if backpressure_count > 10000 {
@@ -1032,11 +1026,10 @@ impl LSMEngine {
                 immutable.len()
             };
 
-            if queue_len < self.max_immutable_slots {
-                if self.try_rotate_memtable().is_ok() {
+            if queue_len < self.max_immutable_slots
+                && self.try_rotate_memtable().is_ok() {
                     continue;
                 }
-            }
 
             backpressure_count += 1;
             if backpressure_count > 10000 {
@@ -2163,11 +2156,19 @@ impl LSMEngine {
 impl Drop for LSMEngine {
     fn drop(&mut self) {
         debug_log!("[LSMEngine::Drop] 🛑 Shutting down LSM engine...");
-        
-        // 🔧 Step 1: Signal background threads to shutdown
-        self.shutdown.store(true, Ordering::Relaxed);
 
-        // 🚀 Wake up both threads so they see the shutdown flag immediately
+        // 🔧 Step 1: Flush ALL data while background thread is still alive.
+        // This rotates active memtable → immutable queue, then waits for the
+        // background flush thread to drain the queue via condvar.
+        debug_log!("[LSMEngine::Drop] 💾 Flushing data (thread still alive)...");
+        if let Err(e) = self.flush() {
+            debug_log!("[LSMEngine::Drop] ⚠️  Flush failed: {:?}", e);
+        } else {
+            debug_log!("[LSMEngine::Drop] ✓ Flush complete");
+        }
+
+        // 🔧 Step 2: Signal shutdown and stop background threads
+        self.shutdown.store(true, Ordering::Relaxed);
         {
             let (lock, cvar) = &*self.flush_wakeup;
             if let Ok(mut guard) = lock.lock() { *guard = true; }
@@ -2179,36 +2180,23 @@ impl Drop for LSMEngine {
             cvar.notify_all();
         }
 
-        debug_log!("[LSMEngine::Drop] ✓ Shutdown signal sent");
-        
-        // 🔧 Step 2: Wait for background threads to exit FIRST
-        // This prevents deadlock: threads may hold flush_lock
         if let Some(compaction_thread) = self.compaction_thread.take() {
             debug_log!("[LSMEngine::Drop] ⏳ Waiting for compaction thread...");
             let _ = compaction_thread.join();
             debug_log!("[LSMEngine::Drop] ✓ Compaction thread stopped");
         }
-        
+
         if let Some(flush_thread) = self.flush_thread.take() {
             debug_log!("[LSMEngine::Drop] ⏳ Waiting for flush thread...");
             let _ = flush_thread.join();
             debug_log!("[LSMEngine::Drop] ✓ Flush thread stopped");
         }
-        
-        // 🔧 Step 3: Now safe to flush (no competing threads)
-        debug_log!("[LSMEngine::Drop] 💾 Performing final flush...");
-        if let Err(e) = self.flush() {
-            debug_log!("[LSMEngine::Drop] ⚠️  Final flush failed: {:?}", e);
-        } else {
-            debug_log!("[LSMEngine::Drop] ✓ Final flush complete");
-        }
-        
-        // 🔧 Step 4: Clear SSTable cache to release file handles
+
+        // 🔧 Step 3: Clear SSTable cache to release file handles
         self.sstable_cache.clear();
         debug_log!("[LSMEngine::Drop] ✓ Cache cleared");
-        
+
         debug_log!("[LSMEngine::Drop] ✅ LSM engine shutdown complete");
-        // ✅ All Arc references released, memory freed immediately
     }
 }
 
@@ -2239,16 +2227,14 @@ mod tests {
     #[test]
     fn test_memtable_flush() {
         let temp_dir = TempDir::new().unwrap();
-        let mut config = LSMConfig::default();
-        config.memtable_size = 100; // Small size to trigger flush
-        
+        let config = LSMConfig { memtable_size: 100, ..Default::default() };
+
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
         
         // Insert enough data to trigger flush
-        for i in 0..20 {
-            let key = i as u64;  // ✅ u64 key
+        for i in 0..20u64 {
             let value = Value::new(vec![0u8; 10], i);
-            engine.put(key, value).unwrap();
+            engine.put(i, value).unwrap();
         }
         
         // Explicitly flush
@@ -2261,6 +2247,6 @@ mod tests {
             .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
             .collect();
         
-        assert!(sstables.len() > 0, "Should have created at least one SSTable");
+        assert!(!sstables.is_empty(), "Should have created at least one SSTable");
     }
 }

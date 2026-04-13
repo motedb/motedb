@@ -731,6 +731,7 @@ impl TextFTSIndex {
     }
     
     /// Load metadata from disk
+    #[allow(clippy::type_complexity)]
     fn load_metadata(stats_path: &PathBuf) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>)> {
         let mut file = File::open(stats_path)?;
         let mut buffer = Vec::new();
@@ -873,6 +874,7 @@ pub struct TextFTSStats {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use tempfile::TempDir;

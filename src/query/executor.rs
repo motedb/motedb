@@ -18,6 +18,7 @@ impl ResultIterator {
     }
     
     /// Get next row
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<&Row> {
         if self.pos < self.rows.len() {
             let row = &self.rows[self.pos];

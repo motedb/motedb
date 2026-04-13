@@ -5,6 +5,7 @@
 //! 2. **版本管理**: 每次刷盘生成新版本，记录完整文件快照
 //! 3. **崩溃恢复**: 只加载 Manifest 中已提交的版本
 
+#[allow(clippy::module_inception)]
 mod manifest;
 mod version;
 

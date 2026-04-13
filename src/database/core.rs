@@ -136,6 +136,9 @@ pub struct MoteDB {
     /// which can cause deadlock via timestamp_index write lock contention
     pub(crate) checkpoint_mutex: Arc<Mutex<()>>,
 
+    /// 🛡️ Database closed flag — all operations check this and return error if true
+    pub(crate) is_closed: Arc<AtomicBool>,
+
     /// Auto-checkpoint thread (if enabled)
     auto_checkpoint_thread: Option<AutoCheckpointThread>,
 
@@ -144,6 +147,10 @@ pub struct MoteDB {
 
     /// Background index builder thread
     index_builder_thread: Option<IndexBuilderThread>,
+
+    /// File lock to prevent concurrent database opens on the same directory.
+    /// Holds an exclusive flock on `.lock` file. Released on Drop.
+    _lock_file: Option<std::fs::File>,
 }
 
 /// Auto-checkpoint background thread
@@ -183,7 +190,10 @@ impl MoteDB {
         
         // 🎯 统一目录结构：所有文件放在 {name}.mote/ 目录下
         std::fs::create_dir_all(&db_path)?;
-        
+
+        // 🔒 Acquire exclusive file lock to prevent concurrent opens
+        let lock_file = Self::acquire_lock(&db_path)?;
+
         let wal_path = db_path.join("wal");
         let lsm_dir = db_path.join("lsm");
         let indexes_dir = db_path.join("indexes");
@@ -252,9 +262,11 @@ impl MoteDB {
             pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
+            is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
             index_build_tx: None,
             index_builder_thread: None,
+            _lock_file: Some(lock_file),
         };
 
         // 🚀 P1: Async Index Build Pipeline
@@ -276,14 +288,10 @@ impl MoteDB {
         }
         
         // 🚀 Start auto-checkpoint thread if enabled
-        let auto_checkpoint_thread = if let Some(auto_config) = config.auto_checkpoint {
-            Some(Self::start_auto_checkpoint_thread(
+        let auto_checkpoint_thread = config.auto_checkpoint.map(|auto_config| Self::start_auto_checkpoint_thread(
                 db.clone_for_callback(),
                 auto_config,
-            ))
-        } else {
-            None
-        };
+            ));
         
         // Update db with the thread handle
         let mut db = db;
@@ -319,9 +327,11 @@ impl MoteDB {
             pk_lookup_capacity: self.pk_lookup_capacity,
             is_flushing: self.is_flushing.clone(),  // 🆕 共享 flush 标志
             checkpoint_mutex: self.checkpoint_mutex.clone(),
+            is_closed: self.is_closed.clone(),
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
             index_build_tx: None,  // Don't clone sender (only owned by original)
             index_builder_thread: None,  // Don't clone thread (only owned by original)
+            _lock_file: None,  // Don't clone lock (only owned by original)
         }
     }
 
@@ -341,6 +351,9 @@ impl MoteDB {
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         let path = path.as_ref();
         let db_path = path.with_extension("mote");
+
+        // 🔒 Acquire exclusive file lock to prevent concurrent opens
+        let lock_file = Self::acquire_lock(&db_path)?;
 
         // 🎯 统一目录结构：从 {name}.mote/ 目录读取
         let wal_path = db_path.join("wal");
@@ -498,9 +511,11 @@ impl MoteDB {
             pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
+            is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
             index_build_tx: None,
             index_builder_thread: None,
+            _lock_file: Some(lock_file),
         };
 
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
@@ -938,6 +953,47 @@ impl MoteDB {
         }
 
         Ok(max_id)
+    }
+
+    /// Acquire an exclusive file lock on the database directory.
+    ///
+    /// Creates a `.lock` file and acquires an exclusive `flock`.
+    /// Prevents two processes from opening the same database simultaneously.
+    /// The lock is automatically released when the File is dropped (on Drop).
+    fn acquire_lock(db_path: &Path) -> Result<std::fs::File> {
+        let lock_path = db_path.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        // Try exclusive, non-blocking lock
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let result = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                {
+                    return Err(StorageError::InvalidData(
+                        "Database is already open by another process".into()
+                    ));
+                }
+                return Err(StorageError::Io(err));
+            }
+        }
+
+        // Non-unix: just proceed without file locking
+        #[cfg(not(unix))]
+        {
+            // File locking not supported on this platform
+        }
+
+        Ok(file)
     }
 }
 

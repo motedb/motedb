@@ -24,6 +24,7 @@ impl MoteDB {
     /// let row_id = db.insert_row(vec![Value::Integer(1), Value::Text("Alice".into())])?;
     /// ```ignore
     pub fn insert_row(&self, row: Row) -> Result<RowId> {
+        ensure_open!(self);
         // 1. Allocate row ID
         let row_id = self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -56,6 +57,7 @@ impl MoteDB {
     /// let row = db.get_row(row_id)?.unwrap();
     /// ```ignore
     pub fn get_row(&self, row_id: RowId) -> Result<Option<Row>> {
+        ensure_open!(self);
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
         
@@ -96,6 +98,7 @@ impl MoteDB {
     /// db.update_row(row_id, vec![Value::Text(Text::from("new"))])?;
     /// ```ignore
     pub fn update_row(&self, row_id: RowId, new_row: Row) -> Result<()> {
+        ensure_open!(self);
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
         
@@ -129,6 +132,7 @@ impl MoteDB {
     /// assert!(db.get_row(row_id)?.is_none());
     /// ```ignore
     pub fn delete_row(&self, row_id: RowId) -> Result<()> {
+        ensure_open!(self);
         let table_name = "_default";
         let composite_key = self.make_composite_key(table_name, row_id);
 
@@ -254,6 +258,7 @@ impl MoteDB {
     /// ])?;
     /// ```ignore
     pub fn insert_row_to_table(&self, table_name: &str, mut row: Row) -> Result<RowId> {
+        ensure_open!(self);
         // 1. Get table schema
         let schema = self.table_registry.get_table(table_name)?;
         
@@ -272,7 +277,7 @@ impl MoteDB {
 
             // 🚀 Phase 5: Overflow protection (B1)
             let id = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if id >= i64::MAX {
+            if !(0..=i64::MAX - 1000).contains(&id) {
                 return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
             }
 
@@ -433,6 +438,7 @@ impl MoteDB {
     /// let row = db.get_table_row("users", row_id)?;
     /// ```ignore
     pub fn get_table_row(&self, table_name: &str, row_id: RowId) -> Result<Option<Row>> {
+        ensure_open!(self);
         // Validate table exists
         let _schema = self.table_registry.get_table(table_name)?;
         
@@ -499,6 +505,7 @@ impl MoteDB {
     /// db.update_row_in_table("users", row_id, old_row, vec![Value::Integer(1), Value::Text("Bob".into())])?;
     /// ```ignore
     pub fn update_row_in_table(&self, table_name: &str, row_id: RowId, old_row: Row, new_row: Row) -> Result<()> {
+        ensure_open!(self);
         // 1. Get schema (old_row is now passed in to avoid re-loading)
         let schema = self.table_registry.get_table(table_name)?;
         
@@ -635,6 +642,7 @@ impl MoteDB {
     /// db.delete_row_from_table("users", row_id, old_row)?;
     /// ```ignore
     pub fn delete_row_from_table(&self, table_name: &str, row_id: RowId, old_row: Row) -> Result<()> {
+        ensure_open!(self);
         // 1. Get schema (old_row is now passed in to avoid re-loading)
         let schema = self.table_registry.get_table(table_name)?;
 
@@ -755,6 +763,7 @@ impl MoteDB {
     /// let rows = db.scan_table_rows("users")?;
     /// ```ignore
     pub fn scan_table_rows(&self, table_name: &str) -> Result<Vec<(RowId, Row)>> {
+        ensure_open!(self);
         // Get table schema first (validates table exists)
         let _schema = self.table_registry.get_table(table_name)?;
         
@@ -820,6 +829,7 @@ impl MoteDB {
         table_name: &str,
         batch_size: usize,
     ) -> Result<TableRowBatchedIterator> {
+        ensure_open!(self);
         // Get table schema first (validates table exists)
         let _schema = self.table_registry.get_table(table_name)?;
         
@@ -865,6 +875,7 @@ impl MoteDB {
         &self,
         table_name: &str,
     ) -> Result<TableRowStreamingIterator> {
+        ensure_open!(self);
         // Get table schema first (validates table exists)
         let _schema = self.table_registry.get_table(table_name)?;
         
@@ -1003,6 +1014,7 @@ impl MoteDB {
     /// let row_ids = db.batch_insert_rows_to_table("users", rows)?;
     /// ```ignore
     pub fn batch_insert_rows_to_table(&self, table_name: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+        ensure_open!(self);
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -1295,7 +1307,7 @@ impl MoteDB {
         let count = self.pending_updates.fetch_add(1, Ordering::Relaxed);
         
         // 每2000条触发一次flush（与LSM一致）
-        if count % 2_000 == 0 && count > 0 {
+        if count.is_multiple_of(2_000) && count > 0 {
             debug_log!("[AUTO-FLUSH] Triggered after {} writes", count);
             
             let db_clone = self.clone_for_callback();

@@ -20,6 +20,9 @@ use parking_lot::{RwLock, Mutex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Type alias to reduce complexity of the immutable buffer list.
+type ImmutableBufferList<K, V> = Arc<RwLock<Vec<Arc<BufferState<K, V>>>>>;
+
 /// Generic index buffer for all index types (RocksDB-style Immutable Snapshot)
 ///
 /// # Architecture
@@ -55,7 +58,7 @@ where
 
     /// Immutable buffers (read-only, being flushed)
     /// Ordered from oldest to newest
-    immutable: Arc<RwLock<Vec<Arc<BufferState<K, V>>>>>,
+    immutable: ImmutableBufferList<K, V>,
 
     /// Size limit in bytes (e.g., 1MB)
     size_limit: usize,

@@ -211,10 +211,8 @@ impl PartitionWAL {
 
             next_lsn = lsn + 1;
             // Deserialize record to check for Checkpoint
-            if let Ok(record) = bincode::deserialize::<WALRecord>(&record_data) {
-                if let WALRecord::Checkpoint { lsn: cp_lsn } = record {
-                    last_checkpoint = cp_lsn;
-                }
+            if let Ok(WALRecord::Checkpoint { lsn: cp_lsn }) = bincode::deserialize::<WALRecord>(&record_data) {
+                last_checkpoint = cp_lsn;
             }
         }
         
@@ -331,6 +329,15 @@ impl PartitionWAL {
     }
 
     /// Create a checkpoint
+    ///
+    /// Uses atomic write-new-rename pattern for crash safety:
+    /// 1. Write checkpoint record and sync
+    /// 2. Create a new empty WAL file at a temp path
+    /// 3. Sync the temp file
+    /// 4. Atomically rename temp → original path
+    /// 5. Reopen the new file
+    ///
+    /// If crash occurs at any point, the original WAL is intact.
     fn checkpoint(&mut self) -> Result<()> {
         if self.next_lsn == 0 {
             return Ok(());
@@ -341,13 +348,28 @@ impl PartitionWAL {
         self.last_checkpoint = lsn;
 
         // Ensure checkpoint record is durable BEFORE truncating.
-        // Without this sync, a crash after set_len(0) but before sync_all()
-        // could leave an empty WAL, losing uncommitted records.
         self.file.sync_all()?;
 
-        // Now safe to truncate — checkpoint is durable
-        self.file.set_len(0)?;
-        self.file.sync_all()?;
+        // Atomic truncation: write-new-rename pattern
+        // Create a fresh empty WAL file at a temp path
+        let tmp_path = self.path.with_extension("wal.tmp");
+        {
+            let tmp_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp_file.sync_all()?;
+        }
+
+        // Atomic rename: temp → original (on same filesystem, this is atomic)
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        // Reopen the new empty file
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
 
         // Reset counters
         self.next_lsn = 0;

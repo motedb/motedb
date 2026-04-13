@@ -29,6 +29,7 @@ fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
     db.execute(sql).expect("execute SQL").materialize().expect("materialize")
 }
 
+#[allow(dead_code)]
 fn print_header(title: &str) {
     println!("\n{}", "=".repeat(90));
     println!("  {}", title);
@@ -574,7 +575,7 @@ fn bench_e2e_lifecycle() {
     println!("{}", "=".repeat(90));
 
     // Phase 1: Insert
-    let _insert_ms = {
+    {
         let db = Database::create(&db_path).expect("create db");
         exec(&db, "CREATE TABLE lifecycle (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, ts INTEGER)");
 
@@ -674,7 +675,7 @@ fn bench_concurrent_mixed() {
 
         let total_ops: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
-        print_result(&format!("Concurrent INSERT 10K (4 threads)", ), total_ops, elapsed);
+        print_result("Concurrent INSERT 10K (4 threads)", total_ops, elapsed);
         elapsed
     };
 
@@ -686,6 +687,7 @@ fn bench_concurrent_mixed() {
 // Summary helper
 // ═══════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 fn exec_count(db: &Database, sql: &str) -> i64 {
     let result = exec(db, sql);
     match result {

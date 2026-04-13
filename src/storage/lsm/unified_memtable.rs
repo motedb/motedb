@@ -425,7 +425,7 @@ mod tests {
         
         let retrieved = memtable.get(key).unwrap().unwrap();
         assert_eq!(retrieved.timestamp, 1);
-        assert_eq!(retrieved.deleted, false);
+        assert!(!retrieved.deleted);
     }
     
     #[test]
@@ -459,7 +459,7 @@ mod tests {
         let query = vec![5.0, 6.0, 7.0];
         let results = memtable.vector_search(&query, 3).unwrap();
         
-        assert!(results.len() > 0);
+        assert!(!results.is_empty());
         assert!(results.len() <= 3);
         
         // 验证返回的是完整 entry
@@ -487,18 +487,17 @@ mod tests {
         debug_log!("Memory size: {} bytes", size_after);
         
         // 应该约等于: 4 (data) + 512 (vector) + 16 (metadata) = 532 bytes
-        assert!(size_after >= 500 && size_after <= 600);
+        assert!((500..=600).contains(&size_after));
     }
     
     #[test]
     fn test_should_flush() {
-        let mut config = LSMConfig::default();
-        config.memtable_size = 5000; // 5KB for testing
-        
+        let config = LSMConfig { memtable_size: 5000, ..Default::default() };
+
         let memtable = UnifiedMemTable::new_with_vector_support(&config, 128);
-        
-        assert_eq!(memtable.should_flush(), false);
-        
+
+        assert!(!memtable.should_flush());
+
         // 插入数据直到需要 flush
         // 每个 entry 约 532 bytes, 5000/532 ≈ 9 个
         for i in 0..10 {
@@ -506,7 +505,7 @@ mod tests {
             let vector = vec![1.0f32; 128];
             memtable.put_with_vector(i, data, vector, i).unwrap();
         }
-        
-        assert_eq!(memtable.should_flush(), true);
+
+        assert!(memtable.should_flush());
     }
 }

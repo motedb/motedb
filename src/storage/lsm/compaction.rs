@@ -272,6 +272,10 @@ pub struct CompactionConfig {
     pub lsm_config: LSMConfig,
 }
 
+/// Type alias to reduce complexity of the post-compaction callback type.
+type PostCompactionCbFn = Box<dyn Fn(&[PathBuf]) + Send + Sync>;
+type PostCompactionCb = Arc<std::sync::RwLock<Option<PostCompactionCbFn>>>;
+
 /// Compaction worker
 pub struct CompactionWorker {
     /// Storage directory
@@ -289,7 +293,7 @@ pub struct CompactionWorker {
     /// Callback invoked after compaction replaces SSTables.
     /// Receives the paths of SSTables that were removed, so the cache can
     /// evict only those entries instead of clearing entirely.
-    post_compaction_cb: Arc<std::sync::RwLock<Option<Box<dyn Fn(&[PathBuf]) + Send + Sync>>>>,
+    post_compaction_cb: PostCompactionCb,
 
     /// 🚀 P0 Optimization: Cached snapshot of all SSTable metadata
     /// Readers access this via cheap Arc clone (no Mutex contention).
@@ -339,8 +343,8 @@ impl CompactionWorker {
             if path.extension().and_then(|e| e.to_str()) == Some("sst") {
                 // Parse level from filename: "l{level}_*.sst"
                 let file_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
-                let level = if file_name.starts_with('l') {
-                    file_name[1..].split('_').next()
+                let level = if let Some(rest) = file_name.strip_prefix('l') {
+                    rest.split('_').next()
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(0)
                 } else {
@@ -385,7 +389,7 @@ impl CompactionWorker {
     /// Set a callback to invoke after compaction replaces SSTables.
     /// The callback receives the paths of SSTables that were removed by compaction.
     /// Used to selectively invalidate SSTableCache entries.
-    pub fn set_post_compaction_cb(&self, cb: Box<dyn Fn(&[PathBuf]) + Send + Sync>) {
+    pub fn set_post_compaction_cb(&self, cb: PostCompactionCbFn) {
         let mut guard = self.post_compaction_cb.write().unwrap();
         *guard = Some(cb);
     }

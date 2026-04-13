@@ -25,6 +25,7 @@ impl MoteDB {
     /// db.create_table(schema)?;
     /// ```
     pub fn create_table(&self, schema: TableSchema) -> Result<()> {
+        ensure_open!(self);
         // Register table in catalog (acquires metadata.write() lock)
         self.table_registry.create_table(schema.clone())?;
         // 🔓 Lock released here
@@ -60,6 +61,7 @@ impl MoteDB {
     /// db.drop_table("users")?;
     /// ```
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
+        ensure_open!(self);
         self.table_registry.drop_table(table_name)?;
         // Clean up per-table caches
         self.pk_lookup.remove(table_name);

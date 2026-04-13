@@ -134,8 +134,9 @@ pub fn encode_posting_list(
 }
 
 /// Decode a posting list
-/// 
+///
 /// Returns: (doc_ids, positions_if_present)
+#[allow(clippy::type_complexity)]
 pub fn decode_posting_list(bytes: &[u8]) -> Result<(Vec<u64>, Option<Vec<Vec<u32>>>)> {
     let mut pos = 0;
     

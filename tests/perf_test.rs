@@ -233,7 +233,7 @@ fn test_perf_durability() {
     const N: usize = 5_000;
 
     // Phase 1: Write
-    let write_ms = {
+    let _write_ms = {
         let db = Database::create(&db_path).expect("create db");
         exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, num INTEGER)");
 
@@ -313,13 +313,13 @@ fn test_perf_mixed_crud() {
         }
 
         // Update every 3rd
-        let updates = N / 3;
+        let _updates = N / 3;
         for i in (1..=N as i64).step_by(3) {
             exec(&db, &format!("UPDATE t SET score = -1 WHERE id = {}", i));
         }
 
         // Delete every 5th
-        let deletes = N / 5;
+        let _deletes = N / 5;
         for i in (1..=N as i64).step_by(5) {
             exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
         }

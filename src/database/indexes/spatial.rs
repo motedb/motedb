@@ -29,6 +29,7 @@ impl MoteDB {
     /// db.create_spatial_index("locations", bounds)?;
     /// ```
     pub fn create_spatial_index(&self, name: &str, bounds: BoundingBox) -> Result<()> {
+        ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/spatial_{name}/
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
@@ -230,6 +231,7 @@ impl MoteDB {
     /// let results = db.spatial_range_query("locations", &bbox)?;
     /// ```
     pub fn spatial_range_query(&self, index_name: &str, bbox: &BoundingBox) -> Result<Vec<RowId>> {
+        ensure_open!(self);
         let index_ref = self.spatial_indexes.get(index_name)
             .ok_or_else(|| StorageError::Index(format!("Spatial index '{}' not found", index_name)))?;
         

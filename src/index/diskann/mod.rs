@@ -66,16 +66,16 @@ impl PartialEq for Candidate {
 
 impl Eq for Candidate {}
 
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // 🔥 修复：最大堆（BinaryHeap 默认是最大堆，我们要距离大的在堆顶）
         // 这样 pop() 出来的是距离最大的，留在堆里的是距离最小的
-        self.distance.partial_cmp(&other.distance)
+        self.distance.partial_cmp(&other.distance).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }

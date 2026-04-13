@@ -442,15 +442,15 @@ impl PartialEq for DistanceEntry {
 
 impl Eq for DistanceEntry {}
 
-impl PartialOrd for DistanceEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.dist.partial_cmp(&self.dist)
+impl Ord for DistanceEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.dist.partial_cmp(&self.dist).unwrap_or(Ordering::Equal)
     }
 }
 
-impl Ord for DistanceEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+impl PartialOrd for DistanceEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -629,6 +629,8 @@ impl CellStorage {
                 std::fs::create_dir_all(dir)?;
                 let path = dir.join("spatial_cells.mmap");
                 
+                // truncate intentionally omitted: file is pre-allocated via set_len()
+                #[allow(clippy::suspicious_open_options)]
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -740,7 +742,7 @@ impl CellStorage {
         for (cell_id, tree) in self.hot_cache.iter() {
             if tree.is_dirty {
                 // ✅ 直接序列化引用（无需clone整个树）
-                let serialized = bincode::serialize(&*tree)
+                let serialized = bincode::serialize(tree)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 
                 let data = if self.config.enable_compression {
@@ -1261,6 +1263,7 @@ fn bbox_min_dist_f32(bbox: &BoundingBoxF32, point: &PointF32) -> f32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     
@@ -1322,9 +1325,9 @@ mod tests {
         let query_point = Point::new(25.0, 25.0);
         let results = index.knn_query(&query_point, 3);
         
-        assert!(results.len() > 0);
+        assert!(!results.is_empty());
     }
-    
+
     #[test]
     fn test_lru_cache() {
         use tempfile::TempDir;
@@ -1351,7 +1354,7 @@ mod tests {
         // Query should still work even with evicted cells
         let bbox = BoundingBox::new(0.0, 0.0, 30.0, 30.0);
         let results = index.range_query(&bbox);
-        assert!(results.len() > 0, "Should find points in range");
+        assert!(!results.is_empty(), "Should find points in range");
     }
     
     #[test]
@@ -1422,7 +1425,7 @@ mod tests {
         // Query before save
         let bbox_before = BoundingBox::new(0.0, 0.0, 20.0, 20.0);
         let results_before = index.range_query(&bbox_before);
-        assert!(results_before.len() > 0, "Should find points before save");
+        assert!(!results_before.is_empty(), "Should find points before save");
         
         // Save
         let save_path = temp_dir.path().join("index");
@@ -1446,7 +1449,7 @@ mod tests {
         // Query after load
         let bbox_after = BoundingBox::new(0.0, 0.0, 20.0, 20.0);
         let results_after = index2.range_query(&bbox_after);
-        assert!(results_after.len() > 0, "Should find points after load");
+        assert!(!results_after.is_empty(), "Should find points after load");
         assert_eq!(results_before.len(), results_after.len(), "Results should match");
     }
 }

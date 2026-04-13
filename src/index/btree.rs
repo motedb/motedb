@@ -48,6 +48,9 @@ const BTREE_MAGIC: u32 = 0x42545245;
 /// Current B+Tree format version
 const BTREE_VERSION: u32 = 1;
 
+/// Type alias for the insert result: (old_value, optional split_info)
+type InsertResult = Result<(Option<u64>, Option<(u64, u64)>)>;
+
 /// SuperBlock for B+Tree metadata (stored in Page 0)
 /// This ensures we can recover critical metadata on reopen
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -103,7 +106,7 @@ pub struct BTree {
     /// - Thread A: seek(page 0) → write(page 0 data)
     /// - Thread B: seek(page 1) ← interrupts Thread A!
     /// - Thread A: continues write ← now writing to wrong offset!
-    /// Result: Data corruption (invalid num_keys, etc.)
+    ///   Result: Data corruption (invalid num_keys, etc.)
     flush_lock: Arc<Mutex<()>>,
     
     /// Storage path
@@ -428,6 +431,7 @@ impl BTree {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&storage_path)?;
         
         // Check if file is new or existing
@@ -779,7 +783,7 @@ impl BTree {
                 let page_ref = new_root.read()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
                 let new_root_id = page_ref.page_id;
-                self.flush_page(&*page_ref)?;
+                self.flush_page(&page_ref)?;
                 drop(page_ref);
 
                 // Update root ID
@@ -811,8 +815,8 @@ impl BTree {
     
     /// Internal recursive insert with split handling
     /// Returns (old_value, split_info) where split_info is (split_key, new_page_id)
-    fn insert_internal(&mut self, page_id: u64, key: u64, value: u64) 
-        -> Result<(Option<u64>, Option<(u64, u64)>)> {
+    fn insert_internal(&mut self, page_id: u64, key: u64, value: u64)
+        -> InsertResult {
         
         let page_arc = self.load_page(page_id)?;
         let is_leaf = {
@@ -1723,8 +1727,8 @@ mod tests {
         // Verify scan returns all entries in order
         let all = btree.scan().unwrap();
         assert_eq!(all.len(), 1000);
-        for i in 0..1000 {
-            assert_eq!(all[i], (i as u64, (i * 10) as u64));
+        for (i, &(k, v)) in all.iter().enumerate() {
+            assert_eq!((k, v), (i as u64, (i * 10) as u64));
         }
     }
     

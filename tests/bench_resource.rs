@@ -7,7 +7,6 @@
 use motedb::Database;
 use tempfile::TempDir;
 use std::time::{Instant, Duration};
-use std::collections::BinaryHeap;
 
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
@@ -139,7 +138,7 @@ fn bench_memory_footprint() {
         // Checkpoint + drop
         db.checkpoint().expect("checkpoint");
         drop(db);
-        let (rss_after_drop, _) = print_memory("After checkpoint + drop DB");
+        let (_rss_after_drop, _) = print_memory("After checkpoint + drop DB");
     }
 
     // 100K rows
@@ -411,7 +410,7 @@ fn bench_concurrent_cpu() {
     let mut handles = vec![];
 
     // Read threads
-    for t in 0..2 {
+    for _t in 0..2 {
         let db_clone = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             let mut count = 0;

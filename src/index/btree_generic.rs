@@ -74,13 +74,19 @@ const BTREE_MAGIC: u32 = 0x47425452; // "GBTR" (Generic BTree)
 /// Format version
 const BTREE_VERSION: u32 = 2; // Bumped to v2 for overflow support
 
+/// Type alias for page cache
+type PageCache<K> = Arc<RwLock<LruCache<u64, Arc<RwLock<Page<K>>>>>>;
+
+/// Type alias for the insert result: (old_value, optional split_info)
+type GenericInsertResult<K> = Result<(Option<Vec<u8>>, Option<(K, u64)>)>;
+
 /// Generic B+Tree with fixed-size keys and variable-length values
 pub struct GenericBTree<K: BTreeKey> {
     /// Root page ID
     root_page_id: Arc<RwLock<u64>>,
     
     /// Page cache (page_id -> Page)
-    page_cache: Arc<RwLock<LruCache<u64, Arc<RwLock<Page<K>>>>>>,
+    page_cache: PageCache<K>,
     
     /// Next free page ID
     next_page_id: Arc<RwLock<u64>>,
@@ -573,6 +579,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(!exists)
             .open(&storage_path)?;
         
         let (root_page_id, next_page_id) = if !exists {
@@ -700,8 +707,8 @@ impl<K: BTreeKey> GenericBTree<K> {
     }
     
     /// Internal iterative insert with split handling (avoids stack overflow)
-    fn insert_internal(&mut self, mut page_id: u64, key: K, value: Vec<u8>) 
-        -> Result<(Option<Vec<u8>>, Option<(K, u64)>)> {
+    fn insert_internal(&mut self, mut page_id: u64, key: K, value: Vec<u8>)
+        -> GenericInsertResult<K> {
         
         // 🔧 ITERATIVE IMPLEMENTATION: Use a stack to track path instead of recursion
         let mut path_stack: Vec<(u64, usize)> = Vec::new(); // (page_id, child_index)
@@ -877,8 +884,8 @@ impl<K: BTreeKey> GenericBTree<K> {
     /// OLD RECURSIVE VERSION (kept for reference, not used)
     #[allow(dead_code)]
     #[allow(unused_variables)]
-    fn insert_internal_recursive(&mut self, page_id: u64, key: K, value: Vec<u8>) 
-        -> Result<(Option<Vec<u8>>, Option<(K, u64)>)> {
+    fn insert_internal_recursive(&mut self, page_id: u64, key: K, value: Vec<u8>)
+        -> GenericInsertResult<K> {
         // This is kept for reference only and is not called
         // The actual implementation uses the iterative version above
         unimplemented!("Use iterative insert_internal instead")

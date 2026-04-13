@@ -174,6 +174,9 @@ impl Iterator for MergingIterator {
 mod tests {
     use super::*;
     use crate::storage::lsm::ValueData;
+
+    /// Type alias to reduce complexity of boxed iterator sources in tests.
+    type BoxedIter = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
     
     #[test]
     fn test_merging_iterator_basic() {
@@ -190,7 +193,7 @@ mod tests {
             Ok((6, Value::new(vec![6], 100))),
         ];
         
-        let sources: Vec<Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>> = vec![
+        let sources: Vec<BoxedIter> = vec![
             Box::new(source1.into_iter()),
             Box::new(source2.into_iter()),
         ];
@@ -228,7 +231,7 @@ mod tests {
             })),
         ];
         
-        let sources: Vec<Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>> = vec![
+        let sources: Vec<BoxedIter> = vec![
             Box::new(source1.into_iter()),
             Box::new(source2.into_iter()),
             Box::new(source3.into_iter()),
@@ -262,7 +265,7 @@ mod tests {
             Ok((3, Value::new(vec![3], 100))),
         ];
         
-        let sources: Vec<Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>> = vec![
+        let sources: Vec<BoxedIter> = vec![
             Box::new(source1.into_iter()),
         ];
         

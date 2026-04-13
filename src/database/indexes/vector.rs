@@ -34,6 +34,7 @@ impl MoteDB {
     /// db.create_vector_index("products_embedding", 768)?;
     /// ```
     pub fn create_vector_index(&self, name: &str, dimension: usize, metric: Option<&str>) -> Result<()> {
+        ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/vector_{name}/
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
@@ -222,6 +223,7 @@ impl MoteDB {
     /// }
     /// ```
     pub fn vector_search(&self, index_name: &str, query: &[f32], k: usize) -> Result<Vec<(RowId, f32)>> {
+        ensure_open!(self);
         debug_log!("[vector_search] START: index={}, k={}", index_name, k);
         
         let index_ref = self.vector_indexes.get(index_name)

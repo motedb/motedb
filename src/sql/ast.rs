@@ -2,6 +2,7 @@
 use crate::types::Value;
 
 /// Top-level SQL statement
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Statement {
     Select(SelectStmt),
