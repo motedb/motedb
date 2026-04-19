@@ -758,17 +758,16 @@ impl<K: BTreeKey> GenericBTree<K> {
                     if serialized_size > PAGE_SIZE {
                         // Revert and split
                         let temp_value = page.values[idx].clone();
+                        let target_key = page.keys[idx].clone();
                         page.values[idx] = old.clone().unwrap();
-                        
+
                         let split_key_clone = page.keys[page.num_keys * 2 / 5].clone();
                         let split_info = self.split_leaf(&mut page)?;
                         self.write_page(&page)?;
-                        
+
                         // Re-apply update
                         let mut left_page = self.read_page(page.page_id)?;
                         let mut right_page = self.read_page(split_info.1)?;
-                        
-                        let target_key = page.keys[idx].clone();
                         if target_key < split_key_clone {
                             let update_idx = left_page.keys.binary_search(&target_key).unwrap();
                             left_page.values[update_idx] = temp_value;

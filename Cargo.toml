@@ -111,3 +111,9 @@ panic = "abort"  # panic 直接 abort（-10% 大小）
 inherits = "release"
 opt-level = "z"  # 优化大小
 lto = "fat"
+
+[profile.release-test]
+# Benchmark profile: release optimizations but unwind for test harness
+inherits = "release"
+panic = "unwind"
+strip = false
