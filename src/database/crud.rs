@@ -349,7 +349,7 @@ impl MoteDB {
             if let Some(pk_name) = schema.primary_key() {
                 if col_name == pk_name && !schema.is_primary_key_auto_increment() {
                     if let Some(lookup) = self.pk_lookup.get(table_name) {
-                        lookup.insert(col_value.to_hash_key(), row_id);
+                        lookup.insert(crate::database::pk_cache::PkKey::from_value(col_value), row_id);
                     }
                 }
             }
@@ -671,7 +671,7 @@ impl MoteDB {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if let Some(pk_value) = old_row.get(pk_col.position) {
                         if let Some(lookup) = self.pk_lookup.get(table_name) {
-                            lookup.remove(&pk_value.to_hash_key());
+                            lookup.remove_pk(&crate::database::pk_cache::PkKey::from_value(pk_value));
                         }
                     }
                 }

@@ -721,8 +721,8 @@ impl QueryExecutor {
 
         if is_non_auto_pk {
             // In-memory PK lookup: O(1) LRU cache instead of disk B-Tree
-            let key = value.to_hash_key();
-            let row_id = self.resolve_pk_with_cache(table, &key, column, value)?;
+            let pk_key = crate::database::pk_cache::PkKey::from_value(value);
+            let row_id = self.resolve_pk_with_cache(table, &pk_key, column, value)?;
 
             if let Some(rid) = row_id {
                 let row = self.db.get_table_row(table, rid)?;
@@ -3612,13 +3612,13 @@ impl QueryExecutor {
     fn resolve_pk_with_cache(
         &self,
         table: &str,
-        pk_hash_key: &str,
+        pk_key: &crate::database::pk_cache::PkKey,
         pk_col_name: &str,
         pk_value: &Value,
     ) -> Result<Option<RowId>> {
         // Try LRU cache first
         if let Some(lookup) = self.db.pk_lookup.get(table) {
-            if let Some(rid) = lookup.get(pk_hash_key) {
+            if let Some(rid) = lookup.get_pk(pk_key) {
                 return Ok(Some(rid));
             }
         }
@@ -3629,7 +3629,7 @@ impl QueryExecutor {
         // Refill cache from disk result so next lookup is O(1)
         if let Some(&rid) = row_ids.first() {
             if let Some(lookup) = self.db.pk_lookup.get(table) {
-                lookup.insert(pk_hash_key.to_string(), rid);
+                lookup.insert(pk_key.clone(), rid);
             }
         }
 
@@ -3654,7 +3654,7 @@ impl QueryExecutor {
             }
         } else {
             // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
-            let pk_key = target_value.to_hash_key();
+            let pk_key = crate::database::pk_cache::PkKey::from_value(target_value);
             match self.resolve_pk_with_cache(&stmt.table, &pk_key, pk_col_name, target_value)? {
                 Some(rid) => vec![rid],
                 None => vec![],
@@ -3709,7 +3709,7 @@ impl QueryExecutor {
             }
         } else {
             // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
-            let pk_key = target_value.to_hash_key();
+            let pk_key = crate::database::pk_cache::PkKey::from_value(target_value);
             match self.resolve_pk_with_cache(&stmt.table, &pk_key, pk_col_name, target_value)? {
                 Some(rid) => vec![rid],
                 None => vec![],
@@ -5169,6 +5169,40 @@ impl QueryExecutor {
                 }
             };
             
+            // 🚀 Check row_cache first (microsecond-level hit, skips deserialize)
+            if let Some(cached_row) = self.db.row_cache.get(table_name, row_id) {
+                let is_select_star = stmt.columns.len() == 1
+                    && matches!(stmt.columns[0], SelectColumn::Star);
+
+                if is_select_star {
+                    let column_names: Vec<String> = schema.columns.iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    let result_row: Vec<Value> = schema.columns.iter()
+                        .map(|col| cached_row.get(col.position).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    return Ok(Some(QueryResult::Select {
+                        columns: column_names,
+                        rows: vec![result_row],
+                    }));
+                }
+
+                let sql_row = row_to_sql_row(&cached_row, &schema)?;
+                let mut prefixed_row = SqlRow::new();
+                prefixed_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                prefixed_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                for (col_name, val) in sql_row {
+                    let qualified_name = format!("{}.{}", table_name, col_name);
+                    prefixed_row.insert(qualified_name, val);
+                }
+                let sql_rows = vec![(row_id, prefixed_row)];
+                let (column_names, result_rows) = self.project_columns(&stmt.columns, &sql_rows, &schema)?;
+                return Ok(Some(QueryResult::Select {
+                    columns: column_names,
+                    rows: result_rows,
+                }));
+            }
+
             // 🚀 Direct LSM get (skip column index completely!)
             let composite_key = self.db.make_composite_key(table_name, row_id);
             match self.db.lsm_engine.get(composite_key)? {
@@ -5190,6 +5224,9 @@ impl QueryExecutor {
                     
                     let row = bincode::deserialize::<crate::types::Row>(data)
                         .map_err(|e| StorageError::InvalidData(format!("Deserialization failed: {}", e)))?;
+
+                    // Populate row_cache for future hot-path lookups
+                    self.db.row_cache.put(table_name.to_string(), row_id, row.clone());
 
                     // 🚀 Fast path for SELECT *: skip HashMap conversion entirely
                     //     Direct positional projection from Vec<Value> — saves 2*N HashMap

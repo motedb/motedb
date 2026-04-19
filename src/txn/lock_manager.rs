@@ -196,10 +196,14 @@ impl LockManager {
             txn_locks.remove(&txn_id).unwrap_or_default()
         };
 
-        // Release each lock
+        // Release each lock and clean up empty entries
         for row_id in locked_rows {
             if let Some(entry) = self.locks.get(&row_id) {
                 entry.release(txn_id);
+                if entry.holders.read().is_empty() {
+                    drop(entry);
+                    self.locks.remove(&row_id);
+                }
             }
         }
 
