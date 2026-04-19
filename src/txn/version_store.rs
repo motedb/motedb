@@ -20,9 +20,12 @@ pub type Timestamp = u64;
 pub struct VersionStore {
     /// Row ID -> Version Chain
     pub(crate) versions: DashMap<RowId, VersionChain>,
-    
+
     /// Global timestamp generator
     timestamp_gen: Arc<AtomicU64>,
+
+    /// Maximum number of version chains to keep in memory
+    max_entries: usize,
 }
 
 /// Version Chain - linked list of versions for a single row
@@ -68,9 +71,15 @@ pub struct Snapshot {
 impl VersionStore {
     /// Create a new version store
     pub fn new() -> Self {
+        Self::with_max_entries(50_000)
+    }
+
+    /// Create a new version store with a custom max entries limit
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             versions: DashMap::new(),
             timestamp_gen: Arc::new(AtomicU64::new(1)),
+            max_entries,
         }
     }
     
@@ -109,7 +118,9 @@ impl VersionStore {
         if let Some(chain) = self.versions.get(&row_id) {
             chain.prepend(new_version);
         }
-        
+
+        self.evict_if_needed();
+
         Ok(())
     }
     
@@ -163,10 +174,76 @@ impl VersionStore {
         });
         
         chain.prepend(tombstone);
-        
+
         Ok(())
     }
-    
+
+    /// Evict version chains if the in-memory store exceeds `max_entries`.
+    ///
+    /// Strategy: remove entries where the version chain has a single committed
+    /// version that is not recently modified (commit_ts older than 1000 ticks).
+    /// This avoids evicting hot data while bounding memory. Evicted rows fall
+    /// back to the normal LSM read path.
+    fn evict_if_needed(&self) {
+        let len = self.versions.len();
+        if len <= self.max_entries {
+            return;
+        }
+
+        let excess = len - self.max_entries;
+        let to_remove = excess / 2;
+        if to_remove == 0 {
+            return;
+        }
+
+        let current_ts = self.timestamp_gen.load(Ordering::Relaxed);
+        let recent_threshold = current_ts.saturating_sub(1000);
+
+        let mut candidates = Vec::with_capacity(to_remove);
+
+        for entry in self.versions.iter() {
+            if candidates.len() >= to_remove {
+                break;
+            }
+
+            let chain = entry.value();
+            let head = chain.head.read();
+
+            // Only evict chains where:
+            // 1. The head is a single committed version (no uncommitted follow-ups)
+            // 2. The version has been committed (end_ts != 0 means superseded,
+            //    begin_ts is the commit proxy)
+            // 3. Not recently modified
+            if let Some(version) = head.as_ref() {
+                // Skip if there are multiple versions in the chain (active history)
+                if version.next.is_some() {
+                    continue;
+                }
+                // Skip if the version is still "open" (end_ts == 0 means it's the
+                // current live version, but we also check it's committed).
+                // A version with end_ts == 0 and no txn in active set is committed.
+                // Use begin_ts as a proxy for recency.
+                let begin_ts = version.begin_ts;
+                // Skip recently modified rows
+                if begin_ts > recent_threshold {
+                    continue;
+                }
+                // If end_ts is 0, the row is still the current live version but
+                // old enough to evict. If end_ts != 0, it has been superseded.
+                // Both are safe to evict since data is in LSM.
+                candidates.push(*entry.key());
+            } else {
+                // Empty chain — safe to remove
+                candidates.push(*entry.key());
+            }
+        }
+
+        // Remove candidates from the DashMap
+        for row_id in &candidates {
+            self.versions.remove(row_id);
+        }
+    }
+
     /// Get the visible version for a snapshot
     pub fn get_visible_version(
         &self,

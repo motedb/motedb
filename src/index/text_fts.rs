@@ -14,8 +14,10 @@ use crate::index::text_types::{
 };
 use crate::index::text_dictionary::ChunkedDictionary;
 use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig};
+use lru::LruCache;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::fs::{File, OpenOptions};
@@ -46,8 +48,8 @@ pub struct TextFTSIndex {
     pending_posting_lists: Arc<RwLock<HashMap<TermId, PostingList>>>,
     
     /// Shard counters per term (track next shard_idx to avoid scanning)
-    /// Memory cost: ~4 MB for 300K unique terms
-    shard_counters: Arc<RwLock<HashMap<TermId, u32>>>,
+    /// Bounded by LRU capacity to cap memory usage
+    shard_counters: Arc<RwLock<LruCache<TermId, u32>>>,
     
     /// Tokenizer
     tokenizer: Arc<dyn Tokenizer>,
@@ -155,6 +157,23 @@ impl TextFTSIndex {
         enable_positions: bool,
         dict_cache_size: usize,
     ) -> Result<Self> {
+        Self::with_config_and_lru_capacity(
+            storage_path,
+            tokenizer,
+            enable_positions,
+            dict_cache_size,
+            NonZeroUsize::new(50_000).unwrap(),
+        )
+    }
+
+    /// Create with custom configuration and explicit LRU capacity for shard counters
+    pub fn with_config_and_lru_capacity(
+        storage_path: PathBuf,
+        tokenizer: Arc<dyn Tokenizer>,
+        enable_positions: bool,
+        dict_cache_size: usize,
+        shard_lru_capacity: NonZeroUsize,
+    ) -> Result<Self> {
         // Create storage directory
         let storage_dir = storage_path.with_extension("fts.d");
         std::fs::create_dir_all(&storage_dir)?;
@@ -191,7 +210,7 @@ impl TextFTSIndex {
             btree: Arc::new(RwLock::new(btree)),
             dictionary: Arc::new(dictionary),
             pending_posting_lists: Arc::new(RwLock::new(HashMap::new())),
-            shard_counters: Arc::new(RwLock::new(HashMap::new())),
+            shard_counters: Arc::new(RwLock::new(LruCache::new(shard_lru_capacity))),
             tokenizer,
             bm25_config: BM25Config::default(),
             enable_positions,
@@ -491,10 +510,19 @@ impl TextFTSIndex {
         // Extract base term_id (lower 24 bits)
         let base_term_id = term_id & 0x00FFFFFF;
 
-        // Use shard_counters to know exactly how many shards exist
+        // Use shard_counters LRU to know exactly how many shards exist;
+        // on cache miss, probe the BTree to discover the shard count.
         let max_shard_idx = {
             let counters = self.shard_counters.read();
-            *counters.get(&term_id).unwrap_or(&1)
+            if let Some(&count) = counters.peek(&term_id) {
+                count
+            } else {
+                drop(counters);
+                let count = self.discover_shard_count(term_id, btree)?;
+                let mut counters = self.shard_counters.write();
+                counters.put(term_id, count);
+                count
+            }
         };
 
         // Only scan known shards (not 0-256!)
@@ -546,6 +574,34 @@ impl TextFTSIndex {
             posting.load_positions(&bytes);
         }
         Ok(Some(posting))
+    }
+
+    /// Discover shard count for a term by probing the BTree.
+    ///
+    /// Scans keys in range [base_term_id, (0xFE << 24) | base_term_id] and
+    /// counts how many distinct shard indices exist (shard 0..0xFE, excluding
+    /// the position key at shard 0xFE).
+    fn discover_shard_count(
+        &self,
+        term_id: TermId,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<u32> {
+        let base_term_id = term_id & 0x00FFFFFF;
+        let range_start = base_term_id; // shard 0 key
+        let range_end = (0xFEu32 << 24) | base_term_id; // position shard key (inclusive bound)
+
+        let entries = btree.range(&range_start, &range_end)?;
+
+        let mut max_shard_idx: u32 = 0;
+        for (key, _) in &entries {
+            let shard_idx = *key >> 24;
+            // Only count data shards (0..0xFE), skip position shard (0xFE)
+            if shard_idx < 0xFE && shard_idx + 1 > max_shard_idx {
+                max_shard_idx = shard_idx + 1;
+            }
+        }
+
+        Ok(max_shard_idx)
     }
     
     /// Search for documents containing query terms
@@ -965,7 +1021,7 @@ impl TextFTSIndex {
             let shard_key = (next_shard_idx << 24) | base_term_id;
             btree.insert(shard_key, bytes.to_vec())?;
 
-            shard_counters.insert(*term_id, next_shard_idx + 1);
+            shard_counters.put(*term_id, next_shard_idx + 1);
 
             // Write positions to separate key (shard 0xFE) for phrase query support
             let pos_key = (0xFEu32 << 24) | base_term_id;
@@ -1008,11 +1064,11 @@ impl TextFTSIndex {
         }
         
         {
-            let mut counters = self.shard_counters.write();
             // NOTE: Do NOT clear shard_counters! They are needed for
             // load_posting_list_sharded() to know how many shards exist per term.
             // Clearing would cause data loss (only shard 0 would be read after flush).
-            counters.shrink_to_fit();  // 释放capacity
+            // LRU automatically evicts cold entries when capacity is exceeded.
+            let _counters = self.shard_counters.write();
         }
         
         {
@@ -1045,22 +1101,10 @@ impl TextFTSIndex {
         Ok(())
     }
     
-    /// 🚀 P0 NEW: 主动清理shard_counters中的非活跃term
-    /// 防止shard_counters无限增长（300K terms × 12B = 3.6 MB）
+    /// No-op now that shard_counters is bounded by LRU capacity.
+    /// Kept as a stub for call-site compatibility.
     fn cleanup_shard_counters(&self) {
-        let pending_terms: std::collections::HashSet<TermId> = 
-            self.pending_posting_lists.read().keys().copied().collect();
-        
-        let mut shard_counters = self.shard_counters.write();
-        let before_count = shard_counters.len();
-        
-        shard_counters.retain(|term_id, _| pending_terms.contains(term_id));
-        
-        let after_count = shard_counters.len();
-        if before_count > after_count {
-            debug_log!("    ↳ [CLEANUP] Shard counters: {} → {} (-{} inactive terms)",
-                     before_count, after_count, before_count - after_count);
-        }
+        // LRU handles eviction automatically; no manual cleanup needed.
     }
     
     /// Save metadata to disk
@@ -1180,9 +1224,34 @@ impl TextFTSIndex {
         term_id: TermId,
     ) -> Result<()> {
         let base_term_id = term_id & 0x00FFFFFF;
-        let shard_counters = self.shard_counters.read();
-        let shard_count = *shard_counters.get(&term_id).unwrap_or(&0);
-        drop(shard_counters);
+
+        // Read shard count from LRU; on miss, discover from BTree.
+        // We temporarily release the write lock on btree to take a read guard,
+        // but since consolidate is called from flush() which holds the btree write
+        // lock, we use a direct get approach instead.
+        let shard_count = {
+            let counters = self.shard_counters.read();
+            if let Some(&count) = counters.peek(&term_id) {
+                count
+            } else {
+                // LRU miss: probe BTree for shard count.
+                // We already hold the btree write guard, so we can call range directly.
+                drop(counters);
+                let range_start = base_term_id;
+                let range_end = (0xFEu32 << 24) | base_term_id;
+                let entries = btree.range(&range_start, &range_end)?;
+                let mut max_shard: u32 = 0;
+                for (key, _) in &entries {
+                    let shard_idx = *key >> 24;
+                    if shard_idx < 0xFE && shard_idx + 1 > max_shard {
+                        max_shard = shard_idx + 1;
+                    }
+                }
+                let mut counters = self.shard_counters.write();
+                counters.put(term_id, max_shard);
+                max_shard
+            }
+        };
 
         if shard_count <= 1 {
             return Ok(());
@@ -1231,7 +1300,7 @@ impl TextFTSIndex {
                 let _ = btree.delete(&(shard_idx << 24 | base_term_id));
             }
             let mut shard_counters = self.shard_counters.write();
-            shard_counters.insert(term_id, 0);
+            shard_counters.put(term_id, 0);
             return Ok(());
         }
 
@@ -1247,7 +1316,7 @@ impl TextFTSIndex {
 
         // Reset counter to 1
         let mut shard_counters = self.shard_counters.write();
-        shard_counters.insert(term_id, 1);
+        shard_counters.put(term_id, 1);
 
         Ok(())
     }
