@@ -928,7 +928,41 @@ impl ColumnarStore {
 
             let blocks = manager.read_columns(segment, &col_ids)?;
 
-            // Decode schema columns
+            // P2: Predicate pushdown — decode timestamp column first to find matching rows
+            let ts_block = blocks.iter().find(|b| {
+                column_ids.iter().any(|(id, name)| {
+                    *id == b.column_id && schema.timeseries_column.as_ref().map(|t| t == name).unwrap_or(false)
+                })
+            });
+
+            let matching_rows: Vec<usize> = if let Some(ts_blk) = ts_block {
+                if ts_blk.encoding == ColumnEncoding::GorillaTimestamp {
+                    let ts_micros = gorilla::decode_timestamps(&ts_blk.data, segment.row_count as usize);
+
+                    if segment.is_timestamp_sorted {
+                        let start = ts_micros.iter().position(|&m| m >= start_ts).unwrap_or(ts_micros.len());
+                        let end = ts_micros.iter().rposition(|&m| m <= end_ts).map(|i| i + 1).unwrap_or(0);
+                        if start >= end { continue; }
+                        (start..end).filter(|&i| ts_micros[i] >= start_ts && ts_micros[i] <= end_ts).collect()
+                    } else {
+                        ts_micros.iter().enumerate()
+                            .filter(|(_, &m)| m >= start_ts && m <= end_ts)
+                            .map(|(i, _)| i)
+                            .collect()
+                    }
+                } else {
+                    // Non-gorilla encoding — fall back to full scan
+                    (0..segment.row_count as usize).collect()
+                }
+            } else {
+                (0..segment.row_count as usize).collect()
+            };
+
+            if matching_rows.is_empty() {
+                continue;
+            }
+
+            // Now decode only needed columns for matching rows
             let schema_blocks: Vec<&ColumnBlock> = blocks.iter()
                 .filter(|b| b.column_id < segment.column_count as u16)
                 .collect();
@@ -948,40 +982,10 @@ impl ColumnarStore {
                 None
             };
 
-            // Find timestamp column index for filtering
-            let ts_col_idx = schema.timeseries_column.as_ref().and_then(|ts_col| {
-                column_ids.iter().position(|(_, name)| name == ts_col)
-            });
-
-            // Determine row range to scan
-            let (row_start, row_end) = if segment.is_timestamp_sorted {
-                // Binary search: find [start_ts, end_ts] range
-                self.binary_search_timestamp_range(
-                    &decoded, &column_ids, ts_col_idx, start_ts, end_ts,
-                )
-            } else {
-                (0, segment.row_count as usize)
-            };
-
-            // Filter by time range and construct SqlRow
-            for row_idx in row_start..row_end {
+            // Construct SqlRow for matching rows only
+            for &row_idx in &matching_rows {
                 if row_idx >= decoded.len() {
                     break;
-                }
-
-                // Check time range (needed even for sorted segments — the
-                // binary search gives a tight range but edge rows may still
-                // fall outside due to duplicate timestamps)
-                if let Some(ts_idx) = ts_col_idx {
-                    let col_idx = column_ids[ts_idx].0 as usize;
-                    if col_idx < decoded[row_idx].len() {
-                        if let Value::Timestamp(ts) = &decoded[row_idx][col_idx] {
-                            let micros = ts.as_micros();
-                            if micros < start_ts || micros > end_ts {
-                                continue;
-                            }
-                        }
-                    }
                 }
 
                 let mut sql_row = SqlRow::new();
@@ -992,7 +996,6 @@ impl ColumnarStore {
                     }
                 }
 
-                // P1: Use exact row_id from stored column, fallback to approximate
                 let row_id = if let Some(ref ids) = exact_row_ids {
                     ids.get(row_idx).copied().unwrap_or(segment.min_row_id + row_idx as u64)
                 } else {

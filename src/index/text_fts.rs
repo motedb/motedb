@@ -943,36 +943,8 @@ impl TextFTSIndex {
             let base_term_id = *term_id & 0x00FFFFFF;
             let next_shard_idx = *shard_counters.get(term_id).unwrap_or(&0);
 
-            // Merge with existing shards on disk
-            let merged = if next_shard_idx > 0 {
-                let mut merged_posting = posting.clone();
-                // Read existing shards and merge
-                for shard_idx in 0..next_shard_idx {
-                    let shard_key = (shard_idx << 24) | base_term_id;
-                    if let Ok(Some(bytes)) = btree.get(&shard_key) {
-                        if !bytes.is_empty() {
-                            // Try block format first, then legacy
-                            if super::text_types::BlockPostingList::is_block_format(&bytes) {
-                                if let Ok(block_list) = super::text_types::BlockPostingList::deserialize(&bytes) {
-                                    let mut cursor = block_list.cursor();
-                                    while cursor.is_valid() {
-                                        merged_posting.add(cursor.current_doc() as u64, None);
-                                        cursor.advance();
-                                    }
-                                }
-                            } else if let Ok(shard) = PostingList::deserialize_compact(&bytes) {
-                                merged_posting.merge(&shard);
-                            }
-                        }
-                    }
-                }
-                merged_posting
-            } else {
-                posting.clone()
-            };
-
-            // Remove tombstoned docs
-            let doc_ids = merged.doc_ids();
+            // Remove tombstoned docs from the new posting only
+            let doc_ids = posting.doc_ids();
             let mut clean_ids: Vec<u32> = Vec::new();
             let mut clean_tfs: Vec<u16> = Vec::new();
             for &doc_id_u64 in &doc_ids {
@@ -980,7 +952,7 @@ impl TextFTSIndex {
                 if deleted.contains(&doc_id) { continue; }
                 if deleted_term_docs.contains(&(*term_id, doc_id)) { continue; }
                 clean_ids.push(doc_id_u64 as u32);
-                clean_tfs.push(merged.term_frequency(doc_id));
+                clean_tfs.push(posting.term_frequency(doc_id));
             }
 
             if clean_ids.is_empty() { continue; }
@@ -989,25 +961,25 @@ impl TextFTSIndex {
             let block_list = super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
             let bytes = block_list.as_bytes();
 
-            // Write as shard 0 (replacing all old shards)
-            let shard_key = 0 << 24 | base_term_id;
+            // Append-only: write as a new shard (no merge with existing shards)
+            let shard_key = (next_shard_idx << 24) | base_term_id;
             btree.insert(shard_key, bytes.to_vec())?;
 
-            // Delete old shard entries
-            for shard_idx in 1..next_shard_idx {
-                let old_key = (shard_idx << 24) | base_term_id;
-                let _ = btree.delete(&old_key);
-            }
-
-            // Update counter to 1 (single consolidated shard)
-            shard_counters.insert(*term_id, 1);
+            shard_counters.insert(*term_id, next_shard_idx + 1);
 
             // Write positions to separate key (shard 0xFE) for phrase query support
             let pos_key = (0xFEu32 << 24) | base_term_id;
-            if let Some(pos_bytes) = merged.serialize_positions_for(&clean_ids) {
+            if let Some(pos_bytes) = posting.serialize_positions_for(&clean_ids) {
                 btree.insert(pos_key, pos_bytes)?;
             } else {
                 let _ = btree.delete(&pos_key);
+            }
+
+            // Lazy consolidation: merge shards when count exceeds threshold
+            if next_shard_idx + 1 >= 5 {
+                if let Err(e) = self.consolidate_shards_for_term(&mut btree, *term_id) {
+                    debug_log!("[FTS] Shard consolidation failed for term {}: {}", term_id, e);
+                }
             }
         }
 
@@ -1201,6 +1173,85 @@ impl TextFTSIndex {
     /// 🔥 P0 CRITICAL FIX: Use append-only incremental writes to avoid memory explosion
     /// Old approach: load ALL 680K entries (8+ MB) on every flush → OOM
     /// New approach: append new entries to incremental file → O(pending size) memory
+    /// Merge all shards for a term into a single shard (lazy consolidation)
+    fn consolidate_shards_for_term(
+        &self,
+        btree: &mut parking_lot::RwLockWriteGuard<'_, crate::index::btree_generic::GenericBTree<u32>>,
+        term_id: TermId,
+    ) -> Result<()> {
+        let base_term_id = term_id & 0x00FFFFFF;
+        let shard_counters = self.shard_counters.read();
+        let shard_count = *shard_counters.get(&term_id).unwrap_or(&0);
+        drop(shard_counters);
+
+        if shard_count <= 1 {
+            return Ok(());
+        }
+
+        // Read and merge all shards
+        let mut merged = PostingList::new();
+        for shard_idx in 0..shard_count {
+            let shard_key = (shard_idx << 24) | base_term_id;
+            if let Ok(Some(bytes)) = btree.get(&shard_key) {
+                if !bytes.is_empty() {
+                    if super::text_types::BlockPostingList::is_block_format(&bytes) {
+                        if let Ok(block_list) = super::text_types::BlockPostingList::deserialize(&bytes) {
+                            let mut cursor = block_list.cursor();
+                            while cursor.is_valid() {
+                                merged.add(cursor.current_doc() as u64, None);
+                                cursor.advance();
+                            }
+                        }
+                    } else if let Ok(shard) = PostingList::deserialize_compact(&bytes) {
+                        merged.merge(&shard);
+                    }
+                }
+            }
+        }
+
+        // Filter deleted docs
+        let deleted = self.deleted_docs.read();
+        let deleted_term_docs = self.deleted_term_docs.read();
+        let doc_ids = merged.doc_ids();
+        let mut clean_ids: Vec<u32> = Vec::new();
+        let mut clean_tfs: Vec<u16> = Vec::new();
+        for &doc_id_u64 in &doc_ids {
+            let doc_id = doc_id_u64 as DocId;
+            if deleted.contains(&doc_id) { continue; }
+            if deleted_term_docs.contains(&(term_id, doc_id)) { continue; }
+            clean_ids.push(doc_id_u64 as u32);
+            clean_tfs.push(merged.term_frequency(doc_id));
+        }
+        drop(deleted);
+        drop(deleted_term_docs);
+
+        if clean_ids.is_empty() {
+            // Delete all shards
+            for shard_idx in 0..shard_count {
+                let _ = btree.delete(&(shard_idx << 24 | base_term_id));
+            }
+            let mut shard_counters = self.shard_counters.write();
+            shard_counters.insert(term_id, 0);
+            return Ok(());
+        }
+
+        // Write consolidated as shard 0
+        let block_list = super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
+        let bytes = block_list.as_bytes();
+        btree.insert(0 << 24 | base_term_id, bytes.to_vec())?;
+
+        // Delete old shards
+        for shard_idx in 1..shard_count {
+            let _ = btree.delete(&(shard_idx << 24 | base_term_id));
+        }
+
+        // Reset counter to 1
+        let mut shard_counters = self.shard_counters.write();
+        shard_counters.insert(term_id, 1);
+
+        Ok(())
+    }
+
     fn flush_doc_lengths_if_needed(&mut self, _force: bool) -> Result<()> {
         let mut pending_doc_lens = self.pending_doc_lengths.write();
         if pending_doc_lens.is_empty() {
