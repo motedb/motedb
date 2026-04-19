@@ -137,10 +137,64 @@ impl IOctreeIndex {
         tree_insert(&self.leaf_store, &mut self.root, point, bucket_size, min_extent)
     }
 
-    /// Batch insert multiple 3D points
+    /// Batch insert multiple 3D points with Morton-code sorting for locality.
+    ///
+    /// Sorts points by Z-order curve before inserting, which fills leaves
+    /// sequentially and reduces tree splits significantly compared to
+    /// random-order insertion.
     pub fn batch_insert(&mut self, items: Vec<(u64, Geometry)>) -> Result<()> {
-        for (row_id, geom) in items {
-            self.insert(row_id, &geom)?;
+        if items.is_empty() {
+            return Ok(());
+        }
+        if items.len() < 64 {
+            for (row_id, geom) in items {
+                self.insert(row_id, &geom)?;
+            }
+            return Ok(());
+        }
+
+        // Convert to IndexedPoint3D, expanding bounds in one pass
+        let mut points: Vec<IndexedPoint3D> = Vec::with_capacity(items.len());
+        for (row_id, geom) in &items {
+            match geom {
+                Geometry::Point3D(p) => {
+                    self.world_bounds.expand(p);
+                    points.push(IndexedPoint3D::from_point3d(p, *row_id));
+                }
+                Geometry::Point(p) => {
+                    let p3 = Point3D::new(p.x as f64, p.y as f64, 0.0);
+                    self.world_bounds.expand(&p3);
+                    points.push(IndexedPoint3D::from_point3d(&p3, *row_id));
+                }
+                _ => {}
+            }
+        }
+
+        // Expand root once to cover all points
+        let max_coord = points.iter().map(|p| p.x.max(p.y).max(p.z)).fold(0.0f32, f32::max);
+        let min_coord = points.iter().map(|p| p.x.min(p.y).min(p.z)).fold(0.0f32, f32::min);
+        let abs_max = max_coord.abs().max(min_coord.abs()) + 1.0;
+        while !self.root_contains(&[abs_max, abs_max, abs_max]) {
+            self.expand_root();
+        }
+
+        // Sort by Morton code for spatial locality
+        let bounds_min = [
+            self.world_bounds.min_x as f32,
+            self.world_bounds.min_y as f32,
+            self.world_bounds.min_z as f32,
+        ];
+        let bounds_max = [
+            (self.world_bounds.max_x - self.world_bounds.min_x) as f32,
+            (self.world_bounds.max_y - self.world_bounds.min_y) as f32,
+            (self.world_bounds.max_z - self.world_bounds.min_z) as f32,
+        ];
+        points.sort_by_key(|p| morton_encode_3d(p, &bounds_min, &bounds_max));
+
+        // Insert in sorted order (sequential leaf fills, fewer splits)
+        for point in points {
+            self.insert_into_tree(point)?;
+            self.size += 1;
         }
         Ok(())
     }
@@ -405,6 +459,34 @@ fn tree_box_delete(store: &LeafStore, octant: &mut Octant, min: &[f32; 3], max: 
             total_removed
         }
     }
+}
+
+/// Encode a 3D point into a 64-bit Morton code (Z-order curve key).
+/// Normalizes coordinates to [0, 2^21) per axis and interleaves bits.
+fn morton_encode_3d(p: &IndexedPoint3D, bounds_min: &[f32; 3], bounds_range: &[f32; 3]) -> u64 {
+    let mut code: u64 = 0;
+    for axis in 0..3 {
+        let range = bounds_range[axis];
+        let normalized = if range > 0.0 {
+            ((p.as_array()[axis] - bounds_min[axis]) / range)
+                .clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        // 21 bits per axis → 63 bits total
+        let v = (normalized * ((1u64 << 21) - 1) as f32) as u64;
+        // Spread bits: bit i → bit (i * 3 + axis)
+        let mut bits = v;
+        let mut shift = 0u64;
+        while bits != 0 {
+            if bits & 1 != 0 {
+                code |= 1u64 << (shift * 3 + axis as u64);
+            }
+            bits >>= 1;
+            shift += 1;
+        }
+    }
+    code
 }
 
 pub use node::child_center;

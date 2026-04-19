@@ -1628,91 +1628,10 @@ impl LSMEngine {
     /// let rows = engine.scan_range(start_key, end_key)?;
     /// ```ignore
     pub fn scan_range(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
-        use std::collections::BTreeMap;
-        
-        // Step 1: Collect from MemTable (newest data)
-        let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
-        
-        {
-            let memtable = self.memtable.read();
-            let entries = memtable.scan(start, end)?;
-            
-            for (k, entry) in entries {
-                let value = Value {
-                    data: entry.data,
-                    timestamp: entry.timestamp,
-                    deleted: entry.deleted,
-                };
-                merged.insert(k, value);
-            }
-        }
-        
-        // Step 2: Collect from Immutable queue (timestamp-based dedup)
-        {
-            let immutable = self.immutable.read();
-
-            for memtable in immutable.iter() {
-                let entries = memtable.scan(start, end)?;
-
-                for (k, entry) in entries {
-                    let value = Value {
-                        data: entry.data,
-                        timestamp: entry.timestamp,
-                        deleted: entry.deleted,
-                    };
-                    merged.entry(k).and_modify(|existing| {
-                        if value.timestamp > existing.timestamp {
-                            *existing = value.clone();
-                        }
-                    }).or_insert(value);
-                }
-            }
-        }
-        
-        // Step 3: Collect from SSTables (timestamp-based dedup)
-        let sstable_paths = self.compaction_worker.list_sstables()?;
-
-        for path in sstable_paths.iter() {
-            // Skip if file doesn't exist (may have been compacted)
-            if !path.exists() {
-                continue;
-            }
-
-            // Use cache to get SSTable
-            let cached = match self.sstable_cache.get_or_open(path) {
-                Ok(cached) => cached,
-                Err(_) => continue,
-            };
-
-            let mut sstable = match cached.handle.lock() {
-                Ok(sst) => sst,
-                Err(_) => continue,
-            };
-
-            // Scan SSTable
-            let entries = match sstable.scan(start, end) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    debug_log!("[scan_range] Warning: SSTable scan failed for {:?}: {:?}", path, e);
-                    continue;
-                }
-            };
-
-            for (k, value) in entries {
-                merged.entry(k).and_modify(|existing| {
-                    if value.timestamp > existing.timestamp {
-                        *existing = value.clone();
-                    }
-                }).or_insert(value);
-            }
-        }
-        
-        // Step 4: Filter out deleted entries and return
-        let results: Vec<(Key, Value)> = merged.into_iter()
-            .filter(|(_, v)| !v.deleted)
-            .collect();
-        
-        Ok(results)
+        // Use streaming merge instead of materializing into BTreeMap.
+        // Memory: O(sources) instead of O(total results).
+        let iter = self.scan_range_streaming(start, end)?;
+        Ok(iter.filter_map(|r| r.ok()).collect())
     }
     
     /// 🚀 PHASE B: Parallel range scan (2-3x faster for large scans)
