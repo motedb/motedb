@@ -10,8 +10,8 @@
 //!
 //! ## 架构
 //! - 存储层: WAL + Fragmented Column Store (5K rows/fragment)
-//! - 索引层: Vamana (vector) + R-Tree (spatial) + Inverted (text) + B+Tree (timestamp)
-//! - 查询层: Cost-based optimizer + Volcano-style executor
+//! - 索引层: Vamana (vector) + i-Octree (spatial) + Inverted (text) + B+Tree (timestamp)
+//! - 查询层: Cost-based optimizer + streaming executor
 //! - 事务层: MVCC + Write-Ahead Logging
 
 // 🔧 移除 jemalloc 以减小二进制大小
@@ -42,7 +42,6 @@ macro_rules! debug_log {
 pub mod config;
 pub mod storage;
 pub mod index;
-pub mod query;
 pub mod txn;
 pub mod types;
 pub mod distance;

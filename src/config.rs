@@ -267,7 +267,7 @@ pub enum IndexUpdateStrategy {
     /// 
     /// 批量构建的索引：
     /// - 向量索引（DiskANN）
-    /// - 空间索引（R-Tree）
+    /// - 空间索引（i-Octree）
     /// - 全文索引（FTS）
     /// - 低频查询的索引
     /// 

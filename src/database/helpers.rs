@@ -13,8 +13,6 @@ impl MoteDB {
     /// Batch build all indexes for a specific table
     pub(crate) fn batch_build_table_indexes(&self, table_name: &str, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
-        use std::thread;
-        
         let _start = Instant::now();
 
         debug_log!("[BatchIndexBuilder]   📊 Table '{}': {} rows", table_name, rows.len());

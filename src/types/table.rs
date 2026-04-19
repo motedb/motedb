@@ -150,7 +150,7 @@ pub enum IndexType {
     FullText,
     /// Vector similarity index (DiskANN)
     Vector { dimension: usize },
-    /// Spatial index (Grid + R-Tree)
+    /// Spatial index (i-Octree)
     Spatial,
     /// Timestamp index (B+Tree)
     Timestamp,
