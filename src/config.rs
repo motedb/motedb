@@ -422,6 +422,9 @@ pub struct DBConfig {
     /// None = Disabled (user must manually call checkpoint())
     /// Some(...) = Enabled with automatic cleanup
     pub auto_checkpoint: Option<AutoCheckpointConfig>,
+
+    /// Columnar store configuration (for TimeSeries tables)
+    pub columnar_config: crate::storage::columnar::config::ColumnarConfig,
 }
 
 /// Auto-checkpoint trigger configuration
@@ -495,6 +498,7 @@ impl Default for DBConfig {
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
             query_timeout_secs: None,  // No timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
+            columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
         }
     }
 }
@@ -556,6 +560,38 @@ impl DBConfig {
             row_cache_size: Some(500),
             pk_lookup_capacity: 10_000,  // ~800KB per table (memory-constrained)
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
+            index_update_strategy: IndexUpdateStrategy::BatchOnly,
+            ..Default::default()
+        }
+    }
+
+    /// Robotics preset: optimized for high-frequency sensor ingestion.
+    ///
+    /// Targets: IMU 100Hz-1kHz, motor controllers, occasional image embeddings.
+    /// Memory: ~20MB typical, ~50MB peak.
+    ///
+    /// - WAL: Periodic 50ms, 32MB (tolerates small data loss window)
+    /// - LSM: 4MB memtable, 2 partitions (low memory, fewer threads)
+    /// - Auto-checkpoint: 8MB WAL trigger, 60s interval
+    /// - Index strategy: BatchOnly (highest throughput for sensor data)
+    pub fn for_robotics() -> Self {
+        Self {
+            wal_config: WALConfig {
+                durability_level: DurabilityLevel::Periodic { interval_ms: 50 },
+                max_wal_size: 32 * 1024 * 1024, // 32MB
+                ..Default::default()
+            },
+            num_partitions: 2,
+            lsm_config: LSMConfig {
+                memtable_size_limit: 4 * 1024 * 1024, // 4MB
+                ..Default::default()
+            },
+            row_cache_size: Some(500),
+            pk_lookup_capacity: 10_000,
+            auto_checkpoint: Some(AutoCheckpointConfig {
+                max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
+                min_interval_secs: 60,
+            }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             ..Default::default()
         }

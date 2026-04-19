@@ -186,8 +186,6 @@ impl Checksum {
 
 /// Checksum 增量构建器（用于流式数据）
 pub struct ChecksumBuilder {
-    #[allow(dead_code)]
-    checksum_type: ChecksumType,
     hasher: Option<Hasher>,
 }
 
@@ -200,7 +198,6 @@ impl ChecksumBuilder {
         };
 
         Self {
-            checksum_type,
             hasher,
         }
     }

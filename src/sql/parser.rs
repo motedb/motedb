@@ -397,9 +397,9 @@ impl Parser {
                 Ok(Statement::CreateIndex(self.parse_create_index()?))
             }
             TokenType::Identifier(id) => {
-                // Check for SPATIAL keyword (GEOMETRY is already handled above)
+                // Check for SPATIAL/OCTREE keywords (GEOMETRY is already handled above)
                 let id_upper = id.to_uppercase();
-                if id_upper == "SPATIAL" {
+                if id_upper == "SPATIAL" || id_upper == "OCTREE" {
                     Ok(Statement::CreateIndex(self.parse_create_index()?))
                 } else {
                     Err(self.error("Expected TABLE or INDEX after CREATE"))
@@ -412,12 +412,72 @@ impl Parser {
     fn parse_create_table(&mut self) -> Result<CreateTableStmt> {
         self.expect(TokenType::Table)?;
         let table = self.parse_identifier()?;
-        
+
         self.expect(TokenType::LParen)?;
         let columns = self.parse_column_defs()?;
         self.expect(TokenType::RParen)?;
-        
-        Ok(CreateTableStmt { table, columns })
+
+        // Parse optional TIMESERIES(ts_column) clause
+        let mut table_type = crate::types::TableType::Standard;
+        let mut timeseries_column = None;
+
+        if self.match_token(TokenType::Timeseries) {
+            table_type = crate::types::TableType::TimeSeries;
+            self.expect(TokenType::LParen)?;
+            timeseries_column = Some(self.parse_identifier()?);
+            self.expect(TokenType::RParen)?;
+        }
+
+        // Parse optional TTL clause: TTL 7d / TTL 24h / TTL 30m / TTL 3600s
+        let mut ttl = None;
+        if self.match_token(TokenType::Ttl) {
+            ttl = Some(self.parse_ttl_duration()?);
+        }
+
+        Ok(CreateTableStmt {
+            table,
+            columns,
+            table_type,
+            timeseries_column,
+            ttl,
+        })
+    }
+
+    /// Parse TTL duration: NUMBER followed by s/m/h/d suffix
+    /// Examples: 7d, 24h, 30m, 3600s
+    fn parse_ttl_duration(&mut self) -> Result<crate::types::TTLDuration> {
+        let value = self.parse_i64()?;
+        if value <= 0 {
+            return Err(self.error("TTL duration must be positive"));
+        }
+
+        // Look for a unit suffix as an identifier
+        let unit = if let TokenType::Identifier(ref id) = self.current().token_type {
+            let u = id.to_lowercase();
+            self.advance();
+            u
+        } else {
+            // Default to seconds if no unit specified
+            "s".to_string()
+        };
+
+        let duration = match unit.as_str() {
+            "s" | "sec" | "secs" | "second" | "seconds" => {
+                crate::types::TTLDuration::from_secs(value as u64)
+            }
+            "m" | "min" | "mins" | "minute" | "minutes" => {
+                crate::types::TTLDuration::from_mins(value as u64)
+            }
+            "h" | "hr" | "hrs" | "hour" | "hours" => {
+                crate::types::TTLDuration::from_hours(value as u64)
+            }
+            "d" | "day" | "days" => {
+                crate::types::TTLDuration::from_days(value as u64)
+            }
+            _ => return Err(self.error(&format!("Unknown TTL unit: '{}'", unit))),
+        };
+
+        Ok(duration)
     }
     
     fn parse_column_defs(&mut self) -> Result<Vec<ColumnDef>> {
@@ -519,19 +579,23 @@ impl Parser {
             }
             TokenType::Geometry => {
                 self.advance();
-                IndexType::Spatial
+                IndexType::Octree
             }
             TokenType::Timestamp => {
                 self.advance();
                 IndexType::Timestamp
             }
             TokenType::Identifier(ref id) => {
-                // Also check for SPATIAL keyword (not a data type)
+                // Also check for SPATIAL/OCTREE keywords (not a data type)
                 let id_upper = id.to_uppercase();
                 match id_upper.as_str() {
                     "SPATIAL" => {
                         self.advance();
-                        IndexType::Spatial
+                        IndexType::Octree
+                    }
+                    "OCTREE" => {
+                        self.advance();
+                        IndexType::Octree
                     }
                     _ => IndexType::BTree,  // Default
                 }
@@ -563,7 +627,8 @@ impl Parser {
                         "BTREE" => IndexType::BTree,
                         "TEXT" => IndexType::Text,
                         "VECTOR" => IndexType::Vector,
-                        "SPATIAL" => IndexType::Spatial,
+                        "SPATIAL" => IndexType::Octree,
+                        "OCTREE" => IndexType::Octree,
                         "TIMESTAMP" => IndexType::Timestamp,
                         _ => return Err(MoteDBError::ParseError(
                             format!("Unknown index type: {}", id)
@@ -853,27 +918,48 @@ impl Parser {
                     };
                     self.expect(TokenType::RParen)?;
                     
-                    // Special handling for POINT(x, y) constructor
+                    // Special handling for POINT(x, y) constructor — auto-converts to 3D (z=0)
                     if name.to_uppercase() == "POINT" {
                         if args.len() != 2 {
                             return Err(self.error("POINT() requires exactly 2 arguments (x, y)"));
                         }
-                        
+
                         // Evaluate arguments to get numeric values
                         let x = match &args[0] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("POINT() arguments must be numeric literals")),
                         };
-                        
+
                         let y = match &args[1] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("POINT() arguments must be numeric literals")),
                         };
-                        
-                        use crate::types::{Geometry, Point};
-                        Ok(Expr::Literal(Value::Spatial(Geometry::Point(Point::new(x, y)))))
+
+                        use crate::types::{Geometry, Point3D};
+                        Ok(Expr::Literal(Value::Spatial(Geometry::Point3D(Point3D::new(x, y, 0.0)))))
+                    } else if name.to_uppercase() == "POINT3D" {
+                        if args.len() != 3 {
+                            return Err(self.error("POINT3D() requires exactly 3 arguments (x, y, z)"));
+                        }
+                        let x = match &args[0] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
+                        };
+                        let y = match &args[1] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
+                        };
+                        let z = match &args[2] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
+                        };
+                        use crate::types::{Geometry as G3, Point3D};
+                        Ok(Expr::Literal(Value::Spatial(G3::Point3D(Point3D::new(x, y, z)))))
                     } else if name.to_uppercase() == "MATCH" {
                         // Special handling for MATCH(column) AGAINST(query)
                         if args.len() != 1 {
@@ -899,8 +985,16 @@ impl Parser {
                         };
                         self.advance();
                         self.expect(TokenType::RParen)?;
-                        
-                        Ok(Expr::Match { column, query })
+
+                        // Detect phrase query: query starts and ends with double quotes
+                        let phrase = query.starts_with('"') && query.ends_with('"') && query.len() >= 2;
+                        let query = if phrase {
+                            query[1..query.len()-1].to_string()
+                        } else {
+                            query
+                        };
+
+                        Ok(Expr::Match { column, query, phrase })
                     } else if name.to_uppercase() == "KNN_SEARCH" {
                         // KNN_SEARCH(vector_column, query_vector, k)
                         if args.len() != 3 {
@@ -980,7 +1074,7 @@ impl Parser {
                             _ => return Err(self.error("ST_WITHIN() max_y must be a number")),
                         };
                         
-                        Ok(Expr::StWithin { column, min_x, min_y, max_x, max_y })
+                        Ok(Expr::StWithin3D { column, min_x, min_y, min_z: 0.0, max_x, max_y, max_z: 0.0 })
                     } else if name.to_uppercase() == "ST_DISTANCE" {
                         // ST_DISTANCE(point_column, x, y)
                         if args.len() != 3 {
@@ -1004,7 +1098,7 @@ impl Parser {
                             _ => return Err(self.error("ST_DISTANCE() y must be a number")),
                         };
                         
-                        Ok(Expr::StDistance { column, x, y })
+                        Ok(Expr::StDistance3D { column, x, y, z: 0.0 })
                     } else if name.to_uppercase() == "ST_KNN" {
                         // ST_KNN(point_column, x, y, k)
                         if args.len() != 4 {
@@ -1033,7 +1127,65 @@ impl Parser {
                             _ => return Err(self.error("ST_KNN() k must be a positive integer")),
                         };
                         
-                        Ok(Expr::StKnn { column, x, y, k })
+                        Ok(Expr::StKnn3D { column, x, y, z: 0.0, k })
+                    } else if name.to_uppercase() == "ST_WITHIN_3D" {
+                        if args.len() != 7 {
+                            return Err(self.error("ST_WITHIN_3D() requires 7 arguments: column, min_x, min_y, min_z, max_x, max_y, max_z"));
+                        }
+                        let column = match &args[0] {
+                            Expr::Column(n) => n.clone(),
+                            _ => return Err(self.error("ST_WITHIN_3D() first argument must be a column")),
+                        };
+                        let nums: Vec<f64> = args[1..].iter().map(|a| match a {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => -1.0,
+                        }).collect();
+                        if nums.iter().any(|n| *n < 0.0) {
+                            return Err(self.error("ST_WITHIN_3D() bounds must be numeric"));
+                        }
+                        Ok(Expr::StWithin3D { column, min_x: nums[0], min_y: nums[1], min_z: nums[2], max_x: nums[3], max_y: nums[4], max_z: nums[5] })
+                    } else if name.to_uppercase() == "ST_DISTANCE_3D" {
+                        if args.len() != 4 {
+                            return Err(self.error("ST_DISTANCE_3D() requires 4 arguments: column, x, y, z"));
+                        }
+                        let column = match &args[0] {
+                            Expr::Column(n) => n.clone(),
+                            _ => return Err(self.error("ST_DISTANCE_3D() first argument must be a column")),
+                        };
+                        let x = match &args[1] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("x must be numeric")) };
+                        let y = match &args[2] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("y must be numeric")) };
+                        let z = match &args[3] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("z must be numeric")) };
+                        Ok(Expr::StDistance3D { column, x, y, z })
+                    } else if name.to_uppercase() == "ST_KNN_3D" {
+                        if args.len() != 5 {
+                            return Err(self.error("ST_KNN_3D() requires 5 arguments: column, x, y, z, k"));
+                        }
+                        let column = match &args[0] {
+                            Expr::Column(n) => n.clone(),
+                            _ => return Err(self.error("ST_KNN_3D() first argument must be a column")),
+                        };
+                        let x = match &args[1] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("x must be numeric")) };
+                        let y = match &args[2] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("y must be numeric")) };
+                        let z = match &args[3] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("z must be numeric")) };
+                        let k = match &args[4] {
+                            Expr::Literal(Value::Integer(i)) if *i > 0 => *i as usize,
+                            _ => return Err(self.error("ST_KNN_3D() k must be a positive integer")),
+                        };
+                        Ok(Expr::StKnn3D { column, x, y, z, k })
+                    } else if name.to_uppercase() == "ST_RADIUS_3D" {
+                        if args.len() != 5 {
+                            return Err(self.error("ST_RADIUS_3D() requires 5 arguments: column, x, y, z, radius"));
+                        }
+                        let column = match &args[0] {
+                            Expr::Column(n) => n.clone(),
+                            _ => return Err(self.error("ST_RADIUS_3D() first argument must be a column")),
+                        };
+                        let x = match &args[1] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("x must be numeric")) };
+                        let y = match &args[2] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("y must be numeric")) };
+                        let z = match &args[3] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("z must be numeric")) };
+                        let radius = match &args[4] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("radius must be numeric")) };
+                        Ok(Expr::StRadius3D { column, x, y, z, radius })
                     } else {
                         Ok(Expr::FunctionCall { name, args, distinct })
                     }

@@ -74,6 +74,14 @@ pub enum StorageError {
     /// 🚀 Phase 5: AUTO_INCREMENT overflow error
     #[error("AUTO_INCREMENT overflow for table '{0}': counter has reached i64::MAX")]
     AutoIncrementOverflow(String),
+
+    /// Columnar segment store error
+    #[error("Columnar store error: {0}")]
+    Columnar(String),
+
+    /// Segment file corrupted
+    #[error("Segment file corrupted: {0}")]
+    SegmentCorrupted(std::path::PathBuf),
 }
 
 // Alias for compatibility

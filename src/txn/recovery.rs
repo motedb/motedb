@@ -112,13 +112,15 @@ impl RecoveryManager {
                         // Transaction explicitly rolled back
                         active_txns.remove(txn_id);
                     }
-                    WALRecord::Insert { .. }
-                    | WALRecord::Update { .. }
-                    | WALRecord::Delete { .. } => {
-                        // Record operation for potential redo/undo
-                        // Try to infer txn_id from context (in reality, should be in record)
-                        // For now, we track all data operations
-                        // In a real implementation, each data record should carry txn_id
+                    WALRecord::Insert { txn_id, .. }
+                    | WALRecord::Update { txn_id, .. }
+                    | WALRecord::Delete { txn_id, .. } => {
+                        // Associate data record with its transaction
+                        if *txn_id != 0 && active_txns.contains_key(txn_id) {
+                            if let Some(ops) = active_txns.get_mut(txn_id) {
+                                ops.push((current_lsn, record.clone()));
+                            }
+                        }
                     }
                     WALRecord::Checkpoint { .. } => {
                         // Checkpoint marker - ignore for now
@@ -281,25 +283,30 @@ impl RecoveryManager {
         }
 
         // Undo active transactions (reverse order)
-        for txn_id in analysis.active_txns.keys() {
-            if let Some(operations) = txn_operations.get(txn_id) {
+        for &txn_id in &analysis.active_txns.keys().copied().collect::<Vec<_>>() {
+            if let Some(operations) = txn_operations.get(&txn_id) {
                 // Process in reverse order
                 for operation in operations.iter().rev() {
                     match operation {
-                        WALRecord::Insert { row_id: _, .. } => {
-                            // Undo insert = delete version
-                            // Note: In real implementation, should mark as deleted
-                            // rather than physically remove
+                        WALRecord::Insert { row_id, .. } => {
+                            // Undo insert = delete the version inserted by this txn
+                            let _ = self.version_store.delete_version(
+                                *row_id, txn_id, u64::MAX,
+                            );
                             undo_count += 1;
                         }
-                        WALRecord::Update { row_id: _, old_data: _, .. } => {
+                        WALRecord::Update { row_id, old_data, .. } => {
                             // Undo update = restore old value
-                            // In MVCC, we just don't make the version visible
+                            let _ = self.version_store.insert_version(
+                                *row_id, old_data.clone(), txn_id, u64::MAX,
+                            );
                             undo_count += 1;
                         }
-                        WALRecord::Delete { row_id: _, old_data: _, .. } => {
+                        WALRecord::Delete { row_id, old_data, .. } => {
                             // Undo delete = re-insert old data
-                            // In MVCC, restore the previous version
+                            let _ = self.version_store.insert_version(
+                                *row_id, old_data.clone(), txn_id, u64::MAX,
+                            );
                             undo_count += 1;
                         }
                         _ => {}
@@ -307,7 +314,7 @@ impl RecoveryManager {
                 }
 
                 // Write rollback record
-                // self.wal.log_rollback(0, *txn_id)?;
+                let _ = self.wal.log_rollback(0, txn_id);
             }
         }
 
@@ -374,11 +381,11 @@ mod tests {
 
         // Create WAL records
         wal.log_begin(0, 1, 1).unwrap();
-        wal.log_insert("test_table", 0, 100, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 100, vec![Value::Null], 0).unwrap();
         wal.log_commit(0, 1, 1000).unwrap();
 
         wal.log_begin(0, 2, 1).unwrap();
-        wal.log_insert("test_table", 0, 200, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 200, vec![Value::Null], 0).unwrap();
         // No commit - simulates crash
 
         // Analyze
@@ -400,7 +407,7 @@ mod tests {
 
         // Committed transaction
         wal.log_begin(0, 1, 1).unwrap();
-        wal.log_insert("test_table", 0, 100, vec![Value::Timestamp(Timestamp::from_micros(1000))]).unwrap();
+        wal.log_insert("test_table", 0, 100, vec![Value::Timestamp(Timestamp::from_micros(1000))], 0).unwrap();
         wal.log_commit(0, 1, 1000).unwrap();
 
         // Recover
@@ -429,12 +436,12 @@ mod tests {
 
         // T1: Committed
         wal.log_begin(0, 1, 1).unwrap();
-        wal.log_insert("test_table", 0, 100, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 100, vec![Value::Null], 0).unwrap();
         wal.log_commit(0, 1, 1000).unwrap();
 
         // T2: Uncommitted (crash)
         wal.log_begin(0, 2, 1).unwrap();
-        wal.log_insert("test_table", 0, 200, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 200, vec![Value::Null], 0).unwrap();
 
         // Recover
         let recovery = RecoveryManager::new(wal, version_store);
@@ -454,12 +461,12 @@ mod tests {
 
         // T1: Explicitly rolled back
         wal.log_begin(0, 1, 1).unwrap();
-        wal.log_insert("test_table", 0, 100, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 100, vec![Value::Null], 0).unwrap();
         wal.log_rollback(0, 1).unwrap();
 
         // T2: Committed
         wal.log_begin(0, 2, 1).unwrap();
-        wal.log_insert("test_table", 0, 200, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 200, vec![Value::Null], 0).unwrap();
         wal.log_commit(0, 2, 2000).unwrap();
 
         // Recover
@@ -479,7 +486,7 @@ mod tests {
 
         // Create committed transaction
         wal.log_begin(0, 1, 1).unwrap();
-        wal.log_insert("test_table", 0, 100, vec![Value::Null]).unwrap();
+        wal.log_insert("test_table", 0, 100, vec![Value::Null], 0).unwrap();
         wal.log_commit(0, 1, 1000).unwrap();
 
         let recovery = RecoveryManager::new(wal, version_store);

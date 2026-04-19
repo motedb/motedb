@@ -16,20 +16,6 @@ type FromScanResult = Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)>;
 #[allow(clippy::type_complexity)]
 type RowPredicate = Option<Box<dyn Fn(&SqlRow) -> bool + Send + Sync>>;
 
-/// 🚀 索引下推：可索引的条件类型
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-enum IndexableCondition {
-    /// 点查询: col = value
-    PointQuery { column: String, value: Value },
-    /// 范围查询: start <= col <= end
-    RangeQuery { column: String, start: Value, end: Value },
-    /// 小于: col < value
-    LessThan { column: String, value: Value },
-    /// 大于: col > value
-    GreaterThan { column: String, value: Value },
-}
-
 /// Query result
 #[derive(Debug)]
 pub enum QueryResult {
@@ -681,7 +667,8 @@ impl QueryExecutor {
     /// the materialized execution path with index pushdown fast paths.
     fn expr_needs_materialized_path(expr: &Expr) -> bool {
         match expr {
-            Expr::Match { .. } | Expr::StWithin { .. } | Expr::StKnn { .. } => true,
+            Expr::Match { .. }
+            | Expr::StWithin3D { .. } | Expr::StKnn3D { .. } | Expr::StRadius3D { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
                 Self::expr_needs_materialized_path(left) || Self::expr_needs_materialized_path(right)
             }
@@ -692,12 +679,12 @@ impl QueryExecutor {
     /// Check if ORDER BY expression is ST_DISTANCE or aliases a SELECT column that is ST_DISTANCE
     fn expr_is_or_aliases_st_distance(expr: &Expr, select_cols: &[SelectColumn]) -> bool {
         match expr {
-            Expr::StDistance { .. } => true,
+            Expr::StDistance3D { .. } => true,
             Expr::Column(alias) => {
                 for col in select_cols {
                     match col {
                         SelectColumn::Expr(e, Some(a)) if a == alias => {
-                            return matches!(e, Expr::StDistance { .. });
+                            return matches!(e, Expr::StDistance3D { .. });
                         }
                         _ => {}
                     }
@@ -1184,16 +1171,6 @@ impl QueryExecutor {
             // These expressions should never reach eval_expr_simple — they are
             // redirected to execute_select_internal by expr_needs_materialized_path().
             // The false fallback is a safety net to avoid returning wrong results.
-            Expr::StWithin { .. } => {
-                Ok(row.get("__spatial_within__").cloned().unwrap_or(Value::Bool(false)))
-            }
-            Expr::StKnn { .. } => {
-                Ok(row.get("__spatial_knn__").cloned().unwrap_or(Value::Bool(false)))
-            }
-            Expr::StDistance { .. } => {
-                // ST_DISTANCE is a function, not a predicate — cannot evaluate in simple path
-                Ok(row.get("__spatial_distance__").cloned().unwrap_or(Value::Float(0.0)))
-            }
             Expr::Match { .. } => {
                 // If we have a pre-computed score, non-zero means match
                 let has_score = row.keys().any(|k| k.starts_with("__text_score_"));
@@ -1323,7 +1300,21 @@ impl QueryExecutor {
         }
         
         // From here on, we know stmt.from is Some, so unwrap is safe
-        
+
+        // 🆕 Columnar SELECT for TimeSeries tables
+        // Pattern: SELECT cols FROM ts_table WHERE ts BETWEEN a AND b
+        // → Route to columnar store with time-range pruning + column projection
+        if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let Ok(schema) = self.db.get_table_schema(table_name) {
+                if schema.table_type == crate::types::TableType::TimeSeries {
+                    if let Some(result) = self.try_columnar_select(stmt, &schema)? {
+                        return Ok(result);
+                    }
+                    // Fall through to LSM full scan for complex queries (JOINs, subqueries, etc.)
+                }
+            }
+        }
+
         // 🚀 FAST PATH -3: Primary key point query optimization (P0)
         // Pattern: SELECT * FROM table WHERE primary_key = value
         // → Direct LSM get by row_id (165x faster, no MemTable scan!)
@@ -2579,7 +2570,7 @@ impl QueryExecutor {
             // Leaf nodes - no subqueries to materialize
             Expr::Column(_) | Expr::Literal(_) | Expr::Match { .. } | 
             Expr::KnnSearch { .. } | Expr::KnnDistance { .. } | 
-            Expr::StWithin { .. } | Expr::StDistance { .. } | Expr::StKnn { .. } |
+            Expr::StWithin3D { .. } | Expr::StDistance3D { .. } | Expr::StKnn3D { .. } | Expr::StRadius3D { .. } |
             Expr::WindowFunction { .. } => Ok(expr.clone()),
         }
     }
@@ -2648,7 +2639,7 @@ impl QueryExecutor {
                 }
             }
             
-            Expr::Match { column, query } => {
+            Expr::Match { column, query, .. } => {
                 // 🚀 Fast path: use pre-computed score if available (from text search fast path)
                 let score_key = format!("__text_score_{}__", column);
                 if let Some(Value::Float(score)) = row.get(&score_key) {
@@ -2746,119 +2737,103 @@ impl QueryExecutor {
                     .map(|(a, b)| (a - b).powi(2))
                     .sum::<f32>()
                     .sqrt();
-                
+
                 Ok(Value::Float(distance as f64))
             }
-            
-            Expr::StWithin { column, min_x, min_y, max_x, max_y } => {
-                // 🚀 Fast path: if we're in the spatial fast path, this row is already confirmed to be within bbox
-                if row.get("__spatial_within__").is_some() {
-                    return Ok(Value::Bool(true));
-                }
-                // ST_WITHIN returns Bool - true if point is within bounding box
-                let row_id = row.get("__row_id__")
-                    .and_then(|v| match v {
-                        Value::Integer(i) => Some(*i as u64),
-                        _ => None,
-                    })
-                    .ok_or_else(|| MoteDBError::Query("ST_WITHIN requires __row_id__ in row".into()))?;
-                
-                // 🔧 Get table name
-                let table_name = row.get("__table__")
-                    .and_then(|v| match v {
-                        Value::Text(s) => Some(s.as_str()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| MoteDBError::Query("ST_WITHIN requires __table__ in row".into()))?;
-                
-                // 🔧 Use index_registry to find the correct user-specified index name
-                let index_name = self.db.index_registry.find_by_column(
-                    table_name,
-                    column,
-                    crate::database::index_metadata::IndexType::Spatial
-                ).ok_or_else(|| MoteDBError::Query(format!("No spatial index found for column '{}.{}'", table_name, column)))?;
-                
-                // Create bounding box
-                use crate::types::BoundingBox;
-                let bbox = BoundingBox {
-                    min_x: *min_x,
-                    min_y: *min_y,
-                    max_x: *max_x,
-                    max_y: *max_y,
-                };
-                
-                // Perform range query using spatial index
-                let results = self.db.spatial_range_query(&index_name, &bbox)?;
-                
-                // Check if row_id is in results
-                let in_results = results.contains(&row_id);
-                Ok(Value::Bool(in_results))
-            }
-            
-            Expr::StDistance { column, x, y } => {
-                // 🚀 Fast path: use pre-computed distance if available (from spatial KNN ORDER BY)
+
+            // ==================== 3D Spatial Expressions (i-Octree) ====================
+
+            Expr::StDistance3D { column, x, y, z } => {
+                // Fast path: use pre-computed distance if available
                 if let Some(Value::Float(dist)) = row.get("__spatial_distance__") {
                     return Ok(Value::Float(*dist));
                 }
-                // ST_DISTANCE returns Float - Euclidean distance
-                // Get point value from row
                 let point_value = self.get_column_value(row, column)
                     .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
-                
+
                 use crate::types::Geometry;
-                let point = match point_value {
-                    Value::Spatial(Geometry::Point(p)) => p,
-                    _ => return Err(MoteDBError::TypeError(format!("Column '{}' is not a Point", column))),
+                let geom = match point_value {
+                    Value::Spatial(Geometry::Point3D(p)) => p,
+                    Value::Spatial(Geometry::Point(p)) => {
+                        // 2D point treated as z=0
+                        crate::types::Point3D::new(p.x, p.y, 0.0)
+                    }
+                    _ => return Err(MoteDBError::TypeError(format!("Column '{}' is not a 3D Point", column))),
                 };
-                
-                // Compute Euclidean distance
-                let dx = point.x - x;
-                let dy = point.y - y;
-                let distance = (dx * dx + dy * dy).sqrt();
-                
-                Ok(Value::Float(distance))
+
+                let dx = geom.x - x;
+                let dy = geom.y - y;
+                let dz = geom.z - z;
+                Ok(Value::Float((dx * dx + dy * dy + dz * dz).sqrt()))
             }
-            
-            Expr::StKnn { column, x, y, k } => {
-                // 🚀 Fast path: if we're in the spatial KNN fast path, this row is already in top-k
+
+            Expr::StWithin3D { column, min_x, min_y, min_z, max_x, max_y, max_z } => {
+                if row.get("__spatial_within__").is_some() {
+                    return Ok(Value::Bool(true));
+                }
+                let point_value = self.get_column_value(row, column)
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
+
+                use crate::types::Geometry;
+                let geom = match point_value {
+                    Value::Spatial(Geometry::Point3D(p)) => p,
+                    Value::Spatial(Geometry::Point(p)) => {
+                        crate::types::Point3D::new(p.x, p.y, 0.0)
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                };
+
+                Ok(Value::Bool(
+                    geom.x >= *min_x && geom.x <= *max_x &&
+                    geom.y >= *min_y && geom.y <= *max_y &&
+                    geom.z >= *min_z && geom.z <= *max_z
+                ))
+            }
+
+            Expr::StKnn3D { column, x, y, z, k } => {
+                // Fast path: already filtered by i-Octree KNN
                 if row.get("__spatial_knn__").is_some() {
                     return Ok(Value::Bool(true));
                 }
-                // ST_KNN returns Bool - true if this point is in top-k nearest neighbors
                 let row_id = row.get("__row_id__")
-                    .and_then(|v| match v {
-                        Value::Integer(i) => Some(*i as u64),
-                        _ => None,
-                    })
-                    .ok_or_else(|| MoteDBError::Query("ST_KNN requires __row_id__ in row".into()))?;
-                
-                // 🔧 Get table name
+                    .and_then(|v| match v { Value::Integer(i) => Some(*i as u64), _ => None })
+                    .ok_or_else(|| MoteDBError::Query("ST_KNN_3D requires __row_id__ in row".into()))?;
                 let table_name = row.get("__table__")
-                    .and_then(|v| match v {
-                        Value::Text(s) => Some(s.as_str()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| MoteDBError::Query("ST_KNN requires __table__ in row".into()))?;
-                
-                // 🔧 Use index_registry to find the correct user-specified index name
+                    .and_then(|v| match v { Value::Text(s) => Some(s.as_str()), _ => None })
+                    .ok_or_else(|| MoteDBError::Query("ST_KNN_3D requires __table__ in row".into()))?;
+
                 let index_name = self.db.index_registry.find_by_column(
-                    table_name,
-                    column,
-                    crate::database::index_metadata::IndexType::Spatial
-                ).ok_or_else(|| MoteDBError::Query(format!("No spatial index found for column '{}.{}'", table_name, column)))?;
-                
-                // Create query point
-                use crate::types::Point;
-                let query_point = Point { x: *x, y: *y };
-                
-                // Perform KNN query using spatial index
-                let results = self.db.spatial_knn_query(&index_name, &query_point, *k)?;
-                
-                // Check if row_id is in results
-                let in_results = results.iter().any(|(id, _)| *id == row_id);
-                Ok(Value::Bool(in_results))
+                    table_name, column, crate::database::index_metadata::IndexType::Octree
+                ).ok_or_else(|| MoteDBError::Query(format!("No ioctree index for '{}.{}'", table_name, column)))?;
+
+                let query_point = crate::types::Point3D::new(*x, *y, *z);
+                let results = self.db.ioctree_knn_query(&index_name, &query_point, *k)?;
+                Ok(Value::Bool(results.iter().any(|(id, _)| *id == row_id)))
             }
-            
+
+            Expr::StRadius3D { column, x, y, z, radius } => {
+                if row.get("__spatial_knn__").is_some() {
+                    return Ok(Value::Bool(true));
+                }
+                let point_value = self.get_column_value(row, column)
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
+
+                use crate::types::Geometry;
+                let geom = match point_value {
+                    Value::Spatial(Geometry::Point3D(p)) => p,
+                    Value::Spatial(Geometry::Point(p)) => {
+                        crate::types::Point3D::new(p.x, p.y, 0.0)
+                    }
+                    _ => return Ok(Value::Bool(false)),
+                };
+
+                let dx = geom.x - x;
+                let dy = geom.y - y;
+                let dz = geom.z - z;
+                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                Ok(Value::Bool(dist <= *radius))
+            }
+
             _ => self.evaluator.eval(expr, row)
         }
     }
@@ -3365,7 +3340,12 @@ impl QueryExecutor {
             // Use schema order
             schema.columns.iter().map(|c| c.name.clone()).collect()
         };
-        
+
+        // Route TimeSeries INSERT to columnar store
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            return self.execute_columnar_insert(&stmt, &schema, &columns);
+        }
+
         // 🔥 召回率优化: 使用批量插入提升向量索引图质量
         // 原因: 逐条插入导致DiskANN图连通性差，批量插入可以构建更优质的图
         // 策略: 
@@ -3846,7 +3826,7 @@ impl QueryExecutor {
         let mut schema = TableSchema::new(stmt.table.clone(), columns);
         if let Some(pk_col) = primary_key_cols.first() {
             schema = schema.with_primary_key(pk_col.name.clone());
-            
+
             // 🚀 Phase 5: Set AUTO_INCREMENT flag with optional start value
             if pk_col.auto_increment {
                 if let Some(start) = pk_col.auto_increment_start {
@@ -3855,6 +3835,14 @@ impl QueryExecutor {
                     schema = schema.with_auto_increment();
                 }
             }
+        }
+
+        // TimeSeries table type and TTL
+        if let Some(ref ts_col) = stmt.timeseries_column {
+            schema = schema.with_timeseries(ts_col.clone());
+        }
+        if let Some(ref ttl) = stmt.ttl {
+            schema = schema.with_ttl(*ttl);
         }
         
         self.db.create_table(schema.clone())?;
@@ -3877,16 +3865,23 @@ impl QueryExecutor {
         } else {
             String::new()
         };
-        
+
+        let ts_info = match &stmt.timeseries_column {
+            Some(col) => format!(", timeseries({})", col),
+            None => String::new(),
+        };
+        let ttl_info = match &stmt.ttl {
+            Some(ttl) => format!(", TTL {}", ttl),
+            None => String::new(),
+        };
+
         Ok(QueryResult::Definition {
-            message: format!("Table '{}' created successfully{}", stmt.table, pk_info),
+            message: format!("Table '{}' created successfully{}{}{}", stmt.table, pk_info, ts_info, ttl_info),
         })
     }
     
     /// Execute CREATE INDEX statement
     fn execute_create_index(&self, stmt: CreateIndexStmt) -> Result<QueryResult> {
-        use crate::types::BoundingBox;
-        
         // Get table schema to find column type
         let schema = self.db.get_table_schema(&stmt.table)?;
         let column = schema.columns.iter()
@@ -3914,15 +3909,6 @@ impl QueryExecutor {
                     ));
                 }
             }
-            IndexType::Spatial => {
-                // Verify column is spatial
-                if !matches!(column.col_type, ColumnType::Spatial) {
-                    return Err(MoteDBError::TypeError(
-                        format!("SPATIAL index requires SPATIAL column, got {:?}", column.col_type)
-                    ));
-                }
-                IndexType::Spatial
-            }
             IndexType::Timestamp => {
                 // Verify column is timestamp
                 if !matches!(column.col_type, ColumnType::Timestamp) {
@@ -3931,6 +3917,15 @@ impl QueryExecutor {
                     ));
                 }
                 IndexType::Timestamp
+            }
+            IndexType::Octree => {
+                // Verify column is spatial (3D points)
+                if !matches!(column.col_type, ColumnType::Spatial) {
+                    return Err(MoteDBError::TypeError(
+                        format!("OCTREE index requires SPATIAL column, got {:?}", column.col_type)
+                    ));
+                }
+                IndexType::Octree
             }
             IndexType::BTree | IndexType::Column => {
                 // B-Tree/Column index can be used for any comparable type
@@ -4044,46 +4039,46 @@ impl QueryExecutor {
                     unreachable!("Already validated column type");
                 }
             }
-            IndexType::Spatial => {
-                // 1️⃣ Create empty spatial index
-                // Use default world bounds: [-180, -90] to [180, 90] (longitude, latitude)
-                let default_bounds = BoundingBox::new(-180.0, -90.0, 180.0, 90.0);
-                self.db.create_spatial_index(&index_name, default_bounds)?;
-                
-                // 2️⃣ Backfill existing data (critical fix!)
+            IndexType::Timestamp => {
+                // Timestamp index is global and already created with database
+                // No-op, but return success
+            }
+            IndexType::Octree => {
+                // Create i-Octree index for 3D point cloud data
+                self.db.create_ioctree_index(&index_name)?;
+
+                // Backfill existing 3D point data
                 let column_pos = schema.get_column_position(&stmt.column)
                     .ok_or_else(|| MoteDBError::ColumnNotFound(stmt.column.clone()))?;
-                
+
                 let iter = self.db.scan_table_rows_streaming(&stmt.table)?;
                 let mut backfill_count = 0;
 
                 for result in iter {
                     let (row_id, row) = result?;
                     if let Some(Value::Spatial(geometry)) = row.get(column_pos) {
-                        if let Err(e) = self.db.insert_geometry(row_id, &index_name, geometry.clone()) {
-                            debug_log!("⚠️ Failed to backfill spatial index for row {}: {}", row_id, e);
-                        } else {
-                            backfill_count += 1;
+                        if geometry.is_3d() {
+                            if let Err(e) = self.db.insert_ioctree_point(row_id, &index_name, geometry) {
+                                debug_log!("⚠️ Failed to backfill ioctree index for row {}: {}", row_id, e);
+                            } else {
+                                backfill_count += 1;
+                            }
                         }
                     }
                 }
-                
+
                 if backfill_count > 0 {
-                    debug_log!("Backfilled {} rows into spatial index '{}'", backfill_count, index_name);
+                    debug_log!("Backfilled {} rows into ioctree index '{}'", backfill_count, index_name);
                 }
-                
-                // 3️⃣ Register metadata
+
+                // Register metadata
                 let metadata = crate::database::index_metadata::IndexMetadata::new(
                     index_name.clone(),
                     stmt.table.clone(),
                     stmt.column.clone(),
-                    crate::database::index_metadata::IndexType::Spatial,
+                    crate::database::index_metadata::IndexType::Octree,
                 );
                 self.db.index_registry.register(metadata)?;
-            }
-            IndexType::Timestamp => {
-                // Timestamp index is global and already created with database
-                // No-op, but return success
             }
             IndexType::BTree | IndexType::Column => {
                 // 🚀 Column/BTree index creation
@@ -4120,8 +4115,66 @@ impl QueryExecutor {
     }
     
     /// Execute DROP TABLE statement
-    fn execute_drop_table(&self, _stmt: DropTableStmt) -> Result<QueryResult> {
-        Err(MoteDBError::NotImplemented("DROP TABLE not yet implemented".to_string()))
+    fn execute_drop_table(&self, stmt: DropTableStmt) -> Result<QueryResult> {
+        let table_name = &stmt.table;
+
+        // Verify table exists
+        let schema = self.db.get_table_schema(table_name)?;
+
+        // 1. Drop column indexes for this table
+        let prefix = format!("{}.", table_name);
+        let index_names: Vec<String> = self.db.column_indexes.iter()
+            .filter(|entry| entry.key().starts_with(&prefix))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for idx_name in index_names {
+            self.db.column_indexes.remove(&idx_name);
+        }
+
+        // 2. Drop vector indexes for this table
+        let vector_idx_names: Vec<String> = self.db.vector_indexes.iter()
+            .filter(|entry| entry.key().starts_with(&prefix) || entry.key().contains(&format!("_{}", table_name)))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for idx_name in vector_idx_names {
+            self.db.vector_indexes.remove(&idx_name);
+        }
+
+        // 3. Drop text indexes for this table
+        let text_idx_names: Vec<String> = self.db.text_indexes.iter()
+            .filter(|entry| entry.key().starts_with(&prefix) || entry.key().contains(&format!("_{}", table_name)))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for idx_name in text_idx_names {
+            self.db.text_indexes.remove(&idx_name);
+        }
+
+        // 5. Drop table metadata (schema, auto_increment, pk_lookup)
+        self.db.drop_table(table_name)?;
+
+        // 6. Remove index registry entries
+        self.db.index_registry.remove_by_table(table_name);
+
+        // 7. Delete data from LSM using range delete (best effort)
+        // Composite key = (table_id << 32) | row_id
+        // We scan the entire range for this table_id
+        let table_id = self.db.table_registry.get_table_id(table_name).unwrap_or(0);
+        let start_key = (table_id as u64) << 32;
+        let end_key = start_key | 0xFFFFFFFF;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        if let Err(e) = self.db.lsm_engine.delete_range(start_key, end_key, timestamp) {
+            debug_log!("[DROP TABLE] Warning: LSM range delete failed: {}", e);
+        }
+
+        let _ = schema; // used above for validation
+
+        Ok(QueryResult::Definition {
+            message: format!("Table '{}' dropped successfully", table_name),
+        })
     }
     
     /// Execute DROP INDEX statement
@@ -4139,9 +4192,6 @@ impl QueryExecutor {
             IndexType::Vector => {
                 self.db.vector_indexes.remove(index_name);
             }
-            IndexType::Spatial => {
-                self.db.spatial_indexes.remove(index_name);
-            }
             IndexType::Text => {
                 self.db.text_indexes.remove(index_name);
             }
@@ -4152,6 +4202,9 @@ impl QueryExecutor {
                 if alias != *index_name {
                     self.db.column_indexes.remove(&alias);
                 }
+            }
+            IndexType::Octree => {
+                self.db.ioctree_indexes.remove(index_name);
             }
         }
 
@@ -4426,15 +4479,15 @@ impl QueryExecutor {
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
         // Extract MATCH expression from WHERE clause
-        let (column, query) = match where_clause {
-            Expr::Match { column, query } => (column.clone(), query.clone()),
+        let (column, query, phrase) = match where_clause {
+            Expr::Match { column, query, phrase } => (column.clone(), query.clone(), *phrase),
             // Handle AND: MATCH(...) AND other_conditions — only if MATCH is the dominant filter
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
                 // Try both sides for a MATCH expression
-                if let Expr::Match { column, query } = left.as_ref() {
-                    (column.clone(), query.clone())
-                } else if let Expr::Match { column, query } = right.as_ref() {
-                    (column.clone(), query.clone())
+                if let Expr::Match { column, query, phrase } = left.as_ref() {
+                    (column.clone(), query.clone(), *phrase)
+                } else if let Expr::Match { column, query, phrase } = right.as_ref() {
+                    (column.clone(), query.clone(), *phrase)
                 } else {
                     return Ok(None);
                 }
@@ -4448,7 +4501,7 @@ impl QueryExecutor {
             crate::database::index_metadata::IndexType::Text
         ) {
             Some(name) => name,
-            None => return Ok(None), // No text index — fall back to normal path
+            None => return Ok(None),
         };
 
         if !self.db.text_indexes.contains_key(&index_name) {
@@ -4458,37 +4511,47 @@ impl QueryExecutor {
         // Determine limit (use LIMIT from query, or default to top 1000 for scoring)
         let limit = stmt.limit.unwrap_or(1000);
 
-        // ⚡ Single index lookup — get top-k row_ids with BM25 scores
-        let results = match self.db.text_search_ranked(&index_name, &query, limit) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
+        // Phrase search or ranked search depending on query type
+        let row_ids: Vec<u64> = if phrase {
+            let ids = match self.db.text_search_phrase(&index_name, &query) {
+                Ok(r) => r,
+                Err(_) => return Ok(None),
+            };
+            ids.into_iter().take(limit).collect()
+        } else {
+            let results = match self.db.text_search_ranked(&index_name, &query, limit) {
+                Ok(r) => r,
+                Err(_) => return Ok(None),
+            };
+            results.into_iter().map(|(id, _score)| id).collect()
         };
 
-        if results.is_empty() {
+        if row_ids.is_empty() {
             return Ok(Some(QueryResult::Select {
                 columns: vec![],
                 rows: vec![],
             }));
         }
 
-        // Load rows for matching row_ids
+        // Load rows for matching row_ids — use batch fetch for efficiency
         let schema = self.db.get_table_schema(table_name)?;
-        let mut sql_rows = Vec::with_capacity(results.len());
+        let mut sql_rows = Vec::with_capacity(row_ids.len());
 
-        for (row_id, score) in &results {
-            if let Ok(Some(row)) = self.db.get_table_row(table_name, *row_id) {
-                let mut sql_row = row_to_sql_row(&row, &schema)?;
-                // Add metadata
+        let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
+
+        for (i, row_id) in row_ids.iter().enumerate() {
+            if let Some(row) = batch_rows.get(i).and_then(|(_, opt)| opt.as_ref()) {
+                let mut sql_row = row_to_sql_row(row, &schema)?;
                 sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
                 sql_row.insert("__table__".to_string(), Value::Text(table_name.to_string()));
-                // Pre-compute MATCH score so SELECT MATCH(...) AGAINST works
-                sql_row.insert(format!("__text_score_{}__", column), Value::Float(*score as f64));
-                // Qualified names
+                // For phrase queries, use a default score of 1.0
+                let score = if phrase { 1.0f32 } else { 1.0f32 };
+                sql_row.insert(format!("__text_score_{}__", column), Value::Float(score as f64));
                 let old_row = std::mem::take(&mut sql_row);
                 let mut qualified = SqlRow::new();
                 qualified.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
                 qualified.insert("__table__".to_string(), Value::Text(table_name.to_string()));
-                qualified.insert(format!("__text_score_{}__", column), Value::Float(*score as f64));
+                qualified.insert(format!("__text_score_{}__", column), Value::Float(score as f64));
                 for (col_name, val) in old_row.into_iter() {
                     let qname = Self::make_qualified_name(table_name, &col_name);
                     qualified.insert(qname, val);
@@ -4509,8 +4572,16 @@ impl QueryExecutor {
             return Ok(None);
         }
 
+        // Build scores from sql_rows metadata
+        let scores: Vec<(RowId, f32)> = sql_rows.iter().map(|(id, row)| {
+            let score = row.get(&format!("__text_score_{}__", column))
+                .and_then(|v| if let Value::Float(f) = v { Some(*f as f32) } else { None })
+                .unwrap_or(1.0);
+            (*id, score)
+        }).collect();
+
         let (column_names, result_rows) = self.project_text_search_columns(
-            stmt, &sql_rows, &schema, &column, &results
+            stmt, &sql_rows, &schema, &column, &scores
         )?;
 
         Ok(Some(QueryResult::Select {
@@ -4598,11 +4669,15 @@ impl QueryExecutor {
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
         match where_clause {
-            Expr::StWithin { column, min_x, min_y, max_x, max_y } => {
-                self.execute_spatial_within_fast(stmt, table_name, column, *min_x, *min_y, *max_x, *max_y)
+            // 3D spatial fast paths (i-Octree)
+            Expr::StWithin3D { column, min_x, min_y, min_z, max_x, max_y, max_z } => {
+                self.execute_ioctree_within_fast(stmt, table_name, column, *min_x, *min_y, *min_z, *max_x, *max_y, *max_z)
             }
-            Expr::StKnn { column, x, y, k } => {
-                self.execute_spatial_knn_fast(stmt, table_name, column, *x, *y, *k)
+            Expr::StKnn3D { column, x, y, z, k } => {
+                self.execute_ioctree_knn_fast(stmt, table_name, column, *x, *y, *z, *k)
+            }
+            Expr::StRadius3D { column, x, y, z, radius } => {
+                self.execute_ioctree_radius_fast(stmt, table_name, column, *x, *y, *z, *radius)
             }
             _ => Ok(None),
         }
@@ -4628,17 +4703,17 @@ impl QueryExecutor {
             return Ok(None);
         }
 
-        // Match ORDER BY ST_DISTANCE(column, x, y) or ORDER BY alias where alias refers to ST_DISTANCE
-        let (column, x, y) = match &order_by.expr {
-            Expr::StDistance { column, x, y } => (column.clone(), *x, *y),
+        // Match ORDER BY ST_DISTANCE_3D(column, x, y, z) or ORDER BY alias
+        let dist_expr = match &order_by.expr {
+            Expr::StDistance3D { column, x, y, z } => (column.clone(), *x, *y, *z),
             Expr::Column(alias) => {
-                // Look up alias in SELECT columns to find the ST_DISTANCE expression
+                // Look up alias in SELECT columns to find the ST_DISTANCE_3D expression
                 let mut found = None;
                 for col in &stmt.columns {
                     match col {
                         SelectColumn::Expr(expr, Some(a)) if a == alias => {
-                            if let Expr::StDistance { column, x, y } = expr {
-                                found = Some((column.clone(), *x, *y));
+                            if let Expr::StDistance3D { column, x, y, z } = expr {
+                                found = Some((column.clone(), *x, *y, *z));
                             }
                             break;
                         }
@@ -4661,23 +4736,23 @@ impl QueryExecutor {
             _ => return Ok(None),
         };
 
-        // Find spatial index for this column
-        let index_name = match self.db.index_registry.find_by_column(
-            &table_name, &column,
-            crate::database::index_metadata::IndexType::Spatial
-        ) {
-            Some(name) => name,
-            None => return Ok(None),
-        };
-        if !self.db.spatial_indexes.contains_key(&index_name) {
-            return Ok(None);
-        }
-
-        // Use KNN query
-        let point = crate::types::Point { x, y };
-        let results = match self.db.spatial_knn_query(&index_name, &point, limit) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
+        let (column, x, y, z) = dist_expr;
+        let results: Vec<(RowId, f64)> = {
+            let index_name = match self.db.index_registry.find_by_column(
+                &table_name, &column,
+                crate::database::index_metadata::IndexType::Octree
+            ) {
+                Some(name) => name,
+                None => return Ok(None),
+            };
+            if !self.db.ioctree_indexes.contains_key(&index_name) {
+                return Ok(None);
+            }
+            let point = crate::types::Point3D::new(x, y, z);
+            match self.db.ioctree_knn_query(&index_name, &point, limit) {
+                Ok(r) => r,
+                Err(_) => return Ok(None),
+            }
         };
 
         if results.is_empty() {
@@ -4718,69 +4793,6 @@ impl QueryExecutor {
             columns: column_names,
             rows: result_rows,
         }))
-    }
-
-    /// Execute ST_WITHIN using spatial index directly
-    #[allow(clippy::too_many_arguments)]
-    fn execute_spatial_within_fast(
-        &self,
-        stmt: &SelectStmt,
-        table_name: &str,
-        column: &str,
-        min_x: f64, min_y: f64, max_x: f64, max_y: f64,
-    ) -> Result<Option<QueryResult>> {
-        let index_name = match self.db.index_registry.find_by_column(
-            table_name, column,
-            crate::database::index_metadata::IndexType::Spatial
-        ) {
-            Some(name) => name,
-            None => return Ok(None),
-        };
-
-        if !self.db.spatial_indexes.contains_key(&index_name) {
-            return Ok(None);
-        }
-
-        let bbox = crate::types::BoundingBox { min_x, min_y, max_x, max_y };
-        let row_ids = match self.db.spatial_range_query(&index_name, &bbox) {
-            Ok(ids) => ids,
-            Err(_) => return Ok(None),
-        };
-
-        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, None, true)
-    }
-
-    /// Execute ST_KNN using spatial index directly
-    fn execute_spatial_knn_fast(
-        &self,
-        stmt: &SelectStmt,
-        table_name: &str,
-        column: &str,
-        x: f64, y: f64, k: usize,
-    ) -> Result<Option<QueryResult>> {
-        let index_name = match self.db.index_registry.find_by_column(
-            table_name, column,
-            crate::database::index_metadata::IndexType::Spatial
-        ) {
-            Some(name) => name,
-            None => return Ok(None),
-        };
-
-        if !self.db.spatial_indexes.contains_key(&index_name) {
-            return Ok(None);
-        }
-
-        let point = crate::types::Point { x, y };
-        let results = match self.db.spatial_knn_query(&index_name, &point, k) {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-
-        // Extract row_ids and build distance map
-        let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
-        let dist_map: std::collections::HashMap<u64, f64> = results.into_iter().collect();
-
-        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, Some(&dist_map), false)
     }
 
     /// Load rows by row_ids and project columns for spatial fast path
@@ -4852,6 +4864,103 @@ impl QueryExecutor {
         }))
     }
 
+    // ==================== 3D Spatial Fast Paths (i-Octree) ====================
+
+    /// Execute ST_WITHIN_3D using i-Octree index directly
+    #[allow(clippy::too_many_arguments)]
+    fn execute_ioctree_within_fast(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        column: &str,
+        min_x: f64, min_y: f64, min_z: f64,
+        max_x: f64, max_y: f64, max_z: f64,
+    ) -> Result<Option<QueryResult>> {
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name, column,
+            crate::database::index_metadata::IndexType::Octree
+        ) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        if !self.db.ioctree_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        let bbox = crate::types::BoundingBox3D::new(min_x, min_y, min_z, max_x, max_y, max_z);
+        let row_ids = match self.db.ioctree_range_query(&index_name, &bbox) {
+            Ok(ids) => ids,
+            Err(_) => return Ok(None),
+        };
+
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, None, true)
+    }
+
+    /// Execute ST_KNN_3D using i-Octree index directly
+    fn execute_ioctree_knn_fast(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        column: &str,
+        x: f64, y: f64, z: f64, k: usize,
+    ) -> Result<Option<QueryResult>> {
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name, column,
+            crate::database::index_metadata::IndexType::Octree
+        ) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        if !self.db.ioctree_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        let point = crate::types::Point3D::new(x, y, z);
+        let results = match self.db.ioctree_knn_query(&index_name, &point, k) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
+        let dist_map: std::collections::HashMap<u64, f64> = results.into_iter().collect();
+
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, Some(&dist_map), false)
+    }
+
+    /// Execute ST_RADIUS_3D using i-Octree index directly
+    fn execute_ioctree_radius_fast(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        column: &str,
+        x: f64, y: f64, z: f64, radius: f64,
+    ) -> Result<Option<QueryResult>> {
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name, column,
+            crate::database::index_metadata::IndexType::Octree
+        ) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        if !self.db.ioctree_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+
+        let center = crate::types::Point3D::new(x, y, z);
+        let results = match self.db.ioctree_radius_search(&index_name, &center, radius) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
+        let dist_map: std::collections::HashMap<u64, f64> = results.into_iter().collect();
+
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, Some(&dist_map), false)
+    }
+
     fn to_bool(&self, val: &Value) -> Result<bool> {
         match val {
             Value::Bool(b) => Ok(*b),
@@ -4861,166 +4970,7 @@ impl QueryExecutor {
             _ => Err(MoteDBError::TypeError("Cannot convert to boolean".to_string())),
         }
     }
-    
-    #[allow(dead_code)]
-    fn generate_row_id(&self, _table: &str) -> Result<u64> {
-        // Simple row ID generation: use timestamp + counter
-        // TODO: Implement proper auto-increment per table
-        use std::time::{SystemTime, UNIX_EPOCH, Duration};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_secs(0))
-            .as_micros() as u64;
-        Ok(timestamp)
-    }
-    
-    /// 🚀 提取所有可索引条件（多条件索引下推）
-    /// 
-    /// 从 WHERE 子句中提取所有可以使用索引的条件，包括：
-    /// - 点查询: col = value
-    /// - 范围查询: col > X AND col < Y
-    /// - 不等式: col < value, col > value
-    /// 
-    /// 返回 (可索引条件列表, 不可索引的剩余表达式)
-    #[allow(dead_code)]
-    fn extract_indexable_conditions(&self, expr: &Expr) -> (Vec<IndexableCondition>, Vec<Expr>) {
-        let mut indexable = Vec::new();
-        let mut non_indexable = Vec::new();
-        
-        self.extract_conditions_recursive(expr, &mut indexable, &mut non_indexable);
-        
-        (indexable, non_indexable)
-    }
-    
-    /// 递归提取条件（处理 AND 树）
-    #[allow(dead_code)]
-    #[allow(clippy::only_used_in_recursion)]
-    fn extract_conditions_recursive(
-        &self,
-        expr: &Expr,
-        indexable: &mut Vec<IndexableCondition>,
-        non_indexable: &mut Vec<Expr>,
-    ) {
-        match expr {
-            Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-                // 递归处理 AND 的两边
-                self.extract_conditions_recursive(left, indexable, non_indexable);
-                self.extract_conditions_recursive(right, indexable, non_indexable);
-            }
-            Expr::BinaryOp { left, op, right } => {
-                // 尝试提取单个条件
-                match (left.as_ref(), op, right.as_ref()) {
-                    // col = value
-                    (Expr::Column(col), BinaryOperator::Eq, Expr::Literal(val)) |
-                    (Expr::Literal(val), BinaryOperator::Eq, Expr::Column(col)) => {
-                        indexable.push(IndexableCondition::PointQuery {
-                            column: col.clone(),
-                            value: val.clone(),
-                        });
-                    }
-                    // col < value
-                    (Expr::Column(col), BinaryOperator::Lt, Expr::Literal(val)) |
-                    (Expr::Column(col), BinaryOperator::Le, Expr::Literal(val)) => {
-                        indexable.push(IndexableCondition::LessThan {
-                            column: col.clone(),
-                            value: val.clone(),
-                        });
-                    }
-                    // col > value
-                    (Expr::Column(col), BinaryOperator::Gt, Expr::Literal(val)) |
-                    (Expr::Column(col), BinaryOperator::Ge, Expr::Literal(val)) => {
-                        indexable.push(IndexableCondition::GreaterThan {
-                            column: col.clone(),
-                            value: val.clone(),
-                        });
-                    }
-                    // value < col (反向)
-                    (Expr::Literal(val), BinaryOperator::Lt, Expr::Column(col)) |
-                    (Expr::Literal(val), BinaryOperator::Le, Expr::Column(col)) => {
-                        indexable.push(IndexableCondition::GreaterThan {
-                            column: col.clone(),
-                            value: val.clone(),
-                        });
-                    }
-                    // value > col (反向)
-                    (Expr::Literal(val), BinaryOperator::Gt, Expr::Column(col)) |
-                    (Expr::Literal(val), BinaryOperator::Ge, Expr::Column(col)) => {
-                        indexable.push(IndexableCondition::LessThan {
-                            column: col.clone(),
-                            value: val.clone(),
-                        });
-                    }
-                    _ => {
-                        // 无法索引，加入后置过滤
-                        non_indexable.push(expr.clone());
-                    }
-                }
-            }
-            _ => {
-                // 其他表达式（如函数调用）无法索引
-                non_indexable.push(expr.clone());
-            }
-        }
-    }
-    
-    /// 🚀 选择最优索引
-    /// 
-    /// 从多个可索引条件中选择最优的一个：
-    /// 1. 优先级：点查询 > 范围查询 > 不等式查询
-    /// 2. 检查索引是否存在
-    /// 3. 返回 (最优索引条件, 其他条件作为后置过滤)
-    #[allow(dead_code)]
-    fn choose_best_index(
-        &self,
-        conditions: &[IndexableCondition],
-        table_name: &str,
-    ) -> Option<(IndexableCondition, Vec<Expr>)> {
-        if conditions.is_empty() {
-            return None;
-        }
-        
-        // 1. 尝试点查询（最快）
-        for cond in conditions {
-            if let IndexableCondition::PointQuery { column, .. } = cond {
-                let index_name = format!("{}.{}", table_name, column);
-                if self.db.column_indexes.contains_key(&index_name) {
-                    return Some((cond.clone(), self.build_post_filters(conditions, cond)));
-                }
-            }
-        }
-        
-        // 2. 尝试范围查询
-        // TODO: 检测同列的 > 和 < 条件，合并为范围查询
-        
-        // 3. 尝试不等式查询
-        for cond in conditions {
-            match cond {
-                IndexableCondition::LessThan { column, .. } |
-                IndexableCondition::GreaterThan { column, .. } => {
-                    let index_name = format!("{}.{}", table_name, column);
-                    if self.db.column_indexes.contains_key(&index_name) {
-                        return Some((cond.clone(), self.build_post_filters(conditions, cond)));
-                    }
-                }
-                _ => {}
-            }
-        }
-        
-        None
-    }
-    
-    /// 构建后置过滤表达式（排除已用索引的条件）
-    #[allow(dead_code)]
-    fn build_post_filters(
-        &self,
-        _all_conditions: &[IndexableCondition],
-        _used_condition: &IndexableCondition,
-    ) -> Vec<Expr> {
-        // 简化实现：返回所有其他条件
-        // TODO: 正确地重建表达式树
-        Vec::new()
-    }
-    
+
     /// 🚀 PHASE A OPTIMIZATION: Compile simple comparison to fast closure
     /// 
     /// Converts simple patterns like:
@@ -5690,6 +5640,432 @@ impl QueryExecutor {
         Ok(QueryResult::Select {
             columns: column_names,
             rows: final_rows,
+        })
+    }
+
+    // ==================== Columnar Store Routing ====================
+
+    /// Try to serve a SELECT from the columnar store for TimeSeries tables.
+    /// Returns Ok(Some(result)) if handled, Ok(None) if it should fall through to LSM.
+    fn try_columnar_select(
+        &self,
+        stmt: &SelectStmt,
+        schema: &TableSchema,
+    ) -> Result<Option<QueryResult>> {
+        // Only handle simple FROM table (no JOINs, subqueries)
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name.clone(),
+            _ => return Ok(None),
+        };
+
+        // Extract time range from WHERE clause
+        let ts_col = match &schema.timeseries_column {
+            Some(col) => col.clone(),
+            None => return Ok(None),
+        };
+
+        let (start_ts, end_ts) = match self.extract_time_range(&stmt.where_clause, &ts_col) {
+            Some(range) => range,
+            None => return Ok(None), // Can't determine time range → fall through
+        };
+
+        // Don't handle aggregates or GROUP BY via columnar fast path;
+        // let the standard executor handle them (data is also in LSM via WAL replay).
+        if stmt.group_by.is_some() || self.has_aggregates(&stmt.columns) {
+            return Ok(None);
+        }
+
+        // Extract requested column names
+        let column_names: Vec<String> = stmt.columns.iter().map(|col| {
+            match col {
+                SelectColumn::Star => "*".to_string(),
+                SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => name.clone(),
+                SelectColumn::Expr(_, alias) => alias.clone().unwrap_or_default(),
+            }
+        }).collect();
+
+        // If star, pass empty vec (means all columns)
+        let query_cols: Vec<String> = if column_names.iter().any(|c| c == "*") {
+            vec![]
+        } else {
+            column_names.clone()
+        };
+
+        // Extract non-timestamp column conditions for pruning
+        let conditions = self.extract_column_conditions(&stmt.where_clause, schema, &ts_col);
+
+        let results = if conditions.is_empty() {
+            self.db.columnar_store.query_time_range(
+                &table_name,
+                start_ts,
+                end_ts,
+                &query_cols,
+            )?
+        } else {
+            self.db.columnar_store.query_with_conditions(
+                &table_name,
+                start_ts,
+                end_ts,
+                &conditions,
+                &query_cols,
+            )?
+        };
+
+        // Build result rows
+        let output_columns: Vec<String> = if query_cols.is_empty() {
+            schema.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            column_names
+        };
+
+        let mut rows = Vec::new();
+        for (_row_id, sql_row) in &results {
+            let mut row = Vec::new();
+            for col_name in &output_columns {
+                row.push(sql_row.get(col_name).cloned().unwrap_or(Value::Null));
+            }
+            rows.push(row);
+        }
+
+        // P1: Handle ORDER BY for columnar results
+        if let Some(ref order_by) = stmt.order_by {
+            for order_item in order_by.iter().rev() {
+                let col_name = match &order_item.expr {
+                    Expr::Column(name) => name.clone(),
+                    _ => continue,
+                };
+                let col_idx = output_columns.iter().position(|c| *c == col_name);
+                if let Some(idx) = col_idx {
+                    let ascending = order_item.asc;
+                    rows.sort_by(|a, b| {
+                        let va = a.get(idx).unwrap_or(&Value::Null);
+                        let vb = b.get(idx).unwrap_or(&Value::Null);
+                        let cmp = va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+                        if ascending { cmp } else { cmp.reverse() }
+                    });
+                }
+            }
+        }
+
+        // P1: Handle LIMIT
+        if let Some(limit) = stmt.limit {
+            rows.truncate(limit as usize);
+        }
+
+        Ok(Some(QueryResult::Select {
+            columns: output_columns,
+            rows,
+        }))
+    }
+
+    /// Extract time range from WHERE clause.
+    /// Looks for patterns: ts BETWEEN a AND b, ts >= a AND ts <= b, ts > a, ts < b
+    /// Also handles reverse comparisons: a >= ts → ts <= a, etc.
+    fn extract_time_range(&self, where_clause: &Option<Expr>, ts_col: &str) -> Option<(i64, i64)> {
+        let expr = where_clause.as_ref()?;
+
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                match op {
+                    BinaryOperator::And => {
+                        let left_range = self.extract_time_range(&Some(*left.clone()), ts_col)?;
+                        let right_range = self.extract_time_range(&Some(*right.clone()), ts_col)?;
+                        let start = left_range.0.max(right_range.0);
+                        let end = left_range.1.min(right_range.1);
+                        Some((start, end))
+                    }
+                    BinaryOperator::Ge => {
+                        // ts >= val OR val >= ts (reverse: ts <= val)
+                        if let Expr::Column(col) = left.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(right)?;
+                                return Some((val, i64::MAX));
+                            }
+                        }
+                        // Reverse: literal >= ts → ts <= literal
+                        if let Expr::Column(col) = right.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(left)?;
+                                return Some((i64::MIN, val));
+                            }
+                        }
+                        None
+                    }
+                    BinaryOperator::Gt => {
+                        if let Expr::Column(col) = left.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(right)?;
+                                return Some((val + 1, i64::MAX));
+                            }
+                        }
+                        // Reverse: literal > ts → ts < literal
+                        if let Expr::Column(col) = right.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(left)?;
+                                return Some((i64::MIN, val - 1));
+                            }
+                        }
+                        None
+                    }
+                    BinaryOperator::Le => {
+                        if let Expr::Column(col) = left.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(right)?;
+                                return Some((i64::MIN, val));
+                            }
+                        }
+                        // Reverse: literal <= ts → ts >= literal
+                        if let Expr::Column(col) = right.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(left)?;
+                                return Some((val, i64::MAX));
+                            }
+                        }
+                        None
+                    }
+                    BinaryOperator::Lt => {
+                        if let Expr::Column(col) = left.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(right)?;
+                                return Some((i64::MIN, val - 1));
+                            }
+                        }
+                        // Reverse: literal < ts → ts > literal
+                        if let Expr::Column(col) = right.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(left)?;
+                                return Some((val + 1, i64::MAX));
+                            }
+                        }
+                        None
+                    }
+                    BinaryOperator::Eq => {
+                        if let Expr::Column(col) = left.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(right)?;
+                                return Some((val, val));
+                            }
+                        }
+                        // Reverse: literal = ts
+                        if let Expr::Column(col) = right.as_ref() {
+                            if col == ts_col {
+                                let val = self.eval_literal_to_i64(left)?;
+                                return Some((val, val));
+                            }
+                        }
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            Expr::Between { expr: col, low, high, negated: _ } => {
+                if let Expr::Column(name) = col.as_ref() {
+                    if name == ts_col {
+                        let start = self.eval_literal_to_i64(low)?;
+                        let end = self.eval_literal_to_i64(high)?;
+                        return Some((start, end));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract non-timestamp column conditions from WHERE clause for columnar pruning.
+    /// Returns conditions that can be pushed down to segment-level zone maps and bloom filters.
+    fn extract_column_conditions(
+        &self,
+        where_clause: &Option<Expr>,
+        schema: &TableSchema,
+        ts_col: &str,
+    ) -> Vec<crate::storage::columnar::segment_manager::ColumnCondition> {
+        let expr = match where_clause {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+
+        let mut conditions = Vec::new();
+        self.collect_conditions_recursive(expr, schema, ts_col, &mut conditions);
+        conditions
+    }
+
+    fn collect_conditions_recursive(
+        &self,
+        expr: &Expr,
+        schema: &TableSchema,
+        ts_col: &str,
+        conditions: &mut Vec<crate::storage::columnar::segment_manager::ColumnCondition>,
+    ) {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                match op {
+                    BinaryOperator::And => {
+                        // Recurse into both sides of AND
+                        self.collect_conditions_recursive(left, schema, ts_col, conditions);
+                        self.collect_conditions_recursive(right, schema, ts_col, conditions);
+                    }
+                    BinaryOperator::Eq => {
+                        // col = value OR value = col (non-ts column)
+                        if let Some(cond) = self.try_extract_equality(left, right, schema, ts_col) {
+                            conditions.push(cond);
+                        } else if let Some(cond) = self.try_extract_equality(right, left, schema, ts_col) {
+                            conditions.push(cond);
+                        }
+                    }
+                    BinaryOperator::Ge | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Lt => {
+                        // Try to extract range conditions
+                        if let Some(cond) = self.try_extract_range(left, right, op, schema, ts_col) {
+                            conditions.push(cond);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Try to extract an Equals condition from `col_expr = value_expr`.
+    fn try_extract_equality(
+        &self,
+        col_expr: &Expr,
+        value_expr: &Expr,
+        schema: &TableSchema,
+        ts_col: &str,
+    ) -> Option<crate::storage::columnar::segment_manager::ColumnCondition> {
+        use crate::storage::columnar::segment_manager::ColumnCondition;
+
+        if let Expr::Column(col_name) = col_expr {
+            if col_name == ts_col {
+                return None; // Skip timestamp column
+            }
+            let col_idx = schema.columns.iter().position(|c| c.name == *col_name)?;
+            let value = match value_expr {
+                Expr::Literal(v) => v.clone(),
+                _ => return None,
+            };
+            Some(ColumnCondition::Equals { column_idx: col_idx, value })
+        } else {
+            None
+        }
+    }
+
+    /// Try to extract a Range condition from comparison ops.
+    fn try_extract_range(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        op: &BinaryOperator,
+        schema: &TableSchema,
+        ts_col: &str,
+    ) -> Option<crate::storage::columnar::segment_manager::ColumnCondition> {
+        use crate::storage::columnar::segment_manager::ColumnCondition;
+
+        // Determine which side is the column and which is the value
+        let (col_name, value, is_col_left) = match (left, right) {
+            (Expr::Column(c), Expr::Literal(v)) => (c, v, true),
+            (Expr::Literal(v), Expr::Column(c)) => (c, v, false),
+            _ => return None,
+        };
+
+        if col_name == ts_col {
+            return None;
+        }
+
+        let col_idx = schema.columns.iter().position(|c| c.name == *col_name)?;
+
+        // Convert comparison to a range [low, high]
+        let (low, high) = match (op, is_col_left) {
+            (BinaryOperator::Ge, true) => (value.clone(), Value::Integer(i64::MAX)),  // col >= val
+            (BinaryOperator::Gt, true) => {
+                // col > val → [val+1, MAX]
+                let bumped = self.increment_value(value)?;
+                (bumped, Value::Integer(i64::MAX))
+            }
+            (BinaryOperator::Le, true) => (Value::Integer(i64::MIN), value.clone()),  // col <= val
+            (BinaryOperator::Lt, true) => {
+                let decremented = self.decrement_value(value)?;
+                (Value::Integer(i64::MIN), decremented)
+            }
+            (BinaryOperator::Ge, false) => (Value::Integer(i64::MIN), value.clone()), // val >= col → col <= val
+            (BinaryOperator::Gt, false) => {
+                let decremented = self.decrement_value(value)?;
+                (Value::Integer(i64::MIN), decremented)
+            }
+            (BinaryOperator::Le, false) => (value.clone(), Value::Integer(i64::MAX)), // val <= col → col >= val
+            (BinaryOperator::Lt, false) => {
+                let bumped = self.increment_value(value)?;
+                (bumped, Value::Integer(i64::MAX))
+            }
+            _ => return None,
+        };
+
+        Some(ColumnCondition::Range { column_idx: col_idx, low, high })
+    }
+
+    fn increment_value(&self, v: &Value) -> Option<Value> {
+        match v {
+            Value::Integer(i) => Some(Value::Integer(i + 1)),
+            Value::Float(f) => Some(Value::Float(f + 1.0)),
+            _ => None,
+        }
+    }
+
+    fn decrement_value(&self, v: &Value) -> Option<Value> {
+        match v {
+            Value::Integer(i) => Some(Value::Integer(i - 1)),
+            Value::Float(f) => Some(Value::Float(f - 1.0)),
+            _ => None,
+        }
+    }
+
+    /// Evaluate a literal expression to i64 (for time range extraction).
+    fn eval_literal_to_i64(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Literal(Value::Timestamp(ts)) => Some(ts.as_micros()),
+            Expr::Literal(Value::Integer(i)) => Some(*i),
+            Expr::Literal(Value::Float(f)) => Some(*f as i64),
+            _ => None,
+        }
+    }
+
+    /// Execute INSERT for TimeSeries tables via the columnar store.
+    fn execute_columnar_insert(
+        &self,
+        stmt: &InsertStmt,
+        schema: &crate::types::TableSchema,
+        columns: &[String],
+    ) -> Result<QueryResult> {
+        let mut rows: Vec<Vec<crate::types::Value>> = Vec::new();
+
+        for value_row in &stmt.values {
+            if value_row.len() != columns.len() {
+                return Err(MoteDBError::InvalidArgument(
+                    format!("Column count mismatch: expected {}, got {}", columns.len(), value_row.len())
+                ));
+            }
+
+            // Build SqlRow first (reuses existing type coercion via sql_row_to_row)
+            let mut sql_row = SqlRow::new();
+            for (i, col_name) in columns.iter().enumerate() {
+                let val = match &value_row[i] {
+                    Expr::Literal(v) => v.clone(),
+                    expr => return Err(MoteDBError::InvalidArgument(
+                        format!("INSERT VALUES must be literals, got {:?}", expr)
+                    )),
+                };
+                sql_row.insert(col_name.clone(), val);
+            }
+
+            // Convert to storage Row (handles type coercion)
+            let row = sql_row_to_row(&sql_row, schema)?;
+            rows.push(row);
+        }
+
+        let result = self.db.columnar_store.ingest(&stmt.table, rows)?;
+        Ok(QueryResult::Modification {
+            affected_rows: result.row_ids.len(),
         })
     }
 }

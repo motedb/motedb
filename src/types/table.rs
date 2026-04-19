@@ -3,6 +3,67 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Table type (Standard or TimeSeries)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TableType {
+    /// Standard table (default)
+    #[default]
+    Standard,
+    /// Time-series optimized table
+    /// - Uses ingest() API for high-frequency writes
+    /// - Timestamp column is the designated time column
+    /// - Supports TTL retention policy
+    TimeSeries,
+}
+
+/// TTL duration for data retention
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TTLDuration {
+    /// Duration in seconds
+    pub seconds: u64,
+}
+
+impl TTLDuration {
+    /// Create from seconds
+    pub fn from_secs(secs: u64) -> Self {
+        Self { seconds: secs }
+    }
+
+    /// Create from minutes
+    pub fn from_mins(mins: u64) -> Self {
+        Self { seconds: mins * 60 }
+    }
+
+    /// Create from hours
+    pub fn from_hours(hours: u64) -> Self {
+        Self { seconds: hours * 3600 }
+    }
+
+    /// Create from days
+    pub fn from_days(days: u64) -> Self {
+        Self { seconds: days * 86400 }
+    }
+
+    /// Get duration as seconds
+    pub fn as_secs(&self) -> u64 {
+        self.seconds
+    }
+}
+
+impl std::fmt::Display for TTLDuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.seconds % 86400 == 0 {
+            write!(f, "{}d", self.seconds / 86400)
+        } else if self.seconds % 3600 == 0 {
+            write!(f, "{}h", self.seconds / 3600)
+        } else if self.seconds % 60 == 0 {
+            write!(f, "{}m", self.seconds / 60)
+        } else {
+            write!(f, "{}s", self.seconds)
+        }
+    }
+}
+
 /// Column data type
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
@@ -152,6 +213,15 @@ pub struct TableSchema {
     /// 🚀 Cached column names (avoids cloning N Strings per SELECT *)
     #[serde(skip)]
     pub column_names_cache: Option<Arc<Vec<String>>>,
+    /// Table type (Standard or TimeSeries)
+    #[serde(default)]
+    pub table_type: TableType,
+    /// Designated timestamp column for TimeSeries tables
+    #[serde(default)]
+    pub timeseries_column: Option<String>,
+    /// TTL retention policy (None = keep forever)
+    #[serde(default)]
+    pub ttl: Option<TTLDuration>,
 }
 
 impl TableSchema {
@@ -171,6 +241,9 @@ impl TableSchema {
             auto_increment_start: None,
             column_map,
             column_names_cache: None,
+            table_type: TableType::Standard,
+            timeseries_column: None,
+            ttl: None,
         }
     }
 
@@ -195,14 +268,27 @@ impl TableSchema {
     /// 🚀 Mark primary key as AUTO_INCREMENT
     pub fn with_auto_increment(mut self) -> Self {
         self.primary_key_auto_increment = true;
-        
+
         // Also mark the column itself
         if let Some(pk_col_name) = &self.primary_key_column {
             if let Some(col) = self.columns.iter_mut().find(|c| &c.name == pk_col_name) {
                 col.auto_increment = true;
             }
         }
-        
+
+        self
+    }
+
+    /// Mark as TimeSeries table with designated timestamp column
+    pub fn with_timeseries(mut self, ts_column: String) -> Self {
+        self.table_type = TableType::TimeSeries;
+        self.timeseries_column = Some(ts_column);
+        self
+    }
+
+    /// Set TTL retention policy
+    pub fn with_ttl(mut self, ttl: TTLDuration) -> Self {
+        self.ttl = Some(ttl);
         self
     }
     

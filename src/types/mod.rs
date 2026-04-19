@@ -7,10 +7,10 @@ mod timestamp;
 mod table;
 
 pub use tensor::Tensor;
-pub use spatial::{Geometry, Point, BoundingBox};
+pub use spatial::{Geometry, Point, Point3D, BoundingBox, BoundingBox3D};
 pub use text::{Text, TextDoc};
 pub use timestamp::Timestamp;
-pub use table::{TableSchema, ColumnDef, ColumnType, IndexDef, IndexType, Column};
+pub use table::{TableSchema, ColumnDef, ColumnType, IndexDef, IndexType, Column, TableType, TTLDuration};
 
 use serde::{Deserialize, Serialize, Deserializer, Serializer};
 use std::sync::Arc;

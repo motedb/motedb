@@ -138,9 +138,17 @@ impl MoteDB {
     pub fn text_search_ranked(&self, index_name: &str, query: &str, top_k: usize) -> Result<Vec<(RowId, f32)>> {
         let index_ref = self.text_indexes.get(index_name)
             .ok_or_else(|| StorageError::Index(format!("Text index '{}' not found", index_name)))?;
-        
+
         let results = index_ref.value().read().search_ranked(query, top_k)?;
         Ok(results)
+    }
+
+    /// Search for documents containing an exact phrase
+    pub fn text_search_phrase(&self, index_name: &str, phrase: &str) -> Result<Vec<RowId>> {
+        let index_ref = self.text_indexes.get(index_name)
+            .ok_or_else(|| StorageError::Index(format!("Text index '{}' not found", index_name)))?;
+        let guard = index_ref.value().read();
+        guard.search_phrase(phrase)
     }
     
     /// Get text index statistics

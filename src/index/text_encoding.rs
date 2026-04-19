@@ -1,10 +1,10 @@
-//! Text FTS Encoding - Varint/Delta Compression
+//! Text FTS Encoding - Varint/Delta Compression + Bitpacking
 //!
-//! Based on SQLite FTS5 encoding strategy:
+//! Based on SQLite FTS5 and Tantivy encoding strategies:
 //! - Varint encoding for space efficiency (1-9 bytes per integer)
 //! - Delta encoding for document IDs (only store differences)
+//! - Bitpacking for block-based posting lists (128 docs per block)
 //! - Position deltas (if enabled)
-//! - Segmented posting lists (split large lists into segments)
 
 use crate::{Result, StorageError};
 
@@ -239,10 +239,118 @@ pub fn encode_segmented_posting_list(
     Ok(segments)
 }
 
+// ===================== Bitpacking for Block-Based Posting Lists =====================
+
+/// Compute the number of bits needed to represent the maximum value in a slice.
+/// Returns 0 for empty slices.
+pub fn max_bits(values: &[u32]) -> u8 {
+    match values.iter().max() {
+        Some(&max_val) => {
+            if max_val == 0 { return 1; }
+            32 - max_val.leading_zeros() as u8
+        }
+        None => 0,
+    }
+}
+
+/// Compute the number of bits needed to represent the maximum value in a u16 slice.
+pub fn max_bits_u16(values: &[u16]) -> u8 {
+    match values.iter().max() {
+        Some(&max_val) => {
+            if max_val == 0 { return 1; }
+            16 - max_val.leading_zeros() as u8
+        }
+        None => 0,
+    }
+}
+
+/// Bitpack values into a byte buffer at the current position.
+/// Each value is stored using exactly `bits` bits, packed LSB-first.
+/// The buffer is extended as needed (padded to byte boundary at end).
+///
+/// Returns the number of bytes written.
+pub fn bitpack_into(buf: &mut Vec<u8>, values: &[u32], bits: u8) {
+    if bits == 0 || values.is_empty() {
+        return;
+    }
+
+    let total_bits = values.len() * bits as usize;
+    let total_bytes = (total_bits + 7) / 8;
+
+    // Start position in buf
+    let start_len = buf.len();
+    buf.resize(start_len + total_bytes, 0);
+
+    let mut bit_offset = 0u64; // bit offset within the output region
+    for &val in values {
+        let byte_idx = start_len + (bit_offset / 8) as usize;
+        let bit_shift = (bit_offset % 8) as u8;
+        let mask = ((1u32 << bits) - 1) & val;
+
+        // Write low bits into current byte
+        buf[byte_idx] |= (mask as u8) << bit_shift;
+
+        // Handle bits that overflow into next byte(s)
+        let remaining_bits = 8 - bit_shift;
+        if bits > remaining_bits {
+            let overflow = mask >> remaining_bits;
+            let overflow_bits = bits - remaining_bits;
+            // How many additional bytes does the overflow need?
+            let add_bytes = ((overflow_bits + 7) / 8) as usize;
+            for i in 0..add_bytes {
+                if byte_idx + 1 + i < buf.len() {
+                    buf[byte_idx + 1 + i] |= (overflow >> (i * 8)) as u8;
+                }
+            }
+        }
+
+        bit_offset += bits as u64;
+    }
+}
+
+/// Bitpack u16 values into a byte buffer (converts to u32 first).
+pub fn bitpack_u16_into(buf: &mut Vec<u8>, values: &[u16], bits: u8) {
+    let u32_vals: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+    bitpack_into(buf, &u32_vals, bits);
+}
+
+/// Bitunpack `count` values from data at byte `offset`, each using `bits` bits.
+/// Returns decoded u32 values.
+pub fn bitunpack(data: &[u8], offset: usize, count: usize, bits: u8) -> Vec<u32> {
+    if bits == 0 || count == 0 {
+        return vec![0; count];
+    }
+
+    let mut result = Vec::with_capacity(count);
+    let mask = (1u32 << bits) - 1;
+
+    let mut bit_offset = 0u64;
+    for _ in 0..count {
+        let byte_idx = offset + (bit_offset / 8) as usize;
+        let bit_shift = (bit_offset % 8) as u8;
+
+        // Read enough bytes to extract `bits` bits starting at bit_shift
+        let mut raw_val = 0u64;
+        let bytes_needed = ((bit_shift + bits) as usize + 7) / 8;
+        for i in 0..bytes_needed {
+            if byte_idx + i < data.len() {
+                raw_val |= (data[byte_idx + i] as u64) << (i * 8);
+            }
+        }
+
+        let val = ((raw_val >> bit_shift) as u32) & mask;
+        result.push(val);
+
+        bit_offset += bits as u64;
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_varint_encoding() {
         // Test various values
@@ -322,5 +430,62 @@ mod tests {
         // Flag (0) = 1 byte
         // Total: ~8 bytes vs 40 bytes raw
         assert!(encoded.len() < 15);
+    }
+
+    #[test]
+    fn test_max_bits() {
+        assert_eq!(max_bits(&[]), 0);
+        assert_eq!(max_bits(&[0]), 1);
+        assert_eq!(max_bits(&[1]), 1);
+        assert_eq!(max_bits(&[2]), 2);
+        assert_eq!(max_bits(&[3]), 2);
+        assert_eq!(max_bits(&[4]), 3);
+        assert_eq!(max_bits(&[7]), 3);
+        assert_eq!(max_bits(&[255]), 8);
+        assert_eq!(max_bits(&[256]), 9);
+        assert_eq!(max_bits_u16(&[0, 1, 3]), 2);
+    }
+
+    #[test]
+    fn test_bitpack_roundtrip_1bit() {
+        let values = vec![0, 1, 1, 0, 1, 0, 0, 1];
+        let mut buf = Vec::new();
+        bitpack_into(&mut buf, &values, 1);
+        let decoded = bitunpack(&buf, 0, values.len(), 1);
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_bitpack_roundtrip_5bit() {
+        let values: Vec<u32> = (0..128).map(|i| i % 31).collect();
+        let bits = max_bits(&values);
+        assert_eq!(bits, 5);
+        let mut buf = Vec::new();
+        bitpack_into(&mut buf, &values, bits);
+        let decoded = bitunpack(&buf, 0, values.len(), bits);
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_bitpack_roundtrip_large() {
+        // Simulate doc ID deltas up to 1024
+        let values: Vec<u32> = (0..128).map(|i| (i * 8 + 3) % 1024).collect();
+        let bits = max_bits(&values);
+        let mut buf = Vec::new();
+        bitpack_into(&mut buf, &values, bits);
+        let decoded = bitunpack(&buf, 0, values.len(), bits);
+        assert_eq!(decoded, values);
+        // Verify compression: should be much smaller than 128 * 4 bytes
+        assert!(buf.len() < 128 * 4);
+    }
+
+    #[test]
+    fn test_bitpack_at_offset() {
+        let values = vec![10, 20, 30, 40];
+        let bits = max_bits(&values);
+        let mut buf = vec![0xAA, 0xBB]; // prefix bytes
+        bitpack_into(&mut buf, &values, bits);
+        let decoded = bitunpack(&buf, 2, values.len(), bits);
+        assert_eq!(decoded, values);
     }
 }

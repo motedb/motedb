@@ -1187,10 +1187,28 @@ impl BTree {
             .clone()
     }
     
+    /// Range query with early termination limit
+    ///
+    /// Returns at most `limit` key-value pairs where start <= key <= end.
+    /// Significantly faster than range() + take() for large ranges with small limits.
+    pub fn range_with_limit(&self, start: &u64, end: &u64, limit: usize) -> Result<Vec<(u64, u64)>> {
+        let root_id = *self.root_page_id.read()
+            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+
+        if root_id == 0 || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let first_leaf_id = self.find_leaf_for_key(root_id, *start)?;
+        let mut results = Vec::with_capacity(limit.min(64));
+        self.scan_leaf_chain_limited(first_leaf_id, *start, *end, &mut results, limit)?;
+        Ok(results)
+    }
+
     /// Range query - Optimized with leaf chain scanning
-    /// 
+    ///
     /// Performance: O(log n + k) where k is the number of results
-    /// 
+    ///
     /// Algorithm:
     /// 1. Binary search to find the first leaf containing keys >= start
     /// 2. Sequentially scan leaf nodes using next_leaf pointers
@@ -1390,6 +1408,39 @@ impl BTree {
         Ok(())
     }
     
+    /// Scan leaf chain with early termination at limit
+    fn scan_leaf_chain_limited(&self, start_leaf_id: u64, start: u64, end: u64,
+                                results: &mut Vec<(u64, u64)>, limit: usize) -> Result<()> {
+        let mut current_leaf_id = start_leaf_id;
+
+        while current_leaf_id != INVALID_PAGE_ID && results.len() < limit {
+            let page_arc = self.load_page(current_leaf_id)?;
+            let page = page_arc.read()
+                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+
+            if !page.is_leaf {
+                return Err(StorageError::Index("Expected leaf node".into()));
+            }
+
+            for i in 0..page.num_keys {
+                if results.len() >= limit {
+                    return Ok(());
+                }
+                let key = page.keys[i];
+                if key > end {
+                    return Ok(());
+                }
+                if key >= start {
+                    results.push((key, page.values[i]));
+                }
+            }
+
+            current_leaf_id = page.next_leaf;
+        }
+
+        Ok(())
+    }
+
     /// Flush all dirty pages
     pub fn flush(&self) -> Result<()> {
         // Flush all dirty pages
@@ -1752,6 +1803,33 @@ mod tests {
         // Range query
         let results = btree.range(&1000, &1010).unwrap();
         assert_eq!(results.len(), 11);
+    }
+
+    #[test]
+    fn test_range_with_limit() {
+        let (mut btree, _temp) = create_test_btree();
+
+        for i in 0..500 {
+            btree.insert(i, i * 10).unwrap();
+        }
+
+        // Limit smaller than total results
+        let results = btree.range_with_limit(&0, &499, 5).unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0], (0, 0));
+        assert_eq!(results[4], (4, 40));
+
+        // Limit larger than total results
+        let results = btree.range_with_limit(&100, &110, 50).unwrap();
+        assert_eq!(results.len(), 11);
+
+        // Limit = 0
+        let results = btree.range_with_limit(&0, &499, 0).unwrap();
+        assert!(results.is_empty());
+
+        // Range with no matches
+        let results = btree.range_with_limit(&600, &700, 10).unwrap();
+        assert!(results.is_empty());
     }
 }
 

@@ -9,8 +9,8 @@
 
 use crate::{Result, StorageError};
 use crate::index::text_types::{
-    TermId, DocId, PostingList,
-    Tokenizer, WhitespaceTokenizer, BM25Config,
+    TermId, DocId, PostingList, PostingListFormat, Position,
+    Tokenizer, WhitespaceTokenizer, BM25Config, FieldNormTable,
 };
 use crate::index::text_dictionary::ChunkedDictionary;
 use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig};
@@ -65,7 +65,11 @@ pub struct TextFTSIndex {
     
     /// Pending doc_lengths (accumulated in memory, flushed together)
     pending_doc_lengths: Arc<RwLock<HashMap<DocId, u32>>>,
-    
+
+    /// Cached doc_lengths (fieldnorm encoded, lazy loaded).
+    /// Invalidated on insert/update/delete, rebuilt on next search.
+    doc_length_cache: Arc<RwLock<Option<Arc<HashMap<DocId, u8>>>>>,
+
     /// Deleted documents (tombstones)
     deleted_docs: Arc<RwLock<HashSet<DocId>>>,
     
@@ -91,20 +95,56 @@ struct DocLengthMap {
     lengths: HashMap<DocId, u32>,
 }
 
+/// Internal cursor for WAND query processing.
+struct TermCursorData {
+    idf: f32,
+    upper_bound: f32,
+    /// Sorted (doc_id, tf) entries
+    entries: Vec<(u32, u16)>,
+    /// Current position within entries
+    pos: usize,
+}
+
+impl TermCursorData {
+    fn current_doc(&self) -> u32 {
+        if self.pos >= self.entries.len() {
+            u32::MAX // exhausted cursors sort to end
+        } else {
+            self.entries[self.pos].0
+        }
+    }
+
+    fn current_tf(&self) -> u16 {
+        if self.pos >= self.entries.len() { 0 } else { self.entries[self.pos].1 }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.pos >= self.entries.len()
+    }
+
+    fn advance(&mut self) {
+        self.pos += 1;
+    }
+
+    fn seek(&mut self, target: u32) {
+        // Binary search for first entry >= target
+        if self.is_exhausted() { return; }
+        if self.entries[self.pos].0 >= target { return; }
+        match self.entries[self.pos..].binary_search_by_key(&target, |&(d, _)| d) {
+            Ok(idx) => self.pos += idx,
+            Err(idx) => self.pos += idx,
+        }
+    }
+}
+
 impl TextFTSIndex {
     /// Create a new text FTS index
     pub fn new(storage_path: PathBuf) -> Result<Self> {
         Self::with_config(
             storage_path,
             Arc::new(WhitespaceTokenizer::default()),
-            false,  // disable positions by default (save 30% memory)
-            4,      // 🚀 P0: 进一步降低到4 chunks（原6），减少2MB内存
-                    // 内存优化分析：
-                    // - Dictionary cache: 4 chunks × 520KB/chunk ≈ 2.1 MB ✅ (省2MB)
-                    // - Pending posting lists: ~500 terms × 2KB ≈ 1 MB ✅ (原3MB)
-                    // - Shard counters: 主动清理 → <1 MB ✅
-                    // - BTree cache: 128 pages × 8KB ≈ 1 MB ✅ (原1.5MB)
-                    // Total: ~5 MB ✅ (原10MB，省50%)
+            true,   // enable positions for phrase query support
+            4,
         )
     }
     
@@ -159,6 +199,7 @@ impl TextFTSIndex {
             total_tokens,
             avg_doc_length,
             pending_doc_lengths: Arc::new(RwLock::new(HashMap::new())),
+            doc_length_cache: Arc::new(RwLock::new(None)),
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
         })
@@ -224,30 +265,31 @@ impl TextFTSIndex {
         let mut batch_token_count = 0u64;
         
         // Build per-term doc lists (lightweight intermediate structure)
-        let mut term_docs: HashMap<TermId, Vec<DocId>> = HashMap::new();
+        let mut term_docs: HashMap<TermId, Vec<(DocId, Option<Position>)>> = HashMap::new();
         let mut doc_lengths_batch = HashMap::new();
-        
+
         for &(doc_id, text) in docs {
             let tokens = self.tokenizer.tokenize(text);
             doc_lengths_batch.insert(doc_id, tokens.len() as u32);
             batch_token_count += tokens.len() as u64;
-            
+
             for token in tokens {
                 let term_id = self.dictionary.get_or_insert(&token.text);
-                term_docs.entry(term_id).or_default().push(doc_id);
+                let pos = if self.enable_positions { Some(token.position) } else { None };
+                term_docs.entry(term_id).or_default().push((doc_id, pos));
             }
         }
-        
+
         // 2. Accumulate in pending buffer
         let mut pending = self.pending_posting_lists.write();
-        
-        for (term_id, doc_ids) in term_docs {
+
+        for (term_id, doc_entries) in term_docs {
             let posting = pending.entry(term_id).or_insert_with(|| {
                 PostingList::new_without_positions(!self.enable_positions)
             });
-            
-            for doc_id in doc_ids {
-                posting.add(doc_id, None);
+
+            for (doc_id, pos) in doc_entries {
+                posting.add(doc_id, pos);
             }
         }
         
@@ -259,14 +301,17 @@ impl TextFTSIndex {
         let mut pending_doc_lens = self.pending_doc_lengths.write();
         pending_doc_lens.extend(doc_lengths_batch);
         drop(pending_doc_lens);
-        
+
         // 3. Update statistics
         self.total_docs += docs.len() as u64;
         self.total_tokens += batch_token_count;
-        
+
         if self.total_docs > 0 {
             self.avg_doc_length = self.total_tokens as f32 / self.total_docs as f32;
         }
+
+        // Invalidate doc length cache
+        *self.doc_length_cache.write() = None;
         
         // ✅ 自动flush（每5000个term触发一次）
         if should_auto_flush {
@@ -348,10 +393,13 @@ impl TextFTSIndex {
         } else {
             self.avg_doc_length = 0.0;
         }
-        
+
+        // Invalidate doc length cache
+        *self.doc_length_cache.write() = None;
+
         Ok(())
     }
-    
+
     /// Update a document in the index
     /// 
     /// Strategy: Remove old terms from posting lists + add new terms
@@ -428,42 +476,76 @@ impl TextFTSIndex {
         if self.total_docs > 0 {
             self.avg_doc_length = self.total_tokens as f32 / self.total_docs as f32;
         }
-        
+
+        // Invalidate doc length cache
+        *self.doc_length_cache.write() = None;
+
         Ok(())
     }
-    
+
     /// Load posting list from all shards (helper function)
-    fn load_posting_list_sharded(&self, term_id: TermId, btree: &mut parking_lot::RwLockWriteGuard<GenericBTree<u32>>) -> Result<Option<PostingList>> {
-        let mut merged = PostingList::new();
+    fn load_posting_list_sharded(&self, term_id: TermId, btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>) -> Result<Option<PostingList>> {
+        let mut merged = PostingList::new_without_positions(true);
         let mut found_any = false;
-        
+
         // Extract base term_id (lower 24 bits)
         let base_term_id = term_id & 0x00FFFFFF;
-        
+
         // Use shard_counters to know exactly how many shards exist
         let max_shard_idx = {
             let counters = self.shard_counters.read();
             *counters.get(&term_id).unwrap_or(&1)
         };
-        
+
         // Only scan known shards (not 0-256!)
         for shard_idx in 0..max_shard_idx {
             let shard_key = (shard_idx << 24) | base_term_id;
             match btree.get(&shard_key)? {
                 Some(bytes) if !bytes.is_empty() => {
-                    let shard = PostingList::deserialize_compact(&bytes)?;
-                    merged.merge(&shard);
+                    // Detect format: block (0x42, 0x50) or legacy RoaringBitmap
+                    match PostingListFormat::deserialize(&bytes) {
+                        Ok(PostingListFormat::Block(block)) => {
+                            // Debug: verify block decode
+                            // Convert block format to legacy PostingList for merging
+                            let mut cursor = block.cursor();
+                            while cursor.is_valid() {
+                                let doc_id = cursor.current_doc() as u64;
+                                let tf = cursor.current_tf();
+                                merged.add_with_freq(doc_id, None, tf);
+                                cursor.advance();
+                            }
+                        }
+                        Ok(PostingListFormat::Legacy(shard)) => {
+                            merged.merge(&shard);
+                        }
+                        Err(_) => continue,
+                    }
                     found_any = true;
                 }
-                _ => continue,  // 🔧 FIX: Continue instead of break to check all shards
+                _ => continue,
             }
         }
-        
+
         if found_any {
             Ok(Some(merged))
         } else {
             Ok(None)
         }
+    }
+
+    /// Load posting list with positions (for phrase queries).
+    /// Loads the regular posting list then fetches positions from shard 0xFE.
+    fn load_posting_list_with_positions(&self, term_id: TermId, btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>) -> Result<Option<PostingList>> {
+        let mut posting = match self.load_posting_list_sharded(term_id, btree)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let base_term_id = term_id & 0x00FFFFFF;
+        let pos_key = (0xFEu32 << 24) | base_term_id;
+        if let Some(bytes) = btree.get(&pos_key)? {
+            posting.load_positions(&bytes);
+        }
+        Ok(Some(posting))
     }
     
     /// Search for documents containing query terms
@@ -474,13 +556,13 @@ impl TextFTSIndex {
         }
         
         let pending = self.pending_posting_lists.read();
-        let mut btree = self.btree.write();
+        let btree = self.btree.read();
         let deleted = self.deleted_docs.read();
         let deleted_term_docs = self.deleted_term_docs.read();
-        
+
         // Get posting lists for all query terms
         let mut results: Option<Vec<DocumentId>> = None;
-        
+
         for token in tokens {
             if let Some(term_id) = self.dictionary.get(&token.text) {
                 // Priority: pending > B-Tree disk
@@ -488,21 +570,21 @@ impl TextFTSIndex {
                     pend.clone()
                 } else {
                     // Load from B-Tree disk with sharding support
-                    if let Some(p) = self.load_posting_list_sharded(term_id, &mut btree)? {
+                    if let Some(p) = self.load_posting_list_sharded(term_id, &btree)? {
                         p
                     } else {
                         continue;
                     }
                 };
-                
+
                 let mut doc_ids = posting.doc_ids();
-                
+
                 // Filter out deleted documents
                 doc_ids.retain(|id| !deleted.contains(id));
-                
+
                 // Filter out deleted (term_id, doc_id) pairs
                 doc_ids.retain(|id| !deleted_term_docs.contains(&(term_id, *id)));
-                
+
                 if let Some(ref mut current) = results {
                     // AND operation (intersection)
                     current.retain(|id| doc_ids.contains(id));
@@ -511,75 +593,317 @@ impl TextFTSIndex {
                 }
             }
         }
-        
+
         Ok(results.unwrap_or_default())
     }
     
-    /// Search with BM25 ranking
+    /// Search for documents containing an exact phrase (consecutive token positions).
+    ///
+    /// E.g., search_phrase("machine learning") returns only docs where "machine"
+    /// appears at position N and "learning" at position N+1.
+    pub fn search_phrase(&self, phrase: &str) -> Result<Vec<DocumentId>> {
+        let tokens = self.tokenizer.tokenize(phrase);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pending = self.pending_posting_lists.read();
+        let btree = self.btree.read();
+        let deleted = self.deleted_docs.read();
+
+        // Load posting lists for all phrase tokens (with positions for phrase matching)
+        let mut postings: Vec<(TermId, PostingList)> = Vec::new();
+        for token in &tokens {
+            if let Some(term_id) = self.dictionary.get(&token.text) {
+                let posting = if let Some(pend) = pending.get(&term_id) {
+                    pend.clone()
+                } else if let Some(p) = self.load_posting_list_with_positions(term_id, &btree)? {
+                    p
+                } else {
+                    return Ok(Vec::new()); // Term not found → phrase cannot match
+                };
+                postings.push((term_id, posting));
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+
+        // Single-token phrase: just return docs containing it
+        if postings.len() == 1 {
+            let mut doc_ids = postings.into_iter().next().unwrap().1.doc_ids();
+            doc_ids.retain(|id| !deleted.contains(&(*id as DocId)));
+            return Ok(doc_ids);
+        }
+
+        // Multi-token phrase: intersect by consecutive positions
+        // Start with the candidate set from the first (rarest) term
+        // Sort by doc frequency ascending for better intersection
+        postings.sort_by_key(|(_, p)| p.doc_count());
+
+        let candidates = &postings[0].1;
+        let mut result = Vec::new();
+
+        'outer: for doc_id in candidates.doc_ids() {
+            let doc_id = doc_id as DocId;
+            if deleted.contains(&doc_id) {
+                continue;
+            }
+
+            // Get positions of the first token in this doc
+            let first_positions = match postings[0].1.get_positions(doc_id) {
+                Some(positions) => positions,
+                None => continue, // No position data → cannot verify phrase
+            };
+
+            'pos: for &start_pos in first_positions.iter() {
+                // Check if every subsequent token appears at start_pos + offset
+                for (offset, (_, posting)) in postings.iter().enumerate().skip(1) {
+                    let expected_pos = start_pos + offset as u32;
+                    match posting.get_positions(doc_id) {
+                        Some(positions) => {
+                            if !positions.contains(&expected_pos) {
+                                continue 'pos;
+                            }
+                        }
+                        None => continue 'outer,
+                    }
+                }
+                // All tokens matched at consecutive positions
+                result.push(doc_id);
+                continue 'outer;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Search with BM25 ranking using WAND (Weak AND) for top-K early termination.
+    ///
+    /// WAND skips documents that cannot make it into the top-K results by
+    /// maintaining a score threshold and using per-term upper bounds.
     pub fn search_ranked(&self, query: &str, top_k: usize) -> Result<Vec<(DocumentId, f32)>> {
         let tokens = self.tokenizer.tokenize(query);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        
-        // Load doc_lengths from disk on demand
-        let doc_lengths = self.load_doc_lengths()?;
-        
-        // Calculate BM25 scores
-        let mut scores: HashMap<DocumentId, f32> = HashMap::new();
-        
+
+        // De-duplicate tokens (same token appearing twice doesn't change posting list)
+        let mut unique_tokens: Vec<_> = tokens.iter().map(|t| t.text.clone()).collect();
+        unique_tokens.sort();
+        unique_tokens.dedup();
+
+        // Load doc_lengths (use cache if available)
+        let doc_lengths = self.get_doc_lengths_cached()?;
+        let avg_dl = if self.avg_doc_length > 0.0 { self.avg_doc_length } else { 1.0 };
+
         let pending = self.pending_posting_lists.read();
-        let mut btree = self.btree.write();
+        let btree = self.btree.read();
         let deleted = self.deleted_docs.read();
         let deleted_term_docs = self.deleted_term_docs.read();
-        
-        for token in &tokens {
-            if let Some(term_id) = self.dictionary.get(&token.text) {
-                let posting = if let Some(pend) = pending.get(&term_id) {
-                    pend.clone()
-                } else {
-                    // Load from B-Tree disk with sharding support
-                    if let Some(p) = self.load_posting_list_sharded(term_id, &mut btree)? {
-                        p
-                    } else {
-                        continue;
-                    }
-                };
-                
-                let df = posting.doc_count() as f32;
-                let idf = ((self.total_docs as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
-                
-                for doc_id in posting.doc_ids() {
-                    // Skip deleted documents
-                    if deleted.contains(&doc_id) {
-                        continue;
-                    }
-                    
-                    // Skip deleted (term_id, doc_id) pairs
-                    if deleted_term_docs.contains(&(term_id, doc_id)) {
-                        continue;
-                    }
-                    
-                    let tf = posting.term_frequency(doc_id) as f32;
-                    let doc_len = *doc_lengths.get(&doc_id).unwrap_or(&0) as f32;
-                    
-                    let k1 = self.bm25_config.k1;
-                    let b = self.bm25_config.b;
-                    
-                    let norm = 1.0 - b + b * (doc_len / self.avg_doc_length);
-                    let score = idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
-                    
-                    *scores.entry(doc_id).or_insert(0.0) += score;
+
+        let k1 = self.bm25_config.k1;
+        let b = self.bm25_config.b;
+        let total_docs = self.total_docs as f32;
+
+        // Build term cursors: for each token, load posting list and compute IDF + upper bound
+        let mut cursors: Vec<TermCursorData> = Vec::new();
+        for token_text in &unique_tokens {
+            let term_id = match self.dictionary.get(token_text) {
+                Some(id) => id,
+                None => {
+                    continue;
+                }
+            };
+
+            // Load posting list (pending > disk)
+            let posting = if let Some(pend) = pending.get(&term_id) {
+                pend.clone()
+            } else if let Some(p) = self.load_posting_list_sharded(term_id, &btree)? {
+                p
+            } else {
+                continue;
+            };
+
+            let df = posting.doc_count() as f32;
+            if df == 0.0 { continue; }
+            let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+
+            // Compute max possible BM25 score for this term (upper bound)
+            let max_tf = posting.max_tf();
+            let upper_bound = {
+                let tf = max_tf as f32;
+                let min_norm = 1.0 - b; // minimal norm (doc_len = 0)
+                idf * (tf * (k1 + 1.0)) / (tf + k1 * min_norm)
+            };
+
+            // Collect non-deleted doc_ids with their TFs
+            let mut entries: Vec<(u32, u16)> = Vec::new();
+            let pairs = posting.iter_doc_tf();
+            for (doc_id_u32, tf) in pairs {
+                let doc_id = doc_id_u32 as DocId;
+                if deleted.contains(&doc_id) { continue; }
+                if deleted_term_docs.contains(&(term_id, doc_id)) { continue; }
+                if tf > 0 {
+                    entries.push((doc_id_u32, tf));
                 }
             }
+
+            if entries.is_empty() {
+                continue;
+            }
+            // Sort by doc_id for WAND merge
+            entries.sort_by_key(|&(d, _)| d);
+
+            cursors.push(TermCursorData {
+                idf,
+                upper_bound,
+                entries,
+                pos: 0,
+            });
         }
-        
-        // Sort by score and return top-k
-        let mut ranked: Vec<_> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        ranked.truncate(top_k);
-        
-        Ok(ranked)
+
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Sort cursors by upper bound descending (for better pruning)
+        cursors.sort_by(|a, b| b.upper_bound.partial_cmp(&a.upper_bound).unwrap());
+
+        // WAND execution
+        // Use ordered floats for the heap (Reverse<(OrderedFloat, u32)>)
+        #[derive(Clone, PartialEq)]
+        struct OrdF32(f32);
+        impl Eq for OrdF32 {}
+        impl PartialOrd for OrdF32 {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+        }
+        impl Ord for OrdF32 {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(OrdF32, u32)>> =
+            std::collections::BinaryHeap::with_capacity(top_k + 1);
+        let mut threshold = 0.0f32;
+
+        // Calculate sum of all upper bounds
+        let total_upper: f32 = cursors.iter().map(|c| c.upper_bound).sum();
+        if total_upper < threshold {
+            return Ok(Vec::new());
+        }
+
+        // Iterate using WAND pivot selection
+        loop {
+            // Sort cursors by current doc_id
+            cursors.sort_by_key(|c| c.current_doc());
+
+            // Find pivot: smallest p where sum(upper_bound[0..p+1]) >= threshold
+            let mut prefix_sum = 0.0f32;
+            let mut pivot_idx = None;
+            for (i, cursor) in cursors.iter().enumerate() {
+                if cursor.is_exhausted() { continue; }
+                prefix_sum += cursor.upper_bound;
+                if prefix_sum >= threshold {
+                    pivot_idx = Some(i);
+                    break;
+                }
+            }
+
+            let pivot_idx = match pivot_idx {
+                Some(idx) => idx,
+                None => break, // No doc can exceed threshold
+            };
+
+            let pivot_doc = cursors[pivot_idx].current_doc();
+
+            // Check if all cursors up to pivot are at pivot_doc
+            let mut all_at_pivot = true;
+            for cursor in &mut cursors[..=pivot_idx] {
+                if cursor.is_exhausted() { continue; }
+                if cursor.current_doc() < pivot_doc {
+                    cursor.seek(pivot_doc);
+                }
+                if cursor.current_doc() != pivot_doc {
+                    all_at_pivot = false;
+                }
+            }
+
+            if !all_at_pivot {
+                continue; // Re-sort and retry
+            }
+
+            // Score pivot document
+            let doc_id = pivot_doc as DocId;
+            let doc_len = doc_lengths.get(&doc_id).copied().unwrap_or(0);
+            let dl_approx = FieldNormTable::decode(doc_len, avg_dl);
+            let norm = 1.0 - b + b * (dl_approx / avg_dl);
+
+            let mut score = 0.0f32;
+            for cursor in &cursors {
+                if !cursor.is_exhausted() && cursor.current_doc() == pivot_doc {
+                    let tf = cursor.current_tf() as f32;
+                    score += cursor.idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+                }
+            }
+
+            // Update heap
+            if heap.len() < top_k {
+                heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
+                if heap.len() == top_k {
+                    threshold = heap.peek().map(|h| h.0.0.0).unwrap_or(0.0);
+                }
+            } else if score > threshold {
+                heap.pop();
+                heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
+                threshold = heap.peek().map(|h| h.0.0.0).unwrap_or(0.0);
+            }
+
+            // Advance all cursors at pivot_doc
+            for cursor in &mut cursors {
+                if !cursor.is_exhausted() && cursor.current_doc() == pivot_doc {
+                    cursor.advance();
+                }
+            }
+
+            // Check if any active cursors remain
+            if cursors.iter().all(|c| c.is_exhausted()) {
+                break;
+            }
+        }
+
+        // Extract results
+        let mut results: Vec<(DocumentId, f32)> = heap.into_iter()
+            .map(|std::cmp::Reverse((OrdF32(score), doc))| (doc as DocId, score))
+            .collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        Ok(results)
+    }
+
+    /// Get doc_lengths with caching (fieldnorm encoded).
+    fn get_doc_lengths_cached(&self) -> Result<Arc<HashMap<DocId, u8>>> {
+        {
+            let cache = self.doc_length_cache.read();
+            if let Some(ref cached) = *cache {
+                return Ok(cached.clone());
+            }
+        }
+
+        // Cache miss: load from disk + merge pending
+        let mut doc_lengths = self.load_doc_lengths()?;
+        {
+            let pending_dl = self.pending_doc_lengths.read();
+            doc_lengths.extend(pending_dl.iter().map(|(&k, &v)| (k, v)));
+        }
+
+        let avg_dl = if self.avg_doc_length > 0.0 { self.avg_doc_length } else { 1.0 };
+        let encoded: HashMap<DocId, u8> = doc_lengths.into_iter()
+            .map(|(k, v)| (k, FieldNormTable::encode(v, avg_dl)))
+            .collect();
+
+        let arc = Arc::new(encoded);
+        *self.doc_length_cache.write() = Some(arc.clone());
+        Ok(arc)
     }
     
     /// Flush index to disk (write pending buffer to BTree)
@@ -608,22 +932,87 @@ impl TextFTSIndex {
         let pending_data = std::mem::take(&mut *pending);
         drop(pending);
         
-        // 2. Write to BTree (one segment per term per flush)
+        // 2. Write to BTree using block format
         let t2 = Instant::now();
         let mut btree = self.btree.write();
         let mut shard_counters = self.shard_counters.write();
-        
+        let deleted = self.deleted_docs.read();
+        let deleted_term_docs = self.deleted_term_docs.read();
+
         for (term_id, posting) in pending_data.iter() {
             let base_term_id = *term_id & 0x00FFFFFF;
             let next_shard_idx = *shard_counters.get(term_id).unwrap_or(&0);
-            
-            // Serialize and write
-            let shard_key = (next_shard_idx << 24) | base_term_id;
-            let bytes = posting.serialize_compact()?;
-            btree.insert(shard_key, bytes)?;
-            
-            shard_counters.insert(*term_id, next_shard_idx + 1);
+
+            // Merge with existing shards on disk
+            let merged = if next_shard_idx > 0 {
+                let mut merged_posting = posting.clone();
+                // Read existing shards and merge
+                for shard_idx in 0..next_shard_idx {
+                    let shard_key = (shard_idx << 24) | base_term_id;
+                    if let Ok(Some(bytes)) = btree.get(&shard_key) {
+                        if !bytes.is_empty() {
+                            // Try block format first, then legacy
+                            if super::text_types::BlockPostingList::is_block_format(&bytes) {
+                                if let Ok(block_list) = super::text_types::BlockPostingList::deserialize(&bytes) {
+                                    let mut cursor = block_list.cursor();
+                                    while cursor.is_valid() {
+                                        merged_posting.add(cursor.current_doc() as u64, None);
+                                        cursor.advance();
+                                    }
+                                }
+                            } else if let Ok(shard) = PostingList::deserialize_compact(&bytes) {
+                                merged_posting.merge(&shard);
+                            }
+                        }
+                    }
+                }
+                merged_posting
+            } else {
+                posting.clone()
+            };
+
+            // Remove tombstoned docs
+            let doc_ids = merged.doc_ids();
+            let mut clean_ids: Vec<u32> = Vec::new();
+            let mut clean_tfs: Vec<u16> = Vec::new();
+            for &doc_id_u64 in &doc_ids {
+                let doc_id = doc_id_u64 as DocId;
+                if deleted.contains(&doc_id) { continue; }
+                if deleted_term_docs.contains(&(*term_id, doc_id)) { continue; }
+                clean_ids.push(doc_id_u64 as u32);
+                clean_tfs.push(merged.term_frequency(doc_id));
+            }
+
+            if clean_ids.is_empty() { continue; }
+
+            // Encode as block format
+            let block_list = super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
+            let bytes = block_list.as_bytes();
+
+            // Write as shard 0 (replacing all old shards)
+            let shard_key = 0 << 24 | base_term_id;
+            btree.insert(shard_key, bytes.to_vec())?;
+
+            // Delete old shard entries
+            for shard_idx in 1..next_shard_idx {
+                let old_key = (shard_idx << 24) | base_term_id;
+                let _ = btree.delete(&old_key);
+            }
+
+            // Update counter to 1 (single consolidated shard)
+            shard_counters.insert(*term_id, 1);
+
+            // Write positions to separate key (shard 0xFE) for phrase query support
+            let pos_key = (0xFEu32 << 24) | base_term_id;
+            if let Some(pos_bytes) = merged.serialize_positions_for(&clean_ids) {
+                btree.insert(pos_key, pos_bytes)?;
+            } else {
+                let _ = btree.delete(&pos_key);
+            }
         }
+
+        drop(deleted);
+        drop(deleted_term_docs);
         
         drop(shard_counters);
         let _t2_elapsed = t2.elapsed();
@@ -648,7 +1037,9 @@ impl TextFTSIndex {
         
         {
             let mut counters = self.shard_counters.write();
-            counters.clear();
+            // NOTE: Do NOT clear shard_counters! They are needed for
+            // load_posting_list_sharded() to know how many shards exist per term.
+            // Clearing would cause data loss (only shard 0 would be read after flush).
             counters.shrink_to_fit();  // 释放capacity
         }
         
@@ -775,15 +1166,30 @@ impl TextFTSIndex {
         }
         
         // Merge incremental file if exists
+        // Format: repeated [len:u32 LE][bincode(HashMap<DocId, u32>)]
         if incremental_path.exists() {
             let mut file = File::open(&incremental_path)?;
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
-            
+
             if !buffer.is_empty() {
-                let incremental: HashMap<DocId, u32> = bincode::deserialize(&buffer)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                all_lengths.extend(incremental);
+                let mut cursor = std::io::Cursor::new(&buffer);
+                while cursor.position() < buffer.len() as u64 {
+                    let mut len_bytes = [0u8; 4];
+                    if cursor.read_exact(&mut len_bytes).is_err() {
+                        break;
+                    }
+                    let block_len = u32::from_le_bytes(len_bytes) as usize;
+                    let start = cursor.position() as usize;
+                    let end = start + block_len;
+                    if end > buffer.len() {
+                        break;
+                    }
+                    if let Ok(block) = bincode::deserialize::<HashMap<DocId, u32>>(&buffer[start..end]) {
+                        all_lengths.extend(block);
+                    }
+                    cursor.set_position(end as u64);
+                }
             }
         }
         
@@ -828,29 +1234,6 @@ impl TextFTSIndex {
         }
         
         Ok(())
-    }
-    
-    /// 🚀 P0 NEW: 只从主文件加载doc_lengths
-    #[allow(dead_code)]
-    fn load_doc_lengths_from_main(&self) -> Result<HashMap<DocId, u32>> {
-        let lengths_path = self.storage_dir.join("doclengths.bin");
-        
-        if !lengths_path.exists() {
-            return Ok(HashMap::new());
-        }
-        
-        let mut file = File::open(&lengths_path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        
-        if buffer.is_empty() {
-            return Ok(HashMap::new());
-        }
-        
-        let map: DocLengthMap = bincode::deserialize(&buffer)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        
-        Ok(map.lengths)
     }
     
     /// Get statistics

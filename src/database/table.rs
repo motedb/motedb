@@ -48,22 +48,52 @@ impl MoteDB {
             }
         }
 
+        // Register TimeSeries tables with the columnar store
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            if let Ok(table_id) = self.table_registry.get_table_id(&schema.name) {
+                if let Err(e) = self.columnar_store.register_table(table_id, &schema) {
+                    eprintln!("[WARN] Failed to register columnar table '{}': {}", schema.name, e);
+                }
+            }
+        }
+
         Ok(())
     }
     
     /// Drop a table
-    /// 
-    /// Note: This only removes the table metadata. 
-    /// Existing rows and indexes are not automatically deleted.
-    /// 
-    /// # Example
-    /// ```ignore
-    /// db.drop_table("users")?;
-    /// ```
+    ///
+    /// Deletes row data (LSM tombstones), drops all indexes, cleans up caches,
+    /// and removes table metadata.
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         ensure_open!(self);
+
+        // 1. Delete row data from LSM (tombstones for compaction to reclaim)
+        let table_prefix = self.compute_table_prefix(table_name);
+        let start_key = table_prefix << 32;
+        let end_key = (table_prefix << 32) | 0xFFFF_FFFF;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let _ = self.lsm_engine.delete_range(start_key, end_key, timestamp);
+
+        // 2. Flush so tombstones reach SSTables (enables compaction cleanup)
+        let _ = self.lsm_engine.flush();
+
+        // 3. Drop columnar store for TimeSeries tables
+        let _ = self.columnar_store.drop_table(table_name);
+
+        // 4. Drop in-memory index handles
+        self.vector_indexes.remove(table_name);
+        self.ioctree_indexes.remove(table_name);
+        self.text_indexes.remove(table_name);
+        self.column_indexes.remove(table_name);
+
+        // 5. Invalidate row cache for this table
+        self.row_cache.invalidate_table(table_name);
+
+        // 6. Remove catalog metadata
         self.table_registry.drop_table(table_name)?;
-        // Clean up per-table caches
         self.pk_lookup.remove(table_name);
         self.table_auto_increment.remove(table_name);
         Ok(())
@@ -103,6 +133,40 @@ impl MoteDB {
     /// ```
     pub fn table_exists(&self, table_name: &str) -> bool {
         self.table_registry.table_exists(table_name)
+    }
+
+    /// Get total disk usage in bytes (WAL + LSM + indexes)
+    pub fn disk_usage(&self) -> u64 {
+        let mut total: u64 = 0;
+
+        // WAL directory
+        if let Ok(entries) = std::fs::read_dir(self.path.join("wal")) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+
+        // LSM directory
+        if let Ok(entries) = std::fs::read_dir(self.path.join("lsm")) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+
+        // Indexes directory
+        if let Ok(entries) = std::fs::read_dir(self.path.join("indexes")) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+
+        total
     }
     
     /// Add index to existing table
@@ -147,20 +211,6 @@ impl MoteDB {
         table_id as u64
     }
 
-    /// Extract row_id from composite key
-    #[allow(dead_code)]
-    pub(crate) fn extract_row_id(&self, composite_key: u64) -> RowId {
-        composite_key & 0xFFFFFFFF
-    }
-
-    /// Check if composite key belongs to table
-    #[allow(dead_code)]
-    pub(crate) fn key_matches_table(&self, composite_key: u64, table_name: &str) -> bool {
-        let table_id = self.table_registry.get_table_id(table_name)
-            .unwrap_or(0);
-        (composite_key >> 32) == table_id as u64
-    }
-    
     /// 🚀 P2: Get row cache for statistics and monitoring
     pub fn get_row_cache(&self) -> &std::sync::Arc<crate::cache::RowCache> {
         &self.row_cache

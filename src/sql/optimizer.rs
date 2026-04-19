@@ -436,9 +436,9 @@ impl QueryOptimizer {
         
         // Get or estimate index statistics
         let stats = self.get_index_stats(&index_name)?;
-        
-        // Estimate range selectivity (simplified: assume 10% of range)
-        let range_fraction = 0.1; // TODO: Better estimation based on value distribution
+
+        // Estimate range selectivity from value bounds
+        let range_fraction = Self::estimate_range_fraction(&start, &end);
         let estimated_rows = stats.estimate_range_query(range_fraction);
         
         // Calculate cost: index range scan + row fetch
@@ -602,31 +602,38 @@ impl QueryOptimizer {
         Ok(())
     }
     
-    /// Get index statistics (from cache or estimate)
+    /// Get index statistics (from cache or compute from real data)
     fn get_index_stats(&mut self, index_name: &str) -> Result<IndexStats> {
         // Check cache
         if let Some(stats) = self.index_stats.get(index_name) {
             return Ok(stats.clone());
         }
-        
-        // Estimate statistics (simplified)
-        let table_rows = 10_000; // TODO: Get from table registry
-        
+
+        // Extract table name from index name ("{table}.{column}")
+        let table_name = index_name.split('.').next().unwrap_or("unknown");
+        let table_rows = self.estimate_table_size(table_name);
+
+        // Get real key count from BTree if available
+        let cardinality = if let Some(idx) = self.db.column_indexes.get(index_name) {
+            idx.value().read().entry_count().max(1)
+        } else {
+            (table_rows / 10).max(1)
+        };
+
         let stats = IndexStats {
-            cardinality: table_rows / 10, // Assume 10% unique values
+            cardinality,
             total_rows: table_rows,
-            size_bytes: table_rows * 100, // Rough estimate
+            size_bytes: cardinality * 64,
             is_unique: false,
         };
-        
+
         self.index_stats.insert(index_name.to_string(), stats.clone());
         Ok(stats)
     }
-    
-    /// Estimate table size
-    fn estimate_table_size(&self, _table_name: &str) -> usize {
-        // TODO: Get from table statistics
-        10_000
+
+    /// Estimate table size from LSM metadata
+    fn estimate_table_size(&self, table_name: &str) -> usize {
+        self.db.estimate_table_row_count(table_name).unwrap_or(1_000)
     }
     
     /// Calculate cost of full table scan
@@ -634,6 +641,30 @@ impl QueryOptimizer {
         // Sequential disk reads + predicate evaluation
         (total_rows as f64 * self.cost_params.disk_read_cost)
             + (total_rows as f64 * self.cost_params.predicate_eval_cost)
+    }
+
+    /// Estimate what fraction of rows fall in [start, end] based on value types.
+    /// Uses value magnitudes as a heuristic when possible.
+    fn estimate_range_fraction(start: &Value, end: &Value) -> f64 {
+        match (start, end) {
+            (Value::Integer(s), Value::Integer(e)) => {
+                let range = (*e - *s).unsigned_abs() as f64;
+                // Heuristic: assume integer domain ~[-1B, +1B], clamp fraction
+                ((range / 2_000_000_000.0) * 2.0).clamp(0.001, 0.5)
+            }
+            (Value::Float(s), Value::Float(e)) => {
+                let range = (e - s).abs();
+                // Heuristic: assume float domain ~[-1e6, +1e6]
+                ((range / 2_000_000.0) * 2.0).clamp(0.001, 0.5)
+            }
+            (Value::Timestamp(s), Value::Timestamp(e)) => {
+                let range = (e.as_micros() as f64 - s.as_micros() as f64).abs();
+                // Heuristic: assume full range is ~1 year in microseconds
+                let one_year_us = 365.0 * 24.0 * 3600.0 * 1_000_000.0;
+                (range / one_year_us).clamp(0.001, 0.5)
+            }
+            _ => 0.1, // default for unknown types
+        }
     }
     
     /// Format query plan for EXPLAIN output
@@ -783,7 +814,7 @@ impl QueryOptimizer {
                 ascending: order_by.asc,
                 limit: stmt.limit,
             },
-            estimated_cost: estimated_rows as f64 * 0.1, // Index scan is cheap
+            estimated_cost: estimated_rows as f64 * self.cost_params.index_lookup_cost,
             estimated_rows,
             post_filters: vec![],
         }))
@@ -870,7 +901,7 @@ impl QueryOptimizer {
                 query_vector: query_vector.clone(),
                 k: limit,
             },
-            estimated_cost: 0.1,  // 向量搜索非常快 (~0.03ms)
+            estimated_cost: self.cost_params.index_lookup_cost + (limit as f64 * self.cost_params.memory_read_cost),
             estimated_rows: limit,
             post_filters: vec![],
         }))
@@ -919,29 +950,31 @@ impl QueryOptimizer {
                 
                 if index_exists {
                     // Use index range scan for aggregation
+                    let range_rows = (total_rows as f64 * 0.1) as usize; // estimated range match
                     return Ok(Some(QueryPlan {
                         scan_method: ScanMethod::FullScan {
                             table: table_name.clone(),
                         },
-                        estimated_cost: 10.0, // Much faster than full scan
+                        estimated_cost: self.cost_params.index_lookup_cost * (range_rows as f64)
+                            + range_rows as f64 * self.cost_params.memory_read_cost,
                         estimated_rows: 1,     // Aggregate result is single row
                         post_filters: vec![where_clause.clone()],
                     }));
                 }
             }
-            
+
             // Try point query optimization
             if let Some((col, _val)) = self.try_extract_point_query(where_clause) {
                 let index_name = format!("{}.{}", table_name, col);
                 let index_exists = self.db.column_indexes.contains_key(&index_name);
-                
+
                 if index_exists {
                     // Use index point lookup for aggregation
                     return Ok(Some(QueryPlan {
                         scan_method: ScanMethod::FullScan {
                             table: table_name.clone(),
                         },
-                        estimated_cost: 1.0,  // Very fast
+                        estimated_cost: self.cost_params.index_lookup_cost,
                         estimated_rows: 1,
                         post_filters: vec![where_clause.clone()],
                     }));

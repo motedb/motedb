@@ -47,17 +47,4 @@ impl PkLookupCache {
         cache.pop(key);
     }
 
-    /// Number of entries currently cached.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        let cache = self.cache.lock();
-        cache.len()
-    }
-
-    /// Check if cache is empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        let cache = self.cache.lock();
-        cache.is_empty()
-    }
 }

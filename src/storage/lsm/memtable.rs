@@ -224,28 +224,6 @@ impl MemTable {
     }
 }
 
-/// Legacy iterator - O(n²) performance, kept for compatibility
-/// Use MemTableIteratorOptimized instead for O(n) performance
-#[allow(dead_code)]
-pub struct MemTableIterator {
-    data: Arc<RwLock<BTreeMap<Key, Value>>>,
-    index: usize,
-}
-
-#[allow(dead_code)]
-impl Iterator for MemTableIterator {
-    type Item = (Key, Value);
-    
-    fn next(&mut self) -> Option<Self::Item> {
-        // Note: O(n²) complexity - nth() walks from start each time
-        // Use MemTableIteratorOptimized for production code
-        let data = self.data.read();
-        let item = data.iter().nth(self.index)?;
-        self.index += 1;
-        Some((*item.0, item.1.clone()))
-    }
-}
-
 /// Optimized iterator that clones data once
 pub struct MemTableIteratorOptimized {
     entries: std::vec::IntoIter<(Key, Value)>,

@@ -10,7 +10,7 @@
 //! - **性能监控**: 统计信息和性能分析
 
 use crate::database::{MoteDB, TransactionStats};
-use crate::database::indexes::{VectorIndexStats, SpatialIndexStats};
+use crate::database::indexes::VectorIndexStats;
 use crate::sql::StreamingQueryResult;
 use crate::sql::ast::Statement;
 use crate::types::{Value, Row, RowId, SqlRow};
@@ -58,19 +58,17 @@ use std::sync::Arc;
 /// - `create_column_index()`: 创建列索引（快速等值/范围查询）
 /// - `create_vector_index()`: 创建向量索引（KNN搜索）
 /// - `create_text_index()`: 创建全文索引（BM25搜索）
-/// - `create_spatial_index()`: 创建空间索引（地理位置查询）
+/// - `create_ioctree_index()`: 创建i-Octree 3D空间索引
 ///
 /// ## 5. 查询API
 /// - `query_by_column()`: 按列值查询（使用索引）
 /// - `vector_search()`: 向量KNN搜索
 /// - `text_search()`: 全文搜索（BM25）
-/// - `spatial_search()`: 空间范围查询
 /// - `query_timestamp_range()`: 时间序列查询
 ///
 /// ## 6. 统计信息
 /// - `stats()`: 数据库统计信息
 /// - `vector_index_stats()`: 向量索引统计
-/// - `spatial_index_stats()`: 空间索引统计
 /// - `transaction_stats()`: 事务统计
 ///
 /// ## 7. 持久化
@@ -157,6 +155,11 @@ impl Database {
     /// ```
     pub fn flush(&self) -> Result<()> {
         self.inner.flush()
+    }
+
+    /// Access the columnar segment store (for TimeSeries tables).
+    pub fn columnar_store(&self) -> &crate::storage::ColumnarStore {
+        &self.inner.columnar_store
     }
 
     /// Checkpoint: flush data + persist indexes + truncate WAL
@@ -505,31 +508,6 @@ impl Database {
         self.inner.create_text_index(index_name)
     }
 
-    /// 创建空间索引（用于地理位置查询）
-    ///
-    /// # Examples
-    /// ```ignore
-    /// use motedb::BoundingBox;
-    ///
-    /// // 创建空间索引（指定世界范围）
-    /// let bounds = BoundingBox {
-    ///     min_x: -180.0,
-    ///     min_y: -90.0,
-    ///     max_x: 180.0,
-    ///     max_y: 90.0,
-    /// };
-    /// db.create_spatial_index("locations_coords", bounds)?;
-    ///
-    /// // SQL 空间查询
-    /// let results = db.query(
-    ///     "SELECT * FROM locations 
-    ///      WHERE ST_WITHIN(coords, 116.0, 39.0, 117.0, 40.0)"
-    /// )?;
-    /// ```
-    pub fn create_spatial_index(&self, index_name: &str, bounds: crate::types::BoundingBox) -> Result<()> {
-        self.inner.create_spatial_index(index_name, bounds)
-    }
-
     /// 删除索引
     ///
     /// # Examples
@@ -641,25 +619,6 @@ impl Database {
         self.inner.text_search_ranked(index_name, query, top_k)
     }
 
-    /// 空间范围查询
-    ///
-    /// # Examples
-    /// ```ignore
-    /// use motedb::BoundingBox;
-    ///
-    /// // 查询矩形区域内的所有点
-    /// let bbox = BoundingBox {
-    ///     min_x: 116.0,
-    ///     min_y: 39.0,
-    ///     max_x: 117.0,
-    ///     max_y: 40.0,
-    /// };
-    /// let results = db.spatial_search("locations_coords", &bbox)?;
-    /// ```
-    pub fn spatial_search(&self, index_name: &str, bbox: &crate::types::BoundingBox) -> Result<Vec<RowId>> {
-        self.inner.spatial_range_query(index_name, bbox)
-    }
-
     /// 时间序列范围查询
     ///
     /// # Examples
@@ -689,9 +648,44 @@ impl Database {
         self.inner.vector_index_stats(index_name)
     }
 
-    /// 获取空间索引统计信息
-    pub fn spatial_index_stats(&self, index_name: &str) -> Result<SpatialIndexStats> {
-        self.inner.spatial_index_stats(index_name)
+    // ==================== i-Octree 3D Spatial Index (Embodied Intelligence) ====================
+
+    /// Create an i-Octree 3D spatial index for point cloud data
+    ///
+    /// Use for SLAM, robotics, and 3D perception workloads.
+    pub fn create_ioctree_index(&self, index_name: &str) -> Result<()> {
+        self.inner.create_ioctree_index(index_name)
+    }
+
+    /// 3D KNN query: find k nearest neighbors
+    ///
+    /// Returns `(row_id, distance)` pairs sorted by distance.
+    pub fn ioctree_knn_search(
+        &self,
+        index_name: &str,
+        point: &crate::types::Point3D,
+        k: usize,
+    ) -> Result<Vec<(RowId, f64)>> {
+        self.inner.ioctree_knn_query(index_name, point, k)
+    }
+
+    /// 3D radius search: find all points within radius
+    pub fn ioctree_radius_search(
+        &self,
+        index_name: &str,
+        center: &crate::types::Point3D,
+        radius: f64,
+    ) -> Result<Vec<(RowId, f64)>> {
+        self.inner.ioctree_radius_search(index_name, center, radius)
+    }
+
+    /// 3D range search: find all points within a 3D bounding box
+    pub fn ioctree_range_search(
+        &self,
+        index_name: &str,
+        bbox: &crate::types::BoundingBox3D,
+    ) -> Result<Vec<RowId>> {
+        self.inner.ioctree_range_query(index_name, bbox)
     }
 
     /// 获取事务统计信息

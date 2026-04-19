@@ -1,5 +1,5 @@
 use motedb::{Database, Result};
-use motedb::types::{BoundingBox, Timestamp, Value};
+use motedb::types::{Timestamp, Value};
 use rand::Rng;
 use std::collections::HashMap;
 use std::fs;
@@ -12,7 +12,6 @@ fn main() -> Result<()> {
     docs_batch_insert_example_runs()?;
     docs_vector_index_example_runs()?;
     docs_text_index_example_runs()?;
-    docs_spatial_index_example_runs()?;
     docs_timestamp_example_runs()?;
     docs_transaction_example_runs()?;
     println!("✅ All documentation examples executed successfully");
@@ -159,42 +158,6 @@ fn docs_text_index_example_runs() -> Result<()> {
     // ✅ 现在可以验证搜索结果（增量索引已生效）
     let hits = db.text_search_ranked("articles_content", "Rust", 5)?;
     assert!(!hits.is_empty(), "文本索引应该返回结果（增量更新已生效）");
-
-    drop(db);
-    cleanup_dir(dir);
-    Ok(())
-}
-
-fn docs_spatial_index_example_runs() -> Result<()> {
-    let (db, dir) = setup_db("spatial_index")?;
-    db.execute(
-        "CREATE TABLE locations (
-            id INT,
-            name TEXT,
-            coords VECTOR(2),
-            category TEXT
-        )",
-    )?;
-    let bounds = BoundingBox::new(-180.0, -90.0, 180.0, 90.0);
-    db.create_spatial_index("locations_coords", bounds)?;
-
-    let mut rows = Vec::new();
-    for i in 0..10 {
-        let mut row = HashMap::new();
-        row.insert("id".into(), Value::Integer(i));
-        row.insert("name".into(), Value::Text(format!("POI {}", i)));
-        row.insert("coords".into(), Value::Vector(motedb::types::ArcVec::new(vec![116.0 + i as f32 * 0.01, 39.0])));
-        row.insert("category".into(), Value::Text("restaurant".into()));
-        rows.push(row);
-    }
-
-    db.batch_insert_map("locations", rows)?;
-    db.flush()?;
-
-    let query_box = BoundingBox::new(116.0, 38.5, 117.0, 40.0);
-    let _hits = db.spatial_search("locations_coords", &query_box)?;
-    // TODO: 修复空间索引测试（应该使用 SPATIAL 类型而不是 VECTOR）
-    // assert!(!hits.is_empty(), "空间索引应该返回结果（增量更新已生效）");
 
     drop(db);
     cleanup_dir(dir);

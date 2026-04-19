@@ -11,7 +11,7 @@
 //! - Flush 延迟: < 100ms (单次 fsync)
 
 use super::{Key, Value, ValueData, LSMConfig};
-use crate::index::diskann::fresh_graph::{FreshVamanaGraph, FreshGraphConfig, VectorNode};
+use crate::index::fresh_graph::{FreshVamanaGraph, FreshGraphConfig, VectorNode};
 use crate::distance::DistanceKind;
 use crate::{Result, StorageError};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -256,7 +256,13 @@ impl UnifiedMemTable {
         
         Ok(())
     }
-    
+
+    /// Get all keys in [start, end] range (for range delete)
+    pub fn keys_in_range(&self, start: Key, end: Key) -> Vec<Key> {
+        let entries = self.entries.read();
+        entries.range(start..=end).map(|(k, _)| *k).collect()
+    }
+
     /// 检查是否需要 flush
     pub fn should_flush(&self) -> bool {
         self.size.load(Ordering::Relaxed) >= self.max_size

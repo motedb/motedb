@@ -10,9 +10,9 @@
 use crate::config::DBConfig;
 use crate::index::btree::{BTree, BTreeConfig};
 use crate::index::vamana::{DiskANNIndex, VamanaConfig};
-use crate::index::{SpatialHybridIndex, SpatialHybridConfig, BoundingBoxF32};
 use crate::index::text_fts::TextFTSIndex;
 use crate::index::column_value::ColumnValueIndex;
+use crate::index::ioctree::IOctreeIndex;
 use crate::storage::LSMEngine;
 use crate::txn::coordinator::TransactionCoordinator;
 use crate::txn::version_store::VersionStore;
@@ -43,14 +43,6 @@ pub struct VectorIndexStats {
     pub cache_hit_rate: f32,
     pub memory_usage: usize,
     pub disk_usage: usize,
-}
-
-/// Spatial index statistics
-#[derive(Debug, Clone)]
-pub struct SpatialIndexStats {
-    pub total_entries: usize,
-    pub memory_usage: usize,
-    pub bytes_per_entry: usize,
 }
 
 /// MoteDB instance
@@ -88,22 +80,21 @@ pub struct MoteDB {
     /// Pending index updates counter (for triggering background flush)
     /// 🚀 P0 CRITICAL FIX: 使用 AtomicUsize 避免锁竞争，解决 CPU 飙升问题
     pub(crate) pending_updates: Arc<std::sync::atomic::AtomicUsize>,
-    
-    /// Pending spatial index updates counter
-    /// 🚀 P0 CRITICAL FIX: 使用 AtomicUsize 避免锁竞争
-    pub(crate) pending_spatial_updates: Arc<std::sync::atomic::AtomicUsize>,
-    
+
     /// 🚀 Vector indexes (DiskANN) - 使用 DashMap 提升并发性能
     pub(crate) vector_indexes: Arc<DashMap<String, Arc<RwLock<DiskANNIndex>>>>,
-    
-    /// 🚀 Spatial indexes (Hybrid Grid+RTree) - 使用 DashMap 提升并发性能
-    pub(crate) spatial_indexes: Arc<DashMap<String, Arc<RwLock<SpatialHybridIndex>>>>,
+
+    /// i-Octree indexes (3D point cloud) for embodied intelligence
+    pub(crate) ioctree_indexes: Arc<DashMap<String, Arc<RwLock<IOctreeIndex>>>>,
     
     /// 🚀 Text indexes (FTS with single-file B-Tree) - 使用 DashMap 提升并发性能
     pub text_indexes: Arc<DashMap<String, Arc<RwLock<TextFTSIndex>>>>,
     
     /// 🚀 Column value indexes (for WHERE optimization) - 使用 DashMap 提升并发性能
     pub column_indexes: Arc<DashMap<String, Arc<RwLock<ColumnValueIndex>>>>,
+
+    /// Columnar segment store for TimeSeries tables (Gorilla-compressed immutable segments)
+    pub(crate) columnar_store: Arc<crate::storage::ColumnarStore>,
 
     /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
     /// Bypasses disk-based column index for O(1) PK → row_id resolution.
@@ -148,6 +139,9 @@ pub struct MoteDB {
     /// Background index builder thread
     index_builder_thread: Option<IndexBuilderThread>,
 
+    /// Auto-flush background thread: single dedicated thread replaces per-batch spawns
+    auto_flush_thread: Option<AutoFlushThread>,
+
     /// File lock to prevent concurrent database opens on the same directory.
     /// Holds an exclusive flock on `.lock` file. Released on Drop.
     _lock_file: Option<std::fs::File>,
@@ -170,6 +164,18 @@ struct IndexBuildBatch {
 
 /// Background index builder thread
 struct IndexBuilderThread {
+    /// Thread handle
+    handle: Option<std::thread::JoinHandle<()>>,
+
+    /// Stop signal
+    should_stop: Arc<AtomicBool>,
+}
+
+/// Auto-flush background thread: single thread handles all auto-flush requests
+struct AutoFlushThread {
+    /// Channel to signal flush requests
+    flush_tx: std::sync::mpsc::Sender<()>,
+
     /// Thread handle
     handle: Option<std::thread::JoinHandle<()>>,
 
@@ -224,10 +230,10 @@ impl MoteDB {
         // Create version store and transaction coordinator
         let version_store = Arc::new(VersionStore::new());
         let txn_coordinator = Arc::new(TransactionCoordinator::new(version_store.clone()));
-        
+
         // Create table registry (catalog)
         let table_registry = Arc::new(TableRegistry::new(&db_path)?);
-        
+
         // 🆕 Create index metadata registry
         let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
 
@@ -237,22 +243,38 @@ impl MoteDB {
         // Ensure "_default" table has a stable table_id (= 0)
         table_registry.ensure_default_table_id()?;
 
+        // Shared row ID counter
+        let next_row_id = Arc::new(AtomicU64::new(0));
+
+        // Create columnar store for TimeSeries tables (shares next_row_id and table_registry)
+        let columnar_dir = db_path.join("columnar");
+        let columnar_store = Arc::new(
+            crate::storage::ColumnarStore::create(
+                &columnar_dir,
+                config.columnar_config.clone(),
+                next_row_id.clone(),
+                table_registry.clone(),
+            )?
+        );
+        // Set WAL on columnar store for crash recovery
+        columnar_store.set_wal(wal.clone());
+
         let mut db = Self {
             path: db_path,
             wal,
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
-            next_row_id: Arc::new(AtomicU64::new(0)),
+            next_row_id: next_row_id.clone(),
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
             version_store,
             pending_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            pending_spatial_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             vector_indexes: Arc::new(DashMap::new()),
-            spatial_indexes: Arc::new(DashMap::new()),
+            ioctree_indexes: Arc::new(DashMap::new()),
             text_indexes: Arc::new(DashMap::new()),
             column_indexes: Arc::new(DashMap::new()),
+            columnar_store,
             pk_lookup: Arc::new(DashMap::new()),
             table_registry,
             index_registry,
@@ -266,6 +288,7 @@ impl MoteDB {
             auto_checkpoint_thread: None,
             index_build_tx: None,
             index_builder_thread: None,
+            auto_flush_thread: None,
             _lock_file: Some(lock_file),
         };
 
@@ -296,7 +319,11 @@ impl MoteDB {
         // Update db with the thread handle
         let mut db = db;
         db.auto_checkpoint_thread = auto_checkpoint_thread;
-        
+
+        // Start auto-flush background thread (single thread for all auto-flush requests)
+        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback());
+        db.auto_flush_thread = Some(auto_flush);
+
         Ok(db)
     }
     
@@ -313,11 +340,11 @@ impl MoteDB {
             txn_coordinator: self.txn_coordinator.clone(),
             version_store: self.version_store.clone(),
             pending_updates: self.pending_updates.clone(),
-            pending_spatial_updates: self.pending_spatial_updates.clone(),
             vector_indexes: self.vector_indexes.clone(),
-            spatial_indexes: self.spatial_indexes.clone(),
+            ioctree_indexes: self.ioctree_indexes.clone(),
             text_indexes: self.text_indexes.clone(),
             column_indexes: self.column_indexes.clone(),
+            columnar_store: self.columnar_store.clone(),
             pk_lookup: self.pk_lookup.clone(),
             table_registry: self.table_registry.clone(),
             index_registry: self.index_registry.clone(),  // 🆕
@@ -331,6 +358,7 @@ impl MoteDB {
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
             index_build_tx: None,  // Don't clone sender (only owned by original)
             index_builder_thread: None,  // Don't clone thread (only owned by original)
+            auto_flush_thread: None,    // Don't clone thread (only owned by original)
             _lock_file: None,  // Don't clone lock (only owned by original)
         }
     }
@@ -363,15 +391,20 @@ impl MoteDB {
         // Use config instead of hardcoded default
         let num_partitions = config.num_partitions;
 
-        // Open or create WAL
+        // Open or create WAL (pass user config — fixes config loss on reopen)
+        let wal_config = crate::txn::wal::WALConfig::from(config.wal_config.clone());
         let wal = if wal_path.exists() {
-            Arc::new(WALManager::open(&wal_path, num_partitions)?)
+            Arc::new(WALManager::open_with_config(&wal_path, num_partitions, wal_config)?)
         } else {
             std::fs::create_dir_all(&wal_path)?;
-            Arc::new(WALManager::create(&wal_path, num_partitions)?)
+            Arc::new(WALManager::create_with_config(&wal_path, num_partitions, wal_config)?)
         };
 
-        // Recover from WAL
+        // Replay WAL records into LSM Engine.
+        // Safety: In MoteDB's embedded single-process model, WAL records from committed
+        // transactions are written atomically via batch_append(). Uncommitted records
+        // (crash mid-batch) are detected by checksum verification and skipped.
+        // TimeSeries data is replayed separately into the columnar store below.
         let recovered_records = wal.recover()?;
         
         // Open timestamp index with BTree storage (从 indexes/ 目录)
@@ -425,10 +458,27 @@ impl MoteDB {
         // Replay WAL records into LSM Engine using stable table_id
         debug_log!("[database] 恢复 WAL 记录到 LSM Engine...");
         let mut _recovered_count = 0;
+
+        // Phase 1: Analysis — determine which transactions committed
+        let mut committed_txns: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut active_txns: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for records in recovered_records.values() {
             for record in records {
                 match record {
-                    WALRecord::Insert { table_name, row_id, data, .. } => {
+                    WALRecord::Begin { txn_id, .. } => { active_txns.insert(*txn_id); }
+                    WALRecord::Commit { txn_id, .. } => { active_txns.remove(txn_id); committed_txns.insert(*txn_id); }
+                    WALRecord::Rollback { txn_id } => { active_txns.remove(txn_id); }
+                    _ => {}
+                }
+            }
+        }
+
+        // Phase 2: Redo — replay only committed/auto-commit records
+        for records in recovered_records.values() {
+            for record in records {
+                match record {
+                    WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
                         // Use table_id for composite_key (same as make_composite_key)
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
@@ -439,7 +489,8 @@ impl MoteDB {
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
-                    WALRecord::Update { table_name, row_id, new_data, .. } => {
+                    WALRecord::Update { table_name, row_id, new_data, txn_id, .. } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
@@ -449,7 +500,8 @@ impl MoteDB {
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
-                    WALRecord::Delete { table_name, row_id, timestamp, .. } => {
+                    WALRecord::Delete { table_name, row_id, timestamp, txn_id, .. } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
@@ -476,32 +528,88 @@ impl MoteDB {
 
         // Load existing vector indexes (using metric from registry)
         let vector_indexes = Self::load_vector_indexes(&db_path, &index_registry)?;
-        
-        // Load existing spatial indexes
-        let spatial_indexes = Self::load_spatial_indexes(&db_path)?;
-        
+
         // Load existing text indexes
         let text_indexes = Self::load_text_indexes(&db_path)?;
+
+        // Load existing i-Octree indexes
+        let ioctree_indexes = Self::load_ioctree_indexes(&db_path)?;
         
         // 🚀 P1: Create row cache (use config or default 10000)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
+
+        // Shared row ID counter (initialized from WAL replay)
+        let next_row_id = Arc::new(AtomicU64::new(max_row_id + 1));
+
+        // Create columnar store for TimeSeries tables
+        let columnar_dir = db_path.join("columnar");
+        let columnar_store = Arc::new(
+            crate::storage::ColumnarStore::create(
+                &columnar_dir,
+                config.columnar_config.clone(),
+                next_row_id.clone(),
+                table_registry.clone(),
+            )?
+        );
+
+        // Register existing TimeSeries tables with columnar store
+        for table_name in table_registry.list_tables()? {
+            if let Ok(schema) = table_registry.get_table(&table_name) {
+                if schema.table_type == crate::types::TableType::TimeSeries {
+                    if let Ok(table_id) = table_registry.get_table_id(&table_name) {
+                        if let Err(e) = columnar_store.register_table(table_id, &schema) {
+                            debug_log!("[database] ⚠️ Failed to register columnar table '{}': {:?}", table_name, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Set WAL on columnar store for crash recovery
+        columnar_store.set_wal(wal.clone());
+
+        // Replay WAL records for TimeSeries tables into columnar store
+        // (These records were already replayed into LSM above, but TimeSeries data
+        //  belongs in the columnar store for proper querying)
+        {
+            let mut columnar_replay_count = 0u64;
+            for records in recovered_records.values() {
+                for record in records {
+                    if let WALRecord::Insert { table_name, row_id, data, txn_id, .. } = record {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                        // Check if this table is a TimeSeries table
+                        if let Ok(schema) = table_registry.get_table(table_name) {
+                            if schema.table_type == crate::types::TableType::TimeSeries {
+                                if let Err(e) = columnar_store.replay_row(table_name, *row_id, data.clone()) {
+                                    debug_log!("[database] ⚠️ Failed to replay columnar row for '{}': {:?}", table_name, e);
+                                }
+                                columnar_replay_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if columnar_replay_count > 0 {
+                debug_log!("[database] Replayed {} columnar rows from WAL", columnar_replay_count);
+            }
+        }
 
         let mut db = Self {
             path: db_path,
             wal,
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
-            next_row_id: Arc::new(AtomicU64::new(max_row_id + 1)),
+            next_row_id,
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
             version_store,
             pending_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            pending_spatial_updates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             vector_indexes: Arc::new(Self::hashmap_to_dashmap(vector_indexes)),
-            spatial_indexes: Arc::new(Self::hashmap_to_dashmap(spatial_indexes)),
+            ioctree_indexes: Arc::new(Self::hashmap_to_dashmap(ioctree_indexes)),
             text_indexes: Arc::new(Self::hashmap_to_dashmap(text_indexes)),
             column_indexes: Arc::new(DashMap::new()),
+            columnar_store,
             pk_lookup: Arc::new(DashMap::new()),
             table_registry,
             index_registry,
@@ -515,6 +623,7 @@ impl MoteDB {
             auto_checkpoint_thread: None,
             index_build_tx: None,
             index_builder_thread: None,
+            auto_flush_thread: None,
             _lock_file: Some(lock_file),
         };
 
@@ -538,7 +647,11 @@ impl MoteDB {
         });
 
         db.auto_checkpoint_thread = auto_checkpoint_thread;
-        
+
+        // Start auto-flush background thread
+        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback());
+        db.auto_flush_thread = Some(auto_flush);
+
         // 🚀 Phase 5: Recover AUTO_INCREMENT counters (B3: Crash Recovery)
         // For each table with AUTO_INCREMENT, find max ID from LSM and initialize counter
         for table_name in db.table_registry.list_tables()? {
@@ -628,41 +741,6 @@ impl MoteDB {
         Ok(indexes)
     }
     
-    /// Load existing spatial indexes from disk
-    fn load_spatial_indexes(db_path: &Path) -> Result<HashMap<String, Arc<RwLock<SpatialHybridIndex>>>> {
-        let mut indexes = HashMap::new();
-        
-        // 🎯 从统一目录加载：{db}.mote/indexes/spatial_*/
-        let indexes_dir = db_path.join("indexes");
-        if indexes_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(name) = entry.file_name().into_string() {
-                        if name.starts_with("spatial_") {
-                            let index_name = name.strip_prefix("spatial_").unwrap();
-                            let index_path = entry.path();
-                            
-                            // Try to load with default config (will use saved config from metadata)
-                            let default_config = SpatialHybridConfig::new(
-                                BoundingBoxF32::new(0.0, 0.0, 1000.0, 1000.0)
-                            ).with_mmap(true, Some(index_path.clone()));
-                            
-                            if let Ok(index) = SpatialHybridIndex::load(&index_path, default_config) {
-                                indexes.insert(
-                                    index_name.to_string(),
-                                    Arc::new(RwLock::new(index))
-                                );
-                                debug_log!("[MoteDB] Loaded spatial index: {}", index_name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        Ok(indexes)
-    }
-    
     /// Load existing text indexes from disk
     fn load_text_indexes(db_path: &Path) -> Result<HashMap<String, Arc<RwLock<TextFTSIndex>>>> {
         let mut indexes = HashMap::new();
@@ -694,6 +772,38 @@ impl MoteDB {
                                     Arc::new(RwLock::new(index))
                                 );
                                 debug_log!("[MoteDB] Loaded text index: {}", index_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(indexes)
+    }
+
+    /// Load existing i-Octree indexes from disk
+    fn load_ioctree_indexes(db_path: &Path) -> Result<HashMap<String, Arc<RwLock<IOctreeIndex>>>> {
+        let mut indexes = HashMap::new();
+
+        // Load from {db}.mote/indexes/ioctree_*/
+        let indexes_dir = db_path.join("indexes");
+        if indexes_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        if name.starts_with("ioctree_") {
+                            let index_name = name.strip_prefix("ioctree_").unwrap();
+                            let index_file = entry.path().join("ioctree.bin");
+
+                            if index_file.exists() {
+                                if let Ok(index) = IOctreeIndex::load_from_path(&index_file) {
+                                    indexes.insert(
+                                        index_name.to_string(),
+                                        Arc::new(RwLock::new(index))
+                                    );
+                                    debug_log!("[MoteDB] Loaded ioctree index: {}", index_name);
+                                }
                             }
                         }
                     }
@@ -814,6 +924,51 @@ impl MoteDB {
     /// 
     /// 🚀 Optimized for embedded environments:
     /// 1. Lazy-checking: Only checks WAL size when interval reached (no unnecessary fs calls)
+    /// Start a single background thread for auto-flush requests.
+    /// Replaces the old pattern of spawning a new thread per 2000 writes.
+    fn start_auto_flush_thread(db: Self) -> AutoFlushThread {
+        let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let should_stop_clone = should_stop.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("motedb-auto-flush".into())
+            .spawn(move || {
+                while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Block until a flush request arrives or stop signal
+                    match flush_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            // Drain any queued requests — coalesce multiple flushes into one
+                            while flush_rx.try_recv().is_ok() {}
+                            let _ = db.flush();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                debug_log!("[AutoFlush] 👋 Background thread stopped");
+            })
+            .expect("Failed to spawn auto-flush thread");
+
+        AutoFlushThread {
+            flush_tx,
+            handle: Some(handle),
+            should_stop,
+        }
+    }
+
+    /// Request an auto-flush via the background thread (non-blocking).
+    /// Returns false if the channel is disconnected (thread died).
+    pub(crate) fn request_auto_flush(&self) -> bool {
+        if let Some(ref t) = self.auto_flush_thread {
+            t.flush_tx.send(()).is_ok()
+        } else {
+            false
+        }
+    }
+
     /// 2. Adaptive sleep: Longer intervals in low-activity periods
     /// 3. Zero allocation in hot path
     /// 4. Minimal CPU usage: < 0.1% CPU overhead
@@ -1050,11 +1205,28 @@ impl Drop for MoteDB {
             debug_log!("[MoteDB::Drop] ✅ Auto-checkpoint thread stopped");
         }
 
+        // 🛑 Step 2.5: Stop auto-flush thread
+        if let Some(mut thread) = self.auto_flush_thread.take() {
+            debug_log!("[MoteDB::Drop] 🛑 Stopping auto-flush thread...");
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Drop sender to unblock recv
+            drop(thread.flush_tx);
+            if let Some(handle) = thread.handle.take() {
+                let _ = handle.join();
+            }
+            debug_log!("[MoteDB::Drop] ✅ Auto-flush thread stopped");
+        }
+
+        // Flush columnar store before final checkpoint
+        if let Err(e) = self.columnar_store.flush_all() {
+            debug_log!("[MoteDB::Drop] ⚠️  Columnar store flush failed: {:?}", e);
+        }
+
         // ⚠️ CRITICAL: Always checkpoint on drop to:
         // 1. Persist all data safely
         // 2. Truncate WAL files (prevent accumulation)
         // 3. Ensure clean shutdown
-        
+
         debug_log!("[MoteDB::Drop] 🚪 Database closing, performing final checkpoint...");
         
         // Ignore errors during drop (logging only)

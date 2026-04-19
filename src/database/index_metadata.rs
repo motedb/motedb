@@ -2,7 +2,7 @@
 //!
 //! Tracks all indexes created on tables, supporting:
 //! - Custom index names
-//! - Index type tracking (Column/Vector/Text/Spatial)
+//! - Index type tracking (Column/Vector/Text/Octree)
 //! - Table/column relationships
 //! - Persistent metadata storage
 //! - Stale marking for indexes that failed to update
@@ -19,7 +19,7 @@ pub enum IndexType {
     Column,
     Vector,
     Text,
-    Spatial,
+    Octree,
 }
 
 /// Index metadata entry
@@ -158,6 +158,18 @@ impl IndexRegistry {
         self.save()?;
         Ok(())
     }
+
+    /// Remove all indexes for a given table (used by DROP TABLE)
+    pub fn remove_by_table(&self, table_name: &str) {
+        let keys_to_remove: Vec<String> = self.indexes.iter()
+            .filter(|entry| entry.value().table_name == table_name)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys_to_remove {
+            self.indexes.remove(&key);
+        }
+        let _ = self.save();
+    }
     
     /// Get index metadata
     pub fn get(&self, index_name: &str) -> Option<IndexMetadata> {
@@ -194,7 +206,7 @@ impl IndexRegistry {
     pub fn generate_name(table_name: &str, column_name: &str, index_type: &IndexType) -> String {
         match index_type {
             IndexType::Column => format!("{}.{}", table_name, column_name),
-            IndexType::Vector | IndexType::Text | IndexType::Spatial => {
+            IndexType::Vector | IndexType::Text | IndexType::Octree => {
                 format!("{}_{}", table_name, column_name)
             }
         }

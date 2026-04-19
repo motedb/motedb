@@ -48,8 +48,6 @@ struct BlobFile {
     file_id: u32,
     writer: BufWriter<File>,  // 🚀 使用 BufWriter 减少系统调用
     offset: u64,
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 impl BlobStore {
@@ -325,7 +323,6 @@ impl BlobFile {
             file_id,
             writer: BufWriter::with_capacity(64 * 1024, file),
             offset,
-            path,
         })
     }
 

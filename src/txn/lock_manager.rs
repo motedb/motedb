@@ -120,50 +120,6 @@ impl LockManager {
         self.acquire_lock(txn_id, row_id, LockMode::Exclusive)
     }
 
-    /// Check if there's a cycle in the wait-for graph (deadlock detection)
-    #[allow(dead_code)]
-    fn has_cycle(&self, start_txn: TransactionId, current_txn: TransactionId, visited: &mut HashSet<TransactionId>) -> bool {
-        if current_txn == start_txn && !visited.is_empty() {
-            return true;
-        }
-        
-        if visited.contains(&current_txn) {
-            return false;
-        }
-        
-        visited.insert(current_txn);
-        
-        let wait_for = self.wait_for.lock();
-        if let Some(waiting_for) = wait_for.get(&current_txn) {
-            for &next_txn in waiting_for {
-                if self.has_cycle(start_txn, next_txn, visited) {
-                    return true;
-                }
-            }
-        }
-        
-        false
-    }
-
-    /// Detect deadlock for a transaction
-    #[allow(dead_code)]
-    fn detect_deadlock(&self, txn_id: TransactionId) -> bool {
-        let mut visited = HashSet::new();
-        self.has_cycle(txn_id, txn_id, &mut visited)
-    }
-
-    /// Add wait-for edge
-    #[allow(dead_code)]
-    fn add_wait_for(&self, waiter: TransactionId, holders: &[TransactionId]) {
-        let mut wait_for = self.wait_for.lock();
-        let entry = wait_for.entry(waiter).or_default();
-        for &holder in holders {
-            if holder != waiter {
-                entry.insert(holder);
-            }
-        }
-    }
-
     /// Remove wait-for edges for a transaction
     fn remove_wait_for(&self, txn_id: TransactionId) {
         let mut wait_for = self.wait_for.lock();

@@ -111,9 +111,14 @@ impl MoteDB {
         
         // Step 3: Persist other indexes to disk
         self.flush_vector_indexes()?;
-        self.flush_spatial_indexes()?;
         self.flush_text_indexes()?;
-        
+        self.flush_ioctree_indexes()?;
+
+        // Step 3.5: Flush columnar store (TimeSeries segment files)
+        if let Err(e) = self.columnar_store.flush_all() {
+            debug_log!("[Flush] Warning: Columnar flush failed: {:?}", e);
+        }
+
         // 4. Reset pending counter
         // 🚀 P0 CRITICAL FIX: 使用原子操作
         self.pending_updates.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -224,7 +229,11 @@ impl MoteDB {
 
         // Reset pending counters
         self.pending_updates.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.pending_spatial_updates.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Step 5.5: Flush columnar store (TimeSeries segment files)
+        if let Err(e) = self.columnar_store.flush_all() {
+            debug_log!("[Checkpoint]   ⚠️ Columnar flush failed: {:?}", e);
+        }
 
         // Step 6: Persist AUTO_INCREMENT counters to catalog
         if let Err(e) = self.table_registry.persist_auto_increment_counters() {
@@ -246,13 +255,13 @@ impl MoteDB {
         
         // 2. Flush vector indexes
         self.flush_vector_indexes()?;
-        
-        // 3. Flush spatial indexes
-        self.flush_spatial_indexes()?;
-        
-        // 4. Flush text indexes
+
+        // 3. Flush text indexes
         self.flush_text_indexes()?;
-        
+
+        // 4.5 Flush i-Octree indexes
+        self.flush_ioctree_indexes()?;
+
         // 5. Flush column indexes (先收集Arc，避免持锁期间flush)
         let indexes_to_flush: Vec<_> = self.column_indexes.iter()
             .map(|entry| entry.value().clone())

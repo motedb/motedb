@@ -61,7 +61,7 @@ pub use config::{DBConfig, DurabilityLevel, LSMConfig, WALConfig, AutoCheckpoint
 pub use error::{Result, StorageError, MoteDBError};
 
 // 主要对外 API (now using modular database)
-pub use database::{MoteDB, DatabaseStats, VectorIndexStats, SpatialIndexStats, QueryProfile, TransactionStats};
+pub use database::{MoteDB, DatabaseStats, VectorIndexStats, QueryProfile, TransactionStats};
 pub use api::Database;  // 简化 API 包装
 pub use catalog::TableRegistry;
 pub use sql::{QueryResult, StreamingQueryResult};  // ✅ 移除 execute_sql，添加 StreamingQueryResult

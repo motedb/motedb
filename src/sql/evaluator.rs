@@ -152,8 +152,6 @@ impl CompiledPattern {
 }
 
 pub struct ExprEvaluator {
-    #[allow(dead_code)]
-    db: Option<Arc<MoteDB>>,  // Optional database reference for MATCH() function
     /// ⚡ Pattern cache: pattern string -> compiled pattern
     /// RwLock for concurrent read access (common case)
     pattern_cache: Arc<RwLock<HashMap<String, CompiledPattern>>>,
@@ -164,15 +162,13 @@ pub struct ExprEvaluator {
 impl ExprEvaluator {
     pub fn new() -> Self {
         Self {
-            db: None,
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
             last_insert_id: Rc::new(RefCell::new(None)),
         }
     }
 
-    pub fn with_db(db: Arc<MoteDB>) -> Self {
+    pub fn with_db(_db: Arc<MoteDB>) -> Self {
         Self {
-            db: Some(db),
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
             last_insert_id: Rc::new(RefCell::new(None)),
         }
@@ -297,21 +293,19 @@ impl ExprEvaluator {
                 Err(MoteDBError::Query("KNN_DISTANCE must be evaluated by executor".into()))
             }
             
-            Expr::StWithin { .. } => {
-                // ST_WITHIN is handled at executor level (requires spatial index access)
-                Err(MoteDBError::Query("ST_WITHIN must be evaluated by executor".into()))
+            Expr::StWithin3D { .. } => {
+                Err(MoteDBError::Query("ST_WITHIN_3D must be evaluated by executor".into()))
             }
-            
-            Expr::StDistance { .. } => {
-                // ST_DISTANCE is handled at executor level (requires row geometry data)
-                Err(MoteDBError::Query("ST_DISTANCE must be evaluated by executor".into()))
+            Expr::StDistance3D { .. } => {
+                Err(MoteDBError::Query("ST_DISTANCE_3D must be evaluated by executor".into()))
             }
-            
-            Expr::StKnn { .. } => {
-                // ST_KNN is handled at executor level (requires spatial index access)
-                Err(MoteDBError::Query("ST_KNN must be evaluated by executor".into()))
+            Expr::StKnn3D { .. } => {
+                Err(MoteDBError::Query("ST_KNN_3D must be evaluated by executor".into()))
             }
-            
+            Expr::StRadius3D { .. } => {
+                Err(MoteDBError::Query("ST_RADIUS_3D must be evaluated by executor".into()))
+            }
+
             Expr::WindowFunction { .. } => {
                 // Window functions are handled at executor level (require partition data)
                 Err(MoteDBError::Query("Window functions must be evaluated by executor".into()))
@@ -1146,7 +1140,39 @@ impl ExprEvaluator {
                 let diff_seconds = diff_micros / 1_000_000;
                 Ok(Value::Integer(diff_seconds))
             }
-            
+
+            "time_bucket" => {
+                // TIME_BUCKET(interval_string, timestamp) - floor timestamp to bucket boundary
+                // Example: TIME_BUCKET('5m', ts) → floors ts to nearest 5-minute boundary
+                //          TIME_BUCKET('1h', ts) → floors ts to nearest 1-hour boundary
+                if args.len() != 2 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "TIME_BUCKET() takes 2 arguments (interval, timestamp)".to_string()
+                    ));
+                }
+
+                // Parse interval string
+                let interval_str = match self.eval(&args[0], row)? {
+                    Value::Text(s) => s,
+                    _ => return Err(MoteDBError::TypeError(
+                        "TIME_BUCKET() first argument must be a text interval like '5m', '1h', '1d'".to_string()
+                    )),
+                };
+
+                let bucket_micros = parse_interval_to_micros(&interval_str)?;
+
+                let ts = match self.eval(&args[1], row)? {
+                    Value::Timestamp(ts) => ts,
+                    _ => return Err(MoteDBError::TypeError(
+                        "TIME_BUCKET() second argument must be timestamp".to_string()
+                    )),
+                };
+
+                let floored = (ts.as_micros() / bucket_micros) * bucket_micros;
+                use crate::types::Timestamp;
+                Ok(Value::Timestamp(Timestamp::from_micros(floored)))
+            }
+
             "day_of_week" | "dow" => {
                 // DAY_OF_WEEK(timestamp) - extract day of week (1=Monday, 7=Sunday)
                 if args.len() != 1 {
@@ -1359,51 +1385,7 @@ impl ExprEvaluator {
         
         result
     }
-    
-    /// Simple LIKE pattern matching (fallback for non-cached cases)
-    /// Supports % (any characters) and _ (single character)
-    #[allow(dead_code)]
-    fn like_match(&self, text: &str, pattern: &str) -> bool {
-        let text_chars: Vec<char> = text.chars().collect();
-        let pattern_chars: Vec<char> = pattern.chars().collect();
-        
-        self.like_match_recursive(&text_chars, &pattern_chars, 0, 0)
-    }
-    
-    #[allow(clippy::only_used_in_recursion)]
-    fn like_match_recursive(&self, text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
-        // End of pattern
-        if pi >= pattern.len() {
-            return ti >= text.len();
-        }
-        
-        // End of text
-        if ti >= text.len() {
-            // Pattern must be all % to match
-            return pattern[pi..].iter().all(|&c| c == '%');
-        }
-        
-        match pattern[pi] {
-            '%' => {
-                // Try matching 0 or more characters
-                self.like_match_recursive(text, pattern, ti, pi + 1) ||
-                self.like_match_recursive(text, pattern, ti + 1, pi)
-            }
-            '_' => {
-                // Match exactly one character
-                self.like_match_recursive(text, pattern, ti + 1, pi + 1)
-            }
-            c => {
-                // Exact match
-                if text[ti] == c {
-                    self.like_match_recursive(text, pattern, ti + 1, pi + 1)
-                } else {
-                    false
-                }
-            }
-        }
-    }
-    
+
     // E-SQL Vector Distance Functions
     
     /// L2 Distance (Euclidean): <->
@@ -1554,6 +1536,41 @@ impl ExprEvaluator {
         
         Ok(Value::Bool(same_region && above))
     }
+}
+
+/// Parse interval string like '5m', '1h', '30s', '1d' to microseconds.
+fn parse_interval_to_micros(interval: &str) -> crate::Result<i64> {
+    let interval = interval.trim();
+    if interval.is_empty() {
+        return Err(crate::MoteDBError::InvalidArgument("Empty interval string".to_string()));
+    }
+
+    // Split into numeric part and unit
+    let (num_str, unit) = if let Some(pos) = interval.find(|c: char| !c.is_ascii_digit()) {
+        (&interval[..pos], &interval[pos..])
+    } else {
+        (interval, "s")
+    };
+
+    let num: i64 = num_str.parse().map_err(|_| {
+        crate::MoteDBError::InvalidArgument(format!("Invalid interval number: '{}'", num_str))
+    })?;
+
+    if num <= 0 {
+        return Err(crate::MoteDBError::InvalidArgument("Interval must be positive".to_string()));
+    }
+
+    let micros = match unit {
+        "s" | "sec" | "second" | "seconds" => num * 1_000_000,
+        "m" | "min" | "minute" | "minutes" => num * 60 * 1_000_000,
+        "h" | "hr" | "hour" | "hours" => num * 3600 * 1_000_000,
+        "d" | "day" | "days" => num * 86400 * 1_000_000,
+        _ => return Err(crate::MoteDBError::InvalidArgument(
+            format!("Unknown interval unit: '{}'. Use s/m/h/d", unit)
+        )),
+    };
+
+    Ok(micros)
 }
 
 impl Default for ExprEvaluator {

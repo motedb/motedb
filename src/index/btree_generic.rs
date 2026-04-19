@@ -881,16 +881,6 @@ impl<K: BTreeKey> GenericBTree<K> {
         Ok((old_value_result, None))
     }
     
-    /// OLD RECURSIVE VERSION (kept for reference, not used)
-    #[allow(dead_code)]
-    #[allow(unused_variables)]
-    fn insert_internal_recursive(&mut self, page_id: u64, key: K, value: Vec<u8>)
-        -> GenericInsertResult<K> {
-        // This is kept for reference only and is not called
-        // The actual implementation uses the iterative version above
-        unimplemented!("Use iterative insert_internal instead")
-    }
-    
     /// Split a leaf page
     fn split_leaf(&mut self, page: &mut Page<K>) -> Result<(K, u64)> {
         // NOTE: Do NOT convert values here - write_page will handle it
@@ -1013,8 +1003,19 @@ impl<K: BTreeKey> GenericBTree<K> {
     pub fn get(&self, key: &K) -> Result<Option<Vec<u8>>> {
         let root_id = *self.root_page_id.read()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
+
         self.search_internal(root_id, key)
+    }
+
+    /// Approximate number of entries (upper bound from page count)
+    pub fn approximate_entry_count(&self) -> usize {
+        let next_id = *self.next_page_id.read()
+            .unwrap_or_else(|e| e.into_inner());
+        // Page 0 is superblock, so pages are 1..next_id
+        // Approx: (leaf pages) × max_keys. Roughly half the pages are leaves.
+        let total_pages = next_id.saturating_sub(1) as usize;
+        let leaf_pages = (total_pages + 1) / 2;
+        leaf_pages * self.max_keys
     }
     
     /// Internal recursive search

@@ -295,7 +295,11 @@ pub struct CompactionWorker {
     /// evict only those entries instead of clearing entirely.
     post_compaction_cb: PostCompactionCb,
 
-    /// 🚀 P0 Optimization: Cached snapshot of all SSTable metadata
+    /// SSTable files pending deletion from a previous compaction cycle.
+    /// Deferred by one cycle so in-flight scans finish before files are removed.
+    pending_deletions: Mutex<Vec<PathBuf>>,
+
+    /// Cached snapshot of all SSTable metadata
     /// Readers access this via cheap Arc clone (no Mutex contention).
     /// Updated atomically after register_sstable() and run_compaction().
     sstable_snapshot: RwLock<Option<Arc<Vec<SSTableMeta>>>>,
@@ -317,6 +321,7 @@ impl CompactionWorker {
             },
             stats: Arc::new(Mutex::new(CompactionStats::default())),
             post_compaction_cb: Arc::new(std::sync::RwLock::new(None)),
+            pending_deletions: Mutex::new(Vec::new()),
             sstable_snapshot: RwLock::new(None),
         };
 
@@ -402,6 +407,27 @@ impl CompactionWorker {
             }
         }
     }
+
+    /// Delete SST files deferred from a previous compaction cycle.
+    /// Called at the start of each compaction so in-flight scans from the
+    /// last cycle have finished by now.
+    pub fn flush_pending_deletions(&self) {
+        let pending = {
+            let mut guard = self.pending_deletions.lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for path in &pending {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Defer file deletion to the next compaction cycle instead of deleting now.
+    fn defer_deletion(&self, path: PathBuf) {
+        let mut guard = self.pending_deletions.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.push(path);
+    }
     
     /// Register a new SSTable (from MemTable flush)
     pub fn register_sstable(&self, meta: SSTableMeta) -> Result<()> {
@@ -465,6 +491,9 @@ impl CompactionWorker {
     
     /// Run one round of compaction
     pub fn run_compaction(&self) -> Result<()> {
+        // Flush deferred deletions from previous compaction cycle
+        self.flush_pending_deletions();
+
         let levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         
@@ -528,11 +557,11 @@ impl CompactionWorker {
         // Collect all removed SSTable paths for selective cache eviction
         let mut removed_paths: Vec<PathBuf> = Vec::with_capacity(sources.len() + overlapping.len());
 
-        // Remove source files (only those that actually existed)
+        // Remove source files (deferred — actual deletion happens next compaction cycle)
         for source in &valid_sources {
             levels[level_idx].remove_sstable(&source.path);
             removed_paths.push(source.path.clone());
-            let _ = fs::remove_file(&source.path);
+            self.defer_deletion(source.path.clone());
         }
 
         // Also clean up metadata for files that didn't exist
@@ -543,11 +572,11 @@ impl CompactionWorker {
             }
         }
 
-        // Remove overlapping files (only those that actually existed)
+        // Remove overlapping files (deferred)
         for overlap in &valid_overlapping {
             levels[level_idx + 1].remove_sstable(&overlap.path);
             removed_paths.push(overlap.path.clone());
-            let _ = fs::remove_file(&overlap.path);
+            self.defer_deletion(overlap.path.clone());
         }
 
         // Also clean up metadata for files that didn't exist
@@ -856,18 +885,18 @@ impl CompactionWorker {
                 }
             }
 
-            // Remove from L0 main list
+            // Remove from L0 main list (deferred)
             for source in &valid_sources {
                 levels[0].remove_sstable(&source.path);
                 removed_paths.push(source.path.clone());
-                let _ = std::fs::remove_file(&source.path);
+                self.defer_deletion(source.path.clone());
             }
 
-            // Remove overlapping from L1
+            // Remove overlapping from L1 (deferred)
             for overlap in &valid_overlapping {
                 levels[1].remove_sstable(&overlap.path);
                 removed_paths.push(overlap.path.clone());
-                let _ = std::fs::remove_file(&overlap.path);
+                self.defer_deletion(overlap.path.clone());
             }
 
             // Add to L1
@@ -899,10 +928,10 @@ impl CompactionWorker {
                 levels[0].sstables.push(meta);
             }
 
-            // Remove source files
+            // Remove source files (deferred)
             for source in &valid_sources {
                 removed_paths.push(source.path.clone());
-                let _ = std::fs::remove_file(&source.path);
+                self.defer_deletion(source.path.clone());
             }
         }
 

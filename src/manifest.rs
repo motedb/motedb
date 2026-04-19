@@ -16,7 +16,6 @@
 //! 1. Write all data files (versioned names)
 //!    - data_000001.sst
 //!    - vector_000001.sst
-//!    - spatial_000001.mmap
 //!    - text_000001.sst
 //! 2. fsync() all files
 //! 3. Write MANIFEST-000001.tmp
@@ -50,9 +49,6 @@ pub struct Manifest {
     /// Vector index files
     pub vector_indexes: HashMap<String, String>,
     
-    /// Spatial index files
-    pub spatial_indexes: HashMap<String, String>,
-    
     /// Text index files
     pub text_indexes: HashMap<String, String>,
     
@@ -76,7 +72,6 @@ impl Manifest {
             version,
             lsm_file: None,
             vector_indexes: HashMap::new(),
-            spatial_indexes: HashMap::new(),
             text_indexes: HashMap::new(),
             timestamp_indexes: HashMap::new(),
             column_indexes: HashMap::new(),
@@ -100,18 +95,14 @@ impl Manifest {
             hasher = hasher.wrapping_add(Self::hash_string(file));
         }
         
-        for (_, file) in &self.spatial_indexes {
-            hasher = hasher.wrapping_add(Self::hash_string(file));
-        }
-        
         for (_, file) in &self.text_indexes {
             hasher = hasher.wrapping_add(Self::hash_string(file));
         }
-        
+
         for (_, file) in &self.timestamp_indexes {
             hasher = hasher.wrapping_add(Self::hash_string(file));
         }
-        
+
         for (_, file) in &self.column_indexes {
             hasher = hasher.wrapping_add(Self::hash_string(file));
         }
@@ -234,12 +225,6 @@ impl Manifest {
             }
         }
         
-        for (_, file) in &self.spatial_indexes {
-            if !db_path.join(file).exists() {
-                return Ok(false);
-            }
-        }
-        
         for (_, file) in &self.text_indexes {
             if !db_path.join(file).exists() {
                 return Ok(false);
@@ -273,9 +258,6 @@ impl Manifest {
         for (_, file) in &self.vector_indexes {
             active_files.insert(file.clone());
         }
-        for (_, file) in &self.spatial_indexes {
-            active_files.insert(file.clone());
-        }
         for (_, file) in &self.text_indexes {
             active_files.insert(file.clone());
         }
@@ -285,7 +267,7 @@ impl Manifest {
         for (_, file) in &self.column_indexes {
             active_files.insert(file.clone());
         }
-        
+
         // Scan directory for data files
         for entry in std::fs::read_dir(db_path)? {
             let entry = entry?;
@@ -371,9 +353,6 @@ impl Manifest {
         for (_, file) in &current.vector_indexes {
             active_files.insert(file.clone());
         }
-        for (_, file) in &current.spatial_indexes {
-            active_files.insert(file.clone());
-        }
         for (_, file) in &current.text_indexes {
             active_files.insert(file.clone());
         }
@@ -409,13 +388,6 @@ impl Manifest {
                 }
                 
                 for (_, file) in &old_manifest.vector_indexes {
-                    if !active_files.contains(file) {
-                        let _ = std::fs::remove_file(db_path.join(file));
-                        deleted_count += 1;
-                    }
-                }
-                
-                for (_, file) in &old_manifest.spatial_indexes {
                     if !active_files.contains(file) {
                         let _ = std::fs::remove_file(db_path.join(file));
                         deleted_count += 1;
@@ -566,9 +538,6 @@ impl Manifest {
         for (_, file) in &manifest.vector_indexes {
             files.insert(file.clone());
         }
-        for (_, file) in &manifest.spatial_indexes {
-            files.insert(file.clone());
-        }
         for (_, file) in &manifest.text_indexes {
             files.insert(file.clone());
         }
@@ -579,7 +548,7 @@ impl Manifest {
             files.insert(file.clone());
         }
     }
-    
+
     // Helper: Get all files from manifest
     fn get_all_files(manifest: &Manifest) -> Vec<String> {
         let mut files = Vec::new();
@@ -588,9 +557,6 @@ impl Manifest {
             files.push(file.clone());
         }
         for (_, file) in &manifest.vector_indexes {
-            files.push(file.clone());
-        }
-        for (_, file) in &manifest.spatial_indexes {
             files.push(file.clone());
         }
         for (_, file) in &manifest.text_indexes {
@@ -602,7 +568,7 @@ impl Manifest {
         for (_, file) in &manifest.column_indexes {
             files.push(file.clone());
         }
-        
+
         files
     }
 }

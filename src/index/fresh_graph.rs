@@ -13,7 +13,39 @@ use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
-use super::Candidate;
+
+/// Search candidate node
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub id: u64,
+    pub distance: f32,
+}
+
+impl Candidate {
+    pub fn new(id: u64, distance: f32) -> Self {
+        Self { id, distance }
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+
+impl Eq for Candidate {}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance.partial_cmp(&other.distance).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Edge optimization: conditional parallelism
 #[cfg(feature = "rayon")]
@@ -151,7 +183,27 @@ impl FreshVamanaGraph {
         
         Ok(())
     }
-    
+
+    /// Insert pre-built nodes with neighbor lists already computed (e.g. by batch_vamana_build).
+    /// This avoids re-computing the graph structure on each individual insert.
+    pub fn insert_prebuilt(&self, nodes: Vec<(RowId, VectorNode)>, medoid: RowId) -> Result<()> {
+        let count = nodes.len();
+        if self.nodes.len() + count > self.config.max_nodes {
+            return Err(StorageError::ResourceExhausted(
+                format!("Insert would exceed max_nodes ({})", self.config.max_nodes)
+            ));
+        }
+        for (id, node) in nodes {
+            let vec_size = node.vector.len() * std::mem::size_of::<f32>();
+            let neighbor_size = node.neighbors.len() * std::mem::size_of::<u64>();
+            self.memory_usage.fetch_add(vec_size + neighbor_size, Ordering::Relaxed);
+            self.nodes.insert(id, node);
+        }
+        self.insert_count.fetch_add(count, Ordering::Relaxed);
+        self.medoid.store(medoid, Ordering::Release);
+        Ok(())
+    }
+
     /// 🚀 批量插入（延迟图构建）
     /// 
     /// **核心优化**：先插入所有向量（无边），然后一次性构建图

@@ -10,185 +10,6 @@ use crate::{Result, StorageError};
 use super::core::MoteDB;
 
 impl MoteDB {
-    /// Batch build indexes from flushed MemTable data
-    ///
-    /// Called by LSM Engine's flush callback with all row data from MemTable.
-    /// After P1.1 (table_id replaces hash), the deadlock is eliminated because
-    /// find_table_name_by_id is a pure in-memory registry lookup — no LSM scan.
-    #[allow(dead_code)]
-    pub(crate) fn batch_build_indexes_from_flush(&self, memtable: &crate::storage::lsm::UnifiedMemTable) -> Result<()> {
-        use std::time::Instant;
-        let _start = Instant::now();
-
-        let memtable_len = memtable.len();
-        debug_log!("[BatchIndexBuilder] Flush callback received, MemTable entries: {}", memtable_len);
-
-        if memtable_len == 0 {
-            return Ok(());
-        }
-
-        // Skip batch building for very small datasets (rely on incremental indexing)
-        const MIN_BATCH_SIZE: usize = 100;
-        if memtable_len < MIN_BATCH_SIZE {
-            debug_log!("[BatchIndexBuilder] Skipping ({} < {}), relying on incremental indexing",
-                     memtable_len, MIN_BATCH_SIZE);
-            return Ok(());
-        }
-
-        debug_log!("[BatchIndexBuilder] Building indexes from {} flushed rows", memtable_len);
-
-        // Phase 1: Group rows by table_name using collision-free table_id
-        let mut tables_data: std::collections::HashMap<String, Vec<(RowId, Row)>> = std::collections::HashMap::new();
-
-        for (composite_key, entry) in memtable.iter() {
-            if entry.deleted {
-                continue;
-            }
-
-            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-            let table_id = (composite_key >> 32) as u32;
-
-            let row_bytes: Vec<u8> = match &entry.data {
-                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
-                crate::storage::lsm::ValueData::Blob(blob_ref) => {
-                    match self.lsm_engine.resolve_blob(blob_ref) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            debug_log!("[BatchIndexBuilder] Failed to resolve blob for row {}: {}", row_id, e);
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            let row: Row = match bincode::deserialize(&row_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    debug_log!("[BatchIndexBuilder] Failed to deserialize row {}: {}", row_id, e);
-                    continue;
-                }
-            };
-
-            // Pure in-memory lookup — no LSM scan, no deadlock risk
-            let table_name = match self.find_table_name_by_id(table_id) {
-                Ok(name) => name,
-                Err(_) => continue, // Unknown table_id, skip
-            };
-
-            tables_data.entry(table_name)
-                .or_default()
-                .push((row_id, row));
-        }
-
-        debug_log!("[BatchIndexBuilder] Grouped into {} tables", tables_data.len());
-
-        // Phase 2: Build indexes per table
-        for (table_name, rows) in &tables_data {
-            if let Err(e) = self.batch_build_table_indexes(table_name, rows) {
-                debug_log!("[BatchIndexBuilder] Warning: index build failed for table '{}': {:?}", table_name, e);
-                // Don't fail the entire flush — index can be rebuilt later
-            }
-        }
-
-        debug_log!("[BatchIndexBuilder] Batch index building complete in {:?} ({} tables)",
-                 _start.elapsed(), tables_data.len());
-        Ok(())
-        
-        /* DISABLED CODE - CAUSES DEADLOCKS
-        if memtable_len == 0 {
-            return Ok(());
-        }
-        
-        // 🚀 Performance: Skip batch building for small datasets
-        const MIN_BATCH_SIZE: usize = 500;
-        if memtable_len < MIN_BATCH_SIZE {
-            debug_log!("[BatchIndexBuilder] ⚠️  跳过批量构建（数据量 {} < {}），依赖增量索引", 
-                     memtable_len, MIN_BATCH_SIZE);
-            return Ok(());
-        }
-        
-        debug_log!("[BatchIndexBuilder] 🚀 Building indexes from {} flushed rows", memtable_len);
-        
-        // Phase 1: Group rows by table_name
-        let mut tables_data: HashMap<String, Vec<(RowId, Row)>> = HashMap::new();
-        
-        for (composite_key, entry) in memtable.iter() {
-            if entry.deleted {
-                continue;
-            }
-            
-            let row_bytes = match &entry.data {
-                crate::storage::lsm::ValueData::Inline(bytes) => bytes,
-                crate::storage::lsm::ValueData::Blob(_) => {
-                    debug_log!("[BatchIndexBuilder] ⚠️  Blob not supported for index building yet");
-                    continue;
-                }
-            };
-            
-            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-            let table_hash = composite_key >> 32;
-            
-            let row: Row = match bincode::deserialize(&row_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    debug_log!("[BatchIndexBuilder] ⚠️  Failed to deserialize row {}: {}", row_id, e);
-                    continue;
-                }
-            };
-            
-            let table_name = self.find_table_name_by_hash(table_hash)?;
-            
-            tables_data.entry(table_name)
-                .or_default()
-                .push((row_id, row));
-        }
-        
-        debug_log!("[BatchIndexBuilder]   ↳ Grouped into {} tables", tables_data.len());
-        
-        // Phase 2: Build indexes (parallel if multiple tables)
-        let tables_count = tables_data.len();
-        
-        if tables_count == 1 {
-            for (table_name, rows) in tables_data {
-                self.batch_build_table_indexes(&table_name, &rows)?;
-            }
-        } else {
-            use std::thread;
-            let handles: Vec<_> = tables_data.into_iter().map(|(table_name, rows)| {
-                let db = self.clone_for_callback();
-                thread::spawn(move || {
-                    db.batch_build_table_indexes(&table_name, &rows)
-                })
-            }).collect();
-            
-            for (idx, handle) in handles.into_iter().enumerate() {
-                match handle.join() {
-                    Ok(Ok(())) => {},
-                    Ok(Err(e)) => {
-                        debug_log!("[BatchIndexBuilder] ⚠️  Table {} build failed: {}", idx, e);
-                        return Err(e);
-                    }
-                    Err(_) => {
-                        return Err(StorageError::Index("Thread panicked during batch build".into()));
-                    }
-                }
-            }
-        }
-        
-        debug_log!("[BatchIndexBuilder] ✅ Batch index building complete in {:?} ({} tables)", start.elapsed(), tables_count);
-        Ok(())
-        */
-    }
-    
-    /// Find table name by its stable sequential table_id (reverse lookup).
-    ///
-    /// This is a pure in-memory operation on the TableRegistry's HashMap
-    /// — no LSM scan, no deadlock risk.
-    #[allow(dead_code)]
-    fn find_table_name_by_id(&self, table_id: u32) -> Result<String> {
-        self.table_registry.get_table_name_by_id(table_id)
-    }
-    
     /// Batch build all indexes for a specific table
     pub(crate) fn batch_build_table_indexes(&self, table_name: &str, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
@@ -217,7 +38,7 @@ impl MoteDB {
             let table_name = table_name.clone();
             let schema = schema.clone();
             let rows = rows.clone();
-            handles.push(thread::spawn(move || {
+            handles.push(std::thread::Builder::new().spawn(move || {
                 db.batch_build_column_indexes(&table_name, &schema, &rows)
             }));
         }
@@ -227,7 +48,7 @@ impl MoteDB {
             let db = self.clone_for_callback();
             let schema = schema.clone();
             let rows = rows.clone();
-            handles.push(thread::spawn(move || {
+            handles.push(std::thread::Builder::new().spawn(move || {
                 db.batch_build_timestamp_indexes(&schema, &rows)
             }));
         }
@@ -238,35 +59,31 @@ impl MoteDB {
             let table_name = table_name.clone();
             let schema = schema.clone();
             let rows = rows.clone();
-            handles.push(thread::spawn(move || {
+            handles.push(std::thread::Builder::new().spawn(move || {
                 db.batch_build_vector_indexes(&table_name, &schema, &rows)
             }));
         }
-        
-        // 4. Spatial indexes
-        {
-            let db = self.clone_for_callback();
-            let table_name = table_name.clone();
-            let schema = schema.clone();
-            let rows = rows.clone();
-            handles.push(thread::spawn(move || {
-                db.batch_build_spatial_indexes(&table_name, &schema, &rows)
-            }));
-        }
-        
-        // 5. Text indexes
+
+        // 4. Text indexes
         {
             let db = self.clone_for_callback();
             let table_name_clone = table_name.clone();
             let schema = schema.clone();
             let rows = rows.clone();
-            handles.push(thread::spawn(move || {
+            handles.push(std::thread::Builder::new().spawn(move || {
                 db.batch_build_text_indexes(&table_name_clone, &schema, &rows)
             }));
         }
         
         // Wait for all threads
-        for (idx, handle) in handles.into_iter().enumerate() {
+        for (idx, handle_result) in handles.into_iter().enumerate() {
+            let handle = match handle_result {
+                Ok(h) => h,
+                Err(e) => {
+                    debug_log!("[BatchIndexBuilder] ⚠️  Index type {} thread spawn failed: {}", idx, e);
+                    continue;
+                }
+            };
             match handle.join() {
                 Ok(Ok(())) => {},
                 Ok(Err(e)) => {
@@ -279,12 +96,11 @@ impl MoteDB {
             }
         }
         
-        debug_log!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?} (5 parallel threads)", table_name, _start.elapsed());
+        debug_log!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?} (4 parallel threads)", table_name, _start.elapsed());
         Ok(())
     }
     
     /// Batch build column indexes
-    #[allow(dead_code)]
     fn batch_build_column_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
@@ -327,7 +143,6 @@ impl MoteDB {
     }
     
     /// Batch build timestamp indexes
-    #[allow(dead_code)]
     fn batch_build_timestamp_indexes(&self, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
@@ -355,7 +170,6 @@ impl MoteDB {
     }
     
     /// Batch build vector indexes
-    #[allow(dead_code)]
     fn batch_build_vector_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         
         for col_def in &schema.columns {
@@ -380,34 +194,7 @@ impl MoteDB {
         Ok(())
     }
     
-    /// Batch build spatial indexes
-    #[allow(dead_code)]
-    fn batch_build_spatial_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
-        
-        for col_def in &schema.columns {
-            if let crate::types::ColumnType::Spatial = col_def.col_type {
-                let index_name = format!("{}_{}", table_name, col_def.name);
-                if let Some(index_ref) = self.spatial_indexes.get(&index_name) {
-                    let index = index_ref.value();
-                    let mut geometries = Vec::new();
-                    for (row_id, row) in rows {
-                        if let Some(crate::types::Value::Spatial(geom)) = row.get(col_def.position) {
-                            geometries.push((*row_id, geom.clone()));
-                        }
-                    }
-                    
-                    if !geometries.is_empty() {
-                        index.write().batch_insert(geometries)?;
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
     /// Batch build text indexes
-    #[allow(dead_code)]
     fn batch_build_text_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
         use crate::index::builder::IndexBuilder;
         

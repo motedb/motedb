@@ -69,6 +69,8 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "true" => TokenType::True,
     "false" => TokenType::False,
     "auto_increment" => TokenType::AutoIncrement,
+    "timeseries" => TokenType::Timeseries,
+    "ttl" => TokenType::Ttl,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +124,8 @@ pub enum TokenType {
     Tables,   // TABLES
     Alter,    // ALTER
     AutoIncrement, // AUTO_INCREMENT
+    Timeseries, // TIMESERIES
+    Ttl,       // TTL
     
     // Data types
     Integer,

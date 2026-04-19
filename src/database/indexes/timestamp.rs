@@ -101,25 +101,41 @@ impl MoteDB {
     }
     
     /// Query by timestamp range
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let row_ids = db.query_timestamp_range(1000, 2000)?;
     /// ```
     pub fn query_timestamp_range(&self, start: i64, end: i64) -> Result<Vec<RowId>> {
         ensure_open!(self);
-        self.query_timestamp_range_with_profile(start, end).map(|(ids, _)| ids)
+        self.query_timestamp_range_inner(start, end, None).map(|(ids, _)| ids)
     }
-    
+
+    /// Query by timestamp range with a limit (stops scanning early)
+    pub fn query_timestamp_range_with_limit(&self, start: i64, end: i64, limit: usize) -> Result<Vec<RowId>> {
+        ensure_open!(self);
+        self.query_timestamp_range_inner(start, end, Some(limit)).map(|(ids, _)| ids)
+    }
+
     /// Query by timestamp range with performance profiling
     pub fn query_timestamp_range_with_profile(&self, start: i64, end: i64) -> Result<(Vec<RowId>, QueryProfile)> {
+        ensure_open!(self);
+        self.query_timestamp_range_inner(start, end, None)
+    }
+
+    /// Inner implementation shared by range query variants
+    fn query_timestamp_range_inner(&self, start: i64, end: i64, limit: Option<usize>) -> Result<(Vec<RowId>, QueryProfile)> {
         let total_start = std::time::Instant::now();
         
         // 1. Query from persisted index (flushed data)
         let index_start = std::time::Instant::now();
         let start_u64 = start as u64;
         let end_u64 = end as u64;
-        let index_results = self.timestamp_index.read().range(&start_u64, &end_u64)?;
+        let index_results = if let Some(lim) = limit {
+            self.timestamp_index.read().range_with_limit(&start_u64, &end_u64, lim)?
+        } else {
+            self.timestamp_index.read().range(&start_u64, &end_u64)?
+        };
         let mut result_ids: Vec<RowId> = index_results.into_iter().map(|(_, row_id)| row_id).collect();
         let index_duration = index_start.elapsed();
         
@@ -155,12 +171,6 @@ impl MoteDB {
         };
         
         Ok((result_ids, profile))
-    }
-    
-    /// Scan LSM MemTable for timestamp range
-    #[allow(dead_code)]
-    fn scan_memtable_by_timestamp(&self, start: i64, end: i64) -> Result<Vec<RowId>> {
-        self.scan_memtable_by_timestamp_with_profile(start, end).map(|(ids, _)| ids)
     }
     
     /// Scan LSM MemTable with profiling

@@ -225,6 +225,29 @@ fn test_match_against_limit() {
     assert!(result.len() <= 2, "Should respect LIMIT");
 }
 
+#[test]
+fn test_match_against_phrase() {
+    let (db, _dir) = create_db();
+    setup_text(&db);
+
+    // Exact phrase: "Machine learning" should match only the article with that exact sequence
+    let result = rows(&db,
+        "SELECT id FROM articles WHERE MATCH(body) AGAINST('\"machine learning\"')");
+    assert_eq!(result.len(), 1, "Phrase 'machine learning' should match exactly 1 article");
+    assert_eq!(result[0][0], Value::Integer(8));
+}
+
+#[test]
+fn test_match_against_phrase_no_match() {
+    let (db, _dir) = create_db();
+    setup_text(&db);
+
+    // "learning machine" is NOT in any document (words are in wrong order)
+    let result = rows(&db,
+        "SELECT id FROM articles WHERE MATCH(body) AGAINST('\"learning machine\"')");
+    assert!(result.is_empty(), "Phrase 'learning machine' should not match (wrong order)");
+}
+
 // ============================================================================
 // Vector Fast Path Tests
 // ============================================================================
@@ -371,9 +394,15 @@ fn test_text_search_after_insert() {
     exec(&db, "INSERT INTO docs VALUES (1, 'hello world database')");
     exec(&db, "INSERT INTO docs VALUES (2, 'vector search engine')");
 
+    // Before flush: search should work from pending
+    let pre_flush = db.text_search_ranked("docs_body", "database", 10).unwrap();
+
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
     std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // After flush+checkpoint: search should work from disk
+    let post_flush = db.text_search_ranked("docs_body", "database", 10).unwrap();
 
     let result = rows(&db, "SELECT id FROM docs WHERE MATCH(body) AGAINST('database')");
     assert!(!result.is_empty(), "Text search should find 'database'");

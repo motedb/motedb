@@ -30,9 +30,6 @@ pub struct Manifest {
     manifest_file: Arc<Mutex<File>>,
     /// 下一个版本号
     next_version: Arc<Mutex<u64>>,
-    /// Manifest 文件编号
-    #[allow(dead_code)]
-    manifest_number: u64,
 }
 
 impl Manifest {
@@ -82,7 +79,6 @@ impl Manifest {
             current_version: Arc::new(Mutex::new(version)),
             manifest_file: Arc::new(Mutex::new(manifest_file)),
             next_version: Arc::new(Mutex::new(next_version)),
-            manifest_number,
         })
     }
     

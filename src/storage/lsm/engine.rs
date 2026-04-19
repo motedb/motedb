@@ -519,7 +519,7 @@ impl LSMEngine {
                     }
                 }
             }
-        }).expect("Failed to spawn flush thread");
+        }).map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to spawn flush thread: {}", e))))?;
         
         engine.compaction_thread = Some(compaction_thread);
         engine.flush_thread = Some(flush_thread);
@@ -982,6 +982,48 @@ impl LSMEngine {
         self.put(key, Value::tombstone(timestamp))
     }
 
+    /// Delete all keys in [start, end] range by inserting individual tombstones.
+    ///
+    /// For TTL GC and DROP TABLE: scans the memtable for keys in range and
+    /// marks each as deleted. On-disk SSTable entries are handled during
+    /// compaction when they encounter these tombstones.
+    ///
+    /// # Performance
+    /// - Memtable keys: O(k) where k = keys in range (BTree range scan)
+    /// - SSTable keys: tombstones written to memtable, cleaned up by compaction
+    pub fn delete_range(&self, start: Key, end: Key, timestamp: u64) -> Result<usize> {
+        if start > end {
+            return Ok(0);
+        }
+
+        let tombstone = Value::tombstone(timestamp);
+        let mut count = 0;
+
+        // 1. Write tombstones to memtable for all existing keys in range
+        let keys_in_range: Vec<Key> = {
+            let memtable = self.memtable.read();
+            memtable.keys_in_range(start, end)
+        };
+
+        for key in &keys_in_range {
+            self.put(*key, tombstone.clone())?;
+            count += 1;
+        }
+
+        // 2. Also insert range tombstone boundaries so future compactions
+        //    know the entire [start, end] range is deleted.
+        //    We write tombstones at start and end — compaction will merge.
+        if keys_in_range.is_empty() {
+            // Even if no keys in memtable, SSTables might have data in this range.
+            // Write boundary tombstones so compaction knows to drop them.
+            self.put(start, tombstone.clone())?;
+            self.put(end, tombstone)?;
+            count = 2;
+        }
+
+        Ok(count)
+    }
+
     /// Resolve a blob reference to its actual data.
     /// Used by index builders to access large values stored in blob files.
     pub fn resolve_blob(&self, blob_ref: &super::BlobRef) -> Result<Vec<u8>> {
@@ -1203,28 +1245,29 @@ impl LSMEngine {
         {
             let immutable = self.immutable.read();
             if immutable.len() >= self.max_immutable_slots {
-                // Queue full, skip rotation (non-blocking)
                 return Err(StorageError::Transaction("Immutable queue full".into()));
             }
         }
 
-        // Acquire both locks for atomic swap
-        let mut memtable_lock = self.memtable.write();
-        let mut immutable_lock = self.immutable.write();
+        // Acquire both locks for atomic swap, then release before notifying
+        {
+            let mut memtable_lock = self.memtable.write();
+            let mut immutable_lock = self.immutable.write();
 
-        // Double-check queue not full (another thread might have added)
-        if immutable_lock.len() >= self.max_immutable_slots {
-            return Err(StorageError::Transaction("Immutable queue full".into()));
-        }
+            // Double-check queue not full (another thread might have added)
+            if immutable_lock.len() >= self.max_immutable_slots {
+                return Err(StorageError::Transaction("Immutable queue full".into()));
+            }
 
-        // Create new UnifiedMemTable with same configuration
-        let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
+            // Create new UnifiedMemTable with same configuration
+            let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
 
-        // Atomic swap: active -> push to queue back, create new active
-        let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
-        immutable_lock.push_back(old_memtable);
+            // Atomic swap: active -> push to queue back, create new active
+            let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
+            immutable_lock.push_back(old_memtable);
+        } // Both locks released here — safe to acquire flush_wakeup
 
-        // 🚀 Wake up flush thread to process the new immutable
+        // Wake up flush thread to process the new immutable
         {
             let (lock, cvar) = &*self.flush_wakeup;
             if let Ok(mut guard) = lock.lock() {
@@ -1283,111 +1326,8 @@ impl LSMEngine {
         }
     }
     
-    
-    /// Internal flush implementation
-    /// 🔥 NEW: Pop from front of queue (FIFO)
-    #[allow(dead_code)]
-    fn flush_immutable_impl(&self) -> Result<Option<PathBuf>> {
-        // Pop one MemTable from front of queue (oldest first)
-        let memtable = {
-            let mut immutable_lock = self.immutable.write();
-            
-            match immutable_lock.pop_front() {  // 🔥 Pop from front (FIFO)
-                Some(mem) => mem,
-                None => return Ok(None), // Queue empty
-            }
-        };
-        // 🔧 Lock released here, one queue slot is now freed
-        //    But memtable still holds data until SSTable is built
-        
-        // 🚀 Unified Flush Callback (NEW)
-        // Call callback with MemTable reference (zero-copy, efficient)
-        // This allows Database layer to batch build all indexes
-        {
-            let callback_guard = self.flush_callback.read();
-            if let Some(ref callback) = *callback_guard {
-                // ✅ Pass MemTable reference directly (no data copy)
-                callback(&memtable)?;
-            }
-        }
-        
-        // Generate SSTable ID
-        let sst_id = {
-            let mut next_id = self.next_sst_id.write();
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
-        
-        // Build SSTable (I/O happens here, no locks held)
-        let sst_path = self.storage_dir.join(format!("l0_{:06}.sst", sst_id));
-        
-        // 🔧 确保存储目录存在（防止目录被删除导致flush失败）
-        if !self.storage_dir.exists() {
-            return Ok(None); // Database已关闭，跳过flush
-        }
-        
-        let mut builder = SSTableBuilder::new(&sst_path, self.config.clone(), memtable.len())?;
-        
-        // 🆕 Use UnifiedEntry iterator and convert to Value
-        for (key, entry) in memtable.iter() {
-            let value = Value {
-                data: entry.data,
-                timestamp: entry.timestamp,
-                deleted: entry.deleted,
-            };
-            builder.add(key, value)?;
-        }
-        
-        let meta = builder.finish()?;
-        
-        // TODO: Phase 2 - Flush vector graph nodes to SST
-        // if let Ok(nodes) = memtable.export_vector_nodes() {
-        //     // Write vector nodes to separate SST file
-        // }
-        
-        // 🔧 Explicitly drop memtable ASAP to free memory
-        drop(memtable);
-        
-        // Register SSTable with compaction worker
-        self.compaction_worker.register_sstable(meta)?;
 
-        // 🚀 Wake up compaction thread (new SSTable may need compaction)
-        {
-            let (lock, cvar) = &*self.compaction_wakeup;
-            if let Ok(mut guard) = lock.lock() {
-                *guard = true;
-            }
-            cvar.notify_all();
-        }
 
-        Ok(Some(sst_path))
-    }
-    
-    #[allow(dead_code)]
-    fn flush_immutable_with_path(&self) -> Result<Option<PathBuf>> {
-        // Try to acquire flush ownership (lock-free)
-        if self.flush_in_progress.compare_exchange(
-            false, 
-            true, 
-            Ordering::Acquire, 
-            Ordering::Relaxed
-        ).is_err() {
-            // Another thread is flushing, skip
-            return Ok(None);
-        }
-        
-        // We own the flush now
-        let result = self.flush_immutable_impl();
-        
-        // Release flush ownership
-        self.flush_in_progress.store(false, Ordering::Release);
-        
-        result
-    }
-    
-
-    
     /// Scan MemTable (including immutable) with zero-copy callback
     /// 
     /// ✅ Zero-copy optimization: No Vec allocation, processes items in-place
@@ -1707,50 +1647,48 @@ impl LSMEngine {
             }
         }
         
-        // Step 2: Collect from Immutable queue
-        // 🔥 NEW: Iterate through entire queue (oldest to newest)
+        // Step 2: Collect from Immutable queue (timestamp-based dedup)
         {
             let immutable = self.immutable.read();
-            
+
             for memtable in immutable.iter() {
                 let entries = memtable.scan(start, end)?;
-                
+
                 for (k, entry) in entries {
-                    // Only insert if key doesn't exist or this version is newer
                     let value = Value {
                         data: entry.data,
                         timestamp: entry.timestamp,
                         deleted: entry.deleted,
                     };
-                    
-                    merged.entry(k).or_insert(value);
+                    merged.entry(k).and_modify(|existing| {
+                        if value.timestamp > existing.timestamp {
+                            *existing = value.clone();
+                        }
+                    }).or_insert(value);
                 }
             }
         }
         
-        // Step 3: Collect from SSTables (oldest data)
-        // ⚠️  CRITICAL FIX: SSTable应该按照从新到旧的顺序扫描
-        //     因为使用or_insert()，先插入的值会被保留
+        // Step 3: Collect from SSTables (timestamp-based dedup)
         let sstable_paths = self.compaction_worker.list_sstables()?;
-        
-        // 🔥 反转顺序：从最新的SSTable开始扫描
-        for path in sstable_paths.iter().rev() {
+
+        for path in sstable_paths.iter() {
             // Skip if file doesn't exist (may have been compacted)
             if !path.exists() {
                 continue;
             }
-            
+
             // Use cache to get SSTable
             let cached = match self.sstable_cache.get_or_open(path) {
                 Ok(cached) => cached,
-                Err(_) => continue, // Skip if can't open (e.g., being compacted)
+                Err(_) => continue,
             };
 
             let mut sstable = match cached.handle.lock() {
                 Ok(sst) => sst,
-                Err(_) => continue, // Skip if lock poisoned
+                Err(_) => continue,
             };
-            
+
             // Scan SSTable
             let entries = match sstable.scan(start, end) {
                 Ok(entries) => entries,
@@ -1759,10 +1697,13 @@ impl LSMEngine {
                     continue;
                 }
             };
-            
+
             for (k, value) in entries {
-                // Only insert if key doesn't exist (MemTable/newer SST has priority)
-                merged.entry(k).or_insert(value);
+                merged.entry(k).and_modify(|existing| {
+                    if value.timestamp > existing.timestamp {
+                        *existing = value.clone();
+                    }
+                }).or_insert(value);
             }
         }
         
@@ -1859,10 +1800,14 @@ impl LSMEngine {
             })
             .collect();
         
-        // Step 4: Merge results (serial, but fast)
+        // Step 4: Merge results using timestamp-based dedup (order-independent)
         for entries in sstable_results {
             for (k, value) in entries {
-                merged.entry(k).or_insert(value);
+                merged.entry(k).and_modify(|existing| {
+                    if value.timestamp > existing.timestamp {
+                        *existing = value.clone();
+                    }
+                }).or_insert(value);
             }
         }
         
@@ -2195,6 +2140,10 @@ impl Drop for LSMEngine {
         // 🔧 Step 3: Clear SSTable cache to release file handles
         self.sstable_cache.clear();
         debug_log!("[LSMEngine::Drop] ✓ Cache cleared");
+
+        // Step 4: Flush any deferred SST deletions from last compaction
+        self.compaction_worker.flush_pending_deletions();
+        debug_log!("[LSMEngine::Drop] ✓ Pending deletions flushed");
 
         debug_log!("[LSMEngine::Drop] ✅ LSM engine shutdown complete");
     }

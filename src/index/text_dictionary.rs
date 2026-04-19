@@ -23,10 +23,6 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Default cache size: number of chunks to keep in memory
-#[allow(dead_code)]
-const DEFAULT_CACHE_SIZE: usize = 16;
-
 /// A chunk of the dictionary
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DictionaryChunk {

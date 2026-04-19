@@ -4,23 +4,22 @@
 
 mod manager;
 pub mod builder;  // 🚀 新增：批量索引构建接口
-pub mod spatial_hybrid;
 pub mod text_types;
 pub mod text_fts;
 pub mod text_encoding;
 pub mod text_dictionary;
 pub mod tokenizers;  // 🔌 新增：分词器插件系统
 pub mod vamana;
-pub mod diskann;  // 🚀 新增：FreshDiskANN (LSM 融合架构)
+pub mod fresh_graph;
 pub mod btree;
 pub mod btree_generic;
 pub mod primary_key;
 pub mod column_value;
 pub mod cached_index; // 🚀 P1: 索引缓存层
+pub mod ioctree;     // i-Octree 3D spatial index for embodied intelligence
 
 pub use manager::{IndexManager, IndexType, IndexUpdate};
 pub use builder::{IndexBuilder, BuildStats};  // 🚀 导出批量构建接口
-pub use spatial_hybrid::{SpatialHybridIndex, SpatialHybridConfig, BoundingBoxF32, MemoryStats};
 pub use text_fts::{TextFTSIndex, TextFTSStats};
 pub use text_types::{Tokenizer, WhitespaceTokenizer, NgramTokenizer, Token};
 pub use text_dictionary::ChunkedDictionary;
@@ -51,9 +50,6 @@ pub trait Index: Send + Sync {
 pub enum Predicate {
     /// Vector KNN search: (query_vector, k)
     VectorKnn(Vec<f32>, usize),
-    
-    /// Spatial range query: (min_x, min_y, max_x, max_y)
-    SpatialRange(f64, f64, f64, f64),
     
     /// Text search: query string
     TextSearch(String),

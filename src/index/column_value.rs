@@ -627,7 +627,15 @@ impl ColumnValueIndex {
             total_row_ids: 0,  // Not tracked in LRU cache
         }
     }
-    
+
+    /// Get the approximate number of entries in the index
+    pub fn entry_count(&self) -> usize {
+        // Approximate from BTree page metadata (avoid full scan)
+        // The page count * max_keys_per_page gives an upper bound
+        let btree = self.btree.read();
+        btree.approximate_entry_count()
+    }
+
     // Helper: Convert Value to bytes for comparison
     fn value_to_bytes(&self, value: &Value) -> Result<Vec<u8>> {
         use crate::types::Value;

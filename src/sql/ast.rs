@@ -105,6 +105,12 @@ pub struct DeleteStmt {
 pub struct CreateTableStmt {
     pub table: String,
     pub columns: Vec<ColumnDef>,
+    /// Table type: Standard or TimeSeries
+    pub table_type: crate::types::TableType,
+    /// Designated timestamp column for TimeSeries tables
+    pub timeseries_column: Option<String>,
+    /// TTL retention policy
+    pub ttl: Option<crate::types::TTLDuration>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +155,7 @@ pub enum IndexType {
     Column,      // 🆕 Column value index (same as BTree but explicit name)
     Text,
     Vector,
-    Spatial,
+    Octree,      // i-Octree for 3D point cloud (embodied intelligence)
     Timestamp,
 }
 
@@ -274,6 +280,8 @@ pub enum Expr {
     Match {
         column: String,
         query: String,
+        /// If true, the query is an exact phrase (wrapped in double quotes)
+        phrase: bool,
     },
     
     /// KNN_SEARCH vector similarity search
@@ -303,49 +311,47 @@ pub enum Expr {
         query_vector: crate::types::ArcVec,
     },
     
-    /// ST_WITHIN spatial range query
-    /// 
-    /// Syntax: ST_WITHIN(point_column, min_x, min_y, max_x, max_y)
-    /// Returns: Bool (true if point is within bounding box)
-    /// 
-    /// Examples:
-    /// - WHERE ST_WITHIN(location, 0, 0, 100, 100)
-    /// - Used for spatial filtering with spatial index
-    StWithin {
+    // ---- 3D Spatial expressions (i-Octree) ----
+
+    /// ST_WITHIN_3D: 3D bounding box range query
+    /// Syntax: WHERE ST_WITHIN_3D(column, min_x, min_y, min_z, max_x, max_y, max_z)
+    StWithin3D {
         column: String,
         min_x: f64,
         min_y: f64,
+        min_z: f64,
         max_x: f64,
         max_y: f64,
+        max_z: f64,
     },
-    
-    /// ST_DISTANCE spatial distance function
-    /// 
-    /// Syntax: ST_DISTANCE(point_column, x, y)
-    /// Returns: Float (Euclidean distance)
-    /// 
-    /// Examples:
-    /// - SELECT ST_DISTANCE(location, 50, 50) AS distance
-    /// - ORDER BY ST_DISTANCE(location, 50, 50)
-    StDistance {
+
+    /// ST_DISTANCE_3D: 3D Euclidean distance
+    /// Syntax: ST_DISTANCE_3D(column, x, y, z)
+    StDistance3D {
         column: String,
         x: f64,
         y: f64,
+        z: f64,
     },
-    
-    /// ST_KNN spatial k-nearest neighbors
-    /// 
-    /// Syntax: ST_KNN(point_column, x, y, k)
-    /// Returns: Bool (true if in top-k nearest neighbors)
-    /// 
-    /// Examples:
-    /// - WHERE ST_KNN(location, 50, 50, 10)
-    /// - Used with ST_DISTANCE for scoring
-    StKnn {
+
+    /// ST_KNN_3D: 3D k-nearest neighbors
+    /// Syntax: WHERE ST_KNN_3D(column, x, y, z, k)
+    StKnn3D {
         column: String,
         x: f64,
         y: f64,
+        z: f64,
         k: usize,
+    },
+
+    /// ST_RADIUS_3D: 3D radius search
+    /// Syntax: WHERE ST_RADIUS_3D(column, x, y, z, radius)
+    StRadius3D {
+        column: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        radius: f64,
     },
 }
 

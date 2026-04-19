@@ -36,9 +36,7 @@ impl MoteDB {
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
 
         // 3. Write to WAL first (durability)
-        self.wal.log_insert(table_name, partition, composite_key, row.clone())?;
-        
-        // 4. Write to LSM MemTable
+        self.wal.log_insert(table_name, partition, composite_key, row.clone(), 0)?;
         let row_data = bincode::serialize(&row)?;
         let value = crate::storage::lsm::Value::new(row_data, composite_key);
         self.lsm_engine.put(composite_key, value)?;
@@ -110,7 +108,7 @@ impl MoteDB {
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
         
         // 3. Write to WAL first (durability)
-        self.wal.log_update(table_name, partition, composite_key, old_row, new_row.clone())?;
+        self.wal.log_update(table_name, partition, composite_key, old_row, new_row.clone(), 0)?;
         
         // 4. Update in LSM MemTable
         let row_data = bincode::serialize(&new_row)?;
@@ -150,7 +148,7 @@ impl MoteDB {
             .as_micros() as u64;
 
         // 4. Write to WAL first (durability)
-        self.wal.log_delete(table_name, partition, composite_key, old_row, timestamp)?;
+        self.wal.log_delete(table_name, partition, composite_key, old_row, timestamp, 0)?;
 
         // 5. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
@@ -313,7 +311,7 @@ impl MoteDB {
         let partition = (row_id % self.num_partitions as u64) as PartitionId;
 
         // 5. Write to WAL first (durability)
-        self.wal.log_insert(table_name, partition, row_id, row.clone())?;
+        self.wal.log_insert(table_name, partition, row_id, row.clone(), 0)?;
         
         // 6. Write to LSM MemTable with table prefix
         let row_data = bincode::serialize(&row)?;
@@ -394,12 +392,12 @@ impl MoteDB {
                 }
             }
 
-            // 7.4 Spatial Index
+            // 7.4 i-Octree Index (3D point cloud)
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Octree) {
                     if let crate::types::Value::Spatial(geom) = col_value {
-                        if let Err(_e) = self.insert_geometry(row_id, &index_name, geom.clone()) {
-                            debug_log!("[insert_row] Failed to update spatial index '{}': {}", index_name, _e);
+                        if let Err(_e) = self.insert_ioctree_point(row_id, &index_name, geom) {
+                            debug_log!("[insert_row] Failed to update ioctree index '{}': {}", index_name, _e);
                             index_errors.push(index_name.clone());
                         }
                     }
@@ -516,7 +514,7 @@ impl MoteDB {
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
         
         // 4. Write to WAL first (durability)
-        self.wal.log_update(table_name, partition, composite_key, old_row.clone(), new_row.clone())?;
+        self.wal.log_update(table_name, partition, composite_key, old_row.clone(), new_row.clone(), 0)?;
         
         // 5. Update in LSM MemTable
         let row_data = bincode::serialize(&new_row)?;
@@ -595,24 +593,22 @@ impl MoteDB {
                 }
             }
 
-            // 6.4 Spatial Index
+            // 6.4 i-Octree Index (3D point cloud)
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.spatial_indexes.contains_key(&index_name) {
+                if let Some(octree_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Octree) {
                     let mut failed = false;
-                    if let Err(_e) = self.delete_geometry(row_id, &index_name) {
-                        debug_log!("[update_row] Failed to delete old spatial geometry '{}': {}", index_name, _e);
+                    if let Err(_e) = self.delete_ioctree_point(row_id, &octree_name) {
+                        debug_log!("[update_row] Failed to delete old ioctree point '{}': {}", octree_name, _e);
                         failed = true;
                     }
-
                     if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
-                        if let Err(_e) = self.insert_geometry(row_id, &index_name, new_geom.clone()) {
-                            debug_log!("[update_row] Failed to update spatial index '{}': {}", index_name, _e);
+                        if let Err(_e) = self.insert_ioctree_point(row_id, &octree_name, new_geom) {
+                            debug_log!("[update_row] Failed to update ioctree index '{}': {}", octree_name, _e);
                             failed = true;
                         }
                     }
                     if failed {
-                        index_errors.push(index_name.clone());
+                        index_errors.push(octree_name.clone());
                     }
                 }
             }
@@ -661,7 +657,7 @@ impl MoteDB {
         // 5. Write to WAL first (durability guarantee)
         //    WAL must be written BEFORE any mutation so that a crash at any
         //    point below can be recovered correctly.
-        self.wal.log_delete(table_name, partition, composite_key, old_row.clone(), timestamp)?;
+        self.wal.log_delete(table_name, partition, composite_key, old_row.clone(), timestamp, 0)?;
 
         // 6. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
@@ -738,13 +734,12 @@ impl MoteDB {
                 }
             }
 
-            // Spatial Index
+            // i-Octree Index (3D point cloud)
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.spatial_indexes.contains_key(&index_name) {
-                    if let Err(_e) = self.delete_geometry(row_id, &index_name) {
-                        debug_log!("[delete_row] Failed to delete from spatial index '{}': {}", index_name, _e);
-                        self.index_registry.mark_stale(&index_name);
+                if let Some(octree_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Octree) {
+                    if let Err(_e) = self.delete_ioctree_point(row_id, &octree_name) {
+                        debug_log!("[delete_row] Failed to delete from ioctree index '{}': {}", octree_name, _e);
+                        self.index_registry.mark_stale(&octree_name);
                     }
                 }
             }
@@ -888,7 +883,6 @@ impl MoteDB {
         
         Ok(TableRowStreamingIterator {
             lsm_iter,
-            table_name: table_name.to_string(),
         })
     }
     
@@ -1047,9 +1041,10 @@ impl MoteDB {
                 row_id: *row_id,
                 partition,
                 data: row.clone(),
+                txn_id: 0,
             });
         }
-        
+
         // 5. Batch write WAL (single fsync)
         self.wal.batch_append(0, wal_records)?;
         
@@ -1145,20 +1140,15 @@ impl MoteDB {
                 }
             }
             
-            // 7.4 批量更新 Spatial Index
+            // 7.4 i-Octree Index (3D point cloud)
             if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Spatial) {
-                    let mut geometries: Vec<(RowId, crate::types::Geometry)> = Vec::with_capacity(rows.len());
+                if let Some(octree_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Octree) {
                     for (row_id, row) in row_ids.iter().zip(rows.iter()) {
                         if let Some(crate::types::Value::Spatial(geom)) = row.get(col_def.position) {
-                            geometries.push((*row_id, geom.clone()));
-                        }
-                    }
-                    
-                    if !geometries.is_empty() {
-                        if let Err(_e) = self.batch_insert_geometries(&index_name, geometries) {
-                            debug_log!("[batch_insert] Failed to batch update spatial index '{}': {}", index_name, _e);
-                            self.index_registry.mark_stale(&index_name);
+                            if let Err(_e) = self.insert_ioctree_point(*row_id, &octree_name, geom) {
+                                debug_log!("[batch_insert] Failed to update ioctree index '{}': {}", octree_name, _e);
+                                self.index_registry.mark_stale(&octree_name);
+                            }
                         }
                     }
                 }
@@ -1178,14 +1168,10 @@ impl MoteDB {
             // 每2000条触发flush（与LSM一致）
             if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
                 debug_log!("[AUTO-FLUSH] Batch insert triggered after {} writes", old_count + rows.len());
-                
-                let db_clone = self.clone_for_callback();
-                std::thread::spawn(move || {
-                    let _ = db_clone.flush();
-                });
+                self.request_auto_flush();
             }
         }
-        
+
         Ok(row_ids)
     }
     
@@ -1224,6 +1210,7 @@ impl MoteDB {
                 row_id: *row_id,
                 partition,
                 data: row.clone(),
+                txn_id: 0,
             });
         }
 
@@ -1250,11 +1237,7 @@ impl MoteDB {
             // 每2000条触发flush（与LSM一致）
             if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
                 debug_log!("[AUTO-FLUSH] Batch upsert triggered after {} writes", old_count + rows.len());
-                
-                let db_clone = self.clone_for_callback();
-                std::thread::spawn(move || {
-                    let _ = db_clone.flush();
-                });
+                self.request_auto_flush();
             }
         }
 
@@ -1309,11 +1292,7 @@ impl MoteDB {
         // 每2000条触发一次flush（与LSM一致）
         if count.is_multiple_of(2_000) && count > 0 {
             debug_log!("[AUTO-FLUSH] Triggered after {} writes", count);
-            
-            let db_clone = self.clone_for_callback();
-            std::thread::spawn(move || {
-                let _ = db_clone.flush();
-            });
+            self.request_auto_flush();
         }
     }
     
@@ -1674,8 +1653,6 @@ impl Iterator for TableRowBatchedIterator {
 /// 逐个返回行数据，不预先加载任何数据到内存。
 pub struct TableRowStreamingIterator {
     lsm_iter: crate::storage::lsm::MergingIterator,
-    #[allow(dead_code)]
-    table_name: String,
 }
 
 impl Iterator for TableRowStreamingIterator {

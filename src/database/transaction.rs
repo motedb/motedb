@@ -241,7 +241,7 @@ impl MoteDB {
         // 1. Write to WAL (now with table_name from write_set)
         for (row_id, (table_name, row_data)) in &write_set {
             let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-            self.wal.log_insert(table_name, partition, *row_id, row_data.clone())?;
+            self.wal.log_insert(table_name, partition, *row_id, row_data.clone(), txn_id)?;
         }
 
         // 2. Commit in transaction coordinator (applies to version store)
@@ -295,6 +295,7 @@ impl MoteDB {
                     row_id: *row_id,
                     partition,
                     data: row_data.clone(),
+                    txn_id,
                 }
             );
         }
