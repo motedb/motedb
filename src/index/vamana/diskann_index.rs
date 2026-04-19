@@ -1204,14 +1204,16 @@ impl DiskANNIndex {
             None => return Ok(()),
         };
         
-        // 1. 搜索候选邻居
-                        // 🔥 行业标准efConstruction=400
-                        let ef_construction = 400;
-                        let candidates = self.greedy_search(
-                            &query_vec,
-                            medoid_id,
-                            ef_construction,
-                        )?;
+        // 1. 搜索候选邻居 (adaptive ef: smaller for mature graphs)
+        let graph_size = self.vectors.len();
+        let ef_construction = if graph_size < 1000 { 300 }
+            else if graph_size < 10000 { 150 }
+            else { 80 };
+        let candidates = self.greedy_search(
+            &query_vec,
+            medoid_id,
+            ef_construction,
+        )?;
         
         // 2. 剪枝选择前向边
         let neighbors = robust_prune(
@@ -1288,14 +1290,16 @@ impl DiskANNIndex {
         // 1. 获取旧邻居（需要清理反向边）
         let old_neighbors: HashSet<RowId> = self.graph.neighbors(node_id).iter().copied().collect();  // ✅ P1: Arc deref via iter()
         
-        // 2. 搜索新候选邻居
-                        // 🔥 行业标准efConstruction=400
-                        let ef_construction = 400;
-                        let candidates = self.greedy_search(
-                            &query_vec,
-                            medoid_id,
-                            ef_construction,
-                        )?;
+        // 2. 搜索新候选邻居 (adaptive ef)
+        let graph_size = self.vectors.len();
+        let ef_construction = if graph_size < 1000 { 300 }
+            else if graph_size < 10000 { 150 }
+            else { 80 };
+        let candidates = self.greedy_search(
+            &query_vec,
+            medoid_id,
+            ef_construction,
+        )?;
         
         // 3. 剪枝选择新邻居
         let new_neighbors = robust_prune(

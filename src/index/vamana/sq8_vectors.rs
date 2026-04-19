@@ -35,19 +35,14 @@ pub struct SQ8Vectors {
     index: Arc<RwLock<HashMap<RowId, u64>>>,
 
     /// LRU cache: row_id -> decompressed f32 vector
-    /// 
-    /// ✅ P1: Arc-wrapped values to avoid cloning large f32 vectors
-    /// - Old: Clone Vec<f32> (avg 128 * 4 = 512 bytes)  
-    /// - New: Clone Arc (8 bytes) - **98.4% memory saving**
     cache: Arc<RwLock<LruCache<RowId, Arc<Vec<f32>>>>>,
-    
-    /// 🚀 NEW: Quantized vector cache (for fast distance computation)
-    /// 
-    /// ✅ P1: Arc-wrapped quantized vectors too
-    /// - Much smaller (u8 vs f32), but still benefits from Arc
+
+    /// Quantized vector cache (for fast distance computation)
     quantized_cache: Arc<RwLock<LruCache<RowId, Arc<QuantizedVector>>>>,
 
-    /// File handle (shared, read-only after build)
+    /// Persistent file handles (avoid open/close per read)
+    read_file: Arc<RwLock<File>>,
+    write_file: Arc<RwLock<File>>,
     file_path: PathBuf,
 }
 
@@ -70,6 +65,9 @@ impl SQ8Vectors {
         file.write_all(&0u64.to_le_bytes())
             .map_err(StorageError::Io)?;
 
+        let read_file = File::open(&file_path).map_err(StorageError::Io)?;
+        let write_file = OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?;
+
         Ok(Self {
             _data_dir: data_dir,
             dimension,
@@ -80,8 +78,10 @@ impl SQ8Vectors {
                 NonZeroUsize::new(cache_size).unwrap(),
             ))),
             quantized_cache: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_size * 2).unwrap(), // Larger cache for quantized (cheaper)
+                NonZeroUsize::new(cache_size * 2).unwrap(),
             ))),
+            read_file: Arc::new(RwLock::new(read_file)),
+            write_file: Arc::new(RwLock::new(write_file)),
             file_path,
         })
     }
@@ -138,6 +138,8 @@ impl SQ8Vectors {
             quantized_cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size * 2).unwrap(),
             ))),
+            read_file: Arc::new(RwLock::new(File::open(&file_path).map_err(StorageError::Io)?)),
+            write_file: Arc::new(RwLock::new(OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?)),
             file_path,
         })
     }
@@ -380,6 +382,7 @@ impl SQ8Vectors {
     /// Flush (persist count)
     pub fn flush(&self) -> Result<()> {
         let count = self.index.read().len() as u64;
+        // Need a separate handle for writing the header (not append mode)
         let mut file = OpenOptions::new()
             .write(true)
             .open(&self.file_path)
@@ -425,11 +428,10 @@ impl SQ8Vectors {
     // ==================== Private Helpers ====================
 
     fn read_quantized(&self, offset: u64) -> Result<QuantizedVector> {
-        let mut file = File::open(&self.file_path).map_err(StorageError::Io)?;
+        let mut file = self.read_file.write();
         file.seek(SeekFrom::Start(offset + 8))
-            .map_err(StorageError::Io)?; // Skip row_id
+            .map_err(StorageError::Io)?;
 
-        // Read min, max, codes
         let mut min_bytes = [0u8; 4];
         let mut max_bytes = [0u8; 4];
         file.read_exact(&mut min_bytes).map_err(StorageError::Io)?;
@@ -445,14 +447,10 @@ impl SQ8Vectors {
     }
 
     fn append_quantized(&self, row_id: RowId, qvec: &QuantizedVector) -> Result<u64> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.file_path)
-            .map_err(StorageError::Io)?;
+        let mut file = self.write_file.write();
 
         let offset = file.metadata().map_err(StorageError::Io)?.len();
 
-        // Write: row_id + min + max + codes
         file.write_all(&row_id.to_le_bytes())
             .map_err(StorageError::Io)?;
         file.write_all(&qvec.min.to_le_bytes())
