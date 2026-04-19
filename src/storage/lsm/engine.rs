@@ -14,6 +14,11 @@ use std::collections::VecDeque;
 type FlushCallback = Arc<dyn Fn(&UnifiedMemTable) -> Result<()> + Send + Sync>;
 type KVIterator = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
 
+/// Maximum consecutive flush errors before the circuit breaker trips.
+/// Beyond this threshold the memtable is dropped (data remains in the WAL for recovery)
+/// to prevent an infinite retry loop on permanent errors (e.g. disk full).
+const MAX_CONSECUTIVE_FLUSH_ERRORS: u32 = 5;
+
 /// Cached SSTable entry with separate bloom filter for lock-free pre-checking
 struct CachedSSTable {
     /// Bloom filter (can be checked without acquiring SSTable mutex)
@@ -175,10 +180,16 @@ pub struct LSMEngine {
     /// 🚀 Unified Flush Callback
     /// Callback: &UnifiedMemTable -> Result<()>
     /// Called during flush to enable batch index building
-    /// 
+    ///
     /// ✅ 统一入口：手动Flush和后台Flush都会触发
     /// ✅ 传入MemTable引用：避免数据拷贝，高效批量构建
     flush_callback: Arc<RwLock<Option<FlushCallback>>>,
+
+    /// Circuit breaker: counts consecutive SSTable write failures.
+    /// After exceeding MAX_CONSECUTIVE_FLUSH_ERRORS, the flush thread drops the
+    /// memtable instead of requeueing it (data is still in WAL for recovery).
+    /// Reset to 0 on any successful flush.
+    consecutive_flush_errors: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl LSMEngine {
@@ -223,6 +234,27 @@ impl LSMEngine {
 
         let compaction_worker = Arc::new(CompactionWorker::new(storage_dir.clone(), &config));
 
+        // Clean up orphan .sst files — files on disk not in the compaction worker's
+        // level metadata. These can be left behind by interrupted compaction or flush.
+        {
+            let known_paths: std::collections::HashSet<PathBuf> = compaction_worker
+                .get_all_sstables()
+                .map(|metas| metas.iter().map(|m| m.path.clone()).collect())
+                .unwrap_or_default();
+
+            if let Ok(entries) = std::fs::read_dir(&storage_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("sst")
+                        && !known_paths.contains(&path)
+                    {
+                        debug_log!("[LSM] Cleaning up orphan SSTable: {:?}", path);
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
         // Initialize blob store
         let blob_dir = storage_dir.join("blobs");
         let blob_store = Arc::new(BlobStore::new(blob_dir, config.blob_file_size)?);
@@ -252,6 +284,7 @@ impl LSMEngine {
             flush_callback: Arc::new(RwLock::new(None)),
             flush_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             compaction_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
+            consecutive_flush_errors: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
         // Wire post-compaction callback to evict only removed SSTables from cache
@@ -329,6 +362,7 @@ impl LSMEngine {
         let flush_callback_weak = Arc::downgrade(&engine.flush_callback); // 🔥 NEW: Callback for index building
         let flush_wakeup = engine.flush_wakeup.clone(); // 🚀 Condvar for event-driven flush
         let compaction_wakeup_for_flush = engine.compaction_wakeup.clone(); // Notify compaction after SST build
+        let consecutive_flush_errors = engine.consecutive_flush_errors.clone(); // Circuit breaker
 
         let flush_thread = thread::Builder::new()
             .name("lsm-flush".to_string())
@@ -455,6 +489,9 @@ impl LSMEngine {
                                     }
 
                                     if flush_success {
+                                        // Reset circuit breaker on successful flush
+                                        consecutive_flush_errors.store(0, Ordering::Relaxed);
+
                                         // 🔥 Call flush callback AFTER SSTable is successfully built
                                         if let Some(callback_arc) = flush_callback_weak.upgrade() {
                                             let callback_guard = callback_arc.read();
@@ -468,11 +505,23 @@ impl LSMEngine {
                                         // Explicitly drop memtable (data is now in SSTable)
                                         drop(memtable);
                                     } else {
-                                        // CRITICAL: Put memtable back to front of queue to prevent data loss
-                                        debug_log!("[LSM Flush] 🚨 CRITICAL: SSTable write failed after 3 attempts, putting memtable back to queue!");
-                                        {
-                                            let mut immutable_lock = immutable.write();
-                                            immutable_lock.push_front(memtable);
+                                        // Circuit breaker: increment consecutive error count
+                                        let errors = consecutive_flush_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                                        if errors > MAX_CONSECUTIVE_FLUSH_ERRORS {
+                                            // Permanent error (e.g. disk full) — drop the memtable.
+                                            // Data is still in the WAL and can be recovered on restart.
+                                            debug_log!(
+                                                "[LSM Flush] 🚨 CRITICAL: {} consecutive flush failures, dropping memtable (data in WAL for recovery)",
+                                                errors
+                                            );
+                                            drop(memtable);
+                                        } else {
+                                            // Requeue for retry — the error may be transient
+                                            debug_log!("[LSM Flush] 🚨 CRITICAL: SSTable write failed after 3 attempts (consecutive errors: {}), putting memtable back to queue!", errors);
+                                            {
+                                                let mut immutable_lock = immutable.write();
+                                                immutable_lock.push_front(memtable);
+                                            }
                                         }
                                     }
                                 }

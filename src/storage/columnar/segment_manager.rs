@@ -5,9 +5,23 @@ use crate::storage::lsm::BloomFilter;
 use crate::types::Value;
 use crate::{Result, StorageError};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Name of the merge manifest file used for crash-safe segment replacement.
+const MERGE_MANIFEST_NAME: &str = "merge_manifest.json";
+
+/// Manifest tracking an in-progress merge for crash recovery.
+#[derive(Serialize, Deserialize)]
+struct MergeManifest {
+    /// Path(s) of the new merged segment(s).
+    new: Vec<String>,
+    /// Paths of the old segments to be deleted.
+    old: Vec<String>,
+}
 
 /// Maximum number of segment readers to cache.
 const READER_CACHE_SIZE: usize = 32;
@@ -32,9 +46,15 @@ pub struct SegmentManager {
 
 impl SegmentManager {
     /// Open a segment manager, scanning the directory for existing .mcdb files.
+    ///
+    /// Also recovers from interrupted merge operations by checking for a
+    /// `merge_manifest.json` left behind by a crash during `replace_segments()`.
     pub fn open(directory: &Path, table_id: u32) -> Result<Self> {
         std::fs::create_dir_all(directory)
             .map_err(StorageError::Io)?;
+
+        // Recover from interrupted merges BEFORE scanning for segments
+        Self::recover_merge_manifest(directory);
 
         let mut segments = Vec::new();
 
@@ -65,6 +85,51 @@ impl SegmentManager {
             segments: RwLock::new(segments),
             reader_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Check for a `merge_manifest.json` and resume or clean up an interrupted merge.
+    ///
+    /// - If the new file exists AND old files exist: delete old files (resume merge).
+    /// - If the new file is missing: the merge was incomplete; just delete the manifest.
+    fn recover_merge_manifest(directory: &Path) {
+        let manifest_path = directory.join(MERGE_MANIFEST_NAME);
+        if !manifest_path.exists() {
+            return;
+        }
+
+        let data = match std::fs::read_to_string(&manifest_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[WARN] Failed to read merge manifest {:?}: {}", manifest_path, e);
+                let _ = std::fs::remove_file(&manifest_path);
+                return;
+            }
+        };
+
+        let manifest: MergeManifest = match serde_json::from_str(&data) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[WARN] Failed to parse merge manifest: {}", e);
+                let _ = std::fs::remove_file(&manifest_path);
+                return;
+            }
+        };
+
+        // Check whether the new segment file was written
+        let new_exists = manifest.new.iter().any(|p| Path::new(p).exists());
+
+        if new_exists {
+            // The new segment exists — clean up old segments that were meant to be replaced
+            for old_path in &manifest.old {
+                if Path::new(old_path).exists() {
+                    if let Err(e) = std::fs::remove_file(Path::new(old_path)) {
+                        eprintln!("[WARN] Failed to delete old segment {:?}: {}", old_path, e);
+                    }
+                }
+            }
+        }
+        // In any case, remove the manifest — the merge is either complete or abandoned
+        let _ = std::fs::remove_file(&manifest_path);
     }
 
     /// Register a newly written segment file.
@@ -300,7 +365,15 @@ impl SegmentManager {
     }
 
     /// Replace old segments with a new merged segment.
-    /// Removes old segment files, evicts them from reader cache, and registers the new one.
+    ///
+    /// Uses a `merge_manifest.json` for crash safety:
+    /// 1. Write manifest listing new + old paths, fsync it
+    /// 2. Update in-memory state
+    /// 3. Delete old files
+    /// 4. Delete the manifest
+    ///
+    /// If a crash occurs between steps, startup recovery in `open()` will
+    /// either resume the deletion or abandon the incomplete merge.
     pub fn replace_segments(
         &self,
         old_segments: &[Arc<SegmentMetadata>],
@@ -312,13 +385,30 @@ impl SegmentManager {
         let new_reader = SegmentReader::open(new_segment_path)?;
         let new_meta = Arc::new(new_reader.metadata());
 
+        // Step 1: Write merge manifest and fsync it for crash safety
+        let manifest_path = self.directory.join(MERGE_MANIFEST_NAME);
+        let manifest = MergeManifest {
+            new: vec![new_segment_path.to_string_lossy().into_owned()],
+            old: old_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        };
+        {
+            let json = serde_json::to_string_pretty(&manifest)
+                .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            let mut file = std::fs::File::create(&manifest_path)
+                .map_err(StorageError::Io)?;
+            file.write_all(json.as_bytes())
+                .map_err(StorageError::Io)?;
+            file.sync_all()
+                .map_err(StorageError::Io)?;
+        }
+
         // Collect file deletions, perform I/O outside of locks
         let paths_to_delete: Vec<PathBuf> = old_paths.iter()
             .filter(|p| p.exists())
             .cloned()
             .collect();
 
-        // Lock ordering: always segments first, then reader_cache
+        // Step 2: Lock ordering: always segments first, then reader_cache
         {
             let mut segments = self.segments.write();
             let old_path_set: std::collections::HashSet<PathBuf> = old_paths.iter().cloned().collect();
@@ -332,10 +422,13 @@ impl SegmentManager {
             self.reader_cache.write().remove(path);
         }
 
-        // Delete files (I/O after locks released)
+        // Step 3: Delete old files (I/O after locks released)
         for path in &paths_to_delete {
             let _ = std::fs::remove_file(path);
         }
+
+        // Step 4: Delete the merge manifest
+        let _ = std::fs::remove_file(&manifest_path);
 
         Ok(())
     }

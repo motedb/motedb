@@ -43,7 +43,10 @@ struct LeafStoreInner {
 
 impl LeafStore {
     /// Open or create a LeafStore in the given directory
-    pub fn open(dir: &Path) -> Result<Self> {
+    ///
+    /// `cache_capacity` controls the number of leaf slots kept in the LRU cache.
+    /// Each slot is ~516 bytes, so 4096 slots ≈ 2MB.
+    pub fn open(dir: &Path, cache_capacity: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("leaf_data.bin");
         let exists = path.exists() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
@@ -75,7 +78,8 @@ impl LeafStore {
             0
         };
 
-        let cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
+        let cap = NonZeroUsize::new(cache_capacity.max(1)).unwrap();
+        let cache = LruCache::new(cap);
 
         Ok(Self {
             inner: Mutex::new(LeafStoreInner {

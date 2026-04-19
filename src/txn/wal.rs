@@ -464,12 +464,20 @@ pub struct WALManager {
 
     /// Group commit state (GroupCommit mode)
     group_commit: Option<GroupCommitThread>,
+
+    /// Flag indicating new writes have arrived since last flush check (Periodic mode).
+    /// Shared with the flush thread for adaptive backoff.
+    periodic_new_writes: Arc<AtomicBool>,
 }
 
 /// Background flush thread (Periodic mode)
 struct FlushThread {
     handle: Option<thread::JoinHandle<()>>,
     should_stop: Arc<AtomicBool>,
+    /// Flag set by write paths, consumed by the flush thread for adaptive interval.
+    /// Kept alive via Arc so the thread can read it; not accessed from the struct itself.
+    #[allow(dead_code)]
+    new_writes: Arc<AtomicBool>,
 }
 
 // === Group Commit ===
@@ -522,9 +530,10 @@ impl WALManager {
         }
 
         let partitions = Arc::new(partitions);
+        let new_writes = Arc::new(AtomicBool::new(false));
 
         // Start background threads
-        let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone());
+        let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone(), new_writes.clone());
         let group_commit = Self::start_group_commit_thread_if_needed(&config, partitions.clone());
 
         Ok(Self {
@@ -534,6 +543,7 @@ impl WALManager {
             config,
             flush_thread,
             group_commit,
+            periodic_new_writes: new_writes,
         })
     }
 
@@ -563,9 +573,10 @@ impl WALManager {
         }
 
         let partitions = Arc::new(partitions);
+        let new_writes = Arc::new(AtomicBool::new(false));
 
         // Start background threads
-        let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone());
+        let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone(), new_writes.clone());
         let group_commit = Self::start_group_commit_thread_if_needed(&config, partitions.clone());
 
         Ok(Self {
@@ -575,35 +586,59 @@ impl WALManager {
             config,
             flush_thread,
             group_commit,
+            periodic_new_writes: new_writes,
         })
     }
 
-    /// Start background flush thread (Periodic mode)
+    /// Start background flush thread (Periodic mode) with adaptive backoff.
+    ///
+    /// When no writes are detected, the sleep interval doubles up to `max_idle_ms`
+    /// to conserve CPU/wake-ups on idle edge devices. When writes arrive, the thread
+    /// syncs and resets to the base interval.
     fn start_flush_thread_if_needed(
         config: &WALConfig,
         partitions: Arc<DashMap<PartitionId, parking_lot::Mutex<PartitionWAL>>>,
+        new_writes: Arc<AtomicBool>,
     ) -> Option<FlushThread> {
         if let DurabilityLevel::Periodic { interval_ms } = config.durability_level {
             let should_stop = Arc::new(AtomicBool::new(false));
             let should_stop_clone = should_stop.clone();
+            let new_writes_clone = new_writes.clone();
 
-            let interval = Duration::from_millis(interval_ms);
+            let base_interval = Duration::from_millis(interval_ms);
+            // Max idle interval: 10x base, capped at 5000ms, never less than base
+            let max_idle = Duration::from_millis((interval_ms * 10).min(5000).max(interval_ms));
 
-            let handle = thread::spawn(move || {
-                while !should_stop_clone.load(Ordering::Relaxed) {
-                    thread::sleep(interval);
+            let handle = thread::Builder::new()
+                .name("motedb-periodic-flush".into())
+                .spawn(move || {
+                    let mut current_interval = base_interval;
 
-                    // 刷盘所有分区 (lock-free iteration via DashMap)
-                    for entry in partitions.iter() {
-                        let wal = entry.value().lock();
-                        let _ = wal.file.sync_data();
+                    while !should_stop_clone.load(Ordering::Relaxed) {
+                        thread::sleep(current_interval);
+
+                        let had_writes = new_writes_clone.swap(false, Ordering::Relaxed);
+
+                        // Flush all partitions (sync_data is cheap if nothing dirty)
+                        for entry in partitions.iter() {
+                            let wal = entry.value().lock();
+                            let _ = wal.file.sync_data();
+                        }
+
+                        // Adaptive backoff: if no writes, double interval; if writes, reset
+                        if had_writes {
+                            current_interval = base_interval;
+                        } else {
+                            current_interval = (current_interval * 2).min(max_idle);
+                        }
                     }
-                }
-            });
+                })
+                .ok();
 
             Some(FlushThread {
-                handle: Some(handle),
+                handle,
                 should_stop,
+                new_writes,
             })
         } else {
             None
@@ -734,6 +769,9 @@ impl WALManager {
         partition: PartitionId,
         record: WALRecord,
     ) -> Result<LogSequenceNumber> {
+        // Signal periodic flush thread that writes are happening
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
+
         if let Some(ref gc) = self.group_commit {
             let done = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
@@ -755,9 +793,16 @@ impl WALManager {
             let flag = done.0.lock().unwrap();
             if !*flag {
                 let result = done.1.wait_timeout(flag, timeout).unwrap();
-                let _timed_out = !*result.0;
-                // On timeout: record is still queued and will be flushed by the background
-                // thread. This is acceptable — the caller's data is in the kernel buffer.
+                let timed_out = !*result.0;
+                if timed_out {
+                    // Data may still be in the group commit queue and not yet written
+                    // to the kernel buffer. Sync the partition file as a safety net so
+                    // that at least whatever IS in the kernel buffer reaches disk.
+                    if let Some(entry) = self.partitions.get(&partition) {
+                        let wal = entry.value().lock();
+                        let _ = wal.file.sync_data();
+                    }
+                }
             }
 
             Ok(0) // LSN assigned asynchronously by batch_append
@@ -838,6 +883,7 @@ impl WALManager {
         txn_id: TransactionId,
         isolation_level: u8,
     ) -> Result<LogSequenceNumber> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
         let record = WALRecord::Begin {
             txn_id,
             isolation_level,
@@ -856,6 +902,7 @@ impl WALManager {
         txn_id: TransactionId,
         commit_ts: Timestamp,
     ) -> Result<LogSequenceNumber> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
         let record = WALRecord::Commit {
             txn_id,
             commit_ts,
@@ -873,6 +920,7 @@ impl WALManager {
         partition: PartitionId,
         txn_id: TransactionId,
     ) -> Result<LogSequenceNumber> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
         let record = WALRecord::Rollback {
             txn_id,
         };
@@ -893,6 +941,9 @@ impl WALManager {
         partition: PartitionId,
         records: Vec<WALRecord>,
     ) -> Result<Vec<LogSequenceNumber>> {
+        if !records.is_empty() {
+            self.periodic_new_writes.store(true, Ordering::Relaxed);
+        }
         let entry = self.partitions.get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();

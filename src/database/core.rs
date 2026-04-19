@@ -543,6 +543,30 @@ impl MoteDB {
 
         // Create columnar store for TimeSeries tables
         let columnar_dir = db_path.join("columnar");
+
+        // Clean up leftover .mcdb.tmp files from interrupted columnar segment writes.
+        // These are safe to delete because they were never registered with a SegmentManager.
+        if columnar_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&columnar_dir) {
+                for entry in entries.flatten() {
+                    let sub_dir = entry.path();
+                    if sub_dir.is_dir() {
+                        if let Ok(sub_entries) = std::fs::read_dir(&sub_dir) {
+                            for sub_entry in sub_entries.flatten() {
+                                let path = sub_entry.path();
+                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                    if name.ends_with(".mcdb.tmp") {
+                                        debug_log!("[database] Cleaning up temp columnar segment: {:?}", path);
+                                        let _ = std::fs::remove_file(&path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let columnar_store = Arc::new(
             crate::storage::ColumnarStore::create(
                 &columnar_dir,

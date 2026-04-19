@@ -26,6 +26,9 @@ use std::path::PathBuf;
 
 pub use node::{IndexedPoint3D, Octant};
 
+/// Default LeafStore LRU cache capacity (4096 slots ~ 2MB)
+const DEFAULT_LEAF_CACHE_CAPACITY: usize = 4096;
+
 /// i-Octree configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IOctreeConfig {
@@ -37,6 +40,9 @@ pub struct IOctreeConfig {
     pub down_size: bool,
     /// Persistence directory
     pub data_dir: Option<PathBuf>,
+    /// LeafStore LRU cache capacity in slots (default: 4096 ~ 2MB).
+    /// Reduce for memory-constrained edge devices (e.g. 1024 ~ 512KB).
+    pub leaf_cache_capacity: Option<usize>,
 }
 
 impl Default for IOctreeConfig {
@@ -46,7 +52,15 @@ impl Default for IOctreeConfig {
             min_extent: 0.01,
             down_size: false,
             data_dir: None,
+            leaf_cache_capacity: None,
         }
+    }
+}
+
+impl IOctreeConfig {
+    /// Return the effective leaf cache capacity
+    pub fn cache_capacity(&self) -> usize {
+        self.leaf_cache_capacity.unwrap_or(DEFAULT_LEAF_CACHE_CAPACITY)
     }
 }
 
@@ -82,7 +96,7 @@ impl IOctreeIndex {
             })
             .unwrap_or_else(|| std::env::temp_dir().join(format!("motedb_ioctree_{}", name)));
 
-        let leaf_store = LeafStore::open(&work_dir).expect("Failed to create LeafStore");
+        let leaf_store = LeafStore::open(&work_dir, config.cache_capacity()).expect("Failed to create LeafStore");
         let root_leaf_id = leaf_store.create_leaf(vec![]).expect("Failed to create root leaf");
 
         Self {

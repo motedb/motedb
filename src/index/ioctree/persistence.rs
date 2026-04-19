@@ -154,7 +154,7 @@ fn load_v2(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         })
         .unwrap_or_else(|| path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
 
-    let leaf_store = LeafStore::open(&work_dir)?;
+    let leaf_store = LeafStore::open(&work_dir, config.cache_capacity())?;
 
     Ok(IOctreeIndex {
         root,
@@ -222,7 +222,7 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
     });
 
-    let leaf_store = LeafStore::open(&data_dir)?;
+    let leaf_store = LeafStore::open(&data_dir, config.cache_capacity())?;
 
     // Migrate v1 tree to v2: extract Vec<IndexedPoint3D> → LeafStore leaf_ids
     let legacy_root: LegacyOctant = bincode::deserialize(&tree_buf)
