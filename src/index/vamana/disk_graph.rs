@@ -1,20 +1,8 @@
-//! Disk-based graph storage for DiskANN
+//! Disk-based graph storage with bounded memory for DiskANN
 //!
 //! Stores Vamana graph adjacency list on disk with LRU cache.
-//! File: graph.bin
-//!
-//! Format:
-//! [Header - 16 bytes]
-//!   magic: u32 (0x4752_5048 = "GRPH")
-//!   version: u32
-//!   max_degree: u32
-//!   node_count: u32
-//!
-//! [Node Records]
-//! Each record:
-//!   row_id: u64
-//!   neighbor_count: u32
-//!   neighbors: [u64; neighbor_count]
+//! Offset index is LRU-bounded, falling back to binary search on a
+//! sidecar index file (graph.idx).
 
 use crate::types::RowId;
 use crate::{Result, StorageError};
@@ -31,37 +19,34 @@ const MAGIC: u32 = 0x4752_5048; // "GRPH"
 const VERSION: u32 = 1;
 const HEADER_SIZE: u64 = 16;
 
-/// Disk-based graph with LRU cache + 🚀 **分层存储（热/冷数据分离）**
+/// Disk-based graph with bounded memory
 pub struct DiskGraph {
     max_degree: usize,
     file: Arc<RwLock<File>>,
-    
-    /// Index: row_id → file offset
-    index: Arc<RwLock<HashMap<RowId, u64>>>,
-    
-    /// 🔥 **热数据层：LRU缓存（内存）**
-    /// - 常访问的节点邻接表
-    /// - 自动淘汰冷数据到磁盘
-    /// 
-    /// ✅ P1: Arc-wrapped values to avoid cloning large neighbor lists
-    /// - Old: Clone Vec<RowId> (avg 64 * 8 = 512 bytes)
-    /// - New: Clone Arc (8 bytes) - **98.4% memory saving**
+
+    /// Bounded offset index: row_id → file offset (LRU-capped)
+    index: Arc<RwLock<LruCache<RowId, u64>>>,
+
+    /// Sidecar index file for binary search on LRU miss
+    index_file: Arc<RwLock<File>>,
+    index_count: Arc<RwLock<u64>>,
+    /// Tracked count of nodes (incremental on set/remove)
+    count: Arc<RwLock<u64>>,
+
+    /// LRU cache for adjacency lists
     cache: Arc<Mutex<LruCache<RowId, Arc<Vec<RowId>>>>>,
-    
-    /// 🧊 **冷数据层：Pin到内存的热节点集合**
-    /// - 永远不会被LRU淘汰
-    /// - 用于medoid和高度数节点
-    /// 
-    /// ✅ P1: Arc-wrapped values for hot nodes too
+
+    /// Pinned hot nodes (bounded)
     hot_nodes: Arc<RwLock<HashSet<RowId>>>,
-    hot_cache: Arc<RwLock<HashMap<RowId, Arc<Vec<RowId>>>>>,
-    
+    hot_cache: Arc<RwLock<LruCache<RowId, Arc<Vec<RowId>>>>>,
+    max_hot_nodes: usize,
+
     /// Next write offset
     next_offset: Arc<Mutex<u64>>,
-    
+
     /// Dirty flag
     dirty: Arc<RwLock<bool>>,
-    
+
     file_path: PathBuf,
 }
 
@@ -72,504 +57,573 @@ impl DiskGraph {
         max_degree: usize,
         cache_capacity: usize,
     ) -> Result<Self> {
+        Self::create_with_hot_limit(data_dir, max_degree, cache_capacity, 100)
+    }
+
+    /// Create with explicit hot node limit
+    pub fn create_with_hot_limit(
+        data_dir: impl AsRef<Path>,
+        max_degree: usize,
+        cache_capacity: usize,
+        max_hot_nodes: usize,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir).map_err(StorageError::Io)?;
-        
+
         let file_path = data_dir.join("graph.bin");
+        let idx_path = data_dir.join("graph.idx");
+
         let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&file_path)
-            .map_err(StorageError::Io)?;
-        
+            .create(true).read(true).write(true).truncate(true)
+            .open(&file_path).map_err(StorageError::Io)?;
+
         Self::write_header(&mut file, max_degree, 0)?;
-        
+
+        // Create empty sidecar index
+        let mut idx = File::create(&idx_path).map_err(StorageError::Io)?;
+        idx.write_all(&0u64.to_le_bytes()).map_err(StorageError::Io)?;
+
         Ok(Self {
             max_degree,
             file: Arc::new(RwLock::new(file)),
-            index: Arc::new(RwLock::new(HashMap::new())),
-            cache: Arc::new(Mutex::new(
-                LruCache::new(NonZeroUsize::new(cache_capacity).unwrap())
-            )),
+            index: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
+            ))),
+            index_file: Arc::new(RwLock::new(File::open(&idx_path).map_err(StorageError::Io)?)),
+            index_count: Arc::new(RwLock::new(0)),
+            count: Arc::new(RwLock::new(0)),
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(cache_capacity).unwrap(),
+            ))),
             hot_nodes: Arc::new(RwLock::new(HashSet::new())),
-            hot_cache: Arc::new(RwLock::new(HashMap::new())),
+            hot_cache: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(max_hot_nodes.max(1)).unwrap(),
+            ))),
+            max_hot_nodes,
             next_offset: Arc::new(Mutex::new(HEADER_SIZE)),
             dirty: Arc::new(RwLock::new(false)),
             file_path,
         })
     }
-    
+
     /// Load existing disk graph
-    pub fn load(
+    pub fn load(data_dir: impl AsRef<Path>, cache_capacity: usize) -> Result<Self> {
+        Self::load_with_hot_limit(data_dir, cache_capacity, 100)
+    }
+
+    /// Load with explicit hot node limit
+    pub fn load_with_hot_limit(
         data_dir: impl AsRef<Path>,
         cache_capacity: usize,
+        max_hot_nodes: usize,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let file_path = data_dir.join("graph.bin");
-        
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file_path)
-            .map_err(StorageError::Io)?;
-        
+        let idx_path = data_dir.join("graph.idx");
+
+        let mut file = OpenOptions::new().read(true).write(true)
+            .open(&file_path).map_err(StorageError::Io)?;
+
         let (max_degree, node_count) = Self::read_header(&mut file)?;
-        let (index, next_offset) = Self::build_index(&mut file, node_count)?;
-        
+
+        // Build sidecar index if needed
+        let index_count = if idx_path.exists() {
+            let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
+            let mut buf = [0u8; 8];
+            idx.read_exact(&mut buf).map_err(StorageError::Io)?;
+            u64::from_le_bytes(buf)
+        } else {
+            Self::build_sidecar_index(&file_path, &idx_path, node_count)?;
+            // Reopen file after building
+            let mut file = OpenOptions::new().read(true).write(true)
+                .open(&file_path).map_err(StorageError::Io)?;
+            // Recalculate next_offset by scanning
+            let (_, _next_off) = Self::scan_for_next_offset(&mut file, node_count)?;
+            // We return count, next_offset is derived later
+            node_count as u64
+        };
+
+        // Derive next_offset
+        let next_off = {
+            let mut file = OpenOptions::new().read(true).write(true)
+                .open(&file_path).map_err(StorageError::Io)?;
+            let (_, off) = Self::scan_for_next_offset(&mut file, node_count)?;
+            off
+        };
+
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+
         Ok(Self {
             max_degree,
-            file: Arc::new(RwLock::new(file)),
-            index: Arc::new(RwLock::new(index)),
-            cache: Arc::new(Mutex::new(
-                LruCache::new(NonZeroUsize::new(cache_capacity).unwrap())
+            file: Arc::new(RwLock::new(
+                OpenOptions::new().read(true).write(true).open(&file_path).map_err(StorageError::Io)?
             )),
+            index: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
+            ))),
+            index_file: Arc::new(RwLock::new(idx_read)),
+            index_count: Arc::new(RwLock::new(index_count)),
+            count: Arc::new(RwLock::new(index_count)),
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(cache_capacity).unwrap(),
+            ))),
             hot_nodes: Arc::new(RwLock::new(HashSet::new())),
-            hot_cache: Arc::new(RwLock::new(HashMap::new())),
-            next_offset: Arc::new(Mutex::new(next_offset)),
+            hot_cache: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(max_hot_nodes.max(1)).unwrap(),
+            ))),
+            max_hot_nodes,
+            next_offset: Arc::new(Mutex::new(next_off)),
             dirty: Arc::new(RwLock::new(false)),
             file_path,
         })
     }
-    
-    pub fn max_degree(&self) -> usize {
-        self.max_degree
+
+    fn scan_for_next_offset(file: &mut File, node_count: usize) -> Result<(usize, u64)> {
+        file.seek(SeekFrom::Start(HEADER_SIZE)).map_err(StorageError::Io)?;
+        let mut offset = HEADER_SIZE;
+        let mut actual_count = 0usize;
+        let mut buf8 = [0u8; 8];
+        let mut buf4 = [0u8; 4];
+
+        for _ in 0..node_count {
+            if file.read_exact(&mut buf8).is_err() { break; }
+            if file.read_exact(&mut buf4).is_err() { break; }
+            let ncount = u32::from_le_bytes(buf4) as usize;
+            let record_size = 8 + 4 + (ncount * 8);
+            offset += record_size as u64;
+            actual_count += 1;
+            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() { break; }
+        }
+        Ok((actual_count, offset))
     }
-    
-    pub fn node_count(&self) -> usize {
-        self.index.read().len()
+
+    fn build_sidecar_index(data_path: &Path, idx_path: &Path, node_count: usize) -> Result<u64> {
+        let mut file = OpenOptions::new().read(true).open(data_path).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE)).map_err(StorageError::Io)?;
+
+        let mut entries: Vec<(RowId, u64)> = Vec::with_capacity(node_count);
+        let mut offset = HEADER_SIZE;
+        let mut buf8 = [0u8; 8];
+        let mut buf4 = [0u8; 4];
+
+        for _ in 0..node_count {
+            if file.read_exact(&mut buf8).is_err() { break; }
+            let node_id = u64::from_le_bytes(buf8);
+            if file.read_exact(&mut buf4).is_err() { break; }
+            let ncount = u32::from_le_bytes(buf4) as usize;
+
+            entries.push((node_id, offset));
+            let record_size = 8 + 4 + (ncount * 8);
+            offset += record_size as u64;
+            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() { break; }
+        }
+
+        entries.sort_by_key(|(id, _)| *id);
+
+        let mut idx_file = File::create(idx_path).map_err(StorageError::Io)?;
+        let count = entries.len() as u64;
+        idx_file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+        for (row_id, off) in &entries {
+            idx_file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
+            idx_file.write_all(&off.to_le_bytes()).map_err(StorageError::Io)?;
+        }
+        idx_file.sync_all().map_err(StorageError::Io)?;
+
+        Ok(count)
     }
-    
-    pub fn is_empty(&self) -> bool {
-        self.index.read().is_empty()
-    }
-    
-    /// 🔥 **Pin节点到热数据层（永远在内存中）**
-    /// 
-    /// **适用场景：**
-    /// - Medoid节点（每次查询的起点）
-    /// - 高度数节点（hub nodes）
-    /// - 频繁访问的节点
-    pub fn pin_hot_node(&self, node_id: RowId) {
-        if !self.hot_nodes.read().contains(&node_id) {
-            // 加载到热缓存
-            if let Some(neighbors) = self.get_from_cache_or_disk(node_id) {
-                self.hot_cache.write().insert(node_id, neighbors);
-                self.hot_nodes.write().insert(node_id);
+
+    /// Look up file offset: LRU → binary search on sidecar
+    fn lookup_offset(&self, node_id: RowId) -> Option<u64> {
+        {
+            let mut index = self.index.write();
+            if let Some(&offset) = index.get(&node_id) {
+                return Some(offset);
             }
         }
+
+        let count = *self.index_count.read();
+        if count == 0 { return None; }
+
+        let mut file = self.index_file.write();
+        let entry_size = 16u64;
+        let mut lo = 0i64;
+        let mut hi = count as i64 - 1;
+
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let file_offset = 8 + mid as u64 * entry_size;
+            file.seek(SeekFrom::Start(file_offset)).ok()?;
+            let mut buf = [0u8; 16];
+            file.read_exact(&mut buf).ok()?;
+            let mid_id = u64::from_le_bytes(buf[..8].try_into().ok()?);
+            let mid_offset = u64::from_le_bytes(buf[8..].try_into().ok()?);
+
+            match mid_id.cmp(&node_id) {
+                std::cmp::Ordering::Equal => {
+                    drop(file);
+                    self.index.write().put(node_id, mid_offset);
+                    return Some(mid_offset);
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid - 1,
+            }
+        }
+        None
     }
-    
-    /// 🧊 **Unpin节点（允许LRU淘汰）**
+
+    pub fn max_degree(&self) -> usize { self.max_degree }
+
+    pub fn node_count(&self) -> usize {
+        *self.count.read() as usize
+    }
+
+    pub fn is_empty(&self) -> bool { self.node_count() == 0 }
+
+    /// Pin hot node (bounded — evicts oldest when at capacity)
+    pub fn pin_hot_node(&self, node_id: RowId) {
+        if self.hot_nodes.read().contains(&node_id) { return; }
+        if let Some(neighbors) = self.get_from_cache_or_disk(node_id) {
+            // Evict from hot_cache if at capacity
+            if self.hot_nodes.read().len() >= self.max_hot_nodes {
+                // Find oldest hot node (first entry in LRU)
+                let _to_evict = {
+                    let mut hc = self.hot_cache.write();
+                    if let Some((evict_id, _)) = hc.pop_lru() {
+                        self.hot_nodes.write().remove(&evict_id);
+                        drop(hc);
+                        Some(evict_id)
+                    } else { None }
+                };
+            }
+            self.hot_cache.write().put(node_id, neighbors);
+            self.hot_nodes.write().insert(node_id);
+        }
+    }
+
     pub fn unpin_hot_node(&self, node_id: RowId) {
         self.hot_nodes.write().remove(&node_id);
-        self.hot_cache.write().remove(&node_id);
+        self.hot_cache.write().pop(&node_id);
     }
-    
-    /// 获取热节点数量
-    pub fn hot_node_count(&self) -> usize {
-        self.hot_nodes.read().len()
-    }
-    
-    /// 🚀 **批量Pin高度数节点（自动识别hub nodes）**
+
+    pub fn hot_node_count(&self) -> usize { self.hot_nodes.read().len() }
+
+    /// Batch pin high-degree nodes
     pub fn pin_high_degree_nodes(&self, top_k: usize) {
-        let index = self.index.read();
-        let mut degrees: Vec<(RowId, usize)> = index
-            .keys()
-            .map(|&id| {
-                let degree = self.neighbors(id).len();
-                (id, degree)
-            })
+        // Sample a subset of IDs to avoid loading all
+        let ids: Vec<RowId> = {
+            let index = self.index.read();
+            index.iter().map(|(&id, _)| id).take(top_k * 10).collect()
+        };
+
+        let mut degrees: Vec<(RowId, usize)> = ids.iter()
+            .map(|&id| (id, self.neighbors(id).len()))
             .collect();
-        
         degrees.sort_by(|a, b| b.1.cmp(&a.1));
-        
+
         for (id, _) in degrees.into_iter().take(top_k) {
             self.pin_hot_node(id);
         }
     }
-    
-    /// Check if node exists in graph
+
+    /// Check if node exists
     pub fn has_node(&self, node_id: RowId) -> bool {
-        self.index.read().contains_key(&node_id)
+        self.lookup_offset(node_id).is_some()
     }
-    
+
     pub fn node_ids(&self) -> Vec<RowId> {
-        self.index.read().keys().copied().collect()
+        let count = *self.index_count.read();
+        if count > 0 {
+            let mut file = self.index_file.write();
+            let mut ids = Vec::with_capacity(count as usize);
+            let _ = file.seek(SeekFrom::Start(8));
+            for _ in 0..count {
+                let mut buf = [0u8; 16];
+                if file.read_exact(&mut buf).is_ok() {
+                    ids.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
+                }
+            }
+            ids
+        } else {
+            self.index.read().iter().map(|(&id, _)| id).collect()
+        }
     }
-    
+
     /// Add node (without neighbors)
     pub fn add_node(&self, node_id: RowId) {
-        if self.index.read().contains_key(&node_id) {
-            return;
-        }
+        if self.lookup_offset(node_id).is_some() { return; }
         *self.dirty.write() = true;
     }
-    
-    /// Get neighbors (with tiered caching: hot → LRU → disk)
-    /// 
-    /// ✅ P1: Returns Arc-wrapped Vec to avoid cloning in high-QPS scenarios
+
+    /// Get neighbors with tiered caching: hot → LRU → disk
     pub fn neighbors(&self, node_id: RowId) -> Arc<Vec<RowId>> {
-        // 1. 🔥 Check hot cache first (pinned nodes)
+        // 1. Hot cache
         {
-            let hot_cache = self.hot_cache.read();
-            if let Some(neighbors) = hot_cache.get(&node_id) {
-                return Arc::clone(neighbors);  // ✅ P1: Clone Arc (8 bytes) instead of Vec (512 bytes)
-            }
+            let mut hot = self.hot_cache.write();
+            if let Some(n) = hot.get(&node_id) { return Arc::clone(n); }
         }
-        
-        // 2. 🌡️ Check LRU cache
+        // 2. LRU cache
         {
             let mut cache = self.cache.lock();
-            if let Some(neighbors) = cache.get(&node_id) {
-                return Arc::clone(neighbors);  // ✅ P1: Clone Arc (8 bytes)
-            }
+            if let Some(n) = cache.get(&node_id) { return Arc::clone(n); }
         }
-        
-        // 3. 🧊 Read from disk (cold data)
+        // 3. Disk
         match self.get_from_cache_or_disk(node_id) {
-            Some(neighbors) => neighbors,
+            Some(n) => n,
             None => Arc::new(Vec::new()),
         }
     }
-    
-    /// Internal helper: get from cache or disk
+
     fn get_from_cache_or_disk(&self, node_id: RowId) -> Option<Arc<Vec<RowId>>> {
-        // Get offset
-        let offset = match self.index.read().get(&node_id) {
-            Some(&off) => off,
-            None => return None,
-        };
-        
-        // Read from disk
+        let offset = self.lookup_offset(node_id)?;
         match self.read_neighbors_at(offset) {
             Ok(neighbors) => {
-                // Add to LRU cache (Arc-wrapped)
-                let arc_neighbors = Arc::new(neighbors);
-                self.cache.lock().put(node_id, Arc::clone(&arc_neighbors));
-                Some(arc_neighbors)
+                let arc = Arc::new(neighbors);
+                self.cache.lock().put(node_id, Arc::clone(&arc));
+                Some(arc)
             }
             Err(_) => None,
         }
     }
-    
-    /// Set neighbors (replaces existing) with tiered caching
+
+    /// Set neighbors (replaces existing)
     pub fn set_neighbors(&self, node_id: RowId, mut neighbors: Vec<RowId>) -> Result<()> {
-        // Remove duplicates and self-loops
         neighbors.retain(|&id| id != node_id);
         neighbors.sort_unstable();
         neighbors.dedup();
-        
-        // Enforce degree limit
-        if neighbors.len() > self.max_degree {
-            neighbors.truncate(self.max_degree);
-        }
-        
+        if neighbors.len() > self.max_degree { neighbors.truncate(self.max_degree); }
+
         let offset = {
             let mut next_offset = self.next_offset.lock();
             let offset = *next_offset;
-            
             self.write_neighbors_at(node_id, &neighbors, offset)?;
-            
             let record_size = 8 + 4 + (neighbors.len() * 8);
             *next_offset += record_size as u64;
-            
             offset
         };
-        
-        self.index.write().insert(node_id, offset);
-        
-        // 🔥 Update tiered cache (Arc-wrapped)
-        let arc_neighbors = Arc::new(neighbors);
-        if self.hot_nodes.read().contains(&node_id) {
-            // Hot node: update hot cache
-            self.hot_cache.write().insert(node_id, Arc::clone(&arc_neighbors));
-        } else {
-            // Normal node: update LRU cache
-            self.cache.lock().put(node_id, arc_neighbors);
+
+        let is_new = {
+            let mut idx = self.index.write();
+            let was_present = idx.get(&node_id).is_some();
+            idx.put(node_id, offset);
+            !was_present
+        };
+        if is_new {
+            *self.count.write() += 1;
         }
-        
+
+        let arc = Arc::new(neighbors);
+        if self.hot_nodes.read().contains(&node_id) {
+            self.hot_cache.write().put(node_id, arc);
+        } else {
+            self.cache.lock().put(node_id, arc);
+        }
+
         *self.dirty.write() = true;
-        
         Ok(())
     }
-    
-    /// Add edge
+
     pub fn add_edge(&self, from: RowId, to: RowId) -> Result<()> {
-        if from == to {
-            return Ok(());
-        }
-        
+        if from == to { return Ok(()); }
         let neighbors_arc = self.neighbors(from);
-        
-        if neighbors_arc.contains(&to) {
-            return Ok(());
-        }
-        
+        if neighbors_arc.contains(&to) { return Ok(()); }
         if neighbors_arc.len() >= self.max_degree {
             return Err(StorageError::InvalidData("Max degree exceeded".to_string()));
         }
-        
-        // Clone Arc's inner Vec to modify
         let mut neighbors = (*neighbors_arc).clone();
         neighbors.push(to);
         self.set_neighbors(from, neighbors)
     }
-    
-    /// Check if edge exists
+
     pub fn has_edge(&self, from: RowId, to: RowId) -> bool {
         self.neighbors(from).contains(&to)
     }
-    
-    /// Get degree
-    pub fn degree(&self, node_id: RowId) -> usize {
-        self.neighbors(node_id).len()
-    }
-    
+
+    pub fn degree(&self, node_id: RowId) -> usize { self.neighbors(node_id).len() }
+
     /// Remove node
     pub fn remove_node(&self, node_id: RowId) -> Arc<Vec<RowId>> {
         let neighbors = self.neighbors(node_id);
-        
-        self.index.write().remove(&node_id);
-        // 🚀 P2: Only invalidate this node (not full clear)
+        let was_present = self.index.write().pop(&node_id).is_some();
         self.cache.lock().pop(&node_id);
+        self.hot_nodes.write().remove(&node_id);
+        self.hot_cache.write().pop(&node_id);
+        if was_present {
+            *self.count.write() = self.count.read().saturating_sub(1);
+        }
         *self.dirty.write() = true;
-        
         neighbors
     }
-    
-    /// 🚀 P2: Batch remove nodes with smart cache invalidation
-    /// 
-    /// More efficient than calling `remove_node()` multiple times
-    /// as it only locks once.
+
     pub fn batch_remove_nodes(&self, node_ids: &[RowId]) -> HashMap<RowId, Vec<RowId>> {
         let mut all_neighbors = HashMap::new();
-        
-        {
-            let mut index = self.index.write();
-            let mut cache = self.cache.lock();
-            
-            for &node_id in node_ids {
-                // Get neighbors before removal
-                if let Some(&offset) = index.get(&node_id) {
-                    let neighbors = self.read_neighbors_at(offset).unwrap_or_default();
-                    all_neighbors.insert(node_id, neighbors);
-                }
-                
-                // Remove from index and cache
-                index.remove(&node_id);
-                cache.pop(&node_id);
-            }
+        for &node_id in node_ids {
+            let n = self.remove_node(node_id);
+            all_neighbors.insert(node_id, (*n).clone());
         }
-        
-        *self.dirty.write() = true;
         all_neighbors
     }
-    
-    /// Flush to disk (OPTIMIZED: incremental write, skip full rewrite during batch insert)
+
+    /// Flush to disk
     pub fn flush(&self) -> Result<()> {
-        if !*self.dirty.read() {
-            return Ok(());
-        }
-        
-        // Update header with current node count
-        let node_count = self.index.read().len();
+        if !*self.dirty.read() { return Ok(()); }
+
+        let node_count = self.node_count();
         {
             let mut file = self.file.write();
             Self::write_header(&mut file, self.max_degree, node_count)?;
             file.sync_all().map_err(StorageError::Io)?;
         }
-        
+
+        // Rebuild sidecar index
+        if node_count > 0 {
+            let idx_path = self.file_path.with_extension("idx");
+            let count = Self::build_sidecar_index(&self.file_path, &idx_path, node_count)?;
+            *self.index_count.write() = count;
+            let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+            *self.index_file.write() = idx_read;
+        }
+
         *self.dirty.write() = false;
         Ok(())
     }
-    
-    /// Compact graph file (full rewrite for defragmentation)
-    /// Call this periodically, not on every flush
+
+    /// Compact graph file (full rewrite)
     pub fn compact(&self) -> Result<()> {
-        // Rewrite file
         let temp_path = self.file_path.with_extension("tmp");
-        
+        let idx_path = self.file_path.with_extension("idx");
+
         {
             let mut temp_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&temp_path)
-                .map_err(StorageError::Io)?;
-            
-            let index = self.index.read();
-            Self::write_header(&mut temp_file, self.max_degree, index.len())?;
-            
-            let mut new_index = HashMap::new();
+                .create(true).write(true).truncate(true)
+                .open(&temp_path).map_err(StorageError::Io)?;
+
+            // Get all node IDs from sidecar
+            let ids = self.node_ids();
+            Self::write_header(&mut temp_file, self.max_degree, ids.len())?;
+
+            let mut new_entries: Vec<(RowId, u64)> = Vec::with_capacity(ids.len());
             let mut offset = HEADER_SIZE;
-            
-            for (&node_id, _) in index.iter() {
+
+            for &node_id in &ids {
                 let neighbors = self.neighbors(node_id);
-                
-                // Write to temp file
-                temp_file.write_all(&node_id.to_le_bytes())
-                    .map_err(StorageError::Io)?;
-                temp_file.write_all(&(neighbors.len() as u32).to_le_bytes())
-                    .map_err(StorageError::Io)?;
-                
-                for &neighbor in neighbors.iter() {  // ✅ P1: Arc deref via iter()
-                    temp_file.write_all(&neighbor.to_le_bytes())
-                        .map_err(StorageError::Io)?;
+                temp_file.write_all(&node_id.to_le_bytes()).map_err(StorageError::Io)?;
+                temp_file.write_all(&(neighbors.len() as u32).to_le_bytes()).map_err(StorageError::Io)?;
+                for &neighbor in neighbors.iter() {
+                    temp_file.write_all(&neighbor.to_le_bytes()).map_err(StorageError::Io)?;
                 }
-                
-                new_index.insert(node_id, offset);
-                
+                new_entries.push((node_id, offset));
                 let record_size = 8 + 4 + (neighbors.len() * 8);
                 offset += record_size as u64;
             }
-            
+
             temp_file.sync_all().map_err(StorageError::Io)?;
-            
-            drop(index);
-            *self.index.write() = new_index;
+
+            // Write new sidecar
+            new_entries.sort_by_key(|(id, _)| *id);
+            let mut idx_file = File::create(&idx_path).map_err(StorageError::Io)?;
+            let count = new_entries.len() as u64;
+            idx_file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+            for (row_id, off) in &new_entries {
+                idx_file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
+                idx_file.write_all(&off.to_le_bytes()).map_err(StorageError::Io)?;
+            }
+            idx_file.sync_all().map_err(StorageError::Io)?;
+
             *self.next_offset.lock() = offset;
         }
-        
-        // Replace file
-        std::fs::rename(&temp_path, &self.file_path)
-            .map_err(StorageError::Io)?;
-        
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.file_path)
-            .map_err(StorageError::Io)?;
-        
+
+        std::fs::rename(&temp_path, &self.file_path).map_err(StorageError::Io)?;
+
+        let file = OpenOptions::new().read(true).write(true)
+            .open(&self.file_path).map_err(StorageError::Io)?;
         *self.file.write() = file;
+
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+        *self.index_file.write() = idx_read;
+        // Clear LRU index (offsets changed)
+        self.index.write().clear();
+
         *self.dirty.write() = false;
-        
         Ok(())
     }
-    
+
     pub fn clear(&self) {
         self.index.write().clear();
         self.cache.lock().clear();
+        self.hot_nodes.write().clear();
+        self.hot_cache.write().clear();
         *self.next_offset.lock() = HEADER_SIZE;
         *self.dirty.write() = true;
     }
-    
-    /// Get memory usage (cache only)
+
     pub fn memory_usage(&self) -> usize {
-        let cache_size = self.cache.lock().len();
-        // Approximate: row_id (8) + degree (4) + neighbors (avg 32 * 8)
-        cache_size * (8 + 4 + 32 * 8)
+        let cache_size = self.cache.lock().len() * (8 + 4 + 32 * 8);
+        let hot_size = self.hot_cache.read().len() * (8 + 4 + 32 * 8);
+        cache_size + hot_size
     }
-    
-    /// Get disk usage (approximate)
+
     pub fn disk_usage(&self) -> usize {
-        let count = self.index.read().len();
-        // Approximate: row_id (8) + degree (4) + neighbors (avg 32 * 8)
+        let count = self.node_count();
         count * (8 + 4 + 32 * 8)
     }
-    
+
     // --- Private helpers ---
-    
+
     fn write_header(file: &mut File, max_degree: usize, node_count: usize) -> Result<()> {
         file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
-        
         file.write_all(&MAGIC.to_le_bytes()).map_err(StorageError::Io)?;
         file.write_all(&VERSION.to_le_bytes()).map_err(StorageError::Io)?;
         file.write_all(&(max_degree as u32).to_le_bytes()).map_err(StorageError::Io)?;
         file.write_all(&(node_count as u32).to_le_bytes()).map_err(StorageError::Io)?;
-        
         Ok(())
     }
-    
+
     fn read_header(file: &mut File) -> Result<(usize, usize)> {
         file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
-        
         let mut buf = [0u8; 4];
-        
+
         file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let magic = u32::from_le_bytes(buf);
         if magic != MAGIC {
             return Err(StorageError::InvalidData("Invalid graph file".to_string()));
         }
-        
+
         file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let _version = u32::from_le_bytes(buf);
-        
         file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let max_degree = u32::from_le_bytes(buf) as usize;
-        
         file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let node_count = u32::from_le_bytes(buf) as usize;
-        
+
         Ok((max_degree, node_count))
     }
-    
+
     fn write_neighbors_at(&self, node_id: RowId, neighbors: &[RowId], offset: u64) -> Result<()> {
         let mut file = self.file.write();
-        
         file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
-        
         file.write_all(&node_id.to_le_bytes()).map_err(StorageError::Io)?;
         file.write_all(&(neighbors.len() as u32).to_le_bytes()).map_err(StorageError::Io)?;
-        
         for &neighbor in neighbors {
             file.write_all(&neighbor.to_le_bytes()).map_err(StorageError::Io)?;
         }
-        
         Ok(())
     }
-    
+
     fn read_neighbors_at(&self, offset: u64) -> Result<Vec<RowId>> {
         let mut file = self.file.write();
-        
         file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
-        
-        // Read node_id
         let mut buf8 = [0u8; 8];
         file.read_exact(&mut buf8).map_err(StorageError::Io)?;
-        
-        // Read neighbor count
         let mut buf4 = [0u8; 4];
         file.read_exact(&mut buf4).map_err(StorageError::Io)?;
         let count = u32::from_le_bytes(buf4) as usize;
-        
-        // Read neighbors
+
         let mut neighbors = Vec::with_capacity(count);
         for _ in 0..count {
             file.read_exact(&mut buf8).map_err(StorageError::Io)?;
             neighbors.push(u64::from_le_bytes(buf8));
         }
-        
         Ok(neighbors)
-    }
-    
-    fn build_index(file: &mut File, node_count: usize) -> Result<(HashMap<RowId, u64>, u64)> {
-        let mut index = HashMap::with_capacity(node_count);
-        let mut offset = HEADER_SIZE;
-        
-        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
-        
-        for _ in 0..node_count {
-            let mut buf8 = [0u8; 8];
-            file.read_exact(&mut buf8).map_err(StorageError::Io)?;
-            let node_id = u64::from_le_bytes(buf8);
-            
-            let mut buf4 = [0u8; 4];
-            file.read_exact(&mut buf4).map_err(StorageError::Io)?;
-            let neighbor_count = u32::from_le_bytes(buf4) as usize;
-            
-            index.insert(node_id, offset);
-            
-            // Skip neighbors
-            file.seek(SeekFrom::Current((neighbor_count * 8) as i64))
-                .map_err(StorageError::Io)?;
-            
-            let record_size = 8 + 4 + (neighbor_count * 8);
-            offset += record_size as u64;
-        }
-        
-        Ok((index, offset))
     }
 }
 
@@ -577,46 +631,59 @@ impl DiskGraph {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    
+
     #[test]
     fn test_disk_graph_create() {
         let temp_dir = TempDir::new().unwrap();
         let graph = DiskGraph::create(temp_dir.path(), 32, 1000).unwrap();
-        
         assert_eq!(graph.max_degree(), 32);
         assert!(graph.is_empty());
     }
-    
+
     #[test]
     fn test_disk_graph_neighbors() {
         let temp_dir = TempDir::new().unwrap();
         let graph = DiskGraph::create(temp_dir.path(), 32, 1000).unwrap();
-        
         graph.set_neighbors(1, vec![2, 3, 4]).unwrap();
-        
         let neighbors = graph.neighbors(1);
         assert_eq!(neighbors.len(), 3);
         assert!(neighbors.contains(&2));
     }
-    
+
     #[test]
     fn test_disk_graph_persistence() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         {
             let graph = DiskGraph::create(temp_dir.path(), 32, 1000).unwrap();
             graph.set_neighbors(1, vec![2, 3]).unwrap();
             graph.set_neighbors(2, vec![1, 3]).unwrap();
             graph.flush().unwrap();
         }
-        
-        // Reload
+
         {
             let graph = DiskGraph::load(temp_dir.path(), 1000).unwrap();
             assert_eq!(graph.node_count(), 2);
-            
             let n1 = graph.neighbors(1);
             assert!(n1.contains(&2) && n1.contains(&3));
+        }
+    }
+
+    #[test]
+    fn test_disk_graph_lru_eviction() {
+        let temp_dir = TempDir::new().unwrap();
+        let graph = DiskGraph::create_with_hot_limit(temp_dir.path(), 32, 2, 5).unwrap();
+
+        // Insert 10 nodes (LRU only holds 2)
+        for i in 0..10u64 {
+            graph.set_neighbors(i, vec![(i + 1) % 10]).unwrap();
+        }
+        graph.flush().unwrap();
+
+        // All should be accessible via sidecar fallback
+        for i in 0..10u64 {
+            let n = graph.neighbors(i);
+            assert_eq!(n.len(), 1, "node {} should have 1 neighbor", i);
         }
     }
 }

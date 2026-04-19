@@ -425,6 +425,63 @@ pub struct DBConfig {
 
     /// Columnar store configuration (for TimeSeries tables)
     pub columnar_config: crate::storage::columnar::config::ColumnarConfig,
+
+    /// Edge index memory limits — caps all index structures to bounded memory
+    pub edge_index: EdgeIndexConfig,
+}
+
+/// Bounded memory limits for index structures.
+///
+/// All indexes use LRU eviction when exceeding these caps.
+/// Edge devices should use `EdgeIndexConfig::for_edge()` for minimal footprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeIndexConfig {
+    /// DiskANN vector offset LRU capacity (default: 4096, edge: 512)
+    pub vector_index_capacity: usize,
+    /// DiskANN graph offset LRU capacity (default: 2048, edge: 256)
+    pub graph_index_capacity: usize,
+    /// DiskANN pinned hot node limit (default: 100, edge: 10)
+    pub graph_hot_node_limit: usize,
+    /// FTS shard counter LRU cap (default: 10000, edge: 500)
+    pub fts_shard_counter_cap: usize,
+    /// FTS pending terms auto-flush threshold (default: 200, edge: 50)
+    pub fts_pending_terms_limit: usize,
+    /// FTS pending docs auto-flush threshold (default: 2000, edge: 500)
+    pub fts_pending_docs_limit: usize,
+    /// Max in-memory version chains (default: 50000, edge: 5000)
+    pub version_store_max_entries: usize,
+    /// i-Octree LeafStore LRU slots (default: 4096, edge: 256)
+    pub ioctree_leaf_cache_cap: usize,
+}
+
+impl Default for EdgeIndexConfig {
+    fn default() -> Self {
+        Self {
+            vector_index_capacity: 4096,
+            graph_index_capacity: 2048,
+            graph_hot_node_limit: 100,
+            fts_shard_counter_cap: 10_000,
+            fts_pending_terms_limit: 200,
+            fts_pending_docs_limit: 2000,
+            version_store_max_entries: 50_000,
+            ioctree_leaf_cache_cap: 4096,
+        }
+    }
+}
+
+impl EdgeIndexConfig {
+    pub fn for_edge() -> Self {
+        Self {
+            vector_index_capacity: 512,
+            graph_index_capacity: 256,
+            graph_hot_node_limit: 10,
+            fts_shard_counter_cap: 500,
+            fts_pending_terms_limit: 50,
+            fts_pending_docs_limit: 500,
+            version_store_max_entries: 5000,
+            ioctree_leaf_cache_cap: 256,
+        }
+    }
 }
 
 /// Auto-checkpoint trigger configuration
@@ -499,6 +556,7 @@ impl Default for DBConfig {
             query_timeout_secs: None,  // No timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
+            edge_index: EdgeIndexConfig::default(),
         }
     }
 }
@@ -511,7 +569,7 @@ impl DBConfig {
             ..Default::default()
         }
     }
-    
+
     /// 创建通用场景配置
     pub fn for_general() -> Self {
         Self {
@@ -519,7 +577,7 @@ impl DBConfig {
             ..Default::default()
         }
     }
-    
+
     /// 创建高性能场景配置
     pub fn for_high_performance() -> Self {
         Self {
@@ -527,7 +585,7 @@ impl DBConfig {
             ..Default::default()
         }
     }
-    
+
     /// 创建测试用配置
     pub fn for_testing() -> Self {
         Self {
@@ -555,12 +613,17 @@ impl DBConfig {
             num_partitions: 2,
             lsm_config: LSMConfig {
                 memtable_size_limit: 4 * 1024 * 1024, // 4MB
+                sstable_cache_size: Some(8),
+                sstable_cache_memory_limit_mb: Some(10), // 10MB max
+                block_size: Some(16 * 1024),             // 16KB blocks
                 ..Default::default()
             },
             row_cache_size: Some(500),
-            pk_lookup_capacity: 10_000,  // ~800KB per table (memory-constrained)
+            pk_lookup_capacity: 10_000,  // ~800KB per table
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
+            columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
+            edge_index: EdgeIndexConfig::for_edge(),
             ..Default::default()
         }
     }
@@ -584,6 +647,9 @@ impl DBConfig {
             num_partitions: 2,
             lsm_config: LSMConfig {
                 memtable_size_limit: 4 * 1024 * 1024, // 4MB
+                sstable_cache_size: Some(16),
+                sstable_cache_memory_limit_mb: Some(20),
+                block_size: Some(32 * 1024),
                 ..Default::default()
             },
             row_cache_size: Some(500),
@@ -593,6 +659,8 @@ impl DBConfig {
                 min_interval_secs: 60,
             }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
+            columnar_config: crate::storage::columnar::config::ColumnarConfig::for_robotics(),
+            edge_index: EdgeIndexConfig::for_edge(),
             ..Default::default()
         }
     }
@@ -603,20 +671,32 @@ impl DBConfig {
 pub struct LSMConfig {
     /// MemTable 大小限制（字节）
     pub memtable_size_limit: usize,
-    
+
     /// Level 0 SSTable 数量阈值（触发合并）
     pub level0_compaction_threshold: usize,
-    
+
     /// 布隆过滤器假阳性率
     pub bloom_filter_false_positive_rate: f64,
+
+    /// SSTable cache entry count (None = storage default 128)
+    pub sstable_cache_size: Option<usize>,
+
+    /// SSTable cache memory limit in MB (None = storage default 200MB)
+    pub sstable_cache_memory_limit_mb: Option<usize>,
+
+    /// SSTable block size in bytes (None = storage default 64KB)
+    pub block_size: Option<usize>,
 }
 
 impl Default for LSMConfig {
     fn default() -> Self {
         Self {
-            memtable_size_limit: 4 * 1024 * 1024, // 4MB (stable memory for embedded use)
+            memtable_size_limit: 4 * 1024 * 1024, // 4MB
             level0_compaction_threshold: 4,
             bloom_filter_false_positive_rate: 0.01, // 1%
+            sstable_cache_size: None,
+            sstable_cache_memory_limit_mb: None,
+            block_size: None,
         }
     }
 }

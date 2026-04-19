@@ -1,14 +1,11 @@
-//! SQ8 compressed vector storage with LRU cache
+//! SQ8 compressed vector storage with LRU-bounded memory
 //!
 //! Storage format:
-//! - File: vectors_sq8.bin
-//! - Layout: [count: u64] [entry1] [entry2] ...
-//! - Entry: [row_id: u64] [min: f32] [max: f32] [codes: [u8; dim]]
+//! - Data file: vectors_sq8.bin — [count: u64] [entry1] [entry2] ...
+//! - Index file: vectors_sq8.idx — [count: u64] [row_id: u64, offset: u64]... (sorted)
 //!
-//! **🚀 PERFORMANCE OPTIMIZATION:**
-//! - Direct quantized vector access (skip decompression for distance calc)
-//! - Batch read support for graph traversal
-//! - LRU cache for both f32 and quantized vectors
+//! Memory is bounded: the offset index uses LRU eviction, falling back to
+//! binary search on the sidecar index file when entries are evicted.
 
 use super::sq8::{QuantizedVector, SQ8Quantizer};
 use crate::types::RowId;
@@ -22,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// SQ8 compressed vector storage
+/// SQ8 compressed vector storage with bounded memory
 pub struct SQ8Vectors {
     _data_dir: PathBuf,
     dimension: usize,
@@ -31,8 +28,15 @@ pub struct SQ8Vectors {
     /// Entry size = 8 (row_id) + 4 (min) + 4 (max) + dimension (codes)
     _entry_size: usize,
 
-    /// In-memory index: row_id -> file offset
-    index: Arc<RwLock<HashMap<RowId, u64>>>,
+    /// Bounded offset index: row_id -> file offset (LRU-capped)
+    index: Arc<RwLock<LruCache<RowId, u64>>>,
+
+    /// Sidecar index file handle for binary search on LRU miss
+    index_file: Arc<RwLock<File>>,
+    /// Total entries in the sidecar index (for binary search bounds)
+    index_count: Arc<RwLock<u64>>,
+    /// Total entries (tracked incrementally on insert/delete)
+    count: Arc<RwLock<u64>>,
 
     /// LRU cache: row_id -> decompressed f32 vector
     cache: Arc<RwLock<LruCache<RowId, Arc<Vec<f32>>>>>,
@@ -57,23 +61,33 @@ impl SQ8Vectors {
         std::fs::create_dir_all(&data_dir).map_err(StorageError::Io)?;
 
         let dimension = quantizer.dimension();
-        let entry_size = 8 + 4 + 4 + dimension; // row_id + min + max + codes
+        let entry_size = 8 + 4 + 4 + dimension;
         let file_path = data_dir.join("vectors_sq8.bin");
+        let idx_path = data_dir.join("vectors_sq8.idx");
 
-        // Create empty file with count=0
+        // Create empty data file with count=0
         let mut file = File::create(&file_path).map_err(StorageError::Io)?;
-        file.write_all(&0u64.to_le_bytes())
-            .map_err(StorageError::Io)?;
+        file.write_all(&0u64.to_le_bytes()).map_err(StorageError::Io)?;
+
+        // Create empty index file with count=0
+        let mut idx_file = File::create(&idx_path).map_err(StorageError::Io)?;
+        idx_file.write_all(&0u64.to_le_bytes()).map_err(StorageError::Io)?;
 
         let read_file = File::open(&file_path).map_err(StorageError::Io)?;
         let write_file = OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?;
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
         Ok(Self {
             _data_dir: data_dir,
             dimension,
             quantizer,
             _entry_size: entry_size,
-            index: Arc::new(RwLock::new(HashMap::new())),
+            index: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(cache_size.max(1)).unwrap(),
+            ))),
+            index_file: Arc::new(RwLock::new(idx_read)),
+            index_count: Arc::new(RwLock::new(0)),
+            count: Arc::new(RwLock::new(0)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size).unwrap(),
             ))),
@@ -96,76 +110,145 @@ impl SQ8Vectors {
         let dimension = quantizer.dimension();
         let entry_size = 8 + 4 + 4 + dimension;
         let file_path = data_dir.join("vectors_sq8.bin");
+        let idx_path = data_dir.join("vectors_sq8.idx");
 
         if !file_path.exists() {
-            return Err(StorageError::InvalidData(
-                "SQ8 vectors file not found".to_string(),
-            ));
+            return Err(StorageError::InvalidData("SQ8 vectors file not found".to_string()));
         }
 
-        // Build index
-        let mut file = File::open(&file_path).map_err(StorageError::Io)?;
-        let mut count_bytes = [0u8; 8];
-        file.read_exact(&mut count_bytes).map_err(StorageError::Io)?;
-        let count = u64::from_le_bytes(count_bytes);
+        // Build sidecar index from data file (or load existing sidecar)
+        let index_count = if idx_path.exists() {
+            let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
+            let mut buf = [0u8; 8];
+            idx.read_exact(&mut buf).map_err(StorageError::Io)?;
+            u64::from_le_bytes(buf)
+        } else {
+            // Build sidecar from scratch by scanning data file
+            let count = Self::build_sidecar_index(&file_path, &idx_path, entry_size)?;
+            count
+        };
 
-        let mut index = HashMap::new();
-        let mut offset = 8u64; // After count
-
-        for _ in 0..count {
-            let mut row_id_bytes = [0u8; 8];
-            file.read_exact(&mut row_id_bytes)
-                .map_err(StorageError::Io)?;
-            let row_id = u64::from_le_bytes(row_id_bytes);
-
-            index.insert(row_id, offset);
-            offset += entry_size as u64;
-
-            // Skip the rest of this entry
-            file.seek(SeekFrom::Current((entry_size - 8) as i64))
-                .map_err(StorageError::Io)?;
-        }
+        let read_file = File::open(&file_path).map_err(StorageError::Io)?;
+        let write_file = OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?;
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
         Ok(Self {
             _data_dir: data_dir,
             dimension,
             quantizer,
             _entry_size: entry_size,
-            index: Arc::new(RwLock::new(index)),
+            index: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(cache_size.max(1)).unwrap(),
+            ))),
+            index_file: Arc::new(RwLock::new(idx_read)),
+            index_count: Arc::new(RwLock::new(index_count)),
+            count: Arc::new(RwLock::new(index_count)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size).unwrap(),
             ))),
             quantized_cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size * 2).unwrap(),
             ))),
-            read_file: Arc::new(RwLock::new(File::open(&file_path).map_err(StorageError::Io)?)),
-            write_file: Arc::new(RwLock::new(OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?)),
+            read_file: Arc::new(RwLock::new(read_file)),
+            write_file: Arc::new(RwLock::new(write_file)),
             file_path,
         })
     }
 
+    /// Build sidecar index file by scanning the data file.
+    /// Returns the count of entries written.
+    fn build_sidecar_index(data_path: &Path, idx_path: &Path, entry_size: usize) -> Result<u64> {
+        let mut data = File::open(data_path).map_err(StorageError::Io)?;
+        let mut count_bytes = [0u8; 8];
+        data.read_exact(&mut count_bytes).map_err(StorageError::Io)?;
+        let count = u64::from_le_bytes(count_bytes);
+
+        // Read all (row_id, offset) pairs
+        let mut entries: Vec<(RowId, u64)> = Vec::with_capacity(count as usize);
+        let mut offset = 8u64;
+        for _ in 0..count {
+            let mut row_id_bytes = [0u8; 8];
+            data.read_exact(&mut row_id_bytes).map_err(StorageError::Io)?;
+            let row_id = u64::from_le_bytes(row_id_bytes);
+            entries.push((row_id, offset));
+            offset += entry_size as u64;
+            data.seek(SeekFrom::Current((entry_size - 8) as i64)).map_err(StorageError::Io)?;
+        }
+
+        // Sort by row_id for binary search
+        entries.sort_by_key(|(id, _)| *id);
+
+        // Write sidecar index
+        let mut idx_file = File::create(idx_path).map_err(StorageError::Io)?;
+        idx_file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+        for (row_id, off) in &entries {
+            idx_file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
+            idx_file.write_all(&off.to_le_bytes()).map_err(StorageError::Io)?;
+        }
+        idx_file.sync_all().map_err(StorageError::Io)?;
+
+        Ok(count)
+    }
+
+    /// Look up file offset for a row_id.
+    /// Checks LRU first, falls back to binary search on sidecar index file.
+    fn lookup_offset(&self, row_id: RowId) -> Option<u64> {
+        // 1. Check LRU cache
+        {
+            let mut index = self.index.write();
+            if let Some(&offset) = index.get(&row_id) {
+                return Some(offset);
+            }
+        }
+
+        // 2. Binary search on sidecar index file
+        let count = *self.index_count.read();
+        if count == 0 {
+            return None;
+        }
+
+        let mut file = self.index_file.write();
+        let entry_size = 16u64; // row_id (8) + offset (8)
+        let mut lo = 0i64;
+        let mut hi = count as i64 - 1;
+
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let file_offset = 8 + mid as u64 * entry_size;
+            file.seek(SeekFrom::Start(file_offset)).ok()?;
+            let mut buf = [0u8; 16];
+            file.read_exact(&mut buf).ok()?;
+            let mid_id = u64::from_le_bytes(buf[..8].try_into().ok()?);
+            let mid_offset = u64::from_le_bytes(buf[8..].try_into().ok()?);
+
+            match mid_id.cmp(&row_id) {
+                std::cmp::Ordering::Equal => {
+                    // Found — cache it for next time
+                    drop(file);
+                    self.index.write().put(row_id, mid_offset);
+                    return Some(mid_offset);
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid - 1,
+            }
+        }
+        None
+    }
+
     /// Get decompressed vector
-    /// 
-    /// ✅ P1: Returns Arc-wrapped Vec<f32> to avoid expensive cloning
     pub fn get(&self, row_id: RowId) -> Option<Arc<Vec<f32>>> {
         // Check cache first
         {
             let mut cache = self.cache.write();
             if let Some(vec) = cache.get(&row_id) {
-                return Some(Arc::clone(vec));  // ✅ P1: Clone Arc (8 bytes) instead of Vec<f32> (512 bytes)
+                return Some(Arc::clone(vec));
             }
         }
 
-        // Read from disk
-        let offset = {
-            let index = self.index.read();
-            *index.get(&row_id)?
-        };
-
+        let offset = self.lookup_offset(row_id)?;
         let qvec = self.read_quantized(offset).ok()?;
         let vec = self.quantizer.dequantize(&qvec);
 
-        // Cache it (Arc-wrapped)
         let arc_vec = Arc::new(vec);
         {
             let mut cache = self.cache.write();
@@ -174,33 +257,19 @@ impl SQ8Vectors {
 
         Some(arc_vec)
     }
-    
-    /// 🚀 **NEW: Get quantized vector (no decompression)**
-    /// 
-    /// **Performance advantage:**
-    /// - Skip decompression (u8 → f32 conversion)
-    /// - 4x less memory (u8 vs f32)
-    /// - Use with asymmetric_distance_cosine for fast search
-    /// 
-    /// ✅ P1: Returns Arc-wrapped QuantizedVector
+
+    /// Get quantized vector (no decompression)
     pub fn get_quantized(&self, row_id: RowId) -> Option<Arc<QuantizedVector>> {
-        // Check quantized cache first
         {
             let mut cache = self.quantized_cache.write();
             if let Some(qvec) = cache.get(&row_id) {
-                return Some(Arc::clone(qvec));  // ✅ P1: Clone Arc (8 bytes)
+                return Some(Arc::clone(qvec));
             }
         }
 
-        // Read from disk
-        let offset = {
-            let index = self.index.read();
-            *index.get(&row_id)?
-        };
-
+        let offset = self.lookup_offset(row_id)?;
         let qvec = self.read_quantized(offset).ok()?;
 
-        // Cache it (Arc-wrapped)
         let arc_qvec = Arc::new(qvec);
         {
             let mut cache = self.quantized_cache.write();
@@ -209,41 +278,29 @@ impl SQ8Vectors {
 
         Some(arc_qvec)
     }
-    
-    /// 🚀 **NEW: Batch get quantized vectors (optimized for graph search)**
-    /// 
-    /// **Use case:** During DiskANN greedy search, we need to compute distances
-    /// to many neighbor vectors. Batch reading is much faster than individual reads.
-    /// 
-    /// **Performance:**
-    /// - Single disk seek for sequential IDs
-    /// - Batch cache lookup
-    /// - Returns only quantized vectors (skip decompression)
-    /// 
-    /// ✅ P1: Returns Arc-wrapped quantized vectors
+
+    /// Batch get quantized vectors
     pub fn batch_get_quantized(&self, row_ids: &[RowId]) -> HashMap<RowId, Arc<QuantizedVector>> {
         let mut result = HashMap::with_capacity(row_ids.len());
         let mut uncached_ids = Vec::new();
-        
-        // 1. Check cache first
+
         {
             let mut cache = self.quantized_cache.write();
             for &row_id in row_ids {
                 if let Some(qvec) = cache.get(&row_id) {
-                    result.insert(row_id, Arc::clone(qvec));  // ✅ P1: Clone Arc (8 bytes)
+                    result.insert(row_id, Arc::clone(qvec));
                 } else {
                     uncached_ids.push(row_id);
                 }
             }
         }
-        
-        // 2. Read uncached from disk
+
         for row_id in uncached_ids {
             if let Some(qvec) = self.get_quantized(row_id) {
                 result.insert(row_id, qvec);
             }
         }
-        
+
         result
     }
 
@@ -257,68 +314,48 @@ impl SQ8Vectors {
             )));
         }
 
-        // Check if already exists
-        {
-            let index = self.index.read();
-            if index.contains_key(&row_id) {
-                return Err(StorageError::InvalidData(format!(
-                    "Vector {} already exists",
-                    row_id
-                )));
-            }
+        // Check if already exists (LRU lookup + sidecar)
+        if self.lookup_offset(row_id).is_some() {
+            return Err(StorageError::InvalidData(format!("Vector {} already exists", row_id)));
         }
 
-        // Quantize
         let qvec = self.quantizer.quantize(&vector)?;
-
-        // Append to file
         let offset = self.append_quantized(row_id, &qvec)?;
 
-        // Update index
-        {
-            let mut index = self.index.write();
-            index.insert(row_id, offset);
-        }
+        // Update in-memory LRU index
+        self.index.write().put(row_id, offset);
+        *self.count.write() += 1;
 
-        // Cache decompressed vector (Arc-wrapped)
+        // Cache decompressed vector
         {
             let mut cache = self.cache.write();
-            cache.put(row_id, Arc::new(vector));  // ✅ P1: Wrap in Arc
+            cache.put(row_id, Arc::new(vector));
         }
 
         Ok(())
     }
 
-    /// Batch insert (more efficient)
+    /// Batch insert
     pub fn batch_insert(&self, batch: Vec<(RowId, Vec<f32>)>) -> Result<usize> {
         let mut inserted = 0;
-
         for (row_id, vector) in batch {
             if self.insert(row_id, vector).is_ok() {
                 inserted += 1;
             }
         }
-
         Ok(inserted)
     }
 
     /// Update vector
     pub fn update(&self, row_id: RowId, vector: Vec<f32>) -> Result<bool> {
-        // For simplicity, SQ8 doesn't support in-place update
-        // (would require rewriting entire file due to variable entry size)
-        // Just return false for now
-        let exists = self.index.read().contains_key(&row_id);
-        if !exists {
+        if self.lookup_offset(row_id).is_none() {
             return Ok(false);
         }
 
-        // Cache the new vector for reads (Arc-wrapped)
         {
             let mut cache = self.cache.write();
-            cache.put(row_id, Arc::new(vector.clone()));  // ✅ P1: Wrap in Arc
+            cache.put(row_id, Arc::new(vector.clone()));
         }
-        
-        // 🚀 P2: Also invalidate quantized cache to ensure consistency
         {
             let mut qcache = self.quantized_cache.write();
             qcache.pop(&row_id);
@@ -327,85 +364,86 @@ impl SQ8Vectors {
         Ok(true)
     }
 
-    /// Delete vector (mark as deleted, don't actually remove)
+    /// Delete vector
     pub fn delete(&self, row_id: RowId) -> Result<bool> {
         let removed = {
             let mut index = self.index.write();
-            index.remove(&row_id).is_some()
+            index.pop(&row_id).is_some()
         };
 
         if removed {
-            // 🚀 P2: Smart cache invalidation (only this vector)
+            *self.count.write() -= 1;
             self.invalidate_single(row_id);
         }
 
         Ok(removed)
     }
-    
-    /// 🚀 P2: Invalidate single vector from both caches
-    /// 
-    /// **Optimization**: Instead of clearing entire cache on delete,
-    /// only invalidate the affected entry. This preserves cache warmth
-    /// for all other vectors.
-    /// 
-    /// **Expected improvement**: ~10-30x better cache hit rate after deletes
+
     fn invalidate_single(&self, row_id: RowId) {
-        let mut cache = self.cache.write();
-        cache.pop(&row_id);
-        drop(cache);
-        
-        let mut qcache = self.quantized_cache.write();
-        qcache.pop(&row_id);
+        self.cache.write().pop(&row_id);
+        self.quantized_cache.write().pop(&row_id);
     }
-    
-    /// 🚀 P2: Batch invalidation for multiple vectors
-    /// 
-    /// More efficient than calling `invalidate_single()` multiple times
-    /// as it only locks once per cache.
+
     pub fn invalidate_batch(&self, row_ids: &[RowId]) {
-        if row_ids.is_empty() {
-            return;
-        }
-        
+        if row_ids.is_empty() { return; }
         let mut cache = self.cache.write();
-        for &row_id in row_ids {
-            cache.pop(&row_id);
-        }
+        for &row_id in row_ids { cache.pop(&row_id); }
         drop(cache);
-        
         let mut qcache = self.quantized_cache.write();
-        for &row_id in row_ids {
-            qcache.pop(&row_id);
-        }
+        for &row_id in row_ids { qcache.pop(&row_id); }
     }
 
-    /// Flush (persist count)
+    /// Flush: update data file header and rebuild sidecar index
     pub fn flush(&self) -> Result<()> {
-        let count = self.index.read().len() as u64;
-        // Need a separate handle for writing the header (not append mode)
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&self.file_path)
-            .map_err(StorageError::Io)?;
+        let count = *self.count.read();
 
-        file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
-        file.write_all(&count.to_le_bytes())
-            .map_err(StorageError::Io)?;
+        // Update data file header with current count
+        {
+            let mut file = OpenOptions::new().write(true)
+                .open(&self.file_path).map_err(StorageError::Io)?;
+            file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
+            file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+            file.sync_all().map_err(StorageError::Io)?;
+        }
+
+        // Rebuild sidecar index from data file
+        if count > 0 {
+            let idx_path = self.file_path.with_extension("idx");
+            let _ = Self::build_sidecar_index(&self.file_path, &idx_path, self._entry_size);
+            *self.index_count.write() = count;
+            let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+            *self.index_file.write() = idx_read;
+        }
 
         Ok(())
     }
 
-    /// Get all vector IDs
+    /// Get all vector IDs (reads from sidecar index)
     pub fn ids(&self) -> Vec<RowId> {
-        self.index.read().keys().copied().collect()
+        let count = *self.index_count.read();
+        if count == 0 {
+            // Fall back to LRU entries if sidecar is empty (during initial inserts)
+            return self.index.read().iter().map(|(&id, _)| id).collect();
+        }
+
+        let mut file = self.index_file.write();
+        let mut ids = Vec::with_capacity(count as usize);
+        let _ = file.seek(SeekFrom::Start(8));
+        for _ in 0..count {
+            let mut buf = [0u8; 16];
+            if file.read_exact(&mut buf).is_ok() {
+                ids.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
+            }
+        }
+        ids
     }
 
     pub fn len(&self) -> usize {
-        self.index.read().len()
+        *self.count.read() as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.read().is_empty()
+        self.len() == 0
     }
 
     pub fn dimension(&self) -> usize {
@@ -413,24 +451,20 @@ impl SQ8Vectors {
     }
 
     pub fn memory_usage(&self) -> usize {
-        // Index + cache
-        let index_size = self.index.read().len() * (8 + 8); // row_id + offset
+        let index_size = self.index.read().len() * 16;
         let cache_size = self.cache.read().len() * (8 + self.dimension * 4);
         index_size + cache_size
     }
 
     pub fn disk_usage(&self) -> usize {
-        std::fs::metadata(&self.file_path)
-            .map(|m| m.len() as usize)
-            .unwrap_or(0)
+        std::fs::metadata(&self.file_path).map(|m| m.len() as usize).unwrap_or(0)
     }
 
     // ==================== Private Helpers ====================
 
     fn read_quantized(&self, offset: u64) -> Result<QuantizedVector> {
         let mut file = self.read_file.write();
-        file.seek(SeekFrom::Start(offset + 8))
-            .map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(offset + 8)).map_err(StorageError::Io)?;
 
         let mut min_bytes = [0u8; 4];
         let mut max_bytes = [0u8; 4];
@@ -448,15 +482,11 @@ impl SQ8Vectors {
 
     fn append_quantized(&self, row_id: RowId, qvec: &QuantizedVector) -> Result<u64> {
         let mut file = self.write_file.write();
-
         let offset = file.metadata().map_err(StorageError::Io)?.len();
 
-        file.write_all(&row_id.to_le_bytes())
-            .map_err(StorageError::Io)?;
-        file.write_all(&qvec.min.to_le_bytes())
-            .map_err(StorageError::Io)?;
-        file.write_all(&qvec.max.to_le_bytes())
-            .map_err(StorageError::Io)?;
+        file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&qvec.min.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&qvec.max.to_le_bytes()).map_err(StorageError::Io)?;
         file.write_all(&qvec.codes).map_err(StorageError::Io)?;
 
         Ok(offset)
@@ -469,36 +499,54 @@ mod tests {
 
     #[test]
     fn test_sq8_vectors_basic() {
-        use std::env;
-
-        let temp_dir = env::temp_dir().join("sq8_vectors_test");
+        let temp_dir = std::env::temp_dir().join("sq8_vectors_test");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let quantizer = Arc::new(SQ8Quantizer::new(4));
         let storage = SQ8Vectors::create(&temp_dir, quantizer.clone(), 10).unwrap();
 
-        // Insert
         storage.insert(1, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         storage.insert(2, vec![5.0, 6.0, 7.0, 8.0]).unwrap();
 
-        // Get
         let v1 = storage.get(1).unwrap();
         assert_eq!(v1.len(), 4);
 
-        // Check accuracy
         let expected = [1.0, 2.0, 3.0, 4.0];
         for (a, &b) in v1.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 0.1);
         }
 
-        // Flush and reload
         storage.flush().unwrap();
         let loaded = SQ8Vectors::load(&temp_dir, quantizer, 10).unwrap();
 
         assert_eq!(loaded.len(), 2);
         let v1_loaded = loaded.get(1).unwrap();
         assert_eq!(v1_loaded.len(), 4);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_sq8_vectors_lru_eviction() {
+        let temp_dir = std::env::temp_dir().join("sq8_vectors_lru_test");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let quantizer = Arc::new(SQ8Quantizer::new(4));
+        let storage = SQ8Vectors::create(&temp_dir, quantizer.clone(), 2).unwrap(); // tiny LRU
+
+        // Insert 10 vectors (LRU can only hold 2)
+        for i in 0..10u64 {
+            storage.insert(i, vec![i as f32, 0.0, 0.0, 0.0]).unwrap();
+        }
+        storage.flush().unwrap();
+
+        // All should still be accessible via sidecar fallback
+        for i in 0..10u64 {
+            let v = storage.get(i).unwrap();
+            assert!((v[0] - i as f32).abs() < 0.1, "Failed for row_id={}", i);
+        }
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
