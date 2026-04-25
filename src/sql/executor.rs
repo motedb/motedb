@@ -3136,17 +3136,38 @@ impl QueryExecutor {
                         if args.is_empty() {
                             return Err(MoteDBError::InvalidArgument("SUM requires an argument".to_string()));
                         }
-                        let mut sum = 0.0;
+                        let mut int_sum: i64 = 0;
+                        let mut float_sum: f64 = 0.0;
+                        let mut has_float = false;
                         for row in rows {
                             let val = self.evaluator.eval(&args[0], row)?;
                             match val {
-                                Value::Integer(i) => sum += i as f64,
-                                Value::Float(f) => sum += f,
+                                Value::Integer(i) => {
+                                    if has_float {
+                                        float_sum += i as f64;
+                                    } else if let Some(s) = int_sum.checked_add(i) {
+                                        int_sum = s;
+                                    } else {
+                                        has_float = true;
+                                        float_sum = int_sum as f64 + i as f64;
+                                    }
+                                }
+                                Value::Float(f) => {
+                                    if !has_float {
+                                        has_float = true;
+                                        float_sum = int_sum as f64;
+                                    }
+                                    float_sum += f;
+                                }
                                 Value::Null => {},
                                 _ => return Err(MoteDBError::TypeError("SUM requires numeric values".to_string())),
                             }
                         }
-                        Ok(Value::Float(sum))
+                        if has_float {
+                            Ok(Value::Float(float_sum))
+                        } else {
+                            Ok(Value::Integer(int_sum))
+                        }
                     }
                     "AVG" => {
                         if args.is_empty() {

@@ -676,7 +676,7 @@ impl PartitionWAL {
         }
 
         let mut lsns = Vec::with_capacity(records.len());
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(records.len() * 256);
 
         // 1. Serialize all records to buffer (LSNs already pre-allocated)
         for record in records {

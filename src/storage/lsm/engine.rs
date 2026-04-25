@@ -248,6 +248,17 @@ impl LSMEngine {
         // level metadata. These can be left behind by interrupted compaction or flush.
         // Safety: move unreadable files to lost+found instead of deleting them,
         // because a truncated footer does not mean the data is unrecoverable.
+        // Also clean up old lost+found files to prevent unbounded disk growth.
+        {
+            let lost_found = storage_dir.join("lost+found");
+            if lost_found.exists() {
+                if let Ok(entries) = std::fs::read_dir(&lost_found) {
+                    for entry in entries.flatten() {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
         {
             let known_paths: std::collections::HashSet<PathBuf> = compaction_worker
                 .get_all_sstables()
@@ -280,7 +291,18 @@ impl LSMEngine {
         } else {
             UnifiedMemTable::new(&config)
         };
-        
+
+        // Recover next_sst_id from existing SSTables to avoid overwriting on restart
+        let max_existing_id = compaction_worker
+            .get_all_sstables()
+            .map(|metas| {
+                metas.iter()
+                    .filter_map(|m| m.path.file_stem()?.to_str()?.strip_prefix("l0_")?.parse::<u64>().ok())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+
         let mut engine = Self {
             memtable: Arc::new(RwLock::new(memtable)),
             immutable: Arc::new(RwLock::new(VecDeque::new())),  // 🔥 Empty queue
@@ -291,7 +313,7 @@ impl LSMEngine {
             sstable_cache: Arc::new(SSTableCache::new(config.sstable_cache_size)),
             storage_dir,
             config: config.clone(),
-            next_sst_id: Arc::new(RwLock::new(0)),
+            next_sst_id: Arc::new(RwLock::new(max_existing_id + 1)),
             compaction_worker: compaction_worker.clone(),
             blob_store,
             compaction_thread: None,

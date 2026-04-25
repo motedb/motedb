@@ -443,7 +443,12 @@ impl CompactionWorker {
             std::mem::take(&mut *guard)
         };
         for path in &pending {
-            let _ = fs::remove_file(path);
+            if let Err(e) = fs::remove_file(path) {
+                debug_log!("[compaction] Failed to delete SST {:?}: {}, will retry next cycle", path, e);
+                let mut guard = self.pending_deletions.lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.push(path.clone());
+            }
         }
     }
 

@@ -122,7 +122,8 @@ impl MoteDB {
             )))?;
 
         // 4. Determine partition
-        let partition = (row_id % self.num_partitions as u64) as PartitionId;
+        let composite_key = self.make_composite_key(table_name, row_id);
+        let partition = (composite_key % self.num_partitions as u64) as PartitionId;
 
         // 5. Encode row to raw bytes (shared between WAL and LSM — zero-copy recovery)
         let col_types = schema.col_types();
@@ -460,6 +461,28 @@ impl MoteDB {
             }
         }
 
+        // 7. Update PK lookup cache if primary key value changed
+        if let Some(pk_name) = schema.primary_key() {
+            if !schema.is_primary_key_auto_increment() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    let old_pk = old_row.get(pk_col.position);
+                    let new_pk = new_row.get(pk_col.position);
+                    if old_pk != new_pk {
+                        if let Some(pk_lookup) = self.pk_lookup.get(table_name) {
+                            if let Some(old_val) = old_pk {
+                                let old_key = crate::database::pk_cache::PkKey::from_value(old_val);
+                                pk_lookup.remove_pk(&old_key);
+                            }
+                            if let Some(new_val) = new_pk {
+                                let new_key = crate::database::pk_cache::PkKey::from_value(new_val);
+                                pk_lookup.insert(new_key, row_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // If any index update failed, mark ALL indexes for this table stale
         if !index_errors.is_empty() {
             debug_log!("[update_row] {} index updates failed for table '{}', marking all stale",
@@ -471,7 +494,7 @@ impl MoteDB {
 
         Ok(())
     }
-    
+
     /// Delete a row from a specific table (table-aware API)
     /// 
     /// # Arguments
@@ -887,7 +910,36 @@ impl MoteDB {
                     idx, table_name, e
                 )))?;
         }
-        
+
+        // 2.5 Check primary key uniqueness for non-AUTO_INCREMENT tables
+        if !schema.is_primary_key_auto_increment() {
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    for (idx, row) in rows.iter().enumerate() {
+                        if let Some(pk_value) = row.get(pk_col.position) {
+                            let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+                            let exists = self.pk_lookup.get(table_name)
+                                .map(|lookup| lookup.get_pk(&pk_key).is_some())
+                                .unwrap_or(false);
+                            if exists {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
+                                )));
+                            }
+                            match self.query_by_column(table_name, pk_name, pk_value) {
+                                Ok(found) if !found.is_empty() => {
+                                    return Err(StorageError::InvalidData(format!(
+                                        "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 3. Batch allocate row IDs
         let mut row_ids = Vec::with_capacity(rows.len());
         let auto_inc = schema.is_primary_key_auto_increment();
@@ -944,7 +996,8 @@ impl MoteDB {
         let mut wal_records = Vec::with_capacity(rows.len());
         let mut kvs = Vec::with_capacity(rows.len());
         for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+            let composite_key = self.make_composite_key(table_name, *row_id);
+            let partition = (composite_key % self.num_partitions as u64) as PartitionId;
             let row_data = row_format::encode(row, col_types)
                 .unwrap_or_else(|_| bincode::serialize(row).unwrap());
 
@@ -1059,7 +1112,13 @@ impl MoteDB {
             // and is updated during flush via batch building
         }
         
-        // 8. Increment pending counter
+        // 8. Update row count for COUNT(*) fast path
+        if let Some(counter) = self.table_row_count.get(table_name) {
+            use std::sync::atomic::Ordering;
+            counter.fetch_add(rows.len() as u64, Ordering::SeqCst);
+        }
+
+        // 9. Increment pending counter
         // 🚀 P0 CRITICAL FIX: 使用原子操作避免锁竞争
         {
             use std::sync::atomic::Ordering;
