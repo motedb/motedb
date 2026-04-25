@@ -329,7 +329,8 @@ impl RecoveryManager {
                 // Process in reverse order
                 for operation in operations.iter().rev() {
                     match operation {
-                        WALRecord::Insert { row_id, .. } => {
+                        WALRecord::Insert { row_id, .. }
+                        | WALRecord::InsertRaw { row_id, .. } => {
                             // Undo insert = delete the version inserted by this txn
                             let _ = self.version_store.delete_version(
                                 *row_id, txn_id, u64::MAX,
@@ -343,11 +344,29 @@ impl RecoveryManager {
                             );
                             undo_count += 1;
                         }
+                        WALRecord::UpdateRaw { row_id, raw_old, .. } => {
+                            // Undo update = restore old value (decode raw bytes)
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_old) {
+                                let _ = self.version_store.insert_version(
+                                    *row_id, row, txn_id, u64::MAX,
+                                );
+                            }
+                            undo_count += 1;
+                        }
                         WALRecord::Delete { row_id, old_data, .. } => {
                             // Undo delete = re-insert old data
                             let _ = self.version_store.insert_version(
                                 *row_id, old_data.clone(), txn_id, u64::MAX,
                             );
+                            undo_count += 1;
+                        }
+                        WALRecord::DeleteRaw { row_id, raw_old, .. } => {
+                            // Undo delete = re-insert old data (decode raw bytes)
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_old) {
+                                let _ = self.version_store.insert_version(
+                                    *row_id, row, txn_id, u64::MAX,
+                                );
+                            }
                             undo_count += 1;
                         }
                         _ => {}

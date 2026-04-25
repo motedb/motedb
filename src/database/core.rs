@@ -434,32 +434,6 @@ impl MoteDB {
             0
         };
 
-        // Replay WAL records (if any uncommitted changes after last checkpoint)
-        for records in recovered_records.values() {
-            for record in records {
-                match record {
-                    WALRecord::Insert { row_id, data, .. } => {
-                        max_row_id = max_row_id.max(*row_id);
-                        if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
-                            let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
-                        }
-                    }
-                    WALRecord::InsertRaw { row_id, raw_data, .. } => {
-                        max_row_id = max_row_id.max(*row_id);
-                        // Extract timestamp from raw data for index
-                        if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
-                            if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                                let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let timestamp_index = Arc::new(RwLock::new(timestamp_idx));
-
         // Open LSM-Tree storage engine
         std::fs::create_dir_all(&lsm_dir)?;
         // Use edge-optimized LSM config if memtable_size_limit differs from default
@@ -488,6 +462,36 @@ impl MoteDB {
                 }
             }
         }
+
+        // Update timestamp index — only for committed/auto-commit records
+        for records in recovered_records.values() {
+            for record in records {
+                match record {
+                    WALRecord::Insert { row_id, data, txn_id, .. } => {
+                        max_row_id = max_row_id.max(*row_id);
+                        if *txn_id == 0 || committed_txns.contains(txn_id) {
+                            if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
+                                let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                            }
+                        }
+                    }
+                    WALRecord::InsertRaw { row_id, raw_data, txn_id, .. } => {
+                        max_row_id = max_row_id.max(*row_id);
+                        if *txn_id == 0 || committed_txns.contains(txn_id) {
+                            // Extract timestamp from raw data for index
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
+                                if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
+                                    let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let timestamp_index = Arc::new(RwLock::new(timestamp_idx));
 
         // Phase 2: Redo — replay only committed/auto-commit records
         for records in recovered_records.values() {

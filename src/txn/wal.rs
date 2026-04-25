@@ -498,7 +498,7 @@ impl PartitionWAL {
                 Err(e) => return Err(e.into()),
             }
 
-            let _total_len = u32::from_le_bytes(len_buf) as usize;
+            let total_len = u32::from_le_bytes(len_buf) as usize;
 
             // Read header: [u64 lsn][u32 checksum][u32 record_len] = 16 bytes
             let mut header = [0u8; 16];
@@ -529,6 +529,21 @@ impl PartitionWAL {
             // Verify checksum (directly on record_data, no re-serialization)
             if Checksum::verify(ChecksumType::CRC32C, &record_data, checksum).is_err() {
                 corrupted_count += 1;
+                // Seek to next record boundary: total_len includes the 4-byte length prefix
+                // and 16-byte header (lsn+checksum+record_len). We've already read all of those
+                // plus record_data, but record_len may be wrong if the header was corrupted.
+                // Use total_len to seek to the correct position.
+                // We've read 4 (total_len) + 16 (header) = 20 bytes of the frame so far.
+                // The record data portion is total_len - 20 bytes.
+                if total_len > 20 {
+                    let seek_offset = (total_len - 20) as i64 - record_len as i64;
+                    if seek_offset != 0 {
+                        if let Err(e) = file.seek(SeekFrom::Current(seek_offset)) {
+                            debug_log!("WAL open: Failed to seek past corrupted record: {}", e);
+                            break;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -772,7 +787,7 @@ impl PartitionWAL {
                 Err(e) => return Err(e.into()),
             }
 
-            let _total_len = u32::from_le_bytes(len_buf) as usize;
+            let total_len = u32::from_le_bytes(len_buf) as usize;
 
             // Read header: [u64 lsn][u32 checksum][u32 record_len] = 16 bytes
             let mut header = [0u8; 16];
@@ -804,6 +819,17 @@ impl PartitionWAL {
             if let Err(e) = Checksum::verify(ChecksumType::CRC32C, &record_data, checksum) {
                 debug_log!("WAL recovery: Checksum verification failed for LSN {}: {}", lsn, e);
                 skipped_corrupted += 1;
+                // Seek to next record boundary using total_len to correct for
+                // potentially corrupted record_len in the header.
+                if total_len > 20 {
+                    let seek_offset = (total_len - 20) as i64 - record_len as i64;
+                    if seek_offset != 0 {
+                        if let Err(seek_err) = file.seek(SeekFrom::Current(seek_offset)) {
+                            debug_log!("WAL recovery: Failed to seek past corrupted record: {}", seek_err);
+                            break;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -813,6 +839,17 @@ impl PartitionWAL {
                 Err(e) => {
                     debug_log!("WAL recovery: Failed to deserialize record: {}", e);
                     skipped_corrupted += 1;
+                    // Checksum was valid but deser failed — cursor is already past record data,
+                    // but correct using total_len in case record_len was inconsistent.
+                    if total_len > 20 {
+                        let seek_offset = (total_len - 20) as i64 - record_len as i64;
+                        if seek_offset != 0 {
+                            if let Err(seek_err) = file.seek(SeekFrom::Current(seek_offset)) {
+                                debug_log!("WAL recovery: Failed to seek past corrupted record: {}", seek_err);
+                                break;
+                            }
+                        }
+                    }
                     continue;
                 }
             };

@@ -1738,34 +1738,53 @@ impl LSMEngine {
         let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
 
         // Unified lock: memtable + immutable together
+        // Use timestamp-aware merge for MVCC correctness (same as scan_range_batched)
+        let merge_entry = |merged: &mut BTreeMap<Key, Value>, k: Key, entry: &crate::storage::lsm::UnifiedEntry| {
+            let new_val = Value { data: entry.data.clone(), timestamp: entry.timestamp, deleted: entry.deleted };
+            merged.entry(k).and_modify(|existing| {
+                if entry.timestamp > existing.timestamp {
+                    *existing = new_val.clone();
+                }
+            }).or_insert(new_val);
+        };
+
         {
             let memtable = self.memtable.read();
             let immutable = self.immutable.read();
 
             for (k, entry) in memtable.scan(start, end)? {
-                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+                merge_entry(&mut merged, k, &entry);
             }
 
             for mt in immutable.iter() {
                 for (k, entry) in mt.scan(start, end)? {
-                    merged.entry(k).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+                    merge_entry(&mut merged, k, &entry);
                 }
             }
         }
 
-        // Epoch check: re-scan if rotation happened
-        let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
-        if epoch_after != epoch_before {
+        // Epoch check: loop until stable (matches scan_range_streaming pattern)
+        loop {
+            let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+            if epoch_after == epoch_before {
+                break;
+            }
             let memtable = self.memtable.read();
             let immutable = self.immutable.read();
             for (k, entry) in memtable.scan(start, end)? {
-                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+                merge_entry(&mut merged, k, &entry);
             }
             for mt in immutable.iter() {
                 for (k, entry) in mt.scan(start, end)? {
-                    merged.entry(k).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+                    merge_entry(&mut merged, k, &entry);
                 }
             }
+            // Re-read epoch after re-scan to check stability
+            let epoch_final = self.rotation_epoch.load(Ordering::Acquire);
+            if epoch_final == epoch_after {
+                break;
+            }
+            // Epoch changed again during re-scan — loop again
         }
 
         // Parallel SSTable scan
@@ -1921,9 +1940,12 @@ impl LSMEngine {
             }
         }
 
-        // Epoch check: re-scan if rotation happened during snapshot
-        let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
-        if epoch_after != epoch_before {
+        // Epoch check: loop until stable (matches scan_range_streaming pattern)
+        loop {
+            let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+            if epoch_after == epoch_before {
+                break;
+            }
             let memtable = self.memtable.read();
             let immutable = self.immutable.read();
             for (k, entry) in memtable.scan(start, end)? {
@@ -1937,6 +1959,10 @@ impl LSMEngine {
                         }
                     }).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
                 }
+            }
+            let epoch_final = self.rotation_epoch.load(Ordering::Acquire);
+            if epoch_final == epoch_after {
+                break;
             }
         }
 

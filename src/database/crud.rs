@@ -516,8 +516,16 @@ impl MoteDB {
         self.row_cache.invalidate(table_name, row_id);
 
         // 7.1 Decrement row count for COUNT(*) fast path
+        // Guard against underflow on double-delete (counter wraps on u64)
         if let Some(counter) = self.table_row_count.get(table_name) {
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            use std::sync::atomic::Ordering::SeqCst;
+            let mut current = counter.load(SeqCst);
+            while current > 0 {
+                match counter.compare_exchange_weak(current, current - 1, SeqCst, SeqCst) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
         }
 
         // 7.2 Remove from PK lookup cache (prevents stale lookups)
@@ -623,6 +631,11 @@ impl MoteDB {
         
         // Process results
         for (composite_key, value) in lsm_rows {
+            // Skip tombstones (deleted rows)
+            if value.deleted {
+                continue;
+            }
+
             // Extract row_id from composite_key
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
             
@@ -1453,6 +1466,11 @@ impl Iterator for TableRowBatchedIterator {
                 let mut result = Vec::with_capacity(batch.len());
                 
                 for (composite_key, value) in batch {
+                    // Skip tombstones (deleted rows)
+                    if value.deleted {
+                        continue;
+                    }
+
                     // Extract row_id from composite_key
                     let row_id = (composite_key & 0xFFFFFFFF) as RowId;
                     

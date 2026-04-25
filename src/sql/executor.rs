@@ -1144,8 +1144,21 @@ impl QueryExecutor {
                 let lv = Self::eval_expr_simple(left, row)?;
                 let rv = Self::eval_expr_simple(right, row)?;
                 match op {
-                    BinaryOperator::Eq => Ok(Value::Bool(lv == rv)),
-                    BinaryOperator::Ne => Ok(Value::Bool(lv != rv)),
+                    BinaryOperator::Eq => {
+                        // NULL = NULL should return false (SQL standard)
+                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
+                            Ok(Value::Bool(false))
+                        } else {
+                            Ok(Value::Bool(lv == rv))
+                        }
+                    }
+                    BinaryOperator::Ne => {
+                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
+                            Ok(Value::Bool(false))
+                        } else {
+                            Ok(Value::Bool(lv != rv))
+                        }
+                    }
                     BinaryOperator::Lt => Ok(Value::Bool(lv < rv)),
                     BinaryOperator::Le => Ok(Value::Bool(lv <= rv)),
                     BinaryOperator::Gt => Ok(Value::Bool(lv > rv)),
@@ -1181,7 +1194,7 @@ impl QueryExecutor {
                 let has_score = row.keys().any(|k| k.starts_with("__text_score_"));
                 Ok(Value::Bool(has_score))
             }
-            _ => Ok(Value::Bool(true)),
+            _ => Ok(Value::Bool(false)),
         }
     }
 
