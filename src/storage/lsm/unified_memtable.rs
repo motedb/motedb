@@ -4,10 +4,12 @@
 //! - 数据和向量分离存储：DataEntry 只含 row data，无 Option<Vec> 开销
 //! - 向量数据单独 BTreeMap，仅向量表创建
 //! - 集成 FreshVamanaGraph 用于向量搜索
+//! - 16 分片 BTreeMap 减少写入锁竞争
 //!
 //! ## 性能优化
 //! - Arc<DataEntry> 避免每次 get() 的 clone（8 bytes vs 全行 memcpy）
-//! - 非 ACP 表省 24 bytes/row 的 Option<Vec<f32>> 开销
+//! - 非 ACP 表省 24 bytes/row 的 Option<Vec> 开销
+//! - 分片设计：put/get 只锁单个分片，并发写入 ~16x 扩展
 
 use super::{Key, Value, ValueData, LSMConfig};
 use crate::index::fresh_graph::{FreshVamanaGraph, FreshGraphConfig, VectorNode};
@@ -17,6 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+
+const SHARD_COUNT: usize = 16;
+const SHARD_MASK: usize = SHARD_COUNT - 1;
 
 /// Data entry (row data only, no vector overhead)
 #[derive(Clone, Debug)]
@@ -80,10 +85,10 @@ impl From<Arc<DataEntry>> for UnifiedEntry {
     }
 }
 
-/// Unified MemTable (数据 + 向量)
+/// Unified MemTable (数据 + 向量) — 16-shard concurrent design
 pub struct UnifiedMemTable {
-    /// 主存储：row_id → Arc<DataEntry> (Arc avoids clone on get)
-    entries: Arc<RwLock<BTreeMap<Key, Arc<DataEntry>>>>,
+    /// 分片存储：16 个独立 BTreeMap，按 key & 0xF 路由
+    shards: [RwLock<BTreeMap<Key, Arc<DataEntry>>>; SHARD_COUNT],
 
     /// 向量数据 (仅向量表创建，避免非向量表的 Option<Vec> 开销)
     vectors: Option<Arc<RwLock<BTreeMap<Key, Vec<f32>>>>>,
@@ -105,10 +110,15 @@ pub struct UnifiedMemTable {
 }
 
 impl UnifiedMemTable {
+    #[inline]
+    fn shard_index(key: Key) -> usize {
+        (key as usize) & SHARD_MASK
+    }
+
     /// 创建不支持向量的 MemTable（兼容旧代码）
     pub fn new(config: &LSMConfig) -> Self {
         Self {
-            entries: Arc::new(RwLock::new(BTreeMap::new())),
+            shards: core::array::from_fn(|_| RwLock::new(BTreeMap::new())),
             vectors: None,
             vector_graph: None,
             vector_dimension: None,
@@ -132,7 +142,7 @@ impl UnifiedMemTable {
         let vector_graph = FreshVamanaGraph::new(fresh_config, metric);
 
         Self {
-            entries: Arc::new(RwLock::new(BTreeMap::new())),
+            shards: core::array::from_fn(|_| RwLock::new(BTreeMap::new())),
             vectors: Some(Arc::new(RwLock::new(BTreeMap::new()))),
             vector_graph: Some(Arc::new(vector_graph)),
             vector_dimension: Some(dimension),
@@ -181,48 +191,55 @@ impl UnifiedMemTable {
         Ok(())
     }
 
-    /// Internal insert with Arc
+    /// Internal insert with Arc — single shard lock
     fn insert_entry(&self, key: Key, entry: Arc<DataEntry>) -> Result<()> {
         let entry_size = entry.memory_size();
 
-        let mut entries = self.entries.write();
+        let mut shard = self.shards[Self::shard_index(key)].write();
 
-        if let Some(old_entry) = entries.get(&key) {
+        if let Some(old_entry) = shard.get(&key) {
             let old_size = old_entry.memory_size();
             self.size.fetch_sub(old_size, Ordering::Relaxed);
         }
 
-        entries.insert(key, entry);
+        shard.insert(key, entry);
         self.size.fetch_add(entry_size, Ordering::Relaxed);
         self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
 
-    /// Batch insert (single lock acquisition)
+    /// Batch insert (grouped by shard for minimal lock contention)
     pub fn batch_put(&self, kvs: &[(Key, Value)]) -> Result<()> {
         if kvs.is_empty() {
             return Ok(());
         }
 
-        let mut entries = self.entries.write();
-        let mut total_size_change: i64 = 0;
-
+        // Group by shard
+        let mut groups: [Vec<(Key, Arc<DataEntry>)>; SHARD_COUNT] = core::array::from_fn(|_| Vec::new());
         for (key, value) in kvs {
             let entry = Arc::new(DataEntry {
                 data: value.data.clone(),
                 timestamp: value.timestamp,
                 deleted: value.deleted,
             });
+            groups[Self::shard_index(*key)].push((*key, entry));
+        }
 
-            let entry_size = entry.memory_size();
-
-            if let Some(old_entry) = entries.get(key) {
-                total_size_change -= old_entry.memory_size() as i64;
+        let mut total_size_change: i64 = 0;
+        for (shard_idx, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
             }
-
-            entries.insert(*key, entry);
-            total_size_change += entry_size as i64;
+            let mut shard = self.shards[shard_idx].write();
+            for (key, entry) in group {
+                let entry_size = entry.memory_size();
+                if let Some(old_entry) = shard.get(&key) {
+                    total_size_change -= old_entry.memory_size() as i64;
+                }
+                shard.insert(key, entry);
+                total_size_change += entry_size as i64;
+            }
         }
 
         if total_size_change > 0 {
@@ -235,10 +252,10 @@ impl UnifiedMemTable {
         Ok(())
     }
 
-    /// Get data — returns UnifiedEntry for compatibility (Arc clone + optional vector lookup)
+    /// Get data — single shard read lock
     pub fn get(&self, key: Key) -> Result<Option<UnifiedEntry>> {
-        let entries = self.entries.read();
-        let Some(arc_entry) = entries.get(&key) else {
+        let shard = self.shards[Self::shard_index(key)].read();
+        let Some(arc_entry) = shard.get(&key) else {
             return Ok(None);
         };
 
@@ -254,7 +271,7 @@ impl UnifiedMemTable {
         }))
     }
 
-    /// Delete (insert tombstone)
+    /// Delete (insert tombstone) — single shard write lock
     pub fn delete(&self, key: Key, timestamp: u64) -> Result<()> {
         let entry = Arc::new(DataEntry {
             data: ValueData::Inline(Vec::new()),
@@ -262,14 +279,14 @@ impl UnifiedMemTable {
             deleted: true,
         });
 
-        let mut entries = self.entries.write();
+        let mut shard = self.shards[Self::shard_index(key)].write();
 
-        if let Some(old_entry) = entries.get(&key) {
+        if let Some(old_entry) = shard.get(&key) {
             self.size.fetch_sub(old_entry.memory_size(), Ordering::Relaxed);
         }
 
         let entry_size = entry.memory_size();
-        entries.insert(key, entry);
+        shard.insert(key, entry);
         self.size.fetch_add(entry_size, Ordering::Relaxed);
 
         // Remove vector if present
@@ -280,10 +297,15 @@ impl UnifiedMemTable {
         Ok(())
     }
 
-    /// Get all keys in [start, end] range (for range delete)
+    /// Get all keys in [start, end] range — merge from all shards
     pub fn keys_in_range(&self, start: Key, end: Key) -> Vec<Key> {
-        let entries = self.entries.read();
-        entries.range(start..=end).map(|(k, _)| *k).collect()
+        let mut all_keys = Vec::new();
+        for shard in &self.shards {
+            let s = shard.read();
+            all_keys.extend(s.range(start..end).map(|(k, _)| *k));
+        }
+        all_keys.sort();
+        all_keys
     }
 
     pub fn should_flush(&self) -> bool {
@@ -300,14 +322,14 @@ impl UnifiedMemTable {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.read().len()
+        self.shards.iter().map(|s| s.read().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.shards.iter().all(|s| s.read().is_empty())
     }
 
-    /// Vector search (in-memory graph)
+    /// Vector search (in-memory graph) — per-key single shard lookup
     pub fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<(Key, UnifiedEntry, f32)>> {
         let graph = self.vector_graph.as_ref()
             .ok_or_else(|| StorageError::Index("Vector search not supported".into()))?;
@@ -315,12 +337,12 @@ impl UnifiedMemTable {
         let ef = k * 5;
         let candidates = graph.search(query, k, ef)?;
 
-        let entries = self.entries.read();
         let vec_map = self.vectors.as_ref();
 
         let mut results = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            if let Some(arc_entry) = entries.get(&candidate.id) {
+            let shard = self.shards[Self::shard_index(candidate.id)].read();
+            if let Some(arc_entry) = shard.get(&candidate.id) {
                 if !arc_entry.deleted {
                     let vector = vec_map.and_then(|vm| vm.read().get(&candidate.id).cloned());
                     results.push((candidate.id, UnifiedEntry {
@@ -337,15 +359,39 @@ impl UnifiedMemTable {
     }
 
     pub fn iter(&self) -> UnifiedMemTableIterator {
-        UnifiedMemTableIterator::new(self.entries.clone(), self.vectors.clone())
+        let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
+        for shard in &self.shards {
+            let s = shard.read();
+            all.extend(s.iter().map(|(k, v)| (*k, Arc::clone(v))));
+        }
+        all.sort_by_key(|(k, _)| *k);
+
+        let vec_map = self.vectors.clone();
+        let items: Vec<(Key, UnifiedEntry)> = all.into_iter().map(|(k, arc)| {
+            let vector = vec_map.as_ref().and_then(|vm| vm.read().get(&k).cloned());
+            (k, UnifiedEntry {
+                data: arc.data.clone(),
+                vector,
+                timestamp: arc.timestamp,
+                deleted: arc.deleted,
+            })
+        }).collect();
+
+        UnifiedMemTableIterator { entries: items.into_iter() }
     }
 
     pub fn snapshot(&self) -> Vec<(Key, UnifiedEntry)> {
-        let entries = self.entries.read();
+        let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
+        for shard in &self.shards {
+            let s = shard.read();
+            all.extend(s.iter().map(|(k, v)| (*k, Arc::clone(v))));
+        }
+        all.sort_by_key(|(k, _)| *k);
+
         let vec_map = self.vectors.as_ref();
-        entries.iter().map(|(k, arc)| {
-            let vector = vec_map.and_then(|vm| vm.read().get(k).cloned());
-            (*k, UnifiedEntry {
+        all.into_iter().map(|(k, arc)| {
+            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+            (k, UnifiedEntry {
                 data: arc.data.clone(),
                 vector,
                 timestamp: arc.timestamp,
@@ -354,49 +400,53 @@ impl UnifiedMemTable {
         }).collect()
     }
 
-    /// Range scan
+    /// Range scan — merge ranges from all shards
     pub fn scan(&self, start: Key, end: Key) -> Result<Vec<(Key, UnifiedEntry)>> {
-        let entries = self.entries.read();
+        let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
+        for shard in &self.shards {
+            let s = shard.read();
+            use std::ops::Bound;
+            let range = s.range((
+                Bound::Included(&start),
+                Bound::Excluded(&end)
+            ));
+            all.extend(range.map(|(k, v)| (*k, Arc::clone(v))));
+        }
+        all.sort_by_key(|(k, _)| *k);
+
         let vec_map = self.vectors.as_ref();
-
-        use std::ops::Bound;
-        let range = entries.range((
-            Bound::Included(&start),
-            Bound::Excluded(&end)
-        ));
-
-        let estimated_size = ((end - start) as usize).min(1000);
-        let mut results = Vec::with_capacity(estimated_size);
-
-        for (k, arc) in range {
-            let vector = vec_map.and_then(|vm| vm.read().get(k).cloned());
-            results.push((*k, UnifiedEntry {
+        let results: Vec<(Key, UnifiedEntry)> = all.into_iter().map(|(k, arc)| {
+            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+            (k, UnifiedEntry {
                 data: arc.data.clone(),
                 vector,
                 timestamp: arc.timestamp,
                 deleted: arc.deleted,
-            }));
-        }
+            })
+        }).collect();
 
         Ok(results)
     }
 
-    /// Full table scan
+    /// Full table scan — merge from all shards
     pub fn scan_all(&self) -> Result<Vec<(Key, UnifiedEntry)>> {
-        let entries = self.entries.read();
+        let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
+        for shard in &self.shards {
+            let s = shard.read();
+            all.extend(s.iter().map(|(k, v)| (*k, Arc::clone(v))));
+        }
+        all.sort_by_key(|(k, _)| *k);
+
         let vec_map = self.vectors.as_ref();
-
-        let mut results = Vec::with_capacity(entries.len());
-
-        for (k, arc) in entries.iter() {
-            let vector = vec_map.and_then(|vm| vm.read().get(k).cloned());
-            results.push((*k, UnifiedEntry {
+        let results: Vec<(Key, UnifiedEntry)> = all.into_iter().map(|(k, arc)| {
+            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+            (k, UnifiedEntry {
                 data: arc.data.clone(),
                 vector,
                 timestamp: arc.timestamp,
                 deleted: arc.deleted,
-            }));
-        }
+            })
+        }).collect();
 
         Ok(results)
     }
@@ -415,23 +465,6 @@ impl UnifiedMemTable {
 /// Unified MemTable Iterator
 pub struct UnifiedMemTableIterator {
     entries: std::vec::IntoIter<(Key, UnifiedEntry)>,
-}
-
-impl UnifiedMemTableIterator {
-    pub fn new(entries: Arc<RwLock<BTreeMap<Key, Arc<DataEntry>>>>, vectors: Option<Arc<RwLock<BTreeMap<Key, Vec<f32>>>>>) -> Self {
-        let entries_guard = entries.read();
-        let vec_map = vectors.as_ref();
-        let items: Vec<(Key, UnifiedEntry)> = entries_guard.iter().map(|(k, arc)| {
-            let vector = vec_map.and_then(|vm| vm.read().get(k).cloned());
-            (*k, UnifiedEntry {
-                data: arc.data.clone(),
-                vector,
-                timestamp: arc.timestamp,
-                deleted: arc.deleted,
-            })
-        }).collect();
-        Self { entries: items.into_iter() }
-    }
 }
 
 impl Iterator for UnifiedMemTableIterator {
@@ -523,7 +556,6 @@ mod tests {
         assert!(size_after > 0);
         debug_log!("Memory size: {} bytes", size_after);
 
-        // DataEntry(4 data + 16 meta) = 20, no vector overhead
         assert!((15..=30).contains(&size_after));
     }
 
@@ -559,6 +591,70 @@ mod tests {
             let entry = memtable.get(i).unwrap().unwrap();
             assert_eq!(entry.vector, None);
             assert_eq!(entry.timestamp, i);
+        }
+    }
+
+    #[test]
+    fn test_shard_distribution() {
+        let memtable = create_memtable();
+        for i in 0..160u64 {
+            let value = Value::new(format!("v_{}", i).into_bytes(), i);
+            memtable.put(i, value).unwrap();
+        }
+        // All 16 shards should have entries
+        for (i, shard) in memtable.shards.iter().enumerate() {
+            let len = shard.read().len();
+            assert!(len > 0, "Shard {} is empty", i);
+        }
+        assert_eq!(memtable.len(), 160);
+    }
+
+    #[test]
+    fn test_scan_ordering() {
+        let memtable = create_memtable();
+        // Insert in non-sequential order
+        for i in [50, 10, 99, 1, 77, 23, 42] {
+            let value = Value::new(format!("v_{}", i).into_bytes(), i);
+            memtable.put(i, value).unwrap();
+        }
+        let result = memtable.scan(0, 100).unwrap();
+        let keys: Vec<Key> = result.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![1, 10, 23, 42, 50, 77, 99]);
+    }
+
+    #[test]
+    fn test_concurrent_puts() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let memtable = Arc::new(create_memtable());
+        let mut handles = Vec::new();
+
+        for t in 0..4 {
+            let mt = Arc::clone(&memtable);
+            handles.push(thread::spawn(move || {
+                let base = t * 1000;
+                for i in 0..1000 {
+                    let key = base + i;
+                    let value = Value::new(format!("t{}_{}", t, i).into_bytes(), key);
+                    mt.put(key, value).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(memtable.len(), 4000);
+
+        // Verify all entries readable
+        for t in 0..4 {
+            for i in 0..1000 {
+                let key = t * 1000 + i;
+                let entry = memtable.get(key).unwrap().unwrap();
+                assert_eq!(entry.timestamp, key);
+            }
         }
     }
 }

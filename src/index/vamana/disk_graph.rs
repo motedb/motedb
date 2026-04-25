@@ -7,6 +7,7 @@
 use crate::types::RowId;
 use crate::{Result, StorageError};
 use lru::LruCache;
+use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -24,10 +25,15 @@ pub struct DiskGraph {
     max_degree: usize,
     file: Arc<RwLock<File>>,
 
+    /// mmap of graph.bin — zero-syscall neighbor reads
+    mmap: Arc<RwLock<Option<Mmap>>>,
+    /// mmap of graph.idx sidecar — zero-syscall offset lookups
+    idx_mmap: Arc<RwLock<Option<Mmap>>>,
+
     /// Bounded offset index: row_id → file offset (LRU-capped)
     index: Arc<RwLock<LruCache<RowId, u64>>>,
 
-    /// Sidecar index file for binary search on LRU miss
+    /// Sidecar index file handle (fallback when mmap unavailable)
     index_file: Arc<RwLock<File>>,
     index_count: Arc<RwLock<u64>>,
     /// Tracked count of nodes (incremental on set/remove)
@@ -86,6 +92,8 @@ impl DiskGraph {
         Ok(Self {
             max_degree,
             file: Arc::new(RwLock::new(file)),
+            mmap: Arc::new(RwLock::new(None)),
+            idx_mmap: Arc::new(RwLock::new(None)),
             index: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
@@ -153,11 +161,17 @@ impl DiskGraph {
 
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
+        let rw_file = OpenOptions::new().read(true).write(true).open(&file_path).map_err(StorageError::Io)?;
+
+        // mmap data file and sidecar for zero-syscall reads
+        let data_mmap = unsafe { Mmap::map(&rw_file).ok() };
+        let idx_mmap = unsafe { Mmap::map(&idx_read).ok() };
+
         Ok(Self {
             max_degree,
-            file: Arc::new(RwLock::new(
-                OpenOptions::new().read(true).write(true).open(&file_path).map_err(StorageError::Io)?
-            )),
+            file: Arc::new(RwLock::new(rw_file)),
+            mmap: Arc::new(RwLock::new(data_mmap)),
+            idx_mmap: Arc::new(RwLock::new(idx_mmap)),
             index: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
@@ -232,7 +246,7 @@ impl DiskGraph {
         Ok(count)
     }
 
-    /// Look up file offset: LRU → binary search on sidecar
+    /// Look up file offset: LRU → mmap binary search → sidecar file fallback
     fn lookup_offset(&self, node_id: RowId) -> Option<u64> {
         {
             let mut index = self.index.write();
@@ -244,6 +258,36 @@ impl DiskGraph {
         let count = *self.index_count.read();
         if count == 0 { return None; }
 
+        // Try mmap path first (zero syscall)
+        {
+            let guard = self.idx_mmap.read();
+            if let Some(ref mmap) = *guard {
+                let entry_size = 16usize;
+                let mut lo = 0i64;
+                let mut hi = count as i64 - 1;
+
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let off = 8 + mid as usize * entry_size;
+                    if off + 16 > mmap.len() { break; }
+                    let mid_id = u64::from_le_bytes(mmap[off..off+8].try_into().ok()?);
+                    let mid_offset = u64::from_le_bytes(mmap[off+8..off+16].try_into().ok()?);
+
+                    match mid_id.cmp(&node_id) {
+                        std::cmp::Ordering::Equal => {
+                            drop(guard);
+                            self.index.write().put(node_id, mid_offset);
+                            return Some(mid_offset);
+                        }
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid - 1,
+                    }
+                }
+                return None;
+            }
+        }
+
+        // Fallback: seek+read on sidecar file
         let mut file = self.index_file.write();
         let entry_size = 16u64;
         let mut lo = 0i64;
@@ -483,6 +527,9 @@ impl DiskGraph {
             *self.index_file.write() = idx_read;
         }
 
+        // Remap after flush
+        self.remap();
+
         *self.dirty.write() = false;
         Ok(())
     }
@@ -543,6 +590,9 @@ impl DiskGraph {
         // Clear LRU index (offsets changed)
         self.index.write().clear();
 
+        // Remap after compact
+        self.remap();
+
         *self.dirty.write() = false;
         Ok(())
     }
@@ -568,6 +618,18 @@ impl DiskGraph {
     }
 
     // --- Private helpers ---
+
+    /// Remap data and sidecar files after flush/compact
+    fn remap(&self) {
+        {
+            let file = self.file.read();
+            *self.mmap.write() = unsafe { Mmap::map(&*file).ok() };
+        }
+        {
+            let idx = self.index_file.read();
+            *self.idx_mmap.write() = unsafe { Mmap::map(&*idx).ok() };
+        }
+    }
 
     fn write_header(file: &mut File, max_degree: usize, node_count: usize) -> Result<()> {
         file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
@@ -610,6 +672,31 @@ impl DiskGraph {
     }
 
     fn read_neighbors_at(&self, offset: u64) -> Result<Vec<RowId>> {
+        // Try mmap path (zero syscall)
+        {
+            let guard = self.mmap.read();
+            if let Some(ref mmap) = *guard {
+                let off = offset as usize;
+                if off + 12 > mmap.len() {
+                    return Err(StorageError::InvalidData("Graph mmap offset out of bounds".into()));
+                }
+                let _node_id = u64::from_le_bytes(mmap[off..off+8].try_into().unwrap());
+                let count = u32::from_le_bytes(mmap[off+8..off+12].try_into().unwrap()) as usize;
+                let neighbors_start = off + 12;
+                let neighbors_end = neighbors_start + count * 8;
+                if neighbors_end > mmap.len() {
+                    return Err(StorageError::InvalidData("Graph mmap neighbor data out of bounds".into()));
+                }
+                let mut neighbors = Vec::with_capacity(count);
+                for i in 0..count {
+                    let n_off = neighbors_start + i * 8;
+                    neighbors.push(u64::from_le_bytes(mmap[n_off..n_off+8].try_into().unwrap()));
+                }
+                return Ok(neighbors);
+            }
+        }
+
+        // Fallback: seek+read
         let mut file = self.file.write();
         file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
         let mut buf8 = [0u8; 8];

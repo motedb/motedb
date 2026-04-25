@@ -15,13 +15,17 @@
 //!
 //! Run: cargo test --test bench_comprehensive --release -- --nocapture --test-threads=1
 
-use motedb::Database;
+use motedb::{Database, DBConfig};
 use tempfile::TempDir;
 use std::time::Instant;
 
+fn edge_config() -> DBConfig {
+    DBConfig::for_edge()
+}
+
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
-    let db = Database::create(dir.path()).expect("create db");
+    let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
     (db, dir)
 }
 
@@ -259,7 +263,7 @@ fn bench_auto_increment_recovery() {
 
     // Phase 1: Create, insert, checkpoint (persist counter)
     {
-        let db = Database::create(&db_path).expect("create db");
+        let db = Database::create_with_config(&db_path, edge_config()).expect("create db");
         exec(&db, "CREATE TABLE t5 (id INTEGER PRIMARY KEY, data TEXT)");
 
         for i in 1..=N as i64 {
@@ -274,7 +278,7 @@ fn bench_auto_increment_recovery() {
     // Phase 2: Reopen — should use O(1) catalog recovery
     let reopen_ms = {
         let start = Instant::now();
-        let db = Database::open(&db_path).expect("open db");
+        let db = Database::open_with_config(&db_path, edge_config()).expect("open db");
         let elapsed = start.elapsed().as_millis() as u64;
 
         // Verify counter works — next insert should continue from N+1
@@ -478,7 +482,7 @@ fn bench_wal_recovery() {
 
     // Phase 1: Create, insert, flush (but don't checkpoint WAL)
     {
-        let db = Database::create(&db_path).expect("create db");
+        let db = Database::create_with_config(&db_path, edge_config()).expect("create db");
         exec(&db, "CREATE TABLE t9 (id INTEGER PRIMARY KEY, data TEXT, value INTEGER)");
         for i in 1..=N as i64 {
             exec(&db, &format!("INSERT INTO t9 VALUES ({}, 'data_{}', {})", i, i, i * 10));
@@ -493,7 +497,7 @@ fn bench_wal_recovery() {
     // Phase 2: Reopen — WAL recovery
     let reopen_ms = {
         let start = Instant::now();
-        let db = Database::open(&db_path).expect("open db");
+        let db = Database::open_with_config(&db_path, edge_config()).expect("open db");
 
         // Verify data integrity
         let result = exec(&db, "SELECT COUNT(*) AS cnt FROM t9");
@@ -576,7 +580,7 @@ fn bench_e2e_lifecycle() {
 
     // Phase 1: Insert
     {
-        let db = Database::create(&db_path).expect("create db");
+        let db = Database::create_with_config(&db_path, edge_config()).expect("create db");
         exec(&db, "CREATE TABLE lifecycle (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, ts INTEGER)");
 
         let start = Instant::now();
@@ -607,7 +611,7 @@ fn bench_e2e_lifecycle() {
 
     // Phase 4: Reopen + query
     let reopen_start = Instant::now();
-    let db = Database::open(&db_path).expect("open db");
+    let db = Database::open_with_config(&db_path, edge_config()).expect("open db");
     let reopen_ms = reopen_start.elapsed().as_millis() as u64;
     print_result("Phase 4: Reopen", 1, reopen_ms);
 

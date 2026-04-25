@@ -314,6 +314,13 @@ impl ExprEvaluator {
     }
     
     fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+        // SQL NULL semantics: any comparison with NULL yields false (not NULL).
+        // This prevents `WHERE col = NULL` from matching rows and
+        // `DELETE WHERE col = NULL` from deleting unintended rows.
+        if matches!(&left, Value::Null) || matches!(&right, Value::Null) {
+            return Ok(Value::Bool(false));
+        }
+
         match op {
             BinaryOperator::Eq => Ok(Value::Bool(left == right)),
             BinaryOperator::Ne => Ok(Value::Bool(left != right)),

@@ -173,6 +173,16 @@ impl Level {
             let meta = self.sstables.remove(idx);
             self.total_size = self.total_size.saturating_sub(meta.size);
         }
+        // Also remove from sublevels (L0 tiered compaction metadata)
+        if self.level == 0 {
+            if let Some(ref mut sublevels) = self.sublevels {
+                for sublevel in sublevels.iter_mut() {
+                    if let Some(idx) = sublevel.sstables.iter().position(|s| s.path == path) {
+                        sublevel.sstables.remove(idx);
+                    }
+                }
+            }
+        }
     }
     
     /// Check if compaction is needed
@@ -222,16 +232,8 @@ impl Level {
     /// Select SSTables for compaction
     pub fn select_for_compaction(&self, config: &LSMConfig) -> Vec<SSTableMeta> {
         if self.level == 0 {
-            // Tiered compaction: select from sublevel
-            if let Some(sublevel_idx) = self.get_sublevel_to_compact() {
-                if let Some(ref sublevels) = self.sublevels {
-                    if sublevel_idx < sublevels.len() {
-                        return sublevels[sublevel_idx].sstables.clone();
-                    }
-                }
-            }
-            
-            // Fallback: compact all overlapping files (legacy)
+            // Use all L0 SSTables for regular compaction.
+            // Tiered sublevel selection is disabled due to a data-loss bug.
             self.sstables.clone()
         } else {
             // L1+: select oldest/largest files
@@ -303,6 +305,9 @@ pub struct CompactionWorker {
     /// Readers access this via cheap Arc clone (no Mutex contention).
     /// Updated atomically after register_sstable() and run_compaction().
     sstable_snapshot: RwLock<Option<Arc<Vec<SSTableMeta>>>>,
+
+    /// Shared epoch counter (bumped on compaction) so scans can detect SSTable changes.
+    compaction_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CompactionWorker {
@@ -323,6 +328,7 @@ impl CompactionWorker {
             post_compaction_cb: Arc::new(std::sync::RwLock::new(None)),
             pending_deletions: Mutex::new(Vec::new()),
             sstable_snapshot: RwLock::new(None),
+            compaction_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Discover existing SSTables on disk
@@ -356,23 +362,42 @@ impl CompactionWorker {
                     0
                 };
 
-                // Read metadata from SSTable footer
-                match crate::storage::lsm::sstable::SSTable::read_metadata(&path) {
-                    Ok((num_entries, min_timestamp, file_size)) => {
+                // Read metadata with real min/max keys from index block
+                match crate::storage::lsm::sstable::SSTable::read_metadata_with_keys(&path) {
+                    Ok((num_entries, min_timestamp, file_size, min_key, max_key)) => {
                         let meta = SSTableMeta {
                             path: path.clone(),
                             size: file_size,
                             num_entries,
-                            min_key: 0,
-                            max_key: u64::MAX,
+                            min_key,
+                            max_key,
                             min_timestamp,
-                            max_timestamp: min_timestamp, // Use min as approximation
-                            bloom_filter: None, // Loaded lazily via SSTableCache
+                            max_timestamp: min_timestamp,
+                            bloom_filter: None,
                         };
                         discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
                     }
                     Err(e) => {
-                        debug_log!("[CompactionWorker] Warning: skipping corrupt SSTable {:?}: {:?}", path, e);
+                        // Fall back to read_metadata without keys (corrupt index but valid footer)
+                        debug_log!("[CompactionWorker] Warning: failed to read keys from {:?}: {:?}, trying footer-only", path, e);
+                        match crate::storage::lsm::sstable::SSTable::read_metadata(&path) {
+                            Ok((num_entries, min_timestamp, file_size)) => {
+                                let meta = SSTableMeta {
+                                    path: path.clone(),
+                                    size: file_size,
+                                    num_entries,
+                                    min_key: 0,
+                                    max_key: u64::MAX,
+                                    min_timestamp,
+                                    max_timestamp: min_timestamp,
+                                    bloom_filter: None,
+                                };
+                                discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
+                            }
+                            Err(e2) => {
+                                debug_log!("[CompactionWorker] Warning: skipping corrupt SSTable {:?}: {:?}", path, e2);
+                            }
+                        }
                     }
                 }
             }
@@ -489,6 +514,11 @@ impl CompactionWorker {
         *snap = None;
     }
     
+    /// Access the compaction epoch (for scan consistency checks)
+    pub fn compaction_epoch(&self) -> &Arc<std::sync::atomic::AtomicU64> {
+        &self.compaction_epoch
+    }
+
     /// Run one round of compaction
     pub fn run_compaction(&self) -> Result<()> {
         // Flush deferred deletions from previous compaction cycle
@@ -504,12 +534,16 @@ impl CompactionWorker {
         };
         
         // ✨ Special handling for L0 tiered compaction
-        if level_idx == 0 {
-            if let Some(sublevel_idx) = levels[0].get_sublevel_to_compact() {
-                drop(levels);  // Release lock before I/O
-                return self.run_tiered_compaction(sublevel_idx);
-            }
-        }
+        // DISABLED: Tiered compaction has a data-loss bug where incremental_merge batches
+        // don't cross-reference overlapping SSTables in other sublevels, causing rows to be
+        // silently dropped during merge. Falls through to the regular compaction path which
+        // correctly handles all overlapping SSTables.
+        // if level_idx == 0 {
+        //     if let Some(sublevel_idx) = levels[0].get_sublevel_to_compact() {
+        //         drop(levels);  // Release lock before I/O
+        //         return self.run_tiered_compaction(sublevel_idx);
+        //     }
+        // }
         
         if level_idx >= levels.len() - 1 {
             return Ok(());  // Last level, can't compact further
@@ -551,6 +585,9 @@ impl CompactionWorker {
         let output_meta = self.merge_sstables(level_idx + 1, &valid_sources, &valid_overlapping)?;
         
         // Update levels
+        // Invalidate snapshot BEFORE modifying levels so that concurrent scans
+        // don't get a stale cached snapshot with removed SSTables.
+        self.invalidate_snapshot();
         let mut levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
@@ -610,6 +647,9 @@ impl CompactionWorker {
         // 🚀 Invalidate snapshot so next read rebuilds it
         self.invalidate_snapshot();
 
+        // Bump compaction epoch so in-flight scans detect SSTable changes
+        self.compaction_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+
         // Selectively evict only removed SSTables from cache (not a full clear)
         self.invoke_post_compaction(&removed_paths);
 
@@ -625,158 +665,157 @@ impl CompactionWorker {
         sources: &[SSTableMeta],
         overlapping: &[SSTableMeta],
     ) -> Result<SSTableMeta> {
-        // Open all input SSTables
+        let rate_limit = self.config.lsm_config.compaction_rate_limit.unwrap_or(u64::MAX);
+        let yield_interval = self.config.lsm_config.compaction_yield_every_n_blocks;
+
+        // Open ALL input SSTables. Skipping any input causes data loss because
+        // run_compaction removes all source+overlapping SSTables from metadata
+        // regardless of whether they were included in the merge output.
         let mut all_inputs = Vec::new();
-        for meta in sources.iter().chain(overlapping.iter()) {
+        let all_sources: Vec<&SSTableMeta> = sources.iter().chain(overlapping.iter()).collect();
+
+        for meta in &all_sources {
             match SSTable::open(&meta.path) {
                 Ok(sstable) => all_inputs.push(sstable),
                 Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // File disappeared between filter and open (rare race condition)
                     debug_log!("⚠️ SSTable disappeared during open: {:?}", meta.path);
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
-        
+
         if all_inputs.is_empty() {
-            // All files disappeared - should not happen since we pre-filtered
             return Err(StorageError::Index(
                 "All input SSTables disappeared during compaction".into()
             ));
         }
-        
+
         // Generate output file path
         let stats = self.stats.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         let output_id = stats.num_compactions;
         let output_path = self.storage_dir.join(format!("l{}_{:06}.sst", output_level, output_id));
-        drop(stats); // 🔧 Release lock early
-        
-        // 🔧 Streaming merge: Use iterator merge instead of BTreeMap
-        // This avoids loading all data into memory at once
-        
-        // Step 1: Collect all iterators
+        drop(stats);
+
+        // Streaming merge
         let mut iters: Vec<_> = all_inputs.into_iter()
             .filter_map(|mut sst| sst.iter().ok())
             .collect();
-        
+
         if iters.is_empty() {
             return Err(StorageError::Index("No valid iterators for compaction".into()));
         }
-        
-        // Step 2: Use a conservative estimate (we don't know exact count without iterating)
-        let estimated_size = sources.len() + overlapping.len() * 1000; // Conservative guess
-        
-        // Build output SSTable using streaming merge
+
+        let estimated_size = sources.len() + overlapping.len() * 1000;
         let mut builder = SSTableBuilder::new(&output_path, self.config.lsm_config.clone(), estimated_size)?;
-        
-        // 🔧 Multi-way merge-sort with priority queue
+
+        // Multi-way merge-sort with priority queue
         use std::collections::BinaryHeap;
-        
+
         #[derive(Debug, Clone)]
         struct MergeEntry {
             key: u64,
             value: super::Value,
             iter_idx: usize,
         }
-        
+
         impl Eq for MergeEntry {}
         impl PartialEq for MergeEntry {
             fn eq(&self, other: &Self) -> bool {
                 self.key == other.key && self.iter_idx == other.iter_idx
             }
         }
-        
+
         impl Ord for MergeEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                // Min-heap: smallest key first
-                other.key.cmp(&self.key)
+                other.key.cmp(&self.key) // min-heap
             }
         }
-        
+
         impl PartialOrd for MergeEntry {
             fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
                 Some(self.cmp(other))
             }
         }
-        
-        // Initialize heap with first entry from each iterator
+
         let mut heap = BinaryHeap::new();
         for (idx, iter) in iters.iter_mut().enumerate() {
             if let Some((key, value)) = iter.next() {
-                heap.push(MergeEntry {
-                    key,
-                    value,
-                    iter_idx: idx,
-                });
+                heap.push(MergeEntry { key, value, iter_idx: idx });
             }
         }
-        
-        // Tombstone TTL (timestamp is in microseconds since epoch)
+
         let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as u64;
-        let tombstone_ttl_micros: u64 = 86_400 * 1_000_000; // 24 hours in microseconds
+        let tombstone_ttl_micros: u64 = 86_400 * 1_000_000;
 
-        // Merge-sort with deduplication
         let mut last_key: Option<u64> = None;
         let mut last_value: Option<super::Value> = None;
+        let mut entries_written: u64 = 0;
+        let merge_start = std::time::Instant::now();
+        let mut _bytes_written: u64 = 0;
 
         while let Some(entry) = heap.pop() {
-            // Check if this is a duplicate key
             if Some(entry.key) == last_key {
-                // Keep entry with highest timestamp (newest version wins)
                 if let Some(ref mut last) = last_value {
                     if entry.value.timestamp > last.timestamp {
                         *last = entry.value;
                     }
                 }
             } else {
-                // Write previous key (if exists)
                 if let (Some(key), Some(value)) = (last_key, last_value.take()) {
-                    // Skip tombstones older than TTL
                     if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                         builder.add(key, value)?;
+                        entries_written += 1;
+
+                        // Throttle: rate limit + cooperative yield
+                        if entries_written % 100 == 0 {
+                            // Estimate bytes written (rough: ~50B per entry)
+                            _bytes_written = entries_written * 50;
+                            let elapsed = merge_start.elapsed().as_secs_f64();
+                            let expected = _bytes_written as f64 / rate_limit as f64;
+                            if elapsed < expected {
+                                std::thread::sleep(std::time::Duration::from_secs_f64(expected - elapsed));
+                            }
+                            // Cooperative yield every yield_interval * 100 entries
+                            if (entries_written / 100) % yield_interval as u64 == 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
                     }
                 }
 
-                // Start tracking new key
                 last_key = Some(entry.key);
                 last_value = Some(entry.value);
             }
-            
-            // Fetch next entry from this iterator
+
             if let Some((key, value)) = iters[entry.iter_idx].next() {
-                heap.push(MergeEntry {
-                    key,
-                    value,
-                    iter_idx: entry.iter_idx,
-                });
+                heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
             }
         }
-        
+
         // Write final key
         if let (Some(key), Some(value)) = (last_key, last_value) {
             if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                 builder.add(key, value)?;
             }
         }
-        
+
         let output_meta = builder.finish()?;
-        
-        // Update write stats
+
         let mut stats = self.stats.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         stats.bytes_written += output_meta.size;
         if stats.bytes_read > 0 {
             stats.write_amplification = stats.bytes_written as f64 / stats.bytes_read as f64;
         }
-        
+
         Ok(output_meta)
     }
-    
+
     /// Get compaction statistics
     pub fn stats(&self) -> Result<CompactionStats> {
         let stats = self.stats.lock()
@@ -816,10 +855,11 @@ impl CompactionWorker {
     /// - L0.0 → L0.1: Merge 2 files → 1 file (small, fast)
     /// - L0.1 → L0.2: Merge 3 files → 1 file (medium)
     /// - L0.2 → L1: Merge 3 files + overlapping L1 → L1 (full merge)
+    #[allow(dead_code)]
     fn run_tiered_compaction(&self, sublevel_idx: usize) -> Result<()> {
         let levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
+
         let sources = if let Some(ref sublevels) = levels[0].sublevels {
             if sublevel_idx >= sublevels.len() {
                 return Ok(());
@@ -828,9 +868,9 @@ impl CompactionWorker {
         } else {
             return Ok(());  // No tiered structure
         };
-        
+
         drop(levels);  // Release lock during I/O
-        
+
         // ✅ Check file existence
         let valid_sources: Vec<_> = sources.iter()
             .filter(|s| s.path.exists())
@@ -874,7 +914,8 @@ impl CompactionWorker {
             // Merge to L1
             let output_meta = self.merge_sstables(1, &valid_sources, &valid_overlapping)?;
 
-            // Update levels
+            // Update levels — invalidate snapshot first
+            self.invalidate_snapshot();
             let mut levels = self.levels.lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
@@ -905,7 +946,8 @@ impl CompactionWorker {
             // ✨ Incremental merge to next sublevel (P2 Phase 3.2)
             let output_metas = self.incremental_merge(&valid_sources, sublevel_idx)?;
 
-            // Update sublevels
+            // Update sublevels — invalidate snapshot first
+            self.invalidate_snapshot();
             let mut levels = self.levels.lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
@@ -923,15 +965,14 @@ impl CompactionWorker {
                 }
             }
 
-            // Update main list (separate from sublevels borrow)
-            for meta in output_metas {
-                levels[0].sstables.push(meta);
-            }
-
-            // Remove source files (deferred)
+            // Update main list — remove old sources, add merged outputs
             for source in &valid_sources {
+                levels[0].remove_sstable(&source.path);
                 removed_paths.push(source.path.clone());
                 self.defer_deletion(source.path.clone());
+            }
+            for meta in output_metas {
+                levels[0].sstables.push(meta);
             }
         }
 
@@ -972,6 +1013,7 @@ impl CompactionWorker {
     /// - Split into batches of 2
     /// - Merge each batch independently
     /// - Reduces single-merge data volume by 50%
+    #[allow(dead_code)]
     fn incremental_merge(&self, sources: &[SSTableMeta], sublevel: usize) -> Result<Vec<SSTableMeta>> {
         const BATCH_SIZE: usize = 2;
         
@@ -986,6 +1028,7 @@ impl CompactionWorker {
     }
     
     /// Merge a small batch of SSTables (for incremental compaction)
+    #[allow(dead_code)]
     fn merge_sstables_incremental(
         &self,
         sublevel: usize,

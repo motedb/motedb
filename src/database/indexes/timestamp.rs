@@ -3,7 +3,7 @@
 //! Extracted from database_legacy.rs
 //! Provides timestamp range query and index rebuild functionality
 
-use crate::types::{Row, RowId};
+use crate::types::RowId;
 use crate::Result;
 
 use crate::database::core::MoteDB;
@@ -76,7 +76,7 @@ impl MoteDB {
                     }
                 };
 
-                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
+                if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
                     if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
                         let ts_micros = ts.as_micros() as u64;
                         if ts_micros > max_indexed_ts {

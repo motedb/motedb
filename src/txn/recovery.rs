@@ -113,8 +113,11 @@ impl RecoveryManager {
                         active_txns.remove(txn_id);
                     }
                     WALRecord::Insert { txn_id, .. }
+                    | WALRecord::InsertRaw { txn_id, .. }
                     | WALRecord::Update { txn_id, .. }
-                    | WALRecord::Delete { txn_id, .. } => {
+                    | WALRecord::UpdateRaw { txn_id, .. }
+                    | WALRecord::Delete { txn_id, .. }
+                    | WALRecord::DeleteRaw { txn_id, .. } => {
                         // Associate data record with its transaction
                         if *txn_id != 0 && active_txns.contains_key(txn_id) {
                             if let Some(ops) = active_txns.get_mut(txn_id) {
@@ -175,14 +178,12 @@ impl RecoveryManager {
                     current_txn = None;
                 }
                 WALRecord::Insert { row_id, data, .. } => {
-                    // Only redo if transaction committed
                     if let Some(txn_id) = current_txn {
                         if analysis.committed_txns.contains(&txn_id) {
                             let commit_ts = analysis.commit_timestamps
                                 .get(&txn_id)
                                 .copied()
                                 .unwrap_or(0);
-                            
                             self.version_store.insert_version(
                                 *row_id,
                                 data.clone(),
@@ -193,6 +194,25 @@ impl RecoveryManager {
                         }
                     }
                 }
+                WALRecord::InsertRaw { row_id, raw_data, .. } => {
+                    if let Some(txn_id) = current_txn {
+                        if analysis.committed_txns.contains(&txn_id) {
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
+                                let commit_ts = analysis.commit_timestamps
+                                    .get(&txn_id)
+                                    .copied()
+                                    .unwrap_or(0);
+                                self.version_store.insert_version(
+                                    *row_id,
+                                    row,
+                                    txn_id,
+                                    commit_ts,
+                                )?;
+                                redo_count += 1;
+                            }
+                        }
+                    }
+                }
                 WALRecord::Update { row_id, new_data, .. } => {
                     if let Some(txn_id) = current_txn {
                         if analysis.committed_txns.contains(&txn_id) {
@@ -200,7 +220,6 @@ impl RecoveryManager {
                                 .get(&txn_id)
                                 .copied()
                                 .unwrap_or(0);
-                            
                             self.version_store.insert_version(
                                 *row_id,
                                 new_data.clone(),
@@ -211,14 +230,33 @@ impl RecoveryManager {
                         }
                     }
                 }
-                WALRecord::Delete { row_id, .. } => {
+                WALRecord::UpdateRaw { row_id, raw_new, .. } => {
+                    if let Some(txn_id) = current_txn {
+                        if analysis.committed_txns.contains(&txn_id) {
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_new) {
+                                let commit_ts = analysis.commit_timestamps
+                                    .get(&txn_id)
+                                    .copied()
+                                    .unwrap_or(0);
+                                self.version_store.insert_version(
+                                    *row_id,
+                                    row,
+                                    txn_id,
+                                    commit_ts,
+                                )?;
+                                redo_count += 1;
+                            }
+                        }
+                    }
+                }
+                WALRecord::Delete { row_id, .. }
+                | WALRecord::DeleteRaw { row_id, .. } => {
                     if let Some(txn_id) = current_txn {
                         if analysis.committed_txns.contains(&txn_id) {
                             let commit_ts = analysis.commit_timestamps
                                 .get(&txn_id)
                                 .copied()
                                 .unwrap_or(0);
-                            
                             self.version_store.delete_version(
                                 *row_id,
                                 txn_id,
@@ -269,8 +307,11 @@ impl RecoveryManager {
                     current_txn = None;
                 }
                 WALRecord::Insert { .. }
+                | WALRecord::InsertRaw { .. }
                 | WALRecord::Update { .. }
-                | WALRecord::Delete { .. } => {
+                | WALRecord::UpdateRaw { .. }
+                | WALRecord::Delete { .. }
+                | WALRecord::DeleteRaw { .. } => {
                     if let Some(txn_id) = current_txn {
                         txn_operations
                             .entry(txn_id)

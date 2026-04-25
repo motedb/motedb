@@ -619,7 +619,7 @@ impl DBConfig {
                 ..Default::default()
             },
             row_cache_size: Some(500),
-            pk_lookup_capacity: 10_000,  // ~800KB per table
+            pk_lookup_capacity: 50_000,  // ~4MB per table, covers most edge datasets
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
@@ -653,7 +653,7 @@ impl DBConfig {
                 ..Default::default()
             },
             row_cache_size: Some(500),
-            pk_lookup_capacity: 10_000,
+            pk_lookup_capacity: 50_000,
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
                 min_interval_secs: 60,

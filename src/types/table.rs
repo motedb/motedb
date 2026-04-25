@@ -213,6 +213,9 @@ pub struct TableSchema {
     /// 🚀 Cached column names (avoids cloning N Strings per SELECT *)
     #[serde(skip)]
     pub column_names_cache: Option<Arc<Vec<String>>>,
+    /// 🚀 Cached column types (avoids cloning Vec<ColumnType> per insert/select)
+    #[serde(skip)]
+    pub cached_col_types: Vec<ColumnType>,
     /// Table type (Standard or TimeSeries)
     #[serde(default)]
     pub table_type: TableType,
@@ -232,6 +235,9 @@ impl TableSchema {
             column_map.insert(col.name.clone(), col.position);
         }
 
+        let cached_col_types: Vec<ColumnType> = columns.iter().map(|c| c.col_type.clone()).collect();
+        let column_names_cache = Arc::new(columns.iter().map(|c| c.name.clone()).collect::<Vec<String>>());
+
         Self {
             name,
             columns,
@@ -240,22 +246,27 @@ impl TableSchema {
             primary_key_auto_increment: false,
             auto_increment_start: None,
             column_map,
-            column_names_cache: None,
+            column_names_cache: Some(column_names_cache),
+            cached_col_types,
             table_type: TableType::Standard,
             timeseries_column: None,
             ttl: None,
         }
     }
 
-    /// Get cached column names (zero-alloc after first build)
-    ///
-    /// Returns Vec<String> clone. The cache is lazily built on first call.
-    /// Safe for concurrent use: the Option is only set once (None → Some).
+    /// Get cached column names as Arc (cheap Arc clone).
+    pub fn column_names_arc(&self) -> Arc<Vec<String>> {
+        match self.column_names_cache {
+            Some(ref cache) => Arc::clone(cache),
+            None => Arc::new(self.columns.iter().map(|c| c.name.clone()).collect()),
+        }
+    }
+
+    /// Get cached column names as Vec<String> (clone).
     pub fn column_names(&self) -> Vec<String> {
         if let Some(ref cache) = self.column_names_cache {
             return (**cache).clone();
         }
-        // Fallback: build on the fly (only happens before rebuild_column_map)
         self.columns.iter().map(|c| c.name.clone()).collect()
     }
     
@@ -343,6 +354,11 @@ impl TableSchema {
         self.columns.len()
     }
 
+    /// Get cached column types slice (zero-alloc)
+    pub fn col_types(&self) -> &[ColumnType] {
+        &self.cached_col_types
+    }
+
     /// Rebuild column map (call after deserialization)
     pub fn rebuild_column_map(&mut self) {
         self.column_map.clear();
@@ -352,6 +368,8 @@ impl TableSchema {
         // 🚀 Rebuild column names cache
         let names: Vec<String> = self.columns.iter().map(|c| c.name.clone()).collect();
         self.column_names_cache = Some(Arc::new(names));
+        // Rebuild cached column types
+        self.cached_col_types = self.columns.iter().map(|c| c.col_type.clone()).collect();
     }
 
     /// Validate a row against this schema
@@ -368,7 +386,7 @@ impl TableSchema {
             let value = &row[i];
             
             // Check null constraint
-            if !col.nullable && matches!(value, crate::types::Value::Text(t) if t.is_empty()) {
+            if !col.nullable && matches!(value, crate::types::Value::Null) {
                 return Err(format!("Column '{}' cannot be null", col.name));
             }
 

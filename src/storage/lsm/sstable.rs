@@ -18,12 +18,14 @@
 //! - Compression: 2.5-3:1 ratio (Snappy on 64KB blocks)
 //! - Block size: 64KB
 
-use super::{Key, Value, BloomFilter, LSMConfig, ValueData, BlobRef};
+use super::{Key, Value, BloomFilter, LSMConfig, ValueData, BlobRef, CompressionAlgorithm};
 use crate::{Result, StorageError};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom, BufWriter, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use memmap2::Mmap;
 
 /// Magic number for SSTable files (ASCII "LSMT")
 const SSTABLE_MAGIC: u32 = 0x4C534D54;
@@ -35,16 +37,20 @@ const SSTABLE_VERSION: u32 = 1;
 pub struct SSTable {
     /// File path
     path: PathBuf,
-    
-    /// File handle
+
+    /// mmap of the entire file (preferred read path — zero syscall)
+    mmap: Option<Mmap>,
+
+    /// Underlying file handle — kept alive to hold the mmap mapping valid
+    #[allow(dead_code)]
     file: File,
-    
+
     /// Block index (first_key -> offset)
     index: BlockIndex,
-    
+
     /// Bloom filter
     bloom: BloomFilter,
-    
+
     /// Footer metadata
     footer: Footer,
 }
@@ -71,6 +77,41 @@ struct Footer {
 }
 
 impl SSTable {
+    /// Read metadata from an SSTable file including min/max keys.
+    /// Used during startup to discover existing SSTables with correct key ranges.
+    pub fn read_metadata_with_keys<P: AsRef<Path>>(path: P) -> Result<(u64, u64, u64, Key, Key)> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(path)?;
+        let footer = Self::read_footer(&mut file)?;
+        let file_size = file.metadata()?.len();
+
+        // Read index block to extract min key.
+        // min_key = first entry of first block (accurate).
+        // max_key = first entry of last block, which is a *lower bound* for the
+        // actual max key (the last block contains keys >= this value).
+        // We cannot get the true max key without parsing the last data block,
+        // so we add 1 to make max_key exclusive — but since the get() range check
+        // uses `key > meta.max_key`, adding 1 would still miss the very last key.
+        // Instead, use u64::MAX for max_key (conservative) and rely on bloom filter.
+        let (min_key, max_key) = if footer.index_size > 0 {
+            file.seek(SeekFrom::Start(footer.index_offset))?;
+            let mut index_buf = vec![0u8; footer.index_size as usize];
+            file.read_exact(&mut index_buf)?;
+            match BlockIndex::deserialize(&index_buf) {
+                Ok(idx) if !idx.entries.is_empty() => {
+                    (idx.entries[0].0, u64::MAX)
+                }
+                _ => (0u64, u64::MAX),
+            }
+        } else {
+            (0u64, u64::MAX)
+        };
+
+        Ok((footer.num_entries, footer.min_timestamp, file_size, min_key, max_key))
+    }
+
     /// Read only metadata from an SSTable file (without loading index/bloom)
     /// Used during startup to discover existing SSTables.
     pub fn read_metadata<P: AsRef<Path>>(path: P) -> Result<(u64, u64, u64)> {
@@ -89,25 +130,29 @@ impl SSTable {
         let mut file = OpenOptions::new()
             .read(true)
             .open(&path)?;
-        
+
         // Read footer
         let footer = Self::read_footer(&mut file)?;
-        
+
         // Read index
         file.seek(SeekFrom::Start(footer.index_offset))?;
         let mut index_buf = vec![0u8; footer.index_size as usize];
         file.read_exact(&mut index_buf)?;
         let index = BlockIndex::deserialize(&index_buf)?;
-        
+
         // Read bloom filter
         file.seek(SeekFrom::Start(footer.bloom_offset))?;
         let mut bloom_buf = vec![0u8; footer.bloom_size as usize];
         file.read_exact(&mut bloom_buf)?;
         let bloom = BloomFilter::from_bytes_full(&bloom_buf)
             .ok_or_else(|| StorageError::InvalidData("Invalid Bloom filter".into()))?;
-        
+
+        // mmap the file for zero-syscall block reads
+        let mmap = unsafe { Mmap::map(&file).ok() };
+
         Ok(Self {
             path,
+            mmap,
             file,
             index,
             bloom,
@@ -121,16 +166,26 @@ impl SSTable {
     }
 
     /// Read a block from disk, verify CRC32, return the data portion (without CRC).
-    /// Block format on disk: [block_data] [crc32: 4 bytes LE]
-    fn read_block(&mut self, offset: u64, size: u32) -> Result<Vec<u8>> {
+    /// Uses mmap when available (zero syscall), falls back to seek+read.
+    fn read_block(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
         if size < 4 {
             return Err(crate::StorageError::InvalidData(
                 format!("Block too small at offset {}: {} bytes", offset, size)
             ));
         }
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; size as usize];
-        self.file.read_exact(&mut buf)?;
+
+        let buf: &[u8] = if let Some(ref mmap) = self.mmap {
+            let end = offset as usize + size as usize;
+            if end > mmap.len() {
+                return Err(crate::StorageError::InvalidData(
+                    format!("Block extends beyond mmap: offset {} + size {} > {}", offset, size, mmap.len())
+                ));
+            }
+            &mmap[offset as usize..end]
+        } else {
+            // Fallback: seek+read (mmap should succeed on real files; this path is for robustness)
+            return Self::read_block_fallback(&self.path, offset, size);
+        };
 
         // Split data and CRC
         let data_len = buf.len() - 4;
@@ -148,27 +203,164 @@ impl SSTable {
         Ok(data.to_vec())
     }
 
-    /// Get a value by key (assumes bloom check was already done externally)
-    pub fn get(&mut self, key: Key) -> Result<Option<Value>> {
-        // Convert u64 key to bytes for bloom filter and block search
+    /// Fallback block read via seek+read (used only when mmap unavailable)
+    fn read_block_fallback(path: &Path, offset: u64, size: u32) -> Result<Vec<u8>> {
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; size as usize];
+        file.read_exact(&mut buf)?;
+
+        let data_len = buf.len() - 4;
+        let data = &buf[..data_len];
+        let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+
+        let computed_crc = crc32fast::hash(data);
+        if stored_crc != computed_crc {
+            return Err(crate::StorageError::InvalidData(
+                format!("CRC32 mismatch at offset {}: expected {:08x}, got {:08x}. Data may be corrupted!",
+                    offset, stored_crc, computed_crc)
+            ));
+        }
+
+        Ok(data.to_vec())
+    }
+
+    /// Get a value by key (assumes bloom check was already done externally).
+    ///
+    /// Optimized: binary searches on raw block bytes, only deserializes the
+    /// single matching entry instead of all entries in the block.
+    pub fn get(&self, key: Key) -> Result<Option<Value>> {
         let key_bytes = key.to_be_bytes();
-        
-        // Fast negative lookup
+
         if !self.bloom.may_contain(&key_bytes) {
             return Ok(None);
         }
-        
-        // Binary search in index
+
         let block_entry = match self.index.find_block(&key_bytes) {
             Some(entry) => entry,
             None => return Ok(None),
         };
-        
-        // Read and search block (with CRC verification)
+
         let block_buf = self.read_block(block_entry.1, block_entry.2)?;
-        
-        let block = DataBlock::deserialize(&block_buf)?;
-        Ok(block.get(&key_bytes))
+        Self::get_from_block_data(&block_buf, &key_bytes)
+    }
+
+    /// Search a single key in raw block data without full deserialization.
+    /// Uses stack-allocated key-offset array and early termination.
+    fn get_from_block_data(data: &[u8], key_bytes: &[u8]) -> Result<Option<Value>> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+
+        // Decompress if needed
+        let uncompressed: Vec<u8>;
+        let buf: &[u8] = match data[0] {
+            0 => &data[1..],
+            1 => {
+                // Snappy
+                let mut decoder = snap::raw::Decoder::new();
+                uncompressed = decoder.decompress_vec(&data[1..])
+                    .map_err(|e| crate::StorageError::Io(std::io::Error::other(
+                        format!("Snappy decompression failed: {}", e)
+                    )))?;
+                &uncompressed
+            }
+            2 => {
+                // Zstd
+                uncompressed = zstd::bulk::decompress(&data[1..], 1024 * 1024)
+                    .map_err(|e| crate::StorageError::Io(std::io::Error::other(
+                        format!("Zstd decompression failed: {}", e)
+                    )))?;
+                &uncompressed
+            }
+            _ => &data[1..],
+        };
+
+        if buf.len() < 4 {
+            return Ok(None);
+        }
+        let num_entries = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+
+        let target_key = u64::from_be_bytes([
+            key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
+            key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
+        ]);
+
+        // Heap-allocated key-offset pairs (a 64KB block can hold ~2800 entries
+        // with minimal values — the old stack array of 256 silently dropped keys
+        // beyond that limit, causing data loss on point queries).
+        let mut key_offsets: Vec<(u64, usize)> = Vec::with_capacity(num_entries);
+        let mut off = 4usize;
+
+        for _ in 0..num_entries {
+            if off + 8 > buf.len() { break; }
+            let k = u64::from_be_bytes([
+                buf[off], buf[off+1], buf[off+2], buf[off+3],
+                buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+            ]);
+
+            key_offsets.push((k, off));
+            off += 8;
+
+            // Skip timestamp (8) + deleted (1) + value_type (1)
+            off += 10;
+            if off > buf.len() { break; }
+            let value_type = buf[off - 1];
+            match value_type {
+                0 => {
+                    if off + 4 > buf.len() { break; }
+                    let vlen = u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as usize;
+                    off += 4 + vlen;
+                }
+                1 => { off += 16; }
+                _ => { break; }
+            }
+        }
+
+        // Binary search
+        let found = key_offsets.binary_search_by_key(&target_key, |(k, _)| *k);
+        match found {
+            Ok(idx) => {
+                let entry_off = key_offsets[idx].1;
+                let mut pos = entry_off + 8;
+                if pos + 10 > buf.len() { return Ok(None); }
+                let timestamp = u64::from_le_bytes([
+                    buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+                    buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                ]);
+                pos += 8;
+                let deleted = buf[pos] != 0;
+                pos += 1;
+                let value_type = buf[pos];
+                pos += 1;
+
+                let value_data = match value_type {
+                    0 => {
+                        if pos + 4 > buf.len() { return Ok(None); }
+                        let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                        pos += 4;
+                        if pos + vlen > buf.len() { return Ok(None); }
+                        ValueData::Inline(buf[pos..pos+vlen].to_vec())
+                    }
+                    1 => {
+                        if pos + 16 > buf.len() { return Ok(None); }
+                        let file_id = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                        pos += 4;
+                        let blob_offset = u64::from_le_bytes([
+                            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+                            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                        ]);
+                        pos += 8;
+                        let size = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                        ValueData::Blob(BlobRef { file_id, offset: blob_offset, size })
+                    }
+                    _ => return Ok(None),
+                };
+
+                Ok(Some(Value { data: value_data, timestamp, deleted }))
+            }
+            Err(_) => Ok(None),
+        }
     }
     
     /// 🚀 P3: 批量查询（使用批量 Bloom Filter 检查）
@@ -187,7 +379,7 @@ impl SSTable {
     /// let keys = vec![key1, key2, key3];
     /// let results = sstable.batch_get(&keys)?;
     /// ```
-    pub fn batch_get(&mut self, keys: &[Key]) -> Result<Vec<Option<Value>>> {
+    pub fn batch_get(&self, keys: &[Key]) -> Result<Vec<Option<Value>>> {
         let mut results = vec![None; keys.len()];
         
         // Step 1: 🚀 批量 Bloom Filter 检查（快速过滤）
@@ -225,7 +417,7 @@ impl SSTable {
     }
     
     /// Scan a range [start, end)
-    pub fn scan(&mut self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
+    pub fn scan(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
         // 🚀 P3 优化：预分配容量（估算范围大小）
         let estimated_size = ((end - start) as usize).min(1000);
         let mut results = Vec::with_capacity(estimated_size);
@@ -504,7 +696,10 @@ impl SSTableBuilder {
             .ok_or_else(|| StorageError::InvalidData("Empty block".into()))?;
         
         // Serialize with compression
-        let block_data = self.current_block.serialize_compressed(self.config.enable_compression)?;
+        let block_data = self.current_block.serialize_compressed(
+            self.config.enable_compression,
+            self.config.compression_algorithm,
+        )?;
         let block_size = block_data.len() as u32;
         
         // Record in index (block_size includes CRC)
@@ -602,35 +797,55 @@ impl DataBlock {
         Ok(buf)
     }
     
-    fn serialize_compressed(&self, enable_compression: bool) -> Result<Vec<u8>> {
+    fn serialize_compressed(&self, enable_compression: bool, algorithm: CompressionAlgorithm) -> Result<Vec<u8>> {
         let uncompressed = self.serialize()?;
-        
+
         if !enable_compression || uncompressed.len() < 1024 {
-            // Very small blocks: compression overhead > benefit
-            // Prepend flag: 0 = uncompressed
-            let mut result = vec![0u8];
+            let mut result = vec![0u8]; // flag 0 = uncompressed
             result.extend_from_slice(&uncompressed);
             return Ok(result);
         }
-        
-        // Snappy compression
-        let mut encoder = snap::raw::Encoder::new();
-        let compressed = encoder.compress_vec(&uncompressed)
-            .map_err(|e| StorageError::Io(std::io::Error::other(
-                format!("Compression failed: {}", e)
-            )))?;
-        
-        // Only use compressed if it's actually smaller
-        if compressed.len() < uncompressed.len() {
-            // Prepend flag: 1 = compressed
-            let mut result = vec![1u8];
-            result.extend_from_slice(&compressed);
-            Ok(result)
-        } else {
-            // Prepend flag: 0 = uncompressed
-            let mut result = vec![0u8];
-            result.extend_from_slice(&uncompressed);
-            Ok(result)
+
+        match algorithm {
+            CompressionAlgorithm::Zstd => {
+                let level = 1; // fast level
+                let compressed = zstd::bulk::compress(&uncompressed, level)
+                    .map_err(|e| StorageError::Io(std::io::Error::other(
+                        format!("Zstd compression failed: {}", e)
+                    )))?;
+
+                if compressed.len() < uncompressed.len() {
+                    let mut result = vec![2u8]; // flag 2 = zstd
+                    result.extend_from_slice(&compressed);
+                    Ok(result)
+                } else {
+                    let mut result = vec![0u8];
+                    result.extend_from_slice(&uncompressed);
+                    Ok(result)
+                }
+            }
+            CompressionAlgorithm::Snappy => {
+                let mut encoder = snap::raw::Encoder::new();
+                let compressed = encoder.compress_vec(&uncompressed)
+                    .map_err(|e| StorageError::Io(std::io::Error::other(
+                        format!("Snappy compression failed: {}", e)
+                    )))?;
+
+                if compressed.len() < uncompressed.len() {
+                    let mut result = vec![1u8]; // flag 1 = snappy
+                    result.extend_from_slice(&compressed);
+                    Ok(result)
+                } else {
+                    let mut result = vec![0u8];
+                    result.extend_from_slice(&uncompressed);
+                    Ok(result)
+                }
+            }
+            CompressionAlgorithm::None => {
+                let mut result = vec![0u8];
+                result.extend_from_slice(&uncompressed);
+                Ok(result)
+            }
         }
     }
     
@@ -644,16 +859,20 @@ impl DataBlock {
         let actual_data = &data[1..];
         
         let uncompressed = match compression_flag {
-            0 => {
-                // Uncompressed
-                actual_data.to_vec()
-            }
+            0 => actual_data.to_vec(),
             1 => {
-                // Compressed with Snappy
+                // Snappy
                 let mut decoder = snap::raw::Decoder::new();
                 decoder.decompress_vec(actual_data)
                     .map_err(|e| StorageError::Io(std::io::Error::other(
-                        format!("Decompression failed: {}", e)
+                        format!("Snappy decompression failed: {}", e)
+                    )))?
+            }
+            2 => {
+                // Zstd — use generous max output size (block size + overhead)
+                zstd::bulk::decompress(actual_data, 1024 * 1024)
+                    .map_err(|e| StorageError::Io(std::io::Error::other(
+                        format!("Zstd decompression failed: {}", e)
                     )))?
             }
             _ => {
@@ -996,7 +1215,7 @@ pub struct SSTableIterator {
 }
 
 impl SSTableIterator {
-    fn new(sstable: &mut SSTable) -> Result<Self> {
+    fn new(sstable: &SSTable) -> Result<Self> {
         // Clone file handle for independent reading
         let file = BufReader::new(
             File::open(&sstable.path)

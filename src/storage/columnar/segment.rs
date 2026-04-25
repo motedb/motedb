@@ -42,6 +42,7 @@
 //! ```
 
 use crate::{Result, StorageError};
+use memmap2::Mmap;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -438,7 +439,7 @@ impl SegmentBuilder {
 // ==================== SegmentReader ====================
 
 /// Reads an existing columnar segment file.
-/// P2: Caches the file handle to avoid opening on every column read.
+/// Uses mmap for zero-syscall column reads on immutable segment files.
 pub struct SegmentReader {
     path: PathBuf,
     header: SegmentHeader,
@@ -449,7 +450,9 @@ pub struct SegmentReader {
     stats_block_offset: u64,
     /// Offset to bloom filter block (0 if none).
     bloom_block_offset: u64,
-    /// Cached file handle (P2: avoids reopen per column read).
+    /// mmap of the entire segment file (zero-syscall reads).
+    mmap: Option<Mmap>,
+    /// Cached file handle (fallback when mmap unavailable).
     file: Mutex<std::fs::File>,
 }
 
@@ -553,6 +556,9 @@ impl SegmentReader {
                 (col_offsets, min_rid, max_rid, stats_off, bloom_off)
             };
 
+        // mmap for zero-syscall column reads
+        let mmap = unsafe { Mmap::map(&file).ok() };
+
         Ok(Self {
             path: path.to_path_buf(),
             header,
@@ -561,6 +567,7 @@ impl SegmentReader {
             max_row_id,
             stats_block_offset,
             bloom_block_offset,
+            mmap,
             file: Mutex::new(file),
         })
     }
@@ -595,7 +602,7 @@ impl SegmentReader {
     }
 
     /// Read a single column's data (column projection).
-    /// P2: Uses cached file handle instead of opening per call.
+    /// Uses mmap for zero-syscall reads, falls back to seek+read.
     pub fn read_column(&self, column_id: u16) -> Result<ColumnBlock> {
         let idx = column_id as usize;
         if idx >= self.column_offsets.len() {
@@ -604,11 +611,49 @@ impl SegmentReader {
             )));
         }
 
+        // Try mmap path (zero syscall)
+        if let Some(ref mmap) = self.mmap {
+            let off = self.column_offsets[idx] as usize;
+            if off + COLUMN_BLOCK_HEADER_SIZE > mmap.len() {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+            let cb_header = &mmap[off..off + COLUMN_BLOCK_HEADER_SIZE];
+
+            let stored_col_id = u16::from_le_bytes(cb_header[0..2].try_into().unwrap());
+            debug_assert_eq!(stored_col_id, column_id);
+
+            let encoding = ColumnEncoding::try_from(cb_header[2])?;
+            let uncompressed_size = u32::from_le_bytes(cb_header[3..7].try_into().unwrap());
+            let compressed_size = u32::from_le_bytes(cb_header[7..11].try_into().unwrap());
+            let null_count = u32::from_le_bytes(cb_header[11..15].try_into().unwrap());
+            let stored_crc = u32::from_le_bytes(cb_header[15..19].try_into().unwrap());
+
+            let data_start = off + COLUMN_BLOCK_HEADER_SIZE;
+            let data_end = data_start + compressed_size as usize;
+            if data_end > mmap.len() {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+            let data = mmap[data_start..data_end].to_vec();
+
+            let computed_crc = crc32fast::hash(&data);
+            if stored_crc != computed_crc {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+
+            return Ok(ColumnBlock {
+                column_id,
+                encoding,
+                uncompressed_size,
+                data,
+                null_count,
+            });
+        }
+
+        // Fallback: seek+read
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(self.column_offsets[idx]))
             .map_err(StorageError::Io)?;
 
-        // Read column block header
         let mut cb_header = [0u8; COLUMN_BLOCK_HEADER_SIZE];
         file.read_exact(&mut cb_header).map_err(StorageError::Io)?;
 
@@ -621,11 +666,9 @@ impl SegmentReader {
         let null_count = u32::from_le_bytes(cb_header[11..15].try_into().unwrap());
         let stored_crc = u32::from_le_bytes(cb_header[15..19].try_into().unwrap());
 
-        // Read compressed data
         let mut data = vec![0u8; compressed_size as usize];
         file.read_exact(&mut data).map_err(StorageError::Io)?;
 
-        // Verify CRC
         let computed_crc = crc32fast::hash(&data);
         if stored_crc != computed_crc {
             return Err(StorageError::CorruptedFile(self.path.clone()));
@@ -656,21 +699,60 @@ impl SegmentReader {
             return Ok(None);
         }
 
+        // Try mmap path
+        if let Some(ref mmap) = self.mmap {
+            let off = self.stats_block_offset as usize;
+            if off + 4 > mmap.len() {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+            let buf = &mmap[off..off+4];
+            let num_stats = u32::from_le_bytes(buf.try_into().unwrap()) as usize;
+
+            let stats_data_size = num_stats * ColumnStatistics::SERIALIZED_SIZE;
+            let total_needed = 4 + stats_data_size + 4; // num_stats + data + CRC
+            if off + total_needed > mmap.len() {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+
+            let stats_buf = &mmap[off+4..off+4+stats_data_size+4];
+
+            // Verify CRC
+            let mut crc_input = Vec::with_capacity(4 + stats_data_size);
+            crc_input.extend_from_slice(buf);
+            crc_input.extend_from_slice(&stats_buf[..stats_data_size]);
+            let stored_crc = u32::from_le_bytes(
+                stats_buf[stats_data_size..stats_data_size+4].try_into().unwrap()
+            );
+            let computed_crc = crc32fast::hash(&crc_input);
+            if stored_crc != computed_crc {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+
+            let mut stats = Vec::with_capacity(num_stats);
+            for i in 0..num_stats {
+                let s_off = i * ColumnStatistics::SERIALIZED_SIZE;
+                if let Some(stat) = ColumnStatistics::from_bytes(
+                    &stats_buf[s_off..s_off + ColumnStatistics::SERIALIZED_SIZE]
+                ) {
+                    stats.push(stat);
+                }
+            }
+            return Ok(Some(stats));
+        }
+
+        // Fallback: seek+read
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(self.stats_block_offset))
             .map_err(StorageError::Io)?;
 
-        // Read num_stats (u32)
         let mut buf = [0u8; 4];
         file.read_exact(&mut buf).map_err(StorageError::Io)?;
         let num_stats = u32::from_le_bytes(buf) as usize;
 
-        // Read stats data + CRC
         let stats_data_size = num_stats * ColumnStatistics::SERIALIZED_SIZE;
-        let mut stats_buf = vec![0u8; stats_data_size + 4]; // +4 for CRC
+        let mut stats_buf = vec![0u8; stats_data_size + 4];
         file.read_exact(&mut stats_buf).map_err(StorageError::Io)?;
 
-        // Verify CRC (over num_stats + stats data, which is buf + stats_data)
         let mut crc_input = Vec::with_capacity(4 + stats_data_size);
         crc_input.extend_from_slice(&buf);
         crc_input.extend_from_slice(&stats_buf[..stats_data_size]);
@@ -682,7 +764,6 @@ impl SegmentReader {
             return Err(StorageError::CorruptedFile(self.path.clone()));
         }
 
-        // Parse statistics
         let mut stats = Vec::with_capacity(num_stats);
         for i in 0..num_stats {
             let offset = i * ColumnStatistics::SERIALIZED_SIZE;
@@ -704,6 +785,47 @@ impl SegmentReader {
             return Ok(None);
         }
 
+        // Try mmap path
+        if let Some(ref mmap) = self.mmap {
+            let off = self.bloom_block_offset as usize;
+            if off + 4 > mmap.len() {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+            let block_len = u32::from_le_bytes(mmap[off..off+4].try_into().unwrap()) as usize;
+            if block_len < 4 || off + 4 + block_len > mmap.len() {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+            let block_buf = &mmap[off+4..off+4+block_len];
+
+            let data_len = block_len - 4;
+            let stored_crc = u32::from_le_bytes(
+                block_buf[data_len..data_len+4].try_into().unwrap()
+            );
+            let computed_crc = crc32fast::hash(&block_buf[..data_len]);
+            if stored_crc != computed_crc {
+                return Err(StorageError::CorruptedFile(self.path.clone()));
+            }
+
+            let mut cursor = 0usize;
+            if data_len < 2 { return Ok(None); }
+            let num_filters = u16::from_le_bytes(block_buf[cursor..cursor+2].try_into().unwrap()) as usize;
+            cursor += 2;
+
+            let mut filters = HashMap::new();
+            for _ in 0..num_filters {
+                if cursor + 6 > data_len { break; }
+                let col_id = u16::from_le_bytes(block_buf[cursor..cursor+2].try_into().unwrap());
+                cursor += 2;
+                let filter_len = u32::from_le_bytes(block_buf[cursor..cursor+4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + filter_len > data_len { break; }
+                filters.insert(col_id, block_buf[cursor..cursor+filter_len].to_vec());
+                cursor += filter_len;
+            }
+            return Ok(Some(filters));
+        }
+
+        // Fallback: seek+read
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(self.bloom_block_offset))
             .map_err(StorageError::Io)?;

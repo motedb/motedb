@@ -4,7 +4,7 @@
 //! Provides column value indexing for WHERE clause optimization
 
 use crate::database::core::MoteDB;
-use crate::types::{Row, RowId, Value};
+use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
 use crate::index::column_value::{ColumnValueIndex, ColumnValueIndexConfig};
 use parking_lot::RwLock;
@@ -105,7 +105,7 @@ impl MoteDB {
                                     }
                                 };
                                 
-                                if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
+                                if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
                                     if let Some(value) = row.get(col_position) {
                                         if let Err(e) = index_arc.write().insert(value, row_id) {
                                             debug_log!("[create_column_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);

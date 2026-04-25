@@ -126,64 +126,92 @@ impl Value {
 }
 
 /// LSM-Tree configuration
-#[derive(Clone, Debug)]
+
+/// Compression algorithm for SSTable blocks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionAlgorithm {
+    #[default]
+    Zstd,
+    Snappy,
+    None,
+}
+
+#[derive(Debug, Clone)]
 pub struct LSMConfig {
     /// MemTable size threshold (default 4MB)
     pub memtable_size: usize,
-    
+
     /// SSTable block size (default 64KB)
     pub block_size: usize,
-    
+
     /// Number of levels (default 7)
     pub num_levels: usize,
-    
+
     /// Level size multiplier (default 10)
     pub level_multiplier: usize,
-    
+
     /// L0 compaction trigger (default 4 files)
     pub l0_compaction_trigger: usize,
-    
+
     /// Bloom filter bits per key (default 10)
     pub bloom_bits_per_key: usize,
-    
+
     /// Enable compression (default true)
     pub enable_compression: bool,
-    
+
+    /// Compression algorithm (default Zstd)
+    pub compression_algorithm: CompressionAlgorithm,
+
+    /// Zstd compression level (default 1, range -7..22)
+    pub zstd_compression_level: i32,
+
     /// Blob threshold: values larger than this go to blob files (default 32KB)
     pub blob_threshold: usize,
-    
+
     /// Blob file size limit (default 256MB)
     pub blob_file_size: usize,
-    
-    /// 🆕 SSTable cache size (number of cached SSTable handles, default 8)
+
+    /// SSTable cache size (number of cached SSTable handles, default 128)
     pub sstable_cache_size: usize,
-    
-    /// 🚀 P0: Memory limit for SSTable cache (bytes)
-    /// 
-    /// When total cache size exceeds this limit, LRU eviction is triggered.
-    /// - None = No limit (uses sstable_cache_size only)
-    /// - Some(200MB) = Max 200MB cache memory (recommended for production)
-    /// 
-    /// Calculation: cache_size × avg_sstable_size
-    /// - 8 SSTables × 25MB = 200MB (default)
-    /// - For embedded: 4 SSTables × 10MB = 40MB
+
+    /// Memory limit for SSTable cache (MB)
     pub sstable_cache_memory_limit_mb: Option<usize>,
+
+    // --- Compaction throttling ---
+
+    /// Max compaction write rate in bytes/sec (None = unlimited, default 4 MB/s)
+    pub compaction_rate_limit: Option<u64>,
+
+    /// Max SSTables open simultaneously during compaction (default 4)
+    pub compaction_max_open_sstables: usize,
+
+    /// Sleep 1ms every N blocks during compaction for cooperative yielding (default 4)
+    pub compaction_yield_every_n_blocks: usize,
+
+    /// Only compact when write load is idle (default false)
+    pub compaction_idle_only: bool,
 }
 
 impl Default for LSMConfig {
     fn default() -> Self {
         Self {
-            memtable_size: 512 * 1024,          // 🚀 P0: 512KB - 激进控制内存（原4MB过大）
-            block_size: 64 * 1024,              // 64KB (optimal for compression)
+            memtable_size: 512 * 1024,
+            block_size: 64 * 1024,
             num_levels: 7,
             level_multiplier: 10,
-            l0_compaction_trigger: 2,           // 🔧 2个文件就触发compaction，减少L0积压
-            bloom_bits_per_key: 12,             // 12 bits - 降低false positive率
+            l0_compaction_trigger: 4,
+            bloom_bits_per_key: 12,
             enable_compression: true,
-            blob_threshold: 32 * 1024,          // 32KB (separate large values/vectors)
-            blob_file_size: 256 * 1024 * 1024,  // 256MB per blob file
-            sstable_cache_size: 128,            // 🚀 128 SSTable cache (avoid eviction thrashing at 50K+ rows)
-            sstable_cache_memory_limit_mb: Some(200),  // 🚀 P0: 200MB memory limit
+            compression_algorithm: CompressionAlgorithm::Zstd,
+            zstd_compression_level: 1,
+            blob_threshold: 32 * 1024,
+            blob_file_size: 256 * 1024 * 1024,
+            sstable_cache_size: 32,
+            sstable_cache_memory_limit_mb: Some(200),
+            compaction_rate_limit: Some(4 * 1024 * 1024), // 4 MB/s
+            compaction_max_open_sstables: 4,
+            compaction_yield_every_n_blocks: 4,
+            compaction_idle_only: false,
         }
     }
 }
@@ -209,33 +237,35 @@ impl LSMConfig {
     pub fn read_optimized() -> Self {
         Self {
             memtable_size: 4 * 1024 * 1024,
-            block_size: 32 * 1024,              // Smaller blocks for faster seeks
+            block_size: 32 * 1024,
             num_levels: 7,
             level_multiplier: 10,
-            l0_compaction_trigger: 2,           // Aggressive compaction
-            bloom_bits_per_key: 16,             // More accurate bloom filters
+            l0_compaction_trigger: 2,
+            bloom_bits_per_key: 16,
             enable_compression: true,
             blob_threshold: 32 * 1024,
             blob_file_size: 256 * 1024 * 1024,
-            sstable_cache_size: 256,            // 🚀 256 SSTable cache for read-heavy
-            sstable_cache_memory_limit_mb: Some(400),  // 🚀 P0: 400MB for read-heavy
+            sstable_cache_size: 256,
+            sstable_cache_memory_limit_mb: Some(400),
+            ..Self::default()
         }
     }
     
     /// Optimized config for write-heavy workloads
     pub fn write_optimized() -> Self {
         Self {
-            memtable_size: 16 * 1024 * 1024,    // Larger buffer
-            block_size: 128 * 1024,             // Larger blocks for batch writes
-            num_levels: 6,                       // Fewer levels
-            level_multiplier: 8,                 // Lower multiplier
-            l0_compaction_trigger: 8,           // Lazy compaction
-            bloom_bits_per_key: 8,              // Smaller bloom filters
+            memtable_size: 16 * 1024 * 1024,
+            block_size: 128 * 1024,
+            num_levels: 6,
+            level_multiplier: 8,
+            l0_compaction_trigger: 8,
+            bloom_bits_per_key: 8,
             enable_compression: true,
             blob_threshold: 32 * 1024,
             blob_file_size: 256 * 1024 * 1024,
-            sstable_cache_size: 64,             // 🚀 64 SSTable cache for write-heavy
-            sstable_cache_memory_limit_mb: Some(200),  // 🚀 P0
+            sstable_cache_size: 64,
+            sstable_cache_memory_limit_mb: Some(200),
+            ..Self::default()
         }
     }
     
@@ -264,17 +294,18 @@ impl LSMConfig {
     /// - 内存占用：**-50%** ✅
     pub fn embedded() -> Self {
         Self {
-            memtable_size: 2 * 1024 * 1024,         // 2MB
-            block_size: 32 * 1024,                   // 32KB
-            num_levels: 6,                           // 6 层
-            level_multiplier: 8,                     // 8x
+            memtable_size: 2 * 1024 * 1024,
+            block_size: 32 * 1024,
+            num_levels: 6,
+            level_multiplier: 8,
             l0_compaction_trigger: 2,
-            bloom_bits_per_key: 8,                   // 8 bits
+            bloom_bits_per_key: 8,
             enable_compression: true,
-            blob_threshold: 16 * 1024,               // 16KB
-            blob_file_size: 128 * 1024 * 1024,       // 128MB
-            sstable_cache_size: 32,                  // 🚀 32 SSTable cache for embedded
-            sstable_cache_memory_limit_mb: Some(40),  // 🚀 P0: 40MB for embedded
+            blob_threshold: 16 * 1024,
+            blob_file_size: 128 * 1024 * 1024,
+            sstable_cache_size: 32,
+            sstable_cache_memory_limit_mb: Some(40),
+            ..Self::default()
         }
     }
     
@@ -293,17 +324,18 @@ impl LSMConfig {
     /// - 内存占用：**-70%** ✅
     pub fn tiny() -> Self {
         Self {
-            memtable_size: 1024 * 1024,         // 1MB
-            block_size: 16 * 1024,                   // 16KB
-            num_levels: 5,                           // 5 层
-            level_multiplier: 4,                     // 4x
+            memtable_size: 1024 * 1024,
+            block_size: 16 * 1024,
+            num_levels: 5,
+            level_multiplier: 4,
             l0_compaction_trigger: 2,
-            bloom_bits_per_key: 6,                   // 6 bits
+            bloom_bits_per_key: 6,
             enable_compression: true,
-            blob_threshold: 8 * 1024,                // 8KB
-            blob_file_size: 64 * 1024 * 1024,        // 64MB
-            sstable_cache_size: 8,                   // 🚀 8 SSTable cache for tiny
-            sstable_cache_memory_limit_mb: Some(20),  // 🚀 P0: 20MB for tiny
+            blob_threshold: 8 * 1024,
+            blob_file_size: 64 * 1024 * 1024,
+            sstable_cache_size: 8,
+            sstable_cache_memory_limit_mb: Some(20),
+            ..Self::default()
         }
     }
     
@@ -323,17 +355,18 @@ impl LSMConfig {
     /// - 磁盘占用: -30-50% ✅（压缩）
     pub fn memory_optimized() -> Self {
         Self {
-            memtable_size: 2 * 1024 * 1024,     // 🔧 2MB（减少峰值内存）
-            block_size: 32 * 1024,              // 🔧 32KB（减少SSTable大小）
+            memtable_size: 2 * 1024 * 1024,
+            block_size: 32 * 1024,
             num_levels: 7,
             level_multiplier: 10,
-            l0_compaction_trigger: 2,           // 🔧 激进压缩（快速合并）
-            bloom_bits_per_key: 10,             // 🔧 10 bits（减少元数据）
-            enable_compression: true,           // ✅ 强制启用Snappy压缩
-            blob_threshold: 16 * 1024,          // 🔧 16KB（更多数据进Blob）
-            blob_file_size: 128 * 1024 * 1024,  // 🔧 128MB（减少Blob文件大小）
-            sstable_cache_size: 4,              // 🔧 4个缓存（最小化内存）
-            sstable_cache_memory_limit_mb: Some(100),  // 🚀 P0: 100MB for memory-optimized
+            l0_compaction_trigger: 2,
+            bloom_bits_per_key: 10,
+            enable_compression: true,
+            blob_threshold: 16 * 1024,
+            blob_file_size: 128 * 1024 * 1024,
+            sstable_cache_size: 4,
+            sstable_cache_memory_limit_mb: Some(100),
+            ..Self::default()
         }
     }
     

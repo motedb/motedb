@@ -7,6 +7,22 @@ use crate::database::core::MoteDB;
 use crate::{Result, StorageError};
 use std::sync::atomic::Ordering;
 
+/// Return freed heap memory to the OS after flush/checkpoint.
+fn trim_allocator() {
+    #[cfg(target_os = "linux")]
+    {
+        // malloc_trim(0) returns all possible freed memory to the OS
+        extern "C" {
+            fn malloc_trim(__pad: usize) -> i32;
+        }
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+    // macOS: the system allocator returns memory more aggressively.
+    // No explicit trimming needed.
+}
+
 /// Get total size of all files in a directory (helper for checkpoint optimization)
 fn get_directory_size(dir: &std::path::Path) -> Result<u64> {
     let mut total = 0;
@@ -120,9 +136,11 @@ impl MoteDB {
         }
 
         // 4. Reset pending counter
-        // 🚀 P0 CRITICAL FIX: 使用原子操作
         self.pending_updates.store(0, std::sync::atomic::Ordering::Relaxed);
-        
+
+        // 5. Return freed memory to OS after flush
+        trim_allocator();
+
         Ok(())
     }
     
@@ -168,79 +186,50 @@ impl MoteDB {
     fn checkpoint_impl(&self, rebuild_indexes: bool) -> Result<()> {
         use std::time::Instant;
 
-        // 🚀 Fast path: Skip if no pending updates and WAL is empty
         let pending_count = self.pending_updates.load(std::sync::atomic::Ordering::Relaxed);
         if pending_count == 0 {
             let wal_dir = self.path.join("wal");
             if let Ok(wal_size) = get_directory_size(&wal_dir) {
                 if wal_size == 0 {
-                    debug_log!("[Checkpoint] ⚡ Skip: No pending updates, WAL empty");
                     return Ok(());
                 }
             }
         }
 
-        let _checkpoint_start = Instant::now();
-        debug_log!("[Checkpoint] 🚀 Starting {}checkpoint (pending_updates={})...",
-            if rebuild_indexes { "full " } else { "" }, pending_count);
+        let checkpoint_start = Instant::now();
 
         // Step 1: Trigger LSM flush (MemTable → SSTable)
-        let _flush_start = Instant::now();
+        let flush_start = Instant::now();
         self.lsm_engine.flush()?;
-        debug_log!("[Checkpoint]   ✓ LSM flush: {:?}", _flush_start.elapsed());
 
         // Step 2: Rebuild timestamp index (only in full checkpoint)
         if rebuild_indexes {
-            let _ts_rebuild_start = Instant::now();
             self.rebuild_timestamp_index()?;
-            debug_log!("[Checkpoint]   ✓ Timestamp rebuild: {:?}", _ts_rebuild_start.elapsed());
         }
 
         // Step 3: Flush all indexes (persist to disk)
-        let _index_flush_start = Instant::now();
         self.flush_all_indexes()?;
-        debug_log!("[Checkpoint]   ✓ Index flush: {:?}", _index_flush_start.elapsed());
 
-        // Step 4: Checkpoint WAL (safe to truncate now)
-        // CRITICAL: Only truncate WAL if immutable queue is empty.
-        // If immutable queue has data (flush failed), WAL must be preserved for recovery.
+        // Step 4: Checkpoint WAL
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
         if immutable_queue_len == 0 {
-            let _wal_checkpoint_start = Instant::now();
             self.wal.checkpoint_all()?;
-            debug_log!("[Checkpoint]   ✓ WAL checkpoint: {:?}", _wal_checkpoint_start.elapsed());
-        } else {
-            debug_log!("[Checkpoint]   ⚠️ WAL NOT truncated: immutable queue has {} items (data safety)", immutable_queue_len);
         }
 
-        // Step 5: Vacuum MVCC version store (remove old versions)
-        let _vacuum_start = Instant::now();
+        // Step 5: Vacuum MVCC
         let current_ts = self.version_store.current_timestamp();
-        match self.version_store.vacuum(current_ts) {
-            Ok(removed) => {
-                if removed > 0 {
-                    debug_log!("[Checkpoint]   ✓ MVCC vacuum: removed {} old versions in {:?}", removed, _vacuum_start.elapsed());
-                }
-            }
-            Err(e) => {
-                debug_log!("[Checkpoint]   ⚠️ MVCC vacuum failed: {:?}", e);
-            }
-        }
+        let _ = self.version_store.vacuum(current_ts);
 
-        // Reset pending counters
         self.pending_updates.store(0, std::sync::atomic::Ordering::Relaxed);
 
-        // Step 5.5: Flush columnar store (TimeSeries segment files)
-        if let Err(e) = self.columnar_store.flush_all() {
-            debug_log!("[Checkpoint]   ⚠️ Columnar flush failed: {:?}", e);
-        }
+        // Step 6: Columnar flush
+        let _ = self.columnar_store.flush_all();
 
-        // Step 6: Persist AUTO_INCREMENT counters to catalog
-        if let Err(e) = self.table_registry.persist_auto_increment_counters() {
-            debug_log!("[Checkpoint]   ⚠️ Failed to persist AUTO_INCREMENT counters: {:?}", e);
-        }
+        // Step 7: Persist counters
+        let _ = self.table_registry.persist_auto_increment_counters();
 
-        debug_log!("[Checkpoint] 🎉 Total: {:?}", _checkpoint_start.elapsed());
+        debug_log!("[Checkpoint] Total: {:.1}ms (flush={:.1}ms)",
+            checkpoint_start.elapsed().as_millis(), flush_start.elapsed().as_millis());
         Ok(())
     }
     

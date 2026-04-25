@@ -13,10 +13,10 @@ use crate::types::{Row, RowId, PartitionId};
 use crate::{Result, StorageError};
 use crate::config::DurabilityLevel;
 use crate::storage::checksum::{Checksum, ChecksumType};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +45,10 @@ impl From<crate::config::WALConfig> for WALConfig {
 }
 
 /// WAL record types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// P3: Row data is stored as raw bytes (from RawRow encoding).
+/// The native binary format replaces bincode for WAL record serialization.
+#[derive(Debug, Clone, PartialEq)]
 pub enum WALRecord {
     /// Insert operation
     Insert {
@@ -53,7 +56,16 @@ pub enum WALRecord {
         row_id: RowId,
         partition: PartitionId,
         data: Row,
-        txn_id: TransactionId, // 0 = auto-commit, >0 = explicit transaction
+        txn_id: TransactionId,
+    },
+
+    /// Insert with raw bytes (zero-copy recovery)
+    InsertRaw {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        raw_data: Vec<u8>,
+        txn_id: TransactionId,
     },
 
     /// Update operation
@@ -66,6 +78,16 @@ pub enum WALRecord {
         txn_id: TransactionId,
     },
 
+    /// Update with raw bytes (zero-copy recovery)
+    UpdateRaw {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        raw_old: Vec<u8>,
+        raw_new: Vec<u8>,
+        txn_id: TransactionId,
+    },
+
     /// Delete operation
     Delete {
         table_name: String,
@@ -75,42 +97,361 @@ pub enum WALRecord {
         timestamp: u64,
         txn_id: TransactionId,
     },
-    
+
+    /// Delete with raw bytes (zero-copy recovery)
+    DeleteRaw {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        raw_old: Vec<u8>,
+        timestamp: u64,
+        txn_id: TransactionId,
+    },
+
     /// Transaction begin marker
     Begin {
         txn_id: TransactionId,
-        isolation_level: u8,  // IsolationLevel as u8
+        isolation_level: u8,
     },
-    
+
     /// Transaction commit marker
     Commit {
         txn_id: TransactionId,
         commit_ts: Timestamp,
     },
-    
+
     /// Transaction rollback marker
     Rollback {
         txn_id: TransactionId,
     },
-    
+
     /// Checkpoint marker (all records before this LSN are persisted)
     Checkpoint { lsn: LogSequenceNumber },
+}
+
+// Native binary format type tags
+const TAG_INSERT_RAW: u8 = 0x01;
+const TAG_UPDATE_RAW: u8 = 0x02;
+const TAG_DELETE_RAW: u8 = 0x03;
+const TAG_BEGIN: u8 = 0x04;
+const TAG_COMMIT: u8 = 0x05;
+const TAG_ROLLBACK: u8 = 0x06;
+const TAG_CHECKPOINT: u8 = 0x07;
+
+impl WALRecord {
+    /// Encode WAL record to native binary format.
+    fn encode_native(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        match self {
+            WALRecord::InsertRaw { table_name, row_id, partition, raw_data, txn_id } => {
+                buf.push(TAG_INSERT_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
+                buf.extend_from_slice(raw_data);
+            }
+            WALRecord::Insert { table_name, row_id, partition, data, txn_id } => {
+                buf.push(TAG_INSERT_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                let bytes = bincode::serialize(data)?;
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+            WALRecord::UpdateRaw { table_name, row_id, partition, raw_old, raw_new, txn_id } => {
+                buf.push(TAG_UPDATE_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                buf.extend_from_slice(&(raw_old.len() as u32).to_le_bytes());
+                buf.extend_from_slice(raw_old);
+                buf.extend_from_slice(&(raw_new.len() as u32).to_le_bytes());
+                buf.extend_from_slice(raw_new);
+            }
+            WALRecord::Update { table_name, row_id, partition, old_data, new_data, txn_id } => {
+                buf.push(TAG_UPDATE_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                let old_bytes = bincode::serialize(old_data)?;
+                buf.extend_from_slice(&(old_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&old_bytes);
+                let new_bytes = bincode::serialize(new_data)?;
+                buf.extend_from_slice(&(new_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&new_bytes);
+            }
+            WALRecord::DeleteRaw { table_name, row_id, partition, raw_old, timestamp, txn_id } => {
+                buf.push(TAG_DELETE_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                buf.extend_from_slice(&(raw_old.len() as u32).to_le_bytes());
+                buf.extend_from_slice(raw_old);
+            }
+            WALRecord::Delete { table_name, row_id, partition, old_data, timestamp, txn_id } => {
+                buf.push(TAG_DELETE_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                let bytes = bincode::serialize(old_data)?;
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+            WALRecord::Begin { txn_id, isolation_level } => {
+                buf.push(TAG_BEGIN);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                buf.push(*isolation_level);
+            }
+            WALRecord::Commit { txn_id, commit_ts } => {
+                buf.push(TAG_COMMIT);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                buf.extend_from_slice(&commit_ts.to_le_bytes());
+            }
+            WALRecord::Rollback { txn_id } => {
+                buf.push(TAG_ROLLBACK);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+            }
+            WALRecord::Checkpoint { lsn } => {
+                buf.push(TAG_CHECKPOINT);
+                buf.extend_from_slice(&lsn.to_le_bytes());
+            }
+        }
+        Ok(buf)
+    }
+
+    /// Decode WAL record from native binary format.
+    /// Returns None if the data doesn't look like native format (caller should try bincode).
+    fn decode_native(data: &[u8]) -> Option<Result<Self>> {
+        if data.is_empty() {
+            return None;
+        }
+        let tag = data[0];
+        let mut pos = 1usize;
+
+        match tag {
+            TAG_INSERT_RAW => {
+                let txn_id = read_u64(data, &mut pos)?;
+                let table_name = read_str(data, &mut pos)?;
+                let row_id = read_u64(data, &mut pos)?;
+                let partition = read_u16(data, &mut pos)? as PartitionId;
+                let payload_len = read_u32(data, &mut pos)? as usize;
+                if pos + payload_len > data.len() {
+                    return None;
+                }
+                let raw_data = data[pos..pos + payload_len].to_vec();
+                Some(Ok(WALRecord::InsertRaw { table_name, row_id, partition, raw_data, txn_id }))
+            }
+            TAG_UPDATE_RAW => {
+                let txn_id = read_u64(data, &mut pos)?;
+                let table_name = read_str(data, &mut pos)?;
+                let row_id = read_u64(data, &mut pos)?;
+                let partition = read_u16(data, &mut pos)? as PartitionId;
+                let old_len = read_u32(data, &mut pos)? as usize;
+                if pos + old_len > data.len() {
+                    return None;
+                }
+                let raw_old = data[pos..pos + old_len].to_vec();
+                pos += old_len;
+                let new_len = read_u32(data, &mut pos)? as usize;
+                if pos + new_len > data.len() {
+                    return None;
+                }
+                let raw_new = data[pos..pos + new_len].to_vec();
+                Some(Ok(WALRecord::UpdateRaw { table_name, row_id, partition, raw_old, raw_new, txn_id }))
+            }
+            TAG_DELETE_RAW => {
+                let txn_id = read_u64(data, &mut pos)?;
+                let table_name = read_str(data, &mut pos)?;
+                let row_id = read_u64(data, &mut pos)?;
+                let partition = read_u16(data, &mut pos)? as PartitionId;
+                let timestamp = read_u64(data, &mut pos)?;
+                let old_len = read_u32(data, &mut pos)? as usize;
+                if pos + old_len > data.len() {
+                    return None;
+                }
+                let raw_old = data[pos..pos + old_len].to_vec();
+                Some(Ok(WALRecord::DeleteRaw { table_name, row_id, partition, raw_old, timestamp, txn_id }))
+            }
+            TAG_BEGIN => {
+                let txn_id = read_u64(data, &mut pos)?;
+                if pos >= data.len() {
+                    return None;
+                }
+                let isolation_level = data[pos];
+                Some(Ok(WALRecord::Begin { txn_id, isolation_level }))
+            }
+            TAG_COMMIT => {
+                let txn_id = read_u64(data, &mut pos)?;
+                let commit_ts = read_u64(data, &mut pos)? as Timestamp;
+                Some(Ok(WALRecord::Commit { txn_id, commit_ts }))
+            }
+            TAG_ROLLBACK => {
+                let txn_id = read_u64(data, &mut pos)?;
+                Some(Ok(WALRecord::Rollback { txn_id }))
+            }
+            TAG_CHECKPOINT => {
+                let lsn = read_u64(data, &mut pos)?;
+                Some(Ok(WALRecord::Checkpoint { lsn }))
+            }
+            _ => None, // Unknown tag — likely bincode data
+        }
+    }
+
+    /// Decode native format with fallback to bincode (for old WAL files)
+    fn decode_with_fallback(data: &[u8]) -> Result<Self> {
+        // Try native binary format first
+        if let Some(result) = Self::decode_native(data) {
+            return result;
+        }
+        // Fallback to bincode (old WAL files with legacy WALRecord format)
+        let legacy: LegacyWALRecord = bincode::deserialize(data)
+            .map_err(|e| StorageError::Serialization(format!("WAL decode failed: {}", e)))?;
+        Ok(legacy.into())
+    }
+
+    /// Get the table name from any record variant that has one
+    pub fn table_name(&self) -> Option<&str> {
+        match self {
+            WALRecord::Insert { table_name, .. }
+            | WALRecord::InsertRaw { table_name, .. }
+            | WALRecord::Update { table_name, .. }
+            | WALRecord::UpdateRaw { table_name, .. }
+            | WALRecord::Delete { table_name, .. }
+            | WALRecord::DeleteRaw { table_name, .. } => Some(table_name),
+            _ => None,
+        }
+    }
+
+    /// Get the row_id from any record variant that has one
+    pub fn row_id(&self) -> Option<RowId> {
+        match self {
+            WALRecord::Insert { row_id, .. }
+            | WALRecord::InsertRaw { row_id, .. }
+            | WALRecord::Update { row_id, .. }
+            | WALRecord::UpdateRaw { row_id, .. }
+            | WALRecord::Delete { row_id, .. }
+            | WALRecord::DeleteRaw { row_id, .. } => Some(*row_id),
+            _ => None,
+        }
+    }
+
+    /// Get the txn_id from any record variant
+    pub fn txn_id(&self) -> TransactionId {
+        match self {
+            WALRecord::Insert { txn_id, .. }
+            | WALRecord::InsertRaw { txn_id, .. }
+            | WALRecord::Update { txn_id, .. }
+            | WALRecord::UpdateRaw { txn_id, .. }
+            | WALRecord::Delete { txn_id, .. }
+            | WALRecord::DeleteRaw { txn_id, .. }
+            | WALRecord::Begin { txn_id, .. }
+            | WALRecord::Commit { txn_id, .. }
+            | WALRecord::Rollback { txn_id } => *txn_id,
+            WALRecord::Checkpoint { .. } => 0,
+        }
+    }
+}
+
+fn encode_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
+    if *pos + 8 > data.len() {
+        return None;
+    }
+    let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
+    *pos += 8;
+    Some(val)
+}
+
+fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
+    if *pos + 4 > data.len() {
+        return None;
+    }
+    let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
+    *pos += 4;
+    Some(val)
+}
+
+fn read_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
+    if *pos + 2 > data.len() {
+        return None;
+    }
+    let val = u16::from_le_bytes(data[*pos..*pos + 2].try_into().ok()?);
+    *pos += 2;
+    Some(val)
+}
+
+fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
+    let len = read_u16(data, pos)? as usize;
+    if *pos + len > data.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    *pos += len;
+    Some(s)
+}
+
+/// Legacy WAL record format (bincode-encoded, for reading old WAL files)
+#[derive(Debug, Clone, Deserialize)]
+enum LegacyWALRecord {
+    Insert { table_name: String, row_id: RowId, partition: PartitionId, data: Row, txn_id: TransactionId },
+    Update { table_name: String, row_id: RowId, partition: PartitionId, old_data: Row, new_data: Row, txn_id: TransactionId },
+    Delete { table_name: String, row_id: RowId, partition: PartitionId, old_data: Row, timestamp: u64, txn_id: TransactionId },
+    Begin { txn_id: TransactionId, isolation_level: u8 },
+    Commit { txn_id: TransactionId, commit_ts: Timestamp },
+    Rollback { txn_id: TransactionId },
+    Checkpoint { lsn: LogSequenceNumber },
+}
+
+impl From<LegacyWALRecord> for WALRecord {
+    fn from(legacy: LegacyWALRecord) -> Self {
+        match legacy {
+            LegacyWALRecord::Insert { table_name, row_id, partition, data, txn_id } =>
+                WALRecord::Insert { table_name, row_id, partition, data, txn_id },
+            LegacyWALRecord::Update { table_name, row_id, partition, old_data, new_data, txn_id } =>
+                WALRecord::Update { table_name, row_id, partition, old_data, new_data, txn_id },
+            LegacyWALRecord::Delete { table_name, row_id, partition, old_data, timestamp, txn_id } =>
+                WALRecord::Delete { table_name, row_id, partition, old_data, timestamp, txn_id },
+            LegacyWALRecord::Begin { txn_id, isolation_level } =>
+                WALRecord::Begin { txn_id, isolation_level },
+            LegacyWALRecord::Commit { txn_id, commit_ts } =>
+                WALRecord::Commit { txn_id, commit_ts },
+            LegacyWALRecord::Rollback { txn_id } =>
+                WALRecord::Rollback { txn_id },
+            LegacyWALRecord::Checkpoint { lsn } =>
+                WALRecord::Checkpoint { lsn },
+        }
+    }
 }
 
 /// WAL manager for each partition
 struct PartitionWAL {
     /// WAL file path
     path: PathBuf,
-    
-    /// Append-only WAL file
-    file: File,
-    
+
+    /// Buffered WAL file (BufWriter amortizes syscalls for Periodic/GroupCommit modes)
+    file: BufWriter<File>,
+
     /// Current LSN
     next_lsn: LogSequenceNumber,
-    
+
     /// Last checkpoint LSN
     last_checkpoint: LogSequenceNumber,
-    
+
     /// WAL configuration
     config: WALConfig,
 }
@@ -123,10 +464,10 @@ impl PartitionWAL {
             .append(true)
             .read(true)
             .open(&path)?;
-        
+
         Ok(Self {
             path,
-            file,
+            file: BufWriter::new(file),
             next_lsn: 0,
             last_checkpoint: 0,
             config,
@@ -193,7 +534,7 @@ impl PartitionWAL {
 
             next_lsn = lsn + 1;
             // Deserialize record to check for Checkpoint
-            if let Ok(WALRecord::Checkpoint { lsn: cp_lsn }) = bincode::deserialize::<WALRecord>(&record_data) {
+            if let Ok(WALRecord::Checkpoint { lsn: cp_lsn }) = WALRecord::decode_with_fallback(&record_data) {
                 last_checkpoint = cp_lsn;
             }
         }
@@ -204,11 +545,19 @@ impl PartitionWAL {
         
         Ok(Self {
             path,
-            file,
+            file: BufWriter::new(file),
             next_lsn,
             last_checkpoint,
             config,
         })
+    }
+
+    /// Flush BufWriter to OS buffer + fsync (for durability)
+    fn sync_flush(&mut self) -> Result<()> {
+        self.file.flush()?;
+        // Get the inner File ref for sync_data
+        self.file.get_ref().sync_data()?;
+        Ok(())
     }
 
     /// Append a record to WAL
@@ -216,35 +565,82 @@ impl PartitionWAL {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
 
-        // 🚀 P0: Serialize once, write header + data
-        let record_data = bincode::serialize(&record)?;
-        let checksum = Checksum::compute(ChecksumType::CRC32C, &record_data);
+        let record_data = record.encode_native()?;
+        self.write_record(lsn, &record_data)?;
 
-        // Layout: [u32 total_len][u64 lsn][u32 checksum][u32 record_len][record_data]
-        let header_size = 4 + 8 + 4 + 4; // 20 bytes
-        let total_len = (header_size + record_data.len()) as u32;
-
-        self.file.write_all(&total_len.to_le_bytes())?;
-        self.file.write_all(&lsn.to_le_bytes())?;
-        self.file.write_all(&checksum.to_le_bytes())?;
-        self.file.write_all(&(record_data.len() as u32).to_le_bytes())?;
-        self.file.write_all(&record_data)?;
-
-        // Fsync based on durability level
         match self.config.durability_level {
-            DurabilityLevel::Synchronous => {
-                self.file.sync_data()?;
-            }
-            DurabilityLevel::GroupCommit { .. } => {
-                // No fsync - application layer responsible for batch_append or explicit flush
-            }
-            DurabilityLevel::Periodic { .. } => {
-                // Background thread handles periodic fsync
-            }
-            DurabilityLevel::NoSync => {}
+            DurabilityLevel::Synchronous => { self.sync_flush()?; }
+            DurabilityLevel::GroupCommit { .. } | DurabilityLevel::Periodic { .. } | DurabilityLevel::NoSync => {}
         }
 
         Ok(lsn)
+    }
+
+    /// Append an INSERT record using raw data by reference (avoids clone).
+    /// Uses a single write buffer to minimize BufWriter interactions.
+    fn append_insert_raw_ref(
+        &mut self,
+        table_name: &str,
+        row_id: RowId,
+        partition: PartitionId,
+        raw_data: &[u8],
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+
+        // Build native record inline (TAG + header + data)
+        let table_bytes = table_name.as_bytes();
+        let record_len = 1 + 8 + (2 + table_bytes.len()) + 8 + 2 + 4 + raw_data.len();
+
+        let mut write_buf = Vec::with_capacity(20 + record_len);
+        // Outer header: [u32 total_len][u64 lsn][u32 checksum][u32 record_len]
+        write_buf.extend_from_slice(&((20 + record_len) as u32).to_le_bytes());
+        write_buf.extend_from_slice(&lsn.to_le_bytes());
+        // checksum placeholder (will patch)
+        let checksum_offset = write_buf.len();
+        write_buf.extend_from_slice(&0u32.to_le_bytes());
+        write_buf.extend_from_slice(&(record_len as u32).to_le_bytes());
+
+        // Record body
+        let record_start = write_buf.len();
+        write_buf.push(TAG_INSERT_RAW);
+        write_buf.extend_from_slice(&txn_id.to_le_bytes());
+        write_buf.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
+        write_buf.extend_from_slice(table_bytes);
+        write_buf.extend_from_slice(&row_id.to_le_bytes());
+        write_buf.extend_from_slice(&(partition as u16).to_le_bytes());
+        write_buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
+        write_buf.extend_from_slice(raw_data);
+
+        // Compute and patch checksum
+        let checksum = Checksum::compute(ChecksumType::CRC32C, &write_buf[record_start..]);
+        write_buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        self.file.write_all(&write_buf)?;
+
+        match self.config.durability_level {
+            DurabilityLevel::Synchronous => { self.sync_flush()?; }
+            _ => {}
+        }
+
+        Ok(lsn)
+    }
+
+    /// Write a pre-serialized record with framing (single buffer).
+    fn write_record(&mut self, lsn: u64, record_data: &[u8]) -> Result<()> {
+        let total_len = (20 + record_data.len()) as u32;
+        let checksum = Checksum::compute(ChecksumType::CRC32C, record_data);
+
+        let mut buf = Vec::with_capacity(20 + record_data.len());
+        buf.extend_from_slice(&total_len.to_le_bytes());
+        buf.extend_from_slice(&lsn.to_le_bytes());
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(record_data);
+
+        self.file.write_all(&buf)?;
+        Ok(())
     }
 
     /// Batch append multiple records (optimized - single fsync)
@@ -276,7 +672,7 @@ impl PartitionWAL {
             self.next_lsn += 1;
             lsns.push(lsn);
 
-            let record_data = bincode::serialize(&record)?;
+            let record_data = record.encode_native()?;
             let checksum = Checksum::compute(ChecksumType::CRC32C, &record_data);
 
             // Header: [u32 total_len][u64 lsn][u32 checksum][u32 record_len]
@@ -296,16 +692,12 @@ impl PartitionWAL {
         // 3. Fsync based on durability level
         match self.config.durability_level {
             DurabilityLevel::Synchronous | DurabilityLevel::GroupCommit { .. } => {
-                // CRITICAL: Immediate fsync for durability ⚠️
-                // GroupCommit 在 batch_append() 中必须 fsync
-                self.file.sync_data()?;
+                self.sync_flush()?;
             }
             DurabilityLevel::Periodic { .. } => {
-                // 定期 fsync，由后台线程处理
+                // BufWriter buffers; periodic flush thread calls sync_flush
             }
-            DurabilityLevel::NoSync => {
-                // 不 fsync（仅测试）
-            }
+            DurabilityLevel::NoSync => {}
         }
         
         Ok(lsns)
@@ -331,7 +723,8 @@ impl PartitionWAL {
         self.last_checkpoint = lsn;
 
         // Ensure checkpoint record is durable BEFORE truncating.
-        self.file.sync_all()?;
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
 
         // Atomic truncation: write-new-rename pattern
         // Create a fresh empty WAL file at a temp path
@@ -349,10 +742,11 @@ impl PartitionWAL {
         std::fs::rename(&tmp_path, &self.path)?;
 
         // Reopen the new empty file
-        self.file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(&self.path)?;
+        self.file = BufWriter::new(file);
 
         // Reset counters
         self.next_lsn = 0;
@@ -416,8 +810,8 @@ impl PartitionWAL {
                 continue;
             }
 
-            // Deserialize record
-            let record: WALRecord = match bincode::deserialize(&record_data) {
+            // Deserialize record (native binary with bincode fallback)
+            let record: WALRecord = match WALRecord::decode_with_fallback(&record_data) {
                 Ok(r) => r,
                 Err(e) => {
                     debug_log!("WAL recovery: Failed to deserialize record: {}", e);
@@ -619,10 +1013,10 @@ impl WALManager {
 
                         let had_writes = new_writes_clone.swap(false, Ordering::Relaxed);
 
-                        // Flush all partitions (sync_data is cheap if nothing dirty)
+                        // Flush all partitions: BufWriter flush → OS buffer, then sync_data → disk
                         for entry in partitions.iter() {
-                            let wal = entry.value().lock();
-                            let _ = wal.file.sync_data();
+                            let mut wal = entry.value().lock();
+                            let _ = wal.sync_flush();
                         }
 
                         // Adaptive backoff: if no writes, double interval; if writes, reset
@@ -799,8 +1193,8 @@ impl WALManager {
                     // to the kernel buffer. Sync the partition file as a safety net so
                     // that at least whatever IS in the kernel buffer reaches disk.
                     if let Some(entry) = self.partitions.get(&partition) {
-                        let wal = entry.value().lock();
-                        let _ = wal.file.sync_data();
+                        let mut wal = entry.value().lock();
+                        let _ = wal.sync_flush();
                     }
                 }
             }
@@ -870,6 +1264,96 @@ impl WALManager {
             row_id,
             partition,
             old_data,
+            timestamp,
+            txn_id,
+        };
+        self.group_commit_append(partition, record)
+    }
+
+    /// Log an insert with raw bytes (zero-copy P3)
+    ///
+    /// Raw data is the same bytes that go into LSM — on recovery, they're
+    /// passed directly to LSM without re-encoding.
+    pub fn log_insert_raw(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_data: Vec<u8>,
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        let record = WALRecord::InsertRaw {
+            table_name: table_name.to_string(),
+            row_id,
+            partition,
+            raw_data,
+            txn_id,
+        };
+        self.group_commit_append(partition, record)
+    }
+
+    /// Log an INSERT using raw data by reference (avoids Vec clone).
+    ///
+    /// For Periodic/NoSync modes, bypasses WALRecord creation entirely —
+    /// encodes directly into a single buffer and writes once to BufWriter.
+    pub fn log_insert_raw_ref(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_data: &[u8],
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
+
+        if self.group_commit.is_some() {
+            // GroupCommit: fall back to owned variant (needs the record in the queue)
+            return self.log_insert_raw(table_name, partition, row_id, raw_data.to_vec(), txn_id);
+        }
+
+        // Direct path (Periodic/NoSync): encode and write in one step, zero clone
+        let entry = self.partitions.get(&partition)
+            .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
+        let mut wal = entry.value().lock();
+        wal.append_insert_raw_ref(table_name, row_id, partition, raw_data, txn_id)
+    }
+
+    /// Log an update with raw bytes (zero-copy P3)
+    pub fn log_update_raw(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_old: Vec<u8>,
+        raw_new: Vec<u8>,
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        let record = WALRecord::UpdateRaw {
+            table_name: table_name.to_string(),
+            row_id,
+            partition,
+            raw_old,
+            raw_new,
+            txn_id,
+        };
+        self.group_commit_append(partition, record)
+    }
+
+    /// Log a delete with raw bytes (zero-copy P3)
+    pub fn log_delete_raw(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_old: Vec<u8>,
+        timestamp: u64,
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        let record = WALRecord::DeleteRaw {
+            table_name: table_name.to_string(),
+            row_id,
+            partition,
+            raw_old,
             timestamp,
             txn_id,
         };
@@ -974,6 +1458,8 @@ impl WALManager {
         for entry in self.partitions.iter() {
             let partition_id = *entry.key();
             let mut wal = entry.value().lock();
+            // Flush BufWriter so all written data is visible to the file read
+            let _ = wal.file.flush();
             let records = wal.recover()?;
             result.insert(partition_id, records);
         }
@@ -1003,8 +1489,8 @@ impl Drop for WALManager {
 
         // Final sync on all partitions
         for entry in self.partitions.iter() {
-            let wal = entry.value().lock();
-            let _ = wal.file.sync_data();
+            let mut wal = entry.value().lock();
+            let _ = wal.sync_flush();
         }
     }
 }
@@ -1064,7 +1550,7 @@ mod tests {
             assert_eq!(recovered.len(), 2);
             
             let count_inserts = |records: &[WALRecord]| -> usize {
-                records.iter().filter(|r| matches!(r, WALRecord::Insert { .. })).count()
+                records.iter().filter(|r| matches!(r, WALRecord::Insert { .. } | WALRecord::InsertRaw { .. })).count()
             };
             
             assert_eq!(count_inserts(recovered.get(&0).unwrap()), 2);
@@ -1087,7 +1573,7 @@ mod tests {
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0], WALRecord::Update { .. }));
+        assert!(matches!(records[0], WALRecord::Update { .. } | WALRecord::UpdateRaw { .. }));
     }
 
     #[test]
@@ -1104,7 +1590,7 @@ mod tests {
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0], WALRecord::Delete { .. }));
+        assert!(matches!(records[0], WALRecord::Delete { .. } | WALRecord::DeleteRaw { .. }));
     }
 
     #[test]
@@ -1131,7 +1617,7 @@ mod tests {
         assert_eq!(records.len(), 3);
         
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
-        assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. }));
+        assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }));
         assert!(matches!(records[2], WALRecord::Commit { txn_id: 1, .. }));
     }
 
@@ -1155,7 +1641,7 @@ mod tests {
         assert_eq!(records.len(), 3);
         
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
-        assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. }));
+        assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }));
         assert!(matches!(records[2], WALRecord::Rollback { txn_id: 1 }));
     }
 
@@ -1199,9 +1685,9 @@ mod tests {
             };
             
             assert_eq!(count_type(records, |r| matches!(r, WALRecord::Begin { .. })), 3);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Insert { .. })), 2);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Update { .. })), 1);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Delete { .. })), 1);
+            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Insert { .. } | WALRecord::InsertRaw { .. })), 2);
+            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Update { .. } | WALRecord::UpdateRaw { .. })), 1);
+            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Delete { .. } | WALRecord::DeleteRaw { .. })), 1);
             assert_eq!(count_type(records, |r| matches!(r, WALRecord::Commit { .. })), 2);
             assert_eq!(count_type(records, |r| matches!(r, WALRecord::Rollback { .. })), 1);
         }
@@ -1257,9 +1743,9 @@ mod tests {
         assert_eq!(records.len(), 5);
         
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
-        assert!(matches!(records[1], WALRecord::Insert { row_id: 100, .. }));
-        assert!(matches!(records[2], WALRecord::Insert { row_id: 101, .. }));
-        assert!(matches!(records[3], WALRecord::Update { row_id: 100, .. }));
+        assert!(matches!(records[1], WALRecord::Insert { row_id: 100, .. } | WALRecord::InsertRaw { row_id: 100, .. }));
+        assert!(matches!(records[2], WALRecord::Insert { row_id: 101, .. } | WALRecord::InsertRaw { row_id: 101, .. }));
+        assert!(matches!(records[3], WALRecord::Update { row_id: 100, .. } | WALRecord::UpdateRaw { row_id: 100, .. }));
         assert!(matches!(records[4], WALRecord::Commit { txn_id: 1, .. }));
     }
 

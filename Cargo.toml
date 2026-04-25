@@ -28,6 +28,7 @@ memmap2 = "0.9"
 
 # Compression (used by: LSM engine, sstable, memtable, txn)
 snap = "1.1"  # Snappy compression (fast, moderate ratio)
+zstd = "0.13" # Zstandard compression (better ratio, fast decompression)
 
 # CRC32 for data integrity (used by: manifest, checksum, WAL)
 crc32fast = "1.4"
@@ -70,8 +71,10 @@ phf = { version = "0.11", features = ["macros"] }
 jieba-rs = { version = "0.7", optional = true }
 
 # 🔍 Optional: Memory profiling (feature-gated)
-tikv-jemallocator = { version = "0.5", optional = true }
 tikv-jemalloc-ctl = { version = "0.5", optional = true }
+
+# 🧠 jemalloc: returns freed memory to OS (prevents RSS from growing forever)
+tikv-jemallocator = { version = "0.5", optional = true, features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 # Benchmarking
@@ -89,13 +92,15 @@ clap = { version = "4.4", features = ["derive"] }
 
 # Enable jieba tokenizer by default
 [features]
-default = ["tokenizer-jieba", "rayon"]  # Full build: jieba + parallelism
-default-edge = []  # Edge/IoT minimal: no tokenizer, no rayon (smallest binary)
+default = ["tokenizer-jieba", "rayon", "jemalloc"]  # Full build: jieba + parallelism + jemalloc
+default-edge = []  # Edge/IoT minimal: no tokenizer, no rayon, system allocator
 # 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
 # 内存分析（用于性能调优）
 mem-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+# 🧠 jemalloc allocator (background thread returns freed memory to OS)
+jemalloc = ["tikv-jemallocator"]
 # ⚡ 数据并行化（可选，减少二进制大小 ~200KB）
 rayon = ["dep:rayon"]  # 启用 Rayon 并行处理
 

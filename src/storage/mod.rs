@@ -8,6 +8,7 @@ pub mod manifest;
 pub mod file_manager;
 pub mod checksum;
 pub mod columnar;
+pub mod row_format;
 
 pub use lsm::{LSMEngine, LSMConfig, MemTable, SSTable};
 pub use manifest::{Manifest, FileMetadata, FileType};

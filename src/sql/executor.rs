@@ -6,9 +6,14 @@ use crate::database::MoteDB;
 use crate::error::{Result, MoteDBError};
 use crate::{StorageError};
 use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId, Row};
+use crate::storage::row_format;
 use std::sync::Arc;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+fn decode_row(data: &[u8], schema: &TableSchema) -> crate::Result<Row> {
+    row_format::decode(data, schema.col_types())
+}
 
 #[allow(clippy::type_complexity)]
 type FromScanResult = Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)>;
@@ -813,7 +818,7 @@ impl QueryExecutor {
                         _ => return Some(Err(StorageError::InvalidData("Unexpected blob".into()))),
                     };
                     
-                    match bincode::deserialize::<crate::types::Row>(data) {
+                    match decode_row(data, &schema_clone) {
                         Ok(row) => {
                             match row_to_sql_row(&row, &schema_clone) {
                                 Ok(sql_row) => {
@@ -917,7 +922,7 @@ impl QueryExecutor {
                             }
                         };
                         
-                        match bincode::deserialize::<crate::types::Row>(data) {
+                        match decode_row(data, &schema_clone) {
                             Ok(row) => {
                                 match row_to_sql_row(&row, &schema_clone) {
                                     Ok(sql_row) => {
@@ -1014,7 +1019,7 @@ impl QueryExecutor {
                 _ => return Err(StorageError::InvalidData("Unexpected blob".into())),
             };
 
-            match bincode::deserialize::<crate::types::Row>(data) {
+            match decode_row(data, &schema_clone) {
                 Ok(row) => {
                     match row_to_sql_row(&row, &schema_clone) {
                         Ok(sql_row) => {
@@ -1448,16 +1453,21 @@ impl QueryExecutor {
                     }
                 }
             } else {
-                // 🚀 COUNT(*) without WHERE - use真正的流式扫描 (O(1) memory)
+                // 🚀 COUNT(*) without WHERE — O(1) from row counter
                 if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
-                    let row_iter = self.db.scan_table_rows_streaming(table_name)?;
-                    let mut count = 0i64;
-                    
-                    for result in row_iter {
-                        let _ = result?;  // 只需验证成功，不保存数据
-                        count += 1;
-                    }
-                    
+                    let count = if let Some(counter) = self.db.table_row_count.get(table_name) {
+                        counter.load(std::sync::atomic::Ordering::Relaxed) as i64
+                    } else {
+                        // Fallback: streaming scan if counter not initialized
+                        let row_iter = self.db.scan_table_rows_streaming(table_name)?;
+                        let mut c = 0i64;
+                        for result in row_iter {
+                            let _ = result?;
+                            c += 1;
+                        }
+                        c
+                    };
+
                     return Ok(QueryResult::Select {
                         columns: vec!["COUNT(*)".to_string()],
                         rows: vec![vec![Value::Integer(count)]],
@@ -2007,18 +2017,17 @@ impl QueryExecutor {
             }
         }
         
-        // If there's WHERE clause, add safety margin (rows may be filtered out)
+        // If there's WHERE clause that hasn't been resolved by an index,
+        // we must scan all rows — the selectivity is unknown and any
+        // pre-truncation risks returning wrong (empty) results.
+        if stmt.where_clause.is_some() {
+            return None;
+        }
+
+        // No WHERE: safe to use exact limit at storage level
         let limit = stmt.limit?;
         let offset = stmt.offset.unwrap_or(0);
-        
-        if stmt.where_clause.is_some() {
-            // Safety margin: load 10x more rows to account for filtering
-            // (Better to overestimate than underestimate)
-            Some((limit + offset) * 10)
-        } else {
-            // No WHERE clause: exact limit works
-            Some(limit + offset)
-        }
+        Some(limit + offset)
     }
     
     /// Check if expression contains aggregates (recursive)
@@ -3486,7 +3495,7 @@ impl QueryExecutor {
                         if matching_row_ids.is_empty() {
                             return Ok(QueryResult::Modification { affected_rows: 0 });
                         }
-                        return self.execute_update_by_row_ids(&stmt, &schema, &matching_row_ids);
+                        return self.execute_update_by_row_ids(&stmt, &schema, &matching_row_ids, &col_name, &target_value);
                     }
                 }
             }
@@ -3565,7 +3574,7 @@ impl QueryExecutor {
                         if matching_row_ids.is_empty() {
                             return Ok(QueryResult::Modification { affected_rows: 0 });
                         }
-                        return self.execute_delete_by_row_ids(&stmt, &schema, &matching_row_ids);
+                        return self.execute_delete_by_row_ids(&stmt, &schema, &matching_row_ids, &col_name, &target_value);
                     }
                 }
             }
@@ -3736,6 +3745,8 @@ impl QueryExecutor {
         stmt: &UpdateStmt,
         schema: &crate::types::TableSchema,
         row_ids: &[RowId],
+        where_col: &str,
+        where_val: &crate::types::Value,
     ) -> Result<QueryResult> {
         let mut affected_rows = 0;
         for &row_id in row_ids {
@@ -3743,6 +3754,14 @@ impl QueryExecutor {
                 Some(r) => r,
                 None => continue,
             };
+
+            // Re-check WHERE condition against actual row data to guard
+            // against stale index entries pointing to modified rows.
+            if let Some(col) = schema.get_column(where_col) {
+                if let Some(actual_val) = row.get(col.position) {
+                    if actual_val != where_val { continue; }
+                } else { continue; }
+            }
 
             let mut sql_row = row_to_sql_row(&row, schema)?;
             for (col_name, expr) in &stmt.assignments {
@@ -3766,8 +3785,10 @@ impl QueryExecutor {
     fn execute_delete_by_row_ids(
         &self,
         stmt: &DeleteStmt,
-        _schema: &crate::types::TableSchema,
+        schema: &crate::types::TableSchema,
         row_ids: &[RowId],
+        where_col: &str,
+        where_val: &crate::types::Value,
     ) -> Result<QueryResult> {
         let mut affected_rows = 0;
         for &row_id in row_ids {
@@ -3775,6 +3796,13 @@ impl QueryExecutor {
                 Some(r) => r,
                 None => continue,
             };
+
+            // Re-check WHERE condition against actual row data
+            if let Some(col) = schema.get_column(where_col) {
+                if let Some(actual_val) = row.get(col.position) {
+                    if actual_val != where_val { continue; }
+                } else { continue; }
+            }
 
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;
             affected_rows += 1;
@@ -5175,9 +5203,7 @@ impl QueryExecutor {
                     && matches!(stmt.columns[0], SelectColumn::Star);
 
                 if is_select_star {
-                    let column_names: Vec<String> = schema.columns.iter()
-                        .map(|c| c.name.clone())
-                        .collect();
+                    let column_names = (*schema.column_names_arc()).clone();
                     let result_row: Vec<Value> = schema.columns.iter()
                         .map(|col| cached_row.get(col.position).cloned().unwrap_or(Value::Null))
                         .collect();
@@ -5222,7 +5248,7 @@ impl QueryExecutor {
                         _ => return Err(StorageError::InvalidData("Unexpected blob".into())),
                     };
                     
-                    let row = bincode::deserialize::<crate::types::Row>(data)
+                    let row = decode_row(data, &schema)
                         .map_err(|e| StorageError::InvalidData(format!("Deserialization failed: {}", e)))?;
 
                     // Populate row_cache for future hot-path lookups
@@ -5235,9 +5261,7 @@ impl QueryExecutor {
                         && matches!(stmt.columns[0], SelectColumn::Star);
 
                     if is_select_star {
-                        let column_names: Vec<String> = schema.columns.iter()
-                            .map(|c| c.name.clone())
-                            .collect();
+                        let column_names = (*schema.column_names_arc()).clone();
                         let result_row: Vec<Value> = schema.columns.iter()
                             .map(|col| row.get(col.position).cloned().unwrap_or(Value::Null))
                             .collect();
@@ -5323,7 +5347,7 @@ impl QueryExecutor {
                     _ => return Err(StorageError::InvalidData("Unexpected blob".into())),
                 };
                 
-                let row = bincode::deserialize::<crate::types::Row>(data)
+                let row = decode_row(data, &schema)
                     .map_err(|e| StorageError::InvalidData(format!("Deserialization failed: {}", e)))?;
 
                 // 🚀 Fast path for SELECT *: skip HashMap conversion entirely

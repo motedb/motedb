@@ -101,7 +101,11 @@ pub struct MoteDB {
     /// Only populated for non-AUTO_INCREMENT primary keys.
     /// Bounded by LRU eviction — falls back to disk index on cache miss.
     pub(crate) pk_lookup: Arc<DashMap<String, Arc<crate::database::pk_cache::PkLookupCache>>>,
-    
+
+    /// Per-table live row count (for COUNT(*) fast path).
+    /// Incremented on INSERT, decremented on DELETE.
+    pub(crate) table_row_count: Arc<DashMap<String, Arc<AtomicU64>>>,
+
     /// Table registry (catalog)
     pub(crate) table_registry: Arc<TableRegistry>,
     
@@ -158,8 +162,8 @@ struct AutoCheckpointThread {
 
 /// Index build job sent through the async pipeline
 struct IndexBuildBatch {
-    /// Rows grouped by table_name
-    tables_data: std::collections::HashMap<String, Vec<(RowId, crate::types::Row)>>,
+    /// Raw row bytes grouped by table_name — decoded lazily in the builder thread
+    tables_data: std::collections::HashMap<String, Vec<(RowId, Vec<u8>)>>,
 }
 
 /// Background index builder thread
@@ -276,6 +280,7 @@ impl MoteDB {
             column_indexes: Arc::new(DashMap::new()),
             columnar_store,
             pk_lookup: Arc::new(DashMap::new()),
+            table_row_count: Arc::new(DashMap::new()),
             table_registry,
             index_registry,
             row_cache,
@@ -346,6 +351,7 @@ impl MoteDB {
             column_indexes: self.column_indexes.clone(),
             columnar_store: self.columnar_store.clone(),
             pk_lookup: self.pk_lookup.clone(),
+            table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
             index_registry: self.index_registry.clone(),  // 🆕
             row_cache: self.row_cache.clone(),
@@ -431,13 +437,23 @@ impl MoteDB {
         // Replay WAL records (if any uncommitted changes after last checkpoint)
         for records in recovered_records.values() {
             for record in records {
-                if let WALRecord::Insert { row_id, data, .. } = record {
-                    max_row_id = max_row_id.max(*row_id);
-                    
-                    // Also insert into timestamp index
-                    if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
-                        let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                match record {
+                    WALRecord::Insert { row_id, data, .. } => {
+                        max_row_id = max_row_id.max(*row_id);
+                        if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
+                            let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                        }
                     }
+                    WALRecord::InsertRaw { row_id, raw_data, .. } => {
+                        max_row_id = max_row_id.max(*row_id);
+                        // Extract timestamp from raw data for index
+                        if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
+                            if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
+                                let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -477,15 +493,32 @@ impl MoteDB {
         for records in recovered_records.values() {
             for record in records {
                 match record {
-                    WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
+                    WALRecord::InsertRaw { table_name, row_id, raw_data, txn_id, .. } => {
                         if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        // Use table_id for composite_key (same as make_composite_key)
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
-
+                        // Zero-copy: raw_data goes straight to LSM
+                        let value = crate::storage::lsm::Value::new(raw_data.clone(), composite_key);
+                        lsm_engine.put(composite_key, value)?;
+                        _recovered_count += 1;
+                    }
+                    WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                        let table_id = table_registry.get_table_id(table_name)
+                            .unwrap_or(0);
+                        let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let row_data = bincode::serialize(data)?;
                         let value = crate::storage::lsm::Value::new(row_data, composite_key);
+                        lsm_engine.put(composite_key, value)?;
+                        _recovered_count += 1;
+                    }
+                    WALRecord::UpdateRaw { table_name, row_id, raw_new, txn_id, .. } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                        let table_id = table_registry.get_table_id(table_name)
+                            .unwrap_or(0);
+                        let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
+                        let value = crate::storage::lsm::Value::new(raw_new.clone(), composite_key);
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
@@ -498,6 +531,14 @@ impl MoteDB {
                         let row_data = bincode::serialize(new_data)?;
                         let value = crate::storage::lsm::Value::new(row_data, composite_key);
                         lsm_engine.put(composite_key, value)?;
+                        _recovered_count += 1;
+                    }
+                    WALRecord::DeleteRaw { table_name, row_id, timestamp, txn_id, .. } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                        let table_id = table_registry.get_table_id(table_name)
+                            .unwrap_or(0);
+                        let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
+                        lsm_engine.delete(composite_key, *timestamp)?;
                         _recovered_count += 1;
                     }
                     WALRecord::Delete { table_name, row_id, timestamp, txn_id, .. } => {
@@ -599,16 +640,26 @@ impl MoteDB {
             let mut columnar_replay_count = 0u64;
             for records in recovered_records.values() {
                 for record in records {
-                    if let WALRecord::Insert { table_name, row_id, data, txn_id, .. } = record {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        // Check if this table is a TimeSeries table
-                        if let Ok(schema) = table_registry.get_table(table_name) {
-                            if schema.table_type == crate::types::TableType::TimeSeries {
-                                if let Err(e) = columnar_store.replay_row(table_name, *row_id, data.clone()) {
-                                    debug_log!("[database] ⚠️ Failed to replay columnar row for '{}': {:?}", table_name, e);
-                                }
-                                columnar_replay_count += 1;
+                    let (table_name, row_id, txn_id, row_data) = match record {
+                        WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
+                            (table_name.clone(), *row_id, *txn_id, data.clone())
+                        }
+                        WALRecord::InsertRaw { table_name, row_id, raw_data, txn_id, .. } => {
+                            let row = match crate::storage::row_format::decode_any(raw_data) {
+                                Ok(r) => r,
+                                Err(_) => continue,
+                            };
+                            (table_name.clone(), *row_id, *txn_id, row)
+                        }
+                        _ => continue,
+                    };
+                    if txn_id != 0 && !committed_txns.contains(&txn_id) { continue; }
+                    if let Ok(schema) = table_registry.get_table(&table_name) {
+                        if schema.table_type == crate::types::TableType::TimeSeries {
+                            if let Err(e) = columnar_store.replay_row(&table_name, row_id, row_data) {
+                                debug_log!("[database] ⚠️ Failed to replay columnar row for '{}': {:?}", table_name, e);
                             }
+                            columnar_replay_count += 1;
                         }
                     }
                 }
@@ -635,6 +686,7 @@ impl MoteDB {
             column_indexes: Arc::new(DashMap::new()),
             columnar_store,
             pk_lookup: Arc::new(DashMap::new()),
+            table_row_count: Arc::new(DashMap::new()),
             table_registry,
             index_registry,
             row_cache,
@@ -682,19 +734,98 @@ impl MoteDB {
             let schema = db.table_registry.get_table(&table_name)?;
             if schema.is_primary_key_auto_increment() {
                 let max_id = db.recover_auto_increment_counter(&table_name, &schema)?;
-                debug_log!("[database] 🔄 Recovered AUTO_INCREMENT counter for '{}': next_id = {}", 
+                debug_log!("[database] 🔄 Recovered AUTO_INCREMENT counter for '{}': next_id = {}",
                     table_name, max_id + 1);
-                
+
                 db.table_auto_increment.insert(
-                    table_name,
+                    table_name.clone(),
                     Arc::new(AtomicI64::new(max_id + 1))
                 );
+
+                // Initialize row count counter (will count via streaming scan)
+                let row_counter = Arc::new(AtomicU64::new(0));
+                let table_prefix = db.compute_table_prefix(&table_name);
+                let start_key = table_prefix << 32;
+                let end_key = (table_prefix + 1) << 32;
+                if let Ok(stream) = db.lsm_engine.scan_range_streaming(start_key, end_key) {
+                    let mut cnt = 0u64;
+                    for result in stream {
+                        if let Ok((_, value)) = result {
+                            if !value.deleted { cnt += 1; }
+                        }
+                    }
+                    row_counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
+                }
+                db.table_row_count.insert(table_name.clone(), row_counter);
+            } else if let Some(pk_col) = schema.primary_key() {
+                // Pre-warm PK lookup cache from SSTable data
+                db.warm_pk_cache(&table_name, &schema, pk_col);
             }
         }
         
         Ok(db)
     }
     
+    /// Pre-warm PK lookup cache by scanning SSTable data for a table.
+    /// This avoids cold-start misses where every PK SELECT requires a full SSTable scan.
+    fn warm_pk_cache(&self, table_name: &str, schema: &crate::types::TableSchema, pk_col: &str) {
+        let pk_position = match schema.columns.iter().find(|c| c.name == pk_col) {
+            Some(col) => col.position,
+            None => return,
+        };
+
+        // Create the PK lookup cache for this table
+        let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(self.pk_lookup_capacity));
+        self.pk_lookup.insert(table_name.to_string(), pk_cache.clone());
+
+        // Initialize row count counter
+        self.table_row_count.insert(table_name.to_string(), Arc::new(AtomicU64::new(0)));
+
+        // Scan LSM for this table's data
+        let table_prefix = self.compute_table_prefix(table_name);
+        let start_key = table_prefix << 32;
+        let end_key = (table_prefix + 1) << 32;
+
+        let col_types = schema.col_types();
+        let mut count = 0;
+
+        if let Ok(stream) = self.lsm_engine.scan_range_streaming(start_key, end_key) {
+            for result in stream {
+                let (composite_key, value) = match result {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if value.deleted {
+                    continue;
+                }
+                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
+                let data_bytes: Vec<u8> = match &value.data {
+                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                        match self.lsm_engine.resolve_blob(blob_ref) {
+                            Ok(data) => data,
+                            Err(_) => continue,
+                        }
+                    }
+                };
+
+                if let Ok(pk_value) = crate::storage::row_format::get_column(&data_bytes, col_types, pk_position) {
+                    pk_cache.insert(crate::database::pk_cache::PkKey::from_value(&pk_value), row_id);
+                    count += 1;
+                }
+            }
+        }
+
+        if count > 0 {
+            debug_log!("[warm_pk_cache] ✅ Pre-warmed PK cache for '{}': {} entries", table_name, count);
+            // Set row count from recovered data
+            if let Some(counter) = self.table_row_count.get(table_name) {
+                counter.store(count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     /// 🚀 Helper: Convert HashMap to DashMap
     fn hashmap_to_dashmap<K: std::hash::Hash + Eq, V>(map: HashMap<K, V>) -> DashMap<K, V> {
         let dashmap = DashMap::new();
@@ -858,8 +989,8 @@ impl MoteDB {
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     match rx.recv_timeout(std::time::Duration::from_secs(2)) {
                         Ok(batch) => {
-                            for (table_name, rows) in &batch.tables_data {
-                                if let Err(e) = db.batch_build_table_indexes(table_name, rows) {
+                            for (table_name, raw_rows) in &batch.tables_data {
+                                if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
                                     debug_log!("[IndexBuilder] ⚠️ Index build failed for '{}': {:?}",
                                         table_name, e);
                                 }
@@ -898,8 +1029,11 @@ impl MoteDB {
             return Ok(());
         }
 
-        // Extract: group rows by table_id → table_name
-        let mut tables_data: std::collections::HashMap<String, Vec<(RowId, crate::types::Row)>> =
+        let mut tables_data: std::collections::HashMap<String, Vec<(RowId, Vec<u8>)>> =
+            std::collections::HashMap::new();
+
+        // Cache table_id → table_name to avoid repeated lookups
+        let mut name_cache: std::collections::HashMap<u32, String> =
             std::collections::HashMap::new();
 
         for (composite_key, entry) in memtable.iter() {
@@ -907,32 +1041,28 @@ impl MoteDB {
                 continue;
             }
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+            let table_id = (composite_key >> 32) as u32;
 
             let row_bytes: Vec<u8> = match &entry.data {
                 crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
-                crate::storage::lsm::ValueData::Blob(_) => {
-                    // Can't resolve blobs here; checkpoint's rebuild will catch these
-                    continue;
-                }
+                crate::storage::lsm::ValueData::Blob(_) => continue,
             };
 
-            let row: crate::types::Row = match bincode::deserialize(&row_bytes) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            // Resolve table_id → table_name (cached, no decode needed)
+            if !name_cache.contains_key(&table_id) {
+                let name = if table_id == 0 {
+                    "_default".to_string()
+                } else {
+                    match registry.get_table_name_by_id(table_id) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    }
+                };
+                name_cache.insert(table_id, name);
+            }
 
-            // Resolve table_id → table_name via registry (pure in-memory, no LSM scan)
-            let table_id = (composite_key >> 32) as u32;
-            let table_name = if table_id == 0 {
-                "_default".to_string()
-            } else {
-                match registry.get_table_name_by_id(table_id) {
-                    Ok(name) => name,
-                    Err(_) => continue, // Unknown table_id, skip
-                }
-            };
-
-            tables_data.entry(table_name).or_default().push((row_id, row));
+            let table_name = name_cache.get(&table_id).unwrap();
+            tables_data.entry(table_name.to_string()).or_default().push((row_id, row_bytes));
         }
 
         if !tables_data.is_empty() {
@@ -959,15 +1089,17 @@ impl MoteDB {
             .name("motedb-auto-flush".into())
             .spawn(move || {
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Block until a flush request arrives or stop signal
                     match flush_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        Ok(()) => {
                             if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
                             // Drain any queued requests — coalesce multiple flushes into one
                             while flush_rx.try_recv().is_ok() {}
                             let _ = db.flush();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // No flush request — don't flush empty memtable
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }

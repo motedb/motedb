@@ -4,7 +4,7 @@
 //! Provides DiskANN-based vector similarity search
 
 use crate::database::core::MoteDB;
-use crate::types::{Row, RowId, Value};
+use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
 use crate::index::vamana::{DiskANNIndex, VamanaConfig};
 use parking_lot::RwLock;
@@ -109,7 +109,7 @@ impl MoteDB {
                                 }
                             };
 
-                            if let Ok(row) = bincode::deserialize::<Row>(&data_bytes) {
+                            if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
                                 if let Some(crate::types::Value::Vector(vec_data)) = row.get(col_position) {
                                         vectors_to_index.push((row_id, vec_data.to_vec()));
                                     }
@@ -296,7 +296,7 @@ impl MoteDB {
             
             // Parse row to get vector value at col_position
             // Row format: bincode-serialized Vec<Value>
-            if let Ok(row_values) = bincode::deserialize::<Vec<Value>>(row_bytes) {
+            if let Ok(row_values) = crate::storage::row_format::decode_any(row_bytes) {
                 if let Some(Value::Vector(vec_data)) = row_values.get(col_position) {
                     if vec_data.len() == query.len() {
                         // Compute L2 distance

@@ -260,7 +260,7 @@ impl<'a> Lexer<'a> {
     
     fn read_string(&mut self, quote: char) -> Result<TokenType> {
         self.advance(); // skip opening quote
-        let mut value = String::new();
+        let mut value = String::with_capacity(32);
         
         while !self.is_eof() && self.current_char() != quote {
             if self.current_char() == '\\' {
@@ -294,7 +294,7 @@ impl<'a> Lexer<'a> {
     }
     
     fn read_number(&mut self) -> Result<TokenType> {
-        let mut value = String::new();
+        let mut value = String::with_capacity(16);
         
         while !self.is_eof() && (self.current_char().is_numeric() || self.current_char() == '.') {
             value.push(self.current_char());
@@ -321,7 +321,7 @@ impl<'a> Lexer<'a> {
     }
     
     fn read_identifier(&mut self) -> TokenType {
-        let mut value = String::new();
+        let mut value = String::with_capacity(16);
         
         while !self.is_eof() {
             let ch = self.current_char();

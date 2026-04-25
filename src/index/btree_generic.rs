@@ -888,7 +888,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         // Find split point based on actual byte size (not just key count)
         // Goal: Keep left page under 50% of PAGE_SIZE to leave room for growth
         let key_size = K::key_size();
-        let target_left_size = (PAGE_SIZE as f64 * 0.4) as usize; // Target 40% for left page
+        let target_left_size = (PAGE_SIZE as f64 * 0.5) as usize; // 50/50 split for better utilization
         let mut left_size = HEADER_SIZE; // Start with header
         let mut split_idx = 0;
         

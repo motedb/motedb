@@ -4,13 +4,17 @@
 //!
 //! Run: cargo test --test bench_resource --release -- --nocapture --test-threads=1
 
-use motedb::Database;
+use motedb::{Database, DBConfig};
 use tempfile::TempDir;
 use std::time::{Instant, Duration};
 
+fn edge_config() -> DBConfig {
+    DBConfig::for_edge()
+}
+
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
-    let db = Database::create(dir.path()).expect("create db");
+    let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
     (db, dir)
 }
 

@@ -7,13 +7,12 @@
 //! Uses B-Tree for persistent storage with efficient range queries.
 
 use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig, BTreeKey};
-use crate::index::cached_index::CachedIndex; // 🚀 P1: 使用LRU缓存
+use crate::index::cached_index::CachedIndex;
 use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
 /// Column Value Index configuration
 #[derive(Debug, Clone)]
@@ -28,60 +27,82 @@ impl Default for ColumnValueIndexConfig {
     fn default() -> Self {
         Self {
             max_page_size: 4096,
-            cache_size: 16,  // 🔧 P2: Reduced from 64 to 16 (64KB total cache per index)
+            cache_size: 16,
         }
     }
 }
 
+/// Compact key layout: [value_data: 12B zero-padded][row_id: 8B BE][value_len: 2B BE] = 22 bytes
+/// - Integer/Float/Timestamp: value_data = 8 bytes BE + 4 bytes zero pad
+/// - Text: value_data = up to 12 bytes UTF-8 + zero pad
+/// - Bool: value_data = 1 byte + 11 bytes zero pad
+const VALUE_DATA_SIZE: usize = 12;
+const ROW_ID_SIZE: usize = 8;
+const VALUE_LEN_SIZE: usize = 2;
+
 /// Key for the B-Tree: (column_value, row_id)
-/// This allows multiple rows with same value + efficient range queries
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// Compact binary encoding — no bincode, no Vec allocation in serialized form.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexKey {
-    /// Column value (serialized as bytes)
     value_bytes: Vec<u8>,
-    /// Row ID (for uniqueness)
     row_id: RowId,
 }
 
-// Implement BTreeKey trait for IndexKey
 impl BTreeKey for IndexKey {
     fn serialize(&self) -> Vec<u8> {
-        // 🔧 P2优化: 从280字节减至64字节（对于Integer类型仅需16字节）
-        let mut result = vec![0u8; 64];  // Reduced from 280 to 64
-        
-        // Serialize to bincode first
-        let serialized = bincode::serialize(self).unwrap_or_default();
-        
-        // Write length prefix (2 bytes)
-        let len = serialized.len().min(62);
-        result[0] = (len >> 8) as u8;
-        result[1] = (len & 0xFF) as u8;
-        
-        // Copy data
-        result[2..2 + len].copy_from_slice(&serialized[..len]);
-        
+        let key_size = Self::key_size();
+        let mut result = vec![0u8; key_size];
+
+        // Value data (zero-padded to VALUE_DATA_SIZE)
+        let val_len = self.value_bytes.len().min(VALUE_DATA_SIZE);
+        result[..val_len].copy_from_slice(&self.value_bytes[..val_len]);
+
+        // Row ID (big-endian for proper ordering)
+        result[VALUE_DATA_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE]
+            .copy_from_slice(&self.row_id.to_be_bytes());
+
+        // Value length (for deserialization)
+        let vlen = self.value_bytes.len() as u16;
+        result[VALUE_DATA_SIZE + ROW_ID_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE]
+            .copy_from_slice(&vlen.to_be_bytes());
+
         result
     }
-    
+
     fn deserialize(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 2 {
+        let key_size = Self::key_size();
+        if bytes.len() < key_size {
             return Err(StorageError::Serialization("Invalid key: too short".to_string()));
         }
-        
-        // Read length
-        let len = ((bytes[0] as usize) << 8) | (bytes[1] as usize);
-        
-        if bytes.len() < 2 + len {
-            return Err(StorageError::Serialization("Invalid key: length mismatch".to_string()));
-        }
-        
-        // Deserialize actual data
-        bincode::deserialize(&bytes[2..2 + len])
-            .map_err(|e| StorageError::Serialization(format!("Failed to deserialize IndexKey: {}", e)))
+
+        // Read value length
+        let vlen = u16::from_be_bytes(
+            bytes[VALUE_DATA_SIZE + ROW_ID_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE]
+                .try_into()
+                .map_err(|_| StorageError::Serialization("Invalid value_len".to_string()))?
+        ) as usize;
+
+        // Reconstruct value_bytes
+        let value_bytes = if vlen <= VALUE_DATA_SIZE {
+            bytes[..vlen].to_vec()
+        } else {
+            // Truncated during serialization — use what we have
+            // Range scans still work because the prefix is preserved
+            bytes[..VALUE_DATA_SIZE].to_vec()
+        };
+
+        // Row ID
+        let row_id = u64::from_be_bytes(
+            bytes[VALUE_DATA_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE]
+                .try_into()
+                .map_err(|_| StorageError::Serialization("Invalid row_id".to_string()))?
+        );
+
+        Ok(IndexKey { value_bytes, row_id })
     }
-    
+
     fn key_size() -> usize {
-        64  // 🔧 Reduced from 280 to 64 (77% space saving)
+        VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE // 22 bytes
     }
 }
 
@@ -310,7 +331,7 @@ impl ColumnValueIndex {
         };
         
         let max_key = IndexKey {
-            value_bytes: vec![0xFF; 64],  // Maximum possible value (64 bytes of 0xFF)
+            value_bytes: vec![0xFF; VALUE_DATA_SIZE],
             row_id: RowId::MAX,
         };
         
@@ -386,7 +407,7 @@ impl ColumnValueIndex {
         
         // End at maximum possible key
         let end_key = IndexKey {
-            value_bytes: vec![0xFF; 1024],  // Large bytes = maximum
+            value_bytes: vec![0xFF; VALUE_DATA_SIZE],  // Large bytes = maximum
             row_id: RowId::MAX,
         };
         
@@ -441,7 +462,7 @@ impl ColumnValueIndex {
         };
         
         let end_key = IndexKey {
-            value_bytes: vec![0xFF; 1024],
+            value_bytes: vec![0xFF; VALUE_DATA_SIZE],
             row_id: RowId::MAX,
         };
         
@@ -545,19 +566,17 @@ impl ColumnValueIndex {
         // 🚀 P0: Removed legacy cache update (memory leak fix)
         
         // Batch invalidate LRU cache (only affected values)
-        // Deduplicate values (Value doesn't implement Hash, so use manual dedup)
         let mut unique_values = items.into_iter()
             .map(|(value, _)| value)
             .collect::<Vec<_>>();
         unique_values.sort_by(|a, b| {
-            // Sort by serialized bytes for deduplication
-            let a_bytes = bincode::serialize(a).unwrap_or_default();
-            let b_bytes = bincode::serialize(b).unwrap_or_default();
+            let a_bytes = match Self::value_to_bytes_helper(a) { Ok(b) => b, Err(_) => vec![] };
+            let b_bytes = match Self::value_to_bytes_helper(b) { Ok(b) => b, Err(_) => vec![] };
             a_bytes.cmp(&b_bytes)
         });
         unique_values.dedup_by(|a, b| {
-            let a_bytes = bincode::serialize(a).unwrap_or_default();
-            let b_bytes = bincode::serialize(b).unwrap_or_default();
+            let a_bytes = match Self::value_to_bytes_helper(a) { Ok(b) => b, Err(_) => vec![] };
+            let b_bytes = match Self::value_to_bytes_helper(b) { Ok(b) => b, Err(_) => vec![] };
             a_bytes == b_bytes
         });
         
@@ -638,14 +657,17 @@ impl ColumnValueIndex {
 
     // Helper: Convert Value to bytes for comparison
     fn value_to_bytes(&self, value: &Value) -> Result<Vec<u8>> {
+        Self::value_to_bytes_helper(value)
+    }
+
+    fn value_to_bytes_helper(value: &Value) -> Result<Vec<u8>> {
         use crate::types::Value;
-        
+
         let bytes = match value {
             Value::Integer(i) => i.to_be_bytes().to_vec(),
             Value::Float(f) => f.to_be_bytes().to_vec(),
             Value::Text(s) => s.as_bytes().to_vec(),
             Value::Bool(b) => vec![if *b { 1 } else { 0 }],
-            // 🚀 新增：支持 Timestamp 类型
             Value::Timestamp(ts) => ts.as_micros().to_be_bytes().to_vec(),
             _ => {
                 return Err(StorageError::InvalidData(
@@ -709,7 +731,7 @@ impl IndexBuilder for ColumnValueIndex {
             rows_processed: stats.total_row_ids,
             build_time_ms: 0, // 在实际实现中应该记录
             persist_time_ms: 0,
-            index_size_bytes: stats.total_row_ids * 64, // 估算：每行64字节
+            index_size_bytes: stats.total_row_ids * 22, // compact key: 22 bytes/row
         }
     }
 }

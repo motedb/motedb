@@ -685,6 +685,7 @@ dependencies = [
  "thiserror",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
+ "zstd",
 ]
 
 [[package]]

@@ -14,14 +14,13 @@
 //! - 查询层: Cost-based optimizer + streaming executor
 //! - 事务层: MVCC + Write-Ahead Logging
 
-// 🔧 移除 jemalloc 以减小二进制大小
-// 使用系统默认分配器
-// #[cfg(not(target_env = "msvc"))]
-// use tikv_jemallocator::Jemalloc;
+// 🧠 jemalloc: background thread returns freed memory to OS (RSS plateaus instead of growing forever)
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+use tikv_jemallocator::Jemalloc;
 
-// #[cfg(not(target_env = "msvc"))]
-// #[global_allocator]
-// static GLOBAL: Jemalloc = Jemalloc;
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 /// Debug-only logging macro
 /// Only prints in debug builds, silenced in release builds

@@ -11,6 +11,7 @@ use super::sq8::{QuantizedVector, SQ8Quantizer};
 use crate::types::RowId;
 use crate::{Result, StorageError};
 use lru::LruCache;
+use memmap2::Mmap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -27,6 +28,11 @@ pub struct SQ8Vectors {
 
     /// Entry size = 8 (row_id) + 4 (min) + 4 (max) + dimension (codes)
     _entry_size: usize,
+
+    /// mmap of vectors_sq8.bin — zero-syscall quantized vector reads
+    data_mmap: Arc<RwLock<Option<Mmap>>>,
+    /// mmap of vectors_sq8.idx sidecar — zero-syscall offset lookups
+    idx_mmap: Arc<RwLock<Option<Mmap>>>,
 
     /// Bounded offset index: row_id -> file offset (LRU-capped)
     index: Arc<RwLock<LruCache<RowId, u64>>>,
@@ -82,6 +88,8 @@ impl SQ8Vectors {
             dimension,
             quantizer,
             _entry_size: entry_size,
+            data_mmap: Arc::new(RwLock::new(None)),
+            idx_mmap: Arc::new(RwLock::new(None)),
             index: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
             ))),
@@ -132,11 +140,17 @@ impl SQ8Vectors {
         let write_file = OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?;
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
+        // mmap data and sidecar for zero-syscall reads
+        let data_mmap = unsafe { Mmap::map(&read_file).ok() };
+        let sidecar_mmap = unsafe { Mmap::map(&idx_read).ok() };
+
         Ok(Self {
             _data_dir: data_dir,
             dimension,
             quantizer,
             _entry_size: entry_size,
+            data_mmap: Arc::new(RwLock::new(data_mmap)),
+            idx_mmap: Arc::new(RwLock::new(sidecar_mmap)),
             index: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
             ))),
@@ -191,7 +205,7 @@ impl SQ8Vectors {
     }
 
     /// Look up file offset for a row_id.
-    /// Checks LRU first, falls back to binary search on sidecar index file.
+    /// Checks LRU first, then mmap binary search, then sidecar file fallback.
     fn lookup_offset(&self, row_id: RowId) -> Option<u64> {
         // 1. Check LRU cache
         {
@@ -201,12 +215,41 @@ impl SQ8Vectors {
             }
         }
 
-        // 2. Binary search on sidecar index file
         let count = *self.index_count.read();
         if count == 0 {
             return None;
         }
 
+        // 2. mmap binary search (zero syscall)
+        {
+            let guard = self.idx_mmap.read();
+            if let Some(ref mmap) = *guard {
+                let entry_size = 16usize;
+                let mut lo = 0i64;
+                let mut hi = count as i64 - 1;
+
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let off = 8 + mid as usize * entry_size;
+                    if off + 16 > mmap.len() { break; }
+                    let mid_id = u64::from_le_bytes(mmap[off..off+8].try_into().ok()?);
+                    let mid_offset = u64::from_le_bytes(mmap[off+8..off+16].try_into().ok()?);
+
+                    match mid_id.cmp(&row_id) {
+                        std::cmp::Ordering::Equal => {
+                            drop(guard);
+                            self.index.write().put(row_id, mid_offset);
+                            return Some(mid_offset);
+                        }
+                        std::cmp::Ordering::Less => lo = mid + 1,
+                        std::cmp::Ordering::Greater => hi = mid - 1,
+                    }
+                }
+                return None;
+            }
+        }
+
+        // 3. Fallback: binary search on sidecar index file
         let mut file = self.index_file.write();
         let entry_size = 16u64; // row_id (8) + offset (8)
         let mut lo = 0i64;
@@ -223,7 +266,6 @@ impl SQ8Vectors {
 
             match mid_id.cmp(&row_id) {
                 std::cmp::Ordering::Equal => {
-                    // Found — cache it for next time
                     drop(file);
                     self.index.write().put(row_id, mid_offset);
                     return Some(mid_offset);
@@ -415,6 +457,9 @@ impl SQ8Vectors {
             *self.index_file.write() = idx_read;
         }
 
+        // Remap after flush
+        self.remap();
+
         Ok(())
     }
 
@@ -463,6 +508,24 @@ impl SQ8Vectors {
     // ==================== Private Helpers ====================
 
     fn read_quantized(&self, offset: u64) -> Result<QuantizedVector> {
+        // Try mmap path (zero syscall)
+        {
+            let guard = self.data_mmap.read();
+            if let Some(ref mmap) = *guard {
+                // Entry layout: [row_id: 8] [min: 4] [max: 4] [codes: dimension]
+                let off = offset as usize + 8; // skip row_id
+                let end = off + 8 + self.dimension;
+                if end > mmap.len() {
+                    return Err(StorageError::InvalidData("SQ8 mmap offset out of bounds".into()));
+                }
+                let min = f32::from_le_bytes(mmap[off..off+4].try_into().unwrap());
+                let max = f32::from_le_bytes(mmap[off+4..off+8].try_into().unwrap());
+                let codes = mmap[off+8..off+8+self.dimension].to_vec();
+                return Ok(QuantizedVector { codes, min, max });
+            }
+        }
+
+        // Fallback: seek+read
         let mut file = self.read_file.write();
         file.seek(SeekFrom::Start(offset + 8)).map_err(StorageError::Io)?;
 
@@ -490,6 +553,18 @@ impl SQ8Vectors {
         file.write_all(&qvec.codes).map_err(StorageError::Io)?;
 
         Ok(offset)
+    }
+
+    /// Remap data and sidecar files after flush
+    fn remap(&self) {
+        {
+            let file = self.read_file.read();
+            *self.data_mmap.write() = unsafe { Mmap::map(&*file).ok() };
+        }
+        {
+            let idx = self.index_file.read();
+            *self.idx_mmap.write() = unsafe { Mmap::map(&*idx).ok() };
+        }
     }
 }
 

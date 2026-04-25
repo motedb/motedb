@@ -191,8 +191,12 @@ impl Token {
 impl TokenType {
     /// Check if this token is a keyword (🚀 P1.3: O(1) perfect hash lookup)
     pub fn from_keyword(s: &str) -> Option<Self> {
-        // Convert to lowercase for case-insensitive matching
-        let lowercase = s.to_lowercase();
+        // Early exit: longest keyword is "auto_increment" (14 chars)
+        if s.len() > 14 {
+            return None;
+        }
+        // ASCII-only lowercasing (SQL keywords are all ASCII, avoids Unicode tables)
+        let lowercase = s.to_ascii_lowercase();
         KEYWORDS.get(lowercase.as_str()).cloned()
     }
 }

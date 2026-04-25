@@ -4,7 +4,7 @@ use super::{UnifiedMemTable, SSTable, SSTableBuilder, Key, Value, ValueData, LSM
 use crate::{Result, StorageError};
 use std::sync::{Arc, Mutex, Condvar};
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -21,18 +21,14 @@ const MAX_CONSECUTIVE_FLUSH_ERRORS: u32 = 5;
 
 /// Cached SSTable entry with separate bloom filter for lock-free pre-checking
 struct CachedSSTable {
-    /// Bloom filter (can be checked without acquiring SSTable mutex)
     bloom: Arc<BloomFilter>,
-    /// SSTable handle (requires mutex to access)
-    handle: Arc<Mutex<SSTable>>,
+    handle: Arc<RwLock<SSTable>>,
 }
 
-/// True LRU cache for SSTable handles (with bloom filter alongside)
-/// 🚀 Uses parking_lot::RwLock with peek/get pattern:
-///    - Cache hits: read lock only (concurrent reads)
-///    - Cache misses: write lock (rare after warm-up)
+/// LRU cache for SSTable handles with memory-aware eviction.
 struct SSTableCache {
     cache: RwLock<lru::LruCache<PathBuf, CachedSSTable>>,
+    max_entries: usize,
 }
 
 impl SSTableCache {
@@ -42,11 +38,12 @@ impl SSTableCache {
             cache: RwLock::new(lru::LruCache::new(
                 NonZeroUsize::new(max_size).unwrap()
             )),
+            max_entries: max_size,
         }
     }
 
     fn get_or_open(&self, path: &PathBuf) -> Result<CachedSSTable> {
-        // Fast path: read lock + peek (doesn't update LRU, but avoids write lock)
+        // Fast path: read lock + peek
         {
             let cache = self.cache.read();
             if let Some(cached) = cache.peek(path) {
@@ -57,9 +54,8 @@ impl SSTableCache {
             }
         }
 
-        // Slow path: write lock for cache miss (open SSTable + insert)
+        // Slow path: write lock
         let mut cache = self.cache.write();
-        // Double-check after acquiring write lock (another thread may have inserted)
         if let Some(cached) = cache.get(path) {
             return Ok(CachedSSTable {
                 bloom: cached.bloom.clone(),
@@ -67,15 +63,21 @@ impl SSTableCache {
             });
         }
 
-        // Open new SSTable and extract bloom filter
+        // Open new SSTable
         let sstable = SSTable::open(path)?;
         let bloom = Arc::new(sstable.bloom_filter().clone());
-        let sstable_arc = Arc::new(Mutex::new(sstable));
+        let sstable_arc = Arc::new(RwLock::new(sstable));
 
         let cached = CachedSSTable {
             bloom: bloom.clone(),
             handle: sstable_arc.clone(),
         };
+
+        // Evict old entries if at capacity
+        while cache.len() >= self.max_entries {
+            cache.pop_lru();
+        }
+
         cache.put(path.clone(), CachedSSTable {
             bloom,
             handle: sstable_arc,
@@ -88,8 +90,6 @@ impl SSTableCache {
         self.cache.write().clear();
     }
 
-    /// Evict only the given SSTable paths from the cache.
-    /// Entries not in `removed_paths` remain cached and usable.
     fn evict(&self, removed_paths: &[PathBuf]) {
         if removed_paths.is_empty() {
             return;
@@ -98,6 +98,11 @@ impl SSTableCache {
         for path in removed_paths {
             cache.pop(path);
         }
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.cache.read().len()
     }
 }
 
@@ -188,6 +193,11 @@ pub struct LSMEngine {
     /// Circuit breaker: counts consecutive SSTable write failures.
     /// After exceeding MAX_CONSECUTIVE_FLUSH_ERRORS, the flush thread drops the
     /// memtable instead of requeueing it (data is still in WAL for recovery).
+
+    /// Monotonically increasing epoch, bumped on every memtable rotation.
+    /// Readers load it before+after scanning active/immutable to detect
+    /// concurrent rotations and retry if needed (lock-free consistency).
+    rotation_epoch: Arc<AtomicU64>,
     /// Reset to 0 on any successful flush.
     consecutive_flush_errors: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -236,6 +246,8 @@ impl LSMEngine {
 
         // Clean up orphan .sst files — files on disk not in the compaction worker's
         // level metadata. These can be left behind by interrupted compaction or flush.
+        // Safety: move unreadable files to lost+found instead of deleting them,
+        // because a truncated footer does not mean the data is unrecoverable.
         {
             let known_paths: std::collections::HashSet<PathBuf> = compaction_worker
                 .get_all_sstables()
@@ -248,8 +260,11 @@ impl LSMEngine {
                     if path.extension().and_then(|e| e.to_str()) == Some("sst")
                         && !known_paths.contains(&path)
                     {
-                        debug_log!("[LSM] Cleaning up orphan SSTable: {:?}", path);
-                        let _ = std::fs::remove_file(&path);
+                        debug_log!("[LSM] Moving orphan SSTable to lost+found: {:?}", path);
+                        let lost_found = storage_dir.join("lost+found");
+                        let _ = std::fs::create_dir_all(&lost_found);
+                        let dest = lost_found.join(path.file_name().unwrap_or_default());
+                        let _ = std::fs::rename(&path, &dest);
                     }
                 }
             }
@@ -282,6 +297,7 @@ impl LSMEngine {
             compaction_thread: None,
             flush_thread: None,
             flush_callback: Arc::new(RwLock::new(None)),
+            rotation_epoch: Arc::new(AtomicU64::new(0)),
             flush_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             compaction_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             consecutive_flush_errors: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -388,39 +404,49 @@ impl LSMEngine {
                     None => return false,
                 };
 
-                if !flush_in_progress.load(Ordering::Acquire) {
+                let fip = flush_in_progress.load(Ordering::Acquire);
+                if !fip {
                     let immutable = match immutable_weak.upgrade() {
                         Some(i) => i,
-                        None => {
-                            return false;
-                        }
+                        None => return false,
                     };
 
                     let has_immutable = {
                         let immutable_guard = immutable.read();
-                        !immutable_guard.is_empty()
+                        immutable_guard.len() > 0
                     };
 
                     if has_immutable {
                         // Try to flush (inline implementation to avoid circular reference)
-                        if flush_in_progress.compare_exchange(
-                            false, true, Ordering::Acquire, Ordering::Relaxed
-                        ).is_ok() {
-                            // Pop from front of queue (FIFO)
-                            let (memtable, _queue_size_after) = {
-                                let mut immutable_lock = immutable.write();
-                                let mt = immutable_lock.pop_front();
-                                let size = immutable_lock.len();
-                                (mt, size)
+                        if flush_in_progress.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                            // 🔒 Drop guard: ensures flush_in_progress is reset even on panic
+                            struct FlushGuard {
+                                flag: Arc<AtomicBool>,
+                            }
+                            impl Drop for FlushGuard {
+                                fn drop(&mut self) {
+                                    self.flag.store(false, Ordering::Release);
+                                }
+                            }
+                            let _flush_guard = FlushGuard { flag: flush_in_progress.clone() };
+
+                            // 🔥 CORRECTNESS FIX: Peek at front memtable WITHOUT popping.
+                            let memtable_len = {
+                                let immutable_guard = immutable.read();
+                                match immutable_guard.front() {
+                                    Some(mt) => mt.len(),
+                                    None => 0,
+                                }
                             };
 
-                            // 🔥 DEADLOCK FIX: Pop memtable FIRST and drop lock
-                            if let Some(memtable) = memtable {
-                                // Generate SSTable ID
+                            if memtable_len == 0 {
+                                // Empty memtable in queue — just pop it to avoid infinite loop
+                                let mut immutable_lock = immutable.write();
+                                immutable_lock.pop_front();
+                            } else {
                                 let next_sst_id = match next_sst_id_weak.upgrade() {
                                     Some(n) => n,
                                     None => {
-                                        flush_in_progress.store(false, Ordering::Release);
                                         return false;
                                     }
                                 };
@@ -438,26 +464,29 @@ impl LSMEngine {
                                     // 🔧 Ensure storage directory exists
                                     if !storage_dir_clone.exists() {
                                         debug_log!("[LSM Flush] ⚠️  Storage directory deleted, skipping flush");
-                                        flush_in_progress.store(false, Ordering::Release);
                                         return false;
                                     }
 
                                     // Build SSTable with retry on failure (data loss prevention)
                                     let mut flush_success = false;
                                     for attempt in 0..3 {
-                                        match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable.len()) {
+                                        match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable_len) {
                                             Ok(mut builder) => {
-                                                // 🆕 Convert UnifiedEntry → Value
-                                                for (key, entry) in memtable.iter() {
-                                                    let value = Value {
-                                                        data: entry.data,
-                                                        timestamp: entry.timestamp,
-                                                        deleted: entry.deleted,
-                                                    };
-                                                    if let Err(e) = builder.add(key, value) {
-                                                        debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
+                                                // Read from front memtable (still in queue, visible to scans)
+                                                let immutable_guard = immutable.read();
+                                                if let Some(front_mt) = immutable_guard.front() {
+                                                    for (key, entry) in front_mt.iter() {
+                                                        let value = Value {
+                                                            data: entry.data,
+                                                            timestamp: entry.timestamp,
+                                                            deleted: entry.deleted,
+                                                        };
+                                                        if let Err(e) = builder.add(key, value) {
+                                                            debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
+                                                        }
                                                     }
                                                 }
+                                                drop(immutable_guard);
 
                                                 match builder.finish() {
                                                     Ok(meta) => {
@@ -492,42 +521,42 @@ impl LSMEngine {
                                         // Reset circuit breaker on successful flush
                                         consecutive_flush_errors.store(0, Ordering::Relaxed);
 
-                                        // 🔥 Call flush callback AFTER SSTable is successfully built
-                                        if let Some(callback_arc) = flush_callback_weak.upgrade() {
-                                            let callback_guard = callback_arc.read();
-                                            if let Some(ref callback) = *callback_guard {
-                                                if let Err(e) = callback(&memtable) {
-                                                    debug_log!("[LSM Flush] ⚠️  Callback error: {:?}", e);
+                                        // SSTable is registered — now safe to pop (data visible via SSTable)
+                                        let memtable = {
+                                            let mut immutable_lock = immutable.write();
+                                            immutable_lock.pop_front()
+                                        };
+
+                                        // 🔥 Call flush callback with owned memtable
+                                        if let Some(memtable) = memtable {
+                                            if let Some(callback_arc) = flush_callback_weak.upgrade() {
+                                                let callback_guard = callback_arc.read();
+                                                if let Some(ref callback) = *callback_guard {
+                                                    if let Err(e) = callback(&memtable) {
+                                                        debug_log!("[LSM Flush] ⚠️  Callback error: {:?}", e);
+                                                    }
                                                 }
                                             }
+                                            drop(memtable);
                                         }
-
-                                        // Explicitly drop memtable (data is now in SSTable)
-                                        drop(memtable);
                                     } else {
-                                        // Circuit breaker: increment consecutive error count
+                                        // Circuit breaker: track errors but never drop the memtable.
+                                        // Dropping is unsafe when WAL is not active (permanent data loss).
+                                        // Instead, log a critical warning and retry on the next cycle.
                                         let errors = consecutive_flush_errors.fetch_add(1, Ordering::Relaxed) + 1;
                                         if errors > MAX_CONSECUTIVE_FLUSH_ERRORS {
-                                            // Permanent error (e.g. disk full) — drop the memtable.
-                                            // Data is still in the WAL and can be recovered on restart.
                                             debug_log!(
-                                                "[LSM Flush] 🚨 CRITICAL: {} consecutive flush failures, dropping memtable (data in WAL for recovery)",
+                                                "[LSM Flush] 🚨 CRITICAL: {} consecutive flush failures. Retrying — memtable NOT dropped to prevent data loss.",
                                                 errors
                                             );
-                                            drop(memtable);
-                                        } else {
-                                            // Requeue for retry — the error may be transient
-                                            debug_log!("[LSM Flush] 🚨 CRITICAL: SSTable write failed after 3 attempts (consecutive errors: {}), putting memtable back to queue!", errors);
-                                            {
-                                                let mut immutable_lock = immutable.write();
-                                                immutable_lock.push_front(memtable);
-                                            }
+                                            // Back off to reduce log spam and disk pressure
+                                            std::thread::sleep(std::time::Duration::from_secs(1));
                                         }
                                     }
                                 }
-                            } // end if let Some(memtable)
+                            } // end else (memtable_len > 0)
 
-                            flush_in_progress.store(false, Ordering::Release);
+                            // _flush_guard Drop resets flush_in_progress=false
 
                             // Notify anyone waiting in flush() that the immutable
                             // queue has been drained.
@@ -542,14 +571,20 @@ impl LSMEngine {
                     }
                 }
 
-                // 🚀 Edge optimization: event-driven wait (replaces busy polling)
-                // Sleeps until notified (new immutable pushed) or 5s timeout
+                // Wait for new work: wake on notification or poll every 500ms.
+                // Check the flag AFTER acquiring the lock to avoid clearing a
+                // signal that arrived between the work check and this wait.
                 {
                     let (lock, cvar) = &*flush_wakeup;
                     let mut guard = lock.lock().unwrap();
-                    // Reset the flag before waiting
-                    *guard = false;
-                    let _ = cvar.wait_timeout(guard, Duration::from_secs(5));
+                    // Only clear+wait if no new signal arrived while we were working
+                    if !*guard {
+                        *guard = false;
+                        let _ = cvar.wait_timeout(guard, Duration::from_millis(500));
+                    } else {
+                        // Signal arrived while we were processing — loop immediately
+                        *guard = false;
+                    }
                 }
                 true // signal: continue loop
                 }));  // end catch_unwind for this iteration
@@ -657,39 +692,34 @@ impl LSMEngine {
     /// Get a value by key (LSM查询: MemTable -> Immutable -> SSTables -> Blob)
     pub fn get(&self, key: Key) -> Result<Option<Value>> {
         // 1. Check active memtable (newest data)
+        let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
         let active_result = {
             let memtable = self.memtable.read();
             memtable.get(key)?
-            // 🔓 memtable锁在这里释放
         };
-        
+
         if let Some(entry) = active_result {
-            // 🆕 Convert UnifiedEntry → Value
             let mut value = Value {
                 data: entry.data,
                 timestamp: entry.timestamp,
                 deleted: entry.deleted,
             };
-            
-            // Check tombstone (DELETE 操作)
+
             if value.deleted {
                 return Ok(None);
             }
-            
-            // Resolve blob reference if needed
+
             if let ValueData::Blob(ref blob_ref) = value.data {
                 let blob_data = self.blob_store.get(blob_ref)?;
                 value.data = ValueData::Inline(blob_data);
             }
             return Ok(Some(value));
         }
-        
+
         // 2. Check immutable queue (reverse order, newer first)
-        // ⚠️  CRITICAL: 在持锁期间查询所有memtable，但立即返回结果避免长时间持锁
         let immutable_result = {
             let immutable = self.immutable.read();
-            
-            // Search from back (newest) to front (oldest)
+
             let mut result = None;
             for memtable in immutable.iter().rev() {
                 if let Some(entry) = memtable.get(key)? {
@@ -698,9 +728,26 @@ impl LSMEngine {
                 }
             }
             result
-            // 🔓 immutable锁在这里释放
         };
-        
+
+        // 2b. Epoch check: if a rotation happened, the old active (which didn't
+        //     have our key) may now be in immutable. Re-check immutable.
+        let found_in_immutable = immutable_result.is_some();
+        let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+        let immutable_result = if !found_in_immutable && epoch_after != epoch_before {
+            let immutable = self.immutable.read();
+            let mut result = None;
+            for memtable in immutable.iter().rev() {
+                if let Some(entry) = memtable.get(key)? {
+                    result = Some(entry);
+                    break;
+                }
+            }
+            result
+        } else {
+            immutable_result
+        };
+
         if let Some(entry) = immutable_result {
             // 🆕 Convert UnifiedEntry → Value
             let mut value = Value {
@@ -724,16 +771,13 @@ impl LSMEngine {
         
         // 3. Check SSTables (Level 0 -> Level 1 -> ... -> Level N)
         let sstable_metas = self.compaction_worker.get_all_sstables()?;
-        
-        // Group by level and search from L0 to LN
+
+        // Search from L0 to LN — no Vec allocation per level
         for level in 0..self.config.num_levels {
-            let level_sstables: Vec<_> = sstable_metas.iter()
+            for meta in sstable_metas.iter()
                 .filter(|meta| self.get_level_from_path(&meta.path) == level)
-                .collect();
-            
-            // For L0: check all files (may overlap), newest first
-            // For L1+: binary search by key range
-            for meta in level_sstables.iter().rev() {
+                .rev()
+            {
                 // Quick check: key in range? [min_key, max_key] inclusive
                 if key < meta.min_key || key > meta.max_key {
                     continue;
@@ -765,9 +809,8 @@ impl LSMEngine {
                     continue;
                 }
 
-                // Bloom says "maybe present" — acquire SSTable handle
-                let mut sstable = cached.handle.lock()
-                    .map_err(|_| StorageError::Lock("SSTable lock poisoned".into()))?;
+                // Bloom says "maybe present" — acquire SSTable handle (read lock for concurrent access)
+                let sstable = cached.handle.read();
                 
                 if let Some(mut value) = sstable.get(key)? {
                     // Resolve blob reference
@@ -920,8 +963,7 @@ impl LSMEngine {
                 };
 
                 // 🔥 P3+: 批量查询（使用 SSTable::batch_get）
-                let mut sstable = cached.handle.lock()
-                    .map_err(|_| StorageError::Lock("SSTable lock poisoned".into()))?;
+                let sstable = cached.handle.read();
                 
                 // 提取 keys（只保留 key，不包含 idx）
                 let query_keys: Vec<Key> = keys_in_range.iter().map(|(_, key)| *key).collect();
@@ -1188,33 +1230,20 @@ impl LSMEngine {
         // 1. Force rotate active MemTable (even if not full)
         // 🔥 CRITICAL: Use a scope to release flush_lock immediately after rotate
         {
-            // Acquire flush lock to prevent concurrent flush operations
-            debug_log!("🔒 [flush] 尝试获取 flush_lock...");
             let _flush_guard = self.flush_lock.lock()
                 .map_err(|_| StorageError::Lock("Flush lock poisoned".into()))?;
-            debug_log!("✅ [flush] 成功获取 flush_lock");
-            
+
             let has_data = {
                 let memtable = self.memtable.read();
                 !memtable.is_empty()
             };
-            
+
             if has_data {
-                debug_log!("📌 [flush] Active memtable有数据，执行rotate...");
-                self.rotate_memtable()?;  // Blocking until queue has space
-                debug_log!("✅ [flush] rotate_memtable完成");
-            } else {
-                debug_log!("⚠️  [flush] Active memtable为空，跳过rotate");
+                self.rotate_memtable()?;
             }
-            
-            debug_log!("🔓 [flush] 释放 flush_lock（scope exit）");
-            // 🔥 flush_guard dropped here, lock released
         }
-        
+
         // 2. Wait for background thread to flush the queue using condvar
-        // The background flush thread notifies flush_wakeup after draining each
-        // immutable memtable, so we wake up immediately instead of polling.
-        debug_log!("💾 [flush] 等待后台线程flush immutable queue (condvar)...");
         let start_wait = std::time::Instant::now();
         {
             let (lock, cvar) = &*self.flush_wakeup;
@@ -1231,14 +1260,12 @@ impl LSMEngine {
                     break;
                 }
 
-                // Timeout protection (120s; debug builds may be slow at index construction)
                 if start_wait.elapsed().as_secs() > 120 {
                     return Err(StorageError::Transaction(
                         "Flush timeout: background thread may be stuck".into(),
                     ));
                 }
 
-                // Wait for the background thread to signal that it has drained an entry.
                 let result = cvar.wait_timeout(guard, Duration::from_millis(100));
                 match result {
                     Ok((timeout_guard, _timed_out)) => guard = timeout_guard,
@@ -1298,36 +1325,25 @@ impl LSMEngine {
             }
         }
 
-        // Acquire both locks for atomic swap, then release before notifying
+        // Acquire both locks for atomic swap (lock order: memtable → immutable, same as get/scan)
         {
             let mut memtable_lock = self.memtable.write();
             let mut immutable_lock = self.immutable.write();
 
-            // Double-check queue not full (another thread might have added)
             if immutable_lock.len() >= self.max_immutable_slots {
                 return Err(StorageError::Transaction("Immutable queue full".into()));
             }
 
-            // Create new UnifiedMemTable with same configuration
             let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
-
-            // Atomic swap: active -> push to queue back, create new active
             let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
-            immutable_lock.push_back(old_memtable);
-        } // Both locks released here — safe to acquire flush_wakeup
-
-        // Wake up flush thread to process the new immutable
-        {
-            let (lock, cvar) = &*self.flush_wakeup;
-            if let Ok(mut guard) = lock.lock() {
-                *guard = true;
+            if !old_memtable.is_empty() {
+                immutable_lock.push_back(old_memtable);
+                self.rotation_epoch.fetch_add(1, Ordering::Release);
             }
-            cvar.notify_all();
         }
-
         Ok(())
     }
-    
+
     /// Force rotate (blocking, used by flush())
     fn rotate_memtable(&self) -> Result<()> {
         // Wait until queue has space
@@ -1352,16 +1368,27 @@ impl LSMEngine {
             }
         }
         
-        // Now rotate
+        // Now rotate (lock order: memtable → immutable, consistent with get/scan)
         let mut memtable_lock = self.memtable.write();
         let mut immutable_lock = self.immutable.write();
-        
-        // 🆕 Create new UnifiedMemTable with same configuration
+
         let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
-        
+
         let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
-        immutable_lock.push_back(old_memtable);  // 🔥 Push to queue
-        
+        immutable_lock.push_back(old_memtable);
+        self.rotation_epoch.fetch_add(1, Ordering::Release);
+
+        // Notify background flush thread (this is an explicit flush, wake immediately)
+        drop(immutable_lock);
+        drop(memtable_lock);
+        {
+            let (lock, cvar) = &*self.flush_wakeup;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = true;
+            }
+            cvar.notify_all();
+        }
+
         Ok(())
     }
     
@@ -1384,17 +1411,15 @@ impl LSMEngine {
     where
         F: FnMut(Key, &[u8]) -> Result<()>,
     {
-        use std::collections::HashMap;
-        
-        // Collect all entries first (to handle deduplication)
-        let mut merged: HashMap<Key, Vec<u8>> = HashMap::new();
-        
+        use std::collections::BTreeMap;
+
+        // BTreeMap: keeps keys sorted naturally, avoids separate sort step
+        let mut merged: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+
         // 1. Scan immutable queue (oldest to newest, so newer values overwrite)
-        // 🔥 NEW: Iterate through entire queue
         {
             let immutable = self.immutable.read();
-            
-            // Scan from front (oldest) to back (newest)
+
             for mem in immutable.iter() {
                 let entries = mem.scan(start, end)?;
                 for (k, entry) in entries {
@@ -1406,7 +1431,7 @@ impl LSMEngine {
                 }
             }
         }
-        
+
         // 2. Scan active MemTable (overwrites older values)
         {
             let memtable = self.memtable.read();
@@ -1419,17 +1444,12 @@ impl LSMEngine {
                 }
             }
         }
-        
-        // 3. Process merged results in sorted order
-        let mut sorted_keys: Vec<_> = merged.keys().copied().collect();
-        sorted_keys.sort_unstable();
-        
-        for key in sorted_keys {
-            if let Some(data) = merged.get(&key) {
-                f(key, data)?;  // ✅ Zero-copy callback
-            }
+
+        // 3. Process merged results (already sorted by BTreeMap)
+        for (key, data) in &merged {
+            f(*key, data)?;
         }
-        
+
         Ok(())
     }
     
@@ -1712,57 +1732,57 @@ impl LSMEngine {
     pub fn scan_range_parallel(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
         use std::collections::BTreeMap;
         use rayon::prelude::*;
-        
-        // Step 1: Collect from MemTable (serial, small data)
+
         let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
-        
+
+        let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
+
+        // Unified lock: memtable + immutable together
         {
             let memtable = self.memtable.read();
-            let entries = memtable.scan(start, end)?;
-            
-            for (k, entry) in entries {
-                let value = Value {
-                    data: entry.data,
-                    timestamp: entry.timestamp,
-                    deleted: entry.deleted,
-                };
-                merged.insert(k, value);
-            }
-        }
-        
-        // Step 2: Collect from Immutable queue (serial, moderate data)
-        {
             let immutable = self.immutable.read();
-            
-            for memtable in immutable.iter() {
-                let entries = memtable.scan(start, end)?;
-                
-                for (k, entry) in entries {
-                    let value = Value {
-                        data: entry.data,
-                        timestamp: entry.timestamp,
-                        deleted: entry.deleted,
-                    };
-                    merged.entry(k).or_insert(value);
+
+            for (k, entry) in memtable.scan(start, end)? {
+                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+            }
+
+            for mt in immutable.iter() {
+                for (k, entry) in mt.scan(start, end)? {
+                    merged.entry(k).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
                 }
             }
         }
-        
-        // Step 3: 🚀 Parallel SSTable scan (main optimization)
-        let sstable_paths = self.compaction_worker.list_sstables()?;
-        
+
+        // Epoch check: re-scan if rotation happened
+        let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+        if epoch_after != epoch_before {
+            let memtable = self.memtable.read();
+            let immutable = self.immutable.read();
+            for (k, entry) in memtable.scan(start, end)? {
+                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+            }
+            for mt in immutable.iter() {
+                for (k, entry) in mt.scan(start, end)? {
+                    merged.entry(k).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+                }
+            }
+        }
+
+        // Parallel SSTable scan
+        let sstable_metas = self.compaction_worker.get_all_sstables()?;
+
         // Parallel scan all SSTables
-        let sstable_results: Vec<Vec<(Key, Value)>> = sstable_paths.par_iter().rev()
-            .filter_map(|path| {
-                // Skip if file doesn't exist
-                if !path.exists() {
+        let sstable_results: Vec<Vec<(Key, Value)>> = sstable_metas.par_iter().rev()
+            .filter_map(|meta| {
+                // Range skip using metadata
+                if start > meta.max_key || end <= meta.min_key {
                     return None;
                 }
-                
+
                 // Open SSTable (thread-safe cache)
-                let cached = self.sstable_cache.get_or_open(path).ok()?;
-                let mut sstable = cached.handle.lock().ok()?;
-                
+                let cached = self.sstable_cache.get_or_open(&meta.path).ok()?;
+                let sstable = cached.handle.read();
+
                 // Scan SSTable
                 sstable.scan(start, end).ok()
             })
@@ -1876,68 +1896,76 @@ impl LSMEngine {
     /// ```
     pub fn scan_range_batched(&self, start: Key, end: Key, batch_size: usize) -> Result<LSMBatchedIterator> {
         use std::collections::BTreeMap;
-        
-        // Step 1: 预先合并所有数据源到 BTreeMap（这是必要的，因为需要合并多版本）
+
         let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
-        
-        // Collect from MemTable
+
+        let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
+
+        // Unified lock: memtable + immutable together (same as scan_range_streaming)
         {
             let memtable = self.memtable.read();
-            let entries = memtable.scan(start, end)?;
-            
-            for (k, entry) in entries {
-                let value = Value {
-                    data: entry.data,
-                    timestamp: entry.timestamp,
-                    deleted: entry.deleted,
-                };
-                merged.insert(k, value);
-            }
-        }
-        
-        // Collect from Immutable queue
-        {
             let immutable = self.immutable.read();
-            
-            for memtable in immutable.iter() {
-                let entries = memtable.scan(start, end)?;
-                
-                for (k, entry) in entries {
-                    let value = Value {
-                        data: entry.data,
-                        timestamp: entry.timestamp,
-                        deleted: entry.deleted,
-                    };
-                    merged.entry(k).or_insert(value);
+
+            for (k, entry) in memtable.scan(start, end)? {
+                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+            }
+
+            for mt in immutable.iter() {
+                for (k, entry) in mt.scan(start, end)? {
+                    merged.entry(k).and_modify(|existing| {
+                        if entry.timestamp > existing.timestamp {
+                            *existing = Value { data: entry.data.clone(), timestamp: entry.timestamp, deleted: entry.deleted };
+                        }
+                    }).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
                 }
             }
         }
-        
+
+        // Epoch check: re-scan if rotation happened during snapshot
+        let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+        if epoch_after != epoch_before {
+            let memtable = self.memtable.read();
+            let immutable = self.immutable.read();
+            for (k, entry) in memtable.scan(start, end)? {
+                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+            }
+            for mt in immutable.iter() {
+                for (k, entry) in mt.scan(start, end)? {
+                    merged.entry(k).and_modify(|existing| {
+                        if entry.timestamp > existing.timestamp {
+                            *existing = Value { data: entry.data.clone(), timestamp: entry.timestamp, deleted: entry.deleted };
+                        }
+                    }).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
+                }
+            }
+        }
+
         // Collect from SSTables (newest first)
-        let sstable_paths = self.compaction_worker.list_sstables()?;
-        
-        for path in sstable_paths.iter().rev() {
-            if !path.exists() {
+        let sstable_metas = self.compaction_worker.get_all_sstables()?;
+
+        for meta in sstable_metas.iter().rev() {
+            if start > meta.max_key || end <= meta.min_key {
                 continue;
             }
-            
-            let cached = match self.sstable_cache.get_or_open(path) {
+
+            let cached = match self.sstable_cache.get_or_open(&meta.path) {
                 Ok(cached) => cached,
                 Err(_) => continue,
             };
 
-            let mut sstable = match cached.handle.lock() {
-                Ok(sst) => sst,
-                Err(_) => continue,
-            };
-            
+            let sstable = cached.handle.read();
+
             let entries = match sstable.scan(start, end) {
                 Ok(entries) => entries,
                 Err(_) => continue,
             };
-            
+
             for (k, value) in entries {
-                merged.entry(k).or_insert(value);
+                merged.entry(k).and_modify(|existing| {
+                    if value.timestamp > existing.timestamp {
+                        *existing = value.clone();
+                    }
+                }).or_insert(value);
             }
         }
         
@@ -1997,71 +2025,82 @@ impl LSMEngine {
     /// ```
     pub fn scan_range_streaming(&self, start: Key, end: Key) -> Result<super::MergingIterator> {
         let mut sources: Vec<KVIterator> = Vec::new();
-        
-        // Source 1: MemTable（优先级最高，source_id = 0）
-        {
-            let memtable = self.memtable.read();
-            let entries = memtable.scan(start, end)?;
-            
-            let iter = entries.into_iter().map(|(k, entry)| {
-                Ok((k, Value {
-                    data: entry.data,
-                    timestamp: entry.timestamp,
-                    deleted: entry.deleted,
-                }))
-            });
-            
-            sources.push(Box::new(iter));
-        }
-        
-        // Source 2-N: Immutable queue（按时间从旧到新）
-        {
-            let immutable = self.immutable.read();
-            
-            for memtable in immutable.iter() {
-                let entries = memtable.scan(start, end)?;
-                
-                let iter = entries.into_iter().map(|(k, entry)| {
-                    Ok((k, Value {
-                        data: entry.data,
-                        timestamp: entry.timestamp,
-                        deleted: entry.deleted,
-                    }))
-                });
-                
-                sources.push(Box::new(iter));
-            }
-        }
-        
-        // Source N+1-M: SSTables（从新到旧）
-        let sstable_paths = self.compaction_worker.list_sstables()?;
 
-        for path in sstable_paths.iter().rev() {
-            if !path.exists() {
-                continue;
-            }
-            
-            let cached = match self.sstable_cache.get_or_open(path) {
-                Ok(cached) => cached,
-                Err(_) => continue,
-            };
+        // Loop until we get a consistent snapshot (epoch stable across the entire snapshot).
+        // This prevents data loss when auto-flush rotates MemTable → Immutable → SSTable
+        // or when compaction replaces SSTables concurrently with our scan.
+        loop {
+            sources.clear();
 
-            let entries = {
-                let mut sstable = match cached.handle.lock() {
-                    Ok(sst) => sst,
+            let rot_epoch_before = self.rotation_epoch.load(Ordering::Acquire);
+            let cmp_epoch_before = self.compaction_worker.compaction_epoch().load(Ordering::Acquire);
+
+            // Phase 1: Snapshot memtable + immutable (under read locks)
+            {
+                let memtable = self.memtable.read();
+                let immutable = self.immutable.read();
+
+                // Source 1: Active MemTable
+                {
+                    let entries = memtable.scan(start, end)?;
+                    let iter = entries.into_iter().map(|(k, entry)| {
+                        Ok((k, Value {
+                            data: entry.data,
+                            timestamp: entry.timestamp,
+                            deleted: entry.deleted,
+                        }))
+                    });
+                    sources.push(Box::new(iter));
+                }
+
+                // Source 2-N: Immutable queue
+                for mt in immutable.iter() {
+                    let entries = mt.scan(start, end)?;
+                    let iter = entries.into_iter().map(|(k, entry)| {
+                        Ok((k, Value {
+                            data: entry.data,
+                            timestamp: entry.timestamp,
+                            deleted: entry.deleted,
+                        }))
+                    });
+                    sources.push(Box::new(iter));
+                }
+            }
+
+            // Phase 2: SSTables
+            let sstable_metas = self.compaction_worker.get_all_sstables()?;
+
+            for meta in sstable_metas.iter().rev() {
+                if start > meta.max_key || end <= meta.min_key {
+                    continue;
+                }
+
+                let cached = match self.sstable_cache.get_or_open(&meta.path) {
+                    Ok(cached) => cached,
                     Err(_) => continue,
                 };
-                
-                match sstable.scan(start, end) {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
-                }
-            };
-            
-            let iter = entries.into_iter().map(Ok);
-            sources.push(Box::new(iter));
+
+                let entries = {
+                    let sstable = cached.handle.read();
+                    match sstable.scan(start, end) {
+                        Ok(entries) => entries,
+                        Err(_) => continue,
+                    }
+                };
+
+                let iter = entries.into_iter().map(Ok);
+                sources.push(Box::new(iter));
+            }
+
+            // Phase 3: Validate consistency — if either epoch changed during our
+            // snapshot, data may have moved or SSTables replaced. Retry.
+            let rot_epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+            let cmp_epoch_after = self.compaction_worker.compaction_epoch().load(Ordering::Acquire);
+            if rot_epoch_after == rot_epoch_before && cmp_epoch_after == cmp_epoch_before {
+                break; // Consistent snapshot
+            }
         }
-        
+
         Ok(super::MergingIterator::new(sources))
     }
 }

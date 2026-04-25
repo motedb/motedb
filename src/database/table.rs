@@ -4,7 +4,7 @@
 //! Contains table schema management and helper methods
 
 use crate::types::{TableSchema, IndexDef, RowId};
-use crate::{Result, StorageError};
+use crate::Result;
 use std::sync::Arc;
 
 use super::core::MoteDB;
@@ -29,6 +29,9 @@ impl MoteDB {
         // Register table in catalog (acquires metadata.write() lock)
         self.table_registry.create_table(schema.clone())?;
         // 🔓 Lock released here
+
+        // Initialize row count counter for COUNT(*) fast path
+        self.table_row_count.insert(schema.name.clone(), Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
         // 🚀 Auto-create column index for PRIMARY KEY (if not AUTO_INCREMENT)
         // AUTO_INCREMENT PKs don't need a column index because PK value == row_id.
@@ -220,8 +223,7 @@ impl MoteDB {
     /// 
     /// Internal helper for query operations
     pub(crate) fn decode_row_data(data: &[u8]) -> Result<crate::types::Row> {
-        bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(format!("Failed to decode row: {}", e)))
+        crate::storage::row_format::decode_any(data)
     }
     
     
