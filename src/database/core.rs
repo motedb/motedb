@@ -749,10 +749,8 @@ impl MoteDB {
                 let end_key = (table_prefix + 1) << 32;
                 if let Ok(stream) = db.lsm_engine.scan_range_streaming(start_key, end_key) {
                     let mut cnt = 0u64;
-                    for result in stream {
-                        if let Ok((_, value)) = result {
-                            if !value.deleted { cnt += 1; }
-                        }
+                    for (_, value) in stream.flatten() {
+                        if !value.deleted { cnt += 1; }
                     }
                     row_counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1049,7 +1047,7 @@ impl MoteDB {
             };
 
             // Resolve table_id → table_name (cached, no decode needed)
-            if !name_cache.contains_key(&table_id) {
+            if let std::collections::hash_map::Entry::Vacant(e) = name_cache.entry(table_id) {
                 let name = if table_id == 0 {
                     "_default".to_string()
                 } else {
@@ -1058,7 +1056,7 @@ impl MoteDB {
                         Err(_) => continue,
                     }
                 };
-                name_cache.insert(table_id, name);
+                e.insert(name);
             }
 
             let table_name = name_cache.get(&table_id).unwrap();
@@ -1078,8 +1076,8 @@ impl MoteDB {
     /// 
     /// 🚀 Optimized for embedded environments:
     /// 1. Lazy-checking: Only checks WAL size when interval reached (no unnecessary fs calls)
-    /// Start a single background thread for auto-flush requests.
-    /// Replaces the old pattern of spawning a new thread per 2000 writes.
+    /// 2. Start a single background thread for auto-flush requests.
+    ///    Replaces the old pattern of spawning a new thread per 2000 writes.
     fn start_auto_flush_thread(db: Self) -> AutoFlushThread {
         let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
         let should_stop = Arc::new(AtomicBool::new(false));

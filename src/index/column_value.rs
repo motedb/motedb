@@ -570,13 +570,13 @@ impl ColumnValueIndex {
             .map(|(value, _)| value)
             .collect::<Vec<_>>();
         unique_values.sort_by(|a, b| {
-            let a_bytes = match Self::value_to_bytes_helper(a) { Ok(b) => b, Err(_) => vec![] };
-            let b_bytes = match Self::value_to_bytes_helper(b) { Ok(b) => b, Err(_) => vec![] };
+            let a_bytes = Self::value_to_bytes_helper(a).unwrap_or_default();
+            let b_bytes = Self::value_to_bytes_helper(b).unwrap_or_default();
             a_bytes.cmp(&b_bytes)
         });
         unique_values.dedup_by(|a, b| {
-            let a_bytes = match Self::value_to_bytes_helper(a) { Ok(b) => b, Err(_) => vec![] };
-            let b_bytes = match Self::value_to_bytes_helper(b) { Ok(b) => b, Err(_) => vec![] };
+            let a_bytes = Self::value_to_bytes_helper(a).unwrap_or_default();
+            let b_bytes = Self::value_to_bytes_helper(b).unwrap_or_default();
             a_bytes == b_bytes
         });
         

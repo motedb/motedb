@@ -275,7 +275,7 @@ pub fn bitpack_into(buf: &mut Vec<u8>, values: &[u32], bits: u8) {
     }
 
     let total_bits = values.len() * bits as usize;
-    let total_bytes = (total_bits + 7) / 8;
+    let total_bytes = total_bits.div_ceil(8);
 
     // Start position in buf
     let start_len = buf.len();
@@ -296,7 +296,7 @@ pub fn bitpack_into(buf: &mut Vec<u8>, values: &[u32], bits: u8) {
             let overflow = mask >> remaining_bits;
             let overflow_bits = bits - remaining_bits;
             // How many additional bytes does the overflow need?
-            let add_bytes = ((overflow_bits + 7) / 8) as usize;
+            let add_bytes = overflow_bits.div_ceil(8) as usize;
             for i in 0..add_bytes {
                 if byte_idx + 1 + i < buf.len() {
                     buf[byte_idx + 1 + i] |= (overflow >> (i * 8)) as u8;
@@ -331,7 +331,7 @@ pub fn bitunpack(data: &[u8], offset: usize, count: usize, bits: u8) -> Vec<u32>
 
         // Read enough bytes to extract `bits` bits starting at bit_shift
         let mut raw_val = 0u64;
-        let bytes_needed = ((bit_shift + bits) as usize + 7) / 8;
+        let bytes_needed = ((bit_shift + bits) as usize).div_ceil(8);
         for i in 0..bytes_needed {
             if byte_idx + i < data.len() {
                 raw_val |= (data[byte_idx + i] as u64) << (i * 8);

@@ -36,18 +36,16 @@ pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) 
             }
             Octant::Inner { children, .. } => {
                 let mut child_dist: Vec<(&Octant, f32)> = Vec::new();
-                for child_opt in children.iter() {
-                    if let Some(ref child) = child_opt {
-                        let d = min_dist_sq_to_octant(child.center(), child.extent(), query);
-                        if result.len() >= k {
-                            if let Some(Reverse((OrderedF32(threshold), _))) = result.peek() {
-                                if d >= *threshold {
-                                    continue;
-                                }
+                for child in children.iter().flatten() {
+                    let d = min_dist_sq_to_octant(child.center(), child.extent(), query);
+                    if result.len() >= k {
+                        if let Some(Reverse((OrderedF32(threshold), _))) = result.peek() {
+                            if d >= *threshold {
+                                continue;
                             }
                         }
-                        child_dist.push((child, d));
                     }
+                    child_dist.push((child, d));
                 }
                 child_dist.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 stack.extend(child_dist);
@@ -115,10 +113,8 @@ fn range_search_recursive(octant: &Octant, min: &[f32; 3], max: &[f32; 3], store
                 collect_all_row_ids(octant, store, results);
                 return;
             }
-            for child_opt in children.iter() {
-                if let Some(ref child) = child_opt {
-                    range_search_recursive(child, min, max, store, results);
-                }
+            for child in children.iter().flatten() {
+                range_search_recursive(child, min, max, store, results);
             }
         }
     }
@@ -146,12 +142,10 @@ fn radius_search_recursive(octant: &Octant, center: &[f32; 3], radius_sq: f32, s
             }
         }
         Octant::Inner { children, .. } => {
-            for child_opt in children.iter() {
-                if let Some(ref child) = child_opt {
-                    let d = min_dist_sq_to_octant(child.center(), child.extent(), center);
-                    if d <= radius_sq {
-                        radius_search_recursive(child, center, radius_sq, store, results);
-                    }
+            for child in children.iter().flatten() {
+                let d = min_dist_sq_to_octant(child.center(), child.extent(), center);
+                if d <= radius_sq {
+                    radius_search_recursive(child, center, radius_sq, store, results);
                 }
             }
         }
@@ -172,10 +166,8 @@ fn collect_all_row_ids(octant: &Octant, store: &LeafStore, results: &mut Vec<u64
             }
         }
         Octant::Inner { children, .. } => {
-            for child_opt in children.iter() {
-                if let Some(ref child) = child_opt {
-                    collect_all_row_ids(child, store, results);
-                }
+            for child in children.iter().flatten() {
+                collect_all_row_ids(child, store, results);
             }
         }
     }

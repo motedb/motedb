@@ -413,7 +413,7 @@ impl LSMEngine {
 
                     let has_immutable = {
                         let immutable_guard = immutable.read();
-                        immutable_guard.len() > 0
+                        !immutable_guard.is_empty()
                     };
 
                     if has_immutable {
@@ -603,7 +603,7 @@ impl LSMEngine {
                     }
                 }
             }
-        }).map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to spawn flush thread: {}", e))))?;
+        }).map_err(|e| StorageError::Io(std::io::Error::other(format!("Failed to spawn flush thread: {}", e))))?;
         
         engine.compaction_thread = Some(compaction_thread);
         engine.flush_thread = Some(flush_thread);
@@ -1700,7 +1700,7 @@ impl LSMEngine {
         // Use streaming merge instead of materializing into BTreeMap.
         // Memory: O(sources) instead of O(total results).
         let iter = self.scan_range_streaming(start, end)?;
-        Ok(iter.filter_map(|r| r.ok()).collect())
+        iter.collect()
     }
     
     /// 🚀 PHASE B: Parallel range scan (2-3x faster for large scans)

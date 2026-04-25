@@ -121,7 +121,7 @@ impl IOctreeIndex {
         let point = match geometry {
             Geometry::Point3D(p) => p,
             Geometry::Point(p) => {
-                owned = Point3D::new(p.x as f64, p.y as f64, 0.0);
+                owned = Point3D::new(p.x, p.y, 0.0);
                 &owned
             }
             _ => return Err(StorageError::InvalidData("i-Octree only accepts point geometry".into())),
@@ -176,7 +176,7 @@ impl IOctreeIndex {
                     points.push(IndexedPoint3D::from_point3d(p, *row_id));
                 }
                 Geometry::Point(p) => {
-                    let p3 = Point3D::new(p.x as f64, p.y as f64, 0.0);
+                    let p3 = Point3D::new(p.x, p.y, 0.0);
                     self.world_bounds.expand(&p3);
                     points.push(IndexedPoint3D::from_point3d(&p3, *row_id));
                 }
@@ -378,12 +378,9 @@ fn split_leaf(store: &LeafStore, octant: &mut Octant) -> Result<()> {
                 children[code] = Some(Box::new(Octant::new_leaf(child_ctr, child_extent, new_leaf_id)));
             }
             if let Some(ref mut child) = children[code] {
-                match child.as_mut() {
-                    Octant::Leaf { leaf_id, point_count, .. } => {
-                        store.add_point(*leaf_id, point)?;
-                        *point_count = store.point_count(*leaf_id)? as u32;
-                    }
-                    _ => {}
+                if let Octant::Leaf { leaf_id, point_count, .. } = child.as_mut() {
+                    store.add_point(*leaf_id, point)?;
+                    *point_count = store.point_count(*leaf_id)? as u32;
                 }
             }
         }

@@ -126,7 +126,6 @@ impl Value {
 }
 
 /// LSM-Tree configuration
-
 /// Compression algorithm for SSTable blocks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionAlgorithm {

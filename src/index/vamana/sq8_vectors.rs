@@ -132,8 +132,8 @@ impl SQ8Vectors {
             u64::from_le_bytes(buf)
         } else {
             // Build sidecar from scratch by scanning data file
-            let count = Self::build_sidecar_index(&file_path, &idx_path, entry_size)?;
-            count
+            
+            Self::build_sidecar_index(&file_path, &idx_path, entry_size)?
         };
 
         let read_file = File::open(&file_path).map_err(StorageError::Io)?;

@@ -4572,8 +4572,7 @@ impl QueryExecutor {
                 let mut sql_row = row_to_sql_row(row, &schema)?;
                 sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
                 sql_row.insert("__table__".to_string(), Value::Text(table_name.to_string()));
-                // For phrase queries, use a default score of 1.0
-                let score = if phrase { 1.0f32 } else { 1.0f32 };
+                let score = 1.0f32;
                 sql_row.insert(format!("__text_score_{}__", column), Value::Float(score as f64));
                 let old_row = std::mem::take(&mut sql_row);
                 let mut qualified = SqlRow::new();
@@ -4926,6 +4925,7 @@ impl QueryExecutor {
     }
 
     /// Execute ST_KNN_3D using i-Octree index directly
+    #[allow(clippy::too_many_arguments)]
     fn execute_ioctree_knn_fast(
         &self,
         stmt: &SelectStmt,
@@ -4958,6 +4958,7 @@ impl QueryExecutor {
     }
 
     /// Execute ST_RADIUS_3D using i-Octree index directly
+    #[allow(clippy::too_many_arguments)]
     fn execute_ioctree_radius_fast(
         &self,
         stmt: &SelectStmt,
@@ -5810,7 +5811,7 @@ impl QueryExecutor {
 
         // P1: Handle LIMIT
         if let Some(limit) = stmt.limit {
-            rows.truncate(limit as usize);
+            rows.truncate(limit);
         }
 
         Ok(Some(QueryResult::Select {
@@ -5958,32 +5959,29 @@ impl QueryExecutor {
         ts_col: &str,
         conditions: &mut Vec<crate::storage::columnar::segment_manager::ColumnCondition>,
     ) {
-        match expr {
-            Expr::BinaryOp { left, op, right } => {
-                match op {
-                    BinaryOperator::And => {
-                        // Recurse into both sides of AND
-                        self.collect_conditions_recursive(left, schema, ts_col, conditions);
-                        self.collect_conditions_recursive(right, schema, ts_col, conditions);
-                    }
-                    BinaryOperator::Eq => {
-                        // col = value OR value = col (non-ts column)
-                        if let Some(cond) = self.try_extract_equality(left, right, schema, ts_col) {
-                            conditions.push(cond);
-                        } else if let Some(cond) = self.try_extract_equality(right, left, schema, ts_col) {
-                            conditions.push(cond);
-                        }
-                    }
-                    BinaryOperator::Ge | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Lt => {
-                        // Try to extract range conditions
-                        if let Some(cond) = self.try_extract_range(left, right, op, schema, ts_col) {
-                            conditions.push(cond);
-                        }
-                    }
-                    _ => {}
+        if let Expr::BinaryOp { left, op, right } = expr {
+            match op {
+                BinaryOperator::And => {
+                    // Recurse into both sides of AND
+                    self.collect_conditions_recursive(left, schema, ts_col, conditions);
+                    self.collect_conditions_recursive(right, schema, ts_col, conditions);
                 }
+                BinaryOperator::Eq => {
+                    // col = value OR value = col (non-ts column)
+                    if let Some(cond) = self.try_extract_equality(left, right, schema, ts_col) {
+                        conditions.push(cond);
+                    } else if let Some(cond) = self.try_extract_equality(right, left, schema, ts_col) {
+                        conditions.push(cond);
+                    }
+                }
+                BinaryOperator::Ge | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Lt => {
+                    // Try to extract range conditions
+                    if let Some(cond) = self.try_extract_range(left, right, op, schema, ts_col) {
+                        conditions.push(cond);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 

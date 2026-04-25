@@ -55,6 +55,7 @@ impl LeafStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(!exists)
             .open(&path)
             .map_err(StorageError::Io)?;
 

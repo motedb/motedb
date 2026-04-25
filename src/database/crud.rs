@@ -111,7 +111,7 @@ impl MoteDB {
             id as RowId
         } else {
             // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
-            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         };
         
         // 3. Validate row
@@ -126,7 +126,7 @@ impl MoteDB {
 
         // 5. Encode row to raw bytes (shared between WAL and LSM — zero-copy recovery)
         let col_types = schema.col_types();
-        let row_data = row_format::encode(&row, &col_types)
+        let row_data = row_format::encode(&row, col_types)
             .unwrap_or_else(|_| bincode::serialize(&row).unwrap());
 
         // 6. Write to WAL first (durability) — by reference, zero clone
@@ -285,7 +285,7 @@ impl MoteDB {
             
             // Deserialize row (RawRow with bincode fallback)
             let col_types = schema.col_types();
-            let row: Row = row_format::decode(data, &col_types)
+            let row: Row = row_format::decode(data, col_types)
                 .map_err(|e| StorageError::Serialization(format!(
                     "Failed to deserialize row {}: {}",
                     row_id, e
@@ -330,9 +330,9 @@ impl MoteDB {
 
         // 4. Encode rows to raw bytes
         let col_types = schema.col_types();
-        let raw_old = row_format::encode(&old_row, &col_types)
+        let raw_old = row_format::encode(&old_row, col_types)
             .unwrap_or_else(|_| bincode::serialize(&old_row).unwrap());
-        let raw_new = row_format::encode(&new_row, &col_types)
+        let raw_new = row_format::encode(&new_row, col_types)
             .unwrap_or_else(|_| bincode::serialize(&new_row).unwrap());
 
         // 5. Write to WAL first (durability) — raw bytes
@@ -505,7 +505,7 @@ impl MoteDB {
         //    point below can be recovered correctly.
         // 5. Write to WAL first (durability guarantee) — raw bytes
         let col_types = schema.col_types();
-        let raw_old = row_format::encode(&old_row, &col_types)
+        let raw_old = row_format::encode(&old_row, col_types)
             .unwrap_or_else(|_| bincode::serialize(&old_row).unwrap());
         self.wal.log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
 
@@ -637,7 +637,7 @@ impl MoteDB {
             };
             
             // Deserialize row
-            let row: Row = deserialize_row(data, &col_types)?;
+            let row: Row = deserialize_row(data, col_types)?;
             result.push((row_id, row));
         }
         
@@ -897,7 +897,7 @@ impl MoteDB {
             }
         } else {
             // Non-AUTO_INCREMENT: use global row_id
-            let start_id = self.next_row_id.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let start_id = self.next_row_id.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::SeqCst);
             for i in 0..rows.len() {
                 row_ids.push(start_id + i as u64);
             }
@@ -932,7 +932,7 @@ impl MoteDB {
         let mut kvs = Vec::with_capacity(rows.len());
         for (row_id, row) in row_ids.iter().zip(rows.iter()) {
             let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-            let row_data = row_format::encode(row, &col_types)
+            let row_data = row_format::encode(row, col_types)
                 .unwrap_or_else(|_| bincode::serialize(row).unwrap());
 
             wal_records.push(WALRecord::InsertRaw {

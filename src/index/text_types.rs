@@ -656,7 +656,7 @@ impl BlockPostingList {
     pub fn from_sorted_pairs(doc_ids: &[u32], tfs: &[u16]) -> Self {
         assert_eq!(doc_ids.len(), tfs.len());
         let num_docs = doc_ids.len() as u32;
-        let num_blocks = ((num_docs as usize) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let num_blocks = (num_docs as usize).div_ceil(BLOCK_SIZE);
         if num_docs == 0 {
             return Self {
                 data: Vec::new(),
@@ -677,10 +677,10 @@ impl BlockPostingList {
         data.extend_from_slice(&[0u8; 4]); // skip_table_offset placeholder
 
         // Skip metadata table
-        let mut skip_table: Vec<(u16, u8)> = Vec::with_capacity(num_blocks as usize);
+        let mut skip_table: Vec<(u16, u8)> = Vec::with_capacity(num_blocks);
 
         // Write blocks
-        for block_idx in 0..num_blocks as usize {
+        for block_idx in 0..num_blocks {
             let start = block_idx * BLOCK_SIZE;
             let end = (start + BLOCK_SIZE).min(doc_ids.len());
             let block_docs = &doc_ids[start..end];
@@ -828,7 +828,7 @@ impl BlockPostingList {
         let mut pos = offset + 3;
 
         // Decode delta doc IDs
-        let delta_bytes = (doc_count * bits_per_docid as usize + 7) / 8;
+        let delta_bytes = (doc_count * bits_per_docid as usize).div_ceil(8);
         let deltas = crate::index::text_encoding::bitunpack(
             data, pos, doc_count, bits_per_docid,
         );
@@ -845,7 +845,7 @@ impl BlockPostingList {
         pos += delta_bytes;
 
         // Decode TFs
-        let tf_bytes = (doc_count * bits_per_tf as usize + 7) / 8;
+        let tf_bytes = (doc_count * bits_per_tf as usize).div_ceil(8);
         let tf_u32 = crate::index::text_encoding::bitunpack(
             data, pos, doc_count, bits_per_tf,
         );
@@ -867,8 +867,8 @@ impl<'a> BlockCursor<'a> {
             let bits_per_docid = self.data[offset + 1] as usize;
             let bits_per_tf = self.data[offset + 2] as usize;
             let block_size = 3 +
-                (doc_count * bits_per_docid + 7) / 8 +
-                (doc_count * bits_per_tf + 7) / 8;
+                (doc_count * bits_per_docid).div_ceil(8) +
+                (doc_count * bits_per_tf).div_ceil(8);
             offset += block_size;
         }
         let (docs, tfs, _next_offset) = BlockPostingList::decode_block_data(self.data, offset);

@@ -515,7 +515,7 @@ impl Database {
         if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
             return Some(Value::Text(s[1..s.len()-1].to_string()));
         }
-        if s.starts_with('-') || s.as_bytes().get(0)?.is_ascii_digit() {
+        if s.starts_with('-') || s.as_bytes().first()?.is_ascii_digit() {
             if let Ok(i) = s.parse::<i64>() { return Some(Value::Integer(i)); }
             if let Ok(f) = s.parse::<f64>() { return Some(Value::Float(f)); }
         }

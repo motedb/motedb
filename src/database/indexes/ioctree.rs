@@ -18,8 +18,10 @@ impl MoteDB {
         let index_dir = indexes_dir.join(format!("ioctree_{}", name));
         std::fs::create_dir_all(&index_dir)?;
 
-        let mut config = IOctreeConfig::default();
-        config.data_dir = Some(index_dir.join("ioctree.bin"));
+        let config = IOctreeConfig {
+            data_dir: Some(index_dir.join("ioctree.bin")),
+            ..Default::default()
+        };
 
         let index = IOctreeIndex::new(config, name.to_string());
         self.ioctree_indexes.insert(name.to_string(), Arc::new(RwLock::new(index)));

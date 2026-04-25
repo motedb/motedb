@@ -267,7 +267,7 @@ impl SSTable {
             }
             2 => {
                 // Zstd
-                uncompressed = zstd::bulk::decompress(&data[1..], 1024 * 1024)
+                uncompressed = zstd::bulk::decompress(&data[1..], 4 * 1024 * 1024)
                     .map_err(|e| crate::StorageError::Io(std::io::Error::other(
                         format!("Zstd decompression failed: {}", e)
                     )))?;
@@ -870,7 +870,7 @@ impl DataBlock {
             }
             2 => {
                 // Zstd — use generous max output size (block size + overhead)
-                zstd::bulk::decompress(actual_data, 1024 * 1024)
+                zstd::bulk::decompress(actual_data, 4 * 1024 * 1024)
                     .map_err(|e| StorageError::Io(std::io::Error::other(
                         format!("Zstd decompression failed: {}", e)
                     )))?

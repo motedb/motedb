@@ -1013,7 +1013,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         // Page 0 is superblock, so pages are 1..next_id
         // Approx: (leaf pages) × max_keys. Roughly half the pages are leaves.
         let total_pages = next_id.saturating_sub(1) as usize;
-        let leaf_pages = (total_pages + 1) / 2;
+        let leaf_pages = total_pages.div_ceil(2);
         leaf_pages * self.max_keys
     }
     

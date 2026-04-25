@@ -619,10 +619,7 @@ impl PartitionWAL {
 
         self.file.write_all(&write_buf)?;
 
-        match self.config.durability_level {
-            DurabilityLevel::Synchronous => { self.sync_flush()?; }
-            _ => {}
-        }
+        if self.config.durability_level == DurabilityLevel::Synchronous { self.sync_flush()?; }
 
         Ok(lsn)
     }
@@ -656,8 +653,8 @@ impl PartitionWAL {
     /// - Maintains ACID durability (fsync before return)
     /// - Amortizes fsync cost across N records
     /// - Performance: 100-1000x better than individual fsyncs
-    /// Append multiple records in a single I/O operation.
-    /// Assumes LSNs were already allocated via `allocate_lsn()` — does NOT increment next_lsn.
+    /// - Append multiple records in a single I/O operation.
+    ///   Assumes LSNs were already allocated via `allocate_lsn()` — does NOT increment next_lsn.
     fn batch_append(&mut self, records: Vec<WALRecord>) -> Result<Vec<LogSequenceNumber>> {
         if records.is_empty() {
             return Ok(Vec::new());

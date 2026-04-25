@@ -20,6 +20,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 
+/// Type alias for the vector storage map
+type VectorMap = Arc<RwLock<BTreeMap<Key, Vec<f32>>>>;
+
 const SHARD_COUNT: usize = 16;
 const SHARD_MASK: usize = SHARD_COUNT - 1;
 
@@ -91,7 +94,7 @@ pub struct UnifiedMemTable {
     shards: [RwLock<BTreeMap<Key, Arc<DataEntry>>>; SHARD_COUNT],
 
     /// 向量数据 (仅向量表创建，避免非向量表的 Option<Vec> 开销)
-    vectors: Option<Arc<RwLock<BTreeMap<Key, Vec<f32>>>>>,
+    vectors: Option<VectorMap>,
 
     /// 向量图索引：Fresh Vamana Graph
     vector_graph: Option<Arc<FreshVamanaGraph>>,

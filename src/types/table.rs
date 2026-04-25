@@ -52,11 +52,11 @@ impl TTLDuration {
 
 impl std::fmt::Display for TTLDuration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.seconds % 86400 == 0 {
+        if self.seconds.is_multiple_of(86400) {
             write!(f, "{}d", self.seconds / 86400)
-        } else if self.seconds % 3600 == 0 {
+        } else if self.seconds.is_multiple_of(3600) {
             write!(f, "{}h", self.seconds / 3600)
-        } else if self.seconds % 60 == 0 {
+        } else if self.seconds.is_multiple_of(60) {
             write!(f, "{}m", self.seconds / 60)
         } else {
             write!(f, "{}s", self.seconds)

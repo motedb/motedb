@@ -27,6 +27,9 @@ use serde::{Serialize, Deserialize};
 /// Document ID type
 pub type DocumentId = u64;
 
+/// Type alias for the cached doc_lengths map
+type DocLengthCache = Arc<RwLock<Option<Arc<HashMap<DocId, u8>>>>>;
+
 /// 🔥 Text FTS Index (Real B+Tree Implementation)
 /// 
 /// Design Philosophy:
@@ -70,7 +73,7 @@ pub struct TextFTSIndex {
 
     /// Cached doc_lengths (fieldnorm encoded, lazy loaded).
     /// Invalidated on insert/update/delete, rebuilt on next search.
-    doc_length_cache: Arc<RwLock<Option<Arc<HashMap<DocId, u8>>>>>,
+    doc_length_cache: DocLengthCache,
 
     /// Deleted documents (tombstones)
     deleted_docs: Arc<RwLock<HashSet<DocId>>>,
@@ -1307,7 +1310,7 @@ impl TextFTSIndex {
         // Write consolidated as shard 0
         let block_list = super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
         let bytes = block_list.as_bytes();
-        btree.insert(0 << 24 | base_term_id, bytes.to_vec())?;
+        btree.insert(base_term_id, bytes.to_vec())?;
 
         // Delete old shards
         for shard_idx in 1..shard_count {

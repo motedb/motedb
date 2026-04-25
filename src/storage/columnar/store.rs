@@ -684,7 +684,7 @@ impl ColumnarStore {
 
         for segment in &segments {
             let mut col_ids: Vec<u16> = column_ids.iter().map(|(id, _)| *id).collect();
-            let row_id_col = segment.column_count as u16;
+            let row_id_col = segment.column_count;
             if segment.has_row_id_column {
                 col_ids.push(row_id_col);
             }
@@ -692,7 +692,7 @@ impl ColumnarStore {
             let blocks = manager.read_columns(segment, &col_ids)?;
 
             let schema_blocks: Vec<&ColumnBlock> = blocks.iter()
-                .filter(|b| b.column_id < segment.column_count as u16)
+                .filter(|b| b.column_id < segment.column_count)
                 .collect();
             let decoded = self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
 
@@ -921,7 +921,7 @@ impl ColumnarStore {
         for segment in &segments {
             // P1: Read schema columns + row_id column (column_count = one past last schema col)
             let mut col_ids: Vec<u16> = column_ids.iter().map(|(id, _)| *id).collect();
-            let row_id_col = segment.column_count as u16; // row_ids stored as extra column
+            let row_id_col = segment.column_count; // row_ids stored as extra column
             if segment.has_row_id_column {
                 col_ids.push(row_id_col);
             }
@@ -964,7 +964,7 @@ impl ColumnarStore {
 
             // Now decode only needed columns for matching rows
             let schema_blocks: Vec<&ColumnBlock> = blocks.iter()
-                .filter(|b| b.column_id < segment.column_count as u16)
+                .filter(|b| b.column_id < segment.column_count)
                 .collect();
             let decoded = self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
 

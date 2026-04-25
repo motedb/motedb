@@ -232,7 +232,7 @@ fn encode_dod(writer: &mut BitWriter, dod: i64) {
             writer.write_bit(true);
             writer.write_bit(true);
             writer.write_bit(true);
-            writer.write_bits(zigzag_encode(dod) as u64, 32);
+            writer.write_bits(zigzag_encode(dod), 32);
         }
     }
 }
@@ -277,8 +277,8 @@ pub fn encode_floats(values: &[f64]) -> Vec<u8> {
     let mut prev_leading: u32 = 64;
     let mut prev_trailing: u32 = 0;
 
-    for i in 1..values.len() {
-        let bits = values[i].to_bits();
+    for &val in &values[1..] {
+        let bits = val.to_bits();
         let xor = bits ^ prev_bits;
 
         if xor == 0 {
@@ -400,11 +400,11 @@ pub fn encode_integers(values: &[i64]) -> Vec<u8> {
     buf.extend_from_slice(&values[0].to_le_bytes());
 
     let mut prev = values[0];
-    for i in 1..values.len() {
-        let delta = values[i] - prev;
+    for &val in &values[1..] {
+        let delta = val - prev;
         let encoded = zigzag_encode(delta);
         write_varint(&mut buf, encoded);
-        prev = values[i];
+        prev = val;
     }
 
     buf

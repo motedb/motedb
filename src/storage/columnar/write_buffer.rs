@@ -203,11 +203,10 @@ pub struct BufferedBatch {
 }
 
 /// In-memory columnar write buffer.
-
 /// Generic in-place reorder using the given permutation.
 /// `perm[i]` = old index that should go to position i.
-fn perm_reorder<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
-    let old: Vec<T> = v.clone();
+fn perm_reorder<T: Clone>(v: &mut [T], perm: &[usize]) {
+    let old: Vec<T> = v.to_vec();
     for (i, &old_idx) in perm.iter().enumerate() {
         v[i] = old[old_idx].clone();
     }
@@ -397,7 +396,7 @@ impl ColumnarWriteBuffer {
             if let Some(ts_idx) = self.ts_column_idx {
                 let in_range = match &self.columns[ts_idx] {
                     ColumnBuffer::Timestamp(vals) => {
-                        vals.get(row_idx).map_or(false, |&ts| ts >= start_ts && ts <= end_ts)
+                        vals.get(row_idx).is_some_and(|&ts| ts >= start_ts && ts <= end_ts)
                     }
                     _ => false,
                 };

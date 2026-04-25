@@ -62,7 +62,7 @@ impl SegmentManager {
         if let Ok(entries) = std::fs::read_dir(directory) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "mcdb") {
+                if path.extension().is_some_and(|e| e == "mcdb") {
                     match SegmentReader::open(&path) {
                         Ok(reader) => {
                             segments.push(Arc::new(reader.metadata()));
@@ -219,9 +219,8 @@ impl SegmentManager {
                         // For Text columns, also check bloom filter
                         if let Value::Text(ref text_val) = value {
                             if segment.has_bloom_filters {
-                                match self.may_contain_text(segment, *column_idx, text_val) {
-                                    Ok(false) => return false, // Bloom filter says no
-                                    _ => {} // Can't determine, assume match
+                                if let Ok(false) = self.may_contain_text(segment, *column_idx, text_val) {
+                                    return false; // Bloom filter says no
                                 }
                             }
                         }
@@ -257,7 +256,7 @@ impl SegmentManager {
                 match map.get(&col_id) {
                     Some(data) => {
                         let bloom = BloomFilter::from_bytes_full(data);
-                        Ok(bloom.map_or(false, |b| b.may_contain(value.as_bytes())))
+                        Ok(bloom.is_some_and(|b| b.may_contain(value.as_bytes())))
                     }
                     None => Ok(true), // No filter for this column → assume match
                 }
@@ -393,7 +392,7 @@ impl SegmentManager {
         };
         {
             let json = serde_json::to_string_pretty(&manifest)
-                .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
             let mut file = std::fs::File::create(&manifest_path)
                 .map_err(StorageError::Io)?;
             file.write_all(json.as_bytes())

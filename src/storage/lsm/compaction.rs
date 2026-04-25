@@ -772,7 +772,7 @@ impl CompactionWorker {
                         entries_written += 1;
 
                         // Throttle: rate limit + cooperative yield
-                        if entries_written % 100 == 0 {
+                        if entries_written.is_multiple_of(100) {
                             // Estimate bytes written (rough: ~50B per entry)
                             _bytes_written = entries_written * 50;
                             let elapsed = merge_start.elapsed().as_secs_f64();
@@ -781,7 +781,7 @@ impl CompactionWorker {
                                 std::thread::sleep(std::time::Duration::from_secs_f64(expected - elapsed));
                             }
                             // Cooperative yield every yield_interval * 100 entries
-                            if (entries_written / 100) % yield_interval as u64 == 0 {
+                            if (entries_written / 100).is_multiple_of(yield_interval as u64) {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             }
                         }

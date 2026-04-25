@@ -113,10 +113,8 @@ impl Octant {
     pub fn recount_size(&mut self) {
         if let Octant::Inner { children, size, .. } = self {
             *size = 0;
-            for child in children.iter() {
-                if let Some(ref c) = child {
-                    *size += c.size();
-                }
+            for c in children.iter().flatten() {
+                *size += c.size();
             }
         }
     }
@@ -127,10 +125,8 @@ impl Octant {
             Octant::Leaf { .. } => std::mem::size_of::<Octant>(),
             Octant::Inner { children, .. } => {
                 let mut total = std::mem::size_of::<Octant>();
-                for child in children.iter() {
-                    if let Some(ref c) = child {
-                        total += c.memory_usage();
-                    }
+                for c in children.iter().flatten() {
+                    total += c.memory_usage();
                 }
                 total
             }

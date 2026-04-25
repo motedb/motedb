@@ -26,17 +26,15 @@ pub fn encode_strings(values: &[Option<String>]) -> (Vec<u8>, StringEncoding) {
     let mut dict: HashMap<String, u16> = HashMap::new();
     let mut dict_entries: Vec<String> = Vec::new();
 
-    for val in values {
-        if let Some(s) = val {
-            if !dict.contains_key(s) {
-                if dict.len() >= MAX_DICT_SIZE as usize {
-                    // Too many unique values — fall back to raw
-                    return encode_strings_raw(values);
-                }
-                let idx = dict_entries.len() as u16;
-                dict.insert(s.clone(), idx);
-                dict_entries.push(s.clone());
+    for s in values.iter().flatten() {
+        if !dict.contains_key(s) {
+            if dict.len() >= MAX_DICT_SIZE as usize {
+                // Too many unique values — fall back to raw
+                return encode_strings_raw(values);
             }
+            let idx = dict_entries.len() as u16;
+            dict.insert(s.clone(), idx);
+            dict_entries.push(s.clone());
         }
     }
 
@@ -162,7 +160,7 @@ pub enum StringEncoding {
 /// Returns (packed_bytes, null_bitmap) where null_bitmap is set if any nulls exist.
 pub fn encode_bools(values: &[Option<bool>]) -> (Vec<u8>, Option<Vec<u8>>) {
     let n = values.len();
-    let packed_bytes = (n + 7) / 8;
+    let packed_bytes = n.div_ceil(8);
     let mut packed = vec![0u8; packed_bytes];
 
     let has_nulls = values.iter().any(|v| v.is_none());
@@ -194,7 +192,7 @@ pub fn decode_bools(packed: &[u8], null_bitmap: Option<&[u8]>, count: usize) -> 
     let mut result = Vec::with_capacity(count);
 
     for i in 0..count {
-        let is_null = null_bitmap.map_or(false, |bm| (bm[i / 8] >> (i % 8)) & 1 == 1);
+        let is_null = null_bitmap.is_some_and(|bm| (bm[i / 8] >> (i % 8)) & 1 == 1);
         if is_null {
             result.push(None);
         } else {

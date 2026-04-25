@@ -335,12 +335,11 @@ fn decode_raw_any(data: &[u8]) -> Result<Row> {
             let mut row = Vec::with_capacity(col_count);
             let mut fixed_idx = 0;
 
-            for i in 0..col_count {
+            for (i, &(v_off, v_len)) in var_offsets.iter().enumerate() {
                 if null_bitmap & (1u64 << i) != 0 {
                     row.push(Value::Null);
                     continue;
                 }
-                let (v_off, v_len) = var_offsets[i];
                 if seen_bitmap & (1u64 << i) != 0 && v_len > 0 {
                     // Variable column — decode as Text or Vector
                     let abs_off = var_data_start + v_off;
