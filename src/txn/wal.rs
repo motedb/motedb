@@ -454,7 +454,15 @@ struct PartitionWAL {
 
     /// WAL configuration
     config: WALConfig,
+
+    /// Approximate bytes written since last checkpoint (for auto-checkpoint)
+    bytes_written: u64,
 }
+
+/// Auto-checkpoint threshold (64 MB). On edge devices with SD cards, this prevents
+/// unbounded WAL growth. After each write, if bytes_written exceeds this limit,
+/// checkpoint() is called to truncate the WAL.
+const AUTO_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 impl PartitionWAL {
     /// Create a new partition WAL with config
@@ -471,6 +479,7 @@ impl PartitionWAL {
             next_lsn: 0,
             last_checkpoint: 0,
             config,
+            bytes_written: 0,
         })
     }
 
@@ -564,6 +573,7 @@ impl PartitionWAL {
             next_lsn,
             last_checkpoint,
             config,
+            bytes_written: 0,
         })
     }
 
@@ -586,6 +596,12 @@ impl PartitionWAL {
         match self.config.durability_level {
             DurabilityLevel::Synchronous => { self.sync_flush()?; }
             DurabilityLevel::GroupCommit { .. } | DurabilityLevel::Periodic { .. } | DurabilityLevel::NoSync => {}
+        }
+
+        // Auto-checkpoint when WAL exceeds size limit (prevents unbounded growth on edge devices)
+        if self.bytes_written >= AUTO_CHECKPOINT_BYTES {
+            debug_log!("[WAL] Auto-checkpoint: {} bytes written, truncating", self.bytes_written);
+            self.checkpoint()?;
         }
 
         Ok(lsn)
@@ -652,6 +668,7 @@ impl PartitionWAL {
         buf.extend_from_slice(record_data);
 
         self.file.write_all(&buf)?;
+        self.bytes_written += buf.len() as u64;
         Ok(())
     }
 
@@ -763,6 +780,7 @@ impl PartitionWAL {
         // Reset counters
         self.next_lsn = 0;
         self.last_checkpoint = 0;
+        self.bytes_written = 0;
 
         Ok(())
     }

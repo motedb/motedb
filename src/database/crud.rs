@@ -638,31 +638,25 @@ impl MoteDB {
     /// ```ignore
     pub fn scan_table_rows(&self, table_name: &str) -> Result<Vec<(RowId, Row)>> {
         ensure_open!(self);
-        // Get table schema for RawRow decoding
         let schema = self.table_registry.get_table(table_name)?;
         let col_types = schema.col_types();
-        
-        // Use LSM range scan to scan keys for this table
+
         let table_prefix = self.compute_table_prefix(table_name);
         let start_key = table_prefix << 32;
         let end_key = (table_prefix + 1) << 32;
-        
-        // 🚀 PHASE B: Use parallel scan for better performance
-        let lsm_rows = self.lsm_engine.scan_range_parallel(start_key, end_key)?;
-        
+
+        // Use streaming scan to avoid materializing full BTreeMap (saves ~420 MB for 300K rows)
+        let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+
         let mut result = Vec::new();
-        
-        // Process results
-        for (composite_key, value) in lsm_rows {
-            // Skip tombstones (deleted rows)
+        for item in lsm_iter {
+            let (composite_key, value) = item?;
             if value.deleted {
                 continue;
             }
 
-            // Extract row_id from composite_key
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-            
-            // Extract data
+
             let data = match &value.data {
                 crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
                 crate::storage::lsm::ValueData::Blob(_) => {
@@ -848,17 +842,21 @@ impl MoteDB {
                 .collect());
         }
         
-        // Use LSM range scan
+        // Use streaming scan to avoid materializing full BTreeMap
         let table_prefix = self.compute_table_prefix(table_name);
         let start_key = table_prefix << 32;
         let end_key = (table_prefix + 1) << 32;
-        
-        let lsm_rows = self.lsm_engine.scan_range_parallel(start_key, end_key)?;
-        
+
+        let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+
         let mut result = Vec::new();
-        
+
         // Process results with partial deserialization
-        for (composite_key, value) in lsm_rows {
+        for item in lsm_iter {
+            let (composite_key, value) = item?;
+            if value.deleted {
+                continue;
+            }
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
             
             let data = match &value.data {

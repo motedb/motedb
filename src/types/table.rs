@@ -232,6 +232,9 @@ impl TableSchema {
     pub fn new(name: String, columns: Vec<ColumnDef>) -> Self {
         let mut column_map = HashMap::new();
         for col in &columns {
+            if column_map.contains_key(&col.name) {
+                eprintln!("[WARN] Duplicate column name '{}' in table '{}', using last definition", col.name, name);
+            }
             column_map.insert(col.name.clone(), col.position);
         }
 

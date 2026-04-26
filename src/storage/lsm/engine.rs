@@ -1752,100 +1752,9 @@ impl LSMEngine {
     /// - No data races (each thread reads different SSTable)
     #[cfg(feature = "rayon")]
     pub fn scan_range_parallel(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
-        use std::collections::BTreeMap;
-        use rayon::prelude::*;
-
-        let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
-
-        let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
-
-        // Unified lock: memtable + immutable together
-        // Use timestamp-aware merge for MVCC correctness (same as scan_range_batched)
-        let merge_entry = |merged: &mut BTreeMap<Key, Value>, k: Key, entry: &crate::storage::lsm::UnifiedEntry| {
-            let new_val = Value { data: entry.data.clone(), timestamp: entry.timestamp, deleted: entry.deleted };
-            merged.entry(k).and_modify(|existing| {
-                if entry.timestamp > existing.timestamp {
-                    *existing = new_val.clone();
-                }
-            }).or_insert(new_val);
-        };
-
-        {
-            let memtable = self.memtable.read();
-            let immutable = self.immutable.read();
-
-            for (k, entry) in memtable.scan(start, end)? {
-                merge_entry(&mut merged, k, &entry);
-            }
-
-            for mt in immutable.iter() {
-                for (k, entry) in mt.scan(start, end)? {
-                    merge_entry(&mut merged, k, &entry);
-                }
-            }
-        }
-
-        // Epoch check: loop until stable (matches scan_range_streaming pattern)
-        loop {
-            let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
-            if epoch_after == epoch_before {
-                break;
-            }
-            let memtable = self.memtable.read();
-            let immutable = self.immutable.read();
-            for (k, entry) in memtable.scan(start, end)? {
-                merge_entry(&mut merged, k, &entry);
-            }
-            for mt in immutable.iter() {
-                for (k, entry) in mt.scan(start, end)? {
-                    merge_entry(&mut merged, k, &entry);
-                }
-            }
-            // Re-read epoch after re-scan to check stability
-            let epoch_final = self.rotation_epoch.load(Ordering::Acquire);
-            if epoch_final == epoch_after {
-                break;
-            }
-            // Epoch changed again during re-scan — loop again
-        }
-
-        // Parallel SSTable scan
-        let sstable_metas = self.compaction_worker.get_all_sstables()?;
-
-        // Parallel scan all SSTables
-        let sstable_results: Vec<Vec<(Key, Value)>> = sstable_metas.par_iter().rev()
-            .filter_map(|meta| {
-                // Range skip using metadata
-                if start > meta.max_key || end <= meta.min_key {
-                    return None;
-                }
-
-                // Open SSTable (thread-safe cache)
-                let cached = self.sstable_cache.get_or_open(&meta.path).ok()?;
-                let sstable = cached.handle.read();
-
-                // Scan SSTable
-                sstable.scan(start, end).ok()
-            })
-            .collect();
-        
-        // Step 4: Merge results using timestamp-based dedup (order-independent)
-        for entries in sstable_results {
-            for (k, value) in entries {
-                merged.entry(k).and_modify(|existing| {
-                    if value.timestamp > existing.timestamp {
-                        *existing = value.clone();
-                    }
-                }).or_insert(value);
-            }
-        }
-        
-        // Step 5: Filter out deleted entries
-        let results: Vec<(Key, Value)> = merged.into_iter()
-            .filter(|(_, v)| !v.deleted)
-            .collect();
-        
-        Ok(results)
+        // Use streaming iterator to avoid materializing full BTreeMap
+        let iter = self.scan_range_streaming(start, end)?;
+        iter.collect()
     }
     
     /// Get compaction statistics
@@ -1936,92 +1845,12 @@ impl LSMEngine {
     /// }
     /// ```
     pub fn scan_range_batched(&self, start: Key, end: Key, batch_size: usize) -> Result<LSMBatchedIterator> {
-        use std::collections::BTreeMap;
-
-        let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
-
-        let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
-
-        // Unified lock: memtable + immutable together (same as scan_range_streaming)
-        {
-            let memtable = self.memtable.read();
-            let immutable = self.immutable.read();
-
-            for (k, entry) in memtable.scan(start, end)? {
-                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
-            }
-
-            for mt in immutable.iter() {
-                for (k, entry) in mt.scan(start, end)? {
-                    merged.entry(k).and_modify(|existing| {
-                        if entry.timestamp > existing.timestamp {
-                            *existing = Value { data: entry.data.clone(), timestamp: entry.timestamp, deleted: entry.deleted };
-                        }
-                    }).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
-                }
-            }
+        // Use streaming iterator internally to avoid BTreeMap materialization
+        let iter = self.scan_range_streaming(start, end)?;
+        let mut all_data = Vec::new();
+        for item in iter {
+            all_data.push(item?);
         }
-
-        // Epoch check: loop until stable (matches scan_range_streaming pattern)
-        loop {
-            let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
-            if epoch_after == epoch_before {
-                break;
-            }
-            let memtable = self.memtable.read();
-            let immutable = self.immutable.read();
-            for (k, entry) in memtable.scan(start, end)? {
-                merged.insert(k, Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
-            }
-            for mt in immutable.iter() {
-                for (k, entry) in mt.scan(start, end)? {
-                    merged.entry(k).and_modify(|existing| {
-                        if entry.timestamp > existing.timestamp {
-                            *existing = Value { data: entry.data.clone(), timestamp: entry.timestamp, deleted: entry.deleted };
-                        }
-                    }).or_insert(Value { data: entry.data, timestamp: entry.timestamp, deleted: entry.deleted });
-                }
-            }
-            let epoch_final = self.rotation_epoch.load(Ordering::Acquire);
-            if epoch_final == epoch_after {
-                break;
-            }
-        }
-
-        // Collect from SSTables (newest first)
-        let sstable_metas = self.compaction_worker.get_all_sstables()?;
-
-        for meta in sstable_metas.iter().rev() {
-            if start > meta.max_key || end <= meta.min_key {
-                continue;
-            }
-
-            let cached = match self.sstable_cache.get_or_open(&meta.path) {
-                Ok(cached) => cached,
-                Err(_) => continue,
-            };
-
-            let sstable = cached.handle.read();
-
-            let entries = match sstable.scan(start, end) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-
-            for (k, value) in entries {
-                merged.entry(k).and_modify(|existing| {
-                    if value.timestamp > existing.timestamp {
-                        *existing = value.clone();
-                    }
-                }).or_insert(value);
-            }
-        }
-        
-        // Filter out deleted entries and convert to Vec
-        let all_data: Vec<(Key, Value)> = merged.into_iter()
-            .filter(|(_, v)| !v.deleted)
-            .collect();
-        
         Ok(LSMBatchedIterator {
             data: all_data,
             batch_size,
