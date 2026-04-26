@@ -113,6 +113,12 @@ impl PartialOrd for Value {
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
             (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
             (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            // Timestamp vs Integer: compare timestamp micros to integer value
+            (Value::Timestamp(a), Value::Integer(b)) => a.as_micros().partial_cmp(b),
+            (Value::Integer(a), Value::Timestamp(b)) => a.partial_cmp(&b.as_micros()),
+            // Timestamp vs Float: compare timestamp micros to float value
+            (Value::Timestamp(a), Value::Float(b)) => (a.as_micros() as f64).partial_cmp(b),
+            (Value::Float(a), Value::Timestamp(b)) => a.partial_cmp(&(b.as_micros() as f64)),
             _ => None,
         }
     }

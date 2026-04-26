@@ -16,17 +16,17 @@ impl Timestamp {
         Self { micros }
     }
 
-    /// Create a timestamp from milliseconds
+    /// Create a timestamp from milliseconds (saturating on overflow)
     pub fn from_millis(millis: i64) -> Self {
         Self {
-            micros: millis * 1000,
+            micros: millis.saturating_mul(1000),
         }
     }
 
-    /// Create a timestamp from seconds
+    /// Create a timestamp from seconds (saturating on overflow)
     pub fn from_secs(secs: i64) -> Self {
         Self {
-            micros: secs * 1_000_000,
+            micros: secs.saturating_mul(1_000_000),
         }
     }
 

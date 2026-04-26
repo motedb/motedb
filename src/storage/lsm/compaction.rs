@@ -336,6 +336,22 @@ impl CompactionWorker {
             debug_log!("[CompactionWorker] Warning: failed to discover SSTables: {:?}", e);
         }
 
+        // Recover num_compactions from existing SSTable file IDs to prevent
+        // filename collisions after restart.
+        if let Ok(levels) = worker.levels.lock() {
+            let max_id: u64 = levels.iter()
+                .flat_map(|l| l.sstables.iter())
+                .filter_map(|m| {
+                    let stem = m.path.file_stem()?.to_str()?;
+                    stem.split('_').last()?.parse::<u64>().ok()
+                })
+                .max()
+                .unwrap_or(0);
+            if let Ok(mut stats) = worker.stats.lock() {
+                stats.num_compactions = max_id + 1;
+            }
+        }
+
         worker
     }
 

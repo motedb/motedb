@@ -598,12 +598,6 @@ impl PartitionWAL {
             DurabilityLevel::GroupCommit { .. } | DurabilityLevel::Periodic { .. } | DurabilityLevel::NoSync => {}
         }
 
-        // Auto-checkpoint when WAL exceeds size limit (prevents unbounded growth on edge devices)
-        if self.bytes_written >= AUTO_CHECKPOINT_BYTES {
-            debug_log!("[WAL] Auto-checkpoint: {} bytes written, truncating", self.bytes_written);
-            self.checkpoint()?;
-        }
-
         Ok(lsn)
     }
 
@@ -1499,6 +1493,19 @@ impl WALManager {
         for entry in self.partitions.iter() {
             let mut wal = entry.value().lock();
             wal.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Auto-checkpoint partitions whose WAL exceeds the size threshold.
+    /// Called from the flush thread AFTER data is safely in SSTables.
+    pub fn auto_checkpoint_if_needed(&self) -> Result<()> {
+        for entry in self.partitions.iter() {
+            let mut wal = entry.value().lock();
+            if wal.bytes_written >= AUTO_CHECKPOINT_BYTES {
+                debug_log!("[WAL] Auto-checkpoint: {} bytes written, truncating", wal.bytes_written);
+                wal.checkpoint()?;
+            }
         }
         Ok(())
     }

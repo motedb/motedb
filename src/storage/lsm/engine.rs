@@ -292,12 +292,19 @@ impl LSMEngine {
             UnifiedMemTable::new(&config)
         };
 
-        // Recover next_sst_id from existing SSTables to avoid overwriting on restart
+        // Recover next_sst_id from existing SSTables to avoid overwriting on restart.
+        // Scan ALL levels (l0_, l1_, l2_, ...) since compaction output files also
+        // consume IDs and can collide with flush output if not accounted for.
         let max_existing_id = compaction_worker
             .get_all_sstables()
             .map(|metas| {
                 metas.iter()
-                    .filter_map(|m| m.path.file_stem()?.to_str()?.strip_prefix("l0_")?.parse::<u64>().ok())
+                    .filter_map(|m| {
+                        let stem = m.path.file_stem()?.to_str()?;
+                        // Strip any "lN_" prefix (l0_, l1_, l2_, etc.)
+                        let id_str = stem.split('_').last()?;
+                        id_str.parse::<u64>().ok()
+                    })
                     .max()
                     .unwrap_or(0)
             })
@@ -513,7 +520,10 @@ impl LSMEngine {
                                                 match builder.finish() {
                                                     Ok(meta) => {
                                                         if let Some(worker) = compaction_worker_weak.upgrade() {
-                                                            let _ = worker.register_sstable(meta);
+                                                            if let Err(e) = worker.register_sstable(meta) {
+                                                                debug_log!("[LSM Flush] ❌ CRITICAL: register_sstable failed: {:?}. SSTable on disk but not tracked.", e);
+                                                                continue;
+                                                            }
                                                         }
                                                         // 🚀 Wake compaction thread (new SSTable registered)
                                                         {

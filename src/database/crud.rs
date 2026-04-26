@@ -234,7 +234,7 @@ impl MoteDB {
 
         // 10. Increment row count for COUNT(*) fast path
         if let Some(counter) = self.table_row_count.get(table_name) {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(row_id)

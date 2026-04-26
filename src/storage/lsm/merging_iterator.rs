@@ -80,49 +80,55 @@ pub struct MergingIterator {
     
     /// 是否已结束
     finished: bool,
+
+    /// First error from any source (propagated when heap drains)
+    first_error: Option<crate::StorageError>,
 }
 
 impl MergingIterator {
-    /// 创建新的合并迭代器
-    ///
-    /// # 参数
-    /// - `sources`: 各个数据源的迭代器（按优先级排序：MemTable > Immutable > SSTables）
+    /// Create a new merging iterator
     pub fn new(sources: Vec<KVIterator>) -> Self {
         let mut iter = Self {
             heap: BinaryHeap::new(),
             sources,
             last_key: None,
             finished: false,
+            first_error: None,
         };
-        
-        // 初始化：从每个数据源读取第一个元素放入堆
+
         iter.fill_heap();
-        
+
         iter
     }
-    
-    /// 从所有数据源填充堆（每个数据源一个元素）
+
     fn fill_heap(&mut self) {
         for (source_id, source) in self.sources.iter_mut().enumerate() {
-            if let Some(Ok((key, value))) = source.next() {
-                self.heap.push(Reverse(HeapItem {
-                    key,
-                    value,
-                    source_id,
-                }));
+            match source.next() {
+                Some(Ok((key, value))) => {
+                    self.heap.push(Reverse(HeapItem { key, value, source_id }));
+                }
+                Some(Err(e)) => {
+                    if self.first_error.is_none() {
+                        self.first_error = Some(e);
+                    }
+                }
+                None => {}
             }
         }
     }
-    
-    /// 从指定数据源读取下一个元素并放入堆
+
     fn refill_from_source(&mut self, source_id: usize) {
         if let Some(source) = self.sources.get_mut(source_id) {
-            if let Some(Ok((key, value))) = source.next() {
-                self.heap.push(Reverse(HeapItem {
-                    key,
-                    value,
-                    source_id,
-                }));
+            match source.next() {
+                Some(Ok((key, value))) => {
+                    self.heap.push(Reverse(HeapItem { key, value, source_id }));
+                }
+                Some(Err(e)) => {
+                    if self.first_error.is_none() {
+                        self.first_error = Some(e);
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -142,6 +148,10 @@ impl Iterator for MergingIterator {
                 Some(item) => item,
                 None => {
                     self.finished = true;
+                    // Propagate the first source error if any
+                    if let Some(e) = self.first_error.take() {
+                        return Some(Err(e));
+                    }
                     return None;
                 }
             };
