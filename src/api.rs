@@ -705,22 +705,37 @@ impl Database {
         } else {
             // Non-AUTO_INCREMENT PK: use pk_lookup cache (O(1)), fall back to column index
             let pk_key = crate::database::pk_cache::PkKey::from_value(&value);
+            let resolve_fallback = |db: &MoteDB, table: &str, col: &str, val: &Value| -> Option<RowId> {
+                match db.query_by_column(table, col, val) {
+                    Ok(ids) => ids.into_iter().next(),
+                    Err(_) => {
+                        // Column index missing (e.g. after restart) — full scan
+                        let s = db.get_table_schema(table).ok()?;
+                        let pos = s.get_column_position(col)?;
+                        let rows = db.scan_table_rows_streaming(table).ok()?;
+                        for item in rows {
+                            if let Ok((rid, row)) = item {
+                                if row.get(pos)? == val {
+                                    return Some(rid);
+                                }
+                            }
+                        }
+                        None
+                    }
+                }
+            };
             let row_id = if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
                 if let Some(rid) = lookup.get_pk(&pk_key) {
                     Some(rid)
                 } else {
-                    // Cache miss — column index fallback + refill cache
-                    let row_ids = self.inner.query_by_column(table_name, col_name, &value)?;
-                    if let Some(&rid) = row_ids.first() {
-                        if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
-                            lookup.insert(pk_key, rid);
-                        }
+                    let rid = resolve_fallback(&self.inner, table_name, col_name, &value);
+                    if let Some(r) = rid {
+                        lookup.insert(pk_key, r);
                     }
-                    row_ids.into_iter().next()
+                    rid
                 }
             } else {
-                let row_ids = self.inner.query_by_column(table_name, col_name, &value)?;
-                row_ids.into_iter().next()
+                resolve_fallback(&self.inner, table_name, col_name, &value)
             };
             match row_id {
                 Some(rid) => self.inner.get_table_row_arc(table_name, rid, &schema)?,

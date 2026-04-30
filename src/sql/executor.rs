@@ -4593,8 +4593,27 @@ impl QueryExecutor {
             }
         }
 
-        // Cache miss — fall back to disk-based column index
-        let row_ids = self.db.query_by_column(table, pk_col_name, pk_value)?;
+        // Cache miss — fall back to column index, or full scan if index missing
+        let row_ids = match self.db.query_by_column(table, pk_col_name, pk_value) {
+            Ok(ids) => ids,
+            Err(_) => {
+                // Column index not available (e.g. after restart) — full scan fallback
+                let schema = self.db.get_table_schema(table)?;
+                let pk_pos = schema.get_column_position(pk_col_name).unwrap_or(0);
+                let rows = self.db.scan_table_rows_streaming(table)?;
+                let mut found = Vec::new();
+                for item in rows {
+                    let (row_id, row) = item?;
+                    if let Some(val) = row.get(pk_pos) {
+                        if val == pk_value {
+                            found.push(row_id);
+                            break;
+                        }
+                    }
+                }
+                found
+            }
+        };
 
         // Refill cache from disk result so next lookup is O(1)
         if let Some(&rid) = row_ids.first() {
