@@ -14,6 +14,7 @@
 use super::{SSTable, SSTableBuilder, LSMConfig, Key};
 use super::bloom::BloomFilter;
 use crate::{Result, StorageError};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -343,7 +344,7 @@ impl CompactionWorker {
                 .flat_map(|l| l.sstables.iter())
                 .filter_map(|m| {
                     let stem = m.path.file_stem()?.to_str()?;
-                    stem.split('_').last()?.parse::<u64>().ok()
+                    stem.split('_').next_back()?.parse::<u64>().ok()
                 })
                 .max()
                 .unwrap_or(0);
@@ -602,9 +603,10 @@ impl CompactionWorker {
             return Ok(());
         }
         
-        // Merge SSTables
-        let output_meta = self.merge_sstables(level_idx + 1, &valid_sources, &valid_overlapping)?;
-        
+        // Merge SSTables — returns output plus the set of paths that were actually
+        // merged (files that survived the TOCTOU window between exists() and open()).
+        let (output_meta, merged_paths) = self.merge_sstables(level_idx + 1, &valid_sources, &valid_overlapping)?;
+
         // Update levels
         // Invalidate snapshot BEFORE modifying levels so that concurrent scans
         // don't get a stale cached snapshot with removed SSTables.
@@ -615,14 +617,18 @@ impl CompactionWorker {
         // Collect all removed SSTable paths for selective cache eviction
         let mut removed_paths: Vec<PathBuf> = Vec::with_capacity(sources.len() + overlapping.len());
 
-        // Remove source files (deferred — actual deletion happens next compaction cycle)
+        // Remove source files that were actually merged (deferred — actual deletion
+        // happens next compaction cycle).  Skip files that disappeared during merge
+        // to avoid data loss from the TOCTOU race.
         for source in &valid_sources {
-            levels[level_idx].remove_sstable(&source.path);
-            removed_paths.push(source.path.clone());
-            self.defer_deletion(source.path.clone());
+            if merged_paths.contains(&source.path) {
+                levels[level_idx].remove_sstable(&source.path);
+                removed_paths.push(source.path.clone());
+                self.defer_deletion(source.path.clone());
+            }
         }
 
-        // Also clean up metadata for files that didn't exist
+        // Also clean up metadata for files that didn't exist at the pre-check
         for source in &sources {
             if !valid_sources.iter().any(|v| v.path == source.path) {
                 levels[level_idx].remove_sstable(&source.path);
@@ -630,14 +636,16 @@ impl CompactionWorker {
             }
         }
 
-        // Remove overlapping files (deferred)
+        // Remove overlapping files that were actually merged (deferred)
         for overlap in &valid_overlapping {
-            levels[level_idx + 1].remove_sstable(&overlap.path);
-            removed_paths.push(overlap.path.clone());
-            self.defer_deletion(overlap.path.clone());
+            if merged_paths.contains(&overlap.path) {
+                levels[level_idx + 1].remove_sstable(&overlap.path);
+                removed_paths.push(overlap.path.clone());
+                self.defer_deletion(overlap.path.clone());
+            }
         }
 
-        // Also clean up metadata for files that didn't exist
+        // Also clean up metadata for files that didn't exist at the pre-check
         for overlap in &overlapping {
             if !valid_overlapping.iter().any(|v| v.path == overlap.path) {
                 levels[level_idx + 1].remove_sstable(&overlap.path);
@@ -678,28 +686,34 @@ impl CompactionWorker {
     }
     
     /// Merge multiple SSTables into one
-    /// 
-    /// Note: sources and overlapping should already be filtered for existing files
+    ///
+    /// Returns the merged output SSTableMeta and a HashSet of paths that were
+    /// actually included in the merge (i.e. NOT skipped due to TOCTOU NotFound).
+    /// The caller MUST only remove metadata for paths in the returned set.
     fn merge_sstables(
         &self,
         output_level: usize,
         sources: &[SSTableMeta],
         overlapping: &[SSTableMeta],
-    ) -> Result<SSTableMeta> {
+    ) -> Result<(SSTableMeta, HashSet<PathBuf>)> {
         let rate_limit = self.config.lsm_config.compaction_rate_limit.unwrap_or(u64::MAX);
         let yield_interval = self.config.lsm_config.compaction_yield_every_n_blocks;
 
-        // Open ALL input SSTables. Skipping any input causes data loss because
-        // run_compaction removes all source+overlapping SSTables from metadata
-        // regardless of whether they were included in the merge output.
+        // Open ALL input SSTables. Track which paths were actually opened
+        // so the caller can avoid removing metadata for files that disappeared
+        // between the existence check and open (TOCTOU race).
         let mut all_inputs = Vec::new();
+        let mut merged_paths = HashSet::new();
         let all_sources: Vec<&SSTableMeta> = sources.iter().chain(overlapping.iter()).collect();
 
         for meta in &all_sources {
             match SSTable::open(&meta.path) {
-                Ok(sstable) => all_inputs.push(sstable),
+                Ok(sstable) => {
+                    merged_paths.insert(meta.path.clone());
+                    all_inputs.push(sstable);
+                }
                 Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug_log!("⚠️ SSTable disappeared during open: {:?}", meta.path);
+                    debug_log!("SSTable disappeared during open (TOCTOU race): {:?}", meta.path);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -834,7 +848,7 @@ impl CompactionWorker {
             stats.write_amplification = stats.bytes_written as f64 / stats.bytes_read as f64;
         }
 
-        Ok(output_meta)
+        Ok((output_meta, merged_paths))
     }
 
     /// Get compaction statistics
@@ -852,183 +866,6 @@ impl CompactionWorker {
         Ok(levels.iter().map(|l| (l.level, l.sstables.len(), l.total_size)).collect())
     }
     
-    /// List all SSTable paths (for range scan)
-    /// Returns paths sorted by level (L0 first = newest)
-    pub fn list_sstables(&self) -> Result<Vec<PathBuf>> {
-        let levels = self.levels.lock()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
-        let mut paths = Vec::new();
-        
-        // Collect from all levels (L0 first = newest data)
-        for level in levels.iter() {
-            for sst in &level.sstables {
-                paths.push(sst.path.clone());
-            }
-        }
-        
-        Ok(paths)
-    }
-    
-    /// ✨ P2 Phase 3: Run tiered compaction for L0 sublevels
-    /// 
-    /// This reduces write amplification by:
-    /// - L0.0 → L0.1: Merge 2 files → 1 file (small, fast)
-    /// - L0.1 → L0.2: Merge 3 files → 1 file (medium)
-    /// - L0.2 → L1: Merge 3 files + overlapping L1 → L1 (full merge)
-    #[allow(dead_code)]
-    fn run_tiered_compaction(&self, sublevel_idx: usize) -> Result<()> {
-        let levels = self.levels.lock()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-
-        let sources = if let Some(ref sublevels) = levels[0].sublevels {
-            if sublevel_idx >= sublevels.len() {
-                return Ok(());
-            }
-            sublevels[sublevel_idx].sstables.clone()
-        } else {
-            return Ok(());  // No tiered structure
-        };
-
-        drop(levels);  // Release lock during I/O
-
-        // ✅ Check file existence
-        let valid_sources: Vec<_> = sources.iter()
-            .filter(|s| s.path.exists())
-            .cloned()
-            .collect();
-        
-        if valid_sources.is_empty() {
-            // Clean up metadata
-            let mut levels = self.levels.lock()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            
-            if let Some(ref mut sublevels) = levels[0].sublevels {
-                if sublevel_idx < sublevels.len() {
-                    sublevels[sublevel_idx].sstables.clear();
-                }
-            }
-            
-            return Ok(());
-        }
-        
-        // Determine target: L0.{n+1} or L1
-        let target_sublevel = sublevel_idx + 1;
-        let compact_to_l1 = target_sublevel >= 3;  // L0.2 → L1
-        
-        // Collect all removed SSTable paths for selective cache eviction
-        let mut removed_paths: Vec<PathBuf> = Vec::new();
-
-        if compact_to_l1 {
-            // Full compaction to L1 (include overlapping files)
-            let levels = self.levels.lock()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-
-            let overlapping = levels[0].get_overlapping(&levels[1], &valid_sources);
-            drop(levels);
-
-            let valid_overlapping: Vec<_> = overlapping.iter()
-                .filter(|s| s.path.exists())
-                .cloned()
-                .collect();
-
-            // Merge to L1
-            let output_meta = self.merge_sstables(1, &valid_sources, &valid_overlapping)?;
-
-            // Update levels — invalidate snapshot first
-            self.invalidate_snapshot();
-            let mut levels = self.levels.lock()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-
-            // Remove from L0 sublevel
-            if let Some(ref mut sublevels) = levels[0].sublevels {
-                if sublevel_idx < sublevels.len() {
-                    sublevels[sublevel_idx].sstables.clear();
-                }
-            }
-
-            // Remove from L0 main list (deferred)
-            for source in &valid_sources {
-                levels[0].remove_sstable(&source.path);
-                removed_paths.push(source.path.clone());
-                self.defer_deletion(source.path.clone());
-            }
-
-            // Remove overlapping from L1 (deferred)
-            for overlap in &valid_overlapping {
-                levels[1].remove_sstable(&overlap.path);
-                removed_paths.push(overlap.path.clone());
-                self.defer_deletion(overlap.path.clone());
-            }
-
-            // Add to L1
-            levels[1].add_sstable(output_meta);
-        } else {
-            // ✨ Incremental merge to next sublevel (P2 Phase 3.2)
-            let output_metas = self.incremental_merge(&valid_sources, sublevel_idx)?;
-
-            // Update sublevels — invalidate snapshot first
-            self.invalidate_snapshot();
-            let mut levels = self.levels.lock()
-                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-
-            // Remove from source sublevel and add to target sublevel
-            if let Some(ref mut sublevels) = levels[0].sublevels {
-                if sublevel_idx < sublevels.len() {
-                    sublevels[sublevel_idx].sstables.clear();
-                }
-
-                // Add to target sublevel
-                if target_sublevel < sublevels.len() {
-                    for meta in &output_metas {
-                        sublevels[target_sublevel].sstables.push(meta.clone());
-                    }
-                }
-            }
-
-            // Update main list — remove old sources, add merged outputs
-            for source in &valid_sources {
-                levels[0].remove_sstable(&source.path);
-                removed_paths.push(source.path.clone());
-                self.defer_deletion(source.path.clone());
-            }
-            for meta in output_metas {
-                levels[0].sstables.push(meta);
-            }
-        }
-
-        // Update stats
-        let mut stats = self.stats.lock()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        stats.num_compactions += 1;
-
-        let bytes_read: u64 = valid_sources.iter().map(|s| s.size).sum();
-        stats.bytes_read += bytes_read;
-
-        // ✨ Track tiered compaction stats
-        if compact_to_l1 {
-            stats.l0_to_l1_compactions += 1;
-        } else {
-            stats.tiered_compactions += 1;
-            // Estimate bytes saved by delaying L1 compaction
-            stats.bytes_saved += bytes_read;
-        }
-
-        // Update write amplification
-        if stats.bytes_read > 0 {
-            stats.write_amplification = stats.bytes_written as f64 / stats.bytes_read as f64;
-        }
-
-        drop(stats);
-
-        // 🚀 Invalidate snapshot so next read rebuilds it
-        self.invalidate_snapshot();
-
-        // Selectively evict only removed SSTables from cache (not a full clear)
-        self.invoke_post_compaction(&removed_paths);
-
-        Ok(())
-    }
     ///
     /// Instead of merging all N files at once:
     /// - Split into batches of 2

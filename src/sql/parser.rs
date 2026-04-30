@@ -7,11 +7,13 @@ use crate::types::Value;
 pub struct Parser {
     tokens: Vec<Token>,
     position: usize,
+    /// Auto-increment counter for unnamed ? parameters
+    next_param_idx: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, position: 0 }
+        Self { tokens, position: 0, next_param_idx: 1 }
     }
     
     /// Parse a SQL statement
@@ -271,7 +273,7 @@ impl Parser {
     fn is_join_keyword(&self) -> bool {
         matches!(
             self.current().token_type,
-            TokenType::Join | TokenType::Inner | TokenType::Left | TokenType::Right
+            TokenType::Join | TokenType::Inner | TokenType::Left | TokenType::Right | TokenType::Full
         )
     }
     
@@ -487,40 +489,50 @@ impl Parser {
             let name = self.parse_identifier()?;
             let data_type = self.parse_data_type()?;
             
-            // Parse constraints
+            // Parse constraints in any order
             let mut nullable = true;
             let mut primary_key = false;
             let mut auto_increment = false;
             let mut auto_increment_start: Option<i64> = None;
-            
-            // NOT NULL
-            if self.match_token(TokenType::Not) {
-                self.expect(TokenType::Null)?;
-                nullable = false;
-            }
-            
-            // PRIMARY KEY
-            if self.match_token(TokenType::Primary) {
-                self.expect(TokenType::Key)?;
-                primary_key = true;
-                nullable = false;  // PRIMARY KEY implies NOT NULL
-            }
-            
-            // 🚀 AUTO_INCREMENT (支持 AUTO_INCREMENT 和 AUTO_INCREMENT = N)
-            if self.match_token(TokenType::AutoIncrement) {
-                auto_increment = true;
-                if !primary_key {
-                    return Err(self.error("AUTO_INCREMENT can only be used with PRIMARY KEY"));
+
+            loop {
+                // NOT NULL
+                if self.match_token(TokenType::Not) {
+                    self.expect(TokenType::Null)?;
+                    nullable = false;
+                    continue;
                 }
-                // 🚀 Phase 4: INTEGER or BIGINT
-                if data_type != DataType::Integer && data_type != DataType::BigInt {
-                    return Err(self.error("AUTO_INCREMENT can only be used with INTEGER or BIGINT columns"));
+
+                // NULL (explicit nullable)
+                if self.match_token(TokenType::Null) {
+                    nullable = true;
+                    continue;
                 }
-                
-                // 🚀 Phase 5: 解析起始值 AUTO_INCREMENT = N (可选)
-                if self.match_token(TokenType::Eq) {
-                    auto_increment_start = Some(self.parse_i64()?);
+
+                // PRIMARY KEY
+                if self.match_token(TokenType::Primary) {
+                    self.expect(TokenType::Key)?;
+                    primary_key = true;
+                    nullable = false;
+                    continue;
                 }
+
+                // AUTO_INCREMENT
+                if self.match_token(TokenType::AutoIncrement) {
+                    auto_increment = true;
+                    if !primary_key {
+                        return Err(self.error("AUTO_INCREMENT can only be used with PRIMARY KEY"));
+                    }
+                    if data_type != DataType::Integer && data_type != DataType::BigInt {
+                        return Err(self.error("AUTO_INCREMENT can only be used with INTEGER or BIGINT columns"));
+                    }
+                    if self.match_token(TokenType::Eq) {
+                        auto_increment_start = Some(self.parse_i64()?);
+                    }
+                    continue;
+                }
+
+                break;
             }
             
             columns.push(ColumnDef {
@@ -751,27 +763,35 @@ impl Parser {
     fn parse_expr(&mut self, min_precedence: u8) -> Result<Expr> {
         // Parse prefix (unary operators, literals, identifiers, etc.)
         let mut left = self.parse_prefix_expr()?;
-        
-        // Parse infix operators
-        while let Some(op) = self.try_parse_binary_op() {
-            let precedence = op.precedence();
-            if precedence < min_precedence {
-                break;
+
+        loop {
+            // Try infix binary operators first
+            if let Some(op) = self.try_parse_binary_op() {
+                let precedence = op.precedence();
+                if precedence < min_precedence {
+                    break;
+                }
+
+                self.advance(); // consume operator
+                let right = self.parse_expr(precedence + 1)?;
+
+                left = Expr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                };
+                continue;
             }
-            
-            self.advance(); // consume operator
-            let right = self.parse_expr(precedence + 1)?;
-            
-            left = Expr::BinaryOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+
+            // Try postfix operators (IS NULL, IN, LIKE, BETWEEN, NOT IN/LIKE/BETWEEN)
+            if self.can_parse_postfix() {
+                left = self.parse_single_postfix(left)?;
+                continue;
+            }
+
+            break;
         }
-        
-        // Handle special postfix operators
-        left = self.parse_postfix_expr(left)?;
-        
+
         Ok(left)
     }
     
@@ -847,6 +867,20 @@ impl Parser {
             TokenType::Null => {
                 self.advance();
                 Ok(Expr::Literal(Value::Null))
+            }
+
+            // Bind variable (? or ?1, ?2, ...)
+            TokenType::Parameter(idx) => {
+                let idx = if *idx == 0 {
+                    // Unnamed ?: auto-assign sequential 1-based index
+                    let next = self.next_param_idx;
+                    self.next_param_idx += 1;
+                    next
+                } else {
+                    *idx
+                };
+                self.advance();
+                Ok(Expr::Parameter(idx))
             }
             
             // ARRAY[...] literal for vectors
@@ -961,40 +995,51 @@ impl Parser {
                         use crate::types::{Geometry as G3, Point3D};
                         Ok(Expr::Literal(Value::Spatial(G3::Point3D(Point3D::new(x, y, z)))))
                     } else if name.to_uppercase() == "MATCH" {
-                        // Special handling for MATCH(column) AGAINST(query)
-                        if args.len() != 1 {
-                            return Err(self.error("MATCH() requires exactly 1 column argument"));
-                        }
-                        
-                        // Extract column name
-                        let column = match &args[0] {
-                            Expr::Column(col_name) => col_name.clone(),
-                            _ => return Err(self.error("MATCH() argument must be a column name")),
-                        };
-                        
-                        // Expect AGAINST keyword
-                        if !self.match_keyword("AGAINST") {
-                            return Err(self.error("Expected AGAINST after MATCH(column)"));
-                        }
-                        
-                        // Expect (query_string)
-                        self.expect(TokenType::LParen)?;
-                        let query = match self.current().token_type {
-                            TokenType::String(ref s) => s.clone(),
-                            _ => return Err(self.error("AGAINST() requires a string literal")),
-                        };
-                        self.advance();
-                        self.expect(TokenType::RParen)?;
+                        // MATCH(column) AGAINST(query) or MATCH(column, query)
+                        if args.len() == 2 {
+                            // Short form: MATCH(column, query_text)
+                            let column = match &args[0] {
+                                Expr::Column(col_name) => col_name.clone(),
+                                _ => return Err(self.error("MATCH() first argument must be a column name")),
+                            };
+                            let query = match &args[1] {
+                                Expr::Literal(Value::Text(s)) => s.clone(),
+                                _ => return Err(self.error("MATCH() second argument must be a string")),
+                            };
+                            Ok(Expr::Match { column, query, phrase: false })
+                        } else if args.len() == 1 {
+                            // Long form: MATCH(column) AGAINST(query)
+                            let column = match &args[0] {
+                                Expr::Column(col_name) => col_name.clone(),
+                                _ => return Err(self.error("MATCH() argument must be a column name")),
+                            };
 
-                        // Detect phrase query: query starts and ends with double quotes
-                        let phrase = query.starts_with('"') && query.ends_with('"') && query.len() >= 2;
-                        let query = if phrase {
-                            query[1..query.len()-1].to_string()
+                            // Expect AGAINST keyword
+                            if !self.match_keyword("AGAINST") {
+                                return Err(self.error("Expected AGAINST after MATCH(column)"));
+                            }
+
+                            // Expect (query_string)
+                            self.expect(TokenType::LParen)?;
+                            let query = match self.current().token_type {
+                                TokenType::String(ref s) => s.clone(),
+                                _ => return Err(self.error("AGAINST() requires a string literal")),
+                            };
+                            self.advance();
+                            self.expect(TokenType::RParen)?;
+
+                            // Detect phrase query: query starts and ends with double quotes
+                            let phrase = query.starts_with('"') && query.ends_with('"') && query.len() >= 2;
+                            let query = if phrase {
+                                query[1..query.len()-1].to_string()
+                            } else {
+                                query
+                            };
+
+                            Ok(Expr::Match { column, query, phrase })
                         } else {
-                            query
-                        };
-
-                        Ok(Expr::Match { column, query, phrase })
+                            Err(self.error("MATCH() requires 1 or 2 arguments"))
+                        }
                     } else if name.to_uppercase() == "KNN_SEARCH" {
                         // KNN_SEARCH(vector_column, query_vector, k)
                         if args.len() != 3 {
@@ -1136,14 +1181,12 @@ impl Parser {
                             Expr::Column(n) => n.clone(),
                             _ => return Err(self.error("ST_WITHIN_3D() first argument must be a column")),
                         };
-                        let nums: Vec<f64> = args[1..].iter().map(|a| match a {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => -1.0,
+                        let nums: Result<Vec<f64>> = args[1..].iter().map(|a| match a {
+                            Expr::Literal(Value::Float(f)) => Ok(*f),
+                            Expr::Literal(Value::Integer(i)) => Ok(*i as f64),
+                            _ => Err(self.error("ST_WITHIN_3D() bounds must be numeric literals")),
                         }).collect();
-                        if nums.iter().any(|n| *n < 0.0) {
-                            return Err(self.error("ST_WITHIN_3D() bounds must be numeric"));
-                        }
+                        let nums = nums?;
                         Ok(Expr::StWithin3D { column, min_x: nums[0], min_y: nums[1], min_z: nums[2], max_x: nums[3], max_y: nums[4], max_z: nums[5] })
                     } else if name.to_uppercase() == "ST_DISTANCE_3D" {
                         if args.len() != 4 {
@@ -1227,112 +1270,118 @@ impl Parser {
         }
     }
     
-    fn parse_postfix_expr(&mut self, mut expr: Expr) -> Result<Expr> {
-        loop {
-            match &self.current().token_type {
-                TokenType::Is => {
-                    self.advance();
-                    let negated = self.match_token(TokenType::Not);
-                    self.expect(TokenType::Null)?;
-                    expr = Expr::IsNull {
-                        expr: Box::new(expr),
-                        negated,
-                    };
-                }
-                TokenType::Not => {
-                    // Check for NOT IN, NOT LIKE, NOT BETWEEN
-                    self.advance();
-                    
-                    match &self.current().token_type {
-                        TokenType::In => {
-                            self.advance();
-                            self.expect(TokenType::LParen)?;
-                            
-                            let list = if matches!(self.current().token_type, TokenType::Select) {
-                                let subquery = self.parse_select()?;
-                                vec![Expr::Subquery(Box::new(subquery))]
-                            } else {
-                                self.parse_expr_list()?
-                            };
-                            
-                            self.expect(TokenType::RParen)?;
-                            expr = Expr::In {
-                                expr: Box::new(expr),
-                                list,
-                                negated: true,
-                            };
-                        }
-                        TokenType::Like => {
-                            self.advance();
-                            let pattern = self.parse_expr(4)?;
-                            expr = Expr::Like {
-                                expr: Box::new(expr),
-                                pattern: Box::new(pattern),
-                                negated: true,
-                            };
-                        }
-                        TokenType::Between => {
-                            self.advance();
-                            let low = self.parse_expr(4)?;
-                            self.expect(TokenType::And)?;
-                            let high = self.parse_expr(4)?;
-                            expr = Expr::Between {
-                                expr: Box::new(expr),
-                                low: Box::new(low),
-                                high: Box::new(high),
-                                negated: true,
-                            };
-                        }
-                        _ => return Err(self.error("Expected IN, LIKE, or BETWEEN after NOT")),
-                    }
-                }
-                TokenType::Like => {
-                    self.advance();
-                    let pattern = self.parse_expr(4)?; // Same precedence as comparison
-                    expr = Expr::Like {
-                        expr: Box::new(expr),
-                        pattern: Box::new(pattern),
-                        negated: false,
-                    };
-                }
-                TokenType::In => {
-                    self.advance();
-                    self.expect(TokenType::LParen)?;
-                    
-                    // Check if this is a subquery: IN (SELECT ...)
-                    let list = if matches!(self.current().token_type, TokenType::Select) {
-                        // Parse subquery
-                        let subquery = self.parse_select()?;
-                        vec![Expr::Subquery(Box::new(subquery))]
-                    } else {
-                        // Parse expression list: IN (1, 2, 3)
-                        self.parse_expr_list()?
-                    };
-                    
-                    self.expect(TokenType::RParen)?;
-                    expr = Expr::In {
-                        expr: Box::new(expr),
-                        list,
-                        negated: false,
-                    };
-                }
-                TokenType::Between => {
-                    self.advance();
-                    let low = self.parse_expr(4)?;
-                    self.expect(TokenType::And)?;
-                    let high = self.parse_expr(4)?;
-                    expr = Expr::Between {
-                        expr: Box::new(expr),
-                        low: Box::new(low),
-                        high: Box::new(high),
-                        negated: false,
-                    };
-                }
-                _ => break,
+    /// Check if the current token starts a postfix operator.
+    fn can_parse_postfix(&self) -> bool {
+        match &self.current().token_type {
+            TokenType::Is => true,
+            TokenType::Not => {
+                matches!(self.peek_token_type(),
+                    TokenType::In | TokenType::Like | TokenType::Between)
             }
+            TokenType::Like | TokenType::In | TokenType::Between => true,
+            _ => false,
         }
-        
-        Ok(expr)
+    }
+
+    /// Parse a single postfix operator (IS NULL, IN, LIKE, BETWEEN, NOT IN/LIKE/BETWEEN).
+    fn parse_single_postfix(&mut self, expr: Expr) -> Result<Expr> {
+        match &self.current().token_type {
+            TokenType::Is => {
+                self.advance();
+                let negated = self.match_token(TokenType::Not);
+                self.expect(TokenType::Null)?;
+                Ok(Expr::IsNull {
+                    expr: Box::new(expr),
+                    negated,
+                })
+            }
+            TokenType::Not => {
+                self.advance(); // consume NOT
+
+                match &self.current().token_type {
+                    TokenType::In => {
+                        self.advance();
+                        self.expect(TokenType::LParen)?;
+
+                        let list = if matches!(self.current().token_type, TokenType::Select) {
+                            let subquery = self.parse_select()?;
+                            vec![Expr::Subquery(Box::new(subquery))]
+                        } else {
+                            self.parse_expr_list()?
+                        };
+
+                        self.expect(TokenType::RParen)?;
+                        Ok(Expr::In {
+                            expr: Box::new(expr),
+                            list,
+                            negated: true,
+                        })
+                    }
+                    TokenType::Like => {
+                        self.advance();
+                        let pattern = self.parse_expr(4)?;
+                        Ok(Expr::Like {
+                            expr: Box::new(expr),
+                            pattern: Box::new(pattern),
+                            negated: true,
+                        })
+                    }
+                    TokenType::Between => {
+                        self.advance();
+                        let low = self.parse_expr(4)?;
+                        self.expect(TokenType::And)?;
+                        let high = self.parse_expr(4)?;
+                        Ok(Expr::Between {
+                            expr: Box::new(expr),
+                            low: Box::new(low),
+                            high: Box::new(high),
+                            negated: true,
+                        })
+                    }
+                    _ => Err(self.error("Expected IN, LIKE, or BETWEEN after NOT")),
+                }
+            }
+            TokenType::Like => {
+                self.advance();
+                let pattern = self.parse_expr(4)?;
+                Ok(Expr::Like {
+                    expr: Box::new(expr),
+                    pattern: Box::new(pattern),
+                    negated: false,
+                })
+            }
+            TokenType::In => {
+                self.advance();
+                self.expect(TokenType::LParen)?;
+
+                let list = if matches!(self.current().token_type, TokenType::Select) {
+                    let subquery = self.parse_select()?;
+                    vec![Expr::Subquery(Box::new(subquery))]
+                } else {
+                    self.parse_expr_list()?
+                };
+
+                self.expect(TokenType::RParen)?;
+                Ok(Expr::In {
+                    expr: Box::new(expr),
+                    list,
+                    negated: false,
+                })
+            }
+            TokenType::Between => {
+                self.advance();
+                let low = self.parse_expr(4)?;
+                self.expect(TokenType::And)?;
+                let high = self.parse_expr(4)?;
+                Ok(Expr::Between {
+                    expr: Box::new(expr),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated: false,
+                })
+            }
+            _ => unreachable!("can_parse_postfix should prevent this"),
+        }
     }
     
     fn try_parse_binary_op(&self) -> Option<BinaryOperator> {
@@ -1397,6 +1446,9 @@ impl Parser {
             if n < 0.0 || n.fract() != 0.0 {
                 return Err(self.error("Expected non-negative integer"));
             }
+            if n > usize::MAX as f64 {
+                return Err(self.error("Number too large for usize"));
+            }
             self.advance();
             Ok(n as usize)
         } else {
@@ -1420,7 +1472,15 @@ impl Parser {
     fn current(&self) -> &Token {
         &self.tokens[self.position]
     }
-    
+
+    fn peek_token_type(&self) -> &TokenType {
+        if self.position + 1 < self.tokens.len() {
+            &self.tokens[self.position + 1].token_type
+        } else {
+            &TokenType::Eof
+        }
+    }
+
     fn advance(&mut self) {
         if self.position < self.tokens.len() - 1 {
             self.position += 1;

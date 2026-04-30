@@ -281,10 +281,6 @@ impl Manifest {
         Ok(deleted_files)
     }
     
-    /// 获取数据目录
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
 }
 
 #[cfg(test)]

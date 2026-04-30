@@ -110,11 +110,6 @@ impl IOctreeIndex {
         }
     }
 
-    /// Create with default config
-    pub fn new_default(name: String) -> Self {
-        Self::new(IOctreeConfig::default(), name)
-    }
-
     /// Insert a 3D point into the index
     pub fn insert(&mut self, row_id: u64, geometry: &Geometry) -> Result<()> {
         let owned;
@@ -151,83 +146,12 @@ impl IOctreeIndex {
         tree_insert(&self.leaf_store, &mut self.root, point, bucket_size, min_extent)
     }
 
-    /// Batch insert multiple 3D points with Morton-code sorting for locality.
-    ///
-    /// Sorts points by Z-order curve before inserting, which fills leaves
-    /// sequentially and reduces tree splits significantly compared to
-    /// random-order insertion.
-    pub fn batch_insert(&mut self, items: Vec<(u64, Geometry)>) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        if items.len() < 64 {
-            for (row_id, geom) in items {
-                self.insert(row_id, &geom)?;
-            }
-            return Ok(());
-        }
-
-        // Convert to IndexedPoint3D, expanding bounds in one pass
-        let mut points: Vec<IndexedPoint3D> = Vec::with_capacity(items.len());
-        for (row_id, geom) in &items {
-            match geom {
-                Geometry::Point3D(p) => {
-                    self.world_bounds.expand(p);
-                    points.push(IndexedPoint3D::from_point3d(p, *row_id));
-                }
-                Geometry::Point(p) => {
-                    let p3 = Point3D::new(p.x, p.y, 0.0);
-                    self.world_bounds.expand(&p3);
-                    points.push(IndexedPoint3D::from_point3d(&p3, *row_id));
-                }
-                _ => {}
-            }
-        }
-
-        // Expand root once to cover all points
-        let max_coord = points.iter().map(|p| p.x.max(p.y).max(p.z)).fold(0.0f32, f32::max);
-        let min_coord = points.iter().map(|p| p.x.min(p.y).min(p.z)).fold(0.0f32, f32::min);
-        let abs_max = max_coord.abs().max(min_coord.abs()) + 1.0;
-        while !self.root_contains(&[abs_max, abs_max, abs_max]) {
-            self.expand_root();
-        }
-
-        // Sort by Morton code for spatial locality
-        let bounds_min = [
-            self.world_bounds.min_x as f32,
-            self.world_bounds.min_y as f32,
-            self.world_bounds.min_z as f32,
-        ];
-        let bounds_max = [
-            (self.world_bounds.max_x - self.world_bounds.min_x) as f32,
-            (self.world_bounds.max_y - self.world_bounds.min_y) as f32,
-            (self.world_bounds.max_z - self.world_bounds.min_z) as f32,
-        ];
-        points.sort_by_key(|p| morton_encode_3d(p, &bounds_min, &bounds_max));
-
-        // Insert in sorted order (sequential leaf fills, fewer splits)
-        for point in points {
-            self.insert_into_tree(point)?;
-            self.size += 1;
-        }
-        Ok(())
-    }
-
     /// Delete a point by row_id
     pub fn delete(&mut self, row_id: u64) -> bool {
         let removed = tree_delete(&self.leaf_store, &mut self.root, row_id);
         if removed {
             self.size = self.size.saturating_sub(1);
         }
-        removed
-    }
-
-    /// Box-wise delete: remove all points within a 3D bounding box
-    pub fn box_delete(&mut self, bbox: &BoundingBox3D) -> usize {
-        let min = [bbox.min_x as f32, bbox.min_y as f32, bbox.min_z as f32];
-        let max = [bbox.max_x as f32, bbox.max_y as f32, bbox.max_z as f32];
-        let removed = tree_box_delete(&self.leaf_store, &mut self.root, &min, &max);
-        self.size = self.size.saturating_sub(removed);
         removed
     }
 
@@ -259,19 +183,9 @@ impl IOctreeIndex {
         self.size == 0
     }
 
-    /// Estimated memory usage (tree structure only, not including leaf data)
-    pub fn memory_usage(&self) -> usize {
-        self.root.memory_usage() + std::mem::size_of::<Self>()
-    }
-
     /// Save to disk
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         persistence::save(self, path)
-    }
-
-    /// Load from disk
-    pub fn load(path: &std::path::Path, config: IOctreeConfig, name: String) -> Result<Self> {
-        persistence::load(path, config, name)
     }
 
     /// Load from disk (path-only convenience wrapper)
@@ -296,11 +210,6 @@ impl IOctreeIndex {
             self.save(&save_path)?;
         }
         Ok(())
-    }
-
-    /// Get the index name
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     fn root_contains(&self, p: &[f32; 3]) -> bool {

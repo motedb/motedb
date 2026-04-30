@@ -74,21 +74,6 @@ impl ColumnarConfig {
         }
     }
 
-    /// Preset for high-throughput logging.
-    /// Large buffers for maximum throughput.
-    pub fn for_logging() -> Self {
-        Self {
-            buffer_row_capacity: 65_536,
-            buffer_byte_capacity: 16 * 1024 * 1024, // 16MB
-            segment_target_rows: 500_000,
-            enable_merge: true,
-            merge_threshold_segments: 12,
-            enable_column_stats: true,
-            enable_bloom_filters: true,
-            enable_timestamp_sort: true,
-            bloom_filter_bits_per_key: 10,
-        }
-    }
 }
 
 #[cfg(test)]

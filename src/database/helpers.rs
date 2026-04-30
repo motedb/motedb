@@ -10,6 +10,22 @@ use crate::{Result, StorageError};
 
 use super::core::MoteDB;
 
+/// Get total size of all files in a directory
+pub(crate) fn dir_size(dir: &std::path::Path) -> Result<u64> {
+    let mut total = 0;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
 impl MoteDB {
     /// Batch build all indexes for a specific table.
     ///
@@ -217,7 +233,20 @@ impl MoteDB {
                 if let Some(index_ref) = self.text_indexes.get(&index_name) {
                     let index = index_ref.value();
                     let mut index_guard = index.write();
-                    index_guard.build_from_memtable(rows)?;
+                    // Filter rows to only include the target column's text value
+                    let col_pos = col_def.position;
+                    let filtered: Vec<(RowId, Vec<Value>)> = rows.iter()
+                        .filter_map(|(row_id, row)| {
+                            row.get(col_pos).and_then(|v| match v {
+                                Value::Text(t) => Some((*row_id, vec![Value::Text(t.clone())])),
+                                Value::TextDoc(t) => Some((*row_id, vec![Value::Text(t.content().to_string())])),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+                    if !filtered.is_empty() {
+                        index_guard.build_from_memtable(&filtered)?;
+                    }
                 }
             }
         }

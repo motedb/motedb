@@ -643,6 +643,7 @@ impl PartitionWAL {
         write_buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
 
         self.file.write_all(&write_buf)?;
+        self.bytes_written += write_buf.len() as u64;
 
         if self.config.durability_level == DurabilityLevel::Synchronous { self.sync_flush()?; }
 
@@ -1107,7 +1108,7 @@ impl WALManager {
                 .name("motedb-group-commit".into())
                 .spawn(move || {
                     while !should_stop_clone.load(Ordering::Relaxed) {
-                        // Wait for entries or timeout
+                        // Wait for first entry or shutdown
                         {
                             let queue = state_clone.queue.lock().unwrap();
                             if queue.is_empty() {
@@ -1115,7 +1116,20 @@ impl WALManager {
                             }
                         }
 
-                        // Drain queue
+                        // Batch accumulation: use condvar timeout to wait for more entries.
+                        // This avoids busy-spinning while still letting batches grow.
+                        {
+                            let queue = state_clone.queue.lock().unwrap();
+                            if !queue.is_empty() && queue.len() < state_clone.max_batch_size {
+                                // Wait up to max_wait_us for more entries to arrive
+                                let _ = state_clone.wakeup.wait_timeout(
+                                    queue,
+                                    Duration::from_micros(state_clone.max_wait_us),
+                                ).unwrap();
+                            }
+                        }
+
+                        // Drain queue (up to max_batch_size)
                         let entries: Vec<GroupCommitEntry> = {
                             let mut queue = state_clone.queue.lock().unwrap();
                             let drain_count = queue.len().min(state_clone.max_batch_size);
@@ -1203,7 +1217,8 @@ impl WALManager {
         }
     }
 
-    /// Push a record through group commit queue and wait for flush
+    /// Push a record through group commit queue (fire-and-forget).
+    /// Caller returns immediately after enqueue; background thread handles batching & fsync.
     fn group_commit_append(
         &self,
         partition: PartitionId,
@@ -1213,37 +1228,15 @@ impl WALManager {
         self.periodic_new_writes.store(true, Ordering::Relaxed);
 
         if let Some(ref gc) = self.group_commit {
-            let done = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-
             {
                 let mut queue = gc.state.queue.lock().unwrap();
                 queue.push(GroupCommitEntry {
                     partition,
                     record,
-                    done: done.clone(),
+                    done: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
                 });
-                if queue.len() >= gc.state.max_batch_size {
-                    gc.state.wakeup.notify_all();
-                }
             }
             gc.state.wakeup.notify_all();
-
-            // Wait for flush with timeout (2× max_wait_us)
-            let timeout = Duration::from_micros(gc.state.max_wait_us * 2);
-            let flag = done.0.lock().unwrap();
-            if !*flag {
-                let result = done.1.wait_timeout(flag, timeout).unwrap();
-                let timed_out = !*result.0;
-                if timed_out {
-                    // Data may still be in the group commit queue and not yet written
-                    // to the kernel buffer. Sync the partition file as a safety net so
-                    // that at least whatever IS in the kernel buffer reaches disk.
-                    if let Some(entry) = self.partitions.get(&partition) {
-                        let mut wal = entry.value().lock();
-                        let _ = wal.sync_flush();
-                    }
-                }
-            }
 
             Ok(0) // LSN assigned asynchronously by batch_append
         } else {
@@ -1511,7 +1504,56 @@ impl WALManager {
     }
 
     /// Recover from crash (returns records per partition)
+    /// Flush all pending group-commit entries to disk.
+    /// Called before `recover()` so in-flight records are visible on disk.
+    pub fn flush_group_commit_queue(&self) {
+        if let Some(ref gc) = self.group_commit {
+            // Stop the background thread so it stops competing for the queue.
+            gc.should_stop.store(true, Ordering::Relaxed);
+            gc.state.wakeup.notify_all();
+
+            // Wait for the background thread to exit (it has a final drain in its
+            // shutdown path). Poll the queue until empty, then give the thread time
+            // to finish its in-flight writes.
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            loop {
+                let queue_len = gc.state.queue.lock().unwrap().len();
+                if queue_len == 0 {
+                    // Extra sleep to let the thread finish writing its last batch
+                    std::thread::sleep(Duration::from_millis(5));
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                gc.state.wakeup.notify_all();
+                std::thread::sleep(Duration::from_micros(500));
+            }
+
+            // Safety net: drain anything still left (e.g. thread didn't finish in time)
+            let entries: Vec<GroupCommitEntry> = {
+                let mut queue = gc.state.queue.lock().unwrap();
+                std::mem::take(&mut *queue)
+            };
+            if !entries.is_empty() {
+                let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
+                for entry in entries {
+                    groups.entry(entry.partition).or_default().push(entry.record);
+                }
+                for (partition, records) in groups {
+                    if let Some(entry) = self.partitions.get(&partition) {
+                        let mut wal = entry.value().lock();
+                        let _ = wal.batch_append(records);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn recover(&self) -> Result<HashMap<PartitionId, Vec<WALRecord>>> {
+        // First, flush any in-flight group-commit entries so they're visible on disk
+        self.flush_group_commit_queue();
+
         let mut result = HashMap::new();
 
         for entry in self.partitions.iter() {
@@ -1683,7 +1725,8 @@ mod tests {
     #[test]
     fn test_wal_transaction_rollback() {
         let temp_dir = TempDir::new().unwrap();
-        let wal = WALManager::create(temp_dir.path(), 2).unwrap();
+        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let wal = WALManager::create_with_config(temp_dir.path(), 2, config).unwrap();
         
         // Begin transaction
         wal.log_begin(0, 1, 1).unwrap();
@@ -1698,7 +1741,7 @@ mod tests {
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 3);
-        
+
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
         assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }));
         assert!(matches!(records[2], WALRecord::Rollback { txn_id: 1 }));

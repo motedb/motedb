@@ -35,10 +35,9 @@ pub mod index_metadata;
 pub mod pk_cache;
 pub mod timeseries;
 pub mod write_controller;
-pub mod ttl_gc;
 
 // Re-export main types
-pub use core::{MoteDB, DatabaseStats, VectorIndexStats};
+pub use core::MoteDB;
 pub use mem_buffer::{IndexMemBuffer, BufferStats};
 pub use indexes::{QueryProfile, MemTableScanProfile};
 pub use transaction::TransactionStats;

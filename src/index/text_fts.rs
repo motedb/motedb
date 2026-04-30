@@ -1110,8 +1110,22 @@ impl TextFTSIndex {
         // LRU handles eviction automatically; no manual cleanup needed.
     }
     
-    /// Save metadata to disk
+    /// Save metadata to disk (prunes deleted_term_docs for fully-deleted docs)
     fn save_metadata(&self) -> Result<()> {
+        // Prune: remove deleted_term_docs entries whose doc is already in deleted_docs
+        {
+            let deleted_docs = self.deleted_docs.read();
+            if !deleted_docs.is_empty() {
+                let mut dtd = self.deleted_term_docs.write();
+                let before = dtd.len();
+                dtd.retain(|(_, doc_id)| !deleted_docs.contains(doc_id));
+                let pruned = before - dtd.len();
+                if pruned > 100 {
+                    debug_log!("[FTS] Pruned {} stale deleted_term_docs entries", pruned);
+                }
+            }
+        }
+
         let meta_path = self.storage_dir.join("index_meta.bin");
         let mut file = OpenOptions::new()
             .write(true)

@@ -17,13 +17,20 @@ pub fn row_to_sql_row(row: &Row, schema: &TableSchema) -> Result<SqlRow> {
 /// Convert SQL SqlRow (HashMap<String, Value>) to storage Row (Vec<Value>)
 pub fn sql_row_to_row(sql_row: &SqlRow, schema: &TableSchema) -> Result<Row> {
     let mut row = Vec::with_capacity(schema.columns.len());
-    
+
     for col_def in &schema.columns {
         let value = sql_row
             .get(&col_def.name)
             .cloned()
             .unwrap_or(Value::Null);
-        
+
+        // Enforce NOT NULL constraint (skip for AUTO_INCREMENT — system fills value)
+        if !col_def.nullable && !col_def.auto_increment && matches!(value, Value::Null) {
+            return Err(crate::error::MoteDBError::InvalidArgument(
+                format!("Column '{}' cannot be null", col_def.name)
+            ));
+        }
+
         // Type coercion for INSERT statements
         let coerced_value = match (&col_def.col_type, &value) {
             // Integer to Timestamp conversion
@@ -36,10 +43,10 @@ pub fn sql_row_to_row(sql_row: &SqlRow, schema: &TableSchema) -> Result<Row> {
             // Pass through
             _ => value,
         };
-        
+
         row.push(coerced_value);
     }
-    
+
     Ok(row)
 }
 

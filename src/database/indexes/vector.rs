@@ -76,16 +76,11 @@ impl MoteDB {
                 debug_log!("[create_vector_index] 🔍 使用scan_range扫描LSM（方案B高性能）...");
                 let start_time = std::time::Instant::now();
 
-                // 🚀 关键：计算该表的key范围
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                table_name.hash(&mut hasher);
-                let table_hash = hasher.finish() & 0xFFFFFFFF;
-
-                // composite_key格式: [table_hash:32位][row_id:32位]
-                let start_key = table_hash << 32;              // table的起始key
-                let end_key = (table_hash + 1) << 32;          // table的结束key
+                // 🚀 关键：计算该表的key范围 — 使用与 make_composite_key 一致的 sequential table_id
+                let table_id = self.table_registry.get_table_id(table_name)
+                    .unwrap_or(0) as u64;
+                let start_key = table_id << 32;
+                let end_key = (table_id + 1) << 32;
 
                 // 🚀 高性能：一次scan_range扫描所有数据
                 let mut vectors_to_index = Vec::new();
@@ -299,12 +294,11 @@ impl MoteDB {
             if let Ok(row_values) = crate::storage::row_format::decode_any(row_bytes) {
                 if let Some(Value::Vector(vec_data)) = row_values.get(col_position) {
                     if vec_data.len() == query.len() {
-                        // Compute L2 distance
+                        // Compute squared L2 distance (consistent with DiskANN SQ8 quantizer)
                         let distance: f32 = vec_data.iter()
                             .zip(query.iter())
                             .map(|(a, b)| (a - b).powi(2))
-                            .sum::<f32>()
-                            .sqrt();
+                            .sum::<f32>();
                         
                         memtable_results.push((row_id, distance));
                     }

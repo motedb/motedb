@@ -6,8 +6,7 @@ use crate::database::MoteDB;
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// ⚡ Compiled LIKE pattern for fast matching
 #[derive(Debug, Clone)]
@@ -155,23 +154,59 @@ pub struct ExprEvaluator {
     /// ⚡ Pattern cache: pattern string -> compiled pattern
     /// RwLock for concurrent read access (common case)
     pattern_cache: Arc<RwLock<HashMap<String, CompiledPattern>>>,
-    /// 🆕 Store the last AUTO_INCREMENT value inserted (shared with QueryExecutor)
-    pub(crate) last_insert_id: Rc<RefCell<Option<i64>>>,
+    /// Store the last AUTO_INCREMENT value inserted (AtomicI64, i64::MIN = None)
+    pub(crate) last_insert_id: AtomicI64,
+    /// Bind parameters for parameterized queries (?1, ?2, ...)
+    params: RwLock<Vec<Value>>,
 }
 
 impl ExprEvaluator {
     pub fn new() -> Self {
         Self {
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
-            last_insert_id: Rc::new(RefCell::new(None)),
+            last_insert_id: AtomicI64::new(i64::MIN),
+            params: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Convert days since Unix epoch to (year, month, day).
+    /// Uses the civil calendar algorithm (correct for all dates).
+    fn days_to_date(days_since_epoch: i64) -> (i64, i64, i64) {
+        // Shift from Unix epoch (1970-01-01) to Gregorian epoch (0000-03-01)
+        // The algorithm works with a year starting on March 1 to simplify leap year handling.
+        let z = days_since_epoch + 719468; // days from 0000-03-01 to 1970-01-01
+        let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+        let doe = z - era * 146097; // day of era [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+        let mp = (5 * doy + 2) / 153; // month index [0, 11] (March=0)
+        let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+        let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+        let y = if m <= 2 { y + 1 } else { y };
+        (y, m, d)
     }
 
     pub fn with_db(_db: Arc<MoteDB>) -> Self {
         Self {
             pattern_cache: Arc::new(RwLock::new(HashMap::new())),
-            last_insert_id: Rc::new(RefCell::new(None)),
+            last_insert_id: AtomicI64::new(i64::MIN),
+            params: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Set bind parameters for a parameterized query.
+    pub fn set_params(&self, params: Vec<Value>) {
+        *self.params.write().unwrap() = params;
+    }
+
+    pub fn get_params(&self) -> Vec<Value> {
+        self.params.read().unwrap().clone()
+    }
+
+    /// Clear bind parameters after execution.
+    pub fn clear_params(&self) {
+        self.params.write().unwrap().clear();
     }
     
     /// Evaluate an expression against a row
@@ -209,6 +244,21 @@ impl ExprEvaluator {
             }
             
             Expr::Literal(val) => Ok(val.clone()),
+
+            Expr::Parameter(idx) => {
+                let params = self.params.read().unwrap();
+                if *idx == 0 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "Unnamed ? parameter not resolved (internal error)".to_string()
+                    ));
+                }
+                let resolved_idx = idx - 1;  // ?1 → index 0, ?2 → index 1
+                params.get(resolved_idx).cloned().ok_or_else(|| {
+                    MoteDBError::InvalidArgument(format!(
+                        "Parameter ?{} not bound ({} parameters provided)", idx, params.len()
+                    ))
+                })
+            }
             
             Expr::BinaryOp { left, op, right } => {
                 let left_val = self.eval(left, row)?;
@@ -227,13 +277,14 @@ impl ExprEvaluator {
             
             Expr::In { expr, list, negated } => {
                 let val = self.eval(expr, row)?;
+
+                // SQL NULL semantics: NULL IN (...) returns NULL (unknown)
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Bool(false)); // NULL rows excluded from WHERE
+                }
+
                 let mut found = false;
-                
-                // Handle subquery IN: expr IN (SELECT ...)
-                // If list contains a single Subquery, it needs special handling
-                // But we can't execute subqueries here - they're handled by executor
-                // So we'll just evaluate literal lists here
-                
+
                 for item in list {
                     let item_val = self.eval(item, row)?;
                     if val == item_val {
@@ -248,7 +299,13 @@ impl ExprEvaluator {
                 let val = self.eval(expr, row)?;
                 let low_val = self.eval(low, row)?;
                 let high_val = self.eval(high, row)?;
-                
+
+                // SQL NULL semantics: if any operand is NULL, exclude the row
+                // This correctly handles NOT BETWEEN too (returns false, not true)
+                if matches!(val, Value::Null) || matches!(low_val, Value::Null) || matches!(high_val, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+
                 let in_range = val >= low_val && val <= high_val;
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
@@ -391,8 +448,8 @@ impl ExprEvaluator {
                 if !args.is_empty() {
                     return Err(MoteDBError::InvalidArgument("last_insert_id() takes no arguments".to_string()));
                 }
-                let last_id = *self.last_insert_id.borrow();
-                Ok(Value::Integer(last_id.unwrap_or(0)))
+                let v = self.last_insert_id.load(Ordering::Relaxed);
+                Ok(Value::Integer(if v == i64::MIN { 0 } else { v }))
             }
             
             // Aggregate functions (will be handled by executor for now)
@@ -431,7 +488,7 @@ impl ExprEvaluator {
                 }
                 let val = self.eval(&args[0], row)?;
                 if let Value::Text(s) = val {
-                    Ok(Value::Integer(s.len() as i64))
+                    Ok(Value::Integer(s.chars().count() as i64))
                 } else {
                     Err(MoteDBError::TypeError("length() requires text argument".to_string()))
                 }
@@ -451,7 +508,7 @@ impl ExprEvaluator {
                         Value::Integer(i) => { use std::fmt::Write; let _ = write!(result, "{}", i); }
                         Value::Float(f) => { use std::fmt::Write; let _ = write!(result, "{}", f); }
                         Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                        Value::Null => result.push_str("NULL"),
+                        Value::Null => return Ok(Value::Null),
                         _ => { use std::fmt::Write; let _ = write!(result, "{:?}", val); }
                     };
                 }
@@ -712,7 +769,7 @@ impl ExprEvaluator {
                 Ok(Value::Float(val.exp()))
             }
             
-            "ln" | "log" => {
+            "ln" => {
                 if args.len() != 1 {
                     return Err(MoteDBError::InvalidArgument("ln() takes 1 argument".to_string()));
                 }
@@ -722,14 +779,14 @@ impl ExprEvaluator {
                 }
                 Ok(Value::Float(val.ln()))
             }
-            
-            "log10" => {
+
+            "log" | "log10" => {
                 if args.len() != 1 {
-                    return Err(MoteDBError::InvalidArgument("log10() takes 1 argument".to_string()));
+                    return Err(MoteDBError::InvalidArgument("log() takes 1 argument".to_string()));
                 }
                 let val = self.to_float(&self.eval(&args[0], row)?)?;
                 if val <= 0.0 {
-                    return Err(MoteDBError::InvalidArgument("log10() of non-positive number".to_string()));
+                    return Err(MoteDBError::InvalidArgument("log() of non-positive number".to_string()));
                 }
                 Ok(Value::Float(val.log10()))
             }
@@ -1002,57 +1059,42 @@ impl ExprEvaluator {
             
             // 🆕 P1 Date/Time extraction functions
             "year" => {
-                // YEAR(timestamp) - extract year
                 if args.len() != 1 {
                     return Err(MoteDBError::InvalidArgument("YEAR() takes 1 argument".to_string()));
                 }
                 let val = self.eval(&args[0], row)?;
                 match val {
                     Value::Timestamp(ts) => {
-                        // Convert microseconds to seconds for chrono-like calculation
-                        let secs = ts.as_micros() / 1_000_000;
-                        // Days since epoch: divide by seconds per day (86400)
-                        let days = secs / 86400;
-                        // Approximate year: 1970 + days/365.25
-                        let year = 1970 + (days as f64 / 365.25) as i64;
-                        Ok(Value::Integer(year))
+                        let (y, _, _) = Self::days_to_date(ts.as_micros() / 1_000_000 / 86400);
+                        Ok(Value::Integer(y))
                     }
                     _ => Err(MoteDBError::TypeError("YEAR() requires timestamp argument".to_string())),
                 }
             }
-            
+
             "month" => {
-                // MONTH(timestamp) - extract month (1-12)
                 if args.len() != 1 {
                     return Err(MoteDBError::InvalidArgument("MONTH() takes 1 argument".to_string()));
                 }
                 let val = self.eval(&args[0], row)?;
                 match val {
                     Value::Timestamp(ts) => {
-                        let secs = ts.as_micros() / 1_000_000;
-                        let days = secs / 86400;
-                        // Simplified month calculation (approximate)
-                        let days_in_year = days % 365;
-                        let month = ((days_in_year / 30) + 1).min(12);
-                        Ok(Value::Integer(month))
+                        let (_, m, _) = Self::days_to_date(ts.as_micros() / 1_000_000 / 86400);
+                        Ok(Value::Integer(m))
                     }
                     _ => Err(MoteDBError::TypeError("MONTH() requires timestamp argument".to_string())),
                 }
             }
-            
+
             "day" | "day_of_month" => {
-                // DAY(timestamp) - extract day of month (1-31)
                 if args.len() != 1 {
                     return Err(MoteDBError::InvalidArgument("DAY() takes 1 argument".to_string()));
                 }
                 let val = self.eval(&args[0], row)?;
                 match val {
                     Value::Timestamp(ts) => {
-                        let secs = ts.as_micros() / 1_000_000;
-                        let days = secs / 86400;
-                        // Day within month (approximation)
-                        let day = (days % 30) + 1;
-                        Ok(Value::Integer(day))
+                        let (_, _, d) = Self::days_to_date(ts.as_micros() / 1_000_000 / 86400);
+                        Ok(Value::Integer(d))
                     }
                     _ => Err(MoteDBError::TypeError("DAY() requires timestamp argument".to_string())),
                 }
@@ -1218,7 +1260,15 @@ impl ExprEvaluator {
                     "INTEGER" | "INT" => {
                         match val {
                             Value::Integer(i) => Ok(Value::Integer(i)),
-                            Value::Float(f) => Ok(Value::Integer(f as i64)),
+                            Value::Float(f) => {
+                                // Check for overflow: f64 as i64 is UB for out-of-range values
+                                if f >= i64::MAX as f64 || f <= i64::MIN as f64 {
+                                    return Err(MoteDBError::TypeError(
+                                        format!("Float {} overflows INTEGER range", f)
+                                    ));
+                                }
+                                Ok(Value::Integer(f as i64))
+                            }
                             Value::Text(s) => s.parse::<i64>()
                                 .map(Value::Integer)
                                 .map_err(|_| MoteDBError::TypeError("Cannot parse integer".to_string())),
@@ -1432,7 +1482,7 @@ impl ExprEvaluator {
             return Ok(Value::Float(1.0)); // Maximum distance for zero vectors
         }
         
-        let cosine_sim = dot / (norm1 * norm2);
+        let cosine_sim = (dot / (norm1 * norm2)).clamp(-1.0, 1.0);
         let dist = 1.0 - cosine_sim; // Range: [0, 2]
         
         Ok(Value::Float(dist as f64))
@@ -1483,42 +1533,46 @@ impl ExprEvaluator {
     /// ST_Distance: Compute 3D Euclidean distance between two spatial points
     fn st_distance(&self, p1: Value, p2: Value) -> Result<Value> {
         use crate::types::Geometry;
-        
-        let point1 = match p1 {
-            Value::Spatial(Geometry::Point(p)) => p,
+
+        let (x1, y1) = match p1 {
+            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
+            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
             _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
         };
-        
-        let point2 = match p2 {
-            Value::Spatial(Geometry::Point(p)) => p,
+
+        let (x2, y2) = match p2 {
+            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
+            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
             _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
         };
-        
-        let dist = ((point1.x - point2.x).powi(2) + (point1.y - point2.y).powi(2)).sqrt();
+
+        let dist = ((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt();
         Ok(Value::Float(dist))
     }
-    
+
     /// WITHIN_RADIUS: Check if a point is within radius of a center point
     fn within_radius(&self, point: Value, center: Value, radius: Value) -> Result<Value> {
         use crate::types::Geometry;
-        
-        let p = match point {
-            Value::Spatial(Geometry::Point(p)) => p,
+
+        let (px, py) = match point {
+            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
+            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
             _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires spatial point for first argument".to_string())),
         };
-        
-        let c = match center {
-            Value::Spatial(Geometry::Point(c)) => c,
+
+        let (cx, cy) = match center {
+            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
+            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
             _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires spatial point for center".to_string())),
         };
-        
+
         let r = match radius {
             Value::Float(r) => r,
             Value::Integer(i) => i as f64,
             _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires numeric radius".to_string())),
         };
-        
-        let dist = ((p.x - c.x).powi(2) + (p.y - c.y).powi(2)).sqrt();
+
+        let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
         Ok(Value::Bool(dist <= r))
     }
     

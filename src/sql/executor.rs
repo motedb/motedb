@@ -8,8 +8,7 @@ use crate::{StorageError};
 use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId, Row};
 use crate::storage::row_format;
 use std::sync::Arc;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Mutex;
 
 fn decode_row(data: &[u8], schema: &TableSchema) -> crate::Result<Row> {
     row_format::decode(data, schema.col_types())
@@ -57,24 +56,7 @@ impl QueryResult {
             _ => None,
         }
     }
-    
-    /// Get rows as maps (column_name -> value)
-    /// Returns empty vec if not a SELECT result
-    pub fn rows_as_maps(&self) -> Vec<std::collections::HashMap<String, Value>> {
-        match self {
-            QueryResult::Select { columns, rows } => {
-                rows.iter().map(|row| {
-                    columns.iter()
-                        .zip(row.iter())
-                        .map(|(col, val)| (col.clone(), val.clone()))
-                        .collect()
-                }).collect()
-            }
-            _ => vec![],
-        }
-    }
-    
-    /// Get row count for SELECT results
+
     pub fn row_count(&self) -> usize {
         match self {
             QueryResult::Select { rows, .. } => rows.len(),
@@ -83,6 +65,8 @@ impl QueryResult {
         }
     }
 }
+
+
 
 /// 🚀 流式查询结果（方案 C：零内存开销）
 /// 
@@ -111,12 +95,18 @@ pub enum StreamingQueryResult {
         /// 🔧 DISTINCT 标志（在 materialize() 时应用）
         distinct: bool,
     },
-    
+
+    /// 🚀 Pre-materialized SELECT result (zero-overhead for fast PK paths)
+    SelectReady {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
+
     /// INSERT/UPDATE/DELETE result
     Modification {
         affected_rows: usize,
     },
-    
+
     /// CREATE/DROP result
     Definition {
         message: String,
@@ -142,25 +132,28 @@ impl StreamingQueryResult {
     /// - `size_hint`: 预估的结果行数（来自优化器统计信息）
     pub fn materialize_with_hint(self, size_hint: Option<usize>) -> Result<QueryResult> {
         match self {
+            Self::SelectReady { columns, rows } => {
+                Ok(QueryResult::Select { columns, rows })
+            }
             Self::SelectStreaming { columns, rows, order_by, limit, offset, distinct } => {
                 // 🔧 Step 1: 收集所有行
                 let estimated_size = size_hint.unwrap_or(1024);
                 let mut materialized_rows = Vec::with_capacity(estimated_size);
-                
+
                 for row_result in rows {
                     materialized_rows.push(row_result?);
                 }
-                
+
                 // 🔧 Step 2: 应用 ORDER BY
                 if let Some(order_clauses) = order_by {
                     Self::apply_order_by(&mut materialized_rows, &columns, &order_clauses)?;
                 }
-                
+
                 // 🔧 Step 3: 应用 DISTINCT
                 if distinct {
                     materialized_rows = Self::apply_distinct(materialized_rows);
                 }
-                
+
                 // 🔧 Step 4: 应用 OFFSET 和 LIMIT
                 let offset_val = offset.unwrap_or(0);
                 let final_rows: Vec<Vec<Value>> = materialized_rows
@@ -168,7 +161,7 @@ impl StreamingQueryResult {
                     .skip(offset_val)
                     .take(limit.unwrap_or(usize::MAX))
                     .collect();
-                
+
                 Ok(QueryResult::Select {
                     columns,
                     rows: final_rows,
@@ -184,30 +177,7 @@ impl StreamingQueryResult {
     }
     
     /// 便利方法：逐行处理（零内存开销）
-    /// 
-    /// # 示例
-    /// ```ignore
-    /// result.for_each(|columns, row| {
-    ///     println!("{}: {}", columns[0], row[0]);
-    ///     Ok(())
-    /// })?;
-    /// ```
-    pub fn for_each<F>(self, mut f: F) -> Result<()>
-    where
-        F: FnMut(&[String], &[Value]) -> Result<()>,
-    {
-        match self {
-            Self::SelectStreaming { columns, rows, .. } => {
-                for row_result in rows {
-                    let row = row_result?;
-                    f(&columns, &row)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    
+
     /// 获取影响行数
     pub fn affected_rows(&self) -> usize {
         match self {
@@ -215,11 +185,12 @@ impl StreamingQueryResult {
             _ => 0,
         }
     }
-    
+
     /// 获取列名（仅 SELECT）
     pub fn columns(&self) -> Option<&[String]> {
         match self {
             Self::SelectStreaming { columns, .. } => Some(columns),
+            Self::SelectReady { columns, .. } => Some(columns),
             _ => None,
         }
     }
@@ -312,23 +283,36 @@ impl StreamingQueryResult {
 pub struct QueryExecutor {
     db: Arc<MoteDB>,
     evaluator: ExprEvaluator,
-    optimizer: RefCell<super::optimizer::QueryOptimizer>,
-    /// Store the last AUTO_INCREMENT value inserted (shared with evaluator)
-    last_insert_id: Rc<RefCell<Option<i64>>>,
+    optimizer: Mutex<super::optimizer::QueryOptimizer>,
+    /// Store the last AUTO_INCREMENT value inserted (mirrors evaluator)
+    last_insert_id: std::sync::atomic::AtomicI64,
 }
 
 impl QueryExecutor {
     pub fn new(db: Arc<MoteDB>) -> Self {
-        let last_insert_id = Rc::new(RefCell::new(None));
-        let mut evaluator = ExprEvaluator::with_db(db.clone());
-        evaluator.last_insert_id = Rc::clone(&last_insert_id);
-        
         Self {
-            evaluator,
-            optimizer: RefCell::new(super::optimizer::QueryOptimizer::new(db.clone())),
-            last_insert_id,
+            evaluator: ExprEvaluator::with_db(db.clone()),
+            optimizer: Mutex::new(super::optimizer::QueryOptimizer::new(db.clone())),
+            last_insert_id: std::sync::atomic::AtomicI64::new(i64::MIN),
             db,
         }
+    }
+
+    /// Reset per-query state. Called before each execute.
+    pub fn reset_last_insert_id(&self) {
+        self.last_insert_id.store(i64::MIN, std::sync::atomic::Ordering::Relaxed);
+        self.evaluator.last_insert_id.store(i64::MIN, std::sync::atomic::Ordering::Relaxed);
+        self.evaluator.clear_params();
+    }
+
+    /// Bind parameters for a parameterized query.
+    pub fn bind_params(&self, params: Vec<Value>) {
+        self.evaluator.set_params(params);
+    }
+
+    /// Clear bind parameters after execution.
+    pub fn clear_params(&self) {
+        self.evaluator.clear_params();
     }
     
     pub fn execute(&self, stmt: Statement) -> Result<QueryResult> {
@@ -631,9 +615,24 @@ impl QueryExecutor {
             }
         }
 
-        let plan = self.optimizer.borrow_mut().optimize_select(stmt)?;
+        // 🚀 Pass bind parameters to optimizer (resolves ? inline, no AST clone needed).
+        let has_params = Self::contains_parameter_stmt(stmt);
+        if has_params {
+            let params = self.evaluator.get_params();
+            if let Some(err) = Self::validate_params_bound(stmt, &params) {
+                return Err(err);
+            }
+            self.optimizer.lock().unwrap().set_params(params);
+        }
 
-        // 根据执行计划选择流式扫描方法
+        let plan = self.optimizer.lock().unwrap().optimize_select(stmt)?;
+
+        if has_params {
+            self.optimizer.lock().unwrap().clear_params();
+        }
+
+        // For PointQuery/RangeQuery, the plan already has resolved values — use original stmt.
+        // For FullScan, WHERE still contains Parameter nodes — substitute needed.
         match plan.scan_method {
             super::optimizer::ScanMethod::PointQuery { ref table, ref column, ref value } => {
                 self.execute_point_query_streaming(stmt, table, column, value)
@@ -641,10 +640,16 @@ impl QueryExecutor {
             super::optimizer::ScanMethod::RangeQuery { ref table, ref column, ref start, start_inclusive, ref end, end_inclusive } => {
                 self.execute_range_query_streaming(stmt, table, column, start, start_inclusive, end, end_inclusive)
             }
+            super::optimizer::ScanMethod::FullScan { .. } if has_params => {
+                // FullScan with params: need to substitute WHERE for correct evaluation
+                let resolved = self.substitute_params_stmt(stmt)?;
+                self.execute_full_scan_streaming(&resolved, plan.scan_method.table_name())
+            }
             super::optimizer::ScanMethod::FullScan { ref table } => {
                 self.execute_full_scan_streaming(stmt, table)
             }
             _ => {
+                // Fallback to materialized path (handles params via eval())
                 let result = self.execute_select_internal(stmt)?;
                 match result {
                     QueryResult::Select { columns, rows } => {
@@ -730,7 +735,7 @@ impl QueryExecutor {
             let row_id = self.resolve_pk_with_cache(table, &pk_key, column, value)?;
 
             if let Some(rid) = row_id {
-                let row = self.db.get_table_row(table, rid)?;
+                let row = self.db.get_table_row_with_schema(table, rid, &schema)?;
                 let result_rows: Vec<Result<Vec<Value>>> = match row {
                     Some(row) => {
                         let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
@@ -776,7 +781,7 @@ impl QueryExecutor {
                 }
             };
 
-            let row = self.db.get_table_row(table, row_id)?;
+            let row = self.db.get_table_row_with_schema(table, row_id, &schema)?;
             let result_rows: Vec<Result<Vec<Value>>> = match row {
                 Some(row) => {
                     let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
@@ -797,48 +802,73 @@ impl QueryExecutor {
 
         // Fallback: use column index
         let row_ids = self.db.query_by_column(table, column, value)?;
-        
-        // 流式读取行数据
-        let db = self.db.clone();
-        let table_name = table.to_string();
-        let schema_clone = schema.clone();
-        let select_cols = stmt.columns.clone();
-        let columns_clone = columns.clone();
-        
-        let rows_iter = row_ids.into_iter().filter_map(move |row_id| {
-            // 构造组合键
-            let composite_key = db.make_composite_key(&table_name, row_id);
-            
-            // 读取行数据
-            match db.lsm_engine.get(composite_key) {
-                Ok(Some(value_data)) if !value_data.deleted => {
-                    // 反序列化行
-                    let data = match &value_data.data {
-                        crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                        _ => return Some(Err(StorageError::InvalidData("Unexpected blob".into()))),
-                    };
-                    
-                    match decode_row(data, &schema_clone) {
-                        Ok(row) => {
-                            match row_to_sql_row(&row, &schema_clone) {
-                                Ok(sql_row) => {
-                                    let projected = Self::project_row_static(&sql_row, &select_cols, &columns_clone, &schema_clone);
-                                    Some(Ok(projected))
-                                }
-                                Err(e) => Some(Err(e)),
-                            }
-                        }
-                        Err(e) => Some(Err(StorageError::InvalidData(format!("Deserialization failed: {}", e)))),
-                    }
+
+        if row_ids.is_empty() {
+            return Ok(StreamingQueryResult::SelectStreaming {
+                columns,
+                rows: Box::new(std::iter::empty()),
+                order_by: stmt.order_by.clone(),
+                limit: stmt.limit,
+                offset: stmt.offset,
+                distinct: stmt.distinct,
+            });
+        }
+
+        // Sort row_ids and choose optimal fetch strategy
+        let mut sorted_ids = row_ids;
+        sorted_ids.sort_unstable();
+        let min_id = sorted_ids[0];
+        let max_id = *sorted_ids.last().unwrap();
+        let density = sorted_ids.len() as f64 / (max_id - min_id + 1) as f64;
+
+        let result_rows: Vec<Result<Vec<Value>>> = if density > 0.1 {
+            // Dense result set: single range scan (sequential I/O >> random I/O)
+            let id_set: std::collections::HashSet<u64> =
+                sorted_ids.into_iter().map(|id| id as u64).collect();
+            let start_key = self.db.make_composite_key(table, min_id);
+            let end_key = self.db.make_composite_key(table, max_id + 1);
+            let schema_c = schema.clone();
+            let sel_c = stmt.columns.clone();
+            let col_c = columns.clone();
+
+            let lsm_rows = self.db.lsm_engine.scan_range(start_key, end_key)
+                .unwrap_or_default();
+
+            lsm_rows.into_iter().filter_map(move |(key, vd)| {
+                let rid = (key & 0xFFFFFFFF) as RowId;
+                if !id_set.contains(&(rid as u64)) || vd.deleted {
+                    return None;
                 }
-                Ok(_) => None, // Deleted or not found
-                Err(e) => Some(Err(e)),
-            }
-        });
-        
+                let data = match &vd.data {
+                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                    _ => return None,
+                };
+                decode_row(data, &schema_c)
+                    .ok()
+                    .map(|row| Ok(Self::project_row_direct(&row, &sel_c, &col_c, &schema_c)))
+            }).collect()
+        } else {
+            // Sparse result set: individual LSM gets
+            sorted_ids.into_iter().filter_map(|row_id| {
+                let key = self.db.make_composite_key(table, row_id);
+                match self.db.lsm_engine.get(key) {
+                    Ok(Some(vd)) if !vd.deleted => {
+                        let data = match &vd.data {
+                            crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                            _ => return None,
+                        };
+                        decode_row(data, &schema)
+                            .ok()
+                            .map(|row| Ok(Self::project_row_direct(&row, &stmt.columns, &columns, &schema)))
+                    }
+                    _ => None,
+                }
+            }).collect()
+        };
+
         Ok(StreamingQueryResult::SelectStreaming {
             columns,
-            rows: Box::new(rows_iter),
+            rows: Box::new(result_rows.into_iter()),
             order_by: stmt.order_by.clone(),
             limit: stmt.limit,
             offset: stmt.offset,
@@ -872,7 +902,8 @@ impl QueryExecutor {
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
         
         // 🚀 优化路径1：主键范围查询使用 LSM range scan（顺序扫描）
-        if column == "id" && schema.primary_key().map(|pk| pk == "id").unwrap_or(false) {
+        let pk_col = schema.primary_key().unwrap_or("id");
+        if column == pk_col {
             return self.execute_primary_key_range_streaming(stmt, table, start, start_inclusive, end, end_inclusive);
         }
         
@@ -924,13 +955,8 @@ impl QueryExecutor {
                         
                         match decode_row(data, &schema_clone) {
                             Ok(row) => {
-                                match row_to_sql_row(&row, &schema_clone) {
-                                    Ok(sql_row) => {
-                                        let projected = Self::project_row_static(&sql_row, &select_cols, &columns_clone, &schema_clone);
-                                        processed.push(Ok(projected));
-                                    }
-                                    Err(e) => processed.push(Err(e)),
-                                }
+                                let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
+                                processed.push(Ok(projected));
                             }
                             Err(e) => processed.push(Err(StorageError::InvalidData(format!("Deserialization failed: {}", e)))),
                         }
@@ -1021,13 +1047,8 @@ impl QueryExecutor {
 
             match decode_row(data, &schema_clone) {
                 Ok(row) => {
-                    match row_to_sql_row(&row, &schema_clone) {
-                        Ok(sql_row) => {
-                            let projected = Self::project_row_static(&sql_row, &select_cols, &columns_clone, &schema_clone);
-                            Ok(projected)
-                        }
-                        Err(e) => Err(e),
-                    }
+                    let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
+                    Ok(projected)
                 }
                 Err(e) => Err(StorageError::InvalidData(format!("Deserialization failed: {}", e))),
             }
@@ -1047,47 +1068,80 @@ impl QueryExecutor {
     fn execute_full_scan_streaming(&self, stmt: &SelectStmt, table: &str) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
-        
-        // 获取流式迭代器
+
         let row_iter = self.db.scan_table_rows_streaming(table)?;
-        
-        // Clone what we need for the closure
+
         let where_clause = stmt.where_clause.clone();
         let _db = self.db.clone();
         let schema_clone = schema.clone();
         let columns_clone = columns.clone();
         let select_cols = stmt.columns.clone();
-        let table_clone = table.to_string();  // 🔧 Clone table name for metadata
+        let table_clone = table.to_string();
 
-        // 惰性过滤和投影
+        // Check if WHERE can be evaluated positionally (bypasses HashMap)
+        let use_positional = where_clause.as_ref().is_none_or(Self::can_eval_positional);
+        // Metadata columns (__row_id__, __table__) are only needed for JOINs.
+        // SELECT * is handled by project_row_direct without HashMap.
+        let needs_metadata = select_cols.iter().any(|c| matches!(c,
+            SelectColumn::Expr(_, _)
+        )) || columns.iter().any(|c| c.starts_with("__"));
+
+        if use_positional && !needs_metadata {
+            // Fast path: no HashMap at all
+            let filtered_iter = row_iter.filter_map(move |result| {
+                match result {
+                    Ok((_row_id, row)) => {
+                        // WHERE filter using positional evaluation
+                        if let Some(ref clause) = where_clause {
+                            let matches = match Self::eval_expr_on_row(clause, &row, &schema_clone) {
+                                Ok(Value::Bool(b)) => b,
+                                Ok(Value::Integer(i)) => i != 0,
+                                Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                                _ => false,
+                            };
+                            if !matches { return None; }
+                        }
+
+                        // Direct projection from Vec<Value>
+                        let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
+                        Some(Ok(projected))
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            });
+
+            return Ok(StreamingQueryResult::SelectStreaming {
+                columns,
+                rows: Box::new(filtered_iter),
+                order_by: stmt.order_by.clone(),
+                limit: stmt.limit,
+                offset: stmt.offset,
+                distinct: stmt.distinct,
+            });
+        }
+
+        // Fallback: HashMap path for complex expressions / metadata columns
         let filtered_iter = row_iter.filter_map(move |result| {
             match result {
-                Ok((row_id, row)) => {  // 🔧 Don't ignore row_id
+                Ok((row_id, row)) => {
                     let mut sql_row = match row_to_sql_row(&row, &schema_clone) {
                         Ok(r) => r,
                         Err(e) => return Some(Err(e)),
                     };
 
-                    // 🔧 Add metadata fields for MATCH, ST_DISTANCE, etc.
                     sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
                     sql_row.insert("__table__".to_string(), Value::Text(table_clone.clone()));
 
-                    // WHERE 过滤
                     if let Some(ref clause) = where_clause {
-                        // 🚀 Inline evaluation for simple expressions (no per-row allocation)
                         let matches = match Self::eval_expr_simple(clause, &sql_row) {
                             Ok(Value::Bool(b)) => b,
                             Ok(Value::Integer(i)) => i != 0,
                             Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
                             _ => false,
                         };
-
-                        if !matches {
-                            return None;
-                        }
+                        if !matches { return None; }
                     }
 
-                    // 投影列
                     let projected = Self::project_row_static(&sql_row, &select_cols, &columns_clone, &schema_clone);
                     Some(Ok(projected))
                 }
@@ -1138,6 +1192,317 @@ impl QueryExecutor {
         }
     }
 
+    /// Simple LIKE pattern matching: % = any sequence, _ = single char
+    fn simple_like_match(text: &str, pattern: &str) -> bool {
+        let t: Vec<char> = text.chars().collect();
+        let p: Vec<char> = pattern.chars().collect();
+        let mut dp = vec![vec![false; p.len() + 1]; t.len() + 1];
+        dp[0][0] = true;
+        for j in 1..=p.len() {
+            if p[j - 1] == '%' { dp[0][j] = dp[0][j - 1]; }
+        }
+        for i in 1..=t.len() {
+            for j in 1..=p.len() {
+                if p[j - 1] == '%' {
+                    dp[i][j] = dp[i][j - 1] || dp[i - 1][j];
+                } else if p[j - 1] == '_' || p[j - 1] == t[i - 1] {
+                    dp[i][j] = dp[i - 1][j - 1];
+                }
+            }
+        }
+        dp[t.len()][p.len()]
+    }
+
+    fn positional_add(l: &Value, r: &Value) -> Result<Value> {
+        match (l, r) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_add(*b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+            (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
+            (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a + *b as f64)),
+            _ => Ok(Value::Null),
+        }
+    }
+    fn positional_sub(l: &Value, r: &Value) -> Result<Value> {
+        match (l, r) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_sub(*b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
+            (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
+            (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a - *b as f64)),
+            _ => Ok(Value::Null),
+        }
+    }
+    fn positional_mul(l: &Value, r: &Value) -> Result<Value> {
+        match (l, r) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_mul(*b))),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
+            (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
+            (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a * *b as f64)),
+            _ => Ok(Value::Null),
+        }
+    }
+    fn positional_div(l: &Value, r: &Value) -> Result<Value> {
+        match (l, r) {
+            (Value::Integer(a), Value::Integer(b)) => {
+                if *b == 0 { return Err(MoteDBError::DivisionByZero); }
+                Ok(Value::Integer(a / b))
+            }
+            (Value::Float(a), Value::Float(b)) => {
+                if *b == 0.0 { return Err(MoteDBError::DivisionByZero); }
+                Ok(Value::Float(a / b))
+            }
+            (Value::Integer(a), Value::Float(b)) => {
+                if *b == 0.0 { return Err(MoteDBError::DivisionByZero); }
+                Ok(Value::Float(*a as f64 / b))
+            }
+            (Value::Float(a), Value::Integer(b)) => {
+                if *b == 0 { return Err(MoteDBError::DivisionByZero); }
+                Ok(Value::Float(a / *b as f64))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+    fn positional_mod(l: &Value, r: &Value) -> Result<Value> {
+        match (l, r) {
+            (Value::Integer(a), Value::Integer(b)) => {
+                if *b == 0 { return Err(MoteDBError::DivisionByZero); }
+                Ok(Value::Integer(a % b))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn extract_f32_slice(v: &Value) -> Option<Vec<f32>> {
+        match v {
+            Value::Vector(vec) => Some(vec.iter().copied().collect()),
+            _ => None,
+        }
+    }
+
+    fn positional_vector_l2(l: &Value, r: &Value) -> Result<Value> {
+        let v1 = Self::extract_f32_slice(l);
+        let v2 = Self::extract_f32_slice(r);
+        match (v1, v2) {
+            (Some(a), Some(b)) => {
+                if a.len() != b.len() {
+                    return Err(MoteDBError::TypeError(format!(
+                        "Vector dimension mismatch: {} vs {}", a.len(), b.len()
+                    )));
+                }
+                let dist: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+                Ok(Value::Float(dist as f64))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn positional_vector_cosine(l: &Value, r: &Value) -> Result<Value> {
+        let v1 = Self::extract_f32_slice(l);
+        let v2 = Self::extract_f32_slice(r);
+        match (v1, v2) {
+            (Some(a), Some(b)) => {
+                if a.len() != b.len() {
+                    return Err(MoteDBError::TypeError(format!(
+                        "Vector dimension mismatch: {} vs {}", a.len(), b.len()
+                    )));
+                }
+                let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                let n1: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let n2: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if n1 == 0.0 || n2 == 0.0 { return Ok(Value::Float(1.0)); }
+                let sim = (dot / (n1 * n2)).clamp(-1.0, 1.0);
+                Ok(Value::Float((1.0 - sim) as f64))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    fn positional_vector_dot(l: &Value, r: &Value) -> Result<Value> {
+        let v1 = Self::extract_f32_slice(l);
+        let v2 = Self::extract_f32_slice(r);
+        match (v1, v2) {
+            (Some(a), Some(b)) => {
+                if a.len() != b.len() {
+                    return Err(MoteDBError::TypeError(format!(
+                        "Vector dimension mismatch: {} vs {}", a.len(), b.len()
+                    )));
+                }
+                let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                Ok(Value::Float(dot as f64))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    /// Evaluate function calls in the positional (no-HashMap) path.
+    fn eval_function_positional(name: &str, args: &[Expr], row: &[Value], schema: &TableSchema) -> Result<Value> {
+        let fname = name.to_lowercase();
+        match fname.as_str() {
+            "concat" => {
+                let mut result = String::new();
+                for arg in args {
+                    match Self::eval_expr_on_row(arg, row, schema)? {
+                        Value::Text(s) => result.push_str(&s),
+                        Value::Integer(i) => { use std::fmt::Write; let _ = write!(result, "{}", i); }
+                        Value::Float(f) => { use std::fmt::Write; let _ = write!(result, "{}", f); }
+                        Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
+                        Value::Null => return Ok(Value::Null),
+                        other => result.push_str(&format!("{:?}", other)),
+                    }
+                }
+                Ok(Value::Text(result))
+            }
+            "upper" | "lower" | "length" | "trim" | "ltrim" | "rtrim" => {
+                let val = Self::eval_expr_on_row(&args[0], row, schema)?;
+                match val {
+                    Value::Text(s) => match fname.as_str() {
+                        "upper" => Ok(Value::Text(s.to_uppercase())),
+                        "lower" => Ok(Value::Text(s.to_lowercase())),
+                        "length" => Ok(Value::Integer(s.chars().count() as i64)),
+                        "trim" => Ok(Value::Text(s.trim().to_string())),
+                        "ltrim" => Ok(Value::Text(s.trim_start().to_string())),
+                        "rtrim" => Ok(Value::Text(s.trim_end().to_string())),
+                        _ => Ok(Value::Text(s)),
+                    },
+                    _ => Ok(Value::Null),
+                }
+            }
+            "abs" | "round" | "floor" | "ceil" | "log" | "ln" | "log10" | "sqrt" | "exp" => {
+                let val = Self::eval_expr_on_row(&args[0], row, schema)?;
+                match val {
+                    Value::Integer(i) => match fname.as_str() {
+                        "abs" => Ok(Value::Integer(i.abs())),
+                        _ => {
+                            let f = i as f64;
+                            Ok(Value::Float(match fname.as_str() {
+                                "round" => f.round(),
+                                "floor" => f.floor(),
+                                "ceil" => f.ceil(),
+                                "log" | "log10" => f.log10(),
+                                "ln" => f.ln(),
+                                "sqrt" => f.sqrt(),
+                                "exp" => f.exp(),
+                                _ => f,
+                            }))
+                        }
+                    },
+                    Value::Float(f) => match fname.as_str() {
+                        "abs" => Ok(Value::Float(f.abs())),
+                        "round" => Ok(Value::Float(f.round())),
+                        "floor" => Ok(Value::Float(f.floor())),
+                        "ceil" => Ok(Value::Float(f.ceil())),
+                        "log" | "log10" => Ok(Value::Float(f.log10())),
+                        "ln" => Ok(Value::Float(f.ln())),
+                        "sqrt" => Ok(Value::Float(f.sqrt())),
+                        "exp" => Ok(Value::Float(f.exp())),
+                        _ => Ok(Value::Float(f)),
+                    },
+                    _ => Ok(Value::Null),
+                }
+            }
+            "coalesce" => {
+                for arg in args {
+                    let val = Self::eval_expr_on_row(arg, row, schema)?;
+                    if !matches!(val, Value::Null) {
+                        return Ok(val);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            "if" => {
+                if args.len() >= 3 {
+                    let cond = Self::eval_expr_on_row(&args[0], row, schema)?;
+                    if Self::is_truthy(&cond) {
+                        Self::eval_expr_on_row(&args[1], row, schema)
+                    } else {
+                        Self::eval_expr_on_row(&args[2], row, schema)
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "within_radius" => {
+                if args.len() != 3 {
+                    return Err(MoteDBError::InvalidArgument("WITHIN_RADIUS() takes 3 arguments".to_string()));
+                }
+                let point = Self::eval_expr_on_row(&args[0], row, schema)?;
+                let center = Self::eval_expr_on_row(&args[1], row, schema)?;
+                let radius = Self::eval_expr_on_row(&args[2], row, schema)?;
+
+                use crate::types::Geometry;
+                let (px, py) = match point {
+                    Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
+                    Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let (cx, cy) = match center {
+                    Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
+                    Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let r = match radius {
+                    Value::Float(f) => f,
+                    Value::Integer(i) => i as f64,
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                Ok(Value::Bool(dist <= r))
+            }
+            "st_distance" => {
+                if args.len() == 2 {
+                    let p1 = Self::eval_expr_on_row(&args[0], row, schema)?;
+                    let p2 = Self::eval_expr_on_row(&args[1], row, schema)?;
+                    match (&p1, &p2) {
+                        (Value::Spatial(a), Value::Spatial(b)) => {
+                            let (x1, y1) = match a {
+                                crate::types::Geometry::Point(p) => (p.x, p.y),
+                                crate::types::Geometry::Point3D(p) => (p.x, p.y),
+                                _ => return Ok(Value::Null),
+                            };
+                            let (x2, y2) = match b {
+                                crate::types::Geometry::Point(p) => (p.x, p.y),
+                                crate::types::Geometry::Point3D(p) => (p.x, p.y),
+                                _ => return Ok(Value::Null),
+                            };
+                            Ok(Value::Float(((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt()))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "match" => {
+                if args.len() != 2 {
+                    return Ok(Value::Bool(false));
+                }
+                let col_name = match &args[0] {
+                    Expr::Column(n) => n.clone(),
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let query_val = Self::eval_expr_on_row(&args[1], row, schema)?;
+                let query_text = match query_val {
+                    Value::Text(s) => s,
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let pos = schema.get_column_position(&col_name);
+                let col_val = match pos {
+                    Some(p) => row.get(p).cloned().unwrap_or(Value::Null),
+                    None => return Ok(Value::Bool(false)),
+                };
+                match col_val {
+                    Value::Text(ref text) => {
+                        let text_lower = text.to_lowercase();
+                        let query_lower = query_text.to_lowercase();
+                        let terms: Vec<&str> = query_lower.split_whitespace().collect();
+                        Ok(Value::Bool(terms.iter().all(|t| text_lower.contains(t))))
+                    }
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
+            _ => Ok(Value::Bool(false)),
+        }
+    }
+
     fn eval_expr_simple(expr: &Expr, row: &SqlRow) -> Result<Value> {
         match expr {
             Expr::BinaryOp { left, op, right } => {
@@ -1159,10 +1524,19 @@ impl QueryExecutor {
                             Ok(Value::Bool(lv != rv))
                         }
                     }
-                    BinaryOperator::Lt => Ok(Value::Bool(lv < rv)),
-                    BinaryOperator::Le => Ok(Value::Bool(lv <= rv)),
-                    BinaryOperator::Gt => Ok(Value::Bool(lv > rv)),
-                    BinaryOperator::Ge => Ok(Value::Bool(lv >= rv)),
+                    BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
+                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
+                            Ok(Value::Bool(false))
+                        } else {
+                            Ok(Value::Bool(match op {
+                                BinaryOperator::Lt => lv < rv,
+                                BinaryOperator::Le => lv <= rv,
+                                BinaryOperator::Gt => lv > rv,
+                                BinaryOperator::Ge => lv >= rv,
+                                _ => unreachable!(),
+                            }))
+                        }
+                    }
                     BinaryOperator::And => {
                         let lb = Self::is_truthy(&lv);
                         let rb = Self::is_truthy(&rv);
@@ -1173,11 +1547,26 @@ impl QueryExecutor {
                         let rb = Self::is_truthy(&rv);
                         Ok(Value::Bool(lb || rb))
                     }
-                    _ => Ok(Value::Bool(false)),
+                    BinaryOperator::Add => Self::positional_add(&lv, &rv),
+                    BinaryOperator::Sub => Self::positional_sub(&lv, &rv),
+                    BinaryOperator::Mul => Self::positional_mul(&lv, &rv),
+                    BinaryOperator::Div => Self::positional_div(&lv, &rv),
+                    BinaryOperator::Mod => Self::positional_mod(&lv, &rv),
+                    BinaryOperator::L2Distance => Self::positional_vector_l2(&lv, &rv),
+                    BinaryOperator::CosineDistance => Self::positional_vector_cosine(&lv, &rv),
+                    BinaryOperator::DotProduct => Self::positional_vector_dot(&lv, &rv),
                 }
             }
             Expr::Column(name) => {
-                row.get(name).cloned().ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))
+                // Try direct lookup, then strip table prefix (e.g., "users.age" → "age")
+                if let Some(v) = row.get(name) {
+                    Ok(v.clone())
+                } else if name.contains('.') {
+                    let col = name.rsplit('.').next().unwrap_or(name);
+                    row.get(col).cloned().ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))
+                } else {
+                    Err(MoteDBError::ColumnNotFound(name.clone()))
+                }
             }
             Expr::Literal(val) => Ok(val.clone()),
             Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
@@ -1189,10 +1578,458 @@ impl QueryExecutor {
             // These expressions should never reach eval_expr_simple — they are
             // redirected to execute_select_internal by expr_needs_materialized_path().
             // The false fallback is a safety net to avoid returning wrong results.
-            Expr::Match { .. } => {
-                // If we have a pre-computed score, non-zero means match
+            Expr::Match { column, query, .. } => {
                 let has_score = row.keys().any(|k| k.starts_with("__text_score_"));
-                Ok(Value::Bool(has_score))
+                if has_score {
+                    Ok(Value::Bool(true))
+                } else {
+                    // Fallback: naive text scan when no FTS index
+                    match row.get(column) {
+                        Some(Value::Text(text)) => {
+                            let text_lower = text.to_lowercase();
+                            let query_lower = query.to_lowercase();
+                            let terms: Vec<&str> = query_lower.split_whitespace().collect();
+                            Ok(Value::Bool(terms.iter().all(|t| text_lower.contains(t))))
+                        }
+                        _ => Ok(Value::Bool(false)),
+                    }
+                }
+            }
+            Expr::FunctionCall { name, args, .. } => {
+                let fname = name.to_lowercase();
+                match fname.as_str() {
+                    "concat" => {
+                        let mut result = String::new();
+                        for arg in args {
+                            match Self::eval_expr_simple(arg, row)? {
+                                Value::Text(s) => result.push_str(&s),
+                                Value::Integer(i) => { use std::fmt::Write; let _ = write!(result, "{}", i); }
+                                Value::Float(f) => { use std::fmt::Write; let _ = write!(result, "{}", f); }
+                                Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
+                                Value::Null => return Ok(Value::Null),
+                                other => result.push_str(&format!("{:?}", other)),
+                            }
+                        }
+                        Ok(Value::Text(result))
+                    }
+                    "upper" | "lower" | "length" | "trim" | "ltrim" | "rtrim" => {
+                        let val = Self::eval_expr_simple(&args[0], row)?;
+                        match val {
+                            Value::Text(s) => match fname.as_str() {
+                                "upper" => Ok(Value::Text(s.to_uppercase())),
+                                "lower" => Ok(Value::Text(s.to_lowercase())),
+                                "length" => Ok(Value::Integer(s.chars().count() as i64)),
+                                "trim" => Ok(Value::Text(s.trim().to_string())),
+                                "ltrim" => Ok(Value::Text(s.trim_start().to_string())),
+                                "rtrim" => Ok(Value::Text(s.trim_end().to_string())),
+                                _ => Ok(Value::Text(s)),
+                            },
+                            _ => Ok(Value::Null),
+                        }
+                    }
+                    "abs" | "round" | "floor" | "ceil" | "log" | "ln" | "log10" | "sqrt" | "exp" => {
+                        let val = Self::eval_expr_simple(&args[0], row)?;
+                        match val {
+                            Value::Integer(i) => match fname.as_str() {
+                                "abs" => Ok(Value::Integer(i.abs())),
+                                _ => {
+                                    let f = i as f64;
+                                    Ok(Value::Float(match fname.as_str() {
+                                        "round" => f.round(),
+                                        "floor" => f.floor(),
+                                        "ceil" => f.ceil(),
+                                        "log" | "log10" => f.log10(),
+                                        "ln" => f.ln(),
+                                        "sqrt" => f.sqrt(),
+                                        "exp" => f.exp(),
+                                        _ => f,
+                                    }))
+                                }
+                            },
+                            Value::Float(f) => match fname.as_str() {
+                                "abs" => Ok(Value::Float(f.abs())),
+                                "round" => Ok(Value::Float(f.round())),
+                                "floor" => Ok(Value::Float(f.floor())),
+                                "ceil" => Ok(Value::Float(f.ceil())),
+                                "log" | "log10" => Ok(Value::Float(f.log10())),
+                                "ln" => Ok(Value::Float(f.ln())),
+                                "sqrt" => Ok(Value::Float(f.sqrt())),
+                                "exp" => Ok(Value::Float(f.exp())),
+                                _ => Ok(Value::Float(f)),
+                            },
+                            _ => Ok(Value::Null),
+                        }
+                    }
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
+            _ => Ok(Value::Bool(false)),
+        }
+    }
+
+    /// Check if an expression can be evaluated positionally (no complex features).
+    /// Simple: Column, Literal, BinaryOp (comparison + AND/OR), UnaryOp::Not, IsNull.
+    /// Check if expression tree contains any Expr::Parameter nodes
+    fn contains_parameter(expr: &Expr) -> bool {
+        match expr {
+            Expr::Parameter(_) => true,
+            Expr::BinaryOp { left, right, .. } =>
+                Self::contains_parameter(left) || Self::contains_parameter(right),
+            Expr::UnaryOp { expr, .. } => Self::contains_parameter(expr),
+            Expr::IsNull { expr, .. } => Self::contains_parameter(expr),
+            Expr::In { expr, list, .. } =>
+                Self::contains_parameter(expr) || list.iter().any(Self::contains_parameter),
+            Expr::Between { expr, low, high, .. } =>
+                Self::contains_parameter(expr) || Self::contains_parameter(low) || Self::contains_parameter(high),
+            Expr::Like { expr, pattern, .. } =>
+                Self::contains_parameter(expr) || Self::contains_parameter(pattern),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::contains_parameter),
+            _ => false,
+        }
+    }
+
+    /// Count the highest parameter index referenced in a statement.
+    /// Returns 0 if no parameters found.
+    pub fn max_parameter_index(stmt: &Statement) -> usize {
+        fn walk_expr(expr: &Expr) -> usize {
+            match expr {
+                Expr::Parameter(idx) => *idx,
+                Expr::BinaryOp { left, right, .. } =>
+                    walk_expr(left).max(walk_expr(right)),
+                Expr::UnaryOp { expr, .. } => walk_expr(expr),
+                Expr::IsNull { expr, .. } => walk_expr(expr),
+                Expr::In { expr, list, .. } =>
+                    list.iter().fold(walk_expr(expr), |acc, e| acc.max(walk_expr(e))),
+                Expr::Between { expr, low, high, .. } =>
+                    walk_expr(expr).max(walk_expr(low)).max(walk_expr(high)),
+                Expr::Like { expr, pattern, .. } =>
+                    walk_expr(expr).max(walk_expr(pattern)),
+                Expr::FunctionCall { args, .. } =>
+                    args.iter().fold(0, |acc, e| acc.max(walk_expr(e))),
+                _ => 0,
+            }
+        }
+        fn walk_stmt(stmt: &Statement) -> usize {
+            match stmt {
+                Statement::Select(s) => s.where_clause.as_ref().map(walk_expr).unwrap_or(0)
+                    .max(s.columns.iter().fold(0, |acc, c| acc.max(match c {
+                        SelectColumn::Expr(e, _) => walk_expr(e),
+                        _ => 0,
+                    }))),
+                Statement::Insert(i) => i.values.iter().fold(0, |acc, row| {
+                    acc.max(row.iter().fold(0, |a, e| a.max(walk_expr(e))))
+                }),
+                Statement::Update(u) => {
+                    let where_max = u.where_clause.as_ref().map(walk_expr).unwrap_or(0);
+                    let set_max = u.assignments.iter().fold(0, |acc, (_, e)| acc.max(walk_expr(e)));
+                    where_max.max(set_max)
+                }
+                Statement::Delete(d) => d.where_clause.as_ref().map(walk_expr).unwrap_or(0),
+                _ => 0,
+            }
+        }
+        walk_stmt(stmt)
+    }
+
+    fn can_eval_positional(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(_) | Expr::Literal(_) => true,
+            Expr::BinaryOp { left, op, right } => {
+                matches!(op,
+                    BinaryOperator::Eq | BinaryOperator::Ne |
+                    BinaryOperator::Lt | BinaryOperator::Le |
+                    BinaryOperator::Gt | BinaryOperator::Ge |
+                    BinaryOperator::And | BinaryOperator::Or |
+                    BinaryOperator::Add | BinaryOperator::Sub |
+                    BinaryOperator::Mul | BinaryOperator::Div |
+                    BinaryOperator::Mod |
+                    BinaryOperator::L2Distance | BinaryOperator::CosineDistance | BinaryOperator::DotProduct
+                ) && Self::can_eval_positional(left)
+                  && Self::can_eval_positional(right)
+            }
+            Expr::UnaryOp { op: UnaryOperator::Not, expr } => Self::can_eval_positional(expr),
+            Expr::IsNull { .. } => true,
+            Expr::In { .. } | Expr::Between { .. } | Expr::Like { .. } => true,
+            Expr::FunctionCall { name, args, .. } => {
+                let fname = name.to_lowercase();
+                let handled = matches!(fname.as_str(),
+                    "concat" | "upper" | "lower" | "length" | "trim" | "ltrim" | "rtrim" |
+                    "abs" | "round" | "floor" | "ceil" | "log" | "ln" | "log10" | "sqrt" | "exp" |
+                    "coalesce" | "if" |
+                    "within_radius" | "st_distance" | "match"
+                );
+                handled && args.iter().all(Self::can_eval_positional)
+            }
+            Expr::Match { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Check if a SelectStmt contains any Parameter nodes.
+    fn contains_parameter_stmt(stmt: &SelectStmt) -> bool {
+        stmt.where_clause.as_ref().is_some_and(Self::contains_parameter)
+            || stmt.columns.iter().any(|c| match c {
+                SelectColumn::Expr(e, _) => Self::contains_parameter(e),
+                _ => false,
+            })
+    }
+
+    /// Validate that all Parameter nodes in stmt are bound to a value in params.
+    fn validate_params_bound(stmt: &SelectStmt, params: &[Value]) -> Option<MoteDBError> {
+        fn check_expr(expr: &Expr, params: &[Value]) -> Option<MoteDBError> {
+            match expr {
+                Expr::Parameter(idx) if *idx == 0 => Some(MoteDBError::InvalidArgument(
+                    "Unnamed ? parameter not resolved (internal error)".to_string()
+                )),
+                Expr::Parameter(idx) => {
+                    if params.get(idx - 1).is_none() {
+                        return Some(MoteDBError::InvalidArgument(format!(
+                            "Parameter ?{} not bound ({} parameters provided)", idx, params.len()
+                        )));
+                    }
+                    None
+                }
+                Expr::BinaryOp { left, right, .. } =>
+                    check_expr(left, params).or_else(|| check_expr(right, params)),
+                Expr::UnaryOp { expr, .. } => check_expr(expr, params),
+                Expr::IsNull { expr, .. } => check_expr(expr, params),
+                _ => None,
+            }
+        }
+        stmt.where_clause.as_ref().and_then(|w| check_expr(w, params))
+    }
+
+    /// Substitute all Expr::Parameter nodes with Expr::Literal using bound params.
+    /// Returns a cloned SelectStmt with resolved values, enabling fast-path matching.
+    fn substitute_params_stmt(&self, stmt: &SelectStmt) -> Result<SelectStmt> {
+        let params = self.evaluator.get_params();
+        let sub = |expr: &Expr| -> Result<Expr> { Self::substitute_expr(expr, &params) };
+
+        let where_clause = match &stmt.where_clause {
+            Some(w) => Some(sub(w)?),
+            None => None,
+        };
+
+        let columns: Vec<SelectColumn> = stmt.columns.iter().map(|c| {
+            match c {
+                SelectColumn::Expr(e, alias) => {
+                    match sub(e) {
+                        Ok(resolved) => SelectColumn::Expr(resolved, alias.clone()),
+                        Err(_) => c.clone(),
+                    }
+                }
+                _ => c.clone(),
+            }
+        }).collect();
+
+        Ok(SelectStmt {
+            columns,
+            from: stmt.from.clone(),
+            where_clause,
+            order_by: stmt.order_by.clone(),
+            limit: stmt.limit,
+            offset: stmt.offset,
+            distinct: stmt.distinct,
+            group_by: stmt.group_by.clone(),
+            having: stmt.having.clone(),
+            latest_by: stmt.latest_by.clone(),
+        })
+    }
+
+    /// Recursively substitute Parameter nodes in an expression tree.
+    fn substitute_expr(expr: &Expr, params: &[Value]) -> Result<Expr> {
+        match expr {
+            Expr::Parameter(idx) => {
+                if *idx == 0 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "Unnamed ? parameter not resolved (internal error)".to_string()
+                    ));
+                }
+                let i = idx - 1;
+                params.get(i).cloned()
+                    .map(Expr::Literal)
+                    .ok_or_else(|| MoteDBError::InvalidArgument(format!(
+                        "Parameter ?{} not bound ({} parameters provided)", idx, params.len()
+                    )))
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let l = Self::substitute_expr(left, params)?;
+                let r = Self::substitute_expr(right, params)?;
+                Ok(Expr::BinaryOp { left: Box::new(l), op: op.clone(), right: Box::new(r) })
+            }
+            Expr::UnaryOp { op, expr: inner } => {
+                let e = Self::substitute_expr(inner, params)?;
+                Ok(Expr::UnaryOp { op: op.clone(), expr: Box::new(e) })
+            }
+            Expr::IsNull { expr: inner, negated } => {
+                let e = Self::substitute_expr(inner, params)?;
+                Ok(Expr::IsNull { expr: Box::new(e), negated: *negated })
+            }
+            Expr::In { expr: inner, list, negated } => {
+                let e = Self::substitute_expr(inner, params)?;
+                let list2: Result<Vec<Expr>> = list.iter().map(|x| Self::substitute_expr(x, params)).collect();
+                Ok(Expr::In { expr: Box::new(e), list: list2?, negated: *negated })
+            }
+            Expr::Between { expr: inner, low, high, negated } => {
+                let e = Self::substitute_expr(inner, params)?;
+                let l = Self::substitute_expr(low, params)?;
+                let h = Self::substitute_expr(high, params)?;
+                Ok(Expr::Between { expr: Box::new(e), low: Box::new(l), high: Box::new(h), negated: *negated })
+            }
+            Expr::Like { expr: inner, pattern, negated } => {
+                let e = Self::substitute_expr(inner, params)?;
+                let p = Self::substitute_expr(pattern, params)?;
+                Ok(Expr::Like { expr: Box::new(e), pattern: Box::new(p), negated: *negated })
+            }
+            Expr::FunctionCall { name, args, distinct } => {
+                let args2: Result<Vec<Expr>> = args.iter().map(|x| Self::substitute_expr(x, params)).collect();
+                Ok(Expr::FunctionCall { name: name.clone(), args: args2?, distinct: *distinct })
+            }
+            // All other variants are cloned as-is (Column, Literal, etc.)
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    /// Evaluate expression directly on Vec<Value> using schema positions.
+    /// Bypasses HashMap creation entirely.
+    fn eval_expr_on_row(expr: &Expr, row: &[Value], schema: &TableSchema) -> Result<Value> {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                let lv = Self::eval_expr_on_row(left, row, schema)?;
+                let rv = Self::eval_expr_on_row(right, row, schema)?;
+                match op {
+                    BinaryOperator::Eq => {
+                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
+                            Ok(Value::Bool(false))
+                        } else {
+                            Ok(Value::Bool(lv == rv))
+                        }
+                    }
+                    BinaryOperator::Ne => {
+                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
+                            Ok(Value::Bool(false))
+                        } else {
+                            Ok(Value::Bool(lv != rv))
+                        }
+                    }
+                    BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
+                        if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
+                            Ok(Value::Bool(false))
+                        } else {
+                            Ok(Value::Bool(match op {
+                                BinaryOperator::Lt => lv < rv,
+                                BinaryOperator::Le => lv <= rv,
+                                BinaryOperator::Gt => lv > rv,
+                                BinaryOperator::Ge => lv >= rv,
+                                _ => unreachable!(),
+                            }))
+                        }
+                    }
+                    BinaryOperator::And => {
+                        Ok(Value::Bool(Self::is_truthy(&lv) && Self::is_truthy(&rv)))
+                    }
+                    BinaryOperator::Or => {
+                        Ok(Value::Bool(Self::is_truthy(&lv) || Self::is_truthy(&rv)))
+                    }
+                    BinaryOperator::Add => Self::positional_add(&lv, &rv),
+                    BinaryOperator::Sub => Self::positional_sub(&lv, &rv),
+                    BinaryOperator::Mul => Self::positional_mul(&lv, &rv),
+                    BinaryOperator::Div => Self::positional_div(&lv, &rv),
+                    BinaryOperator::Mod => Self::positional_mod(&lv, &rv),
+                    BinaryOperator::L2Distance => Self::positional_vector_l2(&lv, &rv),
+                    BinaryOperator::CosineDistance => Self::positional_vector_cosine(&lv, &rv),
+                    BinaryOperator::DotProduct => Self::positional_vector_dot(&lv, &rv),
+                }
+            }
+            Expr::Column(name) => {
+                // Try direct lookup, then strip table prefix (e.g., "users.id" → "id")
+                let col_name = if name.contains('.') {
+                    name.rsplit('.').next().unwrap_or(name)
+                } else {
+                    name
+                };
+                schema.get_column_position(col_name)
+                    .and_then(|pos| row.get(pos).cloned())
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))
+            }
+            Expr::Literal(val) => Ok(val.clone()),
+            Expr::Parameter(_) => {
+                // Parameters need evaluator state, skip for positional eval
+                Ok(Value::Bool(false))
+            }
+            Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
+                let v = Self::eval_expr_on_row(inner, row, schema)?;
+                // NOT NULL should be false (NULL), not true
+                if matches!(v, Value::Null) {
+                    Ok(Value::Bool(false))
+                } else {
+                    Ok(Value::Bool(!Self::is_truthy(&v)))
+                }
+            }
+            Expr::IsNull { expr, negated } => {
+                let v = Self::eval_expr_on_row(expr, row, schema)?;
+                let is_null = matches!(v, Value::Null);
+                Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+            }
+            Expr::In { expr, list, negated } => {
+                let val = Self::eval_expr_on_row(expr, row, schema)?;
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+                let mut found = false;
+                for item in list {
+                    let item_val = Self::eval_expr_on_row(item, row, schema)?;
+                    if val == item_val {
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(Value::Bool(if *negated { !found } else { found }))
+            }
+            Expr::Between { expr, low, high, negated } => {
+                let val = Self::eval_expr_on_row(expr, row, schema)?;
+                let low_val = Self::eval_expr_on_row(low, row, schema)?;
+                let high_val = Self::eval_expr_on_row(high, row, schema)?;
+                if matches!(val, Value::Null) || matches!(low_val, Value::Null) || matches!(high_val, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+                let in_range = val >= low_val && val <= high_val;
+                Ok(Value::Bool(if *negated { !in_range } else { in_range }))
+            }
+            Expr::Like { expr, pattern, negated } => {
+                let val = Self::eval_expr_on_row(expr, row, schema)?;
+                let pat = Self::eval_expr_on_row(pattern, row, schema)?;
+                // NULL LIKE anything = false, NULL NOT LIKE anything = false (SQL NULL semantics)
+                if matches!(val, Value::Null) || matches!(pat, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+                let matches = match (&val, &pat) {
+                    (Value::Text(s), Value::Text(p)) => {
+                        Self::simple_like_match(s, p)
+                    }
+                    _ => false,
+                };
+                Ok(Value::Bool(if *negated { !matches } else { matches }))
+            }
+            Expr::FunctionCall { name, args, .. } => {
+                Self::eval_function_positional(name, args, row, schema)
+            }
+            Expr::Match { column, query, .. } => {
+                let pos = schema.get_column_position(column);
+                match pos {
+                    Some(p) => {
+                        match row.get(p) {
+                            Some(Value::Text(text)) => {
+                                let text_lower = text.to_lowercase();
+                                let query_lower = query.to_lowercase();
+                                let terms: Vec<&str> = query_lower.split_whitespace().collect();
+                                Ok(Value::Bool(terms.iter().all(|t| text_lower.contains(t))))
+                            }
+                            _ => Ok(Value::Bool(false)),
+                        }
+                    }
+                    None => Ok(Value::Bool(false)),
+                }
             }
             _ => Ok(Value::Bool(false)),
         }
@@ -1232,9 +2069,12 @@ impl QueryExecutor {
                             sql_row.get(name).cloned().unwrap_or(Value::Null)
                         }
                         SelectColumn::Star => Value::Null,
-                        SelectColumn::Expr(_, _) => {
-                            // TODO: 表达式求值
-                            Value::Null
+                        SelectColumn::Expr(expr, _) => {
+                            // Evaluate expression against the SQL row
+                            match Self::eval_expr_simple(expr, sql_row) {
+                                Ok(v) => v,
+                                Err(_) => Value::Null,
+                            }
                         }
                     }
                 })
@@ -1268,10 +2108,21 @@ impl QueryExecutor {
                         SelectColumn::Column(name) => name,
                         SelectColumn::ColumnWithAlias(name, _) => name,
                         SelectColumn::Star => return Value::Null,
-                        SelectColumn::Expr(_, _) => return Value::Null,
+                        SelectColumn::Expr(expr, _) => {
+                            return match Self::eval_expr_on_row(expr, row, schema) {
+                                Ok(v) => v,
+                                Err(_) => Value::Null,
+                            };
+                        }
                     };
                     // Look up column position in schema (O(1) via column_map HashMap)
-                    if let Some(pos) = schema.get_column_position(col_name) {
+                    // Handle table-qualified names: "users.id" → "id"
+                    let lookup_name = if col_name.contains('.') {
+                        col_name.rsplit('.').next().unwrap_or(col_name)
+                    } else {
+                        col_name
+                    };
+                    if let Some(pos) = schema.get_column_position(lookup_name) {
                         row.get(pos).cloned().unwrap_or(Value::Null)
                     } else {
                         Value::Null
@@ -1283,6 +2134,17 @@ impl QueryExecutor {
 
     /// Internal SELECT execution (takes &SelectStmt to allow reuse in subqueries)
     fn execute_select_internal(&self, stmt: &SelectStmt) -> Result<QueryResult> {
+        // 🚀 Substitute bind parameters before executing
+        let resolved_stmt;
+        let stmt = if Self::contains_parameter_stmt(stmt) {
+            match self.substitute_params_stmt(stmt) {
+                Ok(s) => { resolved_stmt = s; &resolved_stmt as &SelectStmt }
+                Err(e) => return Err(e),
+            }
+        } else {
+            stmt
+        };
+
         // 🆕 FAST PATH -4: SELECT without FROM clause (e.g., SELECT LAST_INSERT_ID())
         // → Evaluate expressions directly without table scan
         if stmt.from.is_none() {
@@ -2590,8 +3452,8 @@ impl QueryExecutor {
             }
             
             // Leaf nodes - no subqueries to materialize
-            Expr::Column(_) | Expr::Literal(_) | Expr::Match { .. } | 
-            Expr::KnnSearch { .. } | Expr::KnnDistance { .. } | 
+            Expr::Column(_) | Expr::Literal(_) | Expr::Parameter(_) | Expr::Match { .. } |
+            Expr::KnnSearch { .. } | Expr::KnnDistance { .. } |
             Expr::StWithin3D { .. } | Expr::StDistance3D { .. } | Expr::StKnn3D { .. } | Expr::StRadius3D { .. } |
             Expr::WindowFunction { .. } => Ok(expr.clone()),
         }
@@ -2669,39 +3531,51 @@ impl QueryExecutor {
                 }
 
                 // Get row_id from the row
-                let row_id = row.get("__row_id__")
+                let row_id_opt = row.get("__row_id__")
                     .and_then(|v| match v {
                         Value::Integer(i) => Some(*i as u64),
                     _ => None,
-                })
-                .ok_or_else(|| MoteDBError::Query("MATCH requires __row_id__ in row".into()))?;
+                });
 
             // 🔧 Get table name from row
-            let table_name = row.get("__table__")
+            let table_name_opt = row.get("__table__")
                 .and_then(|v| match v {
                     Value::Text(s) => Some(s.as_str()),
                     _ => None,
-                })
-                .ok_or_else(|| MoteDBError::Query("MATCH requires __table__ in row".into()))?;
-            
-            // 🔧 Use index_registry to find the correct user-specified index name
-            let index_name = self.db.index_registry.find_by_column(
-                table_name,
-                column,
-                crate::database::index_metadata::IndexType::Text
-            ).ok_or_else(|| MoteDBError::Query(format!("No text index found for column '{}.{}'", table_name, column)))?;
-            
-            let index_ref = self.db.text_indexes.get(&index_name)
-                .ok_or_else(|| MoteDBError::Query(format!("Text index '{}' not found", index_name)))?;
-            
-            // Perform search and get score for this document
-            let results = index_ref.value().read().search_ranked(query, 1000)?;
-                let score = results.iter()
-                    .find(|(doc_id, _)| *doc_id == row_id)
-                    .map(|(_, score)| *score)
-                    .unwrap_or(0.0);
-                
-                Ok(Value::Float(score as f64))
+                });
+
+            // Try index-based match if metadata is available
+            if let (Some(row_id), Some(table_name)) = (row_id_opt, table_name_opt) {
+                let index_name = self.db.index_registry.find_by_column(
+                    table_name,
+                    column,
+                    crate::database::index_metadata::IndexType::Text
+                );
+                if let Some(index_name) = index_name {
+                    if let Some(index_ref) = self.db.text_indexes.get(&index_name) {
+                        let results = index_ref.value().read().search_ranked(query, 1000)?;
+                        let score = results.iter()
+                            .find(|(doc_id, _)| *doc_id == row_id)
+                            .map(|(_, score)| *score)
+                            .unwrap_or(0.0);
+                        return Ok(Value::Float(score as f64));
+                    }
+                }
+            }
+
+            // Fallback: naive text scan when no FTS index
+            let text_val = row.get(column)
+                .or_else(|| table_name_opt.and_then(|t| row.get(&format!("{}.{}", t, column))));
+            match text_val {
+                Some(Value::Text(text)) => {
+                    let text_lower = text.to_lowercase();
+                    let query_lower = query.to_lowercase();
+                    let terms: Vec<&str> = query_lower.split_whitespace().collect();
+                    let matched = terms.iter().all(|t| text_lower.contains(t));
+                    Ok(Value::Bool(matched))
+                }
+                _ => Ok(Value::Bool(false)),
+            }
             }
             
             Expr::KnnSearch { column, query_vector, k } => {
@@ -2992,7 +3866,45 @@ impl QueryExecutor {
         // Compute aggregates for each group
         let mut column_names = Vec::new();
         let mut result_rows = Vec::new();
-        
+
+        // Handle implicit aggregation with zero input rows:
+        // SQL standard requires aggregate queries with no GROUP BY to return
+        // exactly one row (e.g., COUNT(*) over empty table returns 0, not empty set)
+        if groups.is_empty() && group_by_cols.is_empty() {
+            // Compute column names from column specs
+            for col_spec in columns {
+                let col_name = match col_spec {
+                    SelectColumn::Column(name) => name.clone(),
+                    SelectColumn::ColumnWithAlias(_, alias) => alias.clone(),
+                    SelectColumn::Expr(_, Some(alias)) => alias.clone(),
+                    SelectColumn::Expr(expr, None) => format!("{:?}", expr),
+                    SelectColumn::Star => {
+                        return Err(MoteDBError::Query(
+                            "SELECT * not allowed with GROUP BY".to_string()
+                        ));
+                    }
+                };
+                column_names.push(col_name);
+            }
+
+            // Compute aggregates over empty row set
+            let empty_rows: Vec<&SqlRow> = Vec::new();
+            let mut result_row = Vec::new();
+            for col_spec in columns {
+                let col_value = match col_spec {
+                    SelectColumn::Expr(expr, _) => {
+                        self.eval_aggregate(expr, &empty_rows)?
+                    }
+                    SelectColumn::Column(_)
+                    | SelectColumn::ColumnWithAlias(_, _)
+                    | SelectColumn::Star => Value::Null,
+                };
+                result_row.push(col_value);
+            }
+            result_rows.push(result_row);
+            return Ok((column_names, result_rows));
+        }
+
         // First pass: determine column names
         if !groups.is_empty() {
             for col_spec in columns {
@@ -3139,10 +4051,12 @@ impl QueryExecutor {
                         let mut int_sum: i64 = 0;
                         let mut float_sum: f64 = 0.0;
                         let mut has_float = false;
+                        let mut has_value = false;
                         for row in rows {
                             let val = self.evaluator.eval(&args[0], row)?;
                             match val {
                                 Value::Integer(i) => {
+                                    has_value = true;
                                     if has_float {
                                         float_sum += i as f64;
                                     } else if let Some(s) = int_sum.checked_add(i) {
@@ -3153,6 +4067,7 @@ impl QueryExecutor {
                                     }
                                 }
                                 Value::Float(f) => {
+                                    has_value = true;
                                     if !has_float {
                                         has_float = true;
                                         float_sum = int_sum as f64;
@@ -3163,7 +4078,9 @@ impl QueryExecutor {
                                 _ => return Err(MoteDBError::TypeError("SUM requires numeric values".to_string())),
                             }
                         }
-                        if has_float {
+                        if !has_value {
+                            Ok(Value::Null)
+                        } else if has_float {
                             Ok(Value::Float(float_sum))
                         } else {
                             Ok(Value::Integer(int_sum))
@@ -3415,11 +4332,15 @@ impl QueryExecutor {
             for (i, col_name) in columns.iter().enumerate() {
                 let val = match &value_row[i] {
                     Expr::Literal(v) => v.clone(),
+                    Expr::Parameter(_) => {
+                        let empty_row = SqlRow::new();
+                        self.evaluator.eval(&value_row[i], &empty_row)?
+                    }
                     expr => return Err(MoteDBError::InvalidArgument(
-                        format!("INSERT VALUES must be literals, got {:?}", expr)
+                        format!("INSERT VALUES must be literals or parameters, got {:?}", expr)
                     )),
                 };
-                
+
                 // 🚀 P3 OPTIMIZATION: For AUTO_INCREMENT primary key, ignore user-provided value
                 // The system will use row_id as primary key value automatically
                 let should_ignore = schema.primary_key()
@@ -3492,10 +4413,11 @@ impl QueryExecutor {
             }
         }
         
-        // 🔥 Update last_insert_id if table has AUTO_INCREMENT primary key
+        // Update last_insert_id if table has AUTO_INCREMENT primary key
         if schema.is_primary_key_auto_increment() {
             if let Some(row_id) = last_row_id {
-                *self.last_insert_id.borrow_mut() = Some(row_id as i64);
+                self.last_insert_id.store(row_id as i64, std::sync::atomic::Ordering::Relaxed);
+                self.evaluator.last_insert_id.store(row_id as i64, std::sync::atomic::Ordering::Relaxed);
             }
         }
         
@@ -3558,15 +4480,20 @@ impl QueryExecutor {
             }
             
             let mut sql_row = sql_row;
-            
-            // Apply assignments
-            for (col_name, expr) in &stmt.assignments {
+
+            // Evaluate all assignments against the ORIGINAL row values (SQL semantics)
+            let original_row = sql_row.clone();
+            let new_values: Vec<(String, Value)> = stmt.assignments.iter().map(|(col_name, expr)| {
                 let new_val = if let Expr::Literal(v) = expr {
                     v.clone()
                 } else {
-                    self.evaluator.eval(expr, &sql_row)?
+                    self.evaluator.eval(expr, &original_row).unwrap_or(Value::Null)
                 };
-                sql_row.insert(col_name.clone(), new_val);
+                (col_name.clone(), new_val)
+            }).collect();
+
+            for (col_name, new_val) in new_values {
+                sql_row.insert(col_name, new_val);
             }
             
             // Convert back to storage Row
@@ -3712,13 +4639,18 @@ impl QueryExecutor {
             };
 
             let mut sql_row = row_to_sql_row(&row, schema)?;
-            for (col_name, expr) in &stmt.assignments {
+            // Evaluate all assignments against ORIGINAL row (SQL semantics)
+            let original_row = sql_row.clone();
+            let new_values: Vec<(String, Value)> = stmt.assignments.iter().map(|(col_name, expr)| {
                 let new_val = if let Expr::Literal(v) = expr {
                     v.clone()
                 } else {
-                    self.evaluator.eval(expr, &sql_row)?
+                    self.evaluator.eval(expr, &original_row).unwrap_or(Value::Null)
                 };
-                sql_row.insert(col_name.clone(), new_val);
+                (col_name.clone(), new_val)
+            }).collect();
+            for (col_name, new_val) in new_values {
+                sql_row.insert(col_name, new_val);
             }
 
             let new_row = sql_row_to_row(&sql_row, schema)?;
@@ -3798,13 +4730,18 @@ impl QueryExecutor {
             }
 
             let mut sql_row = row_to_sql_row(&row, schema)?;
-            for (col_name, expr) in &stmt.assignments {
+            // Evaluate all assignments against ORIGINAL row (SQL semantics)
+            let original_row = sql_row.clone();
+            let new_values: Vec<(String, Value)> = stmt.assignments.iter().map(|(col_name, expr)| {
                 let new_val = if let Expr::Literal(v) = expr {
                     v.clone()
                 } else {
-                    self.evaluator.eval(expr, &sql_row)?
+                    self.evaluator.eval(expr, &original_row).unwrap_or(Value::Null)
                 };
-                sql_row.insert(col_name.clone(), new_val);
+                (col_name.clone(), new_val)
+            }).collect();
+            for (col_name, new_val) in new_values {
+                sql_row.insert(col_name, new_val);
             }
 
             let new_row = sql_row_to_row(&sql_row, schema)?;
@@ -5836,14 +6773,23 @@ impl QueryExecutor {
                     rows.sort_by(|a, b| {
                         let va = a.get(idx).unwrap_or(&Value::Null);
                         let vb = b.get(idx).unwrap_or(&Value::Null);
-                        let cmp = va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+                        let cmp = match (va, vb) {
+                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                            (Value::Null, _) => std::cmp::Ordering::Less,
+                            (_, Value::Null) => std::cmp::Ordering::Greater,
+                            _ => va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal),
+                        };
                         if ascending { cmp } else { cmp.reverse() }
                     });
                 }
             }
         }
 
-        // P1: Handle LIMIT
+        // P1: Handle OFFSET and LIMIT
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            let _ = rows.drain(..offset.min(rows.len()));
+        }
         if let Some(limit) = stmt.limit {
             rows.truncate(limit);
         }
@@ -6144,8 +7090,12 @@ impl QueryExecutor {
             for (i, col_name) in columns.iter().enumerate() {
                 let val = match &value_row[i] {
                     Expr::Literal(v) => v.clone(),
+                    Expr::Parameter(_) => {
+                        let empty_row = SqlRow::new();
+                        self.evaluator.eval(&value_row[i], &empty_row)?
+                    }
                     expr => return Err(MoteDBError::InvalidArgument(
-                        format!("INSERT VALUES must be literals, got {:?}", expr)
+                        format!("INSERT VALUES must be literals or parameters, got {:?}", expr)
                     )),
                 };
                 sql_row.insert(col_name.clone(), val);

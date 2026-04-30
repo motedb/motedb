@@ -34,17 +34,6 @@ impl Default for VamanaConfig {
 }
 
 impl VamanaConfig {
-    /// Create a new configuration
-    pub fn new(max_degree: usize, search_list_size: usize, alpha: f32) -> Self {
-        Self {
-            max_degree,
-            search_list_size,
-            alpha,
-            beam_width: max_degree / 2,
-            metric: DistanceKind::Euclidean,
-        }
-    }
-
     /// Create configuration with specific metric
     pub fn with_metric(mut self, metric: DistanceKind) -> Self {
         self.metric = metric;

@@ -10,11 +10,12 @@
 //! - Prefetching and caching for sequential access
 
 use crate::{Result, StorageError};
-use crate::types::{ColumnType, Row, RowId, PartitionId, Value, SqlRow};
+use crate::types::{ColumnType, Row, RowId, PartitionId, Value};
 use crate::txn::wal::WALRecord;
 use crate::storage::row_format;
 use super::core::MoteDB;
 use std::sync::Arc;
+use std::collections::HashSet;
 
 /// Extract column types from a table schema for RawRow encoding.
 /// Deserialize a row, trying RawRow first (with schema) and falling back to bincode.
@@ -63,9 +64,20 @@ impl MoteDB {
                         // Slow path: check column index (covers cache misses after restart)
                         match self.query_by_column(table_name, pk_name, pk_value) {
                             Ok(found) if !found.is_empty() => {
-                                return Err(StorageError::InvalidData(format!(
-                                    "Duplicate primary key {:?} for table '{}'", pk_value, table_name
-                                )));
+                                // Verify at least one RowId still exists in LSM.
+                                // Column indexes can return stale RowIds after compaction.
+                                let mut has_live = false;
+                                for &rid in &found {
+                                    if self.get_table_row(table_name, rid)?.is_some() {
+                                        has_live = true;
+                                        break;
+                                    }
+                                }
+                                if has_live {
+                                    return Err(StorageError::InvalidData(format!(
+                                        "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                    )));
+                                }
                             }
                             _ => {} // Not found or index not available — proceed
                         }
@@ -135,7 +147,8 @@ impl MoteDB {
 
         // 7. Write to LSM MemTable with table prefix (move row_data, no clone)
         let composite_key = self.make_composite_key(table_name, row_id);
-        let value = crate::storage::lsm::Value::new(row_data, row_id);
+        let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let value = crate::storage::lsm::Value::new(row_data, ts);
         self.lsm_engine.put(composite_key, value)?;
 
         // 7. Update indexes
@@ -252,29 +265,28 @@ impl MoteDB {
     /// ```ignore
     pub fn get_table_row(&self, table_name: &str, row_id: RowId) -> Result<Option<Row>> {
         ensure_open!(self);
-        // Get schema for RawRow decoding
         let schema = self.table_registry.get_table(table_name)?;
+        self.get_table_row_with_schema(table_name, row_id, &schema)
+    }
 
+    /// Get a row using a pre-fetched schema (avoids redundant RwLock acquisition).
+    pub fn get_table_row_with_schema(&self, table_name: &str, row_id: RowId, schema: &crate::types::TableSchema) -> Result<Option<Row>> {
         // Try cache first
         if let Some(row_arc) = self.row_cache.get(table_name, row_id) {
-            // Check if prefetch should be triggered
             if let Some((next_row_id, count, stride)) = self.row_cache.check_prefetch(table_name, row_id) {
                 self.trigger_prefetch(table_name, next_row_id, count, stride);
             }
-            
             return Ok(Some((*row_arc).clone()));
         }
-        
+
         // Cache miss - load from LSM
         let composite_key = self.make_composite_key(table_name, row_id);
-        
+
         if let Some(value) = self.lsm_engine.get(composite_key)? {
-            // Check if row is deleted (tombstone)
             if value.deleted {
                 return Ok(None);
             }
-            
-            // Extract data
+
             let data = match &value.data {
                 crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
                 crate::storage::lsm::ValueData::Blob(_) => {
@@ -283,8 +295,7 @@ impl MoteDB {
                     ));
                 }
             };
-            
-            // Deserialize row (RawRow with bincode fallback)
+
             let col_types = schema.col_types();
             let row: Row = row_format::decode(data, col_types)
                 .map_err(|e| StorageError::Serialization(format!(
@@ -292,15 +303,43 @@ impl MoteDB {
                     row_id, e
                 )))?;
 
-            // Update cache
             self.row_cache.put(table_name.to_string(), row_id, row.clone());
-            
-            // Check if prefetch should be triggered
+
             if let Some((next_row_id, count, stride)) = self.row_cache.check_prefetch(table_name, row_id) {
                 self.trigger_prefetch(table_name, next_row_id, count, stride);
             }
-            
+
             Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get a row as Arc<Row> — avoids cloning the row data for cache hits.
+    /// Use when the caller doesn't need to modify the row (PK SELECT fast path).
+    pub fn get_table_row_arc(&self, table_name: &str, row_id: RowId, schema: &crate::types::TableSchema) -> Result<Option<Arc<Row>>> {
+        // Fast path: skip prefetch tracking for single-row lookups
+        if let Some(row_arc) = self.row_cache.get_fast(table_name, row_id) {
+            if let Some((next_row_id, count, stride)) = self.row_cache.check_prefetch(table_name, row_id) {
+                self.trigger_prefetch(table_name, next_row_id, count, stride);
+            }
+            return Ok(Some(row_arc));
+        }
+
+        // Cache miss — load from LSM (no prefetch for single-row PK lookup)
+        let composite_key = self.make_composite_key(table_name, row_id);
+        if let Some(value) = self.lsm_engine.get(composite_key)? {
+            if value.deleted { return Ok(None); }
+            let data = match &value.data {
+                crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                crate::storage::lsm::ValueData::Blob(_) => {
+                    return Err(StorageError::InvalidData("Blob values not yet supported".into()));
+                }
+            };
+            let row: Row = row_format::decode(data, schema.col_types())
+                .map_err(|e| StorageError::Serialization(format!("Failed to deserialize row {}: {}", row_id, e)))?;
+            self.row_cache.put(table_name.to_string(), row_id, row.clone());
+            Ok(Some(Arc::new(row)))
         } else {
             Ok(None)
         }
@@ -340,15 +379,8 @@ impl MoteDB {
         self.wal.log_update_raw(table_name, partition, composite_key, raw_old, raw_new.clone(), 0)?;
 
         // 6. Update in LSM MemTable (same bytes as WAL)
-        // Use microsecond timestamp so successive UPDATEs to the same row have
-        // monotonically increasing timestamps. Using composite_key was a bug:
-        // all updates to the same row shared the same timestamp, so compaction
-        // merge (which keeps the higher-timestamp entry) couldn't distinguish
-        // between update versions and could keep a stale one.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| StorageError::InvalidData(e.to_string()))?
-            .as_micros() as u64;
+        // Use unified write_lsn for monotonically increasing timestamps.
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let value = crate::storage::lsm::Value::new(raw_new, timestamp);
         self.lsm_engine.put(composite_key, value)?;
 
@@ -518,10 +550,7 @@ impl MoteDB {
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
 
         // 4. Compute timestamp (used by both WAL and LSM)
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| StorageError::InvalidData(e.to_string()))?
-            .as_micros() as u64;
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // 5. Write to WAL first (durability guarantee)
         //    WAL must be written BEFORE any mutation so that a crash at any
@@ -813,69 +842,6 @@ impl MoteDB {
     /// - SELECT * : fallback to full deserialization
     /// 
     /// ## Example
-    /// ```ignore
-    /// // Only deserialize id and name columns
-    /// let rows = db.scan_table_rows_partial("users", &["id", "name"])?;
-    /// ```
-    pub fn scan_table_rows_partial(
-        &self,
-        table_name: &str,
-        required_columns: &[String],
-    ) -> Result<Vec<(RowId, SqlRow)>> {
-        use crate::types::SqlRow;
-        
-        // Get table schema
-        let schema = self.table_registry.get_table(table_name)?;
-        
-        // If all columns required, fallback to full scan
-        if required_columns.len() >= schema.columns.len() {
-            let rows = self.scan_table_rows(table_name)?;
-            return Ok(rows.into_iter()
-                .map(|(row_id, row)| {
-                    let mut sql_row = SqlRow::new();
-                    for (i, col_def) in schema.columns.iter().enumerate() {
-                        let value = row.get(i).cloned().unwrap_or(Value::Null);
-                        sql_row.insert(col_def.name.clone(), value);
-                    }
-                    (row_id, sql_row)
-                })
-                .collect());
-        }
-        
-        // Use streaming scan to avoid materializing full BTreeMap
-        let table_prefix = self.compute_table_prefix(table_name);
-        let start_key = table_prefix << 32;
-        let end_key = (table_prefix + 1) << 32;
-
-        let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
-
-        let mut result = Vec::new();
-
-        // Process results with partial deserialization
-        for item in lsm_iter {
-            let (composite_key, value) = item?;
-            if value.deleted {
-                continue;
-            }
-            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-            
-            let data = match &value.data {
-                crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                crate::storage::lsm::ValueData::Blob(_) => {
-                    return Err(StorageError::InvalidData(
-                        "Blob references should be resolved by LSM engine".into()
-                    ));
-                }
-            };
-            
-            // 🚀 Partial deserialization: only deserialize required columns
-            let sql_row = deserialize_partial(data, required_columns, &schema)?;
-            result.push((row_id, sql_row));
-        }
-        
-        Ok(result)
-    }
-    
     // ==================== Batch Operations ====================
     
     /// Batch insert rows to a specific table with incremental index updates
@@ -913,9 +879,16 @@ impl MoteDB {
         if !schema.is_primary_key_auto_increment() {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
+                    let mut batch_pks: HashSet<crate::database::pk_cache::PkKey> = HashSet::with_capacity(rows.len());
                     for (idx, row) in rows.iter().enumerate() {
                         if let Some(pk_value) = row.get(pk_col.position) {
                             let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+                            // Intra-batch duplicate check
+                            if !batch_pks.insert(pk_key.clone()) {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Batch row {}: duplicate primary key {:?} within batch for table '{}'", idx, pk_value, table_name
+                                )));
+                            }
                             let exists = self.pk_lookup.get(table_name)
                                 .map(|lookup| lookup.get_pk(&pk_key).is_some())
                                 .unwrap_or(false);
@@ -926,9 +899,19 @@ impl MoteDB {
                             }
                             match self.query_by_column(table_name, pk_name, pk_value) {
                                 Ok(found) if !found.is_empty() => {
-                                    return Err(StorageError::InvalidData(format!(
-                                        "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
-                                    )));
+                                    // Verify at least one RowId still exists in LSM
+                                    let mut has_live = false;
+                                    for &rid in &found {
+                                        if self.get_table_row(table_name, rid)?.is_some() {
+                                            has_live = true;
+                                            break;
+                                        }
+                                    }
+                                    if has_live {
+                                        return Err(StorageError::InvalidData(format!(
+                                            "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
+                                        )));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1007,7 +990,8 @@ impl MoteDB {
                 txn_id: 0,
             });
 
-            let value = crate::storage::lsm::Value::new(row_data, *row_id);
+            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let value = crate::storage::lsm::Value::new(row_data, ts);
             let composite_key = self.make_composite_key(table_name, *row_id);
             kvs.push((composite_key, value));
         }
@@ -1017,6 +1001,24 @@ impl MoteDB {
 
         // 6. Batch write LSM MemTable (single lock)
         self.lsm_engine.batch_put(&kvs)?;
+
+        // 6.5 Update PK cache for non-auto_increment tables
+        if !auto_inc {
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    if let Some(lookup) = self.pk_lookup.get(table_name) {
+                        for (i, row) in rows.iter().enumerate() {
+                            if let Some(pk_value) = row.get(pk_col.position) {
+                                lookup.insert(
+                                    crate::database::pk_cache::PkKey::from_value(pk_value),
+                                    row_ids[i],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // 7. Batch update all indexes
         debug_log!("[batch_insert_rows_to_table] Batch updating indexes for {} rows in table '{}'", rows.len(), table_name);
@@ -1437,72 +1439,6 @@ impl MoteDB {
         
         segments
     }
-}
-
-// ==================== Helper Functions ====================
-
-/// 🚀 PHASE B.2: Partial deserialization - only deserialize required columns
-/// 
-/// Uses serde's `IgnoredAny` to skip unwanted columns without allocating memory.
-/// 
-/// ## Performance
-/// - Deserializing 2/10 columns: 5x faster (400µs → 80µs)
-/// - Deserializing 5/10 columns: 2x faster (400µs → 200µs)
-/// 
-/// ## How it works
-/// ```text
-/// Row format: Vec<Value> = [val1, val2, val3, ...]
-///
-/// For each column:
-///   if required → Deserialize to Value
-///   else       → Deserialize to IgnoredAny (skip bytes, no allocation)
-/// ```
-fn deserialize_partial(
-    data: &[u8],
-    required_columns: &[String],
-    schema: &crate::types::TableSchema,
-) -> Result<crate::types::SqlRow> {
-    use serde::de::{Deserialize, IgnoredAny};
-    use crate::types::{SqlRow, Value};
-    
-    let mut sql_row = SqlRow::new();
-    
-    // Create deserializer
-    let mut deserializer = bincode::Deserializer::from_slice(
-        data,
-        bincode::options()
-    );
-    
-    // Bincode Vec format: [length][element1][element2]...
-    // First, deserialize the Vec length
-    let _len: usize = match Deserialize::deserialize(&mut deserializer) {
-        Ok(l) => l,
-        Err(e) => return Err(StorageError::Serialization(format!("Failed to deserialize Vec length: {}", e))),
-    };
-    
-    // Then deserialize each element (column value)
-    for col_def in &schema.columns {
-        if required_columns.contains(&col_def.name) {
-            // Deserialize this column
-            let value: Value = match Deserialize::deserialize(&mut deserializer) {
-                Ok(v) => v,
-                Err(e) => return Err(StorageError::Serialization(
-                    format!("Failed to deserialize column {}: {}", col_def.name, e)
-                )),
-            };
-            sql_row.insert(col_def.name.clone(), value);
-        } else {
-            // 🚀 Skip this column (only advance deserializer pointer, no allocation)
-            let _: IgnoredAny = match Deserialize::deserialize(&mut deserializer) {
-                Ok(v) => v,
-                Err(e) => return Err(StorageError::Serialization(
-                    format!("Failed to skip column {}: {}", col_def.name, e)
-                )),
-            };
-        }
-    }
-    
-    Ok(sql_row)
 }
 
 /// 🚀 表行批量迭代器

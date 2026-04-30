@@ -72,15 +72,11 @@ impl MoteDB {
                 debug_log!("[create_column_index] 🔍 使用scan_range扫描LSM（方案B）...");
                 let start_time = std::time::Instant::now();
                 
-                // 计算表的key范围
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                table_name.hash(&mut hasher);
-                let table_hash = hasher.finish() & 0xFFFFFFFF;
-                
-                let start_key = table_hash << 32;
-                let end_key = (table_hash + 1) << 32;
+                // 计算表的key范围 — 使用与 make_composite_key 一致的 sequential table_id
+                let table_id = self.table_registry.get_table_id(table_name)
+                    .unwrap_or(0) as u64;
+                let start_key = table_id << 32;
+                let end_key = (table_id + 1) << 32;
                 
                 // 一次scan_range扫描所有数据
                 let mut indexed_count = 0;

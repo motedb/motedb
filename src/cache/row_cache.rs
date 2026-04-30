@@ -128,13 +128,9 @@ impl RowCache {
         }
     }
 
-    /// Get a row from cache
-    ///
-    /// 🚀 Optimization: Single write-lock for cache, stats use atomics (no lock)
+    /// Get a row from cache (with prefetch detection).
     pub fn get(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
         let key = (table_hash(table_name), row_id);
-
-        // Fast path: read lock + peek (avoids write-lock contention on read-heavy workloads)
         let cache = self.cache.read();
         if let Some(row) = cache.peek(&key) {
             let result = Arc::clone(row);
@@ -143,11 +139,27 @@ impl RowCache {
             self.update_access_pattern(table_name, row_id);
             return Some(result);
         }
-
         self.misses.fetch_add(1, Ordering::Relaxed);
         drop(cache);
         self.update_access_pattern(table_name, row_id);
         None
+    }
+
+    /// Get a row from cache — ultra-fast path without prefetch tracking.
+    /// Use for single-row PK lookups where sequential prefetch is irrelevant.
+    pub fn get_fast(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
+        let key = (table_hash(table_name), row_id);
+        let cache = self.cache.read();
+        if let Some(row) = cache.peek(&key) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: Arc::clone only increments refcount, safe while cache read lock held
+            // We clone before dropping to avoid use-after-free of the reference
+            let result = Arc::clone(row);
+            Some(result)
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 
     /// 🚀 P2: Update access pattern and detect sequential scans

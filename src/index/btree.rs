@@ -403,22 +403,6 @@ impl BTree {
         Self::with_config(storage_path, BTreeConfig::default())
     }
     
-    /// Create with custom configuration and file manager
-    pub fn with_config_and_manager(
-        storage_path: PathBuf,
-        config: BTreeConfig,
-        file_manager: Arc<FileRefManager>,
-    ) -> Result<Self> {
-        // Acquire file handle first
-        let file_handle = file_manager.acquire(&storage_path)?;
-        
-        let mut btree = Self::with_config(storage_path, config)?;
-        btree.file_manager = Some(file_manager);
-        btree._file_handle = Some(file_handle);
-        
-        Ok(btree)
-    }
-    
     /// Create with custom configuration
     pub fn with_config(storage_path: PathBuf, config: BTreeConfig) -> Result<Self> {
         // Create parent directory
@@ -1232,49 +1216,6 @@ impl BTree {
         Ok(results)
     }
     
-    /// Range query with detailed profiling
-    /// Returns (results, RangeQueryProfile)
-    pub fn range_with_profile(&self, start: &u64, end: &u64) -> Result<(Vec<(u64, u64)>, RangeQueryProfile)> {
-        use std::time::Instant;
-        
-        let total_start = Instant::now();
-        
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        if root_id == 0 {
-            return Ok((Vec::new(), RangeQueryProfile::default()));
-        }
-        
-        // Step 1: Find first leaf
-        let find_start = Instant::now();
-        let first_leaf_id = self.find_leaf_for_key(root_id, *start)?;
-        let find_duration = find_start.elapsed();
-        
-        // Step 2: Scan leaf chain with profiling
-        let scan_start = Instant::now();
-        let mut results = Vec::new();
-        let mut pages_scanned = 0;
-        let mut keys_examined = 0;
-        
-        self.scan_leaf_chain_with_stats(first_leaf_id, *start, *end, &mut results, 
-                                        &mut pages_scanned, &mut keys_examined)?;
-        let scan_duration = scan_start.elapsed();
-        
-        let total_duration = total_start.elapsed();
-        
-        let profile = RangeQueryProfile {
-            find_leaf_us: find_duration.as_micros() as u64,
-            scan_us: scan_duration.as_micros() as u64,
-            total_us: total_duration.as_micros() as u64,
-            pages_scanned,
-            keys_examined,
-            results_found: results.len(),
-        };
-        
-        Ok((results, profile))
-    }
-    
     /// Scan leaf chain with statistics
     fn scan_leaf_chain_with_stats(&self, start_leaf_id: u64, start: u64, end: u64, 
                                    results: &mut Vec<(u64, u64)>,
@@ -1517,34 +1458,52 @@ impl BTree {
     pub fn min_key(&self) -> Result<Option<u64>> {
         let root_id = *self.root_page_id.read()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        // 🔧 Fix: Empty tree (root_id == 0)
+
         if root_id == 0 {
             return Ok(None);
         }
-        
-        let root_page = self.load_page(root_id)?;
-        let page = root_page.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        Ok(page.keys.first().copied())
+
+        // Traverse to the leftmost leaf
+        let mut page_id = root_id;
+        loop {
+            let page_arc = self.load_page(page_id)?;
+            let page = page_arc.read()
+                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+
+            if page.is_leaf {
+                return Ok(page.keys.first().copied());
+            }
+            page_id = match page.children.first() {
+                Some(&id) => id,
+                None => return Ok(page.keys.first().copied()),
+            };
+        }
     }
-    
+
     /// Get max key
     pub fn max_key(&self) -> Result<Option<u64>> {
         let root_id = *self.root_page_id.read()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        // 🔧 Fix: Empty tree (root_id == 0)
+
         if root_id == 0 {
             return Ok(None);
         }
-        
-        let root_page = self.load_page(root_id)?;
-        let page = root_page.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        Ok(page.keys.last().copied())
+
+        // Traverse to the rightmost leaf
+        let mut page_id = root_id;
+        loop {
+            let page_arc = self.load_page(page_id)?;
+            let page = page_arc.read()
+                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+
+            if page.is_leaf {
+                return Ok(page.keys.last().copied());
+            }
+            page_id = match page.children.last() {
+                Some(&id) => id,
+                None => return Ok(page.keys.last().copied()),
+            };
+        }
     }
 }
 

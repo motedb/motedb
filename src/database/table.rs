@@ -3,7 +3,7 @@
 //! Extracted from database_legacy.rs
 //! Contains table schema management and helper methods
 
-use crate::types::{TableSchema, IndexDef, RowId};
+use crate::types::{TableSchema, RowId};
 use crate::Result;
 use std::sync::Arc;
 
@@ -138,59 +138,6 @@ impl MoteDB {
         self.table_registry.table_exists(table_name)
     }
 
-    /// Get total disk usage in bytes (WAL + LSM + indexes)
-    pub fn disk_usage(&self) -> u64 {
-        let mut total: u64 = 0;
-
-        // WAL directory
-        if let Ok(entries) = std::fs::read_dir(self.path.join("wal")) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-
-        // LSM directory
-        if let Ok(entries) = std::fs::read_dir(self.path.join("lsm")) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-
-        // Indexes directory
-        if let Ok(entries) = std::fs::read_dir(self.path.join("indexes")) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
-            }
-        }
-
-        total
-    }
-    
-    /// Add index to existing table
-    /// 
-    /// # Example
-    /// ```ignore
-    /// use motedb::types::{IndexDef, IndexType};
-    /// 
-    /// let index = IndexDef::new(
-    ///     "users_name_idx".into(),
-    ///     "users".into(),
-    ///     "name".into(),
-    ///     IndexType::FullText,
-    /// );
-    /// 
-    /// db.add_table_index(index)?;
-    /// ```
-    pub fn add_table_index(&self, index: IndexDef) -> Result<()> {
-        self.table_registry.add_index(index)
-    }
-    
     // ==================== Internal Helper Methods ====================
 
     /// Make composite key from table name and row ID
@@ -214,11 +161,6 @@ impl MoteDB {
         table_id as u64
     }
 
-    /// 🚀 P2: Get row cache for statistics and monitoring
-    pub fn get_row_cache(&self) -> &std::sync::Arc<crate::cache::RowCache> {
-        &self.row_cache
-    }
-    
     /// Decode row data from LSM storage format
     /// 
     /// Internal helper for query operations

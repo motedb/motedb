@@ -107,9 +107,6 @@ pub struct ColumnDef {
     pub auto_increment_start: Option<i64>,
 }
 
-/// Alias for SQL compatibility
-pub type Column = ColumnDef;
-
 impl ColumnDef {
     pub fn new(name: String, col_type: ColumnType, position: usize) -> Self {
         Self {
@@ -388,13 +385,16 @@ impl TableSchema {
         for (i, col) in self.columns.iter().enumerate() {
             let value = &row[i];
             
-            // Check null constraint
-            if !col.nullable && matches!(value, crate::types::Value::Null) {
+            // Check null constraint (skip AUTO_INCREMENT — system fills value)
+            if !col.nullable && !col.auto_increment && matches!(value, crate::types::Value::Null) {
                 return Err(format!("Column '{}' cannot be null", col.name));
             }
 
             // Type checking
             let type_match = match (&col.col_type, value) {
+                // NULL is valid for any nullable column
+                (_, crate::types::Value::Null) if col.nullable => true,
+
                 // New SQL types
                 (ColumnType::Integer, crate::types::Value::Integer(_)) => true,
                 (ColumnType::Float, crate::types::Value::Float(_)) => true,
@@ -485,5 +485,13 @@ mod tests {
         // Invalid: wrong column count
         let row = vec![Value::Timestamp(Timestamp::from_micros(123))];
         assert!(schema.validate_row(&row).is_err());
+    }
+
+    #[test]
+    fn test_ttl_duration_display() {
+        assert_eq!(format!("{}", TTLDuration::from_days(7)), "7d");
+        assert_eq!(format!("{}", TTLDuration::from_hours(12)), "12h");
+        assert_eq!(format!("{}", TTLDuration::from_mins(30)), "30m");
+        assert_eq!(format!("{}", TTLDuration::from_secs(3600)), "1h");
     }
 }

@@ -189,17 +189,17 @@ impl MoteDB {
         
         for (composite_key, value_bytes) in memtable_entries {
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-            
-            // Zero-copy optimization: extract timestamp directly from bincode bytes
-            if value_bytes.len() >= 20 {
-                let ts_bytes: [u8; 8] = [
-                    value_bytes[12], value_bytes[13], value_bytes[14], value_bytes[15],
-                    value_bytes[16], value_bytes[17], value_bytes[18], value_bytes[19],
-                ];
-                let timestamp = i64::from_le_bytes(ts_bytes);
-                
-                if timestamp >= start && timestamp <= end {
-                    row_ids.push(row_id);
+
+            // Decode row and find timestamp value by checking all columns
+            if let Ok(row) = crate::storage::row_format::decode_any(&value_bytes) {
+                for val in row.iter() {
+                    if let crate::types::Value::Timestamp(ts) = val {
+                        let timestamp = ts.as_micros();
+                        if timestamp >= start && timestamp <= end {
+                            row_ids.push(row_id);
+                        }
+                        break;
+                    }
                 }
             }
         }

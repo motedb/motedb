@@ -103,6 +103,20 @@ pub enum ScanMethod {
     },
 }
 
+impl ScanMethod {
+    pub fn table_name(&self) -> &str {
+        match self {
+            ScanMethod::FullScan { table } |
+            ScanMethod::PointQuery { table, .. } |
+            ScanMethod::RangeQuery { table, .. } |
+            ScanMethod::TextSearch { table, .. } |
+            ScanMethod::VectorSearch { table, .. } |
+            ScanMethod::SpatialRange { table, .. } |
+            ScanMethod::PrimaryKeyScan { table, .. } => table,
+        }
+    }
+}
+
 /// Index statistics for cost estimation
 #[derive(Debug, Clone)]
 pub struct IndexStats {
@@ -145,9 +159,12 @@ impl IndexStats {
 pub struct QueryOptimizer {
     /// Database reference
     db: Arc<MoteDB>,
-    
+
     /// Index statistics cache
     index_stats: HashMap<String, IndexStats>,
+
+    /// Bind parameters for resolving Expr::Parameter nodes inline (avoids AST clone)
+    params: Vec<crate::types::Value>,
     
     /// Cost model parameters
     cost_params: CostParameters,
@@ -183,6 +200,30 @@ impl QueryOptimizer {
             db,
             index_stats: HashMap::new(),
             cost_params: CostParameters::default(),
+            params: Vec::new(),
+        }
+    }
+
+    /// Set bind parameters for this optimization pass.
+    pub fn set_params(&mut self, params: Vec<crate::types::Value>) {
+        self.params = params;
+    }
+
+    /// Clear bind parameters after optimization.
+    pub fn clear_params(&mut self) {
+        self.params.clear();
+    }
+
+    /// Resolve an expression to a literal Value if possible.
+    /// Handles Literal directly and Parameter(idx) via bound params.
+    fn resolve_to_value(&self, expr: &crate::sql::ast::Expr) -> Option<crate::types::Value> {
+        use crate::sql::ast::Expr;
+        match expr {
+            Expr::Literal(v) => Some(v.clone()),
+            Expr::Parameter(idx) if *idx > 0 => {
+                self.params.get(idx - 1).cloned()
+            }
+            _ => None,
         }
     }
     
@@ -248,7 +289,7 @@ impl QueryOptimizer {
         
         // Analyze WHERE clause and generate candidate plans
         let candidates = self.generate_candidate_plans(&table_name, where_clause, &schema)?;
-        
+
         // Select best plan based on cost
         let best_plan = candidates.into_iter()
             .min_by(|a, b| {
@@ -289,7 +330,7 @@ impl QueryOptimizer {
         
         // Analyze WHERE clause for index opportunities
         self.analyze_where_clause(table_name, where_clause, &mut plans)?;
-        
+
         Ok(plans)
     }
     
@@ -332,12 +373,16 @@ impl QueryOptimizer {
                 self.analyze_where_clause(table_name, right, plans)?;
             }
             
-            // Point query: col = value
+            // Point query: col = value (supports Literal AND Parameter)
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                if let (Expr::Column(col), Expr::Literal(val)) = (left.as_ref(), right.as_ref()) {
-                    self.try_point_query_plan(table_name, col, val.clone(), plans)?;
-                } else if let (Expr::Literal(val), Expr::Column(col)) = (left.as_ref(), right.as_ref()) {
-                    self.try_point_query_plan(table_name, col, val.clone(), plans)?;
+                if let Some(val) = self.resolve_to_value(right) {
+                    if let Expr::Column(col) = left.as_ref() {
+                        self.try_point_query_plan(table_name, col, val, plans)?;
+                    }
+                } else if let Some(val) = self.resolve_to_value(left) {
+                    if let Expr::Column(col) = right.as_ref() {
+                        self.try_point_query_plan(table_name, col, val, plans)?;
+                    }
                 }
             }
             
@@ -360,7 +405,8 @@ impl QueryOptimizer {
         let index_name = format!("{}.{}", table_name, column);
 
         // 🚀 Fast path: AUTO_INCREMENT primary key can use direct LSM get (no column index needed)
-        let is_auto_increment_pk = self.db.table_registry.get_table(table_name)
+        let table_result = self.db.table_registry.get_table(table_name);
+        let is_auto_increment_pk = table_result
             .ok()
             .map(|schema| {
                 schema.primary_key()
@@ -633,7 +679,9 @@ impl QueryOptimizer {
 
     /// Estimate table size from LSM metadata
     fn estimate_table_size(&self, table_name: &str) -> usize {
-        self.db.estimate_table_row_count(table_name).unwrap_or(1_000)
+        self.db.estimate_table_row_count(table_name)
+            .unwrap_or(1_000)
+            .max(1)  // Floor of 1 to avoid cost=0 for FullScan
     }
     
     /// Calculate cost of full table scan

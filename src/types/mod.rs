@@ -10,7 +10,7 @@ pub use tensor::Tensor;
 pub use spatial::{Geometry, Point, Point3D, BoundingBox, BoundingBox3D};
 pub use text::{Text, TextDoc};
 pub use timestamp::Timestamp;
-pub use table::{TableSchema, ColumnDef, ColumnType, IndexDef, IndexType, Column, TableType, TTLDuration};
+pub use table::{TableSchema, ColumnDef, ColumnType, IndexDef, IndexType, TableType, TTLDuration};
 
 use serde::{Deserialize, Serialize, Deserializer, Serializer};
 use std::sync::Arc;
@@ -23,26 +23,25 @@ impl ArcVec {
     pub fn new(vec: Vec<f32>) -> Self {
         ArcVec(Arc::new(vec))
     }
-    
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    
+
     pub fn iter(&self) -> std::slice::Iter<'_, f32> {
         self.0.iter()
     }
-    
-    pub fn as_slice(&self) -> &[f32] {
-        self.0.as_ref()
-    }
-    
-    /// Get a cloned Vec<f32> (for APIs that need owned Vec)
+
     pub fn to_vec(&self) -> Vec<f32> {
         (*self.0).clone()
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        self.0.as_ref()
     }
 }
 
@@ -66,7 +65,7 @@ impl<'de> Deserialize<'de> for ArcVec {
 }
 
 /// Unified value type supporting all data modalities
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     /// Integer value
     Integer(i64),
@@ -120,6 +119,40 @@ impl PartialOrd for Value {
             (Value::Timestamp(a), Value::Float(b)) => (a.as_micros() as f64).partial_cmp(b),
             (Value::Float(a), Value::Timestamp(b)) => a.partial_cmp(&(b.as_micros() as f64)),
             _ => None,
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Null, Value::Null) => true,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            // Cross-type: Integer == Float
+            (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), Value::Integer(b)) => *a == (*b as f64),
+            _ => false,
+        }
+    }
+}
+impl Eq for Value {}
+
+impl std::hash::Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Integer(i) => i.hash(state),
+            Value::Float(f) => f.to_bits().hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::Timestamp(t) => t.as_micros().hash(state),
+            Value::Null => {}
+            // For complex types, use Debug format as hash key
+            other => format!("{:?}", other).hash(state),
         }
     }
 }

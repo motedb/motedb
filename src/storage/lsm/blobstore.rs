@@ -132,48 +132,6 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Garbage-collect blob files that contain no live references.
-    ///
-    /// `live_refs` is the set of (file_id, offset) pairs still referenced by SSTables.
-    /// Blob files with no live refs are deleted.
-    pub fn gc_blob_files(&self, live_refs: &std::collections::HashSet<(u32, u64)>) -> Result<usize> {
-        let mut removed = 0;
-
-        // Collect live file IDs
-        let live_file_ids: std::collections::HashSet<u32> =
-            live_refs.iter().map(|(fid, _)| *fid).collect();
-
-        // Scan blob directory
-        let entries: Vec<_> = std::fs::read_dir(&self.dir)?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        let state = self.state.lock()
-            .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
-
-        for entry in entries {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".blob") {
-                    if let Some(id_str) = name.strip_suffix(".blob") {
-                        if let Ok(file_id) = id_str.parse::<u32>() {
-                            // Never delete the current active file
-                            if file_id == state.current_file_id {
-                                continue;
-                            }
-                            // Delete if no live references to this file
-                            if !live_file_ids.contains(&file_id)
-                                && std::fs::remove_file(entry.path()).is_ok() {
-                                    removed += 1;
-                                }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(removed)
-    }
-
     // Internal helpers
 
     fn find_next_file_id(dir: &Path) -> Result<u32> {

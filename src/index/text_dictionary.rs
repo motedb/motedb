@@ -208,42 +208,9 @@ impl ChunkedDictionary {
         None
     }
     
-    /// Get token from TermId (reverse lookup, scans chunks on demand)
-    pub fn get_token(&self, term_id: TermId) -> Option<String> {
-        // Check cache first
-        let cache = self.cache.read();
-        for (_, chunk) in cache.iter() {
-            for (token, tid) in &chunk.entries {
-                if *tid == term_id {
-                    return Some(token.clone());
-                }
-            }
-        }
-        drop(cache);
-        
-        // Scan all chunks (expensive, but rare operation)
-        let meta = self.metadata.read();
-        for chunk_id in 0..meta.num_chunks {
-            if let Ok(chunk) = self.load_chunk(chunk_id) {
-                for (token, tid) in &chunk.entries {
-                    if *tid == term_id {
-                        return Some(token.clone());
-                    }
-                }
-            }
-        }
-        
-        None
-    }
-    
     /// Total number of terms
     pub fn len(&self) -> usize {
         self.metadata.read().total_terms
-    }
-    
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
     
     /// Flush all dirty chunks to disk and clear cache to free memory

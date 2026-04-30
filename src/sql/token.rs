@@ -172,6 +172,7 @@ pub enum TokenType {
     False,
     
     // Special
+    Parameter(usize),  // ? or ?1, ?2, ... (bind variable)
     Eof,
 }
 

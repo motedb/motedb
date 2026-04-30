@@ -302,7 +302,7 @@ impl LSMEngine {
                     .filter_map(|m| {
                         let stem = m.path.file_stem()?.to_str()?;
                         // Strip any "lN_" prefix (l0_, l1_, l2_, etc.)
-                        let id_str = stem.split('_').last()?;
+                        let id_str = stem.split('_').next_back()?;
                         id_str.parse::<u64>().ok()
                     })
                     .max()
@@ -1531,19 +1531,6 @@ impl LSMEngine {
         Ok(())
     }
     
-    /// Scan all MemTable entries (for debugging) - Legacy API
-    /// 
-    /// ⚠️ Prefer scan_all_memtable_with() for zero-copy iteration
-    pub fn scan_all_memtable(&self) -> Result<Vec<(Key, Vec<u8>)>> {
-        // 🚀 P3 优化：预分配容量（估算全表大小）
-        let mut results = Vec::with_capacity(1000);
-        self.scan_all_memtable_with(|k, v| {
-            results.push((k, v.to_vec()));
-            Ok(())
-        })?;
-        Ok(results)
-    }
-    
     /// 🔧 优化方法：只扫描增量数据 (active + immutable MemTable) - Zero-copy version
     /// 已 flush 到 SSTable 的数据应该走持久化索引 + LRU 缓存
     /// 
@@ -1632,6 +1619,7 @@ impl LSMEngine {
         for memtable in immutable.iter() {
             let entries = memtable.scan_all()?;
             for (k, entry) in entries {
+                if entry.deleted { continue; }
                 match &entry.data {
                     ValueData::Inline(d) => f(k, d)?,
                     ValueData::Blob(_) => {},
@@ -1652,66 +1640,6 @@ impl LSMEngine {
     /// 🆕 Public API: Get immutable queue size
     pub fn immutable_queue_len(&self) -> usize {
         self.immutable.read().len()
-    }
-    
-    /// 🆕 Scan all keys with a specific prefix (for table scanning)
-    /// 
-    /// ## Use Case
-    /// - Full table scan: scan_prefix(table_prefix)
-    /// - Returns all keys starting with the prefix
-    /// 
-    /// ## Implementation
-    /// - Composite keys use high 32 bits as table hash
-    /// - Prefix match: (key >> 32) == prefix
-    /// 
-    /// ## Performance
-    /// - Same as scan_range() but filters by prefix
-    /// - O(N log N) where N = matching keys
-    /// 
-    /// # Example
-    /// ```ignore
-    /// // Scan all rows in table "users" (prefix = hash("users"))
-    /// let rows = engine.scan_prefix(table_prefix)?;
-    /// ```ignore
-    pub fn scan_prefix(&self, prefix: Key) -> Result<Vec<(Key, Value)>> {
-        // Convert prefix to range scan: [prefix << 32, (prefix + 1) << 32)
-        let start_key = prefix << 32;
-        let end_key = (prefix + 1) << 32;
-        self.scan_range(start_key, end_key)
-    }
-
-    /// 🆕 Zero-copy scan with prefix and callback
-    /// 
-    /// ## Performance Benefits
-    /// - No Vec allocation (saves memory)
-    /// - Early termination support (callback can return Err)
-    /// - Streaming processing (constant memory usage)
-    /// 
-    /// ## Use Case
-    /// ```ignore
-    /// engine.scan_prefix_with(table_prefix, |key, value| {
-    ///     if value.timestamp <= snapshot_ts {
-    ///         process_row(key, value)?;
-    ///     }
-    ///     Ok(())
-    /// })?;
-    /// ```ignore
-    pub fn scan_prefix_with<F>(&self, prefix: Key, mut callback: F) -> Result<()>
-    where
-        F: FnMut(Key, &Value) -> Result<()>,
-    {
-        // Use range scan instead of scan_all + filter
-        let start_key = prefix << 32;
-        let end_key = (prefix + 1) << 32;
-        let results = self.scan_range(start_key, end_key)?;
-
-        for (key, value) in &results {
-            if !value.deleted {
-                callback(*key, value)?;
-            }
-        }
-
-        Ok(())
     }
     
     /// 🚀 Complete range scan: MemTable + Immutable + SSTables
@@ -1777,19 +1705,6 @@ impl LSMEngine {
         self.compaction_worker.level_stats()
     }
     
-    /// 🆕 P2.4: Get all SSTable paths for a table (for parallel scanning)
-    /// 
-    /// Returns paths of all SSTables that may contain data for the given table prefix.
-    /// Used by parallel scan to distribute work across threads.
-    pub fn get_sstables_for_table(&self, _table_prefix: u64) -> Result<Vec<PathBuf>> {
-        // For now, return all SSTables (could optimize to filter by key range)
-        let sstable_metas = self.compaction_worker.get_all_sstables()?;
-        
-        Ok(sstable_metas.iter()
-            .map(|meta| meta.path.clone())
-            .collect())
-    }
-    
     /// Estimate key count in a given range (fast, O(1))
     /// 
     /// Uses SSTable metadata to estimate count without reading actual data.
@@ -1824,16 +1739,6 @@ impl LSMEngine {
         }
         
         Ok(estimated_count)
-    }
-    
-    /// ✨ P2 Phase 3: Get compaction statistics
-    pub fn get_compaction_stats(&self) -> Result<crate::storage::lsm::CompactionStats> {
-        self.compaction_worker.stats()
-    }
-    
-    /// ✨ P2 Phase 3: Get level statistics (level, file_count, total_size)
-    pub fn get_level_stats(&self) -> Result<Vec<(usize, usize, u64)>> {
-        self.compaction_worker.level_stats()
     }
     
     /// 🚀 流式范围扫描（批量迭代器，内存友好）
@@ -1916,6 +1821,8 @@ impl LSMEngine {
         // Loop until we get a consistent snapshot (epoch stable across the entire snapshot).
         // This prevents data loss when auto-flush rotates MemTable → Immutable → SSTable
         // or when compaction replaces SSTables concurrently with our scan.
+        const MAX_RETRIES: u32 = 10;
+        let mut retries = 0;
         loop {
             sources.clear();
 
@@ -1964,14 +1871,20 @@ impl LSMEngine {
 
                 let cached = match self.sstable_cache.get_or_open(&meta.path) {
                     Ok(cached) => cached,
-                    Err(_) => continue,
+                    Err(e) => {
+                        debug_log!("[scan_range_streaming] Failed to open SSTable {:?}: {:?}", meta.path, e);
+                        continue;
+                    }
                 };
 
                 let entries = {
                     let sstable = cached.handle.read();
                     match sstable.scan(start, end) {
                         Ok(entries) => entries,
-                        Err(_) => continue,
+                        Err(e) => {
+                            debug_log!("[scan_range_streaming] Failed to scan SSTable {:?}: {:?}", meta.path, e);
+                            continue;
+                        }
                     }
                 };
 
@@ -1985,6 +1898,13 @@ impl LSMEngine {
             let cmp_epoch_after = self.compaction_worker.compaction_epoch().load(Ordering::Acquire);
             if rot_epoch_after == rot_epoch_before && cmp_epoch_after == cmp_epoch_before {
                 break; // Consistent snapshot
+            }
+            retries += 1;
+            if retries >= MAX_RETRIES {
+                return Err(crate::error::StorageError::ResourceExhausted(format!(
+                    "scan_range_streaming: failed to get consistent snapshot after {} retries (rotation_epoch: {}→{}, compaction_epoch: {}→{})",
+                    MAX_RETRIES, rot_epoch_before, rot_epoch_after, cmp_epoch_before, cmp_epoch_after
+                )));
             }
         }
 

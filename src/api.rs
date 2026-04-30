@@ -21,6 +21,26 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Pre-computed metadata for fast PK SELECT execution.
+#[allow(dead_code)]
+struct FastPkMeta {
+    table_name: String,
+    col_name: String,
+    param_idx: usize,
+    is_star: bool,
+    select_col_positions: Vec<usize>,
+    is_auto_increment: bool,
+    column_names: Arc<Vec<String>>,
+    schema: Arc<crate::types::TableSchema>,
+}
+
+/// Cached statement entry — statement + optional fast-PK metadata
+struct CachedStmt {
+    stmt: Arc<Statement>,
+    /// Pre-computed fast PK path metadata (set on second call if pattern matches)
+    fast_pk: Option<FastPkMeta>,
+}
+
 /// MoteDB 数据库实例
 ///
 /// # 快速开始
@@ -78,9 +98,11 @@ use std::sync::Arc;
 /// - `close()`: 关闭数据库
 pub struct Database {
     inner: Arc<MoteDB>,
-    /// 🚀 Prepared statement cache: SQL string → parsed Statement
+    /// 🚀 Prepared statement cache: SQL string → CachedStmt
     /// Uses RwLock for concurrent reads + Arc<Statement> for O(1) clone on cache hit
-    stmt_cache: Arc<parking_lot::RwLock<LruCache<String, Arc<Statement>>>>,
+    stmt_cache: Arc<parking_lot::RwLock<LruCache<String, CachedStmt>>>,
+    /// Reused QueryExecutor — avoids per-call allocation of pattern_cache, optimizer state
+    query_executor: crate::sql::QueryExecutor,
 }
 
 impl Database {
@@ -95,9 +117,12 @@ impl Database {
     /// let db = Database::create("data.mote")?;
     /// ```
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let inner = Arc::new(MoteDB::create(path)?);
+        let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
-            inner: Arc::new(MoteDB::create(path)?),
+            inner,
             stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            query_executor,
         })
     }
 
@@ -114,9 +139,12 @@ impl Database {
     /// let db = Database::create_with_config("data.mote", config)?;
     /// ```
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        let inner = Arc::new(MoteDB::create_with_config(path, config)?);
+        let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
-            inner: Arc::new(MoteDB::create_with_config(path, config)?),
+            inner,
             stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            query_executor,
         })
     }
 
@@ -127,9 +155,12 @@ impl Database {
     /// let db = Database::open("data.mote")?;
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let inner = Arc::new(MoteDB::open(path)?);
+        let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
-            inner: Arc::new(MoteDB::open(path)?),
+            inner,
             stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            query_executor,
         })
     }
 
@@ -141,9 +172,12 @@ impl Database {
     /// let db = Database::open_with_config("data.mote", config)?;
     /// ```
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        let inner = Arc::new(MoteDB::open_with_config(path, config)?);
+        let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
-            inner: Arc::new(MoteDB::open_with_config(path, config)?),
+            inner,
             stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            query_executor,
         })
     }
 
@@ -241,11 +275,9 @@ impl Database {
     /// db.execute("CREATE VECTOR INDEX docs_vec ON docs(embedding)")?;
     /// ```
     pub fn execute(&self, sql: &str) -> Result<StreamingQueryResult> {
-        use crate::sql::{Lexer, Parser, QueryExecutor};
+        use crate::sql::{Lexer, Parser};
 
         // 🚀 Fast path: simple INSERT INTO <table> VALUES (...)
-        // Bypasses tokenizer + parser + cache for the most common write pattern.
-        // Handles: INSERT INTO table VALUES (v1, v2, ...)
         if let Some(result) = self.try_fast_insert(sql)? {
             return Ok(result);
         }
@@ -261,37 +293,253 @@ impl Database {
         }
 
         // 🚀 Fast path: SELECT ... FROM <table> WHERE <pk> = <value>
-        // Bypasses ~280µs of tokenizer + parser overhead for the most common read pattern.
         if let Some(result) = self.try_fast_select(sql)? {
             return Ok(result);
         }
 
         // 🚀 Prepared statement cache: skip re-parsing on repeated queries
         let statement: Arc<Statement> = {
-            // Fast path: read lock for cache hits (concurrent with other readers)
             let read_cache = self.stmt_cache.read();
-            if let Some(stmt) = read_cache.peek(sql) {
-                Arc::clone(stmt)
+            if let Some(cached) = read_cache.peek(sql) {
+                Arc::clone(&cached.stmt)
             } else {
                 drop(read_cache);
                 let mut cache = self.stmt_cache.write();
-                if let Some(stmt) = cache.get(sql) {
-                    Arc::clone(stmt)
+                if let Some(cached) = cache.get(sql) {
+                    Arc::clone(&cached.stmt)
                 } else {
                     let mut lexer = Lexer::new(sql);
                     let tokens = lexer.tokenize()?;
                     let mut parser = Parser::new(tokens);
                     let stmt = parser.parse()?;
                     let stmt_arc = Arc::new(stmt);
-                    cache.put(sql.to_string(), Arc::clone(&stmt_arc));
+                    cache.put(sql.to_string(), CachedStmt { stmt: Arc::clone(&stmt_arc), fast_pk: None });
                     stmt_arc
                 }
             }
         };
 
-        let executor = QueryExecutor::new(self.inner.clone());
-        executor.execute_streaming_ref(&statement)
+        // Reuse shared QueryExecutor (preserves pattern_cache + optimizer state)
+        self.query_executor.reset_last_insert_id();
+        self.query_executor.execute_streaming_ref(&statement)
     }
+
+    /// Execute a parameterized query.
+    ///
+    /// The SQL string is parsed once and cached (by the same LRU statement cache
+    /// as `execute()`). On subsequent calls with the same SQL text, the cached
+    /// AST is reused — only the bind values change. This eliminates the
+    /// Lexer → Parser overhead for repeated queries.
+    ///
+    /// Use `?` for positional parameters:
+    /// ```ignore
+    /// // First call: parses + caches
+    /// let result = db.execute_prepared("SELECT * FROM users WHERE id = ?", vec![Value::Integer(42)])?;
+    /// // Second call: cache hit, skips parser
+    /// let result = db.execute_prepared("SELECT * FROM users WHERE id = ?", vec![Value::Integer(99)])?;
+    /// ```
+    pub fn execute_prepared(&self, sql: &str, params: Vec<Value>) -> Result<StreamingQueryResult> {
+        use crate::sql::{Lexer, Parser};
+
+        // Get or parse the statement — check for cached fast PK metadata
+        let (statement, cached_fast_pk): (Arc<Statement>, bool) = {
+            let read_cache = self.stmt_cache.read();
+            if let Some(cached) = read_cache.peek(sql) {
+                // 🚀 Fast path: use pre-computed PK metadata
+                if let Some(ref meta) = cached.fast_pk {
+                    let result = self.execute_fast_pk_with_meta(meta, &params)?;
+                    return Ok(result);
+                }
+                (Arc::clone(&cached.stmt), false)
+            } else {
+                drop(read_cache);
+                let mut cache = self.stmt_cache.write();
+                if let Some(cached) = cache.get(sql) {
+                    if let Some(ref meta) = cached.fast_pk {
+                        let result = self.execute_fast_pk_with_meta(meta, &params)?;
+                        return Ok(result);
+                    }
+                    (Arc::clone(&cached.stmt), false)
+                } else {
+                    let mut lexer = Lexer::new(sql);
+                    let tokens = lexer.tokenize()?;
+                    let mut parser = Parser::new(tokens);
+                    let stmt = parser.parse()?;
+                    let stmt_arc = Arc::new(stmt);
+                    cache.put(sql.to_string(), CachedStmt { stmt: Arc::clone(&stmt_arc), fast_pk: None });
+                    (stmt_arc, true)
+                }
+            }
+        };
+
+        // 🚀 First call (no fast_pk yet): detect pattern and cache metadata
+        if cached_fast_pk {
+            if let Some(meta) = Self::detect_fast_pk_pattern(&statement, &self.inner)? {
+                // Cache the metadata for future calls
+                {
+                    let mut cache = self.stmt_cache.write();
+                    if let Some(cached) = cache.get_mut(sql) {
+                        cached.fast_pk = Some(meta);
+                    }
+                }
+                // Execute using the new metadata
+                let read_cache = self.stmt_cache.read();
+                if let Some(cached) = read_cache.peek(sql) {
+                    if let Some(ref meta) = cached.fast_pk {
+                        let result = self.execute_fast_pk_with_meta(meta, &params)?;
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
+        // Fall through: not a fast PK pattern or first call — use full path
+        self.query_executor.reset_last_insert_id();
+
+        // Validate parameter count
+        if !params.is_empty() || matches!(statement.as_ref(), Statement::Select(s) if s.where_clause.is_some()) {
+            let max_idx = crate::sql::QueryExecutor::max_parameter_index(&statement);
+            if max_idx > 0 && params.len() < max_idx {
+                return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                    "Query has {} parameter(s) but only {} were provided", max_idx, params.len()
+                )));
+            }
+        }
+
+        self.query_executor.bind_params(params);
+        let result = self.query_executor.execute_streaming_ref(&statement);
+        self.query_executor.clear_params();
+        result
+    }
+
+    /// Detect if a statement is a simple PK SELECT pattern.
+    /// Returns pre-computed FastPkMeta if it matches.
+    fn detect_fast_pk_pattern(
+        statement: &Statement,
+        db: &MoteDB,
+    ) -> Result<Option<FastPkMeta>> {
+        use crate::sql::ast::{Statement as S, Expr, BinaryOperator, TableRef, SelectColumn};
+
+        let stmt = match statement {
+            S::Select(s) => s,
+            _ => return Ok(None),
+        };
+
+        if stmt.group_by.is_some() || stmt.having.is_some() ||
+           stmt.order_by.is_some() || stmt.limit.is_some() ||
+           stmt.offset.is_some() || stmt.distinct {
+            return Ok(None);
+        }
+
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name.as_str(),
+            _ => return Ok(None),
+        };
+
+        let (col_name, param_idx) = match stmt.where_clause.as_ref() {
+            Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) => {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(c), Expr::Parameter(idx)) => (c.as_str(), *idx),
+                    (Expr::Parameter(idx), Expr::Column(c)) => (c.as_str(), *idx),
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        let schema = match db.table_registry.get_table(table_name) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+
+        let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
+        if !is_pk { return Ok(None); }
+
+        let is_star = stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star);
+
+        let select_col_positions: Vec<usize> = if is_star {
+            vec![]
+        } else {
+            stmt.columns.iter().filter_map(|col_spec| {
+                let cname = match col_spec {
+                    SelectColumn::Column(n) => n.as_str(),
+                    SelectColumn::ColumnWithAlias(n, _) => n.as_str(),
+                    _ => return None,
+                };
+                let lookup = if cname.contains('.') { cname.rsplit('.').next().unwrap_or(cname) } else { cname };
+                schema.get_column_position(lookup)
+            }).collect()
+        };
+
+        Ok(Some(FastPkMeta {
+            table_name: table_name.to_string(),
+            col_name: col_name.to_string(),
+            param_idx,
+            is_star,
+            select_col_positions,
+            is_auto_increment: schema.is_primary_key_auto_increment(),
+            column_names: schema.column_names_arc(),
+            schema,
+        }))
+    }
+
+    /// Execute a fast PK SELECT using pre-computed metadata.
+    /// This is the hottest path — minimal overhead.
+    fn execute_fast_pk_with_meta(
+        &self,
+        meta: &FastPkMeta,
+        params: &[Value],
+    ) -> Result<StreamingQueryResult> {
+        // Get param value — direct Vec index
+        let pk_value = match params.get(meta.param_idx - 1) {
+            Some(v) => v,
+            None => return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                "Parameter ?{} is unbound", meta.param_idx
+            ))),
+        };
+
+        // Fetch row — Arc<Row> avoids cloning row data for cache hits
+        let row_opt = if meta.is_auto_increment {
+            match pk_value {
+                Value::Integer(id) if *id >= 0 => {
+                    self.inner.get_table_row_arc(&meta.table_name, *id as RowId, &meta.schema)?
+                }
+                _ => None,
+            }
+        } else {
+            let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+            let row_id = if let Some(lookup) = self.inner.pk_lookup.get(&meta.table_name) {
+                lookup.get_pk(&pk_key)
+            } else {
+                None
+            };
+            match row_id {
+                Some(rid) => self.inner.get_table_row_arc(&meta.table_name, rid, &meta.schema)?,
+                None => None,
+            }
+        };
+
+        // Project and return
+        let result_vec: Vec<Vec<Value>> = match row_opt {
+            Some(row_arc) => {
+                if meta.is_star {
+                    // Clone the values from Arc — only one clone needed
+                    vec![(*row_arc).clone()]
+                } else {
+                    vec![meta.select_col_positions.iter()
+                        .map(|&pos| row_arc.get(pos).cloned().unwrap_or(Value::Null))
+                        .collect()]
+                }
+            }
+            None => vec![],
+        };
+
+        Ok(StreamingQueryResult::SelectReady {
+            columns: (*meta.column_names).clone(),
+            rows: result_vec,
+        })
+    }
+
 
     /// Fast INSERT path: parses `INSERT INTO <table> VALUES (<literals>)` directly
     /// from the string without going through the full tokenizer + parser + cache.
@@ -370,6 +618,29 @@ impl Database {
         Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
     }
 
+    /// Find a keyword in haystack case-insensitively, requiring word boundaries.
+    /// Returns the byte offset of the keyword start, or None.
+    /// Matches " from " (space-padded), "FROM ..." (at start), or "... FROM" (at end).
+    fn find_keyword_ci(haystack: &str, keyword: &str) -> Option<usize> {
+        let klen = keyword.len();
+        let hbytes = haystack.as_bytes();
+        let kbytes = keyword.as_bytes();
+        if hbytes.len() < klen { return None; }
+
+        for i in 0..=hbytes.len() - klen {
+            // Quick check: first char must match (case-insensitive)
+            if !hbytes[i].eq_ignore_ascii_case(&kbytes[0]) { continue; }
+            // Full keyword match
+            if !hbytes[i..i+klen].eq_ignore_ascii_case(kbytes) { continue; }
+            // Word boundary before keyword
+            if i > 0 && !hbytes[i - 1].is_ascii_whitespace() { continue; }
+            // Word boundary after keyword
+            if i + klen < hbytes.len() && !hbytes[i + klen].is_ascii_whitespace() { continue; }
+            return Some(i);
+        }
+        None
+    }
+
     /// Fast SELECT path: handles `SELECT cols FROM table WHERE pk = value`
     /// Bypasses tokenizer + parser + statement cache (~280µs overhead).
     fn try_fast_select(&self, sql: &str) -> Result<Option<StreamingQueryResult>> {
@@ -380,9 +651,8 @@ impl Database {
         let after_select = trimmed[6..].trim_start();
 
         // Find "FROM" keyword (case-insensitive, word boundary)
-        let lower_select = after_select.to_ascii_lowercase();
-        let from_pos = match lower_select.find(" from ") {
-            Some(p) => p + 1, // skip leading space
+        let from_pos = match Self::find_keyword_ci(after_select, "from") {
+            Some(p) => p,
             None => return Ok(None),
         };
         let after_from = after_select[from_pos + 4..].trim_start();
@@ -394,14 +664,10 @@ impl Database {
         };
         if table_name.is_empty() { return Ok(None); }
 
-        // Check for "WHERE" keyword (at start or after space)
-        let lower_after = after_table.to_ascii_lowercase();
-        let where_pos = if lower_after.starts_with("where ") || lower_after.starts_with("where\t") {
-            0
-        } else if let Some(p) = lower_after.find(" where ") {
-            p + 1
-        } else {
-            return Ok(None);
+        // Check for "WHERE" keyword (word boundary)
+        let where_pos = match Self::find_keyword_ci(after_table, "where") {
+            Some(p) => p,
+            None => return Ok(None),
         };
         let after_where = after_table[where_pos + 5..].trim_start();
 
@@ -430,10 +696,10 @@ impl Database {
         if !is_pk { return Ok(None); }
         let is_ai = schema.is_primary_key_auto_increment();
 
-        // Fetch row using existing get_table_row (handles cache + LSM internally)
+        // Fetch row using Arc<Row> (avoids cloning row data for cache hits)
         let row_opt = if is_ai {
             match &value {
-                Value::Integer(id) if *id >= 0 => self.inner.get_table_row(table_name, *id as RowId)?,
+                Value::Integer(id) if *id >= 0 => self.inner.get_table_row_arc(table_name, *id as RowId, &schema)?,
                 _ => return Ok(None),
             }
         } else {
@@ -457,7 +723,7 @@ impl Database {
                 row_ids.into_iter().next()
             };
             match row_id {
-                Some(rid) => self.inner.get_table_row(table_name, rid)?,
+                Some(rid) => self.inner.get_table_row_arc(table_name, rid, &schema)?,
                 None => None,
             }
         };
@@ -466,19 +732,17 @@ impl Database {
         let select_part = after_select[..from_pos].trim();
         let is_star = select_part == "*";
 
-        // Build result
+        // Build result — clone values from Arc<Row>
         let result_vec: Vec<Vec<Value>> = match row_opt {
-            Some(row) => {
+            Some(row_arc) => {
                 if is_star {
-                    vec![schema.columns.iter()
-                        .map(|c| row.get(c.position).cloned().unwrap_or(Value::Null))
-                        .collect()]
+                    vec![(*row_arc).clone()]
                 } else {
                     let col_list: Vec<&str> = select_part.split(',').map(|s| s.trim()).collect();
                     let mut vals = Vec::with_capacity(col_list.len());
                     for cname in &col_list {
                         if let Some(cd) = schema.get_column(cname) {
-                            vals.push(row.get(cd.position).cloned().unwrap_or(Value::Null));
+                            vals.push(row_arc.get(cd.position).cloned().unwrap_or(Value::Null));
                         } else {
                             return Ok(None);
                         }
@@ -490,21 +754,14 @@ impl Database {
         };
 
         let column_names: Vec<String> = if is_star {
-            schema.columns.iter().map(|c| c.name.clone()).collect()
-        } else if result_vec.is_empty() {
-            select_part.split(',').map(|s| s.trim().to_string()).collect()
+            schema.column_names()
         } else {
             select_part.split(',').map(|s| s.trim().to_string()).collect()
         };
 
-        let rows = result_vec.into_iter().map(Ok);
-        Ok(Some(StreamingQueryResult::SelectStreaming {
+        Ok(Some(StreamingQueryResult::SelectReady {
             columns: column_names,
-            rows: Box::new(rows),
-            order_by: None,
-            limit: None,
-            offset: None,
-            distinct: false,
+            rows: result_vec,
         }))
     }
 
@@ -538,16 +795,21 @@ impl Database {
         };
         if table_name.is_empty() { return Ok(None); }
 
-        // Must have "SET"
-        let lower_after = after_table.to_ascii_lowercase();
-        if !lower_after.starts_with("set ") && !lower_after.starts_with("set\t") {
+        // Must have "SET" (word boundary at start)
+        if !after_table.as_bytes().get(0..3).map(|b| b.eq_ignore_ascii_case(b"set")).unwrap_or(false) {
+            return Ok(None);
+        }
+        if after_table.len() > 3 && !after_table.as_bytes()[3].is_ascii_whitespace() {
             return Ok(None);
         }
         let after_set = after_table[3..].trim_start();
 
-        // Find "WHERE" keyword
-        let lower_set = after_set.to_ascii_lowercase();
-        let where_pos = match lower_set.rfind(" where ") {
+        // Find "WHERE" keyword (word boundary, search from end for rfind semantics)
+        let where_pos = match after_set.as_bytes().windows(7).rposition(|w| {
+            w[0].is_ascii_whitespace()
+            && w[1..6].eq_ignore_ascii_case(b"where".as_ref())
+            && w[6].is_ascii_whitespace()
+        }) {
             Some(p) => p + 1,
             None => return Ok(None),
         };
@@ -623,7 +885,7 @@ impl Database {
         };
 
         // Load old row, apply updates, write back
-        let old_row = match self.inner.get_table_row(table_name, row_id)? {
+        let old_row = match self.inner.get_table_row_with_schema(table_name, row_id, &schema)? {
             Some(r) => r,
             None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
         };
@@ -663,9 +925,11 @@ impl Database {
         };
         if table_name.is_empty() { return Ok(None); }
 
-        // Check for "WHERE"
-        let lower_after = after_table.to_ascii_lowercase();
-        if !lower_after.starts_with("where ") && !lower_after.starts_with("where\t") {
+        // Check for "WHERE" (word boundary at start)
+        if !after_table.as_bytes().get(0..5).map(|b| b.eq_ignore_ascii_case(b"where")).unwrap_or(false) {
+            return Ok(None);
+        }
+        if after_table.len() > 5 && !after_table.as_bytes()[5].is_ascii_whitespace() {
             return Ok(None);
         }
         let after_where = after_table[5..].trim_start();
@@ -723,7 +987,7 @@ impl Database {
         };
 
         // Load old row, then delete
-        let old_row = match self.inner.get_table_row(table_name, row_id)? {
+        let old_row = match self.inner.get_table_row_with_schema(table_name, row_id, &schema)? {
             Some(r) => r,
             None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
         };
@@ -935,6 +1199,14 @@ impl Database {
         self.inner.batch_insert_rows_to_table(table_name, rows?)
     }
 
+    pub fn batch_insert_with_vectors_map(&self, table_name: &str, sql_rows: Vec<SqlRow>, vector_columns: &[&str]) -> Result<Vec<RowId>> {
+        let schema = self.inner.get_table_schema(table_name)?;
+        let rows: Result<Vec<Row>> = sql_rows.into_iter().map(|sql_row| {
+            crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)
+        }).collect();
+        self.batch_insert_with_vectors(table_name, rows?, vector_columns)
+    }
+
     /// 批量插入带向量的数据（自动构建向量索引）
     ///
     /// **注意：** 此方法接受底层 `Row` 类型（`Vec<Value>`），如果需要使用 HashMap，请使用 `batch_insert_with_vectors_map()`。
@@ -976,18 +1248,6 @@ impl Database {
     ///
     /// let row_ids = db.batch_insert_with_vectors_map("documents", rows, &["embedding"])?;
     /// ```
-    pub fn batch_insert_with_vectors_map(&self, table_name: &str, sql_rows: Vec<SqlRow>, vector_columns: &[&str]) -> Result<Vec<RowId>> {
-        // 获取表结构
-        let schema = self.inner.get_table_schema(table_name)?;
-        
-        // 将 SqlRow (HashMap) 转换为 Row (Vec<Value>)
-        let rows: Result<Vec<Row>> = sql_rows.into_iter().map(|sql_row| {
-            crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)
-        }).collect();
-        
-        self.batch_insert_with_vectors(table_name, rows?, vector_columns)
-    }
-
     // ============================================================================
     // 5. 索引管理
     // ============================================================================
@@ -1037,19 +1297,6 @@ impl Database {
     /// ```
     pub fn create_text_index(&self, index_name: &str) -> Result<()> {
         self.inner.create_text_index(index_name)
-    }
-
-    /// 删除索引
-    ///
-    /// # Examples
-    /// ```ignore
-    /// db.drop_index("users", "email")?;
-    /// ```
-    pub fn drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {
-        // 通过SQL执行
-        let sql = format!("DROP INDEX {} ON {}", index_name, table_name);
-        self.execute(&sql)?;
-        Ok(())
     }
 
     // ============================================================================
@@ -1201,24 +1448,6 @@ impl Database {
     }
 
     /// 3D radius search: find all points within radius
-    pub fn ioctree_radius_search(
-        &self,
-        index_name: &str,
-        center: &crate::types::Point3D,
-        radius: f64,
-    ) -> Result<Vec<(RowId, f64)>> {
-        self.inner.ioctree_radius_search(index_name, center, radius)
-    }
-
-    /// 3D range search: find all points within a 3D bounding box
-    pub fn ioctree_range_search(
-        &self,
-        index_name: &str,
-        bbox: &crate::types::BoundingBox3D,
-    ) -> Result<Vec<RowId>> {
-        self.inner.ioctree_range_query(index_name, bbox)
-    }
-
     /// 获取事务统计信息
     ///
     /// # Examples
@@ -1311,35 +1540,6 @@ impl Database {
         self.inner.update_row_in_table(table_name, row_id, old_row, new_row)
     }
 
-    /// 更新行（使用 HashMap）
-    ///
-    /// # Examples
-    /// ```ignore
-    /// use motedb::types::{Value, SqlRow};
-    /// use std::collections::HashMap;
-    ///
-    /// let mut updated_row = HashMap::new();
-    /// updated_row.insert("name".to_string(), Value::Text("Bob".into()));
-    /// updated_row.insert("age".to_string(), Value::Integer(30));
-    ///
-    /// db.update_row_map("users", 1, updated_row)?;
-    /// ```
-    pub fn update_row_map(&self, table_name: &str, row_id: RowId, sql_row: SqlRow) -> Result<()> {
-        // 先获取旧行
-        let old_row = self.inner.get_table_row(table_name, row_id)?
-            .ok_or_else(|| crate::StorageError::InvalidData(
-                format!("Row {} not found in table '{}'", row_id, table_name)
-            ))?;
-        
-        // 获取表结构
-        let schema = self.inner.get_table_schema(table_name)?;
-        
-        // 将 SqlRow (HashMap) 转换为 Row (Vec<Value>)
-        let new_row = crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)?;
-        
-        self.inner.update_row_in_table(table_name, row_id, old_row, new_row)
-    }
-
     /// 删除行（底层API，推荐使用 SQL DELETE）
     pub fn delete_row(&self, table_name: &str, row_id: RowId) -> Result<()> {
         // 先获取旧行
@@ -1350,10 +1550,6 @@ impl Database {
         self.inner.delete_row_from_table(table_name, row_id, old_row)
     }
 
-    /// 扫描表的所有行（底层API，推荐使用 SQL SELECT）
-    pub fn scan_table(&self, table_name: &str) -> Result<Vec<(RowId, Row)>> {
-        self.inner.scan_table_rows(table_name)
-    }
 }
 
 // 自动在 Drop 时关闭数据库

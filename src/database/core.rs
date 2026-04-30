@@ -28,22 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
-/// Database statistics
-#[derive(Debug, Clone)]
-pub struct DatabaseStats {
-    pub total_rows: RowId,
-    pub num_partitions: u8,
-}
-
 /// Vector index statistics
-#[derive(Debug, Clone)]
-pub struct VectorIndexStats {
-    pub total_vectors: usize,
-    pub dimension: usize,
-    pub cache_hit_rate: f32,
-    pub memory_usage: usize,
-    pub disk_usage: usize,
-}
+
 
 /// MoteDB instance
 pub struct MoteDB {
@@ -61,6 +47,11 @@ pub struct MoteDB {
 
     /// Next row ID (lock-free atomic counter)
     pub(crate) next_row_id: Arc<AtomicU64>,
+
+    /// Global write LSN — monotonically increasing counter used as the unified
+    /// timestamp for all LSM Value writes. Initialized to max(current_time_micros,
+    /// max_row_id + 1) on open, guaranteeing it exceeds any pre-existing timestamp.
+    pub(crate) write_lsn: Arc<AtomicU64>,
     
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
@@ -88,10 +79,10 @@ pub struct MoteDB {
     pub(crate) ioctree_indexes: Arc<DashMap<String, Arc<RwLock<IOctreeIndex>>>>,
     
     /// 🚀 Text indexes (FTS with single-file B-Tree) - 使用 DashMap 提升并发性能
-    pub text_indexes: Arc<DashMap<String, Arc<RwLock<TextFTSIndex>>>>,
-    
+    pub(crate) text_indexes: Arc<DashMap<String, Arc<RwLock<TextFTSIndex>>>>,
+
     /// 🚀 Column value indexes (for WHERE optimization) - 使用 DashMap 提升并发性能
-    pub column_indexes: Arc<DashMap<String, Arc<RwLock<ColumnValueIndex>>>>,
+    pub(crate) column_indexes: Arc<DashMap<String, Arc<RwLock<ColumnValueIndex>>>>,
 
     /// Columnar segment store for TimeSeries tables (Gorilla-compressed immutable segments)
     pub(crate) columnar_store: Arc<crate::storage::ColumnarStore>,
@@ -250,6 +241,13 @@ impl MoteDB {
         // Shared row ID counter
         let next_row_id = Arc::new(AtomicU64::new(0));
 
+        // Unified write LSN — start at current time micros to be higher than any row_id
+        let init_lsn = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(1);
+        let write_lsn = Arc::new(AtomicU64::new(init_lsn));
+
         // Create columnar store for TimeSeries tables (shares next_row_id and table_registry)
         let columnar_dir = db_path.join("columnar");
         let columnar_store = Arc::new(
@@ -269,6 +267,7 @@ impl MoteDB {
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
             next_row_id: next_row_id.clone(),
+            write_lsn: write_lsn.clone(),
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
@@ -340,6 +339,7 @@ impl MoteDB {
             lsm_engine: self.lsm_engine.clone(),
             timestamp_index: self.timestamp_index.clone(),
             next_row_id: self.next_row_id.clone(),
+            write_lsn: self.write_lsn.clone(),
             table_auto_increment: self.table_auto_increment.clone(),  // 🚀 Phase 4
             num_partitions: self.num_partitions,
             txn_coordinator: self.txn_coordinator.clone(),
@@ -493,6 +493,16 @@ impl MoteDB {
 
         let timestamp_index = Arc::new(RwLock::new(timestamp_idx));
 
+        // Initialize write_lsn early for WAL recovery replay.
+        // Must exceed any pre-existing timestamp (row_id or wall-clock micros).
+        let current_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(1);
+        let recovery_lsn = Arc::new(AtomicU64::new(
+            current_micros.max(max_row_id + 1).saturating_add(1_000_000)
+        ));
+
         // Phase 2: Redo — replay only committed/auto-commit records
         for records in recovered_records.values() {
             for record in records {
@@ -502,8 +512,8 @@ impl MoteDB {
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
-                        // Zero-copy: raw_data goes straight to LSM
-                        let value = crate::storage::lsm::Value::new(raw_data.clone(), composite_key);
+                        let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let value = crate::storage::lsm::Value::new(raw_data.clone(), ts);
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
@@ -513,7 +523,8 @@ impl MoteDB {
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let row_data = bincode::serialize(data)?;
-                        let value = crate::storage::lsm::Value::new(row_data, composite_key);
+                        let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let value = crate::storage::lsm::Value::new(row_data, ts);
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
@@ -522,7 +533,8 @@ impl MoteDB {
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
-                        let value = crate::storage::lsm::Value::new(raw_new.clone(), composite_key);
+                        let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let value = crate::storage::lsm::Value::new(raw_new.clone(), ts);
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
@@ -533,25 +545,28 @@ impl MoteDB {
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
 
                         let row_data = bincode::serialize(new_data)?;
-                        let value = crate::storage::lsm::Value::new(row_data, composite_key);
+                        let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let value = crate::storage::lsm::Value::new(row_data, ts);
                         lsm_engine.put(composite_key, value)?;
                         _recovered_count += 1;
                     }
-                    WALRecord::DeleteRaw { table_name, row_id, timestamp, txn_id, .. } => {
+                    WALRecord::DeleteRaw { table_name, row_id, txn_id, .. } => {
                         if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
-                        lsm_engine.delete(composite_key, *timestamp)?;
+                        let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        lsm_engine.delete(composite_key, ts)?;
                         _recovered_count += 1;
                     }
-                    WALRecord::Delete { table_name, row_id, timestamp, txn_id, .. } => {
+                    WALRecord::Delete { table_name, row_id, txn_id, .. } => {
                         if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
                         let table_id = table_registry.get_table_id(table_name)
                             .unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
 
-                        lsm_engine.delete(composite_key, *timestamp)?;
+                        let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        lsm_engine.delete(composite_key, ts)?;
                         _recovered_count += 1;
                     }
                     _ => {}
@@ -585,6 +600,9 @@ impl MoteDB {
 
         // Shared row ID counter (initialized from WAL replay)
         let next_row_id = Arc::new(AtomicU64::new(max_row_id + 1));
+
+        // Reuse the recovery_lsn as the database's write_lsn (it's already initialized high enough)
+        let write_lsn = recovery_lsn;
 
         // Create columnar store for TimeSeries tables
         let columnar_dir = db_path.join("columnar");
@@ -679,6 +697,7 @@ impl MoteDB {
             lsm_engine: lsm_engine.clone(),
             timestamp_index,
             next_row_id,
+            write_lsn,
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
@@ -1185,7 +1204,7 @@ impl MoteDB {
                 
                 // 🚀 Lazy WAL size check - only when needed
                 let wal_dir = db.path.join("wal");
-                match get_directory_size(&wal_dir) {
+                match super::helpers::dir_size(&wal_dir) {
                     Ok(wal_size) if wal_size >= config.max_wal_size_bytes => {
                         debug_log!("[AutoCheckpoint] 🔔 Trigger: WAL {}MB >= {}MB",
                             wal_size / 1024 / 1024, config.max_wal_size_bytes / 1024 / 1024);
@@ -1308,25 +1327,6 @@ impl MoteDB {
 
         Ok(file)
     }
-}
-
-/// Get total size of all files in a directory
-fn get_directory_size(dir: &std::path::Path) -> Result<u64> {
-    let mut total = 0;
-    
-    if !dir.exists() {
-        return Ok(0);
-    }
-    
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            total += metadata.len();
-        }
-    }
-    
-    Ok(total)
 }
 
 /// Automatic cleanup when database is dropped

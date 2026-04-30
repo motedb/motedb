@@ -13,7 +13,6 @@ use crate::{Result, StorageError};
 use lru::LruCache;
 use memmap2::Mmap;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
@@ -321,31 +320,6 @@ impl SQ8Vectors {
         Some(arc_qvec)
     }
 
-    /// Batch get quantized vectors
-    pub fn batch_get_quantized(&self, row_ids: &[RowId]) -> HashMap<RowId, Arc<QuantizedVector>> {
-        let mut result = HashMap::with_capacity(row_ids.len());
-        let mut uncached_ids = Vec::new();
-
-        {
-            let mut cache = self.quantized_cache.write();
-            for &row_id in row_ids {
-                if let Some(qvec) = cache.get(&row_id) {
-                    result.insert(row_id, Arc::clone(qvec));
-                } else {
-                    uncached_ids.push(row_id);
-                }
-            }
-        }
-
-        for row_id in uncached_ids {
-            if let Some(qvec) = self.get_quantized(row_id) {
-                result.insert(row_id, qvec);
-            }
-        }
-
-        result
-    }
-
     /// Insert vector (quantize and write)
     pub fn insert(&self, row_id: RowId, vector: Vec<f32>) -> Result<()> {
         if vector.len() != self.dimension {
@@ -388,16 +362,27 @@ impl SQ8Vectors {
         Ok(inserted)
     }
 
-    /// Update vector
+    /// Update vector (quantize, persist to disk, update caches)
     pub fn update(&self, row_id: RowId, vector: Vec<f32>) -> Result<bool> {
         if self.lookup_offset(row_id).is_none() {
             return Ok(false);
         }
 
+        // Quantize the new vector
+        let qvec = self.quantizer.quantize(&vector)?;
+        // Append the new quantized vector to disk (the old entry remains but
+        // the index will be updated to point to the new offset)
+        let new_offset = self.append_quantized(row_id, &qvec)?;
+
+        // Update in-memory index to point to the new disk offset
+        self.index.write().put(row_id, new_offset);
+
+        // Update raw vector cache
         {
             let mut cache = self.cache.write();
-            cache.put(row_id, Arc::new(vector.clone()));
+            cache.put(row_id, Arc::new(vector));
         }
+        // Invalidate stale quantized cache entry (next read will use new offset)
         {
             let mut qcache = self.quantized_cache.write();
             qcache.pop(&row_id);
@@ -424,15 +409,6 @@ impl SQ8Vectors {
     fn invalidate_single(&self, row_id: RowId) {
         self.cache.write().pop(&row_id);
         self.quantized_cache.write().pop(&row_id);
-    }
-
-    pub fn invalidate_batch(&self, row_ids: &[RowId]) {
-        if row_ids.is_empty() { return; }
-        let mut cache = self.cache.write();
-        for &row_id in row_ids { cache.pop(&row_id); }
-        drop(cache);
-        let mut qcache = self.quantized_cache.write();
-        for &row_id in row_ids { qcache.pop(&row_id); }
     }
 
     /// Flush: update data file header and rebuild sidecar index

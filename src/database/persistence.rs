@@ -23,25 +23,6 @@ fn trim_allocator() {
     // No explicit trimming needed.
 }
 
-/// Get total size of all files in a directory (helper for checkpoint optimization)
-fn get_directory_size(dir: &std::path::Path) -> Result<u64> {
-    let mut total = 0;
-    
-    if !dir.exists() {
-        return Ok(0);
-    }
-    
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            total += metadata.len();
-        }
-    }
-    
-    Ok(total)
-}
-
 impl MoteDB {
     /// Flush database to disk
     /// 
@@ -189,7 +170,7 @@ impl MoteDB {
         let pending_count = self.pending_updates.load(std::sync::atomic::Ordering::Relaxed);
         if pending_count == 0 {
             let wal_dir = self.path.join("wal");
-            if let Ok(wal_size) = get_directory_size(&wal_dir) {
+            if let Ok(wal_size) = super::helpers::dir_size(&wal_dir) {
                 if wal_size == 0 {
                     return Ok(());
                 }

@@ -776,11 +776,11 @@ impl DiskANNIndex {
     /// Delete vector
     pub fn delete(&self, row_id: RowId) -> Result<bool> {
         let removed = self.vectors.delete(row_id)?;
-        
+
         if removed {
             // Remove from graph
             let neighbors = self.graph.remove_node(row_id);
-            
+
             // Clean up reverse edges
             for neighbor in neighbors.iter() {  // ✅ P1: Arc auto-derefs
                 let neighbor_edges_arc = self.graph.neighbors(*neighbor);
@@ -788,8 +788,16 @@ impl DiskANNIndex {
                 neighbor_edges.retain(|&id| id != row_id);
                 self.graph.set_neighbors(*neighbor, neighbor_edges)?;
             }
+
+            // If deleted node was the medoid, pick a new one
+            {
+                let mut medoid_guard = self.medoid.write();
+                if medoid_guard.is_some_and(|m| m == row_id) {
+                    *medoid_guard = self.vectors.ids().first().copied();
+                }
+            }
         }
-        
+
         Ok(removed)
     }
     
@@ -909,55 +917,6 @@ impl DiskANNIndex {
     /// - 从向量存储中恢复图
     /// 
     /// **性能：**
-    /// - 10K节点：~700ms（14,000 v/s）
-    /// - 100K节点：~7s（14,000 v/s）
-    /// - 使用分层构建（O(N log L)）
-    /// 
-    /// **注意：**
-    /// - 重建期间不要插入新数据
-    /// - 会覆盖现有图结构
-    /// - 自动使用最优策略（分层 or 批量）
-    pub fn rebuild_full_graph(&self) -> Result<()> {
-        let _start = Instant::now();
-        
-        let all_ids = self.vectors.ids();
-        if all_ids.is_empty() {
-            return Ok(());
-        }
-        
-        // 🔥 召回率优化: 重新选择最优Medoid（最接近质心）
-        // 原因: 增量插入的Medoid（第一个向量）通常不是最优起点
-        // 新策略: 在重建时重新计算质心，选择最接近质心的向量
-        debug_log!("[DiskANN::rebuild] 🎯 Recomputing optimal medoid...");
-        let new_medoid = self.select_medoid(&all_ids);
-        let old_medoid = *self.medoid.read();
-        if old_medoid != Some(new_medoid) {
-            debug_log!("[DiskANN::rebuild] Medoid changed: {:?} → {}", old_medoid, new_medoid);
-            *self.medoid.write() = Some(new_medoid);
-        }
-        
-        // 使用batch_build_graph（会自动选择最优策略）
-        self.batch_build_graph(&all_ids)?;
-        
-        // Flush to disk
-        self.vectors.flush()?;
-        self.graph.flush()?;
-        
-        Ok(())
-    }
-    
-    /// Compact disk files (slow, full rewrite for defragmentation)
-    /// Call this periodically (e.g., every 100K inserts)
-    pub fn compact_storage(&self) -> Result<()> {
-        debug_log!("[DiskANN] Compacting storage...");
-        let _start = Instant::now();
-
-        self.graph.compact()?;
-
-        debug_log!("[DiskANN] Storage compacted in {:?}", _start.elapsed());
-        Ok(())
-    }
-    
     /// Get index statistics (with caching and sampling)
     pub fn stats(&self) -> IndexStats {
         // 1. Check cache (TTL: 60 seconds)
@@ -1160,34 +1119,6 @@ impl DiskANNIndex {
         }
         
         order
-    }
-    
-    /// Refine graph quality after batch insertion (optional)
-    /// This fixes reverse edges and improves connectivity
-    pub fn refine_graph(&self, sample_rate: f32) -> Result<()> {
-        debug_log!("[DiskANN] Refining graph quality...");
-        let _start = Instant::now();
-
-        let all_ids = self.vectors.ids();
-        let medoid_id = match *self.medoid.read() {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        
-        // Sample nodes to refine (avoid full graph traversal)
-        let sample_size = ((all_ids.len() as f32) * sample_rate) as usize;
-        let mut rng = thread_rng();
-        let sampled: Vec<_> = all_ids.choose_multiple(&mut rng, sample_size).copied().collect();
-        
-        for (i, id) in sampled.iter().enumerate() {
-            if i % 1000 == 0 && i > 0 {
-                debug_log!("[DiskANN] Refined {}/{} nodes", i, sample_size);
-            }
-            self.insert_vector_into_graph(*id, medoid_id)?;
-        }
-        
-        debug_log!("[DiskANN] Graph refinement completed in {:?}", _start.elapsed());
-        Ok(())
     }
     
     // --- Incremental Update Methods ---

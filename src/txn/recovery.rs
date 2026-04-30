@@ -428,6 +428,8 @@ impl RecoveryManager {
 mod tests {
     use super::*;
     use crate::txn::wal::WALManager;
+    use crate::txn::wal::WALConfig;
+    use crate::config::DurabilityLevel;
     use crate::txn::version_store::Snapshot;
     use crate::types::{Value, Timestamp};
     use std::collections::HashSet;
@@ -436,7 +438,8 @@ mod tests {
     #[test]
     fn test_analysis_phase() {
         let temp_dir = TempDir::new().unwrap();
-        let wal = Arc::new(WALManager::create(temp_dir.path(), 2).unwrap());
+        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let wal = Arc::new(WALManager::create_with_config(temp_dir.path(), 2, config).unwrap());
         let version_store = Arc::new(VersionStore::new());
 
         // Create WAL records
@@ -462,7 +465,8 @@ mod tests {
     #[test]
     fn test_redo_phase() {
         let temp_dir = TempDir::new().unwrap();
-        let wal = Arc::new(WALManager::create(temp_dir.path(), 2).unwrap());
+        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let wal = Arc::new(WALManager::create_with_config(temp_dir.path(), 2, config).unwrap());
         let version_store = Arc::new(VersionStore::new());
 
         // Committed transaction
@@ -491,7 +495,8 @@ mod tests {
     #[test]
     fn test_complete_recovery() {
         let temp_dir = TempDir::new().unwrap();
-        let wal = Arc::new(WALManager::create(temp_dir.path(), 2).unwrap());
+        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let wal = Arc::new(WALManager::create_with_config(temp_dir.path(), 2, config).unwrap());
         let version_store = Arc::new(VersionStore::new());
 
         // T1: Committed
@@ -516,7 +521,8 @@ mod tests {
     #[test]
     fn test_recovery_with_rollback() {
         let temp_dir = TempDir::new().unwrap();
-        let wal = Arc::new(WALManager::create(temp_dir.path(), 2).unwrap());
+        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let wal = Arc::new(WALManager::create_with_config(temp_dir.path(), 2, config).unwrap());
         let version_store = Arc::new(VersionStore::new());
 
         // T1: Explicitly rolled back
@@ -541,7 +547,8 @@ mod tests {
     #[test]
     fn test_recovery_idempotence() {
         let temp_dir = TempDir::new().unwrap();
-        let wal = Arc::new(WALManager::create(temp_dir.path(), 2).unwrap());
+        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let wal = Arc::new(WALManager::create_with_config(temp_dir.path(), 2, config).unwrap());
         let version_store = Arc::new(VersionStore::new());
 
         // Create committed transaction

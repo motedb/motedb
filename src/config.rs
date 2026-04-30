@@ -104,15 +104,7 @@ impl DurabilityLevel {
             max_wait_us: 1000,
         }
     }
-    
-    /// 创建自定义 Group Commit 配置
-    pub fn group_commit_custom(max_batch_size: usize, max_wait_us: u64) -> Self {
-        Self::GroupCommit {
-            max_batch_size,
-            max_wait_us,
-        }
-    }
-    
+
     /// 创建定期刷盘配置
     pub fn periodic(interval_ms: u64) -> Self {
         Self::Periodic { interval_ms }
@@ -372,9 +364,6 @@ pub struct DBConfig {
     /// LSM 树配置
     pub lsm_config: LSMConfig,
     
-    /// 是否启用统计信息
-    pub enable_stats: bool,
-    
     /// 🚀 P1: Row cache size (number of rows, None = use default 10000)
     ///
     /// Memory usage: ~1KB/row × cache_size
@@ -425,63 +414,6 @@ pub struct DBConfig {
 
     /// Columnar store configuration (for TimeSeries tables)
     pub columnar_config: crate::storage::columnar::config::ColumnarConfig,
-
-    /// Edge index memory limits — caps all index structures to bounded memory
-    pub edge_index: EdgeIndexConfig,
-}
-
-/// Bounded memory limits for index structures.
-///
-/// All indexes use LRU eviction when exceeding these caps.
-/// Edge devices should use `EdgeIndexConfig::for_edge()` for minimal footprint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EdgeIndexConfig {
-    /// DiskANN vector offset LRU capacity (default: 4096, edge: 512)
-    pub vector_index_capacity: usize,
-    /// DiskANN graph offset LRU capacity (default: 2048, edge: 256)
-    pub graph_index_capacity: usize,
-    /// DiskANN pinned hot node limit (default: 100, edge: 10)
-    pub graph_hot_node_limit: usize,
-    /// FTS shard counter LRU cap (default: 10000, edge: 500)
-    pub fts_shard_counter_cap: usize,
-    /// FTS pending terms auto-flush threshold (default: 200, edge: 50)
-    pub fts_pending_terms_limit: usize,
-    /// FTS pending docs auto-flush threshold (default: 2000, edge: 500)
-    pub fts_pending_docs_limit: usize,
-    /// Max in-memory version chains (default: 50000, edge: 5000)
-    pub version_store_max_entries: usize,
-    /// i-Octree LeafStore LRU slots (default: 4096, edge: 256)
-    pub ioctree_leaf_cache_cap: usize,
-}
-
-impl Default for EdgeIndexConfig {
-    fn default() -> Self {
-        Self {
-            vector_index_capacity: 4096,
-            graph_index_capacity: 2048,
-            graph_hot_node_limit: 100,
-            fts_shard_counter_cap: 10_000,
-            fts_pending_terms_limit: 200,
-            fts_pending_docs_limit: 2000,
-            version_store_max_entries: 50_000,
-            ioctree_leaf_cache_cap: 4096,
-        }
-    }
-}
-
-impl EdgeIndexConfig {
-    pub fn for_edge() -> Self {
-        Self {
-            vector_index_capacity: 512,
-            graph_index_capacity: 256,
-            graph_hot_node_limit: 10,
-            fts_shard_counter_cap: 500,
-            fts_pending_terms_limit: 50,
-            fts_pending_docs_limit: 500,
-            version_store_max_entries: 5000,
-            ioctree_leaf_cache_cap: 256,
-        }
-    }
 }
 
 /// Auto-checkpoint trigger configuration
@@ -506,28 +438,6 @@ impl Default for AutoCheckpointConfig {
 }
 
 impl AutoCheckpointConfig {
-    /// Aggressive cleanup: small WAL size, frequent checkpoints
-    /// 
-    /// Use case: Low-memory environments, frequent writes
-    /// CPU: ~0.2% overhead, Memory: < 1MB
-    pub fn aggressive() -> Self {
-        Self {
-            max_wal_size_bytes: 4 * 1024 * 1024,  // 4MB
-            min_interval_secs: 30,  // 30 seconds (increased from 10s to reduce CPU)
-        }
-    }
-    
-    /// Relaxed cleanup: larger WAL size, less frequent checkpoints
-    /// 
-    /// Use case: High-memory environments, batch workloads
-    /// CPU: < 0.05% overhead, Memory: up to 64MB WAL
-    pub fn relaxed() -> Self {
-        Self {
-            max_wal_size_bytes: 64 * 1024 * 1024,  // 64MB
-            min_interval_secs: 300,  // 5 minutes
-        }
-    }
-    
     /// Embedded/IoT optimized: minimal resource usage
     /// 
     /// Use case: Embedded devices, IoT, mobile apps
@@ -549,14 +459,12 @@ impl Default for DBConfig {
             wal_config: WALConfig::default(),
             num_partitions: 4,
             lsm_config: LSMConfig::default(),
-            enable_stats: true,
             row_cache_size: None,  // Use default 10000
             pk_lookup_capacity: 50_000,  // ~4MB per table
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
             query_timeout_secs: None,  // No timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
-            edge_index: EdgeIndexConfig::default(),
         }
     }
 }
@@ -574,14 +482,6 @@ impl DBConfig {
     pub fn for_general() -> Self {
         Self {
             wal_config: WALConfig::for_general(),
-            ..Default::default()
-        }
-    }
-
-    /// 创建高性能场景配置
-    pub fn for_high_performance() -> Self {
-        Self {
-            wal_config: WALConfig::for_logging(),
             ..Default::default()
         }
     }
@@ -623,7 +523,6 @@ impl DBConfig {
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
-            edge_index: EdgeIndexConfig::for_edge(),
             ..Default::default()
         }
     }
@@ -660,7 +559,6 @@ impl DBConfig {
             }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_robotics(),
-            edge_index: EdgeIndexConfig::for_edge(),
             ..Default::default()
         }
     }

@@ -184,6 +184,22 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenType::Dot
             }
+            '?' => {
+                self.advance();
+                // Check for ?N (numbered parameter like ?1, ?2)
+                if !self.is_eof() && self.current_char().is_ascii_digit() {
+                    let mut num = String::new();
+                    while !self.is_eof() && self.current_char().is_ascii_digit() {
+                        num.push(self.current_char());
+                        self.advance();
+                    }
+                    let idx: usize = num.parse().unwrap_or(1);
+                    TokenType::Parameter(idx)
+                } else {
+                    // Unnamed ? — gets sequential number resolved later
+                    TokenType::Parameter(0)  // 0 = auto-assign
+                }
+            }
             _ => {
                 return Err(MoteDBError::ParseError(format!(
                     "Unexpected character '{}' at {}:{}", ch, line, column
@@ -202,7 +218,30 @@ impl<'a> Lexer<'a> {
             self.bytes[self.position] as char
         }
     }
-    
+
+    /// Decode the current UTF-8 character (handles multi-byte sequences correctly).
+    fn current_utf8_char(&self) -> char {
+        if self.is_eof() {
+            return '\0';
+        }
+        self.input[self.position..].chars().next().unwrap_or('\0')
+    }
+
+    /// Advance past the current UTF-8 character (1-4 bytes).
+    fn advance_utf8(&mut self) {
+        if self.is_eof() {
+            return;
+        }
+        let char_len = self.input[self.position..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        for _ in 0..char_len {
+            self.advance();
+        }
+    }
+
     fn peek_char(&self) -> Option<char> {
         if self.position + 1 < self.bytes.len() {
             Some(self.bytes[self.position + 1] as char)
@@ -210,7 +249,7 @@ impl<'a> Lexer<'a> {
             None
         }
     }
-    
+
     fn advance(&mut self) {
         if !self.is_eof() {
             if self.bytes[self.position] == b'\n' {
@@ -261,14 +300,29 @@ impl<'a> Lexer<'a> {
     fn read_string(&mut self, quote: char) -> Result<TokenType> {
         self.advance(); // skip opening quote
         let mut value = String::with_capacity(32);
-        
-        while !self.is_eof() && self.current_char() != quote {
-            if self.current_char() == '\\' {
+
+        while !self.is_eof() {
+            let ch = self.current_utf8_char();
+
+            if ch == quote {
+                // SQL standard: doubled quote escapes the quote ('it''s' → it's)
+                // Check if next char is also a quote
+                let after_quote = self.position + 1;
+                if after_quote < self.bytes.len() && self.bytes[after_quote] == quote as u8 {
+                    value.push(quote);
+                    self.advance(); // skip first quote
+                    self.advance(); // skip second quote
+                    continue;
+                }
+                // Single quote = end of string
+                break;
+            }
+
+            if ch == '\\' {
                 self.advance();
                 if self.is_eof() {
                     return Err(MoteDBError::ParseError("Unterminated string".to_string()));
                 }
-                // Handle escape sequences
                 let escaped = match self.current_char() {
                     'n' => '\n',
                     't' => '\t',
@@ -279,16 +333,17 @@ impl<'a> Lexer<'a> {
                     c => c,
                 };
                 value.push(escaped);
+                self.advance();
             } else {
-                value.push(self.current_char());
+                value.push(ch);
+                self.advance_utf8();
             }
-            self.advance();
         }
-        
+
         if self.is_eof() {
             return Err(MoteDBError::ParseError("Unterminated string".to_string()));
         }
-        
+
         self.advance(); // skip closing quote
         Ok(TokenType::String(value))
     }
@@ -322,17 +377,17 @@ impl<'a> Lexer<'a> {
     
     fn read_identifier(&mut self) -> TokenType {
         let mut value = String::with_capacity(16);
-        
+
         while !self.is_eof() {
-            let ch = self.current_char();
+            let ch = self.current_utf8_char();
             if ch.is_alphanumeric() || ch == '_' {
                 value.push(ch);
-                self.advance();
+                self.advance_utf8();
             } else {
                 break;
             }
         }
-        
+
         // Check if it's a keyword
         TokenType::from_keyword(&value)
             .unwrap_or(TokenType::Identifier(value))

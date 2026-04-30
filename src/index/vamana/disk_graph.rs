@@ -9,7 +9,7 @@ use crate::{Result, StorageError};
 use lru::LruCache;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
@@ -344,13 +344,6 @@ impl DiskGraph {
         }
     }
 
-    pub fn unpin_hot_node(&self, node_id: RowId) {
-        self.hot_nodes.write().remove(&node_id);
-        self.hot_cache.write().pop(&node_id);
-    }
-
-    pub fn hot_node_count(&self) -> usize { self.hot_nodes.read().len() }
-
     /// Batch pin high-degree nodes
     pub fn pin_high_degree_nodes(&self, top_k: usize) {
         // Sample a subset of IDs to avoid loading all
@@ -367,11 +360,6 @@ impl DiskGraph {
         for (id, _) in degrees.into_iter().take(top_k) {
             self.pin_hot_node(id);
         }
-    }
-
-    /// Check if node exists
-    pub fn has_node(&self, node_id: RowId) -> bool {
-        self.lookup_offset(node_id).is_some()
     }
 
     pub fn node_ids(&self) -> Vec<RowId> {
@@ -466,24 +454,6 @@ impl DiskGraph {
         Ok(())
     }
 
-    pub fn add_edge(&self, from: RowId, to: RowId) -> Result<()> {
-        if from == to { return Ok(()); }
-        let neighbors_arc = self.neighbors(from);
-        if neighbors_arc.contains(&to) { return Ok(()); }
-        if neighbors_arc.len() >= self.max_degree {
-            return Err(StorageError::InvalidData("Max degree exceeded".to_string()));
-        }
-        let mut neighbors = (*neighbors_arc).clone();
-        neighbors.push(to);
-        self.set_neighbors(from, neighbors)
-    }
-
-    pub fn has_edge(&self, from: RowId, to: RowId) -> bool {
-        self.neighbors(from).contains(&to)
-    }
-
-    pub fn degree(&self, node_id: RowId) -> usize { self.neighbors(node_id).len() }
-
     /// Remove node
     pub fn remove_node(&self, node_id: RowId) -> Arc<Vec<RowId>> {
         let neighbors = self.neighbors(node_id);
@@ -496,15 +466,6 @@ impl DiskGraph {
         }
         *self.dirty.write() = true;
         neighbors
-    }
-
-    pub fn batch_remove_nodes(&self, node_ids: &[RowId]) -> HashMap<RowId, Vec<RowId>> {
-        let mut all_neighbors = HashMap::new();
-        for &node_id in node_ids {
-            let n = self.remove_node(node_id);
-            all_neighbors.insert(node_id, (*n).clone());
-        }
-        all_neighbors
     }
 
     /// Flush to disk

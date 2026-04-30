@@ -327,6 +327,7 @@ impl PostingList {
     
     /// Add a document occurrence (optimized for sequential inserts)
     pub fn add(&mut self, doc_id: DocId, position: Option<Position>) {
+        let is_new = !self.doc_ids.contains(doc_id as u32);
         self.doc_ids.insert(doc_id as u32);
 
         // For positions
@@ -336,10 +337,10 @@ impl PostingList {
             }
         }
 
-        // doc_freqs parallel array is lazily maintained.
-        // It is rebuilt during serialization (serialize_compact) and on demand.
-        // When positions are absent, term_frequency() falls back to counting
-        // occurrences via doc_freqs.len() vs doc_ids.len().
+        // Keep doc_freqs in sync for TF queries
+        if is_new {
+            self.doc_freqs.push(1);
+        }
     }
 
     /// Add a document with a known term frequency (used when converting from block format).
@@ -352,17 +353,6 @@ impl PostingList {
         }
     }
     
-    /// Add multiple occurrences of a document (for term frequency)
-    pub fn add_multiple(&mut self, doc_id: DocId, _count: u16, positions: Option<Vec<Position>>) {
-        self.doc_ids.insert(doc_id as u32);
-
-        if let Some(pos_vec) = positions {
-            if let Some(ref mut pos_map) = self.positions {
-                pos_map.entry(doc_id).or_default().extend(pos_vec);
-            }
-        }
-    }
-
     /// Rebuild doc_freqs array after doc_ids change (maintains parallel structure)
     fn rebuild_doc_freqs_array(&mut self) {
         let old_freqs_map: HashMap<u64, u16> = self.doc_ids.iter()
@@ -391,9 +381,9 @@ impl PostingList {
         // Merge doc_ids
         self.doc_ids |= &other.doc_ids;
         
-        // Rebuild parallel array
+        // Rebuild parallel array (default TF=1 for any doc missing from freq_map)
         self.doc_freqs = self.doc_ids.iter()
-            .map(|id| *freq_map.get(&(id as u64)).unwrap_or(&0))
+            .map(|id| *freq_map.get(&(id as u64)).unwrap_or(&1))
             .collect();
         
         // Merge positions
@@ -433,11 +423,6 @@ impl PostingList {
         1
     }
     
-    /// Check if a document exists in the posting list
-    pub fn contains(&self, doc_id: DocId) -> bool {
-        self.doc_ids.contains(doc_id as u32)
-    }
-
     /// Return the maximum term frequency across all documents.
     /// Used for WAND upper bound computation.
     pub fn max_tf(&self) -> u16 {

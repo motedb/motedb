@@ -93,22 +93,6 @@ where
     pruned
 }
 
-/// Simple pruning without diversity constraint
-///
-/// Just keeps the k nearest neighbors.
-pub fn simple_prune(candidates: Vec<Candidate>, max_degree: usize) -> Vec<RowId> {
-    let mut sorted: Vec<_> = candidates.into_iter().collect();
-    sorted.sort_by(|a, b| {
-        a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
-    });
-    
-    sorted
-        .into_iter()
-        .take(max_degree)
-        .map(|c| c.id)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,37 +101,9 @@ mod tests {
     fn test_candidate_ordering() {
         let c1 = Candidate { id: 1, distance: 1.0 };
         let c2 = Candidate { id: 2, distance: 2.0 };
-        
+
         // c1 should be "greater" (min-heap)
         assert!(c1 > c2);
-    }
-
-    #[test]
-    fn test_simple_prune_basic() {
-        let candidates = vec![
-            Candidate { id: 1, distance: 1.0 },
-            Candidate { id: 2, distance: 3.0 },
-            Candidate { id: 3, distance: 2.0 },
-            Candidate { id: 4, distance: 4.0 },
-        ];
-
-        let pruned = simple_prune(candidates, 2);
-        
-        assert_eq!(pruned.len(), 2);
-        assert_eq!(pruned[0], 1); // Closest
-        assert_eq!(pruned[1], 3); // Second closest
-    }
-
-    #[test]
-    fn test_simple_prune_no_pruning_needed() {
-        let candidates = vec![
-            Candidate { id: 1, distance: 1.0 },
-            Candidate { id: 2, distance: 2.0 },
-        ];
-
-        let pruned = simple_prune(candidates, 5);
-        
-        assert_eq!(pruned.len(), 2);
     }
 
     #[test]

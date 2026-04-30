@@ -190,10 +190,13 @@ pub enum AlterTableAction {
 pub enum Expr {
     /// Column reference
     Column(String),
-    
+
     /// Literal value
     Literal(Value),
-    
+
+    /// Bind variable (? or ?1, ?2, ...)
+    Parameter(usize),
+
     /// Binary operation
     BinaryOp {
         left: Box<Expr>,

@@ -315,11 +315,6 @@ impl UnifiedMemTable {
         self.size.load(Ordering::Relaxed) >= self.max_size
     }
 
-    #[inline]
-    pub fn should_flush_atomic(&self) -> bool {
-        self.size.load(Ordering::Relaxed) >= self.max_size
-    }
-
     pub fn size(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
@@ -452,12 +447,6 @@ impl UnifiedMemTable {
         }).collect();
 
         Ok(results)
-    }
-
-    pub fn export_vector_nodes(&self) -> Result<Vec<(Key, VectorNode)>> {
-        let graph = self.vector_graph.as_ref()
-            .ok_or_else(|| StorageError::Index("Vector graph not available".into()))?;
-        graph.export_nodes()
     }
 
     pub fn vector_dimension(&self) -> Option<usize> {
