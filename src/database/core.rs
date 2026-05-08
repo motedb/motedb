@@ -342,6 +342,22 @@ impl MoteDB {
         self.index_build_tx.is_some()
     }
 
+    /// Signal all background threads (index builder, auto-flush, auto-checkpoint)
+    /// to stop. Used by `close()` so that `checkpoint_full()` can acquire all
+    /// index write locks without contention.
+    pub(crate) fn signal_background_threads_stop(&self) {
+        if let Some(ref thread) = self.index_builder_thread {
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(ref thread) = self.auto_flush_thread {
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = thread.flush_tx.send(());
+        }
+        if let Some(ref thread) = self.auto_checkpoint_thread {
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Clone self for callback (only what's needed)
     pub(crate) fn clone_for_callback(&self) -> Self {
         Self {

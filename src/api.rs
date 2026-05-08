@@ -222,18 +222,19 @@ impl Database {
     /// // All subsequent operations will return an error
     /// ```
     pub fn close(&self) -> Result<()> {
-        // Idempotent: if already closed, just return Ok
         if self.inner.is_closed.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
 
-        // Full checkpoint (flush + index persist + WAL truncate)
-        // NOT just flush — close should ensure clean restart
+        // Signal background threads to stop so checkpoint_full() can acquire
+        // all index write locks without contention.
+        self.inner.signal_background_threads_stop();
+
+        // Give background threads time to finish their current work.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
         let result = self.inner.checkpoint_full();
-
-        // Set closed flag AFTER checkpoint (so checkpoint itself can run)
         self.inner.is_closed.store(true, std::sync::atomic::Ordering::Relaxed);
-
         result
     }
 
