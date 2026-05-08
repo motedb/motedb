@@ -386,19 +386,21 @@ impl DiskGraph {
         *self.dirty.write() = true;
     }
 
-    /// Get neighbors with tiered caching: hot → LRU → disk
+    /// Get neighbors with tiered caching: hot → LRU → disk.
+    /// Uses `peek` (no LRU promotion) to avoid write lock contention
+    /// during parallel graph construction.
     pub fn neighbors(&self, node_id: RowId) -> Arc<Vec<RowId>> {
-        // 1. Hot cache
+        // 1. Hot cache (peek = no LRU promotion, only needs &self)
         {
-            let mut hot = self.hot_cache.write();
-            if let Some(n) = hot.get(&node_id) { return Arc::clone(n); }
+            let hot = self.hot_cache.read();
+            if let Some(n) = hot.peek(&node_id) { return Arc::clone(n); }
         }
-        // 2. LRU cache
+        // 2. LRU cache (peek = no promotion)
         {
-            let mut cache = self.cache.lock();
-            if let Some(n) = cache.get(&node_id) { return Arc::clone(n); }
+            let cache = self.cache.lock();
+            if let Some(n) = cache.peek(&node_id) { return Arc::clone(n); }
         }
-        // 3. Disk
+        // 3. Disk (populates cache for future lookups)
         match self.get_from_cache_or_disk(node_id) {
             Some(n) => n,
             None => Arc::new(Vec::new()),

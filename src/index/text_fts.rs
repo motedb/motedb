@@ -235,11 +235,11 @@ impl TextFTSIndex {
     /// - Target: <35 MB total memory for 300K docs
     pub fn batch_insert(&mut self, docs: &[(DocumentId, &str)]) -> Result<()> {
         use std::time::Instant;
-        
+
         if docs.is_empty() {
             return Ok(());
         }
-        
+
         // Remove documents from deleted set if re-inserting
         {
             let mut deleted = self.deleted_docs.write();
@@ -247,36 +247,17 @@ impl TextFTSIndex {
                 deleted.remove(&doc_id);
             }
         }
-        
-        // 🔧 CRITICAL: Multi-condition flush trigger
-        // Trigger flush if ANY of these conditions is met:
-        // 1. pending_posting_lists (unique terms) >= 100
-        // 2. pending_doc_lengths (documents) >= 500
-        // 🚀 P0 CRITICAL: 统一flush阈值与LSM一致 (2000条)，保证数据一致性
-        const AUTO_FLUSH_THRESHOLD_TERMS: usize = 200;      // unique terms (放宽)
-        const AUTO_FLUSH_THRESHOLD_DOCS: usize = 2000;      // documents (与LSM一致)
-        
+
+        const AUTO_FLUSH_THRESHOLD_TERMS: usize = 200;
+        const AUTO_FLUSH_THRESHOLD_DOCS: usize = 2000;
+
         {
             let pending_terms = self.pending_posting_lists.read().len();
             let pending_docs = self.pending_doc_lengths.read().len();
-            
+
             if pending_terms >= AUTO_FLUSH_THRESHOLD_TERMS || pending_docs >= AUTO_FLUSH_THRESHOLD_DOCS {
-                // Release read locks
-                let _ = pending_terms;
-                let _ = pending_docs;
-                
-                debug_log!("[TEXT-AUTO-FLUSH] Triggered: {} terms, {} docs",
-                         self.pending_posting_lists.read().len(),
-                         self.pending_doc_lengths.read().len());
-                
                 self.flush()?;
-                
-                // 🚀 P0 NEW: 主动清理shard_counters，避免积累过多历史term
                 self.cleanup_shard_counters();
-                
-                debug_log!("[TEXT-AUTO-FLUSH] After: {} terms, {} docs",
-                         self.pending_posting_lists.read().len(),
-                         self.pending_doc_lengths.read().len());
             }
         }
         
@@ -337,7 +318,6 @@ impl TextFTSIndex {
         
         // ✅ 自动flush（每5000个term触发一次）
         if should_auto_flush {
-            debug_log!("[TextFTS] Auto-flushing after 5000 pending terms...");
             self.flush()?;
         }
         
@@ -968,7 +948,6 @@ impl TextFTSIndex {
     /// Flush index to disk (write pending buffer to BTree)
     pub fn flush(&mut self) -> Result<()> {
         use std::time::Instant;
-        
         let flush_start = Instant::now();
         
         // 1. Get pending posting lists (use take to avoid clone)
@@ -1036,7 +1015,7 @@ impl TextFTSIndex {
 
             // Lazy consolidation: merge shards when count exceeds threshold
             if next_shard_idx + 1 >= 5 {
-                if let Err(e) = self.consolidate_shards_for_term(&mut btree, *term_id) {
+                if let Err(e) = self.consolidate_shards_for_term(&mut btree, &mut shard_counters, *term_id) {
                     debug_log!("[FTS] Shard consolidation failed for term {}: {}", term_id, e);
                 }
             }
@@ -1097,9 +1076,7 @@ impl TextFTSIndex {
         self.save_metadata()?;
         let _t7_elapsed = t7.elapsed();
         
-        let _total_elapsed = flush_start.elapsed();
-        
-        // debug_log disabled for Phase A optimization
+        let _total_elapsed = flush_start.elapsed();// debug_log disabled for Phase A optimization
         
         Ok(())
     }
@@ -1238,22 +1215,15 @@ impl TextFTSIndex {
     fn consolidate_shards_for_term(
         &self,
         btree: &mut parking_lot::RwLockWriteGuard<'_, crate::index::btree_generic::GenericBTree<u32>>,
+        shard_counters: &mut parking_lot::RwLockWriteGuard<'_, LruCache<TermId, u32>>,
         term_id: TermId,
     ) -> Result<()> {
         let base_term_id = term_id & 0x00FFFFFF;
 
-        // Read shard count from LRU; on miss, discover from BTree.
-        // We temporarily release the write lock on btree to take a read guard,
-        // but since consolidate is called from flush() which holds the btree write
-        // lock, we use a direct get approach instead.
         let shard_count = {
-            let counters = self.shard_counters.read();
-            if let Some(&count) = counters.peek(&term_id) {
+            if let Some(&count) = shard_counters.peek(&term_id) {
                 count
             } else {
-                // LRU miss: probe BTree for shard count.
-                // We already hold the btree write guard, so we can call range directly.
-                drop(counters);
                 let range_start = base_term_id;
                 let range_end = (0xFEu32 << 24) | base_term_id;
                 let entries = btree.range(&range_start, &range_end)?;
@@ -1264,8 +1234,7 @@ impl TextFTSIndex {
                         max_shard = shard_idx + 1;
                     }
                 }
-                let mut counters = self.shard_counters.write();
-                counters.put(term_id, max_shard);
+                shard_counters.put(term_id, max_shard);
                 max_shard
             }
         };
@@ -1316,7 +1285,6 @@ impl TextFTSIndex {
             for shard_idx in 0..shard_count {
                 let _ = btree.delete(&(shard_idx << 24 | base_term_id));
             }
-            let mut shard_counters = self.shard_counters.write();
             shard_counters.put(term_id, 0);
             return Ok(());
         }
@@ -1332,7 +1300,6 @@ impl TextFTSIndex {
         }
 
         // Reset counter to 1
-        let mut shard_counters = self.shard_counters.write();
         shard_counters.put(term_id, 1);
 
         Ok(())

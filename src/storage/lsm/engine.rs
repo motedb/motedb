@@ -1251,8 +1251,7 @@ impl LSMEngine {
     /// 
     /// This allows Database layer to backfill indexes from flushed data.
     pub fn flush_with_paths(&self) -> Result<Vec<PathBuf>> {
-        debug_log!("💾 [flush] 开始flush操作...");
-        
+        debug_log!("💾 [flush] 开始flush操作...");        
         // 🔧 检查存储目录是否存在（防止在数据库关闭后flush）
         if !self.storage_dir.exists() {
             debug_log!("⚠️  [flush] 存储目录不存在，跳过flush: {:?}", self.storage_dir);

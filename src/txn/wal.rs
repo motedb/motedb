@@ -137,6 +137,10 @@ const TAG_BEGIN: u8 = 0x04;
 const TAG_COMMIT: u8 = 0x05;
 const TAG_ROLLBACK: u8 = 0x06;
 const TAG_CHECKPOINT: u8 = 0x07;
+/// Compression marker tag (0x00 never used by record types, backward compatible)
+const TAG_COMPRESSED: u8 = 0x00;
+/// Minimum payload size (bytes) to consider compression. Small records aren't worth it.
+const WAL_COMPRESS_THRESHOLD: usize = 128;
 
 impl WALRecord {
     /// Encode WAL record to native binary format.
@@ -307,8 +311,25 @@ impl WALRecord {
         }
     }
 
-    /// Decode native format with fallback to bincode (for old WAL files)
+    /// Decode native or compressed format with fallback to bincode (for old WAL files)
     fn decode_with_fallback(data: &[u8]) -> Result<Self> {
+        // Check for compression marker
+        if !data.is_empty() && data[0] == TAG_COMPRESSED {
+            // Compressed: [0x00][u32 original_len][zstd_data...]
+            if data.len() < 5 {
+                return Err(StorageError::Serialization("WAL: truncated compressed record".into()));
+            }
+            let original_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            let compressed = &data[5..];
+            let decompressed = zstd::decode_all(compressed)
+                .map_err(|e| StorageError::Serialization(format!("WAL zstd decompress failed: {}", e)))?;
+            if decompressed.len() != original_len {
+                return Err(StorageError::Serialization(
+                    format!("WAL: decompressed size {} != expected {}", decompressed.len(), original_len)));
+            }
+            // Recurse on decompressed data
+            return Self::decode_with_fallback(&decompressed);
+        }
         // Try native binary format first
         if let Some(result) = Self::decode_native(data) {
             return result;
@@ -618,25 +639,31 @@ impl PartitionWAL {
         let table_bytes = table_name.as_bytes();
         let record_len = 1 + 8 + (2 + table_bytes.len()) + 8 + 2 + 4 + raw_data.len();
 
-        let mut write_buf = Vec::with_capacity(20 + record_len);
-        // Outer header: [u32 total_len][u64 lsn][u32 checksum][u32 record_len]
-        write_buf.extend_from_slice(&((20 + record_len) as u32).to_le_bytes());
+        // Build record body first (for potential compression)
+        let mut record_body = Vec::with_capacity(record_len);
+        record_body.push(TAG_INSERT_RAW);
+        record_body.extend_from_slice(&txn_id.to_le_bytes());
+        record_body.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
+        record_body.extend_from_slice(table_bytes);
+        record_body.extend_from_slice(&row_id.to_le_bytes());
+        record_body.extend_from_slice(&(partition as u16).to_le_bytes());
+        record_body.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
+        record_body.extend_from_slice(raw_data);
+
+        // Compress if worthwhile
+        let payload = Self::compress_if_worthwhile(&record_body);
+
+        let mut write_buf = Vec::with_capacity(20 + payload.len());
+        write_buf.extend_from_slice(&((20 + payload.len()) as u32).to_le_bytes());
         write_buf.extend_from_slice(&lsn.to_le_bytes());
         // checksum placeholder (will patch)
         let checksum_offset = write_buf.len();
         write_buf.extend_from_slice(&0u32.to_le_bytes());
-        write_buf.extend_from_slice(&(record_len as u32).to_le_bytes());
+        write_buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
 
-        // Record body
+        // Record body (possibly compressed)
         let record_start = write_buf.len();
-        write_buf.push(TAG_INSERT_RAW);
-        write_buf.extend_from_slice(&txn_id.to_le_bytes());
-        write_buf.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
-        write_buf.extend_from_slice(table_bytes);
-        write_buf.extend_from_slice(&row_id.to_le_bytes());
-        write_buf.extend_from_slice(&(partition as u16).to_le_bytes());
-        write_buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
-        write_buf.extend_from_slice(raw_data);
+        write_buf.extend_from_slice(&payload);
 
         // Compute and patch checksum
         let checksum = Checksum::compute(ChecksumType::CRC32C, &write_buf[record_start..]);
@@ -650,17 +677,38 @@ impl PartitionWAL {
         Ok(lsn)
     }
 
+    /// Compress record data if beneficial. Returns either compressed or original bytes.
+    fn compress_if_worthwhile(data: &[u8]) -> Vec<u8> {
+        if data.len() < WAL_COMPRESS_THRESHOLD {
+            return data.to_vec();
+        }
+        // Try Zstd level 1 compression
+        if let Ok(compressed) = zstd::encode_all(data, 1) {
+            // Only use compressed if we save meaningful space (>10%)
+            if compressed.len() + 5 < data.len() * 9 / 10 {
+                // Format: [0x00][u32 original_len][zstd_data]
+                let mut out = Vec::with_capacity(5 + compressed.len());
+                out.push(TAG_COMPRESSED);
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(&compressed);
+                return out;
+            }
+        }
+        data.to_vec()
+    }
+
     /// Write a pre-serialized record with framing (single buffer).
     fn write_record(&mut self, lsn: u64, record_data: &[u8]) -> Result<()> {
-        let total_len = (20 + record_data.len()) as u32;
-        let checksum = Checksum::compute(ChecksumType::CRC32C, record_data);
+        let payload = Self::compress_if_worthwhile(record_data);
+        let total_len = (20 + payload.len()) as u32;
+        let checksum = Checksum::compute(ChecksumType::CRC32C, &payload);
 
-        let mut buf = Vec::with_capacity(20 + record_data.len());
+        let mut buf = Vec::with_capacity(20 + payload.len());
         buf.extend_from_slice(&total_len.to_le_bytes());
         buf.extend_from_slice(&lsn.to_le_bytes());
         buf.extend_from_slice(&checksum.to_le_bytes());
-        buf.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(record_data);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&payload);
 
         self.file.write_all(&buf)?;
         self.bytes_written += buf.len() as u64;
@@ -697,17 +745,18 @@ impl PartitionWAL {
             lsns.push(lsn);
 
             let record_data = record.encode_native()?;
-            let checksum = Checksum::compute(ChecksumType::CRC32C, &record_data);
+            let payload = Self::compress_if_worthwhile(&record_data);
+            let checksum = Checksum::compute(ChecksumType::CRC32C, &payload);
 
-            // Header: [u32 total_len][u64 lsn][u32 checksum][u32 record_len]
+            // Header: [u32 total_len][u64 lsn][u32 checksum][u32 payload_len]
             let header_size = 4 + 8 + 4 + 4; // 20 bytes
-            let total_len = (header_size + record_data.len()) as u32;
+            let total_len = (header_size + payload.len()) as u32;
 
             buffer.extend_from_slice(&total_len.to_le_bytes());
             buffer.extend_from_slice(&lsn.to_le_bytes());
             buffer.extend_from_slice(&checksum.to_le_bytes());
-            buffer.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
-            buffer.extend_from_slice(&record_data);
+            buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(&payload);
         }
         
         // 2. Single write operation (append 模式自动追加)

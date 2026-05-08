@@ -140,6 +140,9 @@ pub struct MoteDB {
     /// File lock to prevent concurrent database opens on the same directory.
     /// Holds an exclusive flock on `.lock` file. Released on Drop.
     _lock_file: Option<std::fs::File>,
+
+    /// True for clone_for_callback() instances — skip Drop checkpoint.
+    _is_clone: bool,
 }
 
 /// Auto-checkpoint background thread
@@ -294,6 +297,7 @@ impl MoteDB {
             index_builder_thread: None,
             auto_flush_thread: None,
             _lock_file: Some(lock_file),
+            _is_clone: false,
         };
 
         // 🚀 P1: Async Index Build Pipeline
@@ -331,6 +335,13 @@ impl MoteDB {
         Ok(db)
     }
     
+    /// Check whether the async index-build pipeline is active.
+    /// When active, `flush_impl` skips vector/text index flushing to avoid
+    /// write-lock contention with the builder thread.
+    pub(crate) fn is_async_index_pipeline_active(&self) -> bool {
+        self.index_build_tx.is_some()
+    }
+
     /// Clone self for callback (only what's needed)
     pub(crate) fn clone_for_callback(&self) -> Self {
         Self {
@@ -366,6 +377,7 @@ impl MoteDB {
             index_builder_thread: None,  // Don't clone thread (only owned by original)
             auto_flush_thread: None,    // Don't clone thread (only owned by original)
             _lock_file: None,  // Don't clone lock (only owned by original)
+            _is_clone: true,   // Skip Drop checkpoint for clones
         }
     }
 
@@ -724,6 +736,7 @@ impl MoteDB {
             index_builder_thread: None,
             auto_flush_thread: None,
             _lock_file: Some(lock_file),
+            _is_clone: false,
         };
 
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
@@ -1340,6 +1353,12 @@ impl MoteDB {
 /// clean shutdown even if user forgets to call checkpoint().
 impl Drop for MoteDB {
     fn drop(&mut self) {
+        // Clones (used by callback threads) must NOT checkpoint on drop.
+        // Only the original MoteDB owns threads and is responsible for final cleanup.
+        if self._is_clone {
+            return;
+        }
+
         // 🛑 Step 1: Stop index builder thread (drop sender to signal end, then join)
         if let Some(mut thread) = self.index_builder_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping index builder thread...");

@@ -507,8 +507,6 @@ impl DiskANNIndex {
         }
         
         // 🚀 分批渐进式构建
-        #[cfg(feature = "rayon")]
-        use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use dashmap::DashMap;
         
@@ -551,47 +549,45 @@ impl DiskANNIndex {
                 self.graph.add_node(id);
             }
             
-            // 并行构建本批节点的边
+            // Sequential graph construction (avoids Rayon/parking_lot deadlock)
+            // Parallelism is counterproductive here due to DiskGraph lock contention.
             if show_progress {
-                debug_log!("[DiskANN] Phase 1: Building batch nodes (parallel)...");
+                debug_log!("[DiskANN] Phase 1: Building batch nodes (sequential)...");
             }
-            
-            batch.par_iter()
-                .try_for_each(|&id| -> Result<()> {
-                    let query_vec = match self.vectors.get(id) {
-                        Some(v) => v,
-                        None => return Ok(()),
-                    };
-                    
-                    let candidates = self.greedy_search(
-                        &query_vec,
-                        medoid_id,
-                        ef_construction,
-                    )?;
-                    
-                    let neighbors = robust_prune(
-                        candidates,
-                        self.config.max_degree,
-                        self.config.alpha,
-                        |a, b| {
-                            match (self.vectors.get(a), self.vectors.get(b)) {
-                                (Some(vec_a), Some(vec_b)) => self.metric.distance(&vec_a, &vec_b),
-                                _ => f32::MAX,
-                            }
-                        },
-                    );
-                    
-                    temp_graph.insert(id, neighbors);
-                    
-                    if show_progress {
-                        let p = progress.fetch_add(1, Ordering::Relaxed);
-                        if p.is_multiple_of(500) && p > 0 {
-                            debug_log!("  Progress: {}/{}", p, batch.len());
+
+            for &id in batch.iter() {
+                let query_vec = match self.vectors.get(id) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let candidates = self.greedy_search(
+                    &query_vec,
+                    medoid_id,
+                    ef_construction,
+                )?;
+
+                let neighbors = robust_prune(
+                    candidates,
+                    self.config.max_degree,
+                    self.config.alpha,
+                    |a, b| {
+                        match (self.vectors.get(a), self.vectors.get(b)) {
+                            (Some(vec_a), Some(vec_b)) => self.metric.distance(&vec_a, &vec_b),
+                            _ => f32::MAX,
                         }
+                    },
+                );
+
+                temp_graph.insert(id, neighbors);
+
+                if show_progress {
+                    let p = progress.fetch_add(1, Ordering::Relaxed);
+                    if p.is_multiple_of(500) && p > 0 {
+                        debug_log!("  Progress: {}/{}", p, batch.len());
                     }
-                    
-                    Ok(())
-                })?;
+                }
+            }
             
             // Phase 2: 写入前向边
             if show_progress {
@@ -608,17 +604,17 @@ impl DiskANNIndex {
             }
             
             let reverse_edges: DashMap<RowId, Vec<RowId>> = DashMap::new();
-            
-            temp_graph.iter().par_bridge().for_each(|entry| {
+
+            for entry in temp_graph.iter() {
                 let id = *entry.key();
                 let neighbors = entry.value();
-                
+
                 for &neighbor_id in neighbors {
                     reverse_edges.entry(neighbor_id)
                         .or_default()
                         .push(id);
                 }
-            });
+            }
             
             let slack_factor = 1.3;
             let soft_limit = (self.config.max_degree as f32 * slack_factor) as usize;
@@ -1392,18 +1388,13 @@ impl DiskANNIndex {
         let mut result = Vec::new();
         let mut iterations = 0;
         
-        // 🔥 召回率优化: 渐进式迭代限制策略
-        // 策略1: 图构建早期（节点<5000）- 保留限制避免长时间搜索
-        //        原因: 连通性差，无限制搜索收益低且耗时长
-        // 策略2: 图成熟后（节点≥5000）- 移除限制提升召回率
-        //        原因: 连通性好，深度搜索能找到真正的最近邻
+        // Adaptive iteration cap: beam_width * 20 is generous for recall,
+        // but bounded to prevent O(n²) hangs on large graphs.
         let graph_size = self.len();
         let max_iterations = if graph_size < 5000 {
-            // 早期：保守限制（避免卡死）
             (beam_width * 10).min(3000)
         } else {
-            // 成熟：大幅放宽限制（提升召回率）
-            usize::MAX  // 实际上接近无限制，让搜索自然终止
+            (beam_width * 20).min(10000)
         };
         
         while let Some(Reverse(current)) = candidates.pop() {
