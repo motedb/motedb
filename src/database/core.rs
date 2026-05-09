@@ -128,6 +128,11 @@ pub struct MoteDB {
     /// Auto-checkpoint thread (if enabled)
     auto_checkpoint_thread: Option<AutoCheckpointThread>,
 
+    /// Shared flag: true when the async index-build pipeline is running.
+    /// Shared across all clones so `is_async_index_pipeline_active()` works
+    /// correctly even for cloned MoteDB instances (auto-checkpoint thread).
+    is_pipeline_active: Arc<AtomicBool>,
+
     /// Async index build pipeline: sender (None if pipeline disabled)
     index_build_tx: Option<std::sync::mpsc::Sender<IndexBuildBatch>>,
 
@@ -290,6 +295,7 @@ impl MoteDB {
             query_timeout_secs: config.query_timeout_secs,
             pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
+            is_pipeline_active: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
@@ -308,8 +314,9 @@ impl MoteDB {
             Self::start_index_builder_pipeline(db.clone_for_callback());
         db.index_build_tx = Some(index_build_tx);
         db.index_builder_thread = Some(index_builder_thread);
+        db.is_pipeline_active.store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // Set flush callback: extracts rows from memtable → sends through channel (non-blocking)
+        // Set flush callback
         {
             let tx = db.index_build_tx.clone().unwrap();
             let registry = db.table_registry.clone();
@@ -339,7 +346,7 @@ impl MoteDB {
     /// When active, `flush_impl` skips vector/text index flushing to avoid
     /// write-lock contention with the builder thread.
     pub(crate) fn is_async_index_pipeline_active(&self) -> bool {
-        self.index_build_tx.is_some()
+        self.is_pipeline_active.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Signal all background threads (index builder, auto-flush, auto-checkpoint)
@@ -385,7 +392,8 @@ impl MoteDB {
             index_update_strategy: self.index_update_strategy.clone(),
             query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
             pk_lookup_capacity: self.pk_lookup_capacity,
-            is_flushing: self.is_flushing.clone(),  // 🆕 共享 flush 标志
+            is_flushing: self.is_flushing.clone(),
+            is_pipeline_active: self.is_pipeline_active.clone(),  // shared — clones see true when pipeline runs
             checkpoint_mutex: self.checkpoint_mutex.clone(),
             is_closed: self.is_closed.clone(),
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
@@ -745,6 +753,7 @@ impl MoteDB {
             query_timeout_secs: config.query_timeout_secs,
             pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
+            is_pipeline_active: Arc::new(AtomicBool::new(false)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
@@ -760,6 +769,7 @@ impl MoteDB {
             Self::start_index_builder_pipeline(db.clone_for_callback());
         db.index_build_tx = Some(index_build_tx);
         db.index_builder_thread = Some(index_builder_thread);
+        db.is_pipeline_active.store(true, std::sync::atomic::Ordering::Relaxed);
 
         {
             let tx = db.index_build_tx.clone().unwrap();
@@ -1075,7 +1085,7 @@ impl MoteDB {
         registry: &crate::catalog::TableRegistry,
     ) -> crate::Result<()> {
         let memtable_len = memtable.len();
-        if memtable_len == 0 || memtable_len < 100 {
+        if memtable_len == 0 {
             return Ok(());
         }
 
@@ -1378,15 +1388,15 @@ impl Drop for MoteDB {
         // 🛑 Step 1: Stop index builder thread (drop sender to signal end, then join)
         if let Some(mut thread) = self.index_builder_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping index builder thread...");
-            // Drop sender to signal the thread to exit
             self.index_build_tx = None;
+            self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
             thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(handle) = thread.handle.take() {
                 let _ = handle.join();
             }
-            debug_log!("[MoteDB::Drop] ✅ Index builder thread stopped");
         }
         self.index_build_tx = None;
+        self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // 🛑 Step 2: Stop auto-checkpoint thread
         if let Some(mut thread) = self.auto_checkpoint_thread.take() {

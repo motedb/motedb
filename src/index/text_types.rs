@@ -497,13 +497,13 @@ impl PostingList {
         let mut prev_doc_id = 0u32;
         for &doc_id in clean_doc_ids {
             if let Some(pos_list) = pos_map.get(&(doc_id as u64)) {
-                let delta = doc_id - prev_doc_id;
+                let delta = doc_id.saturating_sub(prev_doc_id);
                 prev_doc_id = doc_id;
                 buf.extend_from_slice(&delta.to_le_bytes());
                 buf.extend_from_slice(&(pos_list.len() as u16).to_le_bytes());
                 let mut prev_pos = 0u32;
                 for &pos in pos_list {
-                    let pd = pos - prev_pos;
+                    let pd = pos.saturating_sub(prev_pos);
                     prev_pos = pos;
                     buf.extend_from_slice(&pd.to_le_bytes());
                 }

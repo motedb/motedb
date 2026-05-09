@@ -520,10 +520,10 @@ impl DiskANNIndex {
         
         let mut nodes_with_dist: Vec<_> = shuffled.iter()
             .filter(|&&id| id != medoid_id)
-            .map(|&id| {
-                let vec = self.vectors.get(id).unwrap();
+            .filter_map(|&id| {
+                let vec = self.vectors.get(id)?;
                 let dist = self.metric.distance(&medoid_vec, &vec);
-                (id, dist)
+                Some((id, dist))
             })
             .collect();
         

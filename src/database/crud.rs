@@ -154,6 +154,7 @@ impl MoteDB {
         // 7. Update indexes
         {
         let mut index_errors: Vec<String> = Vec::new();
+        let pipeline_active = self.is_async_index_pipeline_active();
 
         for col_def in &schema.columns {
             let col_name = &col_def.name;
@@ -171,6 +172,25 @@ impl MoteDB {
                         lookup.insert(crate::database::pk_cache::PkKey::from_value(col_value), row_id);
                     }
                 }
+            }
+
+            // Skip column/vector/text index direct updates when async pipeline is active.
+            // The pipeline batch-builds these indexes from flushed memtables — direct
+            // updates cause double-insertion and can corrupt posting lists (unsorted
+            // positions → delta-encoding overflow).
+            if pipeline_active {
+                // 7.4 i-Octree Index is NOT built by the async pipeline, keep it.
+                if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
+                    if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Octree) {
+                        if let crate::types::Value::Spatial(geom) = col_value {
+                            if let Err(_e) = self.insert_ioctree_point(row_id, &index_name, geom) {
+                                debug_log!("[insert_row] Failed to update ioctree index '{}': {}", index_name, _e);
+                                index_errors.push(index_name.clone());
+                            }
+                        }
+                    }
+                }
+                continue;
             }
 
             // 7.1 Column Index — build key once, check DashMap
