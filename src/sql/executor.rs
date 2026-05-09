@@ -6477,6 +6477,12 @@ impl QueryExecutor {
         
         let row_ids = index_arc.read().scan_row_ids_with_limit(scan_limit)?;
 
+        // If the column index is empty (async pipeline may not have built it yet),
+        // fall back to full scan to avoid returning wrong empty results.
+        if row_ids.is_empty() {
+            return Ok(None);
+        }
+
         // Apply sort order (ascending or descending)
         let sorted_row_ids = if order_by.asc {
             row_ids
