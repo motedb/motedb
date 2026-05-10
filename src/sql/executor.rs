@@ -5854,7 +5854,7 @@ impl QueryExecutor {
         table_name: &str,
         row_ids: &[RowId],
         dist_map: Option<&std::collections::HashMap<u64, f64>>,
-        is_within: bool,
+        _is_within: bool,
     ) -> Result<Option<QueryResult>> {
         if row_ids.is_empty() {
             return Ok(Some(QueryResult::Select {
@@ -5866,49 +5866,27 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(table_name)?;
         let limit = stmt.limit.unwrap_or(row_ids.len());
         let row_ids_to_load = &row_ids[..row_ids.len().min(limit)];
+        let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
-        // 🚀 Use batch loading instead of per-row get_table_row
         let batch_rows = self.db.get_table_rows_batch(table_name, row_ids_to_load)?;
 
-        let mut sql_rows = Vec::with_capacity(batch_rows.len());
+        let mut result_rows = Vec::with_capacity(batch_rows.len());
         for (row_id, row_opt) in batch_rows {
             if let Some(row) = row_opt {
-                let mut sql_row = row_to_sql_row(&row, &schema)?;
-                sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                sql_row.insert("__table__".to_string(), Value::Text(table_name.to_string()));
-                if is_within {
-                    sql_row.insert("__spatial_within__".to_string(), Value::Bool(true));
-                } else {
-                    sql_row.insert("__spatial_knn__".to_string(), Value::Bool(true));
-                }
+                let mut projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
                 if let Some(dm) = dist_map {
                     if let Some(d) = dm.get(&row_id) {
-                        sql_row.insert("__spatial_distance__".to_string(), Value::Float(*d));
+                        projected.push(Value::Float(*d));
                     }
                 }
-                let old_row = std::mem::take(&mut sql_row);
-                let mut qualified = SqlRow::new();
-                qualified.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                qualified.insert("__table__".to_string(), Value::Text(table_name.to_string()));
-                if is_within {
-                    qualified.insert("__spatial_within__".to_string(), Value::Bool(true));
-                } else {
-                    qualified.insert("__spatial_knn__".to_string(), Value::Bool(true));
-                }
-                if let Some(dm) = dist_map {
-                    if let Some(d) = dm.get(&row_id) {
-                        qualified.insert("__spatial_distance__".to_string(), Value::Float(*d));
-                    }
-                }
-                for (col_name, val) in old_row.into_iter() {
-                    let qname = Self::make_qualified_name(table_name, &col_name);
-                    qualified.insert(qname, val);
-                }
-                sql_rows.push((row_id, qualified));
+                result_rows.push(projected);
             }
         }
 
-        let (column_names, result_rows) = self.project_columns(&stmt.columns, &sql_rows, &schema)?;
+        let mut column_names = columns.clone();
+        if dist_map.is_some() {
+            column_names.push("distance".to_string());
+        }
 
         Ok(Some(QueryResult::Select {
             columns: column_names,

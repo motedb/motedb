@@ -1174,20 +1174,48 @@ impl MoteDB {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         // Validate table exists
         let _schema = self.table_registry.get_table(table_name)?;
-        
-        // Smart path selection: Detect continuous row_ids
-        let is_continuous = self.is_continuous_row_ids(row_ids);
-        
-        if is_continuous {
-            // Use LSM range scan (much faster for continuous IDs)
-            self.get_table_rows_batch_range(table_name, row_ids)
-        } else {
-            // Use batch point query
-            self.get_table_rows_batch_point(table_name, row_ids)
+
+        // Check row cache first — avoid expensive SSTable scans for repeated queries
+        let mut results: Vec<(RowId, Option<Row>)> = Vec::with_capacity(row_ids.len());
+        let mut cache_hits = 0;
+        let mut missed_ids: Vec<RowId> = Vec::new();
+        let mut missed_indices: Vec<usize> = Vec::new();
+
+        for (i, &row_id) in row_ids.iter().enumerate() {
+            if let Some(row) = self.row_cache.get(table_name, row_id) {
+                results.push((row_id, Some((*row).clone())));
+                cache_hits += 1;
+            } else {
+                results.push((row_id, None)); // placeholder
+                missed_ids.push(row_id);
+                missed_indices.push(i);
+            }
         }
+
+        // All cached — skip LSM entirely
+        if missed_ids.is_empty() {
+            return Ok(results);
+        }
+
+        // Fetch missing rows from LSM
+        let is_continuous = self.is_continuous_row_ids(&missed_ids);
+        let fetched = if is_continuous {
+            self.get_table_rows_batch_range(table_name, &missed_ids)?
+        } else {
+            self.get_table_rows_batch_point(table_name, &missed_ids)?
+        };
+
+        // Merge fetched results into their correct positions
+        for (fetched_idx, (row_id, row_opt)) in fetched.into_iter().enumerate() {
+            if let Some(&result_idx) = missed_indices.get(fetched_idx) {
+                results[result_idx] = (row_id, row_opt);
+            }
+        }
+
+        Ok(results)
     }
     
     // ==================== Internal Helpers ====================
