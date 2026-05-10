@@ -804,6 +804,11 @@ impl QueryExecutor {
         let row_ids = self.db.query_by_column(table, column, value)?;
 
         if row_ids.is_empty() {
+            // If the async pipeline is active, column indexes may not be built yet.
+            // Fall back to full scan to avoid returning wrong empty results.
+            if self.db.is_async_index_pipeline_active() {
+                return self.execute_full_scan_streaming(stmt, table);
+            }
             return Ok(StreamingQueryResult::SelectStreaming {
                 columns,
                 rows: Box::new(std::iter::empty()),
@@ -2313,15 +2318,15 @@ impl QueryExecutor {
                         if self.db.column_indexes.contains_key(&index_name) {
                             // ⚡ Ultra-fast path: Use index to get count
                             match self.db.query_by_column(table_name, &col_name, &target_value) {
-                                Ok(row_ids) => {
+                                Ok(row_ids) if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() => {
                                     let count = row_ids.len() as i64;
                                     return Ok(QueryResult::Select {
                                         columns: vec!["COUNT(*)".to_string()],
                                         rows: vec![vec![Value::Integer(count)]],
                                     });
                                 }
-                                Err(_) => {
-                                    // Fallback to normal execution
+                                Ok(_) | Err(_) => {
+                                    // Fallback: index empty + pipeline active, or query error
                                 }
                             }
                         }
@@ -2377,6 +2382,35 @@ impl QueryExecutor {
                             &lower_value, lower_inclusive,
                             &upper_value, upper_inclusive
                         )?;
+
+                        // If column index is empty (async pipeline not yet built), fall back to full scan
+                        if row_ids.is_empty() && self.db.is_async_index_pipeline_active() {
+                            let row_iter = self.db.scan_table_rows_streaming(table_name)?;
+                            let schema = self.db.get_table_schema(table_name)?;
+                            let mut sql_rows = Vec::new();
+                            for result in row_iter {
+                                let (row_id, row) = result?;
+                                let sql_row = row_to_sql_row(&row, &schema)?;
+                                sql_rows.push((row_id, sql_row));
+                            }
+                            let prefix = table_name;
+                            for (row_id, sql_row) in &mut sql_rows {
+                                let mut new_sql_row = SqlRow::new();
+                                new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
+                                new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                                let old_row = std::mem::take(sql_row);
+                                for (col_name, val) in old_row.into_iter() {
+                                    let qualified_name = Self::make_qualified_name(prefix, &col_name);
+                                    new_sql_row.insert(qualified_name, val);
+                                }
+                                *sql_row = new_sql_row;
+                            }
+                            let mut prefixed_schema = (*schema).clone();
+                            for col in &mut prefixed_schema.columns {
+                                col.name = format!("{}.{}", prefix, col.name);
+                            }
+                            (sql_rows, Arc::new(prefixed_schema))
+                        } else {
                         
                         // 🚀 P0 OPTIMIZATION: Smart index selection based on selectivity
                         // 
@@ -2516,6 +2550,7 @@ impl QueryExecutor {
                             
                             (filtered_rows, Arc::new(prefixed_schema))
                         }
+                        } // row_ids non-empty or pipeline inactive
                     } else {
                         // No index, use table scan
                         self.execute_from_with_limit(stmt.from.as_ref().unwrap(), storage_limit)?
@@ -2535,11 +2570,11 @@ impl QueryExecutor {
                     if index_exists {
                         // ⚡ Fast path: Use column index (40x faster!)
                         match self.db.query_by_column(table_name, &col_name, &target_value) {
-                            Ok(row_ids) => {
+                            Ok(row_ids) if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() => {
                                 // 🚀 Use batch get
                                 let schema = self.db.get_table_schema(table_name)?;
                                 let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
-                                
+
                                 // 🚀 P1 优化：预分配 row_ids 大小
                                 let mut sql_rows = Vec::with_capacity(row_ids.len());
                                 for (row_id, row_opt) in batch_rows {
@@ -2548,7 +2583,7 @@ impl QueryExecutor {
                                         sql_rows.push((row_id, sql_row));
                                     }
                                 }
-                                
+
                                 // Add table prefix
                                 // 🚀 P1 优化：使用 take() 避免克隆所有值
                                 let prefix = table_name;
@@ -2556,7 +2591,7 @@ impl QueryExecutor {
                                     let mut new_sql_row = SqlRow::new();
                                     new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
                                     new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-                                    
+
                                     // 使用 drain() 移动值而不是克隆
                                     let old_row = std::mem::take(sql_row);
                                     for (col_name, val) in old_row.into_iter() {
@@ -2565,7 +2600,7 @@ impl QueryExecutor {
                                     }
                                     *sql_row = new_sql_row;
                                 }
-                                
+
                                 let mut prefixed_schema = (*schema).clone();
                                 for col in &mut prefixed_schema.columns {
                                     col.name = format!("{}.{}", prefix, col.name);
@@ -2573,8 +2608,8 @@ impl QueryExecutor {
 
                                 (sql_rows, Arc::new(prefixed_schema))
                             }
-                            Err(_) => {
-                                // Fallback to table scan
+                            Ok(_) | Err(_) => {
+                                // Fallback: index empty + pipeline active, or query error
                                 self.execute_from(stmt.from.as_ref().unwrap())?
                             }
                         }
@@ -2607,11 +2642,11 @@ impl QueryExecutor {
                         };
                         
                         match row_ids_result {
-                            Ok(row_ids) => {
+                            Ok(row_ids) if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() => {
                                 // 🚀 Use batch get
                                 let schema = self.db.get_table_schema(table_name)?;
                                 let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
-                                
+
                                 // 🚀 P1 优化：预分配 row_ids 大小
                                 let mut sql_rows = Vec::with_capacity(row_ids.len());
                                 for (row_id, row_opt) in batch_rows {
@@ -2620,7 +2655,7 @@ impl QueryExecutor {
                                         sql_rows.push((row_id, sql_row));
                                     }
                                 }
-                                
+
                                 // Add table prefix
                                 // 🚀 P1 优化：使用 take() 避免克隆所有值
                                 let prefix = table_name;
@@ -2628,7 +2663,7 @@ impl QueryExecutor {
                                     let mut new_sql_row = SqlRow::new();
                                     new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
                                     new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-                                    
+
                                     // 使用 drain() 移动值而不是克隆
                                     let old_row = std::mem::take(sql_row);
                                     for (col_name, val) in old_row.into_iter() {
@@ -2637,7 +2672,7 @@ impl QueryExecutor {
                                     }
                                     *sql_row = new_sql_row;
                                 }
-                                
+
                                 let mut prefixed_schema = (*schema).clone();
                                 for col in &mut prefixed_schema.columns {
                                     col.name = format!("{}.{}", prefix, col.name);
@@ -2645,8 +2680,8 @@ impl QueryExecutor {
 
                                 (sql_rows, Arc::new(prefixed_schema))
                             }
-                            Err(_) => {
-                                // Fallback to table scan
+                            Ok(_) | Err(_) => {
+                                // Fallback: index empty + pipeline active, or query error
                                 self.execute_from(stmt.from.as_ref().unwrap())?
                             }
                         }

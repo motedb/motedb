@@ -203,7 +203,14 @@ impl MoteDB {
 
         for col_def in &schema.columns {
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                let index_name = format!("{}_{}", table_name, col_def.name);
+                // Look up actual index name from registry (supports custom names)
+                let index_name = match self.index_registry.find_by_column(
+                    table_name, &col_def.name,
+                    crate::database::index_metadata::IndexType::Vector
+                ) {
+                    Some(name) => name,
+                    None => continue,
+                };
                 if let Some(index_ref) = self.vector_indexes.get(&index_name) {
                     let index = index_ref.value();
                     let mut vectors = Vec::new();
@@ -229,7 +236,14 @@ impl MoteDB {
 
         for col_def in &schema.columns {
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                let index_name = format!("{}_{}", table_name, col_def.name);
+                // Look up actual index name from registry (supports custom names)
+                let index_name = match self.index_registry.find_by_column(
+                    table_name, &col_def.name,
+                    crate::database::index_metadata::IndexType::Text
+                ) {
+                    Some(name) => name,
+                    None => continue,
+                };
                 if let Some(index_ref) = self.text_indexes.get(&index_name) {
                     let index = index_ref.value();
                     let mut index_guard = index.write();
