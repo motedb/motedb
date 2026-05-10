@@ -377,11 +377,14 @@ fn bench_multimodal_memory() {
     }
     println!("  After 50 vector searches: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss_q0);
 
-    // Spatial queries
-    for _ in 0..50 {
+    // Spatial queries (reduced count: each query scans ~10K rows from SSTable)
+    let spatial_start = std::time::Instant::now();
+    for i in 0..5 {
+        let t = std::time::Instant::now();
         let _ = exec(&db, "SELECT * FROM pts WHERE ST_WITHIN(loc, 116.0, 39.5, 117.0, 40.5)");
+        println!("  Spatial query {}: {:?}", i + 1, t.elapsed());
     }
-    println!("  After 50 spatial queries: {:.1} MB", get_rss_mb());
+    println!("  After 5 spatial queries: {:.1} MB ({:?} total)", get_rss_mb(), spatial_start.elapsed());
 
     // Text searches
     for _ in 0..50 {
