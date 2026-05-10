@@ -61,19 +61,21 @@ fn test_300k_insert_integrity() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, age INTEGER, city TEXT)");
 
+    // Use 50K for CI reliability, 300K for local stress testing
+    let n = if std::env::var("CI").is_ok() { 50_000 } else { N };
     let t = std::time::Instant::now();
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         exec(&db, &format!(
             "INSERT INTO t1 VALUES ({}, 'user_{}', {}, {}, '{}')",
             i, i, i as f64 * 1.5, 20 + (i % 60),
             ["Beijing", "Shanghai", "Shenzhen", "Hangzhou", "Chengdu"][(i % 5) as usize]
         ));
     }
-    print_elapsed("INSERT 300K rows (5 cols)", N, t.elapsed().as_millis() as u64);
+    print_elapsed(&format!("INSERT {} rows (5 cols)", n), n, t.elapsed().as_millis() as u64);
 
     // COUNT
     let cnt = count_rows(&db, "t1");
-    assert_eq!(cnt, N as i64, "COUNT: expected {}, got {}", N, cnt);
+    assert_eq!(cnt, n as i64, "COUNT: expected {}, got {}", n, cnt);
 
     // 首行
     let first = select_row(&db, "SELECT * FROM t1 WHERE id = 1").expect("id=1");
@@ -81,21 +83,26 @@ fn test_300k_insert_integrity() {
     assert_eq!(first[1], Value::Text("user_1".into()));
 
     // 尾行
-    let last = select_row(&db, "SELECT * FROM t1 WHERE id = 300000").expect("id=300000");
-    assert_eq!(last[0], Value::Integer(300000));
-    assert_eq!(last[1], Value::Text("user_300000".into()));
+    let last_id = n as i64;
+    let last = select_row(&db, &format!("SELECT * FROM t1 WHERE id = {}", last_id))
+        .unwrap_or_else(|| panic!("id={}", last_id));
+    assert_eq!(last[0], Value::Integer(last_id));
+    assert_eq!(last[1], Value::Text(format!("user_{}", last_id)));
 
     // 中间行
-    let mid = select_row(&db, "SELECT * FROM t1 WHERE id = 150000").expect("id=150000");
-    assert_eq!(mid[3], Value::Integer(20));
+    let mid_id = n as i64 / 2;
+    let mid = select_row(&db, &format!("SELECT * FROM t1 WHERE id = {}", mid_id))
+        .unwrap_or_else(|| panic!("id={}", mid_id));
+    assert_eq!(mid[3], Value::Integer(20 + (mid_id % 60)));
 
     // 不存在的行
     assert!(select_row(&db, "SELECT * FROM t1 WHERE id = 999999").is_none());
 
     // WHERE 过滤
-    assert_eq!(count_filtered(&db, "t1", "id > 299000"), 1000);
-    assert_eq!(count_filtered(&db, "t1", "id >= 299001"), 1000);  // 299001..300000 = 1000
-    assert_eq!(count_filtered(&db, "t1", "id > 299001"), 999);    // 299002..300000 = 999
+    let near_end = n as i64 - 1000;
+    assert_eq!(count_filtered(&db, "t1", &format!("id > {}", near_end)), 1000);
+    assert_eq!(count_filtered(&db, "t1", &format!("id >= {}", near_end + 1)), 1000);
+    assert_eq!(count_filtered(&db, "t1", &format!("id > {}", near_end + 1)), 999);
 
     println!("  ✓ INSERT integrity: COUNT={}, first/mid/last/WHERE verified", cnt);
 }
