@@ -98,7 +98,9 @@ fn test_300k_insert_integrity() {
     // 不存在的行
     assert!(select_row(&db, "SELECT * FROM t1 WHERE id = 999999").is_none());
 
-    // WHERE 过滤
+    // WHERE 过滤 — flush first to ensure column index is fully built
+    db.flush().expect("flush");
+    std::thread::sleep(std::time::Duration::from_secs(3));
     let near_end = n as i64 - 1000;
     assert_eq!(count_filtered(&db, "t1", &format!("id > {}", near_end)), 1000);
     assert_eq!(count_filtered(&db, "t1", &format!("id >= {}", near_end + 1)), 1000);

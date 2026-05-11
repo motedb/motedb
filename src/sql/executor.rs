@@ -801,14 +801,14 @@ impl QueryExecutor {
         }
 
         // Fallback: use column index
-        // If async pipeline is active, column index may be partial — always fall back to full scan
-        if self.db.is_async_index_pipeline_active() {
-            return self.execute_full_scan_streaming(stmt, table);
-        }
-
         let row_ids = self.db.query_by_column(table, column, value)?;
 
         if row_ids.is_empty() {
+            // If the async pipeline is active, column indexes may not be built yet.
+            // Fall back to full scan to avoid returning wrong empty results.
+            if self.db.is_async_index_pipeline_active() {
+                return self.execute_full_scan_streaming(stmt, table);
+            }
             return Ok(StreamingQueryResult::SelectStreaming {
                 columns,
                 rows: Box::new(std::iter::empty()),
@@ -2318,7 +2318,7 @@ impl QueryExecutor {
                         if self.db.column_indexes.contains_key(&index_name) {
                             // ⚡ Ultra-fast path: Use index to get count
                             match self.db.query_by_column(table_name, &col_name, &target_value) {
-                                Ok(row_ids) if !self.db.is_async_index_pipeline_active() => {
+                                Ok(row_ids) if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() => {
                                     let count = row_ids.len() as i64;
                                     return Ok(QueryResult::Select {
                                         columns: vec!["COUNT(*)".to_string()],
@@ -2326,7 +2326,7 @@ impl QueryExecutor {
                                     });
                                 }
                                 Ok(_) | Err(_) => {
-                                    // Fallback: pipeline active (index may be partial) or query error
+                                    // Fallback: index empty + pipeline active, or query error
                                 }
                             }
                         }
@@ -2383,8 +2383,8 @@ impl QueryExecutor {
                             &upper_value, upper_inclusive
                         )?;
 
-                        // If async pipeline is active, column index may be partial — fall back to full scan
-                        if self.db.is_async_index_pipeline_active() {
+                        // If column index is empty (async pipeline not yet built), fall back to full scan
+                        if row_ids.is_empty() && self.db.is_async_index_pipeline_active() {
                             let row_iter = self.db.scan_table_rows_streaming(table_name)?;
                             let schema = self.db.get_table_schema(table_name)?;
                             let mut sql_rows = Vec::new();
@@ -2570,7 +2570,7 @@ impl QueryExecutor {
                     if index_exists {
                         // ⚡ Fast path: Use column index (40x faster!)
                         match self.db.query_by_column(table_name, &col_name, &target_value) {
-                            Ok(row_ids) if !self.db.is_async_index_pipeline_active() => {
+                            Ok(row_ids) if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() => {
                                 // 🚀 Use batch get
                                 let schema = self.db.get_table_schema(table_name)?;
                                 let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
@@ -2609,7 +2609,7 @@ impl QueryExecutor {
                                 (sql_rows, Arc::new(prefixed_schema))
                             }
                             Ok(_) | Err(_) => {
-                                // Fallback: pipeline active (index may be partial) or query error
+                                // Fallback: index empty + pipeline active, or query error
                                 self.execute_from(stmt.from.as_ref().unwrap())?
                             }
                         }
@@ -2642,7 +2642,7 @@ impl QueryExecutor {
                         };
                         
                         match row_ids_result {
-                            Ok(row_ids) if !self.db.is_async_index_pipeline_active() => {
+                            Ok(row_ids) if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() => {
                                 // 🚀 Use batch get
                                 let schema = self.db.get_table_schema(table_name)?;
                                 let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
@@ -2681,7 +2681,7 @@ impl QueryExecutor {
                                 (sql_rows, Arc::new(prefixed_schema))
                             }
                             Ok(_) | Err(_) => {
-                                // Fallback: pipeline active (index may be partial) or query error
+                                // Fallback: index empty + pipeline active, or query error
                                 self.execute_from(stmt.from.as_ref().unwrap())?
                             }
                         }
@@ -6490,8 +6490,9 @@ impl QueryExecutor {
         
         let row_ids = index_arc.read().scan_row_ids_with_limit(scan_limit)?;
 
-        // If async pipeline is active, column index may be partial — fall back to full scan
-        if row_ids.is_empty() || self.db.is_async_index_pipeline_active() {
+        // If the column index is empty (async pipeline may not have built it yet),
+        // fall back to full scan to avoid returning wrong empty results.
+        if row_ids.is_empty() {
             return Ok(None);
         }
 
