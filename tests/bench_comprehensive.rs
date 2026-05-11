@@ -77,6 +77,7 @@ fn bench_insert_throughput() {
     print_result("INSERT 50K rows (5 cols, PK auto-increment)", N, ms);
     let insert_ops_per_s = if ms > 0 { N as f64 / (ms as f64 / 1000.0) } else { 0.0 };
     println!("  -> Throughput: {:.0} inserts/s", insert_ops_per_s);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -140,6 +141,7 @@ fn bench_point_query() {
     let sst_per_op = sst_ms as f64 * 1000.0 / Q as f64;
     let warm_per_op = warm_ms as f64 * 1000.0 / 10_000.0;
     println!("  -> MemTable: {:.1}µs, SSTable: {:.1}µs, Cached: {:.1}µs", mem_per_op, sst_per_op, warm_per_op);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -195,6 +197,7 @@ fn bench_update_delete() {
     let upd_per_op = upd_ms as f64 * 1000.0 / upd_count as f64;
     let del_per_op = del_ms as f64 * 1000.0 / del_count as f64;
     println!("  -> UPDATE: {:.1}µs/op, DELETE: {:.1}µs/op", upd_per_op, del_per_op);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -248,6 +251,7 @@ fn bench_checkpoint() {
     println!("  -> Second fast: {}ms (should be <1ms)", second_fast_ms);
 
     println!("  -> Fast/Full speedup: {:.1}x", if full_ms > 0 { full_ms as f64 / fast_ms.max(1) as f64 } else { 0.0 });
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -354,6 +358,7 @@ fn bench_column_index() {
         start.elapsed().as_millis() as u64
     };
     print_result("Full scan + filter × 50 (stock > 80, no index)", 50, no_idx_ms);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -404,6 +409,7 @@ fn bench_full_scan() {
         start.elapsed().as_millis() as u64
     };
     print_result("COUNT(*) × 100", 100, count_ms);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -467,6 +473,7 @@ fn bench_mixed_crud() {
     );
     let per_op = total_ms as f64 * 1000.0 / total_ops as f64;
     println!("  -> Average: {:.1}µs/op overall", per_op);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -561,6 +568,7 @@ fn bench_prepared_statement_cache() {
     let hot_per_op = hot_ms as f64 * 1000.0 / 10_000.0;
     let speedup = if hot_per_op > 0.0 { cold_per_op / hot_per_op } else { 0.0 };
     println!("  -> Cold: {:.1}µs/op, Hot: {:.1}µs/op, Speedup: {:.1}x", cold_per_op, hot_per_op, speedup);
+    db.close().ok();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -685,6 +693,8 @@ fn bench_concurrent_mixed() {
 
     let ops_per_s = 10_000.0 / (total_ms as f64 / 1000.0);
     println!("  -> Concurrent throughput: {:.0} ops/s", ops_per_s);
+    // Explicitly close DB to stop all background threads before process exit
+    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
 }
 
 // ═══════════════════════════════════════════════════════════════
