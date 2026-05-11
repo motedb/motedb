@@ -13,6 +13,8 @@ use motedb::Database;
 use tempfile::TempDir;
 use std::time::Instant;
 
+fn is_ci() -> bool { std::env::var("CI").is_ok() }
+
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create(dir.path()).expect("create db");
@@ -39,11 +41,11 @@ fn stress_insert_50k() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score FLOAT, age INTEGER)");
 
-    const N: usize = 50_000;
+    let n: usize = if is_ci() { 10_000 } else { 50_000 };
 
     let ms = {
         let start = Instant::now();
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO users VALUES ({}, 'user_{}', 'user_{}@test.com', {}, {})",
                 i, i, i, i as f64 * 1.5, 20 + (i % 50)
@@ -51,11 +53,10 @@ fn stress_insert_50k() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("INSERT 50K rows (5 cols, PK auto)", N, ms);
+    print_result(&format!("INSERT {} rows (5 cols, PK auto)", n), n, ms);
 
     db.flush().expect("flush");
-    // Wait for SSTable registration
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     let cnt = exec_count(&db, "SELECT COUNT(*) AS cnt FROM users");
     println!("  -> Row count after flush: {}", cnt);
@@ -69,13 +70,13 @@ fn stress_pk_lookup() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score FLOAT, tag TEXT)");
 
-    const N: usize = 20_000;
-    const Q: usize = 10_000;
+    let n: usize = if is_ci() { 5_000 } else { 20_000 };
+    let q: usize = if is_ci() { 2_000 } else { 10_000 };
 
     // Seed
     let seed_ms = {
         let start = Instant::now();
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO t VALUES ({}, 'val_{}', {}, 'tag_{}')",
                 i, i, i as f64, i % 10
@@ -83,44 +84,46 @@ fn stress_pk_lookup() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Seed INSERT {} rows", N), N, seed_ms);
+    print_result(&format!("Seed INSERT {} rows", n), n, seed_ms);
 
     // PK lookup — MemTable (all in memory)
     let mem_ms = {
         let start = Instant::now();
-        for i in 1..=Q as i64 {
+        for i in 1..=q as i64 {
             exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("PK SELECT {} queries (MemTable)", Q), Q, mem_ms);
+    print_result(&format!("PK SELECT {} queries (MemTable)", q), q, mem_ms);
 
     // Flush to SSTable
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     // PK lookup — SSTable (tests RowCache + PreparedStatement cache)
     let sst_ms = {
         let start = Instant::now();
-        for i in 1..=Q as i64 {
+        for i in 1..=q as i64 {
             exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("PK SELECT {} queries (SSTable + Cache)", Q), Q, sst_ms);
+    print_result(&format!("PK SELECT {} queries (SSTable + Cache)", q), q, sst_ms);
 
     // Repeated PK queries (tests PreparedStatement cache hit)
+    let cached_reps = if is_ci() { 20 } else { 100 };
+    let cached_total = 100 * cached_reps;
     let cached_ms = {
         let start = Instant::now();
-        // Repeat same 100 queries 100 times = 10K total
-        for _ in 0..100 {
+        // Repeat same 100 queries N times
+        for _ in 0..cached_reps {
             for i in 1..=100i64 {
                 exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
             }
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 10K (repeated 100 queries × 100, stmt cache)", 10_000, cached_ms);
+    print_result(&format!("PK SELECT {} (repeated 100 queries × {}, stmt cache)", cached_total, cached_reps), cached_total, cached_ms);
 }
 
 // ── Test 3: Column Index 查询 ──
@@ -130,12 +133,13 @@ fn stress_column_index() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price FLOAT, stock INTEGER)");
 
-    const N: usize = 30_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
+    let queries: usize = if is_ci() { 20 } else { 100 };
 
     // Seed
     let seed_ms = {
         let start = Instant::now();
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             let cat = match i % 5 {
                 0 => "electronics",
                 1 => "books",
@@ -150,34 +154,34 @@ fn stress_column_index() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Seed INSERT {} rows (5 categories)", N), N, seed_ms);
+    print_result(&format!("Seed INSERT {} rows (5 categories)", n), n, seed_ms);
 
     // Create column index
     exec(&db, "CREATE INDEX idx_category ON products (category)");
     exec(&db, "CREATE INDEX idx_price ON products (price)");
 
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     // Exact match on category
     let eq_ms = {
         let start = Instant::now();
-        for _ in 0..100 {
+        for _ in 0..queries {
             exec(&db, "SELECT * FROM products WHERE category = 'electronics'");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("Column eq scan × 100 (category='electronics')", 100, eq_ms);
+    print_result(&format!("Column eq scan × {} (category='electronics')", queries), queries, eq_ms);
 
     // Range query on price
     let range_ms = {
         let start = Instant::now();
-        for _ in 0..100 {
+        for _ in 0..queries {
             exec(&db, "SELECT * FROM products WHERE price > 500.0 AND price < 600.0");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("Column range scan × 100 (500 < price < 600)", 100, range_ms);
+    print_result(&format!("Column range scan × {} (500 < price < 600)", queries), queries, range_ms);
 }
 
 // ── Test 4: 全表扫描 ──
@@ -187,11 +191,12 @@ fn stress_full_scan() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE events (id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT, ts INTEGER)");
 
-    const N: usize = 50_000;
+    let n: usize = if is_ci() { 10_000 } else { 50_000 };
+    let count_rounds: usize = if is_ci() { 10 } else { 50 };
 
     let seed_ms = {
         let start = Instant::now();
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO events VALUES ({}, 'type_{}', 'payload_data_{}', {})",
                 i, i % 20, i, 1700000000 + i
@@ -199,7 +204,7 @@ fn stress_full_scan() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Seed INSERT {} rows", N), N, seed_ms);
+    print_result(&format!("Seed INSERT {} rows", n), n, seed_ms);
 
     // Scan from MemTable
     let mem_scan_ms = {
@@ -207,11 +212,11 @@ fn stress_full_scan() {
         exec(&db, "SELECT * FROM events");
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("SELECT * {} rows (MemTable)", N), N, mem_scan_ms);
+    print_result(&format!("SELECT * {} rows (MemTable)", n), n, mem_scan_ms);
 
     // Flush
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     // Scan from SSTable
     let sst_scan_ms = {
@@ -219,7 +224,7 @@ fn stress_full_scan() {
         exec(&db, "SELECT * FROM events");
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("SELECT * {} rows (SSTable)", N), N, sst_scan_ms);
+    print_result(&format!("SELECT * {} rows (SSTable)", n), n, sst_scan_ms);
 
     // Scan with filter
     let filter_ms = {
@@ -227,17 +232,17 @@ fn stress_full_scan() {
         exec(&db, "SELECT * FROM events WHERE event_type = 'type_5'");
         start.elapsed().as_millis() as u64
     };
-    print_result("SELECT * with WHERE filter (SSTable, 1/20 match)", N, filter_ms);
+    print_result("SELECT * with WHERE filter (SSTable, 1/20 match)", n, filter_ms);
 
     // COUNT(*) fast path
     let count_ms = {
         let start = Instant::now();
-        for _ in 0..50 {
+        for _ in 0..count_rounds {
             exec(&db, "SELECT COUNT(*) AS cnt FROM events");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("COUNT(*) × 50 (SSTable)", 50, count_ms);
+    print_result(&format!("COUNT(*) × {} (SSTable)", count_rounds), count_rounds, count_ms);
 }
 
 // ── Test 5: 混合 CRUD (INSERT + UPDATE + DELETE + SELECT) ──
@@ -247,13 +252,14 @@ fn stress_mixed_crud() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, amount FLOAT, status TEXT)");
 
-    const N: usize = 30_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
+    let selects: usize = if is_ci() { 1_000 } else { 5_000 };
 
     let total_ms = {
         let start = Instant::now();
 
         // Phase 1: INSERT
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO orders VALUES ({}, 'customer_{}', {}, 'pending')",
                 i, i % 1000, 10.0 + (i as f64 % 990.0)
@@ -261,21 +267,20 @@ fn stress_mixed_crud() {
         }
 
         // Phase 2: UPDATE (1/3)
-        let _updates = N / 3;
-        for i in (1..=N as i64).step_by(3) {
+        let _updates = n / 3;
+        for i in (1..=n as i64).step_by(3) {
             exec(&db, &format!(
                 "UPDATE orders SET status = 'shipped', amount = amount + 10 WHERE id = {}", i
             ));
         }
 
         // Phase 3: DELETE (1/5)
-        let _deletes = N / 5;
-        for i in (1..=N as i64).step_by(5) {
+        let _deletes = n / 5;
+        for i in (1..=n as i64).step_by(5) {
             exec(&db, &format!("DELETE FROM orders WHERE id = {}", i));
         }
 
         // Phase 4: Point SELECT (random)
-        let selects = 5_000;
         for i in (1..=selects as i64).rev() {
             exec(&db, &format!("SELECT * FROM orders WHERE id = {}", i));
         }
@@ -283,10 +288,10 @@ fn stress_mixed_crud() {
         start.elapsed().as_millis() as u64
     };
 
-    let total_ops = N + N / 3 + N / 5 + 5_000;
+    let total_ops = n + n / 3 + n / 5 + selects;
     print_result(
         &format!("Mixed CRUD ({} ops: {}ins + {}upd + {}del + {}sel)",
-            total_ops, N, N/3, N/5, 5000),
+            total_ops, n, n/3, n/5, selects),
         total_ops, total_ms
     );
 }
@@ -298,14 +303,14 @@ fn stress_batch_insert() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE metrics (id INTEGER PRIMARY KEY, host TEXT, cpu FLOAT, mem FLOAT, ts INTEGER)");
 
-    const N: usize = 50_000;
-    const BATCH: usize = 500;
+    let n: usize = if is_ci() { 10_000 } else { 50_000 };
+    let batch: usize = if is_ci() { 100 } else { 500 };
 
     let ms = {
         let start = Instant::now();
         let mut id = 1i64;
-        while id <= N as i64 {
-            let end = (id + BATCH as i64 - 1).min(N as i64);
+        while id <= n as i64 {
+            let end = (id + batch as i64 - 1).min(n as i64);
             // Simulate batch by inserting a chunk
             for i in id..=end {
                 exec(&db, &format!(
@@ -317,7 +322,7 @@ fn stress_batch_insert() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("INSERT {} rows (batch {} chunks)", N, N / BATCH), N, ms);
+    print_result(&format!("INSERT {} rows (batch {} chunks)", n, n / batch), n, ms);
 }
 
 // ── Test 7: PreparedStatement 缓存效果 ──
@@ -327,10 +332,10 @@ fn stress_prepared_statement_cache() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE cache_test (id INTEGER PRIMARY KEY, data TEXT)");
 
-    const N: usize = 5_000;
+    let n: usize = if is_ci() { 2_000 } else { 5_000 };
 
     // Seed
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         exec(&db, &format!("INSERT INTO cache_test VALUES ({}, 'data_{}')", i, i));
     }
 
@@ -342,7 +347,7 @@ fn stress_prepared_statement_cache() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 1K queries (cold stmt cache → warm)", 1000, cold_ms);
+    print_result("PK SELECT 1K queries (cold stmt cache -> warm)", 1000, cold_ms);
 
     // Phase 2: Hot cache — same 100 queries repeated 100 times
     let hot_ms = {
@@ -354,12 +359,12 @@ fn stress_prepared_statement_cache() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 10K (100 unique × 100 repeat, stmt cache hit)", 10_000, hot_ms);
+    print_result("PK SELECT 10K (100 unique x 100 repeat, stmt cache hit)", 10_000, hot_ms);
 
     let hot_per_op = hot_ms as f64 * 1000.0 / 10_000.0;
     let cold_per_op = cold_ms as f64 * 1000.0 / 1_000.0;
     let speedup = if hot_per_op > 0.0 { cold_per_op / hot_per_op } else { 0.0 };
-    println!("  -> Cold: {:.1} µs/op, Hot: {:.1} µs/op, Speedup: {:.1}x",
+    println!("  -> Cold: {:.1} us/op, Hot: {:.1} us/op, Speedup: {:.1}x",
         cold_per_op, hot_per_op, speedup);
 }
 

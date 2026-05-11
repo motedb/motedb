@@ -31,8 +31,9 @@ fn test_column_index_returns_results() {
     // Create column index — previously returned 0 rows due to wrong hash
     db.execute("CREATE INDEX idx_age ON users (age)").unwrap();
 
-    // Give index builder time
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Flush + wait for index builder to process the batch
+    db.flush().unwrap();
+    db.wait_for_indexes_ready();
 
     let r = rows(&db, "SELECT id FROM users WHERE age = 25 ORDER BY id");
     assert!(r.len() >= 2, "Column index should find at least 2 rows with age=25, got {}", r.len());
