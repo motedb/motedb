@@ -19,6 +19,11 @@ use motedb::{Database, DBConfig};
 use tempfile::TempDir;
 use std::time::Instant;
 
+/// CI mode: smaller data sizes for reliable parallel execution
+fn is_ci() -> bool {
+    std::env::var("CI").is_ok()
+}
+
 fn edge_config() -> DBConfig {
     DBConfig::for_edge()
 }
@@ -62,11 +67,10 @@ fn bench_insert_throughput() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score FLOAT, age INTEGER)");
 
-    // Single-row INSERT (50K)
-    const N: usize = 50_000;
+    let n: usize = if is_ci() { 5_000 } else { 50_000 };
     let ms = {
         let start = Instant::now();
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO t1 VALUES ({}, 'user_{}', 'user_{}@test.com', {}, {})",
                 i, i, i, i as f64 * 1.5, 20 + (i % 50)
@@ -74,8 +78,8 @@ fn bench_insert_throughput() {
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("INSERT 50K rows (5 cols, PK auto-increment)", N, ms);
-    let insert_ops_per_s = if ms > 0 { N as f64 / (ms as f64 / 1000.0) } else { 0.0 };
+    print_result(&format!("INSERT {} rows (5 cols, PK auto-increment)", n), n, ms);
+    let insert_ops_per_s = if ms > 0 { n as f64 / (ms as f64 / 1000.0) } else { 0.0 };
     println!("  -> Throughput: {:.0} inserts/s", insert_ops_per_s);
     db.close().ok();
 }
@@ -89,57 +93,59 @@ fn bench_point_query() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT, score FLOAT, tag TEXT)");
 
-    const N: usize = 30_000;
-    const Q: usize = 10_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
+    let q: usize = if is_ci() { 2_000 } else { 10_000 };
 
     // Seed
     let seed_start = Instant::now();
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         exec(&db, &format!("INSERT INTO t2 VALUES ({}, 'val_{}', {}, 'tag_{}')", i, i, i as f64, i % 10));
     }
     let seed_ms = seed_start.elapsed().as_millis() as u64;
-    print_result(&format!("Seed: INSERT {} rows", N), N, seed_ms);
+    print_result(&format!("Seed: INSERT {} rows", n), n, seed_ms);
 
     print_separator();
 
     // Phase 1: PK lookup — MemTable (all in memory)
     let mem_ms = {
         let start = Instant::now();
-        for i in 1..=Q as i64 {
+        for i in 1..=q as i64 {
             exec(&db, &format!("SELECT * FROM t2 WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 10K (MemTable)", Q, mem_ms);
+    print_result(&format!("PK SELECT {} (MemTable)", q), q, mem_ms);
 
     // Phase 2: Flush to SSTable
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     let sst_ms = {
         let start = Instant::now();
-        for i in 1..=Q as i64 {
+        for i in 1..=q as i64 {
             exec(&db, &format!("SELECT * FROM t2 WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 10K (SSTable + RowCache)", Q, sst_ms);
+    print_result(&format!("PK SELECT {} (SSTable + RowCache)", q), q, sst_ms);
 
     // Phase 3: Cache-warm repeated queries
+    let repeats = if is_ci() { 20 } else { 100 };
     let warm_ms = {
         let start = Instant::now();
-        for _ in 0..100 {
+        for _ in 0..repeats {
             for i in 1..=100i64 {
                 exec(&db, &format!("SELECT * FROM t2 WHERE id = {}", i));
             }
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 10K (100 unique × 100, fully cached)", 10_000, warm_ms);
+    let warm_total = repeats * 100;
+    print_result(&format!("PK SELECT {} (100 unique × {}, fully cached)", warm_total, repeats), warm_total, warm_ms);
 
-    let mem_per_op = mem_ms as f64 * 1000.0 / Q as f64;
-    let sst_per_op = sst_ms as f64 * 1000.0 / Q as f64;
-    let warm_per_op = warm_ms as f64 * 1000.0 / 10_000.0;
+    let mem_per_op = mem_ms as f64 * 1000.0 / q as f64;
+    let sst_per_op = sst_ms as f64 * 1000.0 / q as f64;
+    let warm_per_op = warm_ms as f64 * 1000.0 / warm_total as f64;
     println!("  -> MemTable: {:.1}µs, SSTable: {:.1}µs, Cached: {:.1}µs", mem_per_op, sst_per_op, warm_per_op);
     db.close().ok();
 }
@@ -153,20 +159,20 @@ fn bench_update_delete() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t3 (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, status TEXT)");
 
-    const N: usize = 30_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
 
     // Seed
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         exec(&db, &format!("INSERT INTO t3 VALUES ({}, 'name_{}', {}, 'active')", i, i, i as f64));
     }
 
     print_separator();
 
     // UPDATE latency (sequential)
-    let upd_count = N / 3;
+    let upd_count = n / 3;
     let upd_ms = {
         let start = Instant::now();
-        for i in (1..=N as i64).step_by(3) {
+        for i in (1..=n as i64).step_by(3) {
             exec(&db, &format!("UPDATE t3 SET score = score + 10, status = 'updated' WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
@@ -174,10 +180,10 @@ fn bench_update_delete() {
     print_result(&format!("UPDATE {} rows (1/3 of table)", upd_count), upd_count, upd_ms);
 
     // DELETE latency (sequential)
-    let del_count = N / 5;
+    let del_count = n / 5;
     let del_ms = {
         let start = Instant::now();
-        for i in (1..=N as i64).step_by(5) {
+        for i in (1..=n as i64).step_by(5) {
             exec(&db, &format!("DELETE FROM t3 WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
@@ -185,14 +191,15 @@ fn bench_update_delete() {
     print_result(&format!("DELETE {} rows (1/5 of table)", del_count), del_count, del_ms);
 
     // Post-delete SELECT
+    let sel_count = if is_ci() { 1_000 } else { 5_000 };
     let sel_ms = {
         let start = Instant::now();
-        for i in 1..=5000i64 {
+        for i in 1..=sel_count as i64 {
             exec(&db, &format!("SELECT * FROM t3 WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("SELECT 5K after UPDATE+DELETE", 5000, sel_ms);
+    print_result(&format!("SELECT {} after UPDATE+DELETE", sel_count), sel_count, sel_ms);
 
     let upd_per_op = upd_ms as f64 * 1000.0 / upd_count as f64;
     let del_per_op = del_ms as f64 * 1000.0 / del_count as f64;
@@ -209,10 +216,10 @@ fn bench_checkpoint() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t4 (id INTEGER PRIMARY KEY, data TEXT, value FLOAT)");
 
-    const N: usize = 30_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
 
     // Seed data
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         exec(&db, &format!("INSERT INTO t4 VALUES ({}, 'data_{}', {})", i, i, i as f64 * 2.0));
     }
 
@@ -224,11 +231,11 @@ fn bench_checkpoint() {
         db.checkpoint().expect("fast checkpoint");
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Fast checkpoint ({} rows, skip rebuild)", N), 1, fast_ms);
+    print_result(&format!("Fast checkpoint ({} rows, skip rebuild)", n), 1, fast_ms);
     println!("  -> Fast checkpoint: {}ms", fast_ms);
 
     // Insert more data
-    for i in (N + 1) as i64..=(N * 2) as i64 {
+    for i in (n + 1) as i64..=(n * 2) as i64 {
         exec(&db, &format!("INSERT INTO t4 VALUES ({}, 'data_{}', {})", i, i, i as f64 * 2.0));
     }
 
@@ -238,7 +245,7 @@ fn bench_checkpoint() {
         db.checkpoint_full().expect("full checkpoint");
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Full checkpoint ({} rows, with rebuild)", N * 2), 1, full_ms);
+    print_result(&format!("Full checkpoint ({} rows, with rebuild)", n * 2), 1, full_ms);
     println!("  -> Full checkpoint: {}ms", full_ms);
 
     // Second fast checkpoint (should be near-instant, nothing pending)
@@ -263,17 +270,17 @@ fn bench_auto_increment_recovery() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
 
-    const N: usize = 50_000;
+    let n: usize = if is_ci() { 5_000 } else { 50_000 };
 
     // Phase 1: Create, insert, checkpoint (persist counter)
     {
         let db = Database::create_with_config(&db_path, edge_config()).expect("create db");
         exec(&db, "CREATE TABLE t5 (id INTEGER PRIMARY KEY, data TEXT)");
 
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!("INSERT INTO t5 VALUES ({}, 'data_{}')", i, i));
         }
-        db.checkpoint().expect("checkpoint"); // Persists AUTO_INCREMENT counter
+        db.checkpoint().expect("checkpoint");
         db.close().expect("close");
     }
 
@@ -285,13 +292,12 @@ fn bench_auto_increment_recovery() {
         let db = Database::open_with_config(&db_path, edge_config()).expect("open db");
         let elapsed = start.elapsed().as_millis() as u64;
 
-        // Verify counter works — next insert should continue from N+1
-        exec(&db, &format!("INSERT INTO t5 VALUES ({}, 'after_recovery')", N as i64 + 1));
+        exec(&db, &format!("INSERT INTO t5 VALUES ({}, 'after_recovery')", n as i64 + 1));
         db.close().expect("close");
         elapsed
     };
-    print_result(&format!("Reopen DB ({} rows, O(1) counter recovery)", N), 1, reopen_ms);
-    println!("  -> Recovery: {}ms (should be <50ms with catalog cache)", reopen_ms);
+    print_result(&format!("Reopen DB ({} rows, O(1) counter recovery)", n), 1, reopen_ms);
+    println!("  -> Recovery: {}ms", reopen_ms);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -303,10 +309,10 @@ fn bench_column_index() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t6 (id INTEGER PRIMARY KEY, category TEXT, price FLOAT, stock INTEGER)");
 
-    const N: usize = 30_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
 
     // Seed
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         let cat = match i % 5 {
             0 => "electronics",
             1 => "books",
@@ -325,39 +331,41 @@ fn bench_column_index() {
     exec(&db, "CREATE INDEX idx_price ON t6 (price)");
 
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     print_separator();
+
+    let q = if is_ci() { 50 } else { 200 };
 
     // Exact match (category = X)
     let eq_ms = {
         let start = Instant::now();
-        for _ in 0..200 {
+        for _ in 0..q {
             exec(&db, "SELECT * FROM t6 WHERE category = 'electronics'");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("Column eq scan × 200 (category='electronics', ~6K rows)", 200, eq_ms);
+    print_result(&format!("Column eq scan × {} (category='electronics')", q), q, eq_ms);
 
     // Range scan (price between)
     let range_ms = {
         let start = Instant::now();
-        for _ in 0..200 {
+        for _ in 0..q {
             exec(&db, "SELECT * FROM t6 WHERE price > 500.0 AND price < 600.0");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("Column range scan × 200 (500 < price < 600)", 200, range_ms);
+    print_result(&format!("Column range scan × {} (500 < price < 600)", q), q, range_ms);
 
     // No-index scan (full filter)
     let no_idx_ms = {
         let start = Instant::now();
-        for _ in 0..50 {
+        for _ in 0..q / 4 {
             exec(&db, "SELECT * FROM t6 WHERE stock > 80");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("Full scan + filter × 50 (stock > 80, no index)", 50, no_idx_ms);
+    print_result(&format!("Full scan + filter × {} (stock > 80, no index)", q / 4), q / 4, no_idx_ms);
     db.close().ok();
 }
 
@@ -370,9 +378,9 @@ fn bench_full_scan() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t7 (id INTEGER PRIMARY KEY, event_type TEXT, payload TEXT, ts INTEGER)");
 
-    const N: usize = 50_000;
+    let n: usize = if is_ci() { 5_000 } else { 50_000 };
 
-    for i in 1..=N as i64 {
+    for i in 1..=n as i64 {
         exec(&db, &format!(
             "INSERT INTO t7 VALUES ({}, 'type_{}', 'payload_{}', {})",
             i, i % 20, i, 1700000000 + i
@@ -387,10 +395,10 @@ fn bench_full_scan() {
         exec(&db, "SELECT * FROM t7");
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("SELECT * {} rows (MemTable)", N), N, mem_scan_ms);
+    print_result(&format!("SELECT * {} rows (MemTable)", n), n, mem_scan_ms);
 
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     // SSTable scan
     let sst_scan_ms = {
@@ -398,17 +406,17 @@ fn bench_full_scan() {
         exec(&db, "SELECT * FROM t7");
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("SELECT * {} rows (SSTable)", N), N, sst_scan_ms);
+    print_result(&format!("SELECT * {} rows (SSTable)", n), n, sst_scan_ms);
 
     // COUNT(*) fast path
     let count_ms = {
         let start = Instant::now();
-        for _ in 0..100 {
+        for _ in 0..50 {
             exec(&db, "SELECT COUNT(*) AS cnt FROM t7");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("COUNT(*) × 100", 100, count_ms);
+    print_result("COUNT(*) × 50", 50, count_ms);
     db.close().ok();
 }
 
@@ -421,18 +429,17 @@ fn bench_mixed_crud() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t8 (id INTEGER PRIMARY KEY, customer TEXT, amount FLOAT, status TEXT)");
 
-    const N: usize = 30_000;
-    let n_inserts = N;
-    let n_updates = N / 3;
-    let n_deletes = N / 5;
-    let n_selects = 5_000;
-    let total_ops = n_inserts + n_updates + n_deletes + n_selects;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
+    let n_updates = n / 3;
+    let n_deletes = n / 5;
+    let n_selects = if is_ci() { 1_000 } else { 5_000 };
+    let total_ops = n + n_updates + n_deletes + n_selects;
 
     let total_ms = {
         let start = Instant::now();
 
         // INSERT
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO t8 VALUES ({}, 'customer_{}', {:.1}, 'pending')",
                 i, i % 1000, 10.0 + (i as f64 % 990.0)
@@ -442,14 +449,14 @@ fn bench_mixed_crud() {
 
         // UPDATE
         let upd_start = Instant::now();
-        for i in (1..=N as i64).step_by(3) {
+        for i in (1..=n as i64).step_by(3) {
             exec(&db, &format!("UPDATE t8 SET status = 'shipped', amount = amount + 10 WHERE id = {}", i));
         }
         let upd_elapsed = upd_start.elapsed().as_millis() as u64;
 
         // DELETE
         let del_start = Instant::now();
-        for i in (1..=N as i64).step_by(5) {
+        for i in (1..=n as i64).step_by(5) {
             exec(&db, &format!("DELETE FROM t8 WHERE id = {}", i));
         }
         let del_elapsed = del_start.elapsed().as_millis() as u64;
@@ -485,18 +492,17 @@ fn bench_wal_recovery() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
 
-    const N: usize = 30_000;
+    let n: usize = if is_ci() { 5_000 } else { 30_000 };
 
     // Phase 1: Create, insert, flush (but don't checkpoint WAL)
     {
         let db = Database::create_with_config(&db_path, edge_config()).expect("create db");
         exec(&db, "CREATE TABLE t9 (id INTEGER PRIMARY KEY, data TEXT, value INTEGER)");
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!("INSERT INTO t9 VALUES ({}, 'data_{}', {})", i, i, i * 10));
         }
         db.flush().expect("flush");
-        // Don't checkpoint — leave WAL entries for recovery
-        drop(db); // Drop triggers checkpoint, but we still test the reopen path
+        drop(db);
     }
 
     print_separator();
@@ -506,7 +512,6 @@ fn bench_wal_recovery() {
         let start = Instant::now();
         let db = Database::open_with_config(&db_path, edge_config()).expect("open db");
 
-        // Verify data integrity
         let result = exec(&db, "SELECT COUNT(*) AS cnt FROM t9");
         let count = match result {
             motedb::sql::QueryResult::Select { rows, .. } => {
@@ -522,7 +527,7 @@ fn bench_wal_recovery() {
         assert!(count > 0, "Should recover rows from WAL");
         elapsed
     };
-    print_result(&format!("WAL recovery + open ({} rows)", N), 1, reopen_ms);
+    print_result(&format!("WAL recovery + open ({} rows)", n), 1, reopen_ms);
     println!("  -> Recovery time: {}ms", reopen_ms);
 }
 
@@ -535,37 +540,40 @@ fn bench_prepared_statement_cache() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t10 (id INTEGER PRIMARY KEY, data TEXT)");
 
-    const N: usize = 5_000;
-    for i in 1..=N as i64 {
+    let n: usize = if is_ci() { 2_000 } else { 5_000 };
+    for i in 1..=n as i64 {
         exec(&db, &format!("INSERT INTO t10 VALUES ({}, 'data_{}')", i, i));
     }
 
     print_separator();
 
     // Cold cache
+    let cold_count = if is_ci() { 500 } else { 1000 };
     let cold_ms = {
         let start = Instant::now();
-        for i in 1..=1000i64 {
+        for i in 1..=cold_count as i64 {
             exec(&db, &format!("SELECT * FROM t10 WHERE id = {}", i));
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 1K (cold → warm stmt cache)", 1000, cold_ms);
+    print_result(&format!("PK SELECT {} (cold stmt cache)", cold_count), cold_count, cold_ms);
 
     // Hot cache
+    let repeats = if is_ci() { 20 } else { 100 };
     let hot_ms = {
         let start = Instant::now();
-        for _ in 0..100 {
+        for _ in 0..repeats {
             for i in 1..=100i64 {
                 exec(&db, &format!("SELECT * FROM t10 WHERE id = {}", i));
             }
         }
         start.elapsed().as_millis() as u64
     };
-    print_result("PK SELECT 10K (100 unique × 100, stmt cache hit)", 10_000, hot_ms);
+    let hot_total = repeats * 100;
+    print_result(&format!("PK SELECT {} (100 unique × {}, stmt cache hit)", hot_total, repeats), hot_total, hot_ms);
 
-    let cold_per_op = cold_ms as f64 * 1000.0 / 1000.0;
-    let hot_per_op = hot_ms as f64 * 1000.0 / 10_000.0;
+    let cold_per_op = cold_ms as f64 * 1000.0 / cold_count as f64;
+    let hot_per_op = hot_ms as f64 * 1000.0 / hot_total as f64;
     let speedup = if hot_per_op > 0.0 { cold_per_op / hot_per_op } else { 0.0 };
     println!("  -> Cold: {:.1}µs/op, Hot: {:.1}µs/op, Speedup: {:.1}x", cold_per_op, hot_per_op, speedup);
     db.close().ok();
@@ -580,11 +588,7 @@ fn bench_e2e_lifecycle() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
 
-    const N: usize = 50_000;
-
-    println!("\n{}", "=".repeat(90));
-    println!("  E2E Lifecycle: INSERT {} → flush → checkpoint → close → reopen → query", N);
-    println!("{}", "=".repeat(90));
+    let n: usize = if is_ci() { 5_000 } else { 50_000 };
 
     // Phase 1: Insert
     {
@@ -592,19 +596,19 @@ fn bench_e2e_lifecycle() {
         exec(&db, "CREATE TABLE lifecycle (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, ts INTEGER)");
 
         let start = Instant::now();
-        for i in 1..=N as i64 {
+        for i in 1..=n as i64 {
             exec(&db, &format!(
                 "INSERT INTO lifecycle VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
                 i, i, i as f64 * 1.5, i % 10, 1700000000 + i
             ));
         }
         let elapsed = start.elapsed().as_millis() as u64;
-        print_result("Phase 1: INSERT 50K", N, elapsed);
+        print_result(&format!("Phase 1: INSERT {}", n), n, elapsed);
 
         // Phase 2: Flush
         let flush_start = Instant::now();
         db.flush().expect("flush");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        db.wait_for_indexes_ready();
         let flush_elapsed = flush_start.elapsed().as_millis() as u64;
         print_result("Phase 2: Flush", 1, flush_elapsed);
 
@@ -624,21 +628,22 @@ fn bench_e2e_lifecycle() {
     print_result("Phase 4: Reopen", 1, reopen_ms);
 
     // Phase 5: Post-reopen queries
+    let q = if is_ci() { 1_000 } else { 5_000 };
     let query_start = Instant::now();
-    for i in 1..=5000i64 {
+    for i in 1..=q as i64 {
         exec(&db, &format!("SELECT * FROM lifecycle WHERE id = {}", i));
     }
     let query_ms = query_start.elapsed().as_millis() as u64;
-    print_result("Phase 5: PK SELECT 5K after reopen", 5000, query_ms);
+    print_result(&format!("Phase 5: PK SELECT {} after reopen", q), q, query_ms);
 
     // Full scan
     let scan_start = Instant::now();
     exec(&db, "SELECT * FROM lifecycle");
     let scan_ms = scan_start.elapsed().as_millis() as u64;
-    print_result(&format!("Phase 6: SELECT * {} rows after reopen", N), N, scan_ms);
+    print_result(&format!("Phase 6: SELECT * {} rows after reopen", n), n, scan_ms);
 
-    let query_per_op = query_ms as f64 * 1000.0 / 5000.0;
-    let scan_per_row = scan_ms as f64 * 1000.0 / N as f64;
+    let query_per_op = query_ms as f64 * 1000.0 / q as f64;
+    let scan_per_row = scan_ms as f64 * 1000.0 / n as f64;
     println!("  -> PK query: {:.1}µs/op, Full scan: {:.2}µs/row", query_per_op, scan_per_row);
 
     db.close().expect("close");
@@ -658,25 +663,27 @@ fn bench_concurrent_mixed() {
     let db = Arc::new(db);
 
     // Seed
-    const SEED: usize = 10_000;
-    for i in 1..=SEED as i64 {
+    let seed: usize = if is_ci() { 2_000 } else { 10_000 };
+    for i in 1..=seed as i64 {
         exec(&db, &format!("INSERT INTO t12 VALUES ({}, 'seed_{}', {})", i, i, i * 10));
     }
 
     print_separator();
-    println!("  Starting 4 threads × 2,500 ops each (10K total)");
+    let (n_threads, ops_per_thread) = if is_ci() { (2, 500) } else { (4, 2500) };
+    let total_concurrent = n_threads * ops_per_thread;
+    println!("  Starting {} threads × {} ops each ({} total)", n_threads, ops_per_thread, total_concurrent);
 
     let total_ms = {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..4 {
+        for t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
-                let base = t * 2500;
+                let base = t * ops_per_thread;
                 let mut ops = 0;
-                for i in 0..2500 {
-                    let id = (base + i + 1) as i64 + SEED as i64;
+                for i in 0..ops_per_thread {
+                    let id = (base + i + 1) as i64 + seed as i64;
                     let sql = format!("INSERT INTO t12 VALUES ({}, 'thread_{}_{}', {})", id, t, i, id * 10);
                     db_clone.execute(&sql).expect("insert").materialize().expect("mat");
                     ops += 1;
@@ -687,13 +694,12 @@ fn bench_concurrent_mixed() {
 
         let total_ops: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
-        print_result("Concurrent INSERT 10K (4 threads)", total_ops, elapsed);
+        print_result(&format!("Concurrent INSERT {} ({} threads)", total_ops, n_threads), total_ops, elapsed);
         elapsed
     };
 
-    let ops_per_s = 10_000.0 / (total_ms as f64 / 1000.0);
+    let ops_per_s = total_concurrent as f64 / (total_ms as f64 / 1000.0);
     println!("  -> Concurrent throughput: {:.0} ops/s", ops_per_s);
-    // Explicitly close DB to stop all background threads before process exit
     if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
 }
 
