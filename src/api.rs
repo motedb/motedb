@@ -192,6 +192,13 @@ impl Database {
         self.inner.flush()
     }
 
+    /// Wait until all pending index build batches have been processed.
+    ///
+    /// Call after `flush()` to ensure indexes are fully built before querying.
+    pub fn wait_for_indexes_ready(&self) {
+        self.inner.wait_for_indexes_ready();
+    }
+
     /// Access the columnar segment store (for TimeSeries tables).
     pub fn columnar_store(&self) -> &crate::storage::ColumnarStore {
         &self.inner.columnar_store

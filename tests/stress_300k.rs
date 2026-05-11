@@ -98,9 +98,9 @@ fn test_300k_insert_integrity() {
     // 不存在的行
     assert!(select_row(&db, "SELECT * FROM t1 WHERE id = 999999").is_none());
 
-    // WHERE 过滤 — flush first to ensure column index is fully built
+    // WHERE 过滤 — flush + wait for index build to ensure column index is ready
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    db.wait_for_indexes_ready();
     let near_end = n as i64 - 1000;
     assert_eq!(count_filtered(&db, "t1", &format!("id > {}", near_end)), 1000);
     assert_eq!(count_filtered(&db, "t1", &format!("id >= {}", near_end + 1)), 1000);
@@ -222,7 +222,7 @@ fn test_300k_pk_lookup_consistency() {
     }
 
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     // Flush 后验证一致
     for &id in &samples {
@@ -249,6 +249,10 @@ fn test_300k_where_filter_correctness() {
     for i in 1..=M as i64 {
         exec(&db, &format!("INSERT INTO t5 VALUES ({}, {}, {})", i, i % 10, i * 3));
     }
+
+    // Flush + wait for index build to ensure column indexes are ready
+    db.flush().expect("flush");
+    db.wait_for_indexes_ready();
 
     // category = 3 → 5000 行 (每 10 个有 1 个)
     assert_eq!(count_filtered(&db, "t5", "category = 3"), (M / 10) as i64);
@@ -362,7 +366,7 @@ fn test_300k_flush_consistency() {
         .collect();
 
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
 
     let count_after = count_rows(&db, "t7");
     assert_eq!(count_before, count_after, "COUNT mismatch before/after flush");

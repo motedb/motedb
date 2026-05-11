@@ -136,6 +136,10 @@ pub struct MoteDB {
     /// Async index build pipeline: sender (None if pipeline disabled)
     index_build_tx: Option<std::sync::mpsc::Sender<IndexBuildBatch>>,
 
+    /// Number of index build batches sent but not yet processed by the background thread.
+    /// Used by `wait_for_indexes_ready()` to know when indexes are caught up.
+    pending_index_batches: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Background index builder thread
     index_builder_thread: Option<IndexBuilderThread>,
 
@@ -296,6 +300,7 @@ impl MoteDB {
             pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
+            pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
@@ -320,8 +325,13 @@ impl MoteDB {
         {
             let tx = db.index_build_tx.clone().unwrap();
             let registry = db.table_registry.clone();
+            let pending = db.pending_index_batches.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
-                Self::extract_and_send_index_batch(memtable, &tx, &registry)
+                let result = Self::extract_and_send_index_batch(memtable, &tx, &registry);
+                if result.is_ok() && memtable.len() > 0 {
+                    pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                result
             })?;
         }
         
@@ -347,6 +357,25 @@ impl MoteDB {
     /// write-lock contention with the builder thread.
     pub(crate) fn is_async_index_pipeline_active(&self) -> bool {
         self.is_pipeline_active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait until all pending index build batches have been processed.
+    ///
+    /// Call this after `flush()` to ensure column/vector/text indexes are
+    /// fully built before running queries that depend on them.
+    pub fn wait_for_indexes_ready(&self) {
+        let start = std::time::Instant::now();
+        loop {
+            if self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                return;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                debug_log!("[wait_for_indexes_ready] ⚠️ Timed out after 30s, pending={}",
+                    self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Signal all background threads (index builder, auto-flush, auto-checkpoint)
@@ -394,6 +423,7 @@ impl MoteDB {
             pk_lookup_capacity: self.pk_lookup_capacity,
             is_flushing: self.is_flushing.clone(),
             is_pipeline_active: self.is_pipeline_active.clone(),  // shared — clones see true when pipeline runs
+            pending_index_batches: self.pending_index_batches.clone(),
             checkpoint_mutex: self.checkpoint_mutex.clone(),
             is_closed: self.is_closed.clone(),
             auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
@@ -754,6 +784,7 @@ impl MoteDB {
             pk_lookup_capacity: config.pk_lookup_capacity,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
+            pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
@@ -774,8 +805,13 @@ impl MoteDB {
         {
             let tx = db.index_build_tx.clone().unwrap();
             let registry = db.table_registry.clone();
+            let pending = db.pending_index_batches.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
-                Self::extract_and_send_index_batch(memtable, &tx, &registry)
+                let result = Self::extract_and_send_index_batch(memtable, &tx, &registry);
+                if result.is_ok() && memtable.len() > 0 {
+                    pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                result
             })?;
         }
 
@@ -1055,6 +1091,7 @@ impl MoteDB {
                                         table_name, e);
                                 }
                             }
+                            db.pending_index_batches.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             debug_log!("[IndexBuilder] ✅ Processed batch ({} tables)",
                                 batch.tables_data.len());
                         }
