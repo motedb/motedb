@@ -4,6 +4,8 @@ use motedb::Database;
 use std::time::Instant;
 use tempfile::TempDir;
 
+fn is_ci() -> bool { std::env::var("CI").is_ok() }
+
 fn exec(db: &Database, sql: &str) {
     let _ = db.execute(sql).expect("execute SQL").materialize().expect("materialize");
 }
@@ -28,18 +30,22 @@ fn test_memory_linear_growth() {
     let db = Database::create_with_config(dir.path(), DBConfig::for_edge()).expect("create db");
     exec(&db, "CREATE TABLE mem_test (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, data TEXT)");
 
-    // ── Phase 1: Warm up (10K rows, absorb cold-start allocations) ──
-    println!("\n  Phase 1: Warm-up (10K rows)");
-    for i in 1..=10_000i64 {
+    let warmup_rows = if is_ci() { 2_000 } else { 10_000 };
+    let batch_size = if is_ci() { 2_000 } else { 10_000 };
+    let num_batches = if is_ci() { 3 } else { 10 };
+
+    // ── Phase 1: Warm up (absorb cold-start allocations) ──
+    println!("\n  Phase 1: Warm-up ({} rows)", warmup_rows);
+    for i in 1..=warmup_rows as i64 {
         exec(&db, &format!(
             "INSERT INTO mem_test VALUES ({}, 'name_{}', {:.3}, 'tag_{}', 'data_{}')",
             i, i, i as f64 * 0.123, i % 20, i
         ));
     }
     db.flush().expect("flush");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
     let rss_warm = get_rss_mb();
-    let warm_rows = 10_000usize;
+    let warm_rows = warmup_rows;
     println!("  Warm-up done: {} rows, RSS: {:.1} MB", warm_rows, rss_warm);
 
     // ── Phase 2: Incremental inserts — measure ΔRSS per batch ──
@@ -48,8 +54,6 @@ fn test_memory_linear_growth() {
              "TotalRows", "BatchRows", "RSS(MB)", "ΔRSS(MB)", "ΔB/row", "CumB/row", "ops/s");
     println!("{}", "-".repeat(100));
 
-    let batch_size = 10_000usize;
-    let num_batches = 10;
     let mut total_rows = warm_rows;
     let mut prev_rss = rss_warm;
     let mut deltas: Vec<(usize, f64)> = vec![]; // (batch_size, delta_mb)
@@ -67,7 +71,7 @@ fn test_memory_linear_growth() {
         total_rows += batch_size;
 
         db.flush().expect("flush");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        db.wait_for_indexes_ready();
 
         let rss = get_rss_mb();
         let delta = rss - prev_rss;

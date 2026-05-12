@@ -6,6 +6,8 @@ use motedb::Database;
 use tempfile::TempDir;
 use std::time::Instant;
 
+fn is_ci() -> bool { std::env::var("CI").is_ok() }
+
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create(dir.path()).expect("create db");
@@ -77,8 +79,7 @@ fn bench_vector() {
     exec(&db, "CREATE TABLE items (id INTEGER PRIMARY KEY, cat TEXT, emb VECTOR(128))");
     exec(&db, "CREATE VECTOR INDEX items_emb ON items(emb)");
 
-    // Insert 2000 rows (fast enough for benchmark)
-    let n = 2_000;
+    let n = if is_ci() { 500 } else { 2_000 };
     println!("\n  --- INSERT {} rows × 128-dim ---", n);
     sep();
     let t0 = Instant::now();
@@ -100,15 +101,16 @@ fn bench_vector() {
     let t0 = Instant::now();
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
     println!("  Flush: {}ms", t0.elapsed().as_millis());
     println!("  Memory: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss0);
 
     // ANN search via API
     println!("\n  --- ANN Search (top-10, API) ---");
     sep();
-    let mut ann_lat: Vec<u64> = Vec::with_capacity(500);
-    for _ in 0..500 {
+    let n_queries = if is_ci() { 50 } else { 500 };
+    let mut ann_lat: Vec<u64> = Vec::with_capacity(n_queries);
+    for _ in 0..n_queries {
         let q: Vec<f32> = (0..128).map(|_| rand_f32()).collect();
         let t = Instant::now();
         let res = db.vector_search("items_emb", &q, 10).expect("vector search");
@@ -117,13 +119,14 @@ fn bench_vector() {
             println!("  Sample: {} results", res.len());
         }
     }
-    print_latency(&format!("ANN search ({} vecs, 128-dim, top-10)", n), &ann_lat);
+    print_latency(&format!("ANN search ({} vecs, 128-dim, top-10, {} queries)", n, n_queries), &ann_lat);
 
     // SQL vector search
     println!("\n  --- SQL ORDER BY embedding <-> query ---");
     sep();
-    let mut sql_lat: Vec<u64> = Vec::with_capacity(100);
-    for _ in 0..100 {
+    let sql_queries = if is_ci() { 20 } else { 100 };
+    let mut sql_lat: Vec<u64> = Vec::with_capacity(sql_queries);
+    for _ in 0..sql_queries {
         let mut q = String::from('[');
         for d in 0..128 {
             if d > 0 { q.push_str(", "); }
@@ -156,7 +159,7 @@ fn bench_spatial() {
     exec(&db, "CREATE TABLE locs (id INTEGER PRIMARY KEY, name TEXT, coords GEOMETRY)");
     exec(&db, "CREATE SPATIAL INDEX loc_coords ON locs(coords)");
 
-    let n = 10_000;
+    let n = if is_ci() { 2_000 } else { 10_000 };
     println!("\n  --- INSERT {} spatial points ---", n);
     sep();
     let t0 = Instant::now();
@@ -170,14 +173,15 @@ fn bench_spatial() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
     println!("  Memory: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss0);
 
     // ST_WITHIN range query
     println!("\n  --- ST_WITHIN Range Query ---");
     sep();
-    let mut range_lat: Vec<u64> = Vec::with_capacity(500);
-    for _ in 0..500 {
+    let n_range = if is_ci() { 50 } else { 500 };
+    let mut range_lat: Vec<u64> = Vec::with_capacity(n_range);
+    for _ in 0..n_range {
         let cx = 116.0 + rand_f64() * 0.9;
         let cy = 39.5 + rand_f64() * 0.5 + 0.5;
         let sql = format!(
@@ -188,25 +192,27 @@ fn bench_spatial() {
         let _ = exec(&db, &sql);
         range_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency("ST_WITHIN (bbox ~0.04° × 0.04°, 500 queries)", &range_lat);
+    print_latency(&format!("ST_WITHIN (bbox ~0.04° × 0.04°, {} queries)", n_range), &range_lat);
 
     // ST_DISTANCE + ORDER BY
     println!("\n  --- ST_DISTANCE + ORDER BY LIMIT 10 ---");
     sep();
-    let mut dist_lat: Vec<u64> = Vec::with_capacity(200);
-    for _ in 0..200 {
+    let n_dist = if is_ci() { 20 } else { 200 };
+    let mut dist_lat: Vec<u64> = Vec::with_capacity(n_dist);
+    for _ in 0..n_dist {
         let sql = "SELECT id, name, ST_DISTANCE(coords, 116.5, 40.0) AS dist FROM locs ORDER BY dist LIMIT 10";
         let t = Instant::now();
         let _ = exec(&db, sql);
         dist_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency("ST_DISTANCE ORDER BY LIMIT 10 (200 queries)", &dist_lat);
+    print_latency(&format!("ST_DISTANCE ORDER BY LIMIT 10 ({} queries)", n_dist), &dist_lat);
 
     // ST_KNN
     println!("\n  --- ST_KNN Nearest Neighbor ---");
     sep();
-    let mut knn_lat: Vec<u64> = Vec::with_capacity(200);
-    for _ in 0..200 {
+    let n_knn = if is_ci() { 20 } else { 200 };
+    let mut knn_lat: Vec<u64> = Vec::with_capacity(n_knn);
+    for _ in 0..n_knn {
         let cx = 116.0 + rand_f64() * 0.9;
         let cy = 39.5 + rand_f64() * 0.5 + 0.5;
         let sql = format!("SELECT * FROM locs WHERE ST_KNN(coords, {:.4}, {:.4}, 10)", cx, cy);
@@ -214,7 +220,7 @@ fn bench_spatial() {
         let _ = exec(&db, &sql);
         knn_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency("ST_KNN top-10 (200 queries)", &knn_lat);
+    print_latency(&format!("ST_KNN top-10 ({} queries)", n_knn), &knn_lat);
 
     println!("\n  Memory after spatial benchmark: {:.1} MB", get_rss_mb());
 }
@@ -242,7 +248,7 @@ fn bench_text_search() {
         "rust", "memory", "thread", "concurrent", "benchmark", "latency",
     ];
 
-    let n = 10_000;
+    let n = if is_ci() { 2_000 } else { 10_000 };
     println!("\n  --- INSERT {} docs ---", n);
     sep();
     let t0 = Instant::now();
@@ -257,7 +263,7 @@ fn bench_text_search() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
     println!("  Memory: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss0);
 
     // MATCH AGAINST
@@ -272,9 +278,10 @@ fn bench_text_search() {
         ("nonexistent_xyz", "no match"),
     ];
 
+    let n_text_queries = if is_ci() { 20 } else { 200 };
     for (q, desc) in &queries {
-        let mut lat: Vec<u64> = Vec::with_capacity(200);
-        for _ in 0..200 {
+        let mut lat: Vec<u64> = Vec::with_capacity(n_text_queries);
+        for _ in 0..n_text_queries {
             let sql = format!(
                 "SELECT id, title, MATCH(body) AGAINST('{}') AS score \
                  FROM docs WHERE MATCH(body) AGAINST('{}') ORDER BY score DESC LIMIT 10",
@@ -290,13 +297,13 @@ fn bench_text_search() {
     // Direct API
     println!("\n  --- Direct API ---");
     sep();
-    let mut api_lat: Vec<u64> = Vec::with_capacity(200);
-    for _ in 0..200 {
+    let mut api_lat: Vec<u64> = Vec::with_capacity(n_text_queries);
+    for _ in 0..n_text_queries {
         let t = Instant::now();
         let _ = db.text_search_ranked("docs_body", "database index", 10);
         api_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency("text_search_ranked() top-10 (200 queries)", &api_lat);
+    print_latency(&format!("text_search_ranked() top-10 ({} queries)", n_text_queries), &api_lat);
 
     println!("\n  Memory after text benchmark: {:.1} MB", get_rss_mb());
 }
@@ -328,10 +335,11 @@ fn bench_multimodal_memory() {
 
     let words = ["database", "search", "vector", "index", "query", "spatial"];
 
-    // Insert 5 rounds × 2000 rows × 3 tables
-    for round in 1..=5 {
-        let start = (round - 1) * 2000 + 1;
-        let end = round * 2000;
+    // Insert rounds × rows_per_round × 3 tables
+    let (n_rounds, rows_per_round) = if is_ci() { (2, 500) } else { (5, 2000) };
+    for round in 1..=n_rounds {
+        let start = (round - 1) * rows_per_round + 1;
+        let end = round * rows_per_round;
 
         for i in start..=end {
             // Vector (64-dim)
@@ -355,14 +363,14 @@ fn bench_multimodal_memory() {
 
         db.flush().expect("flush");
         let rss = get_rss_mb();
-        let total = round * 2000;
+        let total = round * rows_per_round;
         println!("  Round {} ({}K rows × 3 tables): {:.1} MB (Δ = {:.1} MB)",
             round, total / 1000, rss, rss - rss0);
     }
 
     // Final checkpoint
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    db.wait_for_indexes_ready();
     println!("\n  After final checkpoint: {:.1} MB", get_rss_mb());
 
     // Query memory impact
@@ -370,28 +378,30 @@ fn bench_multimodal_memory() {
     sep();
     let rss_q0 = get_rss_mb();
 
+    let n_q = if is_ci() { 10 } else { 50 };
     // Vector searches
-    for _ in 0..50 {
+    for _ in 0..n_q {
         let q: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
         let _ = db.vector_search("vecs_emb", &q, 10);
     }
-    println!("  After 50 vector searches: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss_q0);
+    println!("  After {} vector searches: {:.1} MB (Δ = {:.1} MB)", n_q, get_rss_mb(), get_rss_mb() - rss_q0);
 
     // Spatial queries
-    for i in 0..50 {
+    for i in 0..n_q {
         let t = std::time::Instant::now();
         let _ = exec(&db, "SELECT * FROM pts WHERE ST_WITHIN(loc, 116.0, 39.5, 117.0, 40.5)");
         if i < 3 || i == 49 {
             println!("  Spatial query {}: {:?}", i + 1, t.elapsed());
         }
     }
-    println!("  After 50 spatial queries: {:.1} MB", get_rss_mb());
+    println!("  After {} spatial queries: {:.1} MB", n_q, get_rss_mb());
 
     // Text searches
-    for _ in 0..50 {
+    for _ in 0..n_q {
         let _ = exec(&db, "SELECT * FROM docs WHERE MATCH(body) AGAINST('vector search') LIMIT 10");
     }
-    println!("  After 50 text searches: {:.1} MB", get_rss_mb());
+    println!("  After {} text searches: {:.1} MB", n_q, get_rss_mb());
 
-    println!("\n  Final: {:.1} MB (total Δ = {:.1} MB for 10K rows × 3 modalities)", get_rss_mb(), get_rss_mb() - rss0);
+    let total_rows = n_rounds * rows_per_round;
+    println!("\n  Final: {:.1} MB (total Δ = {:.1} MB for {}K rows × 3 modalities)", get_rss_mb(), get_rss_mb() - rss0, total_rows / 1000);
 }

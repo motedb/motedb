@@ -48,7 +48,7 @@ fn test_vector_index_underscore_table_name() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Vector search should work
     let query = vec![1.0, 2.0, 3.0, 4.0];
@@ -72,7 +72,7 @@ fn test_spatial_index_underscore_column_name() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Spatial queries should work
     let result = rows(&db, "SELECT * FROM store_locations WHERE ST_WITHIN(geo_coords, 116.0, 39.9, 116.3, 40.3)");
@@ -96,7 +96,7 @@ fn test_text_index_underscore_names() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     let result = rows(&db,
         "SELECT id FROM doc_archive WHERE MATCH(full_body) AGAINST('database search') LIMIT 5");
@@ -132,7 +132,7 @@ fn test_custom_column_index_name() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Point query should use column index
     let result = rows(&db, "SELECT * FROM products WHERE category = 'electronics'");
@@ -155,7 +155,7 @@ fn test_drop_column_index_removes_alias() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Query works with index
     let before = rows(&db, "SELECT * FROM users WHERE email = 'a@b.com'");
@@ -182,7 +182,7 @@ fn test_drop_vector_index() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Search works before drop
     let before = db.vector_search("vecs_v", &[1.0, 2.0, 3.0, 4.0], 3);
@@ -209,7 +209,7 @@ fn test_drop_text_index() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Drop the text index
     exec(&db, "DROP INDEX docs_body ON docs");
@@ -232,7 +232,7 @@ fn test_drop_spatial_index() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Drop
     exec(&db, "DROP INDEX pts_loc ON pts");
@@ -264,7 +264,7 @@ fn test_multiple_indexes_on_one_table() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Column index query
     let cat_result = rows(&db, "SELECT * FROM records WHERE category = 'A'");
@@ -293,7 +293,7 @@ fn test_index_on_empty_table() {
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    db.wait_for_indexes_ready();
 
     // Queries on empty indexed table should work
     let result = rows(&db, "SELECT * FROM empty_t WHERE val = 'x'");
