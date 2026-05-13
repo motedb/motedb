@@ -4480,7 +4480,7 @@ impl QueryExecutor {
                     crate::database::index_metadata::IndexType::Column
                 ) {
                     if let Some(index) = self.db.column_indexes.get(&index_name) {
-                        let matching_row_ids = index.value().read()
+                        let matching_row_ids = index.value()
                             .get(&target_value)
                             .unwrap_or_default();
                         if matching_row_ids.is_empty() {
@@ -4564,7 +4564,7 @@ impl QueryExecutor {
                     crate::database::index_metadata::IndexType::Column
                 ) {
                     if let Some(index) = self.db.column_indexes.get(&index_name) {
-                        let matching_row_ids = index.value().read()
+                        let matching_row_ids = index.value()
                             .get(&target_value)
                             .unwrap_or_default();
                         if matching_row_ids.is_empty() {
@@ -6477,7 +6477,7 @@ impl QueryExecutor {
         let index_arc = self.db.column_indexes
             .get(&pk_index_name)
             .ok_or_else(|| crate::StorageError::Index(format!("Primary key index not found: {}", pk_index_name)))?
-            .clone();  // Clone Arc<RwLock<ColumnValueIndex>>
+            .clone();  // Clone Arc<ColumnValueIndex>
         
         // Calculate how many entries we need to scan
         let offset = stmt.offset.unwrap_or(0);
@@ -6488,7 +6488,7 @@ impl QueryExecutor {
             Some(offset + limit)  // Scan enough to cover offset + limit
         };
         
-        let row_ids = index_arc.read().scan_row_ids_with_limit(scan_limit)?;
+        let row_ids = index_arc.scan_row_ids_with_limit(scan_limit)?;
 
         // If the column index is empty (async pipeline may not have built it yet),
         // fall back to full scan to avoid returning wrong empty results.

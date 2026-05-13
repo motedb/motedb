@@ -5,12 +5,16 @@
 //! - WHERE col >= start AND col <= end (range query)
 //!
 //! Uses B-Tree for persistent storage with efficient range queries.
+//! Uses IndexMemBuffer for lock-free reads: writes go to an in-memory
+//! BTreeMap, reads check the buffer first (no btree lock needed).
 
+use crate::database::mem_buffer::IndexMemBuffer;
 use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig, BTreeKey};
 use crate::index::cached_index::CachedIndex;
 use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -109,6 +113,9 @@ impl BTreeKey for IndexKey {
 /// Column Value Index
 ///
 /// Maps column values to row IDs for fast WHERE lookups.
+/// Uses a two-layer architecture for lock-free reads:
+/// 1. IndexMemBuffer (active + immutable) for recent writes — cheap RwLock on BTreeMap
+/// 2. GenericBTree for flushed data — RwLock only taken during flush (background)
 pub struct ColumnValueIndex {
     /// Table name
     _table_name: String,
@@ -116,12 +123,12 @@ pub struct ColumnValueIndex {
     column_name: String,
     /// Storage path
     _storage_path: PathBuf,
-    /// B-Tree index (value_bytes+row_id → empty)
+    /// B-Tree index (value_bytes+row_id → empty) — only written during flush
     btree: Arc<RwLock<GenericBTree<IndexKey>>>,
-    /// LRU cache for hot values (🚀 P1 optimization)
+    /// LRU cache for hot values
     lru_cache: Arc<CachedIndex>,
-    // 🚀 P0 MEMORY FIX: Removed in-memory BTreeMap cache (causes 8GB leak!)
-    // All lookups now go through LRU cache + B-Tree disk storage
+    /// In-memory buffer for recent writes (RocksDB-style active/immutable)
+    mem_buffer: IndexMemBuffer<IndexKey, ()>,
 }
 
 impl ColumnValueIndex {
@@ -133,26 +140,26 @@ impl ColumnValueIndex {
         config: ColumnValueIndexConfig,
     ) -> Result<Self> {
         let storage_path = path.as_ref().to_path_buf();
-        
+
         let btree_config = GenericBTreeConfig {
             cache_size: config.cache_size,
             unique_keys: false,
             allow_updates: true,
             immediate_sync: false,
         };
-        
+
         let btree = GenericBTree::with_config(storage_path.clone(), btree_config)?;
-        
+
         Ok(Self {
             _table_name: table_name,
             column_name,
             _storage_path: storage_path,
             btree: Arc::new(RwLock::new(btree)),
-            lru_cache: Arc::new(CachedIndex::new(500)), // 🔧 Reduced from 1000 to 500 for P1
-            // 🚀 P0: Removed cache initialization (memory leak fix)
+            lru_cache: Arc::new(CachedIndex::new(500)),
+            mem_buffer: IndexMemBuffer::new(1024 * 1024), // 1MB buffer
         })
     }
-    
+
     /// Open an existing index
     pub fn open<P: AsRef<Path>>(
         path: P,
@@ -160,397 +167,404 @@ impl ColumnValueIndex {
         column_name: String,
         config: ColumnValueIndexConfig,
     ) -> Result<Self> {
-        // Same as create for now (GenericBTree handles both)
         Self::create(path, table_name, column_name, config)
     }
-    
+
     /// Insert a value → row_id mapping
-    pub fn insert(&mut self, value: &Value, row_id: RowId) -> Result<()> {
+    pub fn insert(&self, value: &Value, row_id: RowId) -> Result<()> {
         let value_bytes = self.value_to_bytes(value)?;
-        
         let key = IndexKey {
-            value_bytes: value_bytes.clone(),
+            value_bytes,
             row_id,
         };
-        
-        // Insert into B-Tree (note: takes &mut)
-        {
-            let mut btree = self.btree.write();
-            btree.insert(key, vec![])?;  // Empty value, we only care about the key
+
+        // Write to mem buffer (cheap RwLock on BTreeMap)
+        let full = self.mem_buffer.insert(key, ()).map_err(|e| {
+            StorageError::InvalidData(e)
+        })?;
+
+        // If buffer is full, flush immutable buffers to btree
+        if full {
+            self.drain_immutable_to_btree()?;
         }
-        
-        // 🚀 P0: Removed cache update (memory leak fix)
-        // All lookups now go through LRU cache + B-Tree
-        
+
+        // Invalidate LRU cache for this value (new entry changes result set)
+        self.lru_cache.invalidate(value);
+
         Ok(())
     }
-    
-    /// 🚀 P2: Batch insert for improved performance
-    /// 
-    /// **Optimization strategy**:
-    /// - Sort keys before insertion for better B-Tree locality
-    /// - Single flush operation at the end
-    /// 
-    /// **Expected improvement**: 2-3x faster than sequential inserts
-    pub fn batch_insert(&mut self, items: Vec<(Value, RowId)>) -> Result<()> {
+
+    /// Batch insert for improved performance
+    pub fn batch_insert(&self, items: Vec<(Value, RowId)>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        
-        // Step 1: Convert to IndexKey and sort by value for better B-Tree locality
-        let mut keys: Vec<(IndexKey, Vec<u8>, Value)> = items.into_iter()
+
+        // Sort keys by value for sequential access
+        let mut keys: Vec<(IndexKey, Value)> = items.into_iter()
             .map(|(value, row_id)| {
                 let value_bytes = self.value_to_bytes(&value)?;
                 let key = IndexKey {
-                    value_bytes: value_bytes.clone(),
+                    value_bytes,
                     row_id,
                 };
-                Ok((key, value_bytes, value))
+                Ok((key, value))
             })
             .collect::<Result<Vec<_>>>()?;
-        
-        // Sort by value_bytes for sequential B-Tree access
-        keys.sort_by(|a, b| a.1.cmp(&b.1));
-        
-        // Step 2: Batch insert into B-Tree
-        {
-            let mut btree = self.btree.write();
-            for (key, _, _) in &keys {
-                btree.insert(key.clone(), vec![])?;
+
+        keys.sort_by(|a, b| a.0.value_bytes.cmp(&b.0.value_bytes));
+
+        for (key, value) in &keys {
+            let full = self.mem_buffer.insert(key.clone(), ()).map_err(|e| {
+                StorageError::InvalidData(e)
+            })?;
+            if full {
+                self.drain_immutable_to_btree()?;
             }
+            self.lru_cache.invalidate(value);
         }
-        
-        // 🚀 P0: Removed cache update (memory leak fix)
-        
+
         Ok(())
     }
-    
+
     /// Point query: get all row_ids with exact value
     pub fn get(&self, value: &Value) -> Result<Vec<RowId>> {
-        // 🚀 P1: Try LRU cache first for maximum speed
+        // Try LRU cache first
         if let Some(cached_ids) = self.lru_cache.get(value) {
-            // ✅ P0: Arc deref + clone (small Vec clone, but Arc sharing reduces memory pressure)
             return Ok((*cached_ids).clone());
         }
-        
-        // 🚀 P0: Removed legacy cache check (memory leak fix)
-        // All lookups now go directly to B-Tree if not in LRU
-        
-        // 🚀 P1: Record cache miss
+
         self.lru_cache.record_miss();
-        
+
         let value_bytes = self.value_to_bytes(value)?;
-        
-        // Use B-Tree range scan to find all entries with matching value
         let mut row_ids = Vec::new();
-        
-        let btree = self.btree.read();
-        
-        // Create range: all entries with the same value_bytes
+        let mut seen = HashSet::new();
+
+        // 1. Check mem buffer
         let start_key = IndexKey {
             value_bytes: value_bytes.clone(),
             row_id: 0,
         };
-        
         let end_key = IndexKey {
             value_bytes: value_bytes.clone(),
             row_id: RowId::MAX,
         };
-        
-        // Range scan to get all matching entries
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            // Verify value_bytes matches (should always be true)
-            if key.value_bytes == value_bytes {
-                // No need to check for tombstones - we use real delete now
+
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if key.value_bytes == value_bytes && seen.insert(key.row_id) {
                 row_ids.push(key.row_id);
             }
         }
-        
+
+        // 2. Check persistent btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if key.value_bytes == value_bytes && seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
         drop(btree);
-        
-        // 🚀 P1: Update LRU cache only
+
         if !row_ids.is_empty() {
             self.lru_cache.put(value.clone(), row_ids.clone());
         }
-        
+
         Ok(row_ids)
     }
-    
+
     /// Range query: get all row_ids where start <= value <= end
     pub fn range(&self, start: &Value, end: &Value) -> Result<Vec<RowId>> {
         let start_bytes = self.value_to_bytes(start)?;
         let end_bytes = self.value_to_bytes(end)?;
-        
+
         let mut row_ids = Vec::new();
-        
-        let btree = self.btree.read();
-        
-        // Create range keys
+        let mut seen = HashSet::new();
+
         let start_key = IndexKey {
-            value_bytes: start_bytes,
+            value_bytes: start_bytes.clone(),
             row_id: 0,
         };
-        
         let end_key = IndexKey {
-            value_bytes: end_bytes,
+            value_bytes: end_bytes.clone(),
             row_id: RowId::MAX,
         };
-        
-        // Range scan
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            // No need to check for tombstones - we use real delete now
-            row_ids.push(key.row_id);
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
         }
-        
+
+        // 2. Btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
         Ok(row_ids)
     }
-    
+
     /// Scan all entries in order
-    /// 
-    /// Returns row_ids sorted by their corresponding values
-    /// This is useful for ORDER BY optimization on indexed columns
     pub fn scan_all_row_ids(&self) -> Result<Vec<RowId>> {
         self.scan_row_ids_with_limit(None)
     }
-    
+
     /// Scan entries with optional limit
-    /// 
-    /// Returns at most `limit` row_ids sorted by their corresponding values
-    /// Early termination significantly reduces I/O for LIMIT queries
     pub fn scan_row_ids_with_limit(&self, limit: Option<usize>) -> Result<Vec<RowId>> {
-        let btree = self.btree.read();
-        
-        // Create range that covers all possible keys
+        let mut row_ids = Vec::new();
+        let mut seen = HashSet::new();
+
         let min_key = IndexKey {
-            value_bytes: vec![],  // Minimum possible value
+            value_bytes: vec![],
             row_id: 0,
         };
-        
         let max_key = IndexKey {
             value_bytes: vec![0xFF; VALUE_DATA_SIZE],
             row_id: RowId::MAX,
         };
-        
-        // Range scan with optional limit
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&min_key, &max_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
+        // 2. Btree
+        let btree = self.btree.read();
         let all_entries = if let Some(limit_count) = limit {
-            // Use optimized range_with_limit for early termination
             btree.range_with_limit(&min_key, &max_key, limit_count)?
         } else {
-            // Full scan
             btree.range(&min_key, &max_key)?
         };
-        
-        // Extract row_ids
-        let row_ids: Vec<RowId> = all_entries.into_iter()
-            .map(|(key, _)| key.row_id)
-            .collect();
-        
+        for (key, _) in &all_entries {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
         Ok(row_ids)
     }
-    
-    /// 🚀 Range query: get all row_ids where value < upper_bound
-    /// 
-    /// **Use case**: `WHERE battery_level < 30`, `WHERE price < 100.0`
-    /// 
-    /// **Performance**: O(log N + K) where K = result size
+
+    /// Range query: value < upper_bound
     pub fn query_less_than(&self, upper_bound: &Value) -> Result<Vec<RowId>> {
         let upper_bytes = self.value_to_bytes(upper_bound)?;
-        
+
         let mut row_ids = Vec::new();
-        
-        let btree = self.btree.read();
-        
-        // Start from minimum possible key
-        let start_key = IndexKey {
-            value_bytes: vec![],  // Empty bytes = minimum
-            row_id: 0,
-        };
-        
-        // End at upper_bound (exclusive, so use row_id = 0)
-        let end_key = IndexKey {
-            value_bytes: upper_bytes,
-            row_id: 0,  // Exclusive: don't include upper_bound itself
-        };
-        
-        // Range scan [min, upper_bound)
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            row_ids.push(key.row_id);
-        }
-        
-        Ok(row_ids)
-    }
-    
-    /// 🚀 Range query: get all row_ids where value > lower_bound
-    /// 
-    /// **Use case**: `WHERE created_at > 100000`, `WHERE age > 18`
-    /// 
-    /// **Performance**: O(log N + K) where K = result size
-    pub fn query_greater_than(&self, lower_bound: &Value) -> Result<Vec<RowId>> {
-        let lower_bytes = self.value_to_bytes(lower_bound)?;
-        
-        let mut row_ids = Vec::new();
-        
-        let btree = self.btree.read();
-        
-        // Start from lower_bound + 1 (exclusive)
-        // Use row_id = RowId::MAX to skip all entries with exact lower_bound value
-        let start_key = IndexKey {
-            value_bytes: lower_bytes,
-            row_id: RowId::MAX,
-        };
-        
-        // End at maximum possible key
-        let end_key = IndexKey {
-            value_bytes: vec![0xFF; VALUE_DATA_SIZE],  // Large bytes = maximum
-            row_id: RowId::MAX,
-        };
-        
-        // Range scan (lower_bound, max]
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            row_ids.push(key.row_id);
-        }
-        
-        Ok(row_ids)
-    }
-    
-    /// 🚀 Range query: value <= upper_bound (inclusive)
-    pub fn query_less_than_or_equal(&self, upper_bound: &Value) -> Result<Vec<RowId>> {
-        let upper_bytes = self.value_to_bytes(upper_bound)?;
-        
-        let mut row_ids = Vec::new();
-        
-        let btree = self.btree.read();
-        
+        let mut seen = HashSet::new();
+
         let start_key = IndexKey {
             value_bytes: vec![],
             row_id: 0,
         };
-        
         let end_key = IndexKey {
             value_bytes: upper_bytes,
-            row_id: RowId::MAX,  // Inclusive
+            row_id: 0,
         };
-        
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            row_ids.push(key.row_id);
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
         }
-        
+
+        // 2. Btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
         Ok(row_ids)
     }
-    
-    /// 🚀 Range query: value >= lower_bound (inclusive)
-    pub fn query_greater_than_or_equal(&self, lower_bound: &Value) -> Result<Vec<RowId>> {
+
+    /// Range query: value > lower_bound
+    pub fn query_greater_than(&self, lower_bound: &Value) -> Result<Vec<RowId>> {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
-        
+
         let mut row_ids = Vec::new();
-        
-        let btree = self.btree.read();
-        
+        let mut seen = HashSet::new();
+
         let start_key = IndexKey {
             value_bytes: lower_bytes,
-            row_id: 0,  // Inclusive
+            row_id: RowId::MAX,
         };
-        
         let end_key = IndexKey {
             value_bytes: vec![0xFF; VALUE_DATA_SIZE],
             row_id: RowId::MAX,
         };
-        
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            row_ids.push(key.row_id);
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
         }
-        
+
+        // 2. Btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
         Ok(row_ids)
     }
-    
-    /// 🚀 Dual-bound range query with flexible boundaries
-    /// 
-    /// **Use case**: `WHERE col > X AND col < Y`, `WHERE col >= X AND col <= Y`
-    /// 
-    /// **Performance**: O(log N + K) - single B-Tree scan
-    /// 
-    /// # Arguments
-    /// * `lower_bound` - Lower bound value
-    /// * `lower_inclusive` - If true: >=, if false: >
-    /// * `upper_bound` - Upper bound value  
-    /// * `upper_inclusive` - If true: <=, if false: <
-    pub fn query_between(&self, 
+
+    /// Range query: value <= upper_bound (inclusive)
+    pub fn query_less_than_or_equal(&self, upper_bound: &Value) -> Result<Vec<RowId>> {
+        let upper_bytes = self.value_to_bytes(upper_bound)?;
+
+        let mut row_ids = Vec::new();
+        let mut seen = HashSet::new();
+
+        let start_key = IndexKey {
+            value_bytes: vec![],
+            row_id: 0,
+        };
+        let end_key = IndexKey {
+            value_bytes: upper_bytes,
+            row_id: RowId::MAX,
+        };
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
+        // 2. Btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
+        Ok(row_ids)
+    }
+
+    /// Range query: value >= lower_bound (inclusive)
+    pub fn query_greater_than_or_equal(&self, lower_bound: &Value) -> Result<Vec<RowId>> {
+        let lower_bytes = self.value_to_bytes(lower_bound)?;
+
+        let mut row_ids = Vec::new();
+        let mut seen = HashSet::new();
+
+        let start_key = IndexKey {
+            value_bytes: lower_bytes,
+            row_id: 0,
+        };
+        let end_key = IndexKey {
+            value_bytes: vec![0xFF; VALUE_DATA_SIZE],
+            row_id: RowId::MAX,
+        };
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
+        // 2. Btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
+        Ok(row_ids)
+    }
+
+    /// Dual-bound range query with flexible boundaries
+    pub fn query_between(&self,
                         lower_bound: &Value, lower_inclusive: bool,
                         upper_bound: &Value, upper_inclusive: bool) -> Result<Vec<RowId>> {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
         let upper_bytes = self.value_to_bytes(upper_bound)?;
-        
+
         let mut row_ids = Vec::new();
-        let btree = self.btree.read();
-        
-        // Set start key based on lower_inclusive
+        let mut seen = HashSet::new();
+
         let start_key = IndexKey {
             value_bytes: lower_bytes,
             row_id: if lower_inclusive { 0 } else { RowId::MAX },
         };
-        
-        // Set end key based on upper_inclusive
         let end_key = IndexKey {
             value_bytes: upper_bytes,
             row_id: if upper_inclusive { RowId::MAX } else { 0 },
         };
-        
-        // Single B-Tree scan
-        let results = btree.range(&start_key, &end_key)?;
-        
-        for (key, _value) in results {
-            row_ids.push(key.row_id);
+
+        // 1. Mem buffer
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
         }
-        
+
+        // 2. Btree
+        let btree = self.btree.read();
+        let results = btree.range(&start_key, &end_key)?;
+        for (key, _) in results {
+            if seen.insert(key.row_id) {
+                row_ids.push(key.row_id);
+            }
+        }
+
         Ok(row_ids)
     }
-    
+
     /// Delete a value → row_id mapping
-    pub fn delete(&mut self, value: &Value, row_id: RowId) -> Result<()> {
+    pub fn delete(&self, value: &Value, row_id: RowId) -> Result<()> {
         let value_bytes = self.value_to_bytes(value)?;
-        
         let key = IndexKey {
-            value_bytes: value_bytes.clone(),
+            value_bytes,
             row_id,
         };
-        
-        // Use real B-Tree delete (no longer using tombstone)
+
+        // Try to remove from mem buffer first
+        self.mem_buffer.delete(&key);
+
+        // Also delete from persistent btree (may have been flushed already)
         let mut btree = self.btree.write();
         btree.delete(&key)?;
         drop(btree);
-        
-        // 🚀 P0: Removed legacy cache update (memory leak fix)
-        
-        // Invalidate LRU cache for this value
+
         self.lru_cache.invalidate(value);
-        
+
         Ok(())
     }
-    
-    /// 🚀 P2: Batch delete with smart cache invalidation
-    /// 
-    /// More efficient than calling `delete()` multiple times:
-    /// - Single B-Tree lock
-    /// - Batch cache updates
-    /// - Smart cache invalidation (only affected keys)
-    pub fn batch_delete(&mut self, items: Vec<(Value, RowId)>) -> Result<()> {
+
+    /// Batch delete with smart cache invalidation
+    pub fn batch_delete(&self, items: Vec<(Value, RowId)>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        
-        // Step 1: Batch delete from B-Tree
+
+        // 1. Delete from mem buffer and btree
         {
             let mut btree = self.btree.write();
             for (value, row_id) in &items {
@@ -559,13 +573,12 @@ impl ColumnValueIndex {
                     value_bytes,
                     row_id: *row_id,
                 };
+                self.mem_buffer.delete(&key);
                 btree.delete(&key)?;
             }
         }
-        
-        // 🚀 P0: Removed legacy cache update (memory leak fix)
-        
-        // Batch invalidate LRU cache (only affected values)
+
+        // 2. Batch invalidate LRU cache
         let mut unique_values = items.into_iter()
             .map(|(value, _)| value)
             .collect::<Vec<_>>();
@@ -579,78 +592,103 @@ impl ColumnValueIndex {
             let b_bytes = Self::value_to_bytes_helper(b).unwrap_or_default();
             a_bytes == b_bytes
         });
-        
+
         self.lru_cache.invalidate_batch(&unique_values);
-        
+
         Ok(())
     }
-    
-    /// 🚀 P2: Delete range with smart cache invalidation
-    /// 
-    /// Deletes all entries where start <= value <= end.
-    /// Only invalidates cache entries within the range (not full clear).
-    pub fn delete_range(&mut self, start: &Value, end: &Value) -> Result<usize> {
+
+    /// Delete range with smart cache invalidation
+    pub fn delete_range(&self, start: &Value, end: &Value) -> Result<usize> {
         let start_bytes = self.value_to_bytes(start)?;
         let end_bytes = self.value_to_bytes(end)?;
-        
+
+        let start_key = IndexKey {
+            value_bytes: start_bytes.clone(),
+            row_id: 0,
+        };
+        let end_key = IndexKey {
+            value_bytes: end_bytes.clone(),
+            row_id: RowId::MAX,
+        };
+
         let mut deleted_count = 0;
-        
-        // Step 1: Find and delete all keys in range
+
+        // 1. Find and delete all keys in btree
         {
             let mut btree = self.btree.write();
-            
-            let start_key = IndexKey {
-                value_bytes: start_bytes.clone(),
-                row_id: 0,
-            };
-            
-            let end_key = IndexKey {
-                value_bytes: end_bytes.clone(),
-                row_id: RowId::MAX,
-            };
-            
-            // Get all keys in range
             let keys_to_delete: Vec<IndexKey> = btree.range(&start_key, &end_key)?
                 .into_iter()
                 .map(|(key, _)| key)
                 .collect();
-            
-            // Delete each key
-            for key in keys_to_delete {
-                btree.delete(&key)?;
+
+            for key in &keys_to_delete {
+                self.mem_buffer.delete(key);
+                btree.delete(key)?;
                 deleted_count += 1;
             }
         }
-        
-        // 🚀 P0: Removed legacy cache update (memory leak fix)
-        
-        // Step 3: Smart LRU cache invalidation (only the range)
+
+        // 2. Also delete from mem buffer entries not yet in btree
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in &buffer_results {
+            self.mem_buffer.delete(key);
+            deleted_count += 1;
+        }
+
         self.lru_cache.invalidate_range(start, end);
-        
+
         Ok(deleted_count)
     }
-    
-    /// Flush index to disk
-    pub fn flush(&mut self) -> Result<()> {
+
+    /// Flush mem buffer to persistent btree, then btree to disk
+    pub fn flush(&self) -> Result<()> {
+        self.flush_buffer()?;
         let mut btree = self.btree.write();
         btree.flush()?;
         Ok(())
     }
-    
+
+    /// Drain immutable buffers to btree (called when buffer is full or during checkpoint)
+    fn drain_immutable_to_btree(&self) -> Result<()> {
+        while self.mem_buffer.should_flush() {
+            if let Some(entries) = self.mem_buffer.flush().map_err(|e| StorageError::InvalidData(e))? {
+                if !entries.is_empty() {
+                    let mut btree = self.btree.write();
+                    for (key, _) in entries {
+                        btree.insert(key, vec![])?;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush all buffered entries (active + immutable) to persistent btree
+    pub fn flush_buffer(&self) -> Result<()> {
+        let entries = self.mem_buffer.drain();
+        if !entries.is_empty() {
+            let mut btree = self.btree.write();
+            for (key, _) in entries {
+                btree.insert(key, vec![])?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get index statistics
     pub fn stats(&self) -> IndexStats {
-        // 🚀 P0: Use LRU cache stats instead of removed legacy cache
         let lru_stats = self.lru_cache.stats();
         IndexStats {
             cached_values: lru_stats.size,
-            total_row_ids: 0,  // Not tracked in LRU cache
+            total_row_ids: 0,
         }
     }
 
     /// Get the approximate number of entries in the index
     pub fn entry_count(&self) -> usize {
-        // Approximate from BTree page metadata (avoid full scan)
-        // The page count * max_keys_per_page gives an upper bound
         let btree = self.btree.read();
         btree.approximate_entry_count()
     }
@@ -661,8 +699,6 @@ impl ColumnValueIndex {
     }
 
     fn value_to_bytes_helper(value: &Value) -> Result<Vec<u8>> {
-        use crate::types::Value;
-
         let bytes = match value {
             Value::Integer(i) => i.to_be_bytes().to_vec(),
             Value::Float(f) => f.to_be_bytes().to_vec(),
@@ -675,7 +711,7 @@ impl ColumnValueIndex {
                 ));
             }
         };
-        
+
         Ok(bytes)
     }
 }
@@ -687,65 +723,52 @@ pub struct IndexStats {
     pub total_row_ids: usize,
 }
 
-// ==================== 🚀 Batch Index Builder Implementation ====================
+// ==================== Batch Index Builder Implementation ====================
 
 use crate::index::builder::{IndexBuilder, BuildStats};
 use crate::types::Row;
 
 impl IndexBuilder for ColumnValueIndex {
-    /// 批量构建列值索引（从MemTable flush时调用）
-    /// 
-    /// ⚠️  注意：此方法现在已弃用，应该使用 insert_batch
-    /// 因为此方法无法知道列在 Row 中的位置
     fn build_from_memtable(&mut self, _rows: &[(RowId, Row)]) -> Result<()> {
-        // ⚠️  此方法不应该直接使用
-        // 批量构建应该通过 batch_build_column_indexes 调用 insert_batch
         debug_log!("[ColumnIndex::{}] ⚠️  build_from_memtable is deprecated, use insert_batch instead",
                  self.column_name);
         Ok(())
     }
-    
-    /// 持久化索引到磁盘
+
     fn persist(&mut self) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
-        
-        let mut btree = self.btree.write();
-        btree.flush()?;
-        
+
+        self.flush()?;
+
         let duration = start.elapsed();
         debug_log!("[ColumnIndex::{}] Persist: {:?}", self.column_name, duration);
-        
+
         Ok(())
     }
-    
-    /// 获取索引名称
+
     fn name(&self) -> &str {
         &self.column_name
     }
-    
-    /// 获取构建统计信息
+
     fn stats(&self) -> BuildStats {
         let stats = self.stats();
         BuildStats {
             rows_processed: stats.total_row_ids,
-            build_time_ms: 0, // 在实际实现中应该记录
+            build_time_ms: 0,
             persist_time_ms: 0,
-            index_size_bytes: stats.total_row_ids * 22, // compact key: 22 bytes/row
+            index_size_bytes: stats.total_row_ids * 22,
         }
     }
 }
 
 impl ColumnValueIndex {
-    /// 批量插入（优化的接口）
-    ///
-    /// 用于批量索引构建
-    pub fn insert_batch(&mut self, batch: &[(RowId, &Value)]) -> Result<()> {
+    /// Batch insert (optimized interface for bulk index building)
+    pub fn insert_batch(&self, batch: &[(RowId, &Value)]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
-        // 🚀 批量插入到B-Tree
         for (row_id, value) in batch {
             self.insert(value, *row_id)?;
         }
@@ -764,7 +787,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_index.idx");
 
-        let mut index = ColumnValueIndex::create(
+        let index = ColumnValueIndex::create(
             &path,
             "users".to_string(),
             "age".to_string(),

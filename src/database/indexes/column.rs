@@ -7,87 +7,55 @@ use crate::database::core::MoteDB;
 use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
 use crate::index::column_value::{ColumnValueIndex, ColumnValueIndexConfig};
-use parking_lot::RwLock;
 use std::sync::Arc;
 
 impl MoteDB {
     /// Create a column value index for WHERE clause optimization
-    /// 
-    /// 🚀 **方案B（高性能）**: 使用scan_range一次性扫描LSM，避免全表加载到内存
-    /// 
-    /// # Performance
-    /// - Point queries: 40x faster (1ms vs 40ms)
-    /// - Range queries: Efficient B-Tree scan
-    /// - CREATE INDEX: O(N) 顺序扫描，避免内存溢出
-    /// 
-    /// # Example
-    /// ```ignore
-    /// db.create_column_index("users", "email")?;
-    /// // Now queries like WHERE email = 'foo@bar.com' are 40x faster
-    /// ```
     pub fn create_column_index(&self, table_name: &str, column_name: &str) -> Result<()> {
-        // Use default index name format: {table}.{column}
         let index_name = format!("{}.{}", table_name, column_name);
         self.create_column_index_with_name(table_name, column_name, &index_name)
     }
-    
+
     /// Create a column value index with custom name
-    /// 
-    /// 🚀 **方案B（高性能）**: 使用scan_range一次性扫描LSM，避免全表加载到内存
-    /// 
-    /// # Performance
-    /// - Point queries: 40x faster (1ms vs 40ms)
-    /// - Range queries: Efficient B-Tree scan
-    /// - CREATE INDEX: O(N) 顺序扫描，避免内存溢出
-    /// 
-    /// # Example
-    /// ```ignore
-    /// db.create_column_index_with_name("users", "email", "idx_users_email")?;
-    /// // Now queries like WHERE email = 'foo@bar.com' are 40x faster
-    /// ```
     pub fn create_column_index_with_name(&self, table_name: &str, column_name: &str, index_name: &str) -> Result<()> {
         ensure_open!(self);
-        // 🎯 统一路径：{db}.mote/indexes/column_{index_name}.idx
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
         let index_path = indexes_dir.join(format!("column_{}.idx", index_name));
-        
+
         let config = ColumnValueIndexConfig::default();
         let index = ColumnValueIndex::create(
-            index_path, 
-            table_name.to_string(), 
-            column_name.to_string(), 
+            index_path,
+            table_name.to_string(),
+            column_name.to_string(),
             config
         )?;
-        
-        let index_arc = Arc::new(RwLock::new(index));
+
+        let index_arc = Arc::new(index);
         self.column_indexes.insert(index_name.to_string(), index_arc.clone());
-        
-        // 🚀 方案B：使用scan_range高性能扫描
-        // 获取列在schema中的位置
+
+        // Populate from existing data using scan_range
         if let Ok(schema) = self.table_registry.get_table(table_name) {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
-                
-                debug_log!("[create_column_index] 🔍 使用scan_range扫描LSM（方案B）...");
+
+                debug_log!("[create_column_index] Using scan_range...");
                 let start_time = std::time::Instant::now();
-                
-                // 计算表的key范围 — 使用与 make_composite_key 一致的 sequential table_id
+
                 let table_id = self.table_registry.get_table_id(table_name)
                     .unwrap_or(0) as u64;
                 let start_key = table_id << 32;
                 let end_key = (table_id + 1) << 32;
-                
-                // 一次scan_range扫描所有数据
+
                 let mut indexed_count = 0;
-                const BATCH_SIZE: usize = 500; // 批量flush，避免内存溢出
-                
+                const BATCH_SIZE: usize = 500;
+
                 match self.lsm_engine.scan_range(start_key, end_key) {
                     Ok(entries) => {
                         for (batch_idx, chunk) in entries.chunks(BATCH_SIZE).enumerate() {
                             for (composite_key, value) in chunk {
                                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-                                
+
                                 let data_bytes: Vec<u8> = match &value.data {
                                     crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
                                     crate::storage::lsm::ValueData::Blob(blob_ref) => {
@@ -100,257 +68,169 @@ impl MoteDB {
                                         }
                                     }
                                 };
-                                
+
                                 if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
                                     if let Some(value) = row.get(col_position) {
-                                        if let Err(e) = index_arc.write().insert(value, row_id) {
-                                            debug_log!("[create_column_index] ⚠️ 插入失败 row_id={}: {}", row_id, e);
+                                        if let Err(e) = index_arc.insert(value, row_id) {
+                                            debug_log!("[create_column_index] Insert failed row_id={}: {}", row_id, e);
                                         } else {
                                             indexed_count += 1;
                                         }
                                     }
                                 }
                             }
-                            
-                            // 每4个batch或最后一个batch时flush
+
                             if (batch_idx + 1) % 4 == 0 || (batch_idx + 1) * BATCH_SIZE >= entries.len() {
-                                if let Err(e) = index_arc.write().flush() {
-                                    debug_log!("[create_column_index] ⚠️ Flush失败: {}", e);
+                                if let Err(e) = index_arc.flush() {
+                                    debug_log!("[create_column_index] Flush failed: {}", e);
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        debug_log!("[create_column_index] ⚠️ scan_range失败: {}", e);
+                        debug_log!("[create_column_index] scan_range failed: {}", e);
                     }
                 }
-                
-                let _scan_time = start_time.elapsed();
 
+                let _scan_time = start_time.elapsed();
                 if indexed_count > 0 {
-                    debug_log!("[create_column_index] 🚀 扫描完成：{} 个值，耗时 {:?}",
-                             indexed_count, _scan_time);
-                    debug_log!("[create_column_index] ✅ 批量建索引完成！");
-                } else {
-                    debug_log!("[create_column_index] ⚠️ 未找到任何数据（扫描耗时 {:?}）", _scan_time);
+                    debug_log!("[create_column_index] Indexed {} values in {:?}", indexed_count, _scan_time);
                 }
-            } else {
-                debug_log!("  ✓ Created empty column index '{}' (column not found in schema)", index_name);
             }
-        } else {
-            debug_log!("  ✓ Created empty column index '{}' (table not found)", index_name);
         }
-        
+
         Ok(())
     }
-    
+
     /// Insert value into column index
-    /// 
-    /// Should be called after insert_table_row() if column index exists
     pub fn insert_column_value(&self, table_name: &str, column_name: &str, row_id: RowId, value: &Value) -> Result<()> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        index_ref.value().write().insert(value, row_id)?;
+
+        index_ref.value().insert(value, row_id)?;
         Ok(())
     }
-    
-    /// 🚀 P2 优化：批量插入列索引值
-    /// 
-    /// ## 性能优化
-    /// - 批量排序 + 批量插入 B-Tree
-    /// - 减少锁竞争（单次加锁）
-    /// - 更好的 B-Tree 局部性
-    /// 
-    /// ## 预期效果
-    /// - 1000 条插入：1000 次加锁 → 1 次加锁
-    /// - 性能提升：2-3 倍
+
+    /// Batch insert column index values
     pub fn batch_insert_column_values(&self, table_name: &str, column_name: &str, items: Vec<(RowId, Value)>) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
-        
+
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        // Convert to (Value, RowId) for batch_insert API
+
         let batch: Vec<(Value, RowId)> = items.into_iter()
             .map(|(row_id, value)| (value, row_id))
             .collect();
-        
-        index_ref.value().write().batch_insert(batch)?;
+
+        index_ref.value().batch_insert(batch)?;
         Ok(())
     }
-    
+
     /// Get all column indexes for a table
-    /// 
-    /// Returns list of column names that have indexes
     pub fn get_table_column_indexes(&self, table_name: &str) -> Vec<String> {
         let prefix = format!("{}.", table_name);
-        
+
         self.column_indexes.iter()
             .filter(|entry| entry.key().starts_with(&prefix))
             .map(|entry| entry.key().strip_prefix(&prefix).unwrap().to_string())
             .collect()
     }
-    
+
     /// Delete value from column index
-    /// 
-    /// Should be called after delete_row() if column index exists
     pub fn delete_column_value(&self, table_name: &str, column_name: &str, row_id: RowId, value: &Value) -> Result<()> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        index_ref.value().write().delete(value, row_id)?;
+
+        index_ref.value().delete(value, row_id)?;
         Ok(())
     }
-    
+
     /// Update value in column index (delete old + insert new)
-    /// 
-    /// Should be called after update_row() if column index exists
-    pub fn update_column_value(&self, table_name: &str, column_name: &str, row_id: RowId, 
+    pub fn update_column_value(&self, table_name: &str, column_name: &str, row_id: RowId,
                                 old_value: &Value, new_value: &Value) -> Result<()> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        let mut index_guard = index_ref.value().write();
-        index_guard.delete(old_value, row_id)?;
-        index_guard.insert(new_value, row_id)?;
+
+        let index = index_ref.value();
+        index.delete(old_value, row_id)?;
+        index.insert(new_value, row_id)?;
         Ok(())
     }
-    
-    /// Flush column index to disk (for bulk insert operations)
+
+    /// Flush column index to disk
     pub fn flush_column_index(&self, table_name: &str, column_name: &str) -> Result<()> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-        
-        index_ref.value().write().flush()?;
+
+        index_ref.value().flush()?;
         Ok(())
     }
-    
+
     /// Query by column value (point query)
-    /// 
-    /// # Performance
-    /// - With index: <1ms
-    /// - Without index: 40ms (table scan)
-    /// 
-    /// # LSM Architecture
-    /// - Queries both SSTable (via index) and MemTable (live data)
-    /// - Merges and deduplicates results
-    /// 
-    /// # Example
-    /// ```ignore
-    /// let row_ids = db.query_by_column("users", "email", &Value::Text("foo@bar.com".into()))?;
-    /// ```
     pub fn query_by_column(&self, table_name: &str, column_name: &str, value: &Value) -> Result<Vec<RowId>> {
         ensure_open!(self);
         let index_name = format!("{}.{}", table_name, column_name);
 
-        // Query the in-memory B+Tree index directly.
-        // The index is maintained synchronously on INSERT/UPDATE/DELETE,
-        // so it already covers both MemTable and SSTable data — no need
-        // for a redundant MemTable scan.
-        let row_ids = {
-            let index_ref = self.column_indexes.get(&index_name)
-                .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
+        let index_ref = self.column_indexes.get(&index_name)
+            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
-            let index_guard = index_ref.value().read();
-            index_guard.get(value)?
-        };
-
-        Ok(row_ids)
+        index_ref.value().get(value)
     }
-    
+
     /// Query column value index with range (WHERE col >= start AND col <= end)
-    /// Returns matching row IDs sorted by value
-    /// 
-    /// # LSM Architecture
-    /// - Queries both SSTable (via index) and MemTable (live data)
-    /// 
-    /// # Example
-    /// ```ignore
-    /// let row_ids = db.query_by_column_range("users", "age", 
-    ///     &Value::Integer(20), &Value::Integer(30))?;
-    /// ```
-    pub fn query_by_column_range(&self, table_name: &str, column_name: &str, 
+    pub fn query_by_column_range(&self, table_name: &str, column_name: &str,
                                 start: &Value, end: &Value) -> Result<Vec<RowId>> {
         self.query_by_column_between(table_name, column_name, start, true, end, true)
     }
-    
-    /// 🚀 Query column value index: WHERE col < value
-    /// 
-    /// # Example
-    /// ```ignore
-    /// // Get all users with age < 30
-    /// let row_ids = db.query_by_column_less_than("users", "age", &Value::Integer(30))?;
-    /// ```
+
+    /// Query column value index: WHERE col < value
     pub fn query_by_column_less_than(&self, table_name: &str, column_name: &str,
                                     value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
-        let index_guard = index_ref.value().read();
-        index_guard.query_less_than(value)
+        index_ref.value().query_less_than(value)
     }
-    
-    /// 🚀 Query column value index: WHERE col > value
-    /// 
-    /// # Example
-    /// ```ignore
-    /// // Get all users with age > 18
-    /// let row_ids = db.query_by_column_greater_than("users", "age", &Value::Integer(18))?;
-    /// ```
+
+    /// Query column value index: WHERE col > value
     pub fn query_by_column_greater_than(&self, table_name: &str, column_name: &str,
                                        value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
-        let index_guard = index_ref.value().read();
-        index_guard.query_greater_than(value)
+        index_ref.value().query_greater_than(value)
     }
-    
-    /// 🚀 Query column value index: WHERE col <= value
+
+    /// Query column value index: WHERE col <= value
     pub fn query_by_column_less_than_or_equal(&self, table_name: &str, column_name: &str,
                                              value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
-        let index_guard = index_ref.value().read();
-        index_guard.query_less_than_or_equal(value)
+        index_ref.value().query_less_than_or_equal(value)
     }
-    
-    /// 🚀 Query column value index: WHERE col >= value
+
+    /// Query column value index: WHERE col >= value
     pub fn query_by_column_greater_than_or_equal(&self, table_name: &str, column_name: &str,
                                                 value: &Value) -> Result<Vec<RowId>> {
         let index_name = format!("{}.{}", table_name, column_name);
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
-        let index_guard = index_ref.value().read();
-        index_guard.query_greater_than_or_equal(value)
+        index_ref.value().query_greater_than_or_equal(value)
     }
-    
-    /// 🚀 Query column value index: dual-bound range query with flexible boundaries
-    /// 
-    /// **Use case**: `WHERE col > X AND col < Y`, `WHERE col >= X AND col <= Y`
-    /// 
-    /// **Performance**: O(log N + K) - single B-Tree scan (much faster than intersecting two queries)
-    /// 
-    /// # Example
-    /// ```ignore
-    /// // Get robots created between timestamps (exclusive)
-    /// let row_ids = db.query_by_column_between("robots", "created_at",
-    ///     &Value::Integer(100000), false,
-    ///     &Value::Integer(200000), false)?;
-    /// ```
+
+    /// Query column value index: dual-bound range query
     pub fn query_by_column_between(&self, table_name: &str, column_name: &str,
                                   lower_bound: &Value, lower_inclusive: bool,
                                   upper_bound: &Value, upper_inclusive: bool) -> Result<Vec<RowId>> {
@@ -358,7 +238,6 @@ impl MoteDB {
         let index_ref = self.column_indexes.get(&index_name)
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
-        let index_guard = index_ref.value().read();
-        index_guard.query_between(lower_bound, lower_inclusive, upper_bound, upper_inclusive)
+        index_ref.value().query_between(lower_bound, lower_inclusive, upper_bound, upper_inclusive)
     }
 }

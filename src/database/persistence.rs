@@ -135,7 +135,7 @@ impl MoteDB {
             .collect();
 
         for index in indexes_to_flush {
-            index.write().flush()?;
+            index.flush()?;
         }
 
         Ok(())

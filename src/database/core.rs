@@ -82,7 +82,7 @@ pub struct MoteDB {
     pub(crate) text_indexes: Arc<DashMap<String, Arc<RwLock<TextFTSIndex>>>>,
 
     /// 🚀 Column value indexes (for WHERE optimization) - 使用 DashMap 提升并发性能
-    pub(crate) column_indexes: Arc<DashMap<String, Arc<RwLock<ColumnValueIndex>>>>,
+    pub(crate) column_indexes: Arc<DashMap<String, Arc<ColumnValueIndex>>>,
 
     /// Columnar segment store for TimeSeries tables (Gorilla-compressed immutable segments)
     pub(crate) columnar_store: Arc<crate::storage::ColumnarStore>,

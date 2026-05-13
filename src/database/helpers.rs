@@ -159,7 +159,7 @@ impl MoteDB {
                     .map(|(row_id, value)| (*row_id, value))
                     .collect();
 
-                index.write().insert_batch(&batch_refs)?;
+                index.insert_batch(&batch_refs)?;
                 debug_log!("[ColumnIndex]   ✓ Built {} entries for column '{}'",
                          batch.len(), _col_name);
             }

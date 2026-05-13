@@ -661,7 +661,7 @@ impl QueryOptimizer {
 
         // Get real key count from BTree if available
         let cardinality = if let Some(idx) = self.db.column_indexes.get(index_name) {
-            idx.value().read().entry_count().max(1)
+            idx.value().entry_count().max(1)
         } else {
             (table_rows / 10).max(1)
         };
