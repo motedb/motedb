@@ -32,7 +32,10 @@ jobs:
         run: cargo fetch
 
       - name: Run tests
-        run: cargo test --workspace --all-features --verbose
+        env:
+          CI: "1"
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace --all-features --verbose -- --test-threads=1
 
       - name: Build (release)
         run: cargo build --release
