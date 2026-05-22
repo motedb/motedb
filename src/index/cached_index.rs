@@ -157,17 +157,6 @@ impl CachedIndex {
         cache.clear();
     }
 
-    /// Batch invalidation for multiple keys
-    pub fn invalidate_batch(&self, keys: &[Value]) {
-        if keys.is_empty() {
-            return;
-        }
-        let mut cache = self.cache.lock();
-        for key in keys {
-            let fk = FastKey::from_value(key);
-            cache.pop(&fk);
-        }
-    }
 }
 
 /// Cache statistics

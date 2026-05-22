@@ -252,35 +252,6 @@ impl Manifest {
         Ok(hasher.finalize())
     }
     
-    /// 清理未在当前版本中的文件
-    pub fn garbage_collect(&self) -> Result<Vec<String>> {
-        let version = self.current_version.lock()
-            .map_err(|_| StorageError::Lock("Version lock poisoned".into()))?;
-        let active_files = version.all_file_names();
-        
-        let mut deleted_files = Vec::new();
-        
-        // 扫描数据目录
-        for entry in fs::read_dir(&self.data_dir)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy().to_string();
-            
-            // 跳过 MANIFEST 和 CURRENT
-            if file_name_str.starts_with("MANIFEST") || file_name_str == "CURRENT" {
-                continue;
-            }
-            
-            // 删除不在当前版本中的文件
-            if !active_files.contains(&file_name_str) {
-                fs::remove_file(entry.path())?;
-                deleted_files.push(file_name_str);
-            }
-        }
-        
-        Ok(deleted_files)
-    }
-    
 }
 
 #[cfg(test)]

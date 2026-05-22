@@ -78,11 +78,6 @@ impl CacheStats {
         let total = self.hits + self.misses;
         if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
     }
-
-    pub fn prefetch_efficiency(&self) -> f64 {
-        if self.prefetch_triggered == 0 { 0.0 }
-        else { self.prefetch_useful as f64 / self.prefetch_triggered as f64 }
-    }
 }
 
 /// 🚀 P2: Prefetch configuration
@@ -275,18 +270,6 @@ impl RowCache {
         self.size.store(cache.len(), Ordering::Relaxed);
     }
 
-    /// Batch put rows into cache
-    pub fn put_batch(&self, table_name: &str, rows: Vec<(RowId, Row)>) {
-        let mut cache = self.cache.write();
-        let thash = table_hash(table_name);
-
-        for (row_id, row) in rows {
-            let key = (thash, row_id);
-            cache.put(key, Arc::new(row));
-        }
-        self.size.store(cache.len(), Ordering::Relaxed);
-    }
-
     /// Invalidate a single row
     pub fn invalidate(&self, table_name: &str, row_id: RowId) {
         let key = (table_hash(table_name), row_id);
@@ -346,19 +329,6 @@ impl RowCache {
             capacity: self.capacity,
             prefetch_triggered: self.prefetch_triggered.load(Ordering::Relaxed),
             prefetch_useful: self.prefetch_useful.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Print cache statistics
-    pub fn print_stats(&self) {
-        let stats = self.stats();
-        debug_log!("Row Cache Statistics:");
-        debug_log!("   Hits: {}, Misses: {}", stats.hits, stats.misses);
-        debug_log!("   Hit Rate: {:.2}%", stats.hit_rate() * 100.0);
-        debug_log!("   Size: {}/{} rows", stats.size, stats.capacity);
-
-        if self.prefetch_config.enabled {
-            debug_log!("   Prefetch: triggered={}, useful={}", stats.prefetch_triggered, stats.prefetch_useful);
         }
     }
 }

@@ -132,55 +132,6 @@ impl BloomFilter {
         results
     }
     
-    /// 🚀 P3+: SIMD 优化的批量检查（需要 nightly Rust）
-    /// 
-    /// 使用 SIMD 指令并行检查多个位，进一步提升性能。
-    /// 
-    /// ## 性能提升
-    /// - 批量检查：20 ns/key → **~10 ns/key**（**2x 提速** 🚀）
-    /// - 10K keys：200 μs → **100 μs**
-    /// 
-    /// ## 要求
-    /// - `#[cfg(target_feature = "avx2")]` - 需要 AVX2 指令集
-    /// - 或 `#[cfg(target_feature = "sse4.2")]` - 需要 SSE4.2 指令集
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    pub fn may_contain_batch_simd(&self, keys: &[&[u8]]) -> Vec<bool> {
-        use std::arch::x86_64::*;
-        
-        let mut results = vec![false; keys.len()];
-        
-        // 🚀 SIMD 批量处理（每次处理 4 个 keys）
-        for (chunk_idx, chunk) in keys.chunks(4).enumerate() {
-            let base_idx = chunk_idx * 4;
-            
-            for (i, key) in chunk.iter().enumerate() {
-                let mut found = true;
-                
-                // 并行检查多个哈希值（SIMD）
-                for hash_idx in 0..self.num_hashes {
-                    let hash = self.hash(key, hash_idx);
-                    let bit_pos = (hash as usize) % self.num_bits;
-                    
-                    if !self.get_bit(bit_pos) {
-                        found = false;
-                        break;
-                    }
-                }
-                
-                results[base_idx + i] = found;
-            }
-        }
-        
-        results
-    }
-    
-    /// 🔧 Fallback: 如果不支持 SIMD，使用普通批量检查
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    pub fn may_contain_batch_simd(&self, keys: &[&[u8]]) -> Vec<bool> {
-        // Fallback to normal batch check
-        self.may_contain_batch(keys)
-    }
-    
     /// Serialize to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();

@@ -99,11 +99,6 @@ impl SSTableCache {
             cache.pop(path);
         }
     }
-
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        self.cache.read().len()
-    }
 }
 
 /// LSM-Tree storage engine with multi-slot immutable queue
@@ -1205,41 +1200,7 @@ impl LSMEngine {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    
-    /// 🆕 Vector search in MemTable (returns complete row data)
-    /// 
-    /// ## Returns
-    /// - `Vec<(row_id, Value, distance)>`: 完整的 row data，无需二次查询
-    /// 
-    /// ## Performance
-    /// - 查询延迟: ~2ms (内存图 + 数据解引用)
-    /// - 无额外查询开销（数据和向量在同一 Entry）
-    pub fn vector_search_memtable(&self, query: &[f32], k: usize) -> Result<Vec<(Key, Value, f32)>> {
-        let memtable = self.memtable.read();
-        
-        let results = memtable.vector_search(query, k)?;
-        
-        // Convert UnifiedEntry → Value
-        let mut final_results = Vec::new();
-        for (key, entry, distance) in results {
-            let mut value = Value {
-                data: entry.data,
-                timestamp: entry.timestamp,
-                deleted: entry.deleted,
-            };
-            
-            // Resolve blob reference if needed
-            if let ValueData::Blob(ref blob_ref) = value.data {
-                let blob_data = self.blob_store.get(blob_ref)?;
-                value.data = ValueData::Inline(blob_data);
-            }
-            
-            final_results.push((key, value, distance));
-        }
-        
-        Ok(final_results)
-    }
-    
+
     /// Flush all memtables to disk (THREAD-SAFE: 使用互斥锁防止并发 flush)
     /// 
     /// 🔥 NEW: Flushes entire immutable queue + active memtable
@@ -1516,37 +1477,7 @@ impl LSMEngine {
     }
     
     /// Scan all MemTable entries with zero-copy callback
-    /// 
-    /// ✅ Zero-copy optimization: No Vec allocation
-    /// ⚠️  CRITICAL: 先收集数据，释放锁后再调用回调，避免在持锁期间执行慢操作导致阻塞
-    pub fn scan_all_memtable_with<F>(&self, mut f: F) -> Result<()>
-    where
-        F: FnMut(Key, &[u8]) -> Result<()>,
-    {
-        // Step 1: 收集所有数据（持锁时间最小化）
-        let entries = {
-            let memtable = self.memtable.read();
-            
-            let mut collected = Vec::new();
-            let entries = memtable.scan_all()?;
-            for (k, entry) in entries {
-                match &entry.data {
-                    ValueData::Inline(d) => collected.push((k, d.clone())),
-                    ValueData::Blob(_) => {}, // Skip blob refs
-                }
-            }
-            collected
-            // 🔓 memtable锁在这里释放
-        };
-        
-        // Step 2: 释放锁后，再调用回调处理数据
-        for (k, data) in entries {
-            f(k, &data)?;
-        }
-        
-        Ok(())
-    }
-    
+
     /// 🔧 优化方法：只扫描增量数据 (active + immutable MemTable) - Zero-copy version
     /// 已 flush 到 SSTable 的数据应该走持久化索引 + LRU 缓存
     /// 
@@ -1622,30 +1553,7 @@ impl LSMEngine {
         })?;
         Ok(results)
     }
-    
-    /// 🆕 只扫描 immutable queue (不包括 active MemTable)
-    /// 
-    /// 用于 flush() 场景：先 rotate，再扫描 immutable，避免死锁
-    pub fn scan_immutable_only<F>(&self, mut f: F) -> Result<()>
-    where
-        F: FnMut(Key, &[u8]) -> Result<()>,
-    {
-        let immutable = self.immutable.read();
-        
-        for memtable in immutable.iter() {
-            let entries = memtable.scan_all()?;
-            for (k, entry) in entries {
-                if entry.deleted { continue; }
-                match &entry.data {
-                    ValueData::Inline(d) => f(k, d)?,
-                    ValueData::Blob(_) => {},
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
+
     /// 🆕 Public API: Force rotate active MemTable to immutable queue
     /// 
     /// Blocks until immutable queue has space (backpressure control)
@@ -1679,44 +1587,8 @@ impl LSMEngine {
         iter.collect()
     }
     
-    /// 🚀 PHASE B: Parallel range scan (2-3x faster for large scans)
-    /// 
-    /// Fallback to serial scan if rayon feature is not enabled
-    #[cfg(not(feature = "rayon"))]
-    pub fn scan_range_parallel(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
-        // Fallback to serial scan
-        self.scan_range(start, end)
-    }
-    
-    /// 🚀 PHASE B: Parallel range scan (2-3x faster for large scans)
-    /// 
-    /// This is an optimized version of scan_range() that uses parallel SSTable scanning.
-    /// 
-    /// ## Performance
-    /// - MemTable: Serial (small data, lock contention)
-    /// - SSTables: **Parallel** (main bottleneck, 60% of scan time)
-    /// - Merge: Serial (fast, uses BTreeMap)
-    /// 
-    /// ## Benchmarks
-    /// - 10 SSTables, serial: 800µs
-    /// - 10 SSTables, parallel (4 cores): 200-250µs (3-4x faster)
-    /// 
-    /// ## Thread Safety
-    /// - SSTableCache is thread-safe (uses Mutex)
-    /// - No data races (each thread reads different SSTable)
-    #[cfg(feature = "rayon")]
-    pub fn scan_range_parallel(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
-        // Use streaming iterator to avoid materializing full BTreeMap
-        let iter = self.scan_range_streaming(start, end)?;
-        iter.collect()
-    }
-    
-    /// Get compaction statistics
-    pub fn compaction_stats(&self) -> Result<super::CompactionStats> {
-        self.compaction_worker.stats()
-    }
-    
-    /// Get level statistics  
+
+    /// Get level statistics
     pub fn level_stats(&self) -> Result<Vec<(usize, usize, u64)>> {
         self.compaction_worker.level_stats()
     }

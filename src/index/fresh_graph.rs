@@ -184,26 +184,6 @@ impl FreshVamanaGraph {
         Ok(())
     }
 
-    /// Insert pre-built nodes with neighbor lists already computed (e.g. by batch_vamana_build).
-    /// This avoids re-computing the graph structure on each individual insert.
-    pub fn insert_prebuilt(&self, nodes: Vec<(RowId, VectorNode)>, medoid: RowId) -> Result<()> {
-        let count = nodes.len();
-        if self.nodes.len() + count > self.config.max_nodes {
-            return Err(StorageError::ResourceExhausted(
-                format!("Insert would exceed max_nodes ({})", self.config.max_nodes)
-            ));
-        }
-        for (id, node) in nodes {
-            let vec_size = node.vector.len() * std::mem::size_of::<f32>();
-            let neighbor_size = node.neighbors.len() * std::mem::size_of::<u64>();
-            self.memory_usage.fetch_add(vec_size + neighbor_size, Ordering::Relaxed);
-            self.nodes.insert(id, node);
-        }
-        self.insert_count.fetch_add(count, Ordering::Relaxed);
-        self.medoid.store(medoid, Ordering::Release);
-        Ok(())
-    }
-
     /// 🚀 批量插入（延迟图构建）
     /// 
     /// **核心优化**：先插入所有向量（无边），然后一次性构建图
@@ -638,14 +618,6 @@ impl FreshVamanaGraph {
             insert_count: self.insert_count.load(Ordering::Relaxed),
             memory_usage: self.memory_usage.load(Ordering::Relaxed),
         }
-    }
-    
-    pub fn export_nodes(&self) -> Result<Vec<(RowId, VectorNode)>> {
-        let mut nodes: Vec<_> = self.nodes.iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        nodes.sort_by_key(|(id, _)| *id);
-        Ok(nodes)
     }
     
     pub fn medoid(&self) -> RowId {

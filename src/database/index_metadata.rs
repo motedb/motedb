@@ -216,16 +216,6 @@ impl IndexRegistry {
             .map(|entry| (entry.value().table_name.clone(), entry.value().column_name.clone()))
     }
     
-    /// Generate default index name
-    pub fn generate_name(table_name: &str, column_name: &str, index_type: &IndexType) -> String {
-        match index_type {
-            IndexType::Column => format!("{}.{}", table_name, column_name),
-            IndexType::Vector | IndexType::Text | IndexType::Octree => {
-                format!("{}_{}", table_name, column_name)
-            }
-        }
-    }
-
     /// Mark an index as stale (out-of-sync with data).
     /// Called when an index update fails during insert/update/delete.
     /// Stale indexes will be skipped during queries until rebuilt.
@@ -235,34 +225,6 @@ impl IndexRegistry {
         }
         // Best-effort persist (ignore error — will be retried on next save)
         let _ = self.save();
-    }
-
-    /// Check whether an index is stale.
-    /// Returns `true` if the index exists and is marked stale.
-    /// Returns `false` if the index doesn't exist (not an error — just not tracked).
-    pub fn is_stale(&self, index_name: &str) -> bool {
-        self.indexes.get(index_name)
-            .map(|e| e.stale)
-            .unwrap_or(false)
-    }
-
-    /// Clear stale flag for an index (after successful rebuild).
-    pub fn clear_stale(&self, index_name: &str) {
-        if let Some(mut entry) = self.indexes.get_mut(index_name) {
-            entry.stale = false;
-        }
-        let _ = self.save();
-    }
-
-    /// List all stale indexes for a table (useful during checkpoint rebuild).
-    pub fn list_stale_indexes(&self, table_name: &str) -> Vec<IndexMetadata> {
-        self.indexes.iter()
-            .filter(|entry| {
-                let meta = entry.value();
-                meta.table_name == table_name && meta.stale
-            })
-            .map(|entry| entry.value().clone())
-            .collect()
     }
 }
 

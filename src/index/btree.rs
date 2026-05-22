@@ -14,7 +14,7 @@
 //! Disk:     [mmap file] -----> [Page 0][Page 1][Page 2]...
 //! ```text
 use crate::{Result, StorageError};
-use crate::storage::file_manager::{FileRefManager, FileHandle};
+use crate::storage::file_manager::FileHandle;
 use std::sync::{Arc, RwLock, Mutex};
 use std::path::PathBuf;
 use lru::LruCache;
@@ -117,10 +117,6 @@ pub struct BTree {
 
     /// Page offset table: page_id → file_offset (for compact storage)
     page_offsets: Arc<RwLock<Vec<u64>>>,
-
-    /// File reference manager (for mmap safety)
-    #[allow(dead_code)]
-    file_manager: Option<Arc<FileRefManager>>,
 
     /// File handle (RAII protection)
     _file_handle: Option<FileHandle>,
@@ -490,7 +486,6 @@ impl BTree {
             config,
             stats: Arc::new(RwLock::new(stats)),
             page_offsets: Arc::new(RwLock::new(page_offsets)),
-            file_manager: None,
             _file_handle: None,
         })
     }
@@ -861,13 +856,7 @@ impl BTree {
                     let old = Some(page.values[idx]);
                     page.values[idx] = value;
                     page.dirty = true;
-                    
-                    // ⚡ 性能优化：延迟刷盘
-                    // drop(page);
-                    // let page_ref = page_arc.read()
-                    //     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                    // self.flush_page(&*page_ref)?;
-                    
+
                     return Ok((old, None));
                 }
                 Err(idx) => {
@@ -884,20 +873,11 @@ impl BTree {
             if page.num_keys >= self.config.order {
                 let split_info = self.split_leaf(&mut page)?;
                 drop(page);
-                
-                // ⚡ 性能优化：延迟刷盘
-                // let page_ref = page_arc.read()
-                //     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                // self.flush_page(&*page_ref)?;
-                
+
                 Ok((old_value, Some(split_info)))
             } else {
                 drop(page);
-                // ⚡ 性能优化：延迟刷盘
-                // let page_ref = page_arc.read()
-                //     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                // self.flush_page(&*page_ref)?;
-                
+
                 Ok((old_value, None))
             }
         } else {
@@ -933,20 +913,11 @@ impl BTree {
                 if page.num_keys >= self.config.order {
                     let split_info = self.split_internal(&mut page)?;
                     drop(page);
-                    
-                    // ⚡ 性能优化：延迟刷盘
-                    // let page_ref = page_arc.read()
-                    //     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                    // self.flush_page(&*page_ref)?;
-                    
+
                     Ok((old_value, Some(split_info)))
                 } else {
                     drop(page);
-                    // ⚡ 性能优化：延迟刷盘
-                    // let page_ref = page_arc.read()
-                    //     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                    // self.flush_page(&*page_ref)?;
-                    
+
                     Ok((old_value, None))
                 }
             } else {
@@ -980,12 +951,7 @@ impl BTree {
             let new_id = new_page.page_id;
             
             drop(new_page);
-            
-            // ⚡ 性能优化：延迟刷盘
-            // let page_ref = new_page_arc.read()
-            //     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            // self.flush_page(&*page_ref)?;
-            
+
             (split_key, new_id)
         };
         

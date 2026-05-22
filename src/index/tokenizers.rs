@@ -141,20 +141,6 @@ mod jieba_plugin {
             self.case_sensitive = sensitive;
             self
         }
-
-        /// 设置词长度范围
-        pub fn with_length_range(mut self, min: usize, max: usize) -> Self {
-            self.min_len = min;
-            self.max_len = max;
-            self
-        }
-
-        /// 加载自定义词典
-        pub fn load_dict(&mut self, _dict_path: &str) -> Result<(), String> {
-            // jieba-rs 不支持运行时加载词典，需要在构建时处理
-            // 这里提供接口占位，实际可通过环境变量或配置文件实现
-            Ok(())
-        }
     }
 
     impl Tokenizer for JiebaTokenizer {

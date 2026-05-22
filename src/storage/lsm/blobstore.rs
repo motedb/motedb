@@ -188,15 +188,6 @@ impl BlobStore {
         }
     }
 
-    /// Delete blob — marks blob file as eligible for GC.
-    ///
-    /// Actual space reclamation happens when `gc_blob_files()` is called
-    /// (typically during compaction). Files with no live references are removed.
-    pub fn delete(&self, _blob_ref: &BlobRef) -> Result<()> {
-        // GC is handled externally via gc_blob_files()
-        Ok(())
-    }
-
     // Internal helpers
 
     fn find_next_file_id(dir: &Path) -> Result<u32> {

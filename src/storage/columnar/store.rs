@@ -1227,15 +1227,6 @@ impl ColumnarStore {
         self.flush_all()
     }
 
-    /// Check if a table is registered with the columnar store.
-    pub fn has_table(&self, table_name: &str) -> bool {
-        if let Ok(table_id) = self.table_registry.get_table_id(table_name) {
-            self.managers.contains_key(&table_id)
-        } else {
-            false
-        }
-    }
-
     /// Get segment count for a table.
     pub fn segment_count(&self, table_name: &str) -> usize {
         if let Ok(table_id) = self.table_registry.get_table_id(table_name) {

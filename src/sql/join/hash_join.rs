@@ -131,52 +131,6 @@ impl HashJoinExecutor {
         Ok(results)
     }
     
-    /// RIGHT OUTER JOIN probe
-    /// Returns all build rows, with NULLs for non-matching probe rows
-    pub fn probe_right(&self, rows: Vec<SqlRow>, key_col: &str, probe_columns: &[String]) -> Result<Vec<SqlRow>> {
-        // 🚀 P1 优化：RIGHT JOIN 至少返回所有右表行
-        let hash_size = self.hash_table.len();
-        let mut results = Vec::with_capacity(rows.len().max(hash_size));
-        let mut matched_keys = std::collections::HashSet::new();
-        
-        // First pass: normal probe
-        for probe_row in rows {
-            if let Some(value) = probe_row.get(key_col) {
-                if let Some(key) = HashKey::from_value(value) {
-                    if let Some(build_rows) = self.hash_table.get(&key) {
-                        matched_keys.insert(key.clone());
-                        for build_row in build_rows {
-                            let merged = Self::merge_rows(build_row, &probe_row);
-                            results.push(merged);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Second pass: add unmatched build rows with NULLs
-        for (key, build_rows) in &self.hash_table {
-            if !matched_keys.contains(key) {
-                for build_row in build_rows {
-                    // 🚀 P2 优化：预分配容量
-                    let mut merged = SqlRow::with_capacity(build_row.len() + probe_columns.len());
-                    
-                    // Clone build_row（必须）
-                    for (col, val) in build_row.iter() {
-                        merged.insert(col.clone(), val.clone());
-                    }
-                    
-                    for col in probe_columns {
-                        merged.insert(col.clone(), Value::Null);
-                    }
-                    results.push(merged);
-                }
-            }
-        }
-        
-        Ok(results)
-    }
-    
     /// Merge two rows (build row + probe row)
     /// 🚀 P2 优化：使用移动语义减少 clone
     fn merge_rows(build_row: &SqlRow, probe_row: &SqlRow) -> SqlRow {
@@ -194,11 +148,6 @@ impl HashJoinExecutor {
         }
         
         merged
-    }
-    
-    /// Get hash table size (for statistics)
-    pub fn hash_table_size(&self) -> usize {
-        self.hash_table.len()
     }
     
     /// Get total rows in hash table

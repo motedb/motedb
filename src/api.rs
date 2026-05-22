@@ -21,12 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Pre-computed metadata for fast PK SELECT execution.
-#[allow(dead_code)]
 struct FastPkMeta {
     /// "select", "update", or "delete"
     stmt_type: &'static str,
     table_name: String,
-    col_name: String,
     param_idx: usize,
     /// Only for SELECT: whether it's SELECT *
     is_star: bool,
@@ -520,7 +518,6 @@ impl Database {
         Ok(Some(FastPkMeta {
             stmt_type,
             table_name: table_ref.to_string(),
-            col_name: col_name.to_string(),
             param_idx,
             is_star,
             select_col_positions,

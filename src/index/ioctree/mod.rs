@@ -13,14 +13,13 @@
 
 mod leaf_store;
 mod node;
-mod pending;
 mod persistence;
 mod search;
 
 use crate::types::{BoundingBox3D, Geometry, Point3D};
 use crate::{Result, StorageError};
 use leaf_store::LeafStore;
-use pending::PendingBuffer;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -71,9 +70,6 @@ pub struct IOctreeIndex {
     size: usize,
     world_bounds: BoundingBox3D,
     name: String,
-    /// Tier 0: bounded insert/delete buffer (reserved for future batch optimization)
-    #[allow(dead_code)]
-    pending: PendingBuffer,
     /// Tier 1: disk-backed leaf storage with LRU cache
     leaf_store: LeafStore,
 }
@@ -105,7 +101,6 @@ impl IOctreeIndex {
             size: 0,
             world_bounds,
             name,
-            pending: PendingBuffer::new(),
             leaf_store,
         }
     }

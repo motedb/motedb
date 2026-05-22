@@ -7,7 +7,6 @@
 
 use super::{IOctreeConfig, IOctreeIndex};
 use super::leaf_store::LeafStore;
-use super::pending::PendingBuffer;
 use crate::types::BoundingBox3D;
 use crate::{Result, StorageError};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -162,7 +161,6 @@ fn load_v2(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         size,
         world_bounds,
         name,
-        pending: PendingBuffer::new(),
         leaf_store,
     })
 }
@@ -235,7 +233,6 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         size,
         world_bounds,
         name,
-        pending: PendingBuffer::new(),
         leaf_store,
     })
 }

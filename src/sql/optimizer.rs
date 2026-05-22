@@ -747,59 +747,6 @@ impl QueryOptimizer {
         }
     }
     
-    /// Format query plan for EXPLAIN output
-    pub fn explain_plan(&self, plan: &QueryPlan) -> String {
-        let mut output = String::new();
-        
-        output.push_str("Query Execution Plan:\n");
-        output.push_str("====================\n\n");
-        
-        // Scan method
-        match &plan.scan_method {
-            ScanMethod::FullScan { table } => {
-                output.push_str(&format!("1. Full Table Scan: {}\n", table));
-                output.push_str(&format!("   Cost: {:.3} ms\n", plan.estimated_cost));
-                output.push_str(&format!("   Estimated Rows: {}\n", plan.estimated_rows));
-            }
-            ScanMethod::PointQuery { table, column, value } => {
-                output.push_str(&format!("1. Index Point Query: {}.{}\n", table, column));
-                output.push_str(&format!("   Index: {}.{}\n", table, column));
-                output.push_str(&format!("   Condition: {} = {:?}\n", column, value));
-                output.push_str(&format!("   Cost: {:.3} ms (index lookup)\n", plan.estimated_cost));
-                output.push_str(&format!("   Estimated Rows: {}\n", plan.estimated_rows));
-            }
-            ScanMethod::RangeQuery { table, column, start, start_inclusive, end, end_inclusive } => {
-                output.push_str(&format!("1. Index Range Query: {}.{}\n", table, column));
-                output.push_str(&format!("   Index: {}.{}\n", table, column));
-                
-                let start_op = if *start_inclusive { ">=" } else { ">" };
-                let end_op = if *end_inclusive { "<=" } else { "<" };
-                output.push_str(&format!("   Condition: {} {} {:?} AND {} {} {:?}\n", 
-                    column, start_op, start, column, end_op, end));
-                    
-                output.push_str(&format!("   Cost: {:.3} ms (index scan)\n", plan.estimated_cost));
-                output.push_str(&format!("   Estimated Rows: {}\n", plan.estimated_rows));
-            }
-            _ => {
-                output.push_str("1. Special Index Scan\n");
-                output.push_str(&format!("   Cost: {:.3} ms\n", plan.estimated_cost));
-                output.push_str(&format!("   Estimated Rows: {}\n", plan.estimated_rows));
-            }
-        }
-        
-        // Post-filters
-        if !plan.post_filters.is_empty() {
-            output.push_str("\n2. Post-Filtering:\n");
-            for (i, filter) in plan.post_filters.iter().enumerate() {
-                output.push_str(&format!("   Filter {}: {:?}\n", i + 1, filter));
-            }
-        }
-        
-        output.push_str(&format!("\nTotal Estimated Cost: {:.3} ms\n", plan.estimated_cost));
-        output.push_str(&format!("Final Estimated Rows: {}\n", plan.estimated_rows));
-        
-        output
-    }
 }
 
 #[cfg(test)]

@@ -297,17 +297,6 @@ fn decode_raw_fast(data: &[u8], col_types: &[ColumnType], fixed_count: usize) ->
     Ok(row)
 }
 
-/// Decode into a reusable buffer (avoids per-row Vec allocation).
-/// The buffer is cleared first and reused.
-pub fn decode_fast_into(data: &[u8], col_types: &[ColumnType], fixed_count: usize, buf: &mut Vec<Value>) -> Result<()> {
-    if !is_rawrow(data) {
-        *buf = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        return Ok(());
-    }
-    decode_raw_fast_into(data, col_types, fixed_count, buf)
-}
-
 /// Partial column decode into reusable buffer.
 /// Only decodes columns at the specified positions (0-indexed).
 pub fn decode_fast_partial_into(
