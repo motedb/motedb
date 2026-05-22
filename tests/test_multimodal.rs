@@ -16,10 +16,6 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
-fn exec(db: &Database, sql: &str) -> QueryResult {
-    db.execute(sql).unwrap().materialize().unwrap()
-}
-
 // ============================================================
 // Vector tests
 // ============================================================

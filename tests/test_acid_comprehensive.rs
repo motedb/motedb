@@ -17,13 +17,7 @@ use tempfile::TempDir;
 use std::collections::HashSet;
 
 fn setup_db(dir: &std::path::Path) -> Database {
-    let db = Database::create(dir.join("acid.mote")).unwrap();
-    db
-}
-
-fn setup_db_fast(dir: &std::path::Path) -> Database {
-    let config = DBConfig::for_testing();
-    Database::create_with_config(dir.join("acid.mote"), config).unwrap()
+    Database::create(dir.join("acid.mote")).unwrap()
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
@@ -35,10 +29,6 @@ fn query_rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
         motedb::sql::QueryResult::Select { rows, .. } => rows,
         _ => vec![],
     }
-}
-
-fn row_count(db: &Database, sql: &str) -> usize {
-    query_rows(db, sql).len()
 }
 
 // ============================================================================

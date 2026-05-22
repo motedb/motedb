@@ -395,14 +395,14 @@ fn test_text_search_after_insert() {
     exec(&db, "INSERT INTO docs VALUES (2, 'vector search engine')");
 
     // Before flush: search should work from pending
-    let pre_flush = db.text_search_ranked("docs_body", "database", 10).unwrap();
+    let _pre_flush = db.text_search_ranked("docs_body", "database", 10).unwrap();
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // After flush+checkpoint: search should work from disk
-    let post_flush = db.text_search_ranked("docs_body", "database", 10).unwrap();
+    let _post_flush = db.text_search_ranked("docs_body", "database", 10).unwrap();
 
     let result = rows(&db, "SELECT id FROM docs WHERE MATCH(body) AGAINST('database')");
     assert!(!result.is_empty(), "Text search should find 'database'");

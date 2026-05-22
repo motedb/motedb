@@ -54,7 +54,7 @@ fn main() {
 
     // Test: do queries to warm up caches, then check RSS
     println!("\n--- Query phase (100 PK lookups) ---");
-    for i in (1..=100) {
+    for i in 1..=100 {
         db.execute(&format!("SELECT * FROM t WHERE id = {}", i * 100)).unwrap().materialize().unwrap();
     }
     let rss_after_query = get_rss_kb();

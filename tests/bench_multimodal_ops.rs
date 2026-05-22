@@ -2,7 +2,7 @@
 //!
 //! Run: cargo test --release --test bench_multimodal_ops -- --nocapture --test-threads=1
 
-use motedb::{Database, DBConfig, types::Value};
+use motedb::{Database, DBConfig};
 use tempfile::TempDir;
 use std::time::Instant;
 

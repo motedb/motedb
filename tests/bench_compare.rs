@@ -51,16 +51,6 @@ fn divider() {
     println!("├──────────────────────────────┼──────────────────────┼──────────────────────┤");
 }
 
-fn header(title: &str) {
-    println!("┌──────────────────────────────┩");
-    println!("│  {}",
-        if title.len() > 80 { &title[..80] } else { title });
-    // recalculate with padding
-    println!("┌──────────────────────────────┬──────────────────────┬──────────────────────┐");
-    println!("│  Benchmark                   │  MoteDB              │  SQLite WAL          │");
-    divider();
-}
-
 fn row(label: &str, mote: &str, sqlite: &str) {
     println!("│  {:<28}│  {:<20}│  {:<20}│", label, mote, sqlite);
 }

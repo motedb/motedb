@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_spatial_roundtrip() {
-        use crate::types::{Geometry, Point, Point3D};
+        use crate::types::{Geometry, Point};
         let schema = vec![ColumnType::Integer, ColumnType::Spatial];
         let row = vec![
             Value::Integer(1),

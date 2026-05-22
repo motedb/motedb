@@ -6,7 +6,7 @@
 
 use motedb::{Database, DBConfig};
 use tempfile::TempDir;
-use std::time::{Instant, Duration};
+use std::time::Instant;
 
 fn is_ci() -> bool { std::env::var("CI").is_ok() }
 

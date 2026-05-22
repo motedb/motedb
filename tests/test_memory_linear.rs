@@ -58,7 +58,7 @@ fn test_memory_linear_growth() {
     let mut prev_rss = rss_warm;
     let mut deltas: Vec<(usize, f64)> = vec![]; // (batch_size, delta_mb)
 
-    for b in 0..num_batches {
+    for _b in 0..num_batches {
         let start = Instant::now();
         for i in 1..=batch_size as i64 {
             let id = total_rows as i64 + i;
@@ -120,7 +120,7 @@ fn test_memory_linear_growth() {
     let n = deltas.len() as f64;
     let mut cum_rows = 0usize;
     let mut points: Vec<(f64, f64)> = vec![];
-    for (i, &(batch, delta)) in deltas.iter().enumerate() {
+    for (i, &(batch, _delta)) in deltas.iter().enumerate() {
         cum_rows += batch;
         points.push((cum_rows as f64, rss_warm + deltas[..=i].iter().map(|&(_, d)| d).sum::<f64>()));
     }

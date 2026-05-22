@@ -1313,7 +1313,7 @@ mod tests {
         
         // Read SSTable
         {
-            let mut sst = SSTable::open(&path).unwrap();
+            let sst = SSTable::open(&path).unwrap();
             
             // Test get
             let key = 50u64;  // ✅ u64 key

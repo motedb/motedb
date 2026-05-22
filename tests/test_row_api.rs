@@ -181,8 +181,7 @@ fn test_insert_row_with_txn_commit() {
     let tx = db.begin_transaction().unwrap();
 
     let row = vec![Value::Integer(1), Value::text("txn_user".to_string()), Value::Float(77.7)];
-    let row_id = db.insert_row_with_txn("users", tx, row).unwrap();
-    // RowId assignment varies by implementation
+    let _row_id = db.insert_row_with_txn("users", tx, row).unwrap();
 
     db.commit_transaction(tx).unwrap();
 

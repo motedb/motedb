@@ -4356,7 +4356,6 @@ impl QueryExecutor {
                                     schema.get_column_position(bare)
                                 }
                                 Expr::Literal(Value::Integer(1)) => None, // COUNT(1) ≡ COUNT(*)
-                                Expr::Column(c) if c == "*" => None,     // COUNT(*)
                                 _ => return None,
                             }
                         } else if args.is_empty() && func == "COUNT" {

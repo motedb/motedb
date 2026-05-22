@@ -1034,13 +1034,12 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_block_single_doc_id_zero() {
         let doc_ids = vec![0u32];
         let tfs = vec![1u16];
         let block_list = BlockPostingList::from_sorted_pairs(&doc_ids, &tfs);
         assert_eq!(block_list.num_docs(), 1);
-        let mut cursor = block_list.cursor();
+        let cursor = block_list.cursor();
         assert!(cursor.is_valid());
         assert_eq!(cursor.current_doc(), 0);
         assert_eq!(cursor.current_tf(), 1);

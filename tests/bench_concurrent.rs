@@ -58,7 +58,7 @@ fn bench_read_heavy_concurrent() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 let mut ops = 0;
@@ -111,7 +111,7 @@ fn bench_mixed_read_write_concurrent() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 let base_id = (seed + t * ops_per_thread) as i64;
@@ -177,7 +177,7 @@ fn bench_concurrent_transactions() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 let mut committed = 0;
@@ -242,7 +242,7 @@ fn bench_concurrent_inserts() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 let base = t * inserts_per_thread;
@@ -340,7 +340,7 @@ fn bench_concurrent_row_api() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 let mut ops = 0;
@@ -395,7 +395,7 @@ fn bench_concurrent_prepared() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 let mut ops = 0;
@@ -460,7 +460,7 @@ fn bench_concurrent_delete() {
         let start = Instant::now();
         let mut handles = vec![];
 
-        for t in 0..n_threads {
+        for _t in 0..n_threads {
             let db_clone = Arc::clone(&db);
             let start_id = (t * deletes_per_thread) as i64 + 1;
             let end_id = ((t + 1) * deletes_per_thread) as i64;

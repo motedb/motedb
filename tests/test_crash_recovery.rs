@@ -8,13 +8,6 @@ fn exec(db: &Database, sql: &str) -> QueryResult {
     db.execute(sql).unwrap().materialize().unwrap()
 }
 
-fn count_rows(result: &QueryResult) -> i64 {
-    match result {
-        QueryResult::Select { rows, .. } => rows.len() as i64,
-        _ => 0,
-    }
-}
-
 fn get_first_count(db: &Database, sql: &str) -> i64 {
     match exec(db, sql) {
         QueryResult::Select { rows, .. } => {
