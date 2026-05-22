@@ -133,30 +133,44 @@ impl IndexRegistry {
         Ok(())
     }
     
-    /// Register a new index (atomic: check + insert via DashMap entry API)
+    /// Register a new index.
+    ///
+    /// Atomically checks for duplicates via DashMap::entry, inserts into memory,
+    /// then persists. If save() fails, rolls back the in-memory insertion.
     pub fn register(&self, metadata: IndexMetadata) -> Result<()> {
         use dashmap::mapref::entry::Entry;
+        let name = metadata.name.clone();
 
-        match self.indexes.entry(metadata.name.clone()) {
-            Entry::Occupied(_) => {
-                Err(StorageError::Index(format!(
-                    "Index '{}' already exists",
-                    metadata.name
-                )))
-            }
+        match self.indexes.entry(name.clone()) {
+            Entry::Occupied(_) => Err(StorageError::Index(format!(
+                "Index '{}' already exists", name
+            ))),
             Entry::Vacant(entry) => {
                 entry.insert(metadata);
-                self.save()?;
-                Ok(())
+                if let Err(e) = self.save() {
+                    self.indexes.remove(&name);
+                    Err(e)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
-    
-    /// Remove an index
+
+    /// Remove an index.
+    ///
+    /// Removes from memory, then persists. If save() fails, rolls back.
     pub fn remove(&self, index_name: &str) -> Result<()> {
-        self.indexes.remove(index_name);
-        self.save()?;
-        Ok(())
+        let removed = self.indexes.remove(index_name).map(|(_, v)| v);
+        if let Err(e) = self.save() {
+            // Roll back on failure
+            if let Some(metadata) = removed {
+                self.indexes.insert(index_name.to_string(), metadata);
+            }
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     /// Remove all indexes for a given table (used by DROP TABLE)

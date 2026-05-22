@@ -17,7 +17,7 @@ use crate::database::MoteDB;
 use crate::types::{Value, TableSchema};
 use crate::Result;
 use std::sync::Arc;
-use std::collections::HashMap;
+use dashmap::DashMap;
 
 /// Query execution plan
 #[derive(Debug, Clone)]
@@ -160,12 +160,9 @@ pub struct QueryOptimizer {
     /// Database reference
     db: Arc<MoteDB>,
 
-    /// Index statistics cache
-    index_stats: HashMap<String, IndexStats>,
+    /// Index statistics cache (lock-free DashMap)
+    index_stats: DashMap<String, IndexStats>,
 
-    /// Bind parameters for resolving Expr::Parameter nodes inline (avoids AST clone)
-    params: Vec<crate::types::Value>,
-    
     /// Cost model parameters
     cost_params: CostParameters,
 }
@@ -198,37 +195,26 @@ impl QueryOptimizer {
     pub fn new(db: Arc<MoteDB>) -> Self {
         Self {
             db,
-            index_stats: HashMap::new(),
+            index_stats: DashMap::new(),
             cost_params: CostParameters::default(),
-            params: Vec::new(),
         }
-    }
-
-    /// Set bind parameters for this optimization pass.
-    pub fn set_params(&mut self, params: Vec<crate::types::Value>) {
-        self.params = params;
-    }
-
-    /// Clear bind parameters after optimization.
-    pub fn clear_params(&mut self) {
-        self.params.clear();
     }
 
     /// Resolve an expression to a literal Value if possible.
     /// Handles Literal directly and Parameter(idx) via bound params.
-    fn resolve_to_value(&self, expr: &crate::sql::ast::Expr) -> Option<crate::types::Value> {
+    fn resolve_to_value(params: &[crate::types::Value], expr: &crate::sql::ast::Expr) -> Option<crate::types::Value> {
         use crate::sql::ast::Expr;
         match expr {
             Expr::Literal(v) => Some(v.clone()),
             Expr::Parameter(idx) if *idx > 0 => {
-                self.params.get(idx - 1).cloned()
+                params.get(idx - 1).cloned()
             }
             _ => None,
         }
     }
     
     /// Optimize SELECT statement and generate execution plan
-    pub fn optimize_select(&mut self, stmt: &SelectStmt) -> Result<QueryPlan> {
+    pub fn optimize_select(&self, stmt: &SelectStmt, params: &[crate::types::Value]) -> Result<QueryPlan> {
         // 🚀 P0 FIX: Primary Key ORDER BY optimization
         // Detects patterns like:
         // - `SELECT * FROM table ORDER BY id LIMIT k` (id is primary key)
@@ -246,7 +232,7 @@ impl QueryOptimizer {
         // 🔥 P0 FIX: Aggregate function optimization
         // Check if this is an aggregate query (COUNT, SUM, AVG, etc.)
         if self.is_aggregate_query(stmt) {
-            if let Some(plan) = self.optimize_aggregate(stmt)? {
+            if let Some(plan) = self.optimize_aggregate(stmt, params)? {
                 return Ok(plan);
             }
         }
@@ -288,7 +274,7 @@ impl QueryOptimizer {
         };
         
         // Analyze WHERE clause and generate candidate plans
-        let candidates = self.generate_candidate_plans(&table_name, where_clause, &schema)?;
+        let candidates = self.generate_candidate_plans(&table_name, where_clause, &schema, params)?;
 
         // Select best plan based on cost
         let best_plan = candidates.into_iter()
@@ -310,14 +296,15 @@ impl QueryOptimizer {
     
     /// Generate candidate execution plans
     fn generate_candidate_plans(
-        &mut self,
+        &self,
         table_name: &str,
         where_clause: &Expr,
         _schema: &TableSchema,
+        params: &[crate::types::Value],
     ) -> Result<Vec<QueryPlan>> {
         let mut plans = Vec::new();
         let total_rows = self.estimate_table_size(table_name);
-        
+
         // Always include full table scan as baseline
         plans.push(QueryPlan {
             scan_method: ScanMethod::FullScan {
@@ -327,18 +314,19 @@ impl QueryOptimizer {
             estimated_rows: total_rows,
             post_filters: vec![where_clause.clone()],
         });
-        
+
         // Analyze WHERE clause for index opportunities
-        self.analyze_where_clause(table_name, where_clause, &mut plans)?;
+        self.analyze_where_clause(table_name, where_clause, params, &mut plans)?;
 
         Ok(plans)
     }
     
     /// Analyze WHERE clause and generate index-based plans
     fn analyze_where_clause(
-        &mut self,
+        &self,
         table_name: &str,
         expr: &Expr,
+        params: &[crate::types::Value],
         plans: &mut Vec<QueryPlan>,
     ) -> Result<()> {
         // 🔥 P0 FIX: Check for VECTOR_SEARCH function first (highest priority)
@@ -348,7 +336,7 @@ impl QueryOptimizer {
         }
         
         // First, try to extract range query pattern (handles AND specially)
-        if let Some((col, start, start_incl, end, end_incl)) = self.try_extract_range_query(expr) {
+        if let Some((col, start, start_incl, end, end_incl)) = self.try_extract_range_query(expr, params) {
             self.try_range_query_plan(table_name, &col, start, start_incl, end, end_incl, plans)?;
             return Ok(()); // Range query found, no need to recurse
         }
@@ -357,10 +345,10 @@ impl QueryOptimizer {
             // AND: Try to use most selective index
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
                 // Try left operand
-                self.analyze_where_clause(table_name, left, plans)?;
+                self.analyze_where_clause(table_name, left, params, plans)?;
                 
                 // Try right operand
-                self.analyze_where_clause(table_name, right, plans)?;
+                self.analyze_where_clause(table_name, right, params, plans)?;
                 
                 // TODO: Try combining multiple indexes
             }
@@ -369,23 +357,75 @@ impl QueryOptimizer {
             Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
                 // ORs typically can't use indexes efficiently
                 // Just analyze for completeness
-                self.analyze_where_clause(table_name, left, plans)?;
-                self.analyze_where_clause(table_name, right, plans)?;
+                self.analyze_where_clause(table_name, left, params, plans)?;
+                self.analyze_where_clause(table_name, right, params, plans)?;
             }
             
             // Point query: col = value (supports Literal AND Parameter)
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                if let Some(val) = self.resolve_to_value(right) {
+                if let Some(val) = Self::resolve_to_value(params,right) {
                     if let Expr::Column(col) = left.as_ref() {
                         self.try_point_query_plan(table_name, col, val, plans)?;
                     }
-                } else if let Some(val) = self.resolve_to_value(left) {
+                } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
                         self.try_point_query_plan(table_name, col, val, plans)?;
                     }
                 }
             }
-            
+
+            // Single-sided range: col > val
+            Expr::BinaryOp { left, op: BinaryOperator::Gt, right } => {
+                if let Some(val) = Self::resolve_to_value(params,right) {
+                    if let Expr::Column(col) = left.as_ref() {
+                        self.try_range_query_plan(table_name, col, val.clone(), false, Value::Integer(i64::MAX), true, plans)?;
+                    }
+                } else if let Some(val) = Self::resolve_to_value(params,left) {
+                    if let Expr::Column(col) = right.as_ref() {
+                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), false, plans)?;
+                    }
+                }
+            }
+
+            // Single-sided range: col >= val
+            Expr::BinaryOp { left, op: BinaryOperator::Ge, right } => {
+                if let Some(val) = Self::resolve_to_value(params,right) {
+                    if let Expr::Column(col) = left.as_ref() {
+                        self.try_range_query_plan(table_name, col, val.clone(), true, Value::Integer(i64::MAX), true, plans)?;
+                    }
+                } else if let Some(val) = Self::resolve_to_value(params,left) {
+                    if let Expr::Column(col) = right.as_ref() {
+                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), false, plans)?;
+                    }
+                }
+            }
+
+            // Single-sided range: col < val
+            Expr::BinaryOp { left, op: BinaryOperator::Lt, right } => {
+                if let Some(val) = Self::resolve_to_value(params,right) {
+                    if let Expr::Column(col) = left.as_ref() {
+                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), false, plans)?;
+                    }
+                } else if let Some(val) = Self::resolve_to_value(params,left) {
+                    if let Expr::Column(col) = right.as_ref() {
+                        self.try_range_query_plan(table_name, col, val.clone(), true, Value::Integer(i64::MAX), true, plans)?;
+                    }
+                }
+            }
+
+            // Single-sided range: col <= val
+            Expr::BinaryOp { left, op: BinaryOperator::Le, right } => {
+                if let Some(val) = Self::resolve_to_value(params,right) {
+                    if let Expr::Column(col) = left.as_ref() {
+                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), true, plans)?;
+                    }
+                } else if let Some(val) = Self::resolve_to_value(params,left) {
+                    if let Expr::Column(col) = right.as_ref() {
+                        self.try_range_query_plan(table_name, col, val.clone(), true, Value::Integer(i64::MAX), true, plans)?;
+                    }
+                }
+            }
+
             _ => {
                 // Other expressions: no index optimization
             }
@@ -396,7 +436,7 @@ impl QueryOptimizer {
     
     /// Try to create a point query plan if index exists
     fn try_point_query_plan(
-        &mut self,
+        &self,
         table_name: &str,
         column: &str,
         value: Value,
@@ -464,7 +504,7 @@ impl QueryOptimizer {
     /// - `end_inclusive`: 上界是否包含（<= vs <）
     #[allow(clippy::too_many_arguments)]
     fn try_range_query_plan(
-        &mut self,
+        &self,
         table_name: &str,
         column: &str,
         start: Value,
@@ -516,54 +556,48 @@ impl QueryOptimizer {
     /// ## 示例
     /// - `id >= 100 AND id < 200` → `("id", 100, true, 200, false)`
     /// - `id > 100 AND id <= 200` → `("id", 100, false, 200, true)`
-    fn try_extract_range_query(&self, expr: &Expr) -> Option<(String, Value, bool, Value, bool)> {
+    fn try_extract_range_query(&self, expr: &Expr, params: &[crate::types::Value]) -> Option<(String, Value, bool, Value, bool)> {
         match expr {
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
                 if let (
                     Expr::BinaryOp { left: l1, op: op1, right: r1 },
                     Expr::BinaryOp { left: l2, op: op2, right: r2 }
                 ) = (left.as_ref(), right.as_ref()) {
-                    // Check if both sides reference the same column
+                    // Check if both sides reference the same column (supports Literal and Parameter)
                     let col1 = match (l1.as_ref(), r1.as_ref()) {
-                        (Expr::Column(c), Expr::Literal(_)) => Some(c),
-                        (Expr::Literal(_), Expr::Column(c)) => Some(c),
+                        (Expr::Column(c), other) if Self::resolve_to_value(params,other).is_some() => Some(c),
+                        (other, Expr::Column(c)) if Self::resolve_to_value(params,other).is_some() => Some(c),
                         _ => None,
                     };
-                    
+
                     let col2 = match (l2.as_ref(), r2.as_ref()) {
-                        (Expr::Column(c), Expr::Literal(_)) => Some(c),
-                        (Expr::Literal(_), Expr::Column(c)) => Some(c),
+                        (Expr::Column(c), other) if Self::resolve_to_value(params,other).is_some() => Some(c),
+                        (other, Expr::Column(c)) if Self::resolve_to_value(params,other).is_some() => Some(c),
                         _ => None,
                     };
-                    
+
                     if let (Some(c1), Some(c2)) = (&col1, &col2) {
                         if c1 == c2 {
                             let col_name = (*c1).clone();
 
-                            // Extract start and end values (with inclusivity flags)
-                            let (val1, is_lower1, inclusive1) = match (l1.as_ref(), op1, r1.as_ref()) {
-                                (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, true)),
-                                (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, false)),
-                                (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, true)),
-                                (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, false)),
-                                (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, true)),
-                                (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, false)),
-                                (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, true)),
-                                (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, false)),
-                                _ => None,
-                            }?;
+                            // Helper to extract (value, is_lower_bound, inclusive)
+                            let extract = |col: &Expr, op: &BinaryOperator, val: &Expr| -> Option<(Value, bool, bool)> {
+                                let v = Self::resolve_to_value(params,val)?;
+                                match (col, op) {
+                                    (Expr::Column(_), BinaryOperator::Ge) => Some((v, true, true)),
+                                    (Expr::Column(_), BinaryOperator::Gt) => Some((v, true, false)),
+                                    (Expr::Column(_), BinaryOperator::Le) => Some((v, false, true)),
+                                    (Expr::Column(_), BinaryOperator::Lt) => Some((v, false, false)),
+                                    (_, BinaryOperator::Le) => Some((v, true, true)),
+                                    (_, BinaryOperator::Lt) => Some((v, true, false)),
+                                    (_, BinaryOperator::Ge) => Some((v, false, true)),
+                                    (_, BinaryOperator::Gt) => Some((v, false, false)),
+                                    _ => None,
+                                }
+                            };
 
-                            let (val2, is_lower2, inclusive2) = match (l2.as_ref(), op2, r2.as_ref()) {
-                                (Expr::Column(_), BinaryOperator::Ge, Expr::Literal(v)) => Some((v.clone(), true, true)),
-                                (Expr::Column(_), BinaryOperator::Gt, Expr::Literal(v)) => Some((v.clone(), true, false)),
-                                (Expr::Literal(v), BinaryOperator::Le, Expr::Column(_)) => Some((v.clone(), true, true)),
-                                (Expr::Literal(v), BinaryOperator::Lt, Expr::Column(_)) => Some((v.clone(), true, false)),
-                                (Expr::Column(_), BinaryOperator::Le, Expr::Literal(v)) => Some((v.clone(), false, true)),
-                                (Expr::Column(_), BinaryOperator::Lt, Expr::Literal(v)) => Some((v.clone(), false, false)),
-                                (Expr::Literal(v), BinaryOperator::Ge, Expr::Column(_)) => Some((v.clone(), false, true)),
-                                (Expr::Literal(v), BinaryOperator::Gt, Expr::Column(_)) => Some((v.clone(), false, false)),
-                                _ => None,
-                            }?;
+                            let (val1, is_lower1, inclusive1) = extract(l1, op1, r1)?;
+                            let (val2, is_lower2, inclusive2) = extract(l2, op2, r2)?;
 
                             // One should be lower bound, one should be upper bound
                             if is_lower1 && !is_lower2 {
@@ -615,16 +649,14 @@ impl QueryOptimizer {
     
     /// 🔥 Create vector search plan if index exists
     fn try_vector_search_plan(
-        &mut self,
+        &self,
         table_name: &str,
         column: &str,
         query_vector: &crate::types::ArcVec,
         k: usize,
         plans: &mut Vec<QueryPlan>,
     ) -> Result<()> {
-        let _index_name = format!("{}_{}", table_name, column);
-        
-        // 🔧 Note: We don't check if index exists here, executor will handle it
+        // Note: We don't check if index exists here, executor will handle it
         // This allows the optimizer to always prefer vector search when pattern matches
         
         // Vector search is extremely selective (returns exactly k results)
@@ -649,7 +681,7 @@ impl QueryOptimizer {
     }
     
     /// Get index statistics (from cache or compute from real data)
-    fn get_index_stats(&mut self, index_name: &str) -> Result<IndexStats> {
+    fn get_index_stats(&self, index_name: &str) -> Result<IndexStats> {
         // Check cache
         if let Some(stats) = self.index_stats.get(index_name) {
             return Ok(stats.clone());
@@ -806,7 +838,7 @@ impl QueryOptimizer {
     /// Benefits:
     /// - 600x faster (1ms vs 611ms for 300K rows)
     /// - 280x less memory (0.1MB vs 28MB)
-    fn optimize_primary_key_order_by(&mut self, stmt: &SelectStmt) -> Result<Option<QueryPlan>> {
+    fn optimize_primary_key_order_by(&self, stmt: &SelectStmt) -> Result<Option<QueryPlan>> {
         // Must have ORDER BY with single column
         let order_by = match &stmt.order_by {
             Some(o) if o.len() == 1 => &o[0],
@@ -878,7 +910,7 @@ impl QueryOptimizer {
     /// - `ORDER BY VECTOR_DISTANCE(embedding, [query_vector]) LIMIT K`
     /// 
     /// And converts them to direct vector index search.
-    fn optimize_vector_order_by(&mut self, stmt: &SelectStmt) -> Result<Option<QueryPlan>> {
+    fn optimize_vector_order_by(&self, stmt: &SelectStmt) -> Result<Option<QueryPlan>> {
         // 必须有 ORDER BY 和 LIMIT
         let order_by = match &stmt.order_by {
             Some(o) if o.len() == 1 => &o[0],  // 只支持单列排序
@@ -979,48 +1011,51 @@ impl QueryOptimizer {
     }
     
     /// Optimize aggregate queries to use indexes when possible
-    fn optimize_aggregate(&mut self, stmt: &SelectStmt) -> Result<Option<QueryPlan>> {
+    fn optimize_aggregate(&self, stmt: &SelectStmt, params: &[crate::types::Value]) -> Result<Option<QueryPlan>> {
         // Extract table name
         let table_name = match stmt.from.as_ref().unwrap() {
             TableRef::Table { name, .. } => name.clone(),
             _ => return Ok(None),
         };
-        
+
         let total_rows = self.estimate_table_size(&table_name);
-        
+
         // If there's a WHERE clause, try to use index scan
         if let Some(where_clause) = &stmt.where_clause {
-            // Try range query optimization
-            if let Some((col, _start, _start_incl, _end, _end_incl)) = self.try_extract_range_query(where_clause) {
-                // Check if this column has an index
+            // Try two-sided range query optimization
+            if let Some((col, start, start_incl, end, end_incl)) = self.try_extract_range_query(where_clause, params) {
                 let index_name = format!("{}.{}", table_name, col);
                 let index_exists = self.db.column_indexes.contains_key(&index_name);
-                
+
                 if index_exists {
-                    // Use index range scan for aggregation
-                    let range_rows = (total_rows as f64 * 0.1) as usize; // estimated range match
+                    let range_fraction = Self::estimate_range_fraction(&start, &end);
+                    let range_rows = (total_rows as f64 * range_fraction) as usize;
                     return Ok(Some(QueryPlan {
-                        scan_method: ScanMethod::FullScan {
+                        scan_method: ScanMethod::RangeQuery {
                             table: table_name.clone(),
+                            column: col,
+                            start, start_inclusive: start_incl,
+                            end, end_inclusive: end_incl,
                         },
                         estimated_cost: self.cost_params.index_lookup_cost * (range_rows as f64)
                             + range_rows as f64 * self.cost_params.memory_read_cost,
-                        estimated_rows: 1,     // Aggregate result is single row
+                        estimated_rows: 1,
                         post_filters: vec![where_clause.clone()],
                     }));
                 }
             }
 
-            // Try point query optimization
-            if let Some((col, _val)) = self.try_extract_point_query(where_clause) {
+            // Try point query optimization (supports Literal and Parameter)
+            if let Some((col, val)) = self.try_extract_point_query(where_clause, params) {
                 let index_name = format!("{}.{}", table_name, col);
                 let index_exists = self.db.column_indexes.contains_key(&index_name);
 
                 if index_exists {
-                    // Use index point lookup for aggregation
                     return Ok(Some(QueryPlan {
-                        scan_method: ScanMethod::FullScan {
+                        scan_method: ScanMethod::PointQuery {
                             table: table_name.clone(),
+                            column: col,
+                            value: val,
                         },
                         estimated_cost: self.cost_params.index_lookup_cost,
                         estimated_rows: 1,
@@ -1028,33 +1063,55 @@ impl QueryOptimizer {
                     }));
                 }
             }
+
+            // Try single-sided range optimization
+            if let Some(plan) = self.try_single_sided_range(&table_name, where_clause, params)? {
+                return Ok(Some(QueryPlan {
+                    scan_method: plan.scan_method,
+                    estimated_cost: plan.estimated_cost,
+                    estimated_rows: 1,
+                    post_filters: vec![where_clause.clone()],
+                }));
+            }
         }
-        
+
         // If no optimization found, use full scan
-        // Still return a plan to indicate we've checked
         Ok(Some(QueryPlan {
             scan_method: ScanMethod::FullScan {
                 table: table_name.clone(),
             },
             estimated_cost: self.cost_full_scan(total_rows),
-            estimated_rows: 1, // Aggregate returns 1 row
+            estimated_rows: 1,
             post_filters: stmt.where_clause.as_ref()
                 .map(|clause| vec![clause.clone()])
                 .unwrap_or_default(),
         }))
     }
-    
-    /// Try to extract point query pattern (col = value)
-    fn try_extract_point_query(&self, expr: &Expr) -> Option<(String, Value)> {
+
+    /// Try to extract point query pattern (col = value), supports Literal and Parameter
+    fn try_extract_point_query(&self, expr: &Expr, params: &[crate::types::Value]) -> Option<(String, Value)> {
         match expr {
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(col), Expr::Literal(val)) => Some((col.clone(), val.clone())),
-                    (Expr::Literal(val), Expr::Column(col)) => Some((col.clone(), val.clone())),
-                    _ => None,
+                if let Some(val) = Self::resolve_to_value(params,right) {
+                    if let Expr::Column(col) = left.as_ref() {
+                        return Some((col.clone(), val));
+                    }
                 }
+                if let Some(val) = Self::resolve_to_value(params,left) {
+                    if let Expr::Column(col) = right.as_ref() {
+                        return Some((col.clone(), val));
+                    }
+                }
+                None
             }
             _ => None,
         }
+    }
+
+    /// Try single-sided range optimization for aggregate WHERE clauses
+    fn try_single_sided_range(&self, table_name: &str, expr: &Expr, params: &[crate::types::Value]) -> Result<Option<QueryPlan>> {
+        let mut plans = Vec::new();
+        self.analyze_where_clause(table_name, expr, params, &mut plans)?;
+        Ok(plans.into_iter().min_by_key(|p| p.estimated_cost as u64))
     }
 }

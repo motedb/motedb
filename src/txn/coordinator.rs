@@ -462,7 +462,8 @@ impl TransactionCoordinator {
             if let Some(chain) = self.version_store.versions.get(row_id) {
                 let head = chain.head.read();
                 if let Some(version) = head.as_ref() {
-                    if version.begin_ts > ctx.snapshot.timestamp
+                    if (version.begin_ts > ctx.snapshot.timestamp
+                        || ctx.snapshot.active_txns.contains(&version.txn_id))
                         && version.txn_id != ctx.txn_id
                     {
                         return Err(StorageError::Transaction(

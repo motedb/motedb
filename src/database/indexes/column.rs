@@ -23,7 +23,8 @@ impl MoteDB {
         std::fs::create_dir_all(&indexes_dir)?;
         let index_path = indexes_dir.join(format!("column_{}.idx", index_name));
 
-        let config = ColumnValueIndexConfig::default();
+        let mut config = ColumnValueIndexConfig::default();
+        config.mem_buffer_size = self.column_index_buffer_size;
         let index = ColumnValueIndex::create(
             index_path,
             table_name.to_string(),
@@ -96,37 +97,13 @@ impl MoteDB {
                 if indexed_count > 0 {
                     debug_log!("[create_column_index] Indexed {} values in {:?}", indexed_count, _scan_time);
                 }
+
+                // Index is fully populated from LSM — clear the rebuild flag.
+                // The async pipeline will skip this index since it's already up-to-date.
+                index_arc.mark_rebuilt();
             }
         }
 
-        Ok(())
-    }
-
-    /// Insert value into column index
-    pub fn insert_column_value(&self, table_name: &str, column_name: &str, row_id: RowId, value: &Value) -> Result<()> {
-        let index_name = format!("{}.{}", table_name, column_name);
-        let index_ref = self.column_indexes.get(&index_name)
-            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-
-        index_ref.value().insert(value, row_id)?;
-        Ok(())
-    }
-
-    /// Batch insert column index values
-    pub fn batch_insert_column_values(&self, table_name: &str, column_name: &str, items: Vec<(RowId, Value)>) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let index_name = format!("{}.{}", table_name, column_name);
-        let index_ref = self.column_indexes.get(&index_name)
-            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-
-        let batch: Vec<(Value, RowId)> = items.into_iter()
-            .map(|(row_id, value)| (value, row_id))
-            .collect();
-
-        index_ref.value().batch_insert(batch)?;
         Ok(())
     }
 
@@ -138,29 +115,6 @@ impl MoteDB {
             .filter(|entry| entry.key().starts_with(&prefix))
             .map(|entry| entry.key().strip_prefix(&prefix).unwrap().to_string())
             .collect()
-    }
-
-    /// Delete value from column index
-    pub fn delete_column_value(&self, table_name: &str, column_name: &str, row_id: RowId, value: &Value) -> Result<()> {
-        let index_name = format!("{}.{}", table_name, column_name);
-        let index_ref = self.column_indexes.get(&index_name)
-            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-
-        index_ref.value().delete(value, row_id)?;
-        Ok(())
-    }
-
-    /// Update value in column index (delete old + insert new)
-    pub fn update_column_value(&self, table_name: &str, column_name: &str, row_id: RowId,
-                                old_value: &Value, new_value: &Value) -> Result<()> {
-        let index_name = format!("{}.{}", table_name, column_name);
-        let index_ref = self.column_indexes.get(&index_name)
-            .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
-
-        let index = index_ref.value();
-        index.delete(old_value, row_id)?;
-        index.insert(new_value, row_id)?;
-        Ok(())
     }
 
     /// Flush column index to disk
@@ -239,5 +193,73 @@ impl MoteDB {
             .ok_or_else(|| StorageError::Index(format!("Column index '{}' not found", index_name)))?;
 
         index_ref.value().query_between(lower_bound, lower_inclusive, upper_bound, upper_inclusive)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_create_column_index_and_query() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, tag TEXT, val INT)").unwrap();
+
+        // Insert data first, then create index
+        for i in 0..100i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'tag_{}', {})", i, i % 5, i)).unwrap();
+        }
+
+        db.execute("CREATE INDEX idx_tag ON t (tag) USING COLUMN").unwrap();
+        db.wait_for_indexes_ready();
+        db.flush().unwrap();
+
+        // Query should return results (either via index or full scan)
+        let result = db.execute("SELECT id FROM t WHERE tag = 'tag_3'").unwrap();
+        use crate::sql::QueryResult;
+        if let QueryResult::Select { rows, .. } = result.materialize().unwrap() {
+            assert_eq!(rows.len(), 20, "should find 20 rows with tag='tag_3'");
+        }
+    }
+
+    #[test]
+    fn test_create_index_then_insert() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, category TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_cat ON t (category) USING COLUMN").unwrap();
+        db.wait_for_indexes_ready();
+
+        // Insert after index exists
+        db.execute("INSERT INTO t VALUES (1, 'alpha')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'beta')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'alpha')").unwrap();
+
+        // Query should find newly inserted data (synchronous index update)
+        let result = db.execute("SELECT id FROM t WHERE category = 'alpha' ORDER BY id").unwrap();
+        use crate::sql::QueryResult;
+        if let QueryResult::Select { rows, .. } = result.materialize().unwrap() {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], crate::types::Value::Integer(1));
+            assert_eq!(rows[1][0], crate::types::Value::Integer(3));
+        }
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, tag TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_tag ON t (tag) USING COLUMN").unwrap();
+        db.wait_for_indexes_ready();
+
+        db.execute("DROP INDEX idx_tag").unwrap();
+
+        // Query should still work (falls back to full scan)
+        let result = db.execute("SELECT * FROM t WHERE tag = 'test'").unwrap();
+        assert!(result.materialize().is_ok());
     }
 }

@@ -191,7 +191,7 @@ fn test_drop_recreate_different_types() {
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     let row = query_single(&db, "SELECT v FROM t WHERE id = 1").unwrap();
-    assert_eq!(row[0], Value::Text("hello".to_string()));
+    assert_eq!(row[0], Value::text("hello".to_string()));
 }
 
 // ============================================================
@@ -213,7 +213,7 @@ fn test_insert_many_then_select_with_conditions() {
     let rows = query_rows(&db, "SELECT * FROM t WHERE status = 'active' AND v > 100 ORDER BY id");
     assert!(rows.len() > 0, "Should find active rows with v > 100");
     for row in &rows {
-        assert_eq!(row[1], Value::Text("active".to_string()));
+        assert_eq!(row[1], Value::text("active".to_string()));
         match &row[2] {
             Value::Integer(v) => assert!(*v > 100),
             _ => panic!("v should be integer"),
@@ -233,7 +233,7 @@ fn test_select_star_from_table_with_many_columns() {
     assert_eq!(rows[0].len(), 5);
     assert_eq!(rows[0][0], Value::Integer(1));
     assert_eq!(rows[0][1], Value::Integer(10));
-    assert_eq!(rows[0][2], Value::Text("hello".to_string()));
+    assert_eq!(rows[0][2], Value::text("hello".to_string()));
     assert_eq!(rows[0][3], Value::Integer(30));
 }
 
@@ -369,12 +369,12 @@ fn test_prepared_different_params_sequential() {
     let r2 = db.execute_prepared(sql, vec![Value::Integer(2)]).unwrap().materialize().unwrap();
 
     if let QueryResult::Select { rows: rows1, .. } = r1 {
-        assert_eq!(rows1[0][0], Value::Text("one".to_string()));
+        assert_eq!(rows1[0][0], Value::text("one".to_string()));
     } else {
         panic!("Expected Select result");
     }
     if let QueryResult::Select { rows: rows2, .. } = r2 {
-        assert_eq!(rows2[0][0], Value::Text("two".to_string()));
+        assert_eq!(rows2[0][0], Value::text("two".to_string()));
     } else {
         panic!("Expected Select result");
     }
@@ -390,7 +390,7 @@ fn test_prepared_insert_and_query() {
     for i in 1..=5 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::Text(format!("user{}", i)), Value::Integer(20 + i)],
+            vec![Value::Integer(i), Value::text(format!("user{}", i)), Value::Integer(20 + i)],
         ).unwrap();
     }
 
@@ -402,7 +402,7 @@ fn test_prepared_insert_and_query() {
 
     if let QueryResult::Select { rows, .. } = result {
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::Text("user3".to_string()));
+        assert_eq!(rows[0][0], Value::text("user3".to_string()));
         assert_eq!(rows[0][1], Value::Integer(23));
     }
 }
@@ -438,13 +438,13 @@ fn test_select_upper_lower() {
 
     let row = query_single(&db, "SELECT UPPER(name) FROM t WHERE id = 1").unwrap();
     match &row[0] {
-        Value::Text(s) => assert_eq!(s, "HELLO WORLD"),
+        Value::Text(s) => assert_eq!(s.as_str(), "HELLO WORLD"),
         _ => panic!("UPPER should return text"),
     }
 
     let row = query_single(&db, "SELECT LOWER(name) FROM t WHERE id = 1").unwrap();
     match &row[0] {
-        Value::Text(s) => assert_eq!(s, "hello world"),
+        Value::Text(s) => assert_eq!(s.as_str(), "hello world"),
         _ => panic!("LOWER should return text"),
     }
 }
@@ -513,8 +513,8 @@ fn test_reopen_preserves_all_data() {
     let db = Database::open(&path).unwrap();
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0][1], Value::Text("hello".to_string()));
-    assert_eq!(rows[1][1], Value::Text("world".to_string()));
+    assert_eq!(rows[0][1], Value::text("hello".to_string()));
+    assert_eq!(rows[1][1], Value::text("world".to_string()));
     assert_eq!(rows[2][1], Value::Null);
 }
 

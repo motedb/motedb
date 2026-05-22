@@ -1458,11 +1458,10 @@ impl IndexBuilder for TextFTSIndex {
             for value in row.iter() {
                 match value {
                     Value::Text(text) => {
-                        documents.push((*row_id, text.clone()));
+                        documents.push((*row_id, (**text).clone()));
                         break; // 只取第一个文本列
                     }
                     Value::TextDoc(text) => {
-                        // TextDoc包含的是Text类型，需要获取其内容
                         documents.push((*row_id, text.content().to_string()));
                         break;
                     }

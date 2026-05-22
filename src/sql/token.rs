@@ -190,14 +190,21 @@ impl Token {
 }
 
 impl TokenType {
-    /// Check if this token is a keyword (🚀 P1.3: O(1) perfect hash lookup)
+    /// Check if this token is a keyword — zero-allocation lookup.
+    /// Lowercases into a stack buffer (all keywords are ASCII, max 14 chars).
     pub fn from_keyword(s: &str) -> Option<Self> {
-        // Early exit: longest keyword is "auto_increment" (14 chars)
-        if s.len() > 14 {
+        let len = s.len();
+        if len > 14 || len == 0 {
             return None;
         }
-        // ASCII-only lowercasing (SQL keywords are all ASCII, avoids Unicode tables)
-        let lowercase = s.to_ascii_lowercase();
-        KEYWORDS.get(lowercase.as_str()).cloned()
+        let mut buf = [0u8; 16];
+        let bytes = s.as_bytes();
+        for i in 0..len {
+            buf[i] = bytes[i].to_ascii_lowercase();
+        }
+        // Safety: buf[..len] is valid ASCII after to_ascii_lowercase
+        let lower = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+        KEYWORDS.get(lower).cloned()
     }
 }
+

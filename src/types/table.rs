@@ -430,7 +430,8 @@ impl TableSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Timestamp, Value};
+    use crate::types::{Timestamp, Value, ArcString};
+    use std::sync::Arc;
 
     #[test]
     fn test_column_def() {
@@ -478,7 +479,7 @@ mod tests {
         // Valid row
         let row = vec![
             Value::Timestamp(Timestamp::from_micros(123)),
-            Value::Text("test".to_string()),
+            Value::Text(ArcString(Arc::new("test".to_string()))),
         ];
         assert!(schema.validate_row(&row).is_ok());
 

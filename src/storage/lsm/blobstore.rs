@@ -84,6 +84,15 @@ impl BlobStore {
         })
     }
 
+    /// Flush buffered blob data to disk and fsync.
+    /// Must be called before any SSTable referencing the blobs is synced,
+    /// otherwise a crash could leave the SSTable pointing to incomplete blob data.
+    pub fn flush(&self) -> Result<()> {
+        let mut state = self.state.lock()
+            .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
+        state.current_file.flush()
+    }
+
     /// Write large value to blob file
     pub fn put(&self, data: &[u8]) -> Result<BlobRef> {
         let mut state = self.state.lock()

@@ -315,14 +315,14 @@ fn test_concat_with_null() {
     db.execute("INSERT INTO t VALUES (2, 'hello', NULL)").unwrap();
 
     let rows = query_rows(&db, "SELECT CONCAT(a, b) FROM t ORDER BY id");
-    assert_eq!(rows[0][0], Value::Text("helloworld".to_string()));
+    assert_eq!(rows[0][0], Value::text("helloworld".to_string()));
 
     // CONCAT with NULL: standard SQL returns NULL, but at minimum should not be "hellonull"
     let concat_null = &rows[1][0];
     match concat_null {
         Value::Null => { /* correct SQL behavior */ }
         Value::Text(s) => {
-            assert_ne!(s, "helloNULL", "CONCAT('hello', NULL) should not be 'helloNULL'");
+            assert_ne!(s.as_str(), "helloNULL", "CONCAT('hello', NULL) should not be 'helloNULL'");
         }
         _ => panic!("Unexpected CONCAT result type"),
     }
@@ -440,7 +440,7 @@ fn test_drop_table_then_recreate_different_schema() {
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 1");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1], Value::Text("alice".to_string()),
+    assert_eq!(rows[0][1], Value::text("alice".to_string()),
         "New table should have clean data, no leftover from old table");
 }
 
@@ -571,7 +571,7 @@ fn test_update_with_string_value() {
     db.execute("UPDATE t SET name = 'bob' WHERE id = 1").unwrap();
 
     let row = query_single(&db, "SELECT name FROM t WHERE id = 1").unwrap();
-    assert_eq!(row[0], Value::Text("bob".to_string()));
+    assert_eq!(row[0], Value::text("bob".to_string()));
 }
 
 #[test]
@@ -710,14 +710,14 @@ fn test_prepared_insert_then_select() {
     for i in 1..=3 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?)",
-            vec![Value::Integer(i), Value::Text(format!("val_{}", i))],
+            vec![Value::Integer(i), Value::text(format!("val_{}", i))],
         ).unwrap();
     }
 
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0][1], Value::Text("val_1".to_string()));
-    assert_eq!(rows[2][1], Value::Text("val_3".to_string()));
+    assert_eq!(rows[0][1], Value::text("val_1".to_string()));
+    assert_eq!(rows[2][1], Value::text("val_3".to_string()));
 }
 
 // ============================================================
@@ -796,6 +796,6 @@ fn test_table_with_same_key_different_tables() {
     let r1 = query_single(&db, "SELECT v FROM t1 WHERE id = 1").unwrap();
     let r2 = query_single(&db, "SELECT v FROM t2 WHERE id = 1").unwrap();
 
-    assert_eq!(r1[0], Value::Text("t1_row1".to_string()));
-    assert_eq!(r2[0], Value::Text("t2_row1".to_string()));
+    assert_eq!(r1[0], Value::text("t1_row1".to_string()));
+    assert_eq!(r2[0], Value::text("t2_row1".to_string()));
 }

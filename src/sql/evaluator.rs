@@ -452,9 +452,17 @@ impl ExprEvaluator {
                 Ok(Value::Integer(if v == i64::MIN { 0 } else { v }))
             }
             
-            // Aggregate functions (will be handled by executor for now)
+            // Aggregate functions: look up pre-computed value in row (for HAVING)
             "count" | "sum" | "avg" | "min" | "max" => {
-                Err(MoteDBError::NotImplemented(format!("Aggregate function {} not yet implemented", name)))
+                // Build the column name that matches how the executor stored it
+                let arg_str = if args.is_empty() { "*".to_string() }
+                    else { args.iter().map(|a| match a { Expr::Column(c) => c.clone(), _ => format!("{:?}", a) }).collect::<Vec<_>>().join(", ") };
+                let key = format!("{}({})", name.to_uppercase(), arg_str);
+                if let Some(val) = row.get(&key) {
+                    Ok(val.clone())
+                } else {
+                    Err(MoteDBError::NotImplemented(format!("Aggregate function {} not yet implemented", name)))
+                }
             }
             
             // String functions
@@ -464,7 +472,7 @@ impl ExprEvaluator {
                 }
                 let val = self.eval(&args[0], row)?;
                 if let Value::Text(s) = val {
-                    Ok(Value::Text(s.to_lowercase()))
+                    Ok(Value::text(s.to_lowercase()))
                 } else {
                     Err(MoteDBError::TypeError("lower() requires text argument".to_string()))
                 }
@@ -476,7 +484,7 @@ impl ExprEvaluator {
                 }
                 let val = self.eval(&args[0], row)?;
                 if let Value::Text(s) = val {
-                    Ok(Value::Text(s.to_uppercase()))
+                    Ok(Value::text(s.to_uppercase()))
                 } else {
                     Err(MoteDBError::TypeError("upper() requires text argument".to_string()))
                 }
@@ -512,9 +520,9 @@ impl ExprEvaluator {
                         _ => { use std::fmt::Write; let _ = write!(result, "{:?}", val); }
                     };
                 }
-                Ok(Value::Text(result))
+                Ok(Value::text(result))
             }
-            
+
             "substr" | "substring" => {
                 // SUBSTR(text, start [, length])
                 if args.len() < 2 || args.len() > 3 {
@@ -543,9 +551,9 @@ impl ExprEvaluator {
                 } else {
                     text.chars().skip(start_idx).collect()
                 };
-                Ok(Value::Text(result))
+                Ok(Value::text(result))
             }
-            
+
             "trim" => {
                 // TRIM(text) - remove leading and trailing whitespace
                 if args.len() != 1 {
@@ -555,12 +563,12 @@ impl ExprEvaluator {
                     Value::Text(s) => s,
                     _ => return Err(MoteDBError::TypeError("trim() requires text argument".to_string())),
                 };
-                // ✅ 优化：如果没有前后空格，直接返回原字符串
+                // ✅ 优化：如果没有前后空格，直接返回原字符串（Arc clone，零分配）
                 if text.trim() == text.as_str() {
-                    return Ok(Value::Text(text));
+                    return Ok(Value::Text(text.clone()));
                 }
                 // 否则才创建新字符串
-                Ok(Value::Text(text.trim().to_string()))
+                Ok(Value::text(text.trim().to_string()))
             }
             
             "ltrim" => {
@@ -571,11 +579,11 @@ impl ExprEvaluator {
                     Value::Text(s) => s,
                     _ => return Err(MoteDBError::TypeError("ltrim() requires text argument".to_string())),
                 };
-                // ✅ 优化：如果没有前导空格，直接返回
+                // ✅ 优化：如果没有前导空格，直接返回（Arc clone，零分配）
                 if text.trim_start() == text.as_str() {
-                    return Ok(Value::Text(text));
+                    return Ok(Value::Text(text.clone()));
                 }
-                Ok(Value::Text(text.trim_start().to_string()))
+                Ok(Value::text(text.trim_start().to_string()))
             }
             
             "rtrim" => {
@@ -586,11 +594,11 @@ impl ExprEvaluator {
                     Value::Text(s) => s,
                     _ => return Err(MoteDBError::TypeError("rtrim() requires text argument".to_string())),
                 };
-                // ✅ 优化：如果没有尾随空格，直接返回
+                // ✅ 优化：如果没有尾随空格，直接返回（Arc clone，零分配）
                 if text.trim_end() == text.as_str() {
-                    return Ok(Value::Text(text));
+                    return Ok(Value::Text(text.clone()));
                 }
-                Ok(Value::Text(text.trim_end().to_string()))
+                Ok(Value::text(text.trim_end().to_string()))
             }
             
             "replace" => {
@@ -612,7 +620,7 @@ impl ExprEvaluator {
                     Value::Text(s) => s,
                     _ => return Err(MoteDBError::TypeError("replace() third argument must be text".to_string())),
                 };
-                Ok(Value::Text(text.replace(&from, &to)))
+                Ok(Value::text(text.replace(from.as_str(), to.as_str())))
             }
             
             "reverse" => {
@@ -623,7 +631,7 @@ impl ExprEvaluator {
                     Value::Text(s) => s,
                     _ => return Err(MoteDBError::TypeError("reverse() requires text argument".to_string())),
                 };
-                Ok(Value::Text(text.chars().rev().collect()))
+                Ok(Value::text(text.chars().rev().collect()))
             }
             
             "leftstr" | "str_left" => {
@@ -640,7 +648,7 @@ impl ExprEvaluator {
                     Value::Integer(i) => i.max(0) as usize,
                     _ => return Err(MoteDBError::TypeError("leftstr() second argument must be integer".to_string())),
                 };
-                Ok(Value::Text(text.chars().take(length).collect()))
+                Ok(Value::text(text.chars().take(length).collect()))
             }
             
             "rightstr" | "str_right" => {
@@ -659,7 +667,7 @@ impl ExprEvaluator {
                 };
                 let char_vec: Vec<char> = text.chars().collect();
                 let start_idx = char_vec.len().saturating_sub(length);
-                Ok(Value::Text(char_vec[start_idx..].iter().collect()))
+                Ok(Value::text(char_vec[start_idx..].iter().collect()))
             }
             
             "repeat" => {
@@ -675,7 +683,7 @@ impl ExprEvaluator {
                     Value::Integer(i) => i.max(0) as usize,
                     _ => return Err(MoteDBError::TypeError("repeat() second argument must be integer".to_string())),
                 };
-                Ok(Value::Text(text.repeat(count)))
+                Ok(Value::text(text.repeat(count)))
             }
             
             // Math functions
@@ -1289,14 +1297,14 @@ impl ExprEvaluator {
                     }
                     "TEXT" | "VARCHAR" | "STRING" => {
                         let text = match val {
-                            Value::Text(s) => s,
+                            Value::Text(s) => s.as_str().to_string(),
                             Value::Integer(i) => i.to_string(),
                             Value::Float(f) => f.to_string(),
                             Value::Bool(b) => b.to_string(),
                             Value::Null => "NULL".to_string(),
                             _ => format!("{:?}", val),
                         };
-                        Ok(Value::Text(text))
+                        Ok(Value::text(text))
                     }
                     "BOOLEAN" | "BOOL" => {
                         let b = self.to_bool(&val)?;
@@ -1346,7 +1354,7 @@ impl ExprEvaluator {
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
             (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l + r as f64)),
-            (Value::Text(l), Value::Text(r)) => Ok(Value::Text(format!("{}{}", l, r))),
+            (Value::Text(l), Value::Text(r)) => Ok(Value::text(format!("{}{}", l, r))),
             _ => Err(MoteDBError::TypeError("Cannot add these types".to_string())),
         }
     }
@@ -1535,14 +1543,20 @@ impl ExprEvaluator {
         use crate::types::Geometry;
 
         let (x1, y1) = match p1 {
-            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
-            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+            Value::Spatial(g) => match &*g {
+                Geometry::Point(p) => (p.x, p.y),
+                Geometry::Point3D(p) => (p.x, p.y),
+                _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
+            },
             _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
         };
 
         let (x2, y2) = match p2 {
-            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
-            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+            Value::Spatial(g) => match &*g {
+                Geometry::Point(p) => (p.x, p.y),
+                Geometry::Point3D(p) => (p.x, p.y),
+                _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
+            },
             _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
         };
 
@@ -1555,14 +1569,20 @@ impl ExprEvaluator {
         use crate::types::Geometry;
 
         let (px, py) = match point {
-            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
-            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+            Value::Spatial(g) => match &*g {
+                Geometry::Point(p) => (p.x, p.y),
+                Geometry::Point3D(p) => (p.x, p.y),
+                _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires spatial point for first argument".to_string())),
+            },
             _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires spatial point for first argument".to_string())),
         };
 
         let (cx, cy) = match center {
-            Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
-            Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+            Value::Spatial(g) => match &*g {
+                Geometry::Point(p) => (p.x, p.y),
+                Geometry::Point3D(p) => (p.x, p.y),
+                _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires spatial point for center".to_string())),
+            },
             _ => return Err(MoteDBError::TypeError("WITHIN_RADIUS requires spatial point for center".to_string())),
         };
 
@@ -1579,14 +1599,20 @@ impl ExprEvaluator {
     /// ST_OnTopOf: Check if point p1 is on top of point p2 (p1.y > p2.y)
     fn st_ontopof(&self, p1: Value, p2: Value) -> Result<Value> {
         use crate::types::Geometry;
-        
+
         let point1 = match p1 {
-            Value::Spatial(Geometry::Point(p)) => p,
+            Value::Spatial(g) => match &*g {
+                Geometry::Point(p) => *p,
+                _ => return Err(MoteDBError::TypeError("ST_OnTopOf requires spatial point arguments".to_string())),
+            },
             _ => return Err(MoteDBError::TypeError("ST_OnTopOf requires spatial point arguments".to_string())),
         };
-        
+
         let point2 = match p2 {
-            Value::Spatial(Geometry::Point(p)) => p,
+            Value::Spatial(g) => match &*g {
+                Geometry::Point(p) => *p,
+                _ => return Err(MoteDBError::TypeError("ST_OnTopOf requires spatial point arguments".to_string())),
+            },
             _ => return Err(MoteDBError::TypeError("ST_OnTopOf requires spatial point arguments".to_string())),
         };
         
@@ -1637,5 +1663,282 @@ fn parse_interval_to_micros(interval: &str) -> crate::Result<i64> {
 impl Default for ExprEvaluator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::ast::{Expr, BinaryOperator, UnaryOperator};
+    use crate::types::Value;
+
+    fn eval(expr: &Expr, row: &SqlRow) -> Result<Value> {
+        ExprEvaluator::new().eval(expr, row)
+    }
+
+    fn row(vals: &[(&str, Value)]) -> SqlRow {
+        let mut m = SqlRow::new();
+        for (k, v) in vals {
+            m.insert(k.to_string(), v.clone());
+        }
+        m
+    }
+
+    fn lit_int(v: i64) -> Expr {
+        Expr::Literal(Value::Integer(v))
+    }
+
+    fn lit_float(v: f64) -> Expr {
+        Expr::Literal(Value::Float(v))
+    }
+
+    fn lit_text(v: &str) -> Expr {
+        Expr::Literal(Value::Text(crate::types::ArcString::from(v)))
+    }
+
+    fn lit_null() -> Expr {
+        Expr::Literal(Value::Null)
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    // ━━━ Literals ━━━
+
+    #[test]
+    fn test_eval_literal_int() {
+        assert_eq!(eval(&lit_int(42), &row(&[])).unwrap(), Value::Integer(42));
+    }
+
+    #[test]
+    fn test_eval_literal_null() {
+        assert_eq!(eval(&lit_null(), &row(&[])).unwrap(), Value::Null);
+    }
+
+    // ━━━ Column reference ━━━
+
+    #[test]
+    fn test_eval_column() {
+        let r = row(&[("id", Value::Integer(1)), ("name", Value::Text("alice".into()))]);
+        assert_eq!(eval(&col("id"), &r).unwrap(), Value::Integer(1));
+        assert_eq!(eval(&col("name"), &r).unwrap(), Value::Text("alice".into()));
+    }
+
+    // ━━━ Arithmetic ━━━
+
+    #[test]
+    fn test_eval_arithmetic() {
+        let r = row(&[]);
+        let add = Expr::BinaryOp { left: Box::new(lit_int(3)), op: BinaryOperator::Add, right: Box::new(lit_int(4)) };
+        assert_eq!(eval(&add, &r).unwrap(), Value::Integer(7));
+
+        let sub = Expr::BinaryOp { left: Box::new(lit_int(10)), op: BinaryOperator::Sub, right: Box::new(lit_int(3)) };
+        assert_eq!(eval(&sub, &r).unwrap(), Value::Integer(7));
+
+        let mul = Expr::BinaryOp { left: Box::new(lit_int(6)), op: BinaryOperator::Mul, right: Box::new(lit_int(7)) };
+        assert_eq!(eval(&mul, &r).unwrap(), Value::Integer(42));
+
+        let div = Expr::BinaryOp { left: Box::new(lit_float(10.0)), op: BinaryOperator::Div, right: Box::new(lit_float(4.0)) };
+        assert_eq!(eval(&div, &r).unwrap(), Value::Float(2.5));
+    }
+
+    // ━━━ Comparison ━━━
+
+    #[test]
+    fn test_eval_comparison() {
+        let r = row(&[]);
+        let eq = Expr::BinaryOp { left: Box::new(lit_int(1)), op: BinaryOperator::Eq, right: Box::new(lit_int(1)) };
+        assert_eq!(eval(&eq, &r).unwrap(), Value::Bool(true));
+
+        let ne = Expr::BinaryOp { left: Box::new(lit_int(1)), op: BinaryOperator::Ne, right: Box::new(lit_int(2)) };
+        assert_eq!(eval(&ne, &r).unwrap(), Value::Bool(true));
+
+        let lt = Expr::BinaryOp { left: Box::new(lit_int(1)), op: BinaryOperator::Lt, right: Box::new(lit_int(2)) };
+        assert_eq!(eval(&lt, &r).unwrap(), Value::Bool(true));
+
+        let gt = Expr::BinaryOp { left: Box::new(lit_int(2)), op: BinaryOperator::Gt, right: Box::new(lit_int(1)) };
+        assert_eq!(eval(&gt, &r).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn test_eval_eq_null() {
+        let r = row(&[]);
+        // Full evaluator: NULL = anything → false (WHERE-style filtering)
+        let eq = Expr::BinaryOp { left: Box::new(lit_null()), op: BinaryOperator::Eq, right: Box::new(lit_int(1)) };
+        assert_eq!(eval(&eq, &r).unwrap(), Value::Bool(false));
+    }
+
+    // ━━━ Logic ━━━
+
+    #[test]
+    fn test_eval_and_or() {
+        let r = row(&[]);
+        let and_t = Expr::BinaryOp { left: Box::new(lit_int(1)), op: BinaryOperator::And, right: Box::new(lit_int(1)) };
+        assert_eq!(eval(&and_t, &r).unwrap(), Value::Bool(true));
+
+        let and_f = Expr::BinaryOp { left: Box::new(lit_int(1)), op: BinaryOperator::And, right: Box::new(lit_int(0)) };
+        assert_eq!(eval(&and_f, &r).unwrap(), Value::Bool(false));
+
+        let or_t = Expr::BinaryOp { left: Box::new(lit_int(0)), op: BinaryOperator::Or, right: Box::new(lit_int(1)) };
+        assert_eq!(eval(&or_t, &r).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ IS NULL ━━━
+
+    #[test]
+    fn test_eval_is_null() {
+        let r = row(&[]);
+        let isnull = Expr::IsNull { expr: Box::new(lit_null()), negated: false };
+        assert_eq!(eval(&isnull, &r).unwrap(), Value::Bool(true));
+
+        let notnull = Expr::IsNull { expr: Box::new(lit_int(1)), negated: true };
+        assert_eq!(eval(&notnull, &r).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ IN ━━━
+
+    #[test]
+    fn test_eval_in() {
+        let r = row(&[]);
+        let in_true = Expr::In {
+            expr: Box::new(lit_int(2)),
+            list: vec![lit_int(1), lit_int(2), lit_int(3)],
+            negated: false,
+        };
+        assert_eq!(eval(&in_true, &r).unwrap(), Value::Bool(true));
+
+        let in_false = Expr::In {
+            expr: Box::new(lit_int(99)),
+            list: vec![lit_int(1), lit_int(2)],
+            negated: false,
+        };
+        assert_eq!(eval(&in_false, &r).unwrap(), Value::Bool(false));
+    }
+
+    // ━━━ BETWEEN ━━━
+
+    #[test]
+    fn test_eval_between() {
+        let r = row(&[]);
+        let bt = Expr::Between {
+            expr: Box::new(lit_int(5)),
+            low: Box::new(lit_int(1)),
+            high: Box::new(lit_int(10)),
+            negated: false,
+        };
+        assert_eq!(eval(&bt, &r).unwrap(), Value::Bool(true));
+
+        let nb = Expr::Between {
+            expr: Box::new(lit_int(0)),
+            low: Box::new(lit_int(1)),
+            high: Box::new(lit_int(10)),
+            negated: true,
+        };
+        assert_eq!(eval(&nb, &r).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ LIKE ━━━
+
+    #[test]
+    fn test_eval_like() {
+        let r = row(&[]);
+        let like = Expr::Like {
+            expr: Box::new(lit_text("hello world")),
+            pattern: Box::new(lit_text("%world%")),
+            negated: false,
+        };
+        assert_eq!(eval(&like, &r).unwrap(), Value::Bool(true));
+
+        let nlike = Expr::Like {
+            expr: Box::new(lit_text("hello")),
+            pattern: Box::new(lit_text("%xyz%")),
+            negated: true,
+        };
+        assert_eq!(eval(&nlike, &r).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ NOT ━━━
+
+    #[test]
+    fn test_eval_not() {
+        let r = row(&[]);
+        let not_true = Expr::UnaryOp { op: UnaryOperator::Not, expr: Box::new(lit_int(1)) };
+        assert_eq!(eval(&not_true, &r).unwrap(), Value::Bool(false));
+
+        let not_false = Expr::UnaryOp { op: UnaryOperator::Not, expr: Box::new(lit_int(0)) };
+        assert_eq!(eval(&not_false, &r).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ Functions ━━━
+    // COALESCE, IFNULL, NULLIF are the most commonly used
+
+    #[test]
+    fn test_eval_coalesce() {
+        let r = row(&[]);
+        // COALESCE(NULL, NULL, 42) = 42
+        let func = Expr::FunctionCall {
+            name: "COALESCE".to_string(),
+            args: vec![lit_null(), lit_null(), lit_int(42)],
+            distinct: false,
+        };
+        assert_eq!(eval(&func, &r).unwrap(), Value::Integer(42));
+
+        // COALESCE(1, 2) = 1
+        let func2 = Expr::FunctionCall {
+            name: "COALESCE".to_string(),
+            args: vec![lit_int(1), lit_int(2)],
+            distinct: false,
+        };
+        assert_eq!(eval(&func2, &r).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_eval_ifnull() {
+        let r = row(&[]);
+        // IFNULL(NULL, 'fallback') = 'fallback'
+        let func = Expr::FunctionCall {
+            name: "IFNULL".to_string(),
+            args: vec![lit_null(), lit_text("fallback")],
+            distinct: false,
+        };
+        assert_eq!(eval(&func, &r).unwrap(), Value::Text("fallback".into()));
+
+        // IFNULL(1, 2) = 1
+        let func2 = Expr::FunctionCall {
+            name: "IFNULL".to_string(),
+            args: vec![lit_int(1), lit_int(2)],
+            distinct: false,
+        };
+        assert_eq!(eval(&func2, &r).unwrap(), Value::Integer(1));
+    }
+
+    #[test]
+    fn test_eval_abs_round() {
+        let r = row(&[]);
+        let abs = Expr::FunctionCall {
+            name: "ABS".to_string(),
+            args: vec![lit_int(-5)],
+            distinct: false,
+        };
+        assert_eq!(eval(&abs, &r).unwrap(), Value::Integer(5));
+
+        let round = Expr::FunctionCall {
+            name: "ROUND".to_string(),
+            args: vec![lit_float(3.7)],
+            distinct: false,
+        };
+        assert_eq!(eval(&round, &r).unwrap(), Value::Float(4.0));
+    }
+
+    #[test]
+    fn test_eval_length() {
+        let r = row(&[]);
+        let len = Expr::FunctionCall {
+            name: "LENGTH".to_string(),
+            args: vec![lit_text("hello")],
+            distinct: false,
+        };
+        assert_eq!(eval(&len, &r).unwrap(), Value::Integer(5));
     }
 }

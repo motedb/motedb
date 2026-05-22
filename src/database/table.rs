@@ -161,14 +161,76 @@ impl MoteDB {
         table_id as u64
     }
 
-    /// Decode row data from LSM storage format
-    /// 
-    /// Internal helper for query operations
-    pub(crate) fn decode_row_data(data: &[u8]) -> Result<crate::types::Row> {
-        crate::storage::row_format::decode_any(data)
-    }
-    
-    
     // Note: create_column_index() has been moved to indexes/column.rs
     // Removed duplicate definition to avoid E0592
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use tempfile::TempDir;
+
+    fn setup_db() -> (Database, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_create_table_basic() {
+        let (db, _dir) = setup_db();
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
+        // Should not panic
+    }
+
+    #[test]
+    fn test_create_table_duplicate_name() {
+        let (db, _dir) = setup_db();
+        db.execute("CREATE TABLE t1 (a INT)").unwrap();
+        let result = db.execute("CREATE TABLE t1 (b INT)");
+        assert!(result.is_err(), "duplicate table name should fail");
+    }
+
+    #[test]
+    fn test_create_table_with_pk_insert_select() {
+        let (db, _dir) = setup_db();
+        db.execute("CREATE TABLE pk_test (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("INSERT INTO pk_test VALUES (1, 100)").unwrap();
+        db.execute("INSERT INTO pk_test VALUES (2, 200)").unwrap();
+
+        let result = db.execute("SELECT id, val FROM pk_test ORDER BY id").unwrap();
+        use crate::sql::QueryResult;
+        if let QueryResult::Select { rows, .. } = result.materialize().unwrap() {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], crate::types::Value::Integer(1));
+        }
+    }
+
+    #[test]
+    fn test_drop_table() {
+        let (db, _dir) = setup_db();
+        db.execute("CREATE TABLE t (x INT)").unwrap();
+        db.execute("DROP TABLE t").unwrap();
+        let result = db.execute("INSERT INTO t VALUES (1)");
+        assert!(result.is_err(), "insert into dropped table should fail");
+    }
+
+    #[test]
+    fn test_show_tables() {
+        let (db, _dir) = setup_db();
+        db.execute("CREATE TABLE a (x INT)").unwrap();
+        db.execute("CREATE TABLE b (y INT)").unwrap();
+        let result = db.execute("SHOW TABLES").unwrap();
+        // Should return table names
+        assert!(result.materialize().is_ok());
+    }
+
+    #[test]
+    fn test_describe_table() {
+        let (db, _dir) = setup_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)").unwrap();
+        let result = db.execute("DESCRIBE t").unwrap();
+        assert!(result.materialize().is_ok());
+    }
 }

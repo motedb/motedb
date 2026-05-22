@@ -79,8 +79,8 @@ fn docs_batch_insert_example_runs() -> Result<()> {
     for i in 0..100 {
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Integer(i));
-        row.insert("name".into(), Value::Text(format!("User{}", i)));
-        row.insert("email".into(), Value::Text(format!("user{}@example.com", i)));
+        row.insert("name".into(), Value::text(format!("User{}", i)));
+        row.insert("email".into(), Value::text(format!("user{}@example.com", i)));
         row.insert("age".into(), Value::Integer(20 + (i % 30)));
         rows.push(row);
     }
@@ -108,7 +108,7 @@ fn docs_vector_index_example_runs() -> Result<()> {
     for i in 0..10 {  // 使用小数据量避免触发批量索引的bug
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Integer(i));
-        row.insert("title".into(), Value::Text(format!("Doc {}", i)));
+        row.insert("title".into(), Value::text(format!("Doc {}", i)));
         row.insert("embedding".into(), Value::Vector(motedb::types::ArcVec::new(vec![i as f32 * 0.1; 4])));
         rows.push(row);
     }
@@ -147,8 +147,8 @@ fn docs_text_index_example_runs() -> Result<()> {
     {
         let mut row = HashMap::new();
         row.insert("id".into(), Value::Integer(i as i64));
-        row.insert("title".into(), Value::Text(format!("Article {}", i)));
-        row.insert("content".into(), Value::Text((*content).into()));
+        row.insert("title".into(), Value::text(format!("Article {}", i)));
+        row.insert("content".into(), Value::text(content.to_string()));
         rows.push(row);
     }
 

@@ -114,7 +114,10 @@ pub struct MoteDB {
 
     /// PK lookup cache capacity per table (LRU eviction)
     pub(crate) pk_lookup_capacity: usize,
-    
+
+    /// Column index in-memory write buffer size (bytes)
+    pub(crate) column_index_buffer_size: usize,
+
     /// 🆕 防止递归 flush 的标志
     pub(crate) is_flushing: Arc<AtomicBool>,
 
@@ -139,6 +142,12 @@ pub struct MoteDB {
     /// Number of index build batches sent but not yet processed by the background thread.
     /// Used by `wait_for_indexes_ready()` to know when indexes are caught up.
     pending_index_batches: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Counter for index build errors (incremented by background thread, readable by user)
+    pub index_build_errors: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Counter for flush errors (incremented by background auto-flush thread)
+    pub flush_errors: Arc<std::sync::atomic::AtomicUsize>,
 
     /// Background index builder thread
     index_builder_thread: Option<IndexBuilderThread>,
@@ -298,9 +307,12 @@ impl MoteDB {
             index_update_strategy: config.index_update_strategy.clone(),
             query_timeout_secs: config.query_timeout_secs,
             pk_lookup_capacity: config.pk_lookup_capacity,
+            column_index_buffer_size: config.column_index_buffer_size,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            index_build_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            flush_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
@@ -369,8 +381,18 @@ impl MoteDB {
             if self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 return;
             }
+            // Check if index builder thread has crashed (thread handle finished but work remains)
+            if let Some(ref thread) = self.index_builder_thread {
+                if let Some(ref handle) = thread.handle {
+                    if handle.is_finished() {
+                        let pending = self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed);
+                        warn_log!("[wait_for_indexes_ready] Index builder thread exited with {} batches pending", pending);
+                        return;
+                    }
+                }
+            }
             if start.elapsed() > std::time::Duration::from_secs(30) {
-                debug_log!("[wait_for_indexes_ready] ⚠️ Timed out after 30s, pending={}",
+                warn_log!("[wait_for_indexes_ready] Timed out after 30s, pending={}",
                     self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed));
                 return;
             }
@@ -394,6 +416,50 @@ impl MoteDB {
         }
     }
 
+    /// Wait for background threads to actually finish after signaling stop.
+    /// Returns true if all threads stopped within the timeout.
+    pub(crate) fn wait_for_background_threads_stop(&self, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            let mut all_done = true;
+
+            if let Some(ref thread) = self.index_builder_thread {
+                if let Some(ref handle) = thread.handle {
+                    if !handle.is_finished() {
+                        all_done = false;
+                    }
+                }
+            }
+
+            if let Some(ref thread) = self.auto_flush_thread {
+                if let Some(ref handle) = thread.handle {
+                    if !handle.is_finished() {
+                        all_done = false;
+                    }
+                }
+            }
+
+            if let Some(ref thread) = self.auto_checkpoint_thread {
+                if let Some(ref handle) = thread.handle {
+                    if !handle.is_finished() {
+                        all_done = false;
+                    }
+                }
+            }
+
+            if all_done {
+                return true;
+            }
+
+            if start.elapsed() > timeout {
+                warn_log!("[wait_for_background_threads_stop] Timed out after {:?}", timeout);
+                return false;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Clone self for callback (only what's needed)
     pub(crate) fn clone_for_callback(&self) -> Self {
         Self {
@@ -408,6 +474,8 @@ impl MoteDB {
             txn_coordinator: self.txn_coordinator.clone(),
             version_store: self.version_store.clone(),
             pending_updates: self.pending_updates.clone(),
+            index_build_errors: self.index_build_errors.clone(),
+            flush_errors: self.flush_errors.clone(),
             vector_indexes: self.vector_indexes.clone(),
             ioctree_indexes: self.ioctree_indexes.clone(),
             text_indexes: self.text_indexes.clone(),
@@ -421,6 +489,7 @@ impl MoteDB {
             index_update_strategy: self.index_update_strategy.clone(),
             query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
             pk_lookup_capacity: self.pk_lookup_capacity,
+            column_index_buffer_size: self.column_index_buffer_size,
             is_flushing: self.is_flushing.clone(),
             is_pipeline_active: self.is_pipeline_active.clone(),  // shared — clones see true when pipeline runs
             pending_index_batches: self.pending_index_batches.clone(),
@@ -537,7 +606,9 @@ impl MoteDB {
                         max_row_id = max_row_id.max(*row_id);
                         if *txn_id == 0 || committed_txns.contains(txn_id) {
                             if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
-                                let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                                if let Err(e) = timestamp_idx.insert(ts.as_micros() as u64, *row_id) {
+                                    warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
+                                }
                             }
                         }
                     }
@@ -547,7 +618,9 @@ impl MoteDB {
                             // Extract timestamp from raw data for index
                             if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
                                 if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                                    let _ = timestamp_idx.insert(ts.as_micros() as u64, *row_id);
+                                    if let Err(e) = timestamp_idx.insert(ts.as_micros() as u64, *row_id) {
+                                    warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
+                                }
                                 }
                             }
                         }
@@ -782,9 +855,12 @@ impl MoteDB {
             index_update_strategy: config.index_update_strategy.clone(),
             query_timeout_secs: config.query_timeout_secs,
             pk_lookup_capacity: config.pk_lookup_capacity,
+            column_index_buffer_size: config.column_index_buffer_size,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            index_build_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            flush_errors: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             checkpoint_mutex: Arc::new(Mutex::new(())),
             is_closed: Arc::new(AtomicBool::new(false)),
             auto_checkpoint_thread: None,
@@ -1087,8 +1163,9 @@ impl MoteDB {
                         Ok(batch) => {
                             for (table_name, raw_rows) in &batch.tables_data {
                                 if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
-                                    debug_log!("[IndexBuilder] ⚠️ Index build failed for '{}': {:?}",
+                                    warn_log!("[IndexBuilder] Index build failed for '{}': {:?}",
                                         table_name, e);
+                                    db.index_build_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
                             db.pending_index_batches.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1193,7 +1270,10 @@ impl MoteDB {
                             }
                             // Drain any queued requests — coalesce multiple flushes into one
                             while flush_rx.try_recv().is_ok() {}
-                            let _ = db.flush();
+                            if let Err(e) = db.flush() {
+                                warn_log!("[AutoFlush] Flush failed: {}", e);
+                                db.flush_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             // No flush request — don't flush empty memtable
@@ -1429,7 +1509,9 @@ impl Drop for MoteDB {
             self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
             thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(handle) = thread.handle.take() {
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    warn_log!("[MoteDB::Drop] Index builder thread panicked: {:?}", e);
+                }
             }
         }
         self.index_build_tx = None;
@@ -1440,7 +1522,9 @@ impl Drop for MoteDB {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-checkpoint thread...");
             thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(handle) = thread.handle.take() {
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    warn_log!("[MoteDB::Drop] Auto-checkpoint thread panicked: {:?}", e);
+                }
             }
             debug_log!("[MoteDB::Drop] ✅ Auto-checkpoint thread stopped");
         }
@@ -1452,28 +1536,21 @@ impl Drop for MoteDB {
             // Drop sender to unblock recv
             drop(thread.flush_tx);
             if let Some(handle) = thread.handle.take() {
-                let _ = handle.join();
+                if let Err(e) = handle.join() {
+                    warn_log!("[MoteDB::Drop] Auto-flush thread panicked: {:?}", e);
+                }
             }
             debug_log!("[MoteDB::Drop] ✅ Auto-flush thread stopped");
         }
 
         // Flush columnar store before final checkpoint
         if let Err(e) = self.columnar_store.flush_all() {
-            debug_log!("[MoteDB::Drop] ⚠️  Columnar store flush failed: {:?}", e);
+            warn_log!("[Drop] Columnar store flush failed: {:?}", e);
         }
 
-        // ⚠️ CRITICAL: Always checkpoint on drop to:
-        // 1. Persist all data safely
-        // 2. Truncate WAL files (prevent accumulation)
-        // 3. Ensure clean shutdown
-
-        debug_log!("[MoteDB::Drop] 🚪 Database closing, performing final checkpoint...");
-        
-        // Ignore errors during drop (logging only)
-        // We're shutting down anyway, and panic in drop() is dangerous
-        if let Err(e) = self.checkpoint_full() {
-            debug_log!("[MoteDB::Drop] ⚠️  Failed to checkpoint during drop: {:?}", e);
-            debug_log!("[MoteDB::Drop] ⚠️  WAL files may not be cleaned up");
+        if let Err(e) = self.checkpoint_on_drop() {
+            warn_log!("[Drop] Final checkpoint failed: {:?}", e);
+            warn_log!("[Drop] WAL files may not be cleaned up");
         } else {
             debug_log!("[MoteDB::Drop] ✅ Final checkpoint complete, WAL cleaned");
         }

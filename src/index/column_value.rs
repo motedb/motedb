@@ -35,13 +35,21 @@ pub struct ColumnValueIndexConfig {
     pub max_page_size: usize,
     /// Cache size in pages
     pub cache_size: usize,
+    /// In-memory buffer size for writes before draining to B+Tree (bytes)
+    pub mem_buffer_size: usize,
+    /// Minimum number of immutable buffers before draining to B+Tree.
+    /// Higher values reduce B+Tree write amplification at the cost of memory.
+    /// Default: 2 (drain only when 2+ immutable buffers accumulated).
+    pub drain_threshold: usize,
 }
 
 impl Default for ColumnValueIndexConfig {
     fn default() -> Self {
         Self {
             max_page_size: 4096,
-            cache_size: 16,
+            cache_size: 1024,
+            mem_buffer_size: 1024 * 1024, // 1MB
+            drain_threshold: 2,
         }
     }
 }
@@ -55,10 +63,10 @@ const ROW_ID_SIZE: usize = 8;
 const VALUE_LEN_SIZE: usize = 2;
 
 /// Key for the B-Tree: (column_value, row_id)
-/// Compact binary encoding — no bincode, no Vec allocation in serialized form.
+/// value_bytes is a fixed 12-byte stack array — zero heap allocation on clone.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexKey {
-    value_bytes: Vec<u8>,
+    value_bytes: [u8; VALUE_DATA_SIZE],
     row_id: RowId,
 }
 
@@ -69,19 +77,11 @@ impl std::hash::Hash for IndexKey {
     }
 }
 
-/// Normalize an IndexKey for tombstone operations.
-///
-/// BTreeKey::serialize truncates value_bytes to VALUE_DATA_SIZE (12 bytes).
-/// After a round-trip through btree, deserialized keys have truncated value_bytes
-/// for long text. Tombstones must use the same normalized form so that both
-/// mem-buffer keys (full) and btree keys (truncated) match correctly.
+/// Normalize an IndexKey for tombstone operations. With fixed-size value_bytes,
+/// this is a simple stack copy — no heap allocation.
 fn tombstone_key(key: &IndexKey) -> IndexKey {
     IndexKey {
-        value_bytes: if key.value_bytes.len() > VALUE_DATA_SIZE {
-            key.value_bytes[..VALUE_DATA_SIZE].to_vec()
-        } else {
-            key.value_bytes.clone()
-        },
+        value_bytes: key.value_bytes,
         row_id: key.row_id,
     }
 }
@@ -91,16 +91,15 @@ impl BTreeKey for IndexKey {
         let key_size = Self::key_size();
         let mut result = vec![0u8; key_size];
 
-        // Value data (zero-padded to VALUE_DATA_SIZE)
-        let val_len = self.value_bytes.len().min(VALUE_DATA_SIZE);
-        result[..val_len].copy_from_slice(&self.value_bytes[..val_len]);
+        // Value data: copy 12 bytes as-is
+        result[..VALUE_DATA_SIZE].copy_from_slice(&self.value_bytes[..]);
 
         // Row ID (big-endian for proper ordering)
         result[VALUE_DATA_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE]
             .copy_from_slice(&self.row_id.to_be_bytes());
 
-        // Value length (for deserialization)
-        let vlen = self.value_bytes.len() as u16;
+        // Value length = VALUE_DATA_SIZE (always 12 for fixed-size)
+        let vlen = VALUE_DATA_SIZE as u16;
         result[VALUE_DATA_SIZE + ROW_ID_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE]
             .copy_from_slice(&vlen.to_be_bytes());
 
@@ -113,21 +112,9 @@ impl BTreeKey for IndexKey {
             return Err(StorageError::Serialization("Invalid key: too short".to_string()));
         }
 
-        // Read value length
-        let vlen = u16::from_be_bytes(
-            bytes[VALUE_DATA_SIZE + ROW_ID_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE]
-                .try_into()
-                .map_err(|_| StorageError::Serialization("Invalid value_len".to_string()))?
-        ) as usize;
-
-        // Reconstruct value_bytes
-        let value_bytes = if vlen <= VALUE_DATA_SIZE {
-            bytes[..vlen].to_vec()
-        } else {
-            // Truncated during serialization — use what we have
-            // Range scans still work because the prefix is preserved
-            bytes[..VALUE_DATA_SIZE].to_vec()
-        };
+        // Reconstruct fixed-size value_bytes
+        let mut value_bytes = [0u8; VALUE_DATA_SIZE];
+        value_bytes.copy_from_slice(&bytes[..VALUE_DATA_SIZE]);
 
         // Row ID
         let row_id = u64::from_be_bytes(
@@ -171,8 +158,16 @@ pub struct ColumnValueIndex {
     /// Deleted keys not yet purged from immutable buffers.
     /// Keys are normalized via `tombstone_key()` to match btree's truncated format.
     tombstones: Mutex<HashSet<IndexKey>>,
+    /// Keys to delete from B+Tree during next drain (deferred from update path).
+    pending_deletes: Mutex<Vec<IndexKey>>,
     /// Serializes drain_immutable_to_btree to prevent thundering herd.
     drain_lock: Mutex<()>,
+    /// Minimum immutable buffers before triggering drain (default 2).
+    drain_threshold: usize,
+    /// Set to true when the index is first created or has been stale.
+    /// The async pipeline checks this flag; if false, the index is already
+    /// up-to-date from synchronous INSERT/UPDATE/DELETE paths.
+    needs_rebuild: std::sync::atomic::AtomicBool,
 }
 
 impl ColumnValueIndex {
@@ -200,9 +195,12 @@ impl ColumnValueIndex {
             _storage_path: storage_path,
             btree: Arc::new(RwLock::new(btree)),
             lru_cache: Arc::new(CachedIndex::new(500)),
-            mem_buffer: IndexMemBuffer::new(1024 * 1024), // 1MB buffer
+            mem_buffer: IndexMemBuffer::new(config.mem_buffer_size),
             tombstones: Mutex::new(HashSet::new()),
+            pending_deletes: Mutex::new(Vec::new()),
             drain_lock: Mutex::new(()),
+            drain_threshold: config.drain_threshold,
+            needs_rebuild: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -224,13 +222,15 @@ impl ColumnValueIndex {
             row_id,
         };
 
-        // Write to mem buffer (cheap RwLock on BTreeMap)
+        // Write to mem buffer (primary write path)
         let full = self.mem_buffer.insert(key.clone(), ()).map_err(|e| {
             StorageError::InvalidData(e)
         })?;
 
-        // Re-insert cancels any pending tombstone (normalized key)
-        self.tombstones.lock().remove(&tombstone_key(&key));
+        // Re-insert cancels any pending tombstone — non-blocking (skip if contended)
+        if let Some(mut ts) = self.tombstones.try_lock() {
+            ts.remove(&tombstone_key(&key));
+        }
 
         // If buffer is full, drain immutable buffers to btree (non-blocking)
         if full {
@@ -239,8 +239,58 @@ impl ColumnValueIndex {
             }
         }
 
-        // Invalidate LRU cache for this value (new entry changes result set)
-        self.lru_cache.invalidate(value);
+        // Invalidate LRU cache — skip if cache is empty or lock is contended
+        self.lru_cache.try_invalidate(value);
+
+        Ok(())
+    }
+
+    /// Atomic update: delete old_value→row_id and insert new_value→row_id.
+    /// Acquires locks once instead of twice, and drains at most once.
+    pub fn update(&self, old_value: &Value, new_value: &Value, row_id: RowId) -> Result<()> {
+        let old_value_bytes = self.value_to_bytes(old_value)?;
+        let new_value_bytes = self.value_to_bytes(new_value)?;
+        let old_key = IndexKey { value_bytes: old_value_bytes, row_id };
+        let new_key = IndexKey { value_bytes: new_value_bytes, row_id };
+
+        // 1. Remove old key from active mem_buffer
+        self.mem_buffer.delete(&old_key);
+
+        // 2. Defer B+Tree delete to drain (avoid write lock on hot path)
+        //    Skip if value unchanged (no-op update would delete the entry we just re-inserted).
+        let pending_len = if old_key != new_key {
+            let mut pending = self.pending_deletes.lock();
+            pending.push(old_key.clone());
+            pending.len()
+        } else {
+            0
+        };
+
+        // 3. Tombstone old key (prevents resurrection from immutable buffers during drain).
+        //    Remove any prior tombstone on the new key so it becomes visible.
+        {
+            let mut tombstones = self.tombstones.lock();
+            tombstones.remove(&tombstone_key(&new_key)); // cancel prior tombstone
+            if old_key != new_key {
+                tombstones.insert(tombstone_key(&old_key)); // mark old entry for removal
+            }
+        }
+
+        // 4. Write new key to mem_buffer
+        let full = self.mem_buffer.insert(new_key.clone(), ()).map_err(|e| {
+            StorageError::InvalidData(e)
+        })?;
+
+        // 5. Drain if buffer is full OR pending_deletes accumulated too many
+        if full || pending_len > 10_000 {
+            if let Some(_guard) = self.drain_lock.try_lock() {
+                self.drain_immutable_to_btree()?;
+            }
+        }
+
+        // 6. Invalidate LRU cache — non-blocking
+        self.lru_cache.try_invalidate(old_value);
+        self.lru_cache.try_invalidate(new_value);
 
         Ok(())
     }
@@ -289,18 +339,16 @@ impl ColumnValueIndex {
     }
 
     /// Point query: get all row_ids with exact value
-    pub fn get(&self, value: &Value) -> Result<Vec<RowId>> {
-        // Try LRU cache first
+    /// Get row IDs for a value — returns Arc to avoid cloning the Vec on cache hits.
+    pub fn get_arc(&self, value: &Value) -> Result<Arc<Vec<RowId>>> {
+        // Try LRU cache first (no locks needed)
         if let Some(cached_ids) = self.lru_cache.get(value) {
-            return Ok((*cached_ids).clone());
+            return Ok(cached_ids);
         }
 
         self.lru_cache.record_miss();
 
         let value_bytes = self.value_to_bytes(value)?;
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
-
         let start_key = IndexKey {
             value_bytes: value_bytes.clone(),
             row_id: 0,
@@ -310,50 +358,111 @@ impl ColumnValueIndex {
             row_id: RowId::MAX,
         };
 
-        // 1. Check mem buffer
+        // 🔒 Acquire tombstones BEFORE btree to prevent deadlock with flush_buffer.
+        // All write paths (flush_buffer, delete, delete_range, update) follow the
+        // order tombstones → btree. Readers must follow the same order.
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // Collect from mem_buffer (filter tombstones inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if key.value_bytes == value_bytes && seen.insert(key.row_id) {
+            if key.value_bytes == value_bytes
+                && !tombstones.contains(&tombstone_key(&key))
+                && seen.insert(key.row_id)
+            {
                 results.push(key);
             }
         }
 
-        // 2. Check persistent btree
+        // Collect from persistent btree (filter tombstones inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if key.value_bytes == value_bytes && seen.insert(key.row_id) {
+                if key.value_bytes == value_bytes
+                    && !tombstones.contains(&tombstone_key(&key))
+                    && seen.insert(key.row_id)
+                {
                     results.push(key);
                 }
             }
         }
 
-        // 3. Filter tombstones AND cache atomically.
-        // Holding the tombstone lock during cache put prevents a concurrent delete
-        // from adding a tombstone between the filter and the cache (TOCTOU fix).
-        let row_ids = {
-            let tombstones = self.tombstones.lock();
-            let filtered: Vec<RowId> = results.into_iter()
-                .filter(|key| !tombstones.contains(&tombstone_key(key)))
-                .map(|key| key.row_id)
-                .collect();
-            if !filtered.is_empty() {
-                self.lru_cache.put(value.clone(), filtered.clone());
-            }
-            filtered
+        // Cache atomically while still holding tombstone lock.
+        // This prevents TOCTOU: a concurrent delete could add a tombstone
+        // between our filter and cache, making the cache stale.
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
+        let arc = Arc::new(row_ids);
+        if !arc.is_empty() {
+            self.lru_cache.put(value.clone(), (*arc).clone());
+        }
+        drop(tombstones);
+        Ok(arc)
+    }
+
+    pub fn get(&self, value: &Value) -> Result<Vec<RowId>> {
+        // Try LRU cache first (no locks needed)
+        if let Some(cached_ids) = self.lru_cache.get(value) {
+            return Ok((*cached_ids).clone());
+        }
+
+        self.lru_cache.record_miss();
+
+        let value_bytes = self.value_to_bytes(value)?;
+        let start_key = IndexKey {
+            value_bytes: value_bytes.clone(),
+            row_id: 0,
+        };
+        let end_key = IndexKey {
+            value_bytes: value_bytes.clone(),
+            row_id: RowId::MAX,
         };
 
-        Ok(row_ids)
+        // 🔒 tombstones before btree — consistent with flush_buffer/deletion lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Check mem buffer (filter tombstones inline)
+        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
+        for (key, _) in buffer_results {
+            if key.value_bytes == value_bytes
+                && !tombstones.contains(&tombstone_key(&key))
+                && seen.insert(key.row_id)
+            {
+                results.push(key);
+            }
+        }
+
+        // 2. Check persistent btree (filter tombstones inline)
+        {
+            let btree = self.btree.read();
+            let btree_results = btree.range(&start_key, &end_key)?;
+            for (key, _) in btree_results {
+                if key.value_bytes == value_bytes
+                    && !tombstones.contains(&tombstone_key(&key))
+                    && seen.insert(key.row_id)
+                {
+                    results.push(key);
+                }
+            }
+        }
+
+        // 3. Cache atomically while holding tombstone lock (TOCTOU prevention)
+        let filtered: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
+        if !filtered.is_empty() {
+            self.lru_cache.put(value.clone(), filtered.clone());
+        }
+        drop(tombstones);
+        Ok(filtered)
     }
 
     /// Range query: get all row_ids where start <= value <= end
     pub fn range(&self, start: &Value, end: &Value) -> Result<Vec<RowId>> {
         let start_bytes = self.value_to_bytes(start)?;
         let end_bytes = self.value_to_bytes(end)?;
-
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
 
         let start_key = IndexKey {
             value_bytes: start_bytes,
@@ -364,62 +473,60 @@ impl ColumnValueIndex {
             row_id: RowId::MAX,
         };
 
-        // 1. Mem buffer
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::with_capacity(64);
+        let mut seen: HashSet<u64> = HashSet::with_capacity(64);
+
+        // 1. Mem buffer (filter tombstones inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter tombstones inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if seen.insert(key.row_id) {
+                if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
-    }
-
-    /// Scan all entries in order
-    pub fn scan_all_row_ids(&self) -> Result<Vec<RowId>> {
-        self.scan_row_ids_with_limit(None)
     }
 
     /// Scan entries with optional limit
     pub fn scan_row_ids_with_limit(&self, limit: Option<usize>) -> Result<Vec<RowId>> {
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
-
         let min_key = IndexKey {
-            value_bytes: vec![],
+            value_bytes: [0u8; VALUE_DATA_SIZE],
             row_id: 0,
         };
         let max_key = IndexKey {
-            value_bytes: vec![0xFF; VALUE_DATA_SIZE],
+            value_bytes: [0xFFu8; VALUE_DATA_SIZE],
             row_id: RowId::MAX,
         };
 
-        // 1. Mem buffer
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Mem buffer (filter tombstones inline)
         let buffer_results = self.mem_buffer.range(&min_key, &max_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter tombstones inline)
         {
             let btree = self.btree.read();
             let all_entries = if let Some(limit_count) = limit {
@@ -428,18 +535,14 @@ impl ColumnValueIndex {
                 btree.range(&min_key, &max_key)?
             };
             for (key, _) in all_entries {
-                if seen.insert(key.row_id) {
+                if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
     }
 
@@ -447,43 +550,47 @@ impl ColumnValueIndex {
     pub fn query_less_than(&self, upper_bound: &Value) -> Result<Vec<RowId>> {
         let upper_bytes = self.value_to_bytes(upper_bound)?;
 
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
-
         let start_key = IndexKey {
-            value_bytes: vec![],
+            value_bytes: [0u8; VALUE_DATA_SIZE],
             row_id: 0,
         };
         let end_key = IndexKey {
-            value_bytes: upper_bytes,
-            row_id: 0,
+            value_bytes: upper_bytes.clone(),
+            row_id: RowId::MAX,
         };
 
-        // 1. Mem buffer
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Mem buffer (filter tombstones inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if key.value_bytes != upper_bytes
+                && !tombstones.contains(&tombstone_key(&key))
+                && seen.insert(key.row_id)
+            {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter tombstones inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if seen.insert(key.row_id) {
+                if key.value_bytes != upper_bytes
+                    && !tombstones.contains(&tombstone_key(&key))
+                    && seen.insert(key.row_id)
+                {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
     }
 
@@ -491,43 +598,47 @@ impl ColumnValueIndex {
     pub fn query_greater_than(&self, lower_bound: &Value) -> Result<Vec<RowId>> {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
 
+        let start_key = IndexKey {
+            value_bytes: lower_bytes.clone(),
+            row_id: 0,
+        };
+        let end_key = IndexKey {
+            value_bytes: [0xFFu8; VALUE_DATA_SIZE],
+            row_id: RowId::MAX,
+        };
+
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
         let mut results: Vec<IndexKey> = Vec::new();
         let mut seen = HashSet::new();
 
-        let start_key = IndexKey {
-            value_bytes: lower_bytes,
-            row_id: RowId::MAX,
-        };
-        let end_key = IndexKey {
-            value_bytes: vec![0xFF; VALUE_DATA_SIZE],
-            row_id: RowId::MAX,
-        };
-
-        // 1. Mem buffer
+        // 1. Mem buffer (filter inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if key.value_bytes != lower_bytes
+                && !tombstones.contains(&tombstone_key(&key))
+                && seen.insert(key.row_id)
+            {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if seen.insert(key.row_id) {
+                if key.value_bytes != lower_bytes
+                    && !tombstones.contains(&tombstone_key(&key))
+                    && seen.insert(key.row_id)
+                {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
     }
 
@@ -535,11 +646,8 @@ impl ColumnValueIndex {
     pub fn query_less_than_or_equal(&self, upper_bound: &Value) -> Result<Vec<RowId>> {
         let upper_bytes = self.value_to_bytes(upper_bound)?;
 
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
-
         let start_key = IndexKey {
-            value_bytes: vec![],
+            value_bytes: [0u8; VALUE_DATA_SIZE],
             row_id: 0,
         };
         let end_key = IndexKey {
@@ -547,31 +655,32 @@ impl ColumnValueIndex {
             row_id: RowId::MAX,
         };
 
-        // 1. Mem buffer
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Mem buffer (filter inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if seen.insert(key.row_id) {
+                if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
     }
 
@@ -579,43 +688,41 @@ impl ColumnValueIndex {
     pub fn query_greater_than_or_equal(&self, lower_bound: &Value) -> Result<Vec<RowId>> {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
 
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
-
         let start_key = IndexKey {
             value_bytes: lower_bytes,
             row_id: 0,
         };
         let end_key = IndexKey {
-            value_bytes: vec![0xFF; VALUE_DATA_SIZE],
+            value_bytes: [0xFFu8; VALUE_DATA_SIZE],
             row_id: RowId::MAX,
         };
 
-        // 1. Mem buffer
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Mem buffer (filter inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if seen.insert(key.row_id) {
+                if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
     }
 
@@ -626,9 +733,6 @@ impl ColumnValueIndex {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
         let upper_bytes = self.value_to_bytes(upper_bound)?;
 
-        let mut results: Vec<IndexKey> = Vec::new();
-        let mut seen = HashSet::new();
-
         let start_key = IndexKey {
             value_bytes: lower_bytes,
             row_id: if lower_inclusive { 0 } else { RowId::MAX },
@@ -638,31 +742,32 @@ impl ColumnValueIndex {
             row_id: if upper_inclusive { RowId::MAX } else { 0 },
         };
 
-        // 1. Mem buffer
+        // 🔒 tombstones before btree — consistent lock order
+        let tombstones = self.tombstones.lock();
+        let mut results: Vec<IndexKey> = Vec::new();
+        let mut seen = HashSet::new();
+
+        // 1. Mem buffer (filter inline)
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if seen.insert(key.row_id) {
+            if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                 results.push(key);
             }
         }
 
-        // 2. Btree
+        // 2. Btree (filter inline)
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if seen.insert(key.row_id) {
+                if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
                     results.push(key);
                 }
             }
         }
+        drop(tombstones);
 
-        // 3. Filter tombstones
-        let tombstones = self.tombstones.lock();
-        let row_ids: Vec<RowId> = results.into_iter()
-            .filter(|key| !tombstones.contains(&tombstone_key(key)))
-            .map(|key| key.row_id)
-            .collect();
+        let row_ids: Vec<RowId> = results.into_iter().map(|key| key.row_id).collect();
         Ok(row_ids)
     }
 
@@ -686,48 +791,6 @@ impl ColumnValueIndex {
         drop(btree);
 
         self.lru_cache.invalidate(value);
-
-        Ok(())
-    }
-
-    /// Batch delete with smart cache invalidation
-    pub fn batch_delete(&self, items: Vec<(Value, RowId)>) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        // 1. Delete from mem buffer, mark tombstones, delete from btree
-        {
-            let mut tombstones = self.tombstones.lock();
-            let mut btree = self.btree.write();
-            for (value, row_id) in &items {
-                let value_bytes = self.value_to_bytes(value)?;
-                let key = IndexKey {
-                    value_bytes,
-                    row_id: *row_id,
-                };
-                self.mem_buffer.delete(&key);
-                tombstones.insert(tombstone_key(&key));
-                btree.delete(&key)?;
-            }
-        }
-
-        // 2. Batch invalidate LRU cache
-        let mut unique_values = items.into_iter()
-            .map(|(value, _)| value)
-            .collect::<Vec<_>>();
-        unique_values.sort_by(|a, b| {
-            let a_bytes = Self::value_to_bytes_helper(a).unwrap_or_default();
-            let b_bytes = Self::value_to_bytes_helper(b).unwrap_or_default();
-            a_bytes.cmp(&b_bytes)
-        });
-        unique_values.dedup_by(|a, b| {
-            let a_bytes = Self::value_to_bytes_helper(a).unwrap_or_default();
-            let b_bytes = Self::value_to_bytes_helper(b).unwrap_or_default();
-            a_bytes == b_bytes
-        });
-
-        self.lru_cache.invalidate_batch(&unique_values);
 
         Ok(())
     }
@@ -790,7 +853,17 @@ impl ColumnValueIndex {
     /// Drain immutable buffers to btree (called when buffer is full or during checkpoint)
     ///
     /// Caller must hold drain_lock.
+    ///
+    /// Uses `drain_threshold` to batch multiple immutable buffers into a single
+    /// B+Tree write cycle, reducing write amplification.
     fn drain_immutable_to_btree(&self) -> Result<()> {
+        self.drain_immutable_to_btree_impl(false)
+    }
+
+    fn drain_immutable_to_btree_impl(&self, force: bool) -> Result<()> {
+        if !force && self.mem_buffer.immutable_count() < self.drain_threshold {
+            return Ok(());
+        }
         while self.mem_buffer.should_flush() {
             if let Some(entries) = self.mem_buffer.flush().map_err(|e| StorageError::InvalidData(e))? {
                 if !entries.is_empty() {
@@ -806,23 +879,49 @@ impl ColumnValueIndex {
                 break;
             }
         }
+
+        // Process deferred deletes from update path
+        let deletes: Vec<IndexKey> = {
+            let mut pending = self.pending_deletes.lock();
+            std::mem::take(&mut *pending)
+        };
+        if !deletes.is_empty() {
+            let mut btree = self.btree.write();
+            for key in &deletes {
+                let _ = btree.delete(key);
+            }
+        }
+
         Ok(())
     }
 
-    /// Flush all buffered entries (active + immutable) to persistent btree
+    /// Flush all buffered entries (active + immutable) to persistent btree.
+    /// Drains everything including the active buffer (used by checkpoint/flush).
     pub fn flush_buffer(&self) -> Result<()> {
         let entries = self.mem_buffer.drain();
-        if !entries.is_empty() {
+        let has_entries = !entries.is_empty();
+        let deletes: Vec<IndexKey> = {
+            let mut pending = self.pending_deletes.lock();
+            std::mem::take(&mut *pending)
+        };
+        let has_deletes = !deletes.is_empty();
+
+        if has_entries || has_deletes {
             let tombstones = self.tombstones.lock();
             let mut btree = self.btree.write();
+            // Insert buffered entries (skip tombstoned)
             for (key, _) in &entries {
                 if !tombstones.contains(&tombstone_key(key)) {
                     btree.insert(key.clone(), vec![])?;
                 }
             }
+            // Process deferred deletes from update path
+            for key in &deletes {
+                let _ = btree.delete(key);
+            }
             drop(btree);
             drop(tombstones);
-            // All buffers drained — tombstones no longer needed for resurrection prevention
+            // All buffers drained + deletes applied — tombstones no longer needed
             self.tombstones.lock().clear();
         }
         Ok(())
@@ -837,32 +936,47 @@ impl ColumnValueIndex {
         }
     }
 
+    /// Returns true if this index needs to be rebuilt by the async pipeline.
+    /// Newly created indexes or those that missed synchronous updates need rebuilding.
+    pub fn needs_rebuild(&self) -> bool {
+        self.needs_rebuild.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Clear the rebuild flag after the async pipeline successfully builds the index.
+    pub fn mark_rebuilt(&self) {
+        self.needs_rebuild.store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// Get the approximate number of entries in the index
     pub fn entry_count(&self) -> usize {
         let btree = self.btree.read();
         btree.approximate_entry_count()
     }
 
-    // Helper: Convert Value to bytes for comparison
-    fn value_to_bytes(&self, value: &Value) -> Result<Vec<u8>> {
+    // Helper: Convert Value to fixed 12-byte key (zero-padded for short types)
+    fn value_to_bytes(&self, value: &Value) -> Result<[u8; VALUE_DATA_SIZE]> {
         Self::value_to_bytes_helper(value)
     }
 
-    fn value_to_bytes_helper(value: &Value) -> Result<Vec<u8>> {
-        let bytes = match value {
-            Value::Integer(i) => i.to_be_bytes().to_vec(),
-            Value::Float(f) => f.to_be_bytes().to_vec(),
-            Value::Text(s) => s.as_bytes().to_vec(),
-            Value::Bool(b) => vec![if *b { 1 } else { 0 }],
-            Value::Timestamp(ts) => ts.as_micros().to_be_bytes().to_vec(),
+    fn value_to_bytes_helper(value: &Value) -> Result<[u8; VALUE_DATA_SIZE]> {
+        let mut buf = [0u8; VALUE_DATA_SIZE];
+        match value {
+            Value::Integer(i) => buf[..8].copy_from_slice(&i.to_be_bytes()),
+            Value::Float(f) => buf[..8].copy_from_slice(&f.to_be_bytes()),
+            Value::Timestamp(ts) => buf[..8].copy_from_slice(&ts.as_micros().to_be_bytes()),
+            Value::Bool(b) => buf[0] = if *b { 1 } else { 0 },
+            Value::Text(s) => {
+                let raw = s.as_bytes();
+                let len = raw.len().min(VALUE_DATA_SIZE);
+                buf[..len].copy_from_slice(&raw[..len]);
+            }
             _ => {
                 return Err(StorageError::InvalidData(
                     format!("Unsupported value type for indexing: {:?}", value)
                 ));
             }
         };
-
-        Ok(bytes)
+        Ok(buf)
     }
 }
 
@@ -1024,16 +1138,17 @@ mod tests {
 
     #[test]
     fn test_tombstone_key_normalization() {
-        let short = IndexKey { value_bytes: b"hello".to_vec(), row_id: 42 };
+        let mut vb = [0u8; VALUE_DATA_SIZE];
+        vb[..5].copy_from_slice(b"hello");
+        let short = IndexKey { value_bytes: vb, row_id: 42 };
         let tk_short = tombstone_key(&short);
-        assert_eq!(tk_short.value_bytes, b"hello".to_vec()); // no truncation
+        assert_eq!(tk_short.value_bytes, vb);
 
-        let long = IndexKey {
-            value_bytes: b"abcdefghijklmno_xtralong".to_vec(),
-            row_id: 99,
-        };
+        let mut vb2 = [0u8; VALUE_DATA_SIZE];
+        vb2[..12].copy_from_slice(b"abcdefghijkl");
+        let long = IndexKey { value_bytes: vb2, row_id: 99 };
         let tk_long = tombstone_key(&long);
-        assert_eq!(tk_long.value_bytes, b"abcdefghijkl".to_vec()); // truncated to 12
+        assert_eq!(tk_long.value_bytes, vb2);
         assert_eq!(tk_long.row_id, 99);
     }
 
@@ -1049,7 +1164,7 @@ mod tests {
             ColumnValueIndexConfig::default(),
         )?;
 
-        let long_val = Value::Text("abcdefghijklmno_xtralong_value".to_string());
+        let long_val = Value::text("abcdefghijklmno_xtralong_value".to_string());
 
         // Insert, flush to btree, then delete
         index.insert(&long_val, 1)?;
@@ -1155,6 +1270,189 @@ mod tests {
                 "Deleted key (value={}, row_id={}) still present", i, i);
         }
 
+        Ok(())
+    }
+
+    /// Regression: concurrent get_arc + flush_buffer must not deadlock.
+    /// Ensures both paths follow tombstones → btree lock order.
+    #[test]
+    fn test_concurrent_read_and_flush_no_deadlock() -> Result<()> {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_deadlock2.idx");
+        let index = Arc::new(ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?);
+
+        for i in 0..2000i64 {
+            index.insert(&Value::Integer(i % 100), i as RowId)?;
+        }
+
+        let idx_reader = Arc::clone(&index);
+        let idx_writer = Arc::clone(&index);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s1 = Arc::clone(&stop);
+        let s2 = Arc::clone(&stop);
+
+        let reader = std::thread::spawn(move || {
+            while !s1.load(std::sync::atomic::Ordering::Relaxed) {
+                for v in 0..50i64 {
+                    let _ = idx_reader.get_arc(&Value::Integer(v));
+                }
+            }
+        });
+
+        let writer = std::thread::spawn(move || {
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                for i in 0..100i64 {
+                    let _ = idx_writer.insert(&Value::Integer(i % 50), 10000 + i as RowId);
+                }
+                let _ = idx_writer.flush();
+            }
+        });
+
+        // 3 seconds: deadlock would hang forever
+        std::thread::sleep(Duration::from_secs(3));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        writer.join().unwrap();
+        eprintln!("  OK: concurrent read+flush deadlock regression passed");
+        Ok(())
+    }
+
+    /// Verify update(old_value, new_value) atomically moves a row_id.
+    #[test]
+    fn test_update_moves_row_id() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_update.idx");
+        let index = ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+
+        // Insert row 1 with value 100
+        index.insert(&Value::Integer(100), 1)?;
+        assert_eq!(index.get(&Value::Integer(100))?, vec![1]);
+        assert!(index.get(&Value::Integer(200))?.is_empty());
+
+        // Update: row 1 from 100 → 200
+        index.update(&Value::Integer(100), &Value::Integer(200), 1)?;
+
+        // Old value should NOT have row 1 anymore
+        assert!(!index.get(&Value::Integer(100))?.contains(&1),
+            "old value should not contain updated row");
+        // New value SHOULD have row 1
+        assert!(index.get(&Value::Integer(200))?.contains(&1),
+            "new value should contain updated row");
+        // Only one entry for row 1 across both values
+        assert_eq!(index.get(&Value::Integer(100))?.len() + index.get(&Value::Integer(200))?.len(), 1);
+
+        Ok(())
+    }
+
+    /// Verify update with same value (noop) doesn't lose the row_id.
+    #[test]
+    fn test_update_same_value_noop() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_update_same.idx");
+        let index = ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+
+        index.insert(&Value::Integer(100), 5)?;
+        // Update to same value — should be a noop, not a delete
+        index.update(&Value::Integer(100), &Value::Integer(100), 5)?;
+
+        assert!(index.get(&Value::Integer(100))?.contains(&5),
+            "row should still be present after same-value update");
+        Ok(())
+    }
+
+    /// Verify data survives flush: insert → flush → get
+    #[test]
+    fn test_insert_flush_get() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_flush_get.idx");
+        let index = ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+
+        // Insert many entries to force btree writes
+        for i in 0..500i64 {
+            index.insert(&Value::Integer(i % 20), i as RowId)?;
+        }
+
+        // Flush mem_buffer → btree, then btree → disk
+        index.flush()?;
+
+        // Verify data is still correct after flush
+        let ids = index.get(&Value::Integer(5))?;
+        assert!(!ids.is_empty(), "data should survive flush");
+
+        // Verify range query works after flush
+        let range_ids = index.range(&Value::Integer(0), &Value::Integer(10))?;
+        assert!(!range_ids.is_empty(), "range query should work after flush");
+
+        Ok(())
+    }
+
+    /// Batch insert many entries and verify after flush.
+    #[test]
+    fn test_batch_insert_and_flush() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_batch2.idx");
+        let index = ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+        let items: Vec<(Value, RowId)> = (0..1000i64)
+            .map(|i| (Value::Integer(i % 10), i as RowId))
+            .collect();
+        index.batch_insert(items)?;
+        index.flush()?;
+        for v in 0..10i64 {
+            assert_eq!(index.get(&Value::Integer(v))?.len(), 100,
+                "value {} should have 100 row_ids", v);
+        }
+        Ok(())
+    }
+
+    /// Delete then verify gone.
+    #[test]
+    fn test_delete_makes_entry_invisible() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_del2.idx");
+        let index = ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+        index.insert(&Value::Integer(42), 100)?;
+        index.delete(&Value::Integer(42), 100)?;
+        assert!(index.get(&Value::Integer(42))?.is_empty());
+        Ok(())
+    }
+
+    /// Update then flush — verify data survives.
+    #[test]
+    fn test_update_survives_flush() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_upd_flush2.idx");
+        let index = ColumnValueIndex::create(
+            &path, "t".to_string(), "c".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+        index.insert(&Value::Integer(10), 1)?;
+        index.update(&Value::Integer(10), &Value::Integer(20), 1)?;
+        index.flush()?;
+        assert!(index.get(&Value::Integer(20))?.contains(&1),
+            "after update+flush: row 1 should be at new value");
+        assert!(!index.get(&Value::Integer(10))?.contains(&1),
+            "after update+flush: row 1 should NOT be at old value");
         Ok(())
     }
 }

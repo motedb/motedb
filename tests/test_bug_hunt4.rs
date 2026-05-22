@@ -201,5 +201,5 @@ fn test_pk_equality_non_id_column() {
     // PK lookup on non-'id' column should work via fast path or full scan
     let r = rows(&db, "SELECT name FROM items WHERE sku = 200");
     assert_eq!(r.len(), 1, "PK lookup on 'sku' should find 1 row, got {}", r.len());
-    assert_eq!(r[0][0], Value::Text("b".to_string()));
+    assert_eq!(r[0][0], Value::text("b".to_string()));
 }

@@ -20,6 +20,9 @@ pub enum LockMode {
     Exclusive,
 }
 
+/// Max retries for lock acquisition with exponential backoff
+const MAX_LOCK_RETRIES: usize = 10;
+
 /// Lock request waiting in queue
 #[derive(Debug)]
 struct LockWaiter {
@@ -160,12 +163,25 @@ impl LockManager {
             return Ok(());
         }
         
-        // Cannot acquire immediately - would need to wait
-        // For now, fail fast (tests expect immediate failure)
-        // In production, could implement wait queue with timeout
+        // Cannot acquire immediately — retry with bounded exponential backoff
+        for attempt in 0..MAX_LOCK_RETRIES {
+            match attempt {
+                0..=2 => std::hint::spin_loop(),
+                3..=4 => std::thread::yield_now(),
+                _ => std::thread::sleep(std::time::Duration::from_micros(
+                    100 * (1u64 << (attempt - 5).min(5)),
+                )),
+            }
+            if entry.can_grant(mode, txn_id) {
+                entry.grant(txn_id, mode);
+                let mut txn_locks = self.txn_locks.lock();
+                txn_locks.entry(txn_id).or_default().insert(row_id);
+                return Ok(());
+            }
+        }
         Err(StorageError::Transaction(format!(
-            "Lock conflict: txn {} cannot acquire {:?} lock on row {}",
-            txn_id, mode, row_id
+            "Lock timeout after {} retries: txn {} cannot acquire {:?} lock on row {}",
+            MAX_LOCK_RETRIES, txn_id, mode, row_id
         )))
     }
 

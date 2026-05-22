@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use parking_lot::Mutex as PlMutex;
+use parking_lot::Condvar as PlCondvar;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -319,7 +321,9 @@ impl WALRecord {
             if data.len() < 5 {
                 return Err(StorageError::Serialization("WAL: truncated compressed record".into()));
             }
-            let original_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            let original_len = u32::from_le_bytes(
+                data[1..5].try_into().map_err(|_| StorageError::Serialization("WAL: bad compression header".into()))?
+            ) as usize;
             let compressed = &data[5..];
             let decompressed = zstd::decode_all(compressed)
                 .map_err(|e| StorageError::Serialization(format!("WAL zstd decompress failed: {}", e)))?;
@@ -475,15 +479,7 @@ struct PartitionWAL {
 
     /// WAL configuration
     config: WALConfig,
-
-    /// Approximate bytes written since last checkpoint (for auto-checkpoint)
-    bytes_written: u64,
 }
-
-/// Auto-checkpoint threshold (64 MB). On edge devices with SD cards, this prevents
-/// unbounded WAL growth. After each write, if bytes_written exceeds this limit,
-/// checkpoint() is called to truncate the WAL.
-const AUTO_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 impl PartitionWAL {
     /// Create a new partition WAL with config
@@ -500,7 +496,6 @@ impl PartitionWAL {
             next_lsn: 0,
             last_checkpoint: 0,
             config,
-            bytes_written: 0,
         })
     }
 
@@ -594,7 +589,6 @@ impl PartitionWAL {
             next_lsn,
             last_checkpoint,
             config,
-            bytes_written: 0,
         })
     }
 
@@ -670,7 +664,56 @@ impl PartitionWAL {
         write_buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
 
         self.file.write_all(&write_buf)?;
-        self.bytes_written += write_buf.len() as u64;
+
+
+        if self.config.durability_level == DurabilityLevel::Synchronous { self.sync_flush()?; }
+
+        Ok(lsn)
+    }
+
+    fn append_update_raw_ref(
+        &mut self,
+        table_name: &str,
+        row_id: RowId,
+        partition: PartitionId,
+        raw_old: &[u8],
+        raw_new: &[u8],
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+
+        let table_bytes = table_name.as_bytes();
+        let record_len = 1 + 8 + (2 + table_bytes.len()) + 8 + 2 + 4 + raw_old.len() + 4 + raw_new.len();
+
+        let mut record_body = Vec::with_capacity(record_len);
+        record_body.push(TAG_UPDATE_RAW);
+        record_body.extend_from_slice(&txn_id.to_le_bytes());
+        record_body.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
+        record_body.extend_from_slice(table_bytes);
+        record_body.extend_from_slice(&row_id.to_le_bytes());
+        record_body.extend_from_slice(&(partition as u16).to_le_bytes());
+        record_body.extend_from_slice(&(raw_old.len() as u32).to_le_bytes());
+        record_body.extend_from_slice(raw_old);
+        record_body.extend_from_slice(&(raw_new.len() as u32).to_le_bytes());
+        record_body.extend_from_slice(raw_new);
+
+        let payload = Self::compress_if_worthwhile(&record_body);
+
+        let mut write_buf = Vec::with_capacity(20 + payload.len());
+        write_buf.extend_from_slice(&((20 + payload.len()) as u32).to_le_bytes());
+        write_buf.extend_from_slice(&lsn.to_le_bytes());
+        let checksum_offset = write_buf.len();
+        write_buf.extend_from_slice(&0u32.to_le_bytes());
+        write_buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        let record_start = write_buf.len();
+        write_buf.extend_from_slice(&payload);
+
+        let checksum = Checksum::compute(ChecksumType::CRC32C, &write_buf[record_start..]);
+        write_buf[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        self.file.write_all(&write_buf)?;
 
         if self.config.durability_level == DurabilityLevel::Synchronous { self.sync_flush()?; }
 
@@ -711,7 +754,7 @@ impl PartitionWAL {
         buf.extend_from_slice(&payload);
 
         self.file.write_all(&buf)?;
-        self.bytes_written += buf.len() as u64;
+
         Ok(())
     }
 
@@ -824,7 +867,7 @@ impl PartitionWAL {
         // Reset counters
         self.next_lsn = 0;
         self.last_checkpoint = 0;
-        self.bytes_written = 0;
+
 
         Ok(())
     }
@@ -976,19 +1019,22 @@ struct FlushThread {
 struct GroupCommitEntry {
     partition: PartitionId,
     record: WALRecord,
-    /// Caller waits on this condvar until the record is durable
-    done: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Caller waits on this condvar until the record is durable.
+    /// `None` = pending, `Some(Ok(()))` = flushed, `Some(Err(msg))` = flush failed.
+    done: Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>,
 }
 
 struct GroupCommitState {
     /// Queue of pending records
-    queue: std::sync::Mutex<Vec<GroupCommitEntry>>,
+    queue: PlMutex<Vec<GroupCommitEntry>>,
     /// Signal the flush thread to wake up
-    wakeup: std::sync::Condvar,
+    wakeup: PlCondvar,
     /// Maximum records per batch
     max_batch_size: usize,
     /// Maximum wait time in microseconds before flushing
     max_wait_us: u64,
+    /// Last flush error (set by flush thread, checked by callers)
+    last_error: parking_lot::Mutex<Option<StorageError>>,
 }
 
 struct GroupCommitThread {
@@ -1112,7 +1158,9 @@ impl WALManager {
                         // Flush all partitions: BufWriter flush → OS buffer, then sync_data → disk
                         for entry in partitions.iter() {
                             let mut wal = entry.value().lock();
-                            let _ = wal.sync_flush();
+                        if let Err(e) = wal.sync_flush() {
+                            warn_log!("[WAL] Periodic sync_flush failed: {}", e);
+                        }
                         }
 
                         // Adaptive backoff: if no writes, double interval; if writes, reset
@@ -1143,10 +1191,11 @@ impl WALManager {
         if let DurabilityLevel::GroupCommit { max_batch_size, max_wait_us } = config.durability_level {
             let should_stop = Arc::new(AtomicBool::new(false));
             let state = Arc::new(GroupCommitState {
-                queue: std::sync::Mutex::new(Vec::new()),
-                wakeup: std::sync::Condvar::new(),
+                queue: PlMutex::new(Vec::new()),
+                wakeup: PlCondvar::new(),
                 max_batch_size,
                 max_wait_us,
+                last_error: parking_lot::Mutex::new(None),
             });
 
             let should_stop_clone = should_stop.clone();
@@ -1159,28 +1208,28 @@ impl WALManager {
                     while !should_stop_clone.load(Ordering::Relaxed) {
                         // Wait for first entry or shutdown
                         {
-                            let queue = state_clone.queue.lock().unwrap();
+                            let mut queue = state_clone.queue.lock();
                             if queue.is_empty() {
-                                let _ = state_clone.wakeup.wait_timeout(queue, wait_duration).unwrap();
+                                let _ = state_clone.wakeup.wait_for(&mut queue, wait_duration);
                             }
                         }
 
                         // Batch accumulation: use condvar timeout to wait for more entries.
                         // This avoids busy-spinning while still letting batches grow.
                         {
-                            let queue = state_clone.queue.lock().unwrap();
+                            let mut queue = state_clone.queue.lock();
                             if !queue.is_empty() && queue.len() < state_clone.max_batch_size {
                                 // Wait up to max_wait_us for more entries to arrive
-                                let _ = state_clone.wakeup.wait_timeout(
-                                    queue,
+                                let _ = state_clone.wakeup.wait_for(
+                                    &mut queue,
                                     Duration::from_micros(state_clone.max_wait_us),
-                                ).unwrap();
+                                );
                             }
                         }
 
                         // Drain queue (up to max_batch_size)
                         let entries: Vec<GroupCommitEntry> = {
-                            let mut queue = state_clone.queue.lock().unwrap();
+                            let mut queue = state_clone.queue.lock();
                             let drain_count = queue.len().min(state_clone.max_batch_size);
                             queue.drain(..drain_count).collect()
                         };
@@ -1191,7 +1240,7 @@ impl WALManager {
 
                         // Group by partition
                         let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
-                        let mut done_signals: Vec<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>> = Vec::new();
+                        let mut done_signals: Vec<Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>> = Vec::new();
 
                         for entry in entries {
                             groups.entry(entry.partition).or_default().push(entry.record);
@@ -1199,58 +1248,66 @@ impl WALManager {
                         }
 
                         // Flush each partition group
-                        let flush_result = (|| -> Result<()> {
+                        let flush_ok = (|| -> std::result::Result<(), String> {
                             for (partition, records) in groups {
                                 if let Some(entry) = partitions.get(&partition) {
                                     let mut wal = entry.value().lock();
-                                    wal.batch_append(records)?;
+                                    wal.batch_append(records).map_err(|e| e.to_string())?;
                                 }
                             }
                             Ok(())
                         })();
 
-                        // Signal all callers regardless of result
+                        // Signal all callers with the result
                         for done in done_signals {
                             {
-                                let mut flag = done.0.lock().unwrap();
-                                *flag = true;
+                                let mut flag = done.0.lock();
+                                *flag = Some(flush_ok.clone());
                             }
                             done.1.notify_all();
                         }
 
-                        if let Err(e) = flush_result {
-                            debug_log!("[GroupCommit] Flush error: {}", e);
+                        if let Err(ref msg) = flush_ok {
+                            warn_log!("[GroupCommit] Flush error: {}", msg);
+                            *state_clone.last_error.lock() = Some(StorageError::Transaction(msg.clone()));
                         }
                     }
 
                     // Final drain on shutdown
                     let entries: Vec<GroupCommitEntry> = {
-                        let mut queue = state_clone.queue.lock().unwrap();
+                        let mut queue = state_clone.queue.lock();
                         std::mem::take(&mut *queue)
                     };
 
                     if !entries.is_empty() {
                         let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
-                        let mut done_signals: Vec<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>> = Vec::new();
+                        let mut done_signals: Vec<Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>> = Vec::new();
 
                         for entry in entries {
                             groups.entry(entry.partition).or_default().push(entry.record);
                             done_signals.push(entry.done);
                         }
 
-                        for (partition, records) in groups {
-                            if let Some(entry) = partitions.get(&partition) {
-                                let mut wal = entry.value().lock();
-                                let _ = wal.batch_append(records);
+                        let drain_ok = (|| -> std::result::Result<(), String> {
+                            for (partition, records) in groups {
+                                if let Some(entry) = partitions.get(&partition) {
+                                    let mut wal = entry.value().lock();
+                                    wal.batch_append(records).map_err(|e| e.to_string())?;
+                                }
                             }
-                        }
+                            Ok(())
+                        })();
 
                         for done in done_signals {
                             {
-                                let mut flag = done.0.lock().unwrap();
-                                *flag = true;
+                                let mut flag = done.0.lock();
+                                *flag = Some(drain_ok.clone());
                             }
                             done.1.notify_all();
+                        }
+
+                        if let Err(ref msg) = drain_ok {
+                            warn_log!("[WAL] Shutdown drain flush failed: {}", msg);
                         }
                     }
                 })
@@ -1267,34 +1324,42 @@ impl WALManager {
     }
 
     /// Push a record through group commit queue (fire-and-forget).
-    /// Caller returns immediately after enqueue; background thread handles batching & fsync.
+    /// Returns immediately; background thread handles batching & fsync.
+    /// Call `check_flush_errors()` to detect background flush failures.
     fn group_commit_append(
         &self,
         partition: PartitionId,
         record: WALRecord,
     ) -> Result<LogSequenceNumber> {
-        // Signal periodic flush thread that writes are happening
         self.periodic_new_writes.store(true, Ordering::Relaxed);
 
         if let Some(ref gc) = self.group_commit {
+            // Check for prior flush errors before enqueuing
+            if let Some(e) = gc.state.last_error.lock().take() {
+                return Err(e);
+            }
             {
-                let mut queue = gc.state.queue.lock().unwrap();
+                let mut queue = gc.state.queue.lock();
                 queue.push(GroupCommitEntry {
                     partition,
                     record,
-                    done: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+                    done: Arc::new((PlMutex::new(None), PlCondvar::new())),
                 });
             }
             gc.state.wakeup.notify_all();
-
-            Ok(0) // LSN assigned asynchronously by batch_append
+            Ok(0)
         } else {
-            // No group commit — direct append
             let entry = self.partitions.get(&partition)
                 .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
             let mut wal = entry.value().lock();
             wal.append(record)
         }
+    }
+
+    /// Check for any background flush errors accumulated by the group commit thread.
+    /// Returns and clears the last error if one exists.
+    pub fn check_flush_errors(&self) -> Option<StorageError> {
+        self.group_commit.as_ref()?.state.last_error.lock().take()
     }
 
     /// Log an insert operation (uses group commit if enabled)
@@ -1408,6 +1473,70 @@ impl WALManager {
 
     /// Log an update with raw bytes (zero-copy P3)
     pub fn log_update_raw(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_old: Vec<u8>,
+        raw_new: Vec<u8>,
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
+
+        if self.group_commit.is_some() {
+            // GroupCommit: use the owned record path
+            let record = WALRecord::UpdateRaw {
+                table_name: table_name.to_string(),
+                row_id,
+                partition,
+                raw_old,
+                raw_new,
+                txn_id,
+            };
+            return self.group_commit_append(partition, record);
+        }
+
+        // Direct path: encode and write in one step
+        let entry = self.partitions.get(&partition)
+            .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
+        let mut wal = entry.value().lock();
+        wal.append_update_raw_ref(table_name, row_id, partition, &raw_old, &raw_new, txn_id)
+    }
+
+    /// Log an update by reference (avoids cloning raw_old and raw_new).
+    /// Only usable with GroupCommit disabled (falls back to owned path if enabled).
+    pub fn log_update_raw_ref(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_old: &[u8],
+        raw_new: &[u8],
+        txn_id: TransactionId,
+    ) -> Result<LogSequenceNumber> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
+
+        if self.group_commit.is_some() {
+            // GroupCommit needs owned data — clone here (rare path)
+            let record = WALRecord::UpdateRaw {
+                table_name: table_name.to_string(),
+                row_id,
+                partition,
+                raw_old: raw_old.to_vec(),
+                raw_new: raw_new.to_vec(),
+                txn_id,
+            };
+            return self.group_commit_append(partition, record);
+        }
+
+        let entry = self.partitions.get(&partition)
+            .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
+        let mut wal = entry.value().lock();
+        wal.append_update_raw_ref(table_name, row_id, partition, raw_old, raw_new, txn_id)
+    }
+
+    /// Log an update via group commit (owned path)
+    pub fn log_update_raw_group(
         &self,
         table_name: &str,
         partition: PartitionId,
@@ -1539,19 +1668,6 @@ impl WALManager {
         Ok(())
     }
 
-    /// Auto-checkpoint partitions whose WAL exceeds the size threshold.
-    /// Called from the flush thread AFTER data is safely in SSTables.
-    pub fn auto_checkpoint_if_needed(&self) -> Result<()> {
-        for entry in self.partitions.iter() {
-            let mut wal = entry.value().lock();
-            if wal.bytes_written >= AUTO_CHECKPOINT_BYTES {
-                debug_log!("[WAL] Auto-checkpoint: {} bytes written, truncating", wal.bytes_written);
-                wal.checkpoint()?;
-            }
-        }
-        Ok(())
-    }
-
     /// Recover from crash (returns records per partition)
     /// Flush all pending group-commit entries to disk.
     /// Called before `recover()` so in-flight records are visible on disk.
@@ -1566,7 +1682,7 @@ impl WALManager {
             // to finish its in-flight writes.
             let deadline = std::time::Instant::now() + Duration::from_millis(200);
             loop {
-                let queue_len = gc.state.queue.lock().unwrap().len();
+                let queue_len = gc.state.queue.lock().len();
                 if queue_len == 0 {
                     // Extra sleep to let the thread finish writing its last batch
                     std::thread::sleep(Duration::from_millis(5));
@@ -1581,7 +1697,7 @@ impl WALManager {
 
             // Safety net: drain anything still left (e.g. thread didn't finish in time)
             let entries: Vec<GroupCommitEntry> = {
-                let mut queue = gc.state.queue.lock().unwrap();
+                let mut queue = gc.state.queue.lock();
                 std::mem::take(&mut *queue)
             };
             if !entries.is_empty() {

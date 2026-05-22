@@ -87,20 +87,17 @@ impl SSTable {
         let footer = Self::read_footer(&mut file)?;
         let file_size = file.metadata()?.len();
 
-        // Read index block to extract min key.
-        // min_key = first entry of first block (accurate).
-        // max_key = first entry of last block, which is a *lower bound* for the
-        // actual max key (the last block contains keys >= this value).
-        // We cannot get the true max key without parsing the last data block,
-        // so we add 1 to make max_key exclusive — but since the get() range check
-        // uses `key > meta.max_key`, adding 1 would still miss the very last key.
-        // Instead, use u64::MAX for max_key (conservative) and rely on bloom filter.
+        // Read index to extract min key and locate the last data block.
         let (min_key, max_key) = if footer.index_size > 0 {
             file.seek(SeekFrom::Start(footer.index_offset))?;
             let mut index_buf = vec![0u8; footer.index_size as usize];
             file.read_exact(&mut index_buf)?;
             match BlockIndex::deserialize(&index_buf) {
                 Ok(idx) if !idx.entries.is_empty() => {
+                    // Use u64::MAX for max_key (conservative). The first entry of
+                    // the last block is a lower bound; the true max key requires
+                    // parsing the last block which is error-prone (compression,
+                    // variable-length values). Bloom filter handles false positives.
                     (idx.entries[0].0, u64::MAX)
                 }
                 _ => (0u64, u64::MAX),
@@ -1199,42 +1196,37 @@ pub struct SSTableStats {
     pub max_timestamp: u64,
 }
 
-/// SSTable iterator for sequential scan
-/// 🔧 Streaming iterator: reads blocks on-demand instead of loading all data
+/// SSTable streaming iterator — reads blocks on-demand, supports range filtering.
 pub struct SSTableIterator {
-    /// File reader
     file: BufReader<File>,
-    /// Block index (offset, size pairs)
     index_entries: Vec<(Key, u64, u32)>,
-    /// Current block index
     current_block_idx: usize,
-    /// Current block's entries
     current_block_entries: Vec<(Key, Value)>,
-    /// Position within current block
     position_in_block: usize,
+    /// Stop when key >= end_key (exclusive upper bound)
+    end_key: Option<Key>,
 }
 
 impl SSTableIterator {
     fn new(sstable: &SSTable) -> Result<Self> {
-        // Clone file handle for independent reading
-        let file = BufReader::new(
-            File::open(&sstable.path)
-                .map_err(StorageError::Io)?
-        );
-        
-        // Clone index entries (small metadata, not data)
+        Self::with_range(sstable, None, None)
+    }
+
+    /// Create an iterator over entries in [start_key, end_key).
+    pub fn with_range(sstable: &SSTable, start_key: Option<Key>, end_key: Option<Key>) -> Result<Self> {
+        let file = BufReader::new(File::open(&sstable.path).map_err(StorageError::Io)?);
         let index_entries = sstable.index.entries.clone();
-        
+        let start_block_idx = if let Some(start) = start_key {
+            let start_bytes = start.to_be_bytes();
+            sstable.index.find_block_index(&start_bytes)
+        } else { 0 };
+
         Ok(Self {
-            file,
-            index_entries,
-            current_block_idx: 0,
-            current_block_entries: Vec::new(),
-            position_in_block: 0,
+            file, index_entries, current_block_idx: start_block_idx,
+            current_block_entries: Vec::new(), position_in_block: 0, end_key,
         })
     }
-    
-    /// Load next block into memory (with CRC verification)
+
     fn load_next_block(&mut self) -> Result<bool> {
         if self.current_block_idx >= self.index_entries.len() {
             return Ok(false); // No more blocks
@@ -1277,18 +1269,19 @@ impl Iterator for SSTableIterator {
     
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Try to get entry from current block
             if self.position_in_block < self.current_block_entries.len() {
-                let entry = self.current_block_entries[self.position_in_block].clone();
+                let (key, value) = &self.current_block_entries[self.position_in_block];
+                // Range check: stop at end_key (exclusive upper bound)
+                if let Some(end) = self.end_key {
+                    if *key >= end { return None; }
+                }
                 self.position_in_block += 1;
-                return Some(entry);
+                return Some((*key, value.clone()));
             }
-            
-            // Current block exhausted, load next block
             match self.load_next_block() {
-                Ok(true) => continue,  // Successfully loaded next block
-                Ok(false) => return None,  // No more blocks
-                Err(_) => return None,  // Error reading block
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(_) => return None,
             }
         }
     }

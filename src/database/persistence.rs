@@ -78,6 +78,44 @@ impl MoteDB {
         self.checkpoint_impl(true)
     }
 
+    /// VACUUM: force compaction and reclaim disk space.
+    ///
+    /// Flushes memtables, runs compaction on all LSM levels (dropping tombstones),
+    /// then flushes and waits for all column indexes.
+    pub fn vacuum(&self) -> Result<()> {
+        ensure_open!(self);
+        let _guard = self.checkpoint_mutex.lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+
+        // 1. Flush all memtables to SSTables
+        self.lsm_engine.flush()?;
+
+        // 2. Run compaction on all levels (repeatedly until no more compaction needed)
+        for _ in 0..10 {
+            if !self.lsm_engine.compact()? {
+                break;
+            }
+        }
+
+        // 3. Flush all column/text/vector indexes
+        self.flush_all_indexes()?;
+
+        // 4. Clean up version store
+        let min_active_ts = self.txn_coordinator.get_min_active_timestamp();
+        if let Err(e) = self.version_store.vacuum(min_active_ts) {
+            warn_log!("[VACUUM] Version store vacuum failed: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Checkpoint during Drop — skips the is_closed check since we're shutting down.
+    pub(crate) fn checkpoint_on_drop(&self) -> Result<()> {
+        let _guard = self.checkpoint_mutex.lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+        self.checkpoint_impl(true)
+    }
+
     fn checkpoint_impl(&self, rebuild_indexes: bool) -> Result<()> {
         let pending_count = self.pending_updates.load(Ordering::Relaxed);
         if pending_count == 0 {
@@ -102,11 +140,17 @@ impl MoteDB {
             self.wal.checkpoint_all()?;
         }
 
-        let current_ts = self.version_store.current_timestamp();
-        let _ = self.version_store.vacuum(current_ts);
+        let min_active_ts = self.txn_coordinator.get_min_active_timestamp();
+        if let Err(e) = self.version_store.vacuum(min_active_ts) {
+            warn_log!("[Flush] Version store vacuum failed: {}", e);
+        }
         self.pending_updates.store(0, Ordering::Relaxed);
-        let _ = self.columnar_store.flush_all();
-        let _ = self.table_registry.persist_auto_increment_counters();
+        if let Err(e) = self.columnar_store.flush_all() {
+            warn_log!("[Flush] Columnar store flush failed: {}", e);
+        }
+        if let Err(e) = self.table_registry.persist_auto_increment_counters() {
+            warn_log!("[Flush] Auto-increment persistence failed: {}", e);
+        }
 
         Ok(())
     }

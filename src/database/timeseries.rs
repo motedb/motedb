@@ -6,7 +6,6 @@
 #[cfg(test)]
 mod tests {
     use crate::config::DBConfig;
-    use crate::database::write_controller::BackpressureSignal;
 
     #[test]
     fn test_robotics_config() {
@@ -20,12 +19,5 @@ mod tests {
             config.index_update_strategy,
             crate::config::IndexUpdateStrategy::BatchOnly
         );
-    }
-
-    #[test]
-    fn test_backpressure_signal_display() {
-        assert_eq!(format!("{}", BackpressureSignal::Normal), "Normal");
-        assert_eq!(format!("{}", BackpressureSignal::SlowDown), "SlowDown");
-        assert_eq!(format!("{}", BackpressureSignal::Stop), "Stop");
     }
 }

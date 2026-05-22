@@ -112,7 +112,7 @@ fn test_double_underscore_in_name() {
 
     let result = rows(&db, "SELECT * FROM my__special__table WHERE id = 1");
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0][1], Value::Text("hello".to_string()));
+    assert_eq!(result[0][1], Value::text("hello".to_string()));
 }
 
 // ============================================================================

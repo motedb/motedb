@@ -854,7 +854,7 @@ impl Parser {
             TokenType::String(s) => {
                 let s = s.clone();
                 self.advance();
-                Ok(Expr::Literal(Value::Text(s)))
+                Ok(Expr::Literal(Value::text(s)))
             }
             TokenType::True => {
                 self.advance();
@@ -972,7 +972,7 @@ impl Parser {
                         };
 
                         use crate::types::{Geometry, Point3D};
-                        Ok(Expr::Literal(Value::Spatial(Geometry::Point3D(Point3D::new(x, y, 0.0)))))
+                        Ok(Expr::Literal(Value::spatial(Geometry::Point3D(Point3D::new(x, y, 0.0)))))
                     } else if name.to_uppercase() == "POINT3D" {
                         if args.len() != 3 {
                             return Err(self.error("POINT3D() requires exactly 3 arguments (x, y, z)"));
@@ -993,7 +993,7 @@ impl Parser {
                             _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
                         };
                         use crate::types::{Geometry as G3, Point3D};
-                        Ok(Expr::Literal(Value::Spatial(G3::Point3D(Point3D::new(x, y, z)))))
+                        Ok(Expr::Literal(Value::spatial(G3::Point3D(Point3D::new(x, y, z)))))
                     } else if name.to_uppercase() == "MATCH" {
                         // MATCH(column) AGAINST(query) or MATCH(column, query)
                         if args.len() == 2 {
@@ -1003,7 +1003,7 @@ impl Parser {
                                 _ => return Err(self.error("MATCH() first argument must be a column name")),
                             };
                             let query = match &args[1] {
-                                Expr::Literal(Value::Text(s)) => s.clone(),
+                                Expr::Literal(Value::Text(s)) => (**s).clone(),
                                 _ => return Err(self.error("MATCH() second argument must be a string")),
                             };
                             Ok(Expr::Match { column, query, phrase: false })

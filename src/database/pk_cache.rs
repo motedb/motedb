@@ -24,7 +24,7 @@ impl PkKey {
         match value {
             crate::types::Value::Integer(i) => PkKey::Int(*i),
             crate::types::Value::Float(f) => PkKey::Float(f.to_bits()),
-            crate::types::Value::Text(s) => PkKey::Text(s.clone().into_boxed_str()),
+            crate::types::Value::Text(s) => PkKey::Text(s.as_str().to_string().into_boxed_str()),
             crate::types::Value::Bool(b) => PkKey::Bool(*b),
             crate::types::Value::Null => PkKey::Null,
             _ => PkKey::Null,
@@ -100,5 +100,71 @@ impl PkLookupCache {
     pub fn remove_pk(&self, key: &PkKey) {
         let mut cache = self.cache.lock();
         cache.pop(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pk_key_from_integer() {
+        let key = PkKey::from_value(&crate::types::Value::Integer(42));
+        assert_eq!(key, PkKey::Int(42));
+    }
+
+    #[test]
+    fn test_pk_key_from_text() {
+        let key = PkKey::from_value(&crate::types::Value::Text("hello".into()));
+        match key {
+            PkKey::Text(s) => assert_eq!(&*s, "hello"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn test_pk_key_from_null() {
+        let key = PkKey::from_value(&crate::types::Value::Null);
+        assert_eq!(key, PkKey::Null);
+    }
+
+    #[test]
+    fn test_insert_and_get() {
+        let cache = PkLookupCache::new(100);
+        cache.insert(PkKey::Int(1), 100);
+        cache.insert(PkKey::Int(2), 200);
+
+        assert_eq!(cache.get_pk(&PkKey::Int(1)), Some(100));
+        assert_eq!(cache.get_pk(&PkKey::Int(2)), Some(200));
+        assert_eq!(cache.get_pk(&PkKey::Int(99)), None);
+    }
+
+    #[test]
+    fn test_remove() {
+        let cache = PkLookupCache::new(100);
+        cache.insert(PkKey::Int(1), 100);
+        cache.remove_pk(&PkKey::Int(1));
+        assert_eq!(cache.get_pk(&PkKey::Int(1)), None);
+    }
+
+    #[test]
+    fn test_overwrite() {
+        let cache = PkLookupCache::new(100);
+        cache.insert(PkKey::Int(1), 100);
+        cache.insert(PkKey::Int(1), 999);
+        assert_eq!(cache.get_pk(&PkKey::Int(1)), Some(999));
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let cache = PkLookupCache::new(10);
+        // Insert 20 entries — first 10 should be evicted
+        for i in 0..20i64 {
+            cache.insert(PkKey::Int(i), i as RowId);
+        }
+        // First entries should be gone
+        assert_eq!(cache.get_pk(&PkKey::Int(0)), None);
+        // Last entry should be present
+        assert!(cache.get_pk(&PkKey::Int(19)).is_some());
     }
 }

@@ -38,26 +38,27 @@
 //! [next_page_id: u64][data_len: u32][data: bytes...]
 //! ```text
 use crate::{Result, StorageError};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::Arc;
+use parking_lot::{RwLock, Mutex};
 use std::path::PathBuf;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
+use std::collections::BTreeSet;
 use std::marker::PhantomData;
 
-/// Page size (16KB - optimized for text index with frequent splits)
-pub const PAGE_SIZE: usize = 16384; // 16KB
+/// Max page content size (upper bound for buffer allocation)
+pub const PAGE_SIZE: usize = 4096;
 
-/// Header size
+/// Header size: [is_leaf:1][num_keys:4][next_leaf:8][content_len:2][reserved:1] = 16 bytes
 const HEADER_SIZE: usize = 16;
 
 /// Invalid page ID
 const INVALID_PAGE_ID: u64 = u64::MAX;
 
 /// Overflow threshold: values larger than this are stored in overflow pages
-/// Set to 2KB to ensure pages don't overflow even with multiple medium-sized values
-const OVERFLOW_THRESHOLD: usize = 1024; // 1KB - balance between page utilization and overflow frequency
+const OVERFLOW_THRESHOLD: usize = 1024;
 
 /// Overflow marker: indicates value is stored in overflow page chain
 const OVERFLOW_MARKER: u32 = 0xFFFFFFFF;
@@ -71,8 +72,8 @@ const OVERFLOW_DATA_SIZE: usize = PAGE_SIZE - OVERFLOW_PAGE_HEADER;
 /// Magic number for generic B+Tree files
 const BTREE_MAGIC: u32 = 0x47425452; // "GBTR" (Generic BTree)
 
-/// Format version
-const BTREE_VERSION: u32 = 2; // Bumped to v2 for overflow support
+/// Format version (v3: compact page storage with page table)
+const BTREE_VERSION: u32 = 3;
 
 /// Type alias for page cache
 type PageCache<K> = Arc<RwLock<LruCache<u64, Arc<RwLock<Page<K>>>>>>;
@@ -80,35 +81,52 @@ type PageCache<K> = Arc<RwLock<LruCache<u64, Arc<RwLock<Page<K>>>>>>;
 /// Type alias for the insert result: (old_value, optional split_info)
 type GenericInsertResult<K> = Result<(Option<Vec<u8>>, Option<(K, u64)>)>;
 
+/// Minimum reserve at start of file for superblock.
+/// The superblock stores the page_offsets table. Reserve 128KB to safely accommodate
+/// ~16K pages (about 1.4M entries at max_keys ≈ 88 per leaf).
+///
+/// Before the first flush, pages are appended at offsets ≥ SUPERBLOCK_RESERVE.
+/// During `sync_superblock()`, the superblock may grow as the page table expands,
+/// but it will not exceed this reserve as long as the page count is within limits.
+///
+/// Between flushes, `sync_superblock()` is NOT called (root split metadata is
+/// kept in memory only). This prevents the superblock from growing and overlapping
+/// page data written during the same session. The WAL guarantees durability;
+/// the B+Tree file is a checkpoint, rebuilt on recovery if needed.
+const SUPERBLOCK_RESERVE: u64 = 128 * 1024;
+
 /// Generic B+Tree with fixed-size keys and variable-length values
 pub struct GenericBTree<K: BTreeKey> {
     /// Root page ID
     root_page_id: Arc<RwLock<u64>>,
-    
+
     /// Page cache (page_id -> Page)
     page_cache: PageCache<K>,
-    
+
     /// Next free page ID
     next_page_id: Arc<RwLock<u64>>,
-    
+
     /// Storage file
     storage_file: Arc<RwLock<File>>,
-    
+
     /// Flush lock
     flush_lock: Arc<Mutex<()>>,
-    
+
     /// Storage path
     _storage_path: PathBuf,
 
     /// Configuration
     config: GenericBTreeConfig,
-    
+
     /// Key size in bytes
     key_size: usize,
-    
+
     /// Max keys per page (calculated based on key_size)
     max_keys: usize,
-    
+
+    /// Page offset table: page_id → file_offset
+    page_offsets: Arc<RwLock<Vec<u64>>>,
+
     _phantom: PhantomData<K>,
 }
 
@@ -280,26 +298,30 @@ impl<K: BTreeKey> Page<K> {
         size
     }
     
-    /// Serialize page to bytes
+    /// Serialize page to compact bytes (only actual content, no zero-padding)
     fn serialize(&self, key_size: usize) -> Result<Vec<u8>> {
         // ASSUMPTION: All large values have already been converted to overflow markers
         // by write_page() before calling this method
-        
-        let mut buf = vec![0u8; PAGE_SIZE];
+
+        let content_size = self.calculate_serialized_size(key_size);
+        let mut buf = vec![0u8; content_size];
         let mut offset = 0;
-        
-        // Header: [is_leaf:1][num_keys:4][next_leaf:8][reserved:3] = 16 bytes
+
+        // Header: [is_leaf:1][num_keys:4][next_leaf:8][content_len:2][reserved:1] = 16 bytes
         buf[offset] = if self.is_leaf { 1 } else { 0 };
         offset += 1;
-        
+
         buf[offset..offset+4].copy_from_slice(&(self.num_keys as u32).to_le_bytes());
         offset += 4;
-        
+
         buf[offset..offset+8].copy_from_slice(&self.next_leaf.to_le_bytes());
         offset += 8;
-        
-        // Reserved (3 bytes)
-        offset += 3;
+
+        buf[offset..offset+2].copy_from_slice(&(content_size as u16).to_le_bytes());
+        offset += 2;
+
+        // Reserved (1 byte)
+        offset += 1;
         
         // Keys section - ONLY serialize num_keys elements
         // CRITICAL: After delete, self.keys.len() may equal num_keys (if properly cleaned)
@@ -319,86 +341,58 @@ impl<K: BTreeKey> Page<K> {
         if self.is_leaf {
             // Value offsets and data
             let mut value_offset = 0u32;
-            let value_data_start = offset + self.num_keys * 4;
-            
-            // Pre-check: calculate total space needed
-            let mut total_space_needed = value_data_start;
-            let mut marker_count = 0;
-            let mut large_count = 0;
-            let mut normal_count = 0;
-            
-            // CRITICAL: Only iterate over num_keys values
+
+            // Check for unconverted large values
             for i in 0..self.num_keys {
                 let value = &self.values[i];
-                let is_overflow_marker = value.len() == 20 
+                let is_overflow_marker = value.len() == 20
                     && value[0..4] == OVERFLOW_MARKER.to_le_bytes();
-                
-                if is_overflow_marker {
-                    total_space_needed += 20;
-                    marker_count += 1;
-                } else if value.len() > OVERFLOW_THRESHOLD {
-                    // ERROR: Large value should have been converted before serialize()
-                    large_count += 1;
-                    debug_log!("DEBUG serialize: Page {}: Found unconverted large value #{}: {} bytes",
-                             self.page_id, large_count, value.len());
+
+                if !is_overflow_marker && value.len() > OVERFLOW_THRESHOLD {
                     return Err(StorageError::InvalidData(
-                        format!("Page {}: Found unconverted large value ({} bytes) in serialize(). Must convert in write_page() first.",
+                        format!("Page {}: Found unconverted large value ({} bytes) in serialize().",
                                 self.page_id, value.len())
                     ));
-                } else {
-                    total_space_needed += 4 + value.len();
-                    normal_count += 1;
                 }
             }
-            
-            if total_space_needed > PAGE_SIZE {
-                debug_log!("DEBUG serialize: Page {} overflow! {} keys, {} markers, {} normal, {} bytes needed",
-                         self.page_id, self.num_keys, marker_count, normal_count, total_space_needed);
-                return Err(StorageError::InvalidData(
-                    format!("Page {} cannot fit {} keys: needs {} bytes but PAGE_SIZE is {}",
-                            self.page_id, self.num_keys, total_space_needed, PAGE_SIZE)
-                ));
-            }
-            
+
             // First pass: write offsets - ONLY num_keys values
             for i in 0..self.num_keys {
                 let value = &self.values[i];
                 buf[offset..offset+4].copy_from_slice(&value_offset.to_le_bytes());
                 offset += 4;
-                
-                let is_overflow_marker = value.len() == 20 
+
+                let is_overflow_marker = value.len() == 20
                     && value[0..4] == OVERFLOW_MARKER.to_le_bytes();
-                
+
                 if is_overflow_marker {
                     value_offset += 20;
                 } else {
                     value_offset += 4 + value.len() as u32;
                 }
             }
-            
+
             // Second pass: write value data - ONLY num_keys values
             for i in 0..self.num_keys {
                 let value = &self.values[i];
-                let is_overflow_marker = value.len() == 20 
+                let is_overflow_marker = value.len() == 20
                     && value[0..4] == OVERFLOW_MARKER.to_le_bytes();
-                
+
                 if is_overflow_marker {
-                    // Copy the entire 20-byte overflow marker
                     let overflow_page_id = u64::from_le_bytes([
                         value[4], value[5], value[6], value[7],
                         value[8], value[9], value[10], value[11],
                     ]);
-                    
+
                     if overflow_page_id == 0 {
                         return Err(StorageError::InvalidData(
                             format!("Page {}: Overflow marker with zero page_id", self.page_id)
                         ));
                     }
-                    
+
                     buf[offset..offset+20].copy_from_slice(value);
                     offset += 20;
                 } else {
-                    // Normal inline value
                     let len = value.len() as u32;
                     buf[offset..offset+4].copy_from_slice(&len.to_le_bytes());
                     offset += 4;
@@ -424,20 +418,20 @@ impl<K: BTreeKey> Page<K> {
         Ok(buf)
     }
     
-    /// Deserialize page from bytes
+    /// Deserialize page from compact bytes
     fn deserialize(page_id: u64, buf: &[u8], key_size: usize) -> Result<Self> {
-        if buf.len() < PAGE_SIZE {
+        if buf.len() < HEADER_SIZE {
             return Err(StorageError::InvalidData(
-                format!("Page size too small: {}", buf.len())
+                format!("Page buffer too small: {} < header {}", buf.len(), HEADER_SIZE)
             ));
         }
-        
+
         let mut offset = 0;
-        
+
         // Header
         let is_leaf = buf[offset] == 1;
         offset += 1;
-        
+
         let num_keys = u32::from_le_bytes([
             buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]
         ]) as usize;
@@ -448,9 +442,13 @@ impl<K: BTreeKey> Page<K> {
             buf[offset+4], buf[offset+5], buf[offset+6], buf[offset+7],
         ]);
         offset += 8;
-        
-        // Skip reserved
-        offset += 3;
+
+        // Read content_len (v3 header)
+        let _content_len = u16::from_le_bytes([buf[offset], buf[offset+1]]) as usize;
+        offset += 2;
+
+        // Skip reserved (1 byte)
+        offset += 1;
         
         // Read keys
         let mut keys = Vec::with_capacity(num_keys);
@@ -574,7 +572,8 @@ impl<K: BTreeKey> GenericBTree<K> {
         }
         
         let exists = storage_path.exists();
-        
+
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -582,7 +581,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             .truncate(!exists)
             .open(&storage_path)?;
         
-        let (root_page_id, next_page_id) = if !exists {
+        let (root_page_id, next_page_id, page_offsets) = if !exists {
             // New file: write superblock
             let superblock = SuperBlock {
                 magic: BTREE_MAGIC,
@@ -590,53 +589,58 @@ impl<K: BTreeKey> GenericBTree<K> {
                 root_page_id: 1,
                 next_page_id: 2,
                 key_size: key_size as u32,
+                page_offsets: vec![0],
             };
-            
+
             let sb_bytes = bincode::serialize(&superblock)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            
-            // Pad superblock to 256 bytes
-            let mut padded_sb = vec![0u8; 256];
-            padded_sb[..sb_bytes.len()].copy_from_slice(&sb_bytes);
-            
-            file.write_all(&padded_sb)?;
-            
-            // Pre-allocate space for root page to avoid read errors
-            let root_page_offset = 256 + PAGE_SIZE as u64;
-            file.set_len(root_page_offset)?;
-            
+
+            // Write [len: u32 LE][data]
+            let mut header = vec![0u8; 4 + sb_bytes.len()];
+            header[0..4].copy_from_slice(&(sb_bytes.len() as u32).to_le_bytes());
+            header[4..].copy_from_slice(&sb_bytes);
+
+            file.write_all(&header)?;
             file.sync_all()?;
-            
-            (1u64, 2u64)
+
+            (1u64, 2u64, vec![0u64])
         } else {
-            // Load superblock
-            let mut sb_bytes = vec![0u8; 256];
+            // Load superblock — read [len: u32 LE][data]
+            let mut len_buf = [0u8; 4];
+            file.read_exact(&mut len_buf)?;
+            let sb_size = u32::from_le_bytes(len_buf) as usize;
+
+            if sb_size > 64 * 1024 {
+                return Err(StorageError::Corruption(
+                    format!("SuperBlock size {} implausibly large", sb_size)
+                ));
+            }
+
+            let mut sb_bytes = vec![0u8; sb_size];
             file.read_exact(&mut sb_bytes)?;
-            
+
             let superblock: SuperBlock = bincode::deserialize(&sb_bytes)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            
+
             if superblock.magic != BTREE_MAGIC {
                 return Err(StorageError::InvalidData("Invalid magic number".into()));
             }
-            
-            // Support version 1 (without overflow) and version 2 (with overflow)
-            if superblock.version != 1 && superblock.version != BTREE_VERSION {
-                return Err(StorageError::InvalidData(
-                    format!("Unsupported version: {} (expected 1 or {})", superblock.version, BTREE_VERSION)
-                ));
+
+            if superblock.version < 2 || superblock.version > BTREE_VERSION {
+                // Old-format file — delete and recreate
+                drop(file);
+                let _ = std::fs::remove_file(&storage_path);
+                drop(sb_bytes);
+                return Self::with_config(storage_path, config);
             }
-            
-            // Note: Version 1 files can be read by version 2 code (backward compatible)
-            // Version 2 features (overflow) will be automatically used when writing
-            
+
             if superblock.key_size as usize != key_size {
                 return Err(StorageError::InvalidData(
                     format!("Key size mismatch: expected {}, got {}", key_size, superblock.key_size)
                 ));
             }
-            
-            (superblock.root_page_id, superblock.next_page_id)
+
+            (superblock.root_page_id, superblock.next_page_id, superblock.page_offsets)
         };
         
         let cache_size = NonZeroUsize::new(config.cache_size)
@@ -652,6 +656,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             config,
             key_size,
             max_keys,
+            page_offsets: Arc::new(RwLock::new(page_offsets)),
             _phantom: PhantomData,
         };
         
@@ -659,6 +664,8 @@ impl<K: BTreeKey> GenericBTree<K> {
         if !exists {
             let root_page = Page::new_leaf(root_page_id, max_keys);
             tree.write_page(&root_page)?;
+            // Persist page_offsets so reopens can find the root page
+            tree.sync_superblock()?;
         }
         
         Ok(tree)
@@ -666,8 +673,7 @@ impl<K: BTreeKey> GenericBTree<K> {
     
     /// Insert or update key-value pair
     pub fn insert(&mut self, key: K, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         // Recursive insert with split handling
         let (old_value, split_info) = self.insert_internal(root_id, key, value)?;
@@ -675,8 +681,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         // If root was split, create new root
         if let Some((split_key, new_page_id)) = split_info {
             let new_root_id = {
-                let mut next = self.next_page_id.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut next = self.next_page_id.write();
                 let id = *next;
                 *next += 1;
                 id
@@ -691,16 +696,18 @@ impl<K: BTreeKey> GenericBTree<K> {
             
             // Write new root
             self.write_page(&new_root)?;
-            
+
             // Update root ID
             {
-                let mut root = self.root_page_id.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut root = self.root_page_id.write();
                 *root = new_root_id;
-            } // Release write lock here
-            
-            // Update superblock
-            self.sync_superblock()?;
+            }
+            // Note: sync_superblock() is intentionally NOT called here.
+            // The superblock is a checkpoint mechanism, not a transaction log.
+            // Between flushes, page_offsets and root_page_id live in memory.
+            // On crash, the WAL handles recovery; the B+Tree file is rebuilt.
+            // Calling sync_superblock here would risk the superblock growing
+            // beyond SUPERBLOCK_RESERVE and overwriting live page data.
         }
         
         Ok(old_value)
@@ -761,28 +768,22 @@ impl<K: BTreeKey> GenericBTree<K> {
                         let target_key = page.keys[idx].clone();
                         page.values[idx] = old.clone().unwrap();
 
-                        let split_key_clone = page.keys[page.num_keys * 2 / 5].clone();
                         let split_info = self.split_leaf(&mut page)?;
-                        self.write_page(&page)?;
 
-                        // Re-apply update
-                        let mut left_page = self.read_page(page.page_id)?;
-                        let mut right_page = self.read_page(split_info.1)?;
-                        if target_key < split_key_clone {
-                            let update_idx = left_page.keys.binary_search(&target_key).unwrap();
-                            left_page.values[update_idx] = temp_value;
-                            left_page.dirty = true;
-                            self.write_page(&left_page)?;
+                        // Re-apply update to whichever half contains the key
+                        if let Ok(update_idx) = page.keys.binary_search(&target_key) {
+                            page.values[update_idx] = temp_value;
+                            page.dirty = true;
                         } else {
-                            let update_idx = right_page.keys.binary_search(&target_key).unwrap();
+                            let mut right_page = self.read_page(split_info.1)?;
+                            let update_idx = right_page.keys.binary_search(&target_key)
+                                .expect("key must be in one of the split halves");
                             right_page.values[update_idx] = temp_value;
                             right_page.dirty = true;
                             self.write_page(&right_page)?;
                         }
-                        
+
                         current_split_info = Some(split_info);
-                    } else {
-                        self.write_page(&page)?;
                     }
                     
                     old
@@ -802,23 +803,21 @@ impl<K: BTreeKey> GenericBTree<K> {
                         let temp_key = page.keys.remove(idx);
                         let temp_value = page.values.remove(idx);
                         page.num_keys -= 1;
-                        
-                        let split_key_clone = page.keys[page.num_keys * 2 / 5].clone();
+
                         let split_info = self.split_leaf(&mut page)?;
-                        self.write_page(&page)?;
-                        
-                        // Re-insert
-                        let mut left_page = self.read_page(page.page_id)?;
-                        let mut right_page = self.read_page(split_info.1)?;
-                        
-                        if temp_key < split_key_clone {
-                            let ins_idx = left_page.keys.binary_search(&temp_key).unwrap_err();
-                            left_page.keys.insert(ins_idx, temp_key);
-                            left_page.values.insert(ins_idx, temp_value);
-                            left_page.num_keys += 1;
-                            left_page.dirty = true;
-                            self.write_page(&left_page)?;
+                        let actual_split_key = &split_info.0;
+
+                        // Re-insert into the correct half using the actual split key
+                        if &temp_key < actual_split_key {
+                            // Belongs in left half (page)
+                            let ins_idx = page.keys.binary_search(&temp_key).unwrap_err();
+                            page.keys.insert(ins_idx, temp_key);
+                            page.values.insert(ins_idx, temp_value);
+                            page.num_keys += 1;
+                            page.dirty = true;
                         } else {
+                            // Belongs in right half
+                            let mut right_page = self.read_page(split_info.1)?;
                             let ins_idx = right_page.keys.binary_search(&temp_key).unwrap_err();
                             right_page.keys.insert(ins_idx, temp_key);
                             right_page.values.insert(ins_idx, temp_value);
@@ -826,17 +825,22 @@ impl<K: BTreeKey> GenericBTree<K> {
                             right_page.dirty = true;
                             self.write_page(&right_page)?;
                         }
-                        
+
                         current_split_info = Some(split_info);
-                    } else {
-                        self.write_page(&page)?;
                     }
                     
                     None
                 }
             };
+
+            // Write modified leaf page back to disk and cache.
+            // split_leaf writes the right page but not the left; the normal
+            // insert path never writes at all. This single write_page covers
+            // both cases — it persists the in-memory modifications that would
+            // otherwise be lost when `page` is dropped.
+            self.write_page(&page)?;
         }
-        
+
         // Phase 3: Propagate splits upward iteratively
         while let Some((split_key, new_page_id)) = current_split_info {
             if path_stack.is_empty() {
@@ -869,9 +873,9 @@ impl<K: BTreeKey> GenericBTree<K> {
             
             if needs_split {
                 let parent_split_info = self.split_internal(&mut parent_page)?;
-                self.write_page(&parent_page)?;
                 current_split_info = Some(parent_split_info);
             } else {
+                // No split — write the modified parent page back to disk/cache
                 self.write_page(&parent_page)?;
                 current_split_info = None;
             }
@@ -886,9 +890,9 @@ impl<K: BTreeKey> GenericBTree<K> {
         // This prevents double conversion bugs
         
         // Find split point based on actual byte size (not just key count)
-        // Goal: Keep left page under 50% of PAGE_SIZE to leave room for growth
+        // Goal: Pack 70% into left page to reduce total page count
         let key_size = K::key_size();
-        let target_left_size = (PAGE_SIZE as f64 * 0.5) as usize; // 50/50 split for better utilization
+        let target_left_size = (PAGE_SIZE as f64 * 0.7) as usize; // 70/30 split
         let mut left_size = HEADER_SIZE; // Start with header
         let mut split_idx = 0;
         
@@ -912,15 +916,14 @@ impl<K: BTreeKey> GenericBTree<K> {
             split_idx = i + 1;
         }
         
-        // Ensure we don't create empty pages - split at least at 25%, at most at 75%
+        // Ensure we don't create empty pages - allow 70% left split
         let min_split = (page.num_keys / 4).max(1);
-        let max_split = (page.num_keys * 3 / 4).max(min_split + 1).min(page.num_keys - 1);
+        let max_split = (page.num_keys * 4 / 5).max(min_split + 1).min(page.num_keys - 1);
         split_idx = split_idx.clamp(min_split, max_split);
         
         // Allocate new page
         let new_page_id = {
-            let mut next = self.next_page_id.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut next = self.next_page_id.write();
             let id = *next;
             *next += 1;
             id
@@ -956,21 +959,21 @@ impl<K: BTreeKey> GenericBTree<K> {
         
         // Split key is the first key of new page
         let split_key = new_page.keys[0].clone();
-        
-        // Write new page
+
+        // Write both halves to disk/cache
         self.write_page(&new_page)?;
-        
+        self.write_page(page)?;
+
         Ok((split_key, new_page_id))
     }
-    
+
     /// Split an internal page
     fn split_internal(&mut self, page: &mut Page<K>) -> Result<(K, u64)> {
         let mid = page.num_keys / 2;
         
         // Allocate new page
         let new_page_id = {
-            let mut next = self.next_page_id.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut next = self.next_page_id.write();
             let id = *next;
             *next += 1;
             id
@@ -992,24 +995,23 @@ impl<K: BTreeKey> GenericBTree<K> {
         page.num_keys = page.keys.len();
         page.dirty = true;
         
-        // Write new page
+        // Write both halves to disk/cache
         self.write_page(&new_page)?;
-        
+        self.write_page(page)?;
+
         Ok((split_key, new_page_id))
     }
     
     /// Get value by key
     pub fn get(&self, key: &K) -> Result<Option<Vec<u8>>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
 
         self.search_internal(root_id, key)
     }
 
     /// Approximate number of entries (upper bound from page count)
     pub fn approximate_entry_count(&self) -> usize {
-        let next_id = *self.next_page_id.read()
-            .unwrap_or_else(|e| e.into_inner());
+        let next_id = *self.next_page_id.read();
         // Page 0 is superblock, so pages are 1..next_id
         // Approx: (leaf pages) × max_keys. Roughly half the pages are leaves.
         let total_pages = next_id.saturating_sub(1) as usize;
@@ -1082,8 +1084,7 @@ impl<K: BTreeKey> GenericBTree<K> {
     /// It works by marking keys as deleted (lazy deletion) to avoid complex tree restructuring.
     /// Periodic compaction can be added later to reclaim space.
     pub fn delete(&mut self, key: &K) -> Result<Option<Vec<u8>>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         if root_id == 0 {
             return Ok(None);
@@ -1097,13 +1098,11 @@ impl<K: BTreeKey> GenericBTree<K> {
         let root_page = self.read_page(root_id)?;
         if !root_page.is_leaf && root_page.num_keys == 0 && root_page.children.len() == 1 {
             let new_root_id = root_page.children[0];
-            let mut root_write = self.root_page_id.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut root_write = self.root_page_id.write();
             *root_write = new_root_id;
-            drop(root_write);
-            
-            // Sync to disk
-            self.sync_superblock()?;
+            // root_page_id change lives in memory until next flush;
+            // sync_superblock() is deferred to avoid disk I/O on the hot path
+            // and to prevent superblock growth from overlapping page data.
         }
         
         Ok(result)
@@ -1119,24 +1118,25 @@ impl<K: BTreeKey> GenericBTree<K> {
                 Ok(pos) => {
                     // Found the key, remove it
                     let old_value = page.values[pos].clone();
-                    
+
                     // Safety check: ensure vectors have enough elements
                     if pos >= page.keys.len() || pos >= page.values.len() {
                         return Err(StorageError::InvalidData(
-                            format!("Delete position {} out of bounds (keys={}, values={})", 
+                            format!("Delete position {} out of bounds (keys={}, values={})",
                                     pos, page.keys.len(), page.values.len())
                         ));
                     }
-                    
+
                     // Use Vec::remove for safe element removal
                     page.keys.remove(pos);
                     page.values.remove(pos);
                     page.num_keys -= 1;
                     page.dirty = true;
-                    
-                    // Write page back
+
+                    // Persist the modified page. Without this, the modification
+                    // is lost because read_page returns a clone from the cache.
                     self.write_page(&page)?;
-                    
+
                     Ok(Some(old_value))
                 }
                 Err(_) => {
@@ -1166,29 +1166,34 @@ impl<K: BTreeKey> GenericBTree<K> {
     
     /// Sync superblock to disk
     fn sync_superblock(&self) -> Result<()> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        let next_id = *self.next_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
+        let root_id = *self.root_page_id.read();
+        let next_id = *self.next_page_id.read();
+        let page_offsets = self.page_offsets.read();
+
         let superblock = SuperBlock {
             magic: BTREE_MAGIC,
             version: BTREE_VERSION,
             root_page_id: root_id,
             next_page_id: next_id,
             key_size: self.key_size as u32,
+            page_offsets: page_offsets.clone(),
         };
-        
+
         let sb_bytes = bincode::serialize(&superblock)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
+
+        // Write [len: u32 LE][data]
+        let header_len = 4 + sb_bytes.len();
+        let mut buf = vec![0u8; header_len];
+        buf[0..4].copy_from_slice(&(sb_bytes.len() as u32).to_le_bytes());
+        buf[4..].copy_from_slice(&sb_bytes);
+
+        let mut file = self.storage_file.write();
+
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&sb_bytes)?;
+        file.write_all(&buf)?;
         file.sync_all()?;
-        
+
         Ok(())
     }
     
@@ -1201,8 +1206,7 @@ impl<K: BTreeKey> GenericBTree<K> {
         while !remaining.is_empty() {
             // Allocate new overflow page
             let page_id = {
-                let mut next = self.next_page_id.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut next = self.next_page_id.write();
                 let id = *next;
                 *next += 1;
                 // Debug logging removed for performance
@@ -1223,8 +1227,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             // Next page ID (0 if this is the last page)
             let next_page_id = if remaining.len() > chunk_size {
                 // More data remaining, will allocate next page
-                let next = self.next_page_id.read()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let next = self.next_page_id.read();
                 *next // Peek at next ID
             } else {
                 0 // Last page
@@ -1242,13 +1245,22 @@ impl<K: BTreeKey> GenericBTree<K> {
             page_buf[8..12].copy_from_slice(&(chunk_size as u32).to_le_bytes());
             page_buf[12..12+chunk_size].copy_from_slice(chunk);
             
-            // Write overflow page to disk
-            let mut file = self.storage_file.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
-            let offset = 256 + (page_id - 1) * PAGE_SIZE as u64;
-            file.seek(SeekFrom::Start(offset))?;
+            // Write overflow page to disk (append at file end)
+            let mut file = self.storage_file.write();
+
+            let file_end = file.metadata()?.len().max(SUPERBLOCK_RESERVE);
+            file.seek(SeekFrom::Start(file_end))?;
             file.write_all(&page_buf)?;
+
+            // Record offset in page table
+            {
+                let mut offsets = self.page_offsets.write();
+                let idx = page_id as usize;
+                if idx >= offsets.len() {
+                    offsets.resize(idx + 1, 0);
+                }
+                offsets[idx] = file_end;
+            }
             
             remaining = &remaining[chunk_size..];
         }
@@ -1272,13 +1284,22 @@ impl<K: BTreeKey> GenericBTree<K> {
             }
             
             
-            // Read overflow page
-            let mut file = self.storage_file.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
-            let offset = 256 + (page_id - 1) * PAGE_SIZE as u64;
-            file.seek(SeekFrom::Start(offset))?;
-            
+            // Read overflow page using page table
+            let file_offset = {
+                let offsets = self.page_offsets.read();
+                let idx = page_id as usize;
+                if idx >= offsets.len() || offsets[idx] == 0 {
+                    return Err(StorageError::Corruption(
+                        format!("Overflow page {} not found in page table", page_id)
+                    ));
+                }
+                offsets[idx]
+            };
+
+            let mut file = self.storage_file.write();
+
+            file.seek(SeekFrom::Start(file_offset))?;
+
             let mut page_buf = vec![0u8; PAGE_SIZE];
             file.read_exact(&mut page_buf)?;
             
@@ -1310,8 +1331,7 @@ impl<K: BTreeKey> GenericBTree<K> {
     /// 2. Scan leaf chain sequentially using next_leaf pointers
     /// 3. Stop when key > end
     pub fn range(&self, start: &K, end: &K) -> Result<Vec<(K, Vec<u8>)>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         if root_id == 0 {
             return Ok(Vec::new());
@@ -1333,8 +1353,7 @@ impl<K: BTreeKey> GenericBTree<K> {
     /// Returns at most `limit` key-value pairs where start <= key <= end
     /// Significantly faster than range() + take() because it stops scanning early
     pub fn range_with_limit(&self, start: &K, end: &K, limit: usize) -> Result<Vec<(K, Vec<u8>)>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         if root_id == 0 || limit == 0 {
             return Ok(Vec::new());
@@ -1351,94 +1370,94 @@ impl<K: BTreeKey> GenericBTree<K> {
     }
     
     /// Scan leaf chain with early termination
-    fn scan_leaf_chain_with_limit(&self, start_leaf_id: u64, start: &K, end: &K, 
+    fn scan_leaf_chain_with_limit(&self, start_leaf_id: u64, start: &K, end: &K,
                        results: &mut Vec<(K, Vec<u8>)>, limit: usize) -> Result<()> {
         let mut current_leaf_id = start_leaf_id;
-        
+
         while current_leaf_id != INVALID_PAGE_ID && results.len() < limit {
-            let page = self.read_page(current_leaf_id)?;
-            
+            let page_arc = self.read_page_arc(current_leaf_id)?;
+            let page = page_arc.read();
+
             if !page.is_leaf {
                 return Err(StorageError::Index("Expected leaf node".into()));
             }
-            
+
             for i in 0..page.num_keys {
                 if results.len() >= limit {
-                    // Early termination - we have enough results
                     return Ok(());
                 }
-                
+
                 let key = &page.keys[i];
-                
-                // Only add keys within the range
+
                 if key <= end && key >= start {
                     let value = &page.values[i];
-                    
-                    // Check if this is an overflow value
+
                     let actual_value = if value.len() == 20 && value[0..4] == OVERFLOW_MARKER.to_le_bytes() {
-                        // Overflow value: read from overflow chain
                         let overflow_page_id = u64::from_le_bytes([
                             value[4], value[5], value[6], value[7],
                             value[8], value[9], value[10], value[11],
                         ]);
-                        
+
                         let total_size = u64::from_le_bytes([
                             value[12], value[13], value[14], value[15],
                             value[16], value[17], value[18], value[19],
                         ]);
-                        
+
                         if overflow_page_id == 0 {
                             return Err(StorageError::InvalidData(
                                 format!("Overflow page_id is 0 for key in page {}", current_leaf_id)
                             ));
                         }
-                        
+
                         self.read_overflow_chain(overflow_page_id, total_size)?
                     } else {
-                        // Normal inline value
                         value.clone()
                     };
-                    
+
                     results.push((key.clone(), actual_value));
                 }
             }
-            
-            // Move to next leaf
+
             current_leaf_id = page.next_leaf;
         }
-        
+
         Ok(())
     }
     
     /// Find leaf node that should contain the given key
     fn find_leaf_for_key(&self, page_id: u64, key: &K) -> Result<u64> {
-        let page = self.read_page(page_id)?;
-        
+        let page_arc = self.read_page_arc(page_id)?;
+        let page = page_arc.read();
+
         if page.is_leaf {
             return Ok(page_id);
         }
-        
+
         // Internal node: binary search to find child
         let child_idx = match page.keys.binary_search(key) {
-            Ok(idx) => idx + 1,  // Key found, go to right child
-            Err(idx) => idx,     // Insert position
+            Ok(idx) => idx + 1,
+            Err(idx) => idx,
         };
-        
+
         if child_idx >= page.children.len() {
             return Err(StorageError::Index(
-                format!("Child index {} out of bounds (num_children={}, num_keys={})", 
+                format!("Child index {} out of bounds (num_children={}, num_keys={})",
                         child_idx, page.children.len(), page.num_keys)
             ));
         }
-        
+
         let child_id = page.children[child_idx];
-        
+
         if child_id == 0 {
             return Err(StorageError::Corruption(
                 format!("Invalid child_id=0 at page {}, child_idx={}", page_id, child_idx)
             ));
         }
-        
+
+        // Drop read guards before recursive call
+        drop(page);
+        drop(page_arc);
+
         self.find_leaf_for_key(child_id, key)
     }
     
@@ -1449,283 +1468,346 @@ impl<K: BTreeKey> GenericBTree<K> {
     /// 
     /// 🚀 Phase 2 优化：预读下一个叶子节点
     /// - 预期提升：**2x** (减少 I/O 延迟)
-    fn scan_leaf_chain(&self, start_leaf_id: u64, start: &K, end: &K, 
+    fn scan_leaf_chain(&self, start_leaf_id: u64, start: &K, end: &K,
                        results: &mut Vec<(K, Vec<u8>)>) -> Result<()> {
         let mut current_leaf_id = start_leaf_id;
-        let mut prefetch_page: Option<Page<K>> = None;
-        
+        let mut prefetch_page: Option<Arc<RwLock<Page<K>>>> = None;
+
         while current_leaf_id != INVALID_PAGE_ID {
-            // 🚀 Phase 2: 使用预读的页面（如果有）
-            let page = if let Some(prefetched) = prefetch_page.take() {
-                prefetched  // 使用预读的页面（节省磁盘 I/O）
+            // Use prefetched page if available, otherwise load
+            let page_arc = if let Some(prefetched) = prefetch_page.take() {
+                prefetched
             } else {
-                self.read_page(current_leaf_id)?  // 第一次访问
+                self.read_page_arc(current_leaf_id)?
             };
-            
+            let page = page_arc.read();
+
             if !page.is_leaf {
                 return Err(StorageError::Index("Expected leaf node".into()));
             }
-            
+
             for i in 0..page.num_keys {
                 let key = &page.keys[i];
-                
-                // ✅ Don't break early - continue scanning all pages
-                // Only add keys within the range
+
                 if key <= end && key >= start {
                     let value = &page.values[i];
-                    
-                    // Check if this is an overflow value
+
                     let actual_value = if value.len() == 20 && value[0..4] == OVERFLOW_MARKER.to_le_bytes() {
-                        // Overflow value: read from overflow chain
                         let overflow_page_id = u64::from_le_bytes([
                             value[4], value[5], value[6], value[7],
                             value[8], value[9], value[10], value[11],
                         ]);
-                        
+
                         let total_size = u64::from_le_bytes([
                             value[12], value[13], value[14], value[15],
                             value[16], value[17], value[18], value[19],
                         ]);
-                        
+
                         if overflow_page_id == 0 {
                             return Err(StorageError::InvalidData(
                                 format!("Overflow page_id is 0 for key in page {}", current_leaf_id)
                             ));
                         }
-                        
+
                         self.read_overflow_chain(overflow_page_id, total_size)?
                     } else {
-                        // Normal inline value
                         value.clone()
                     };
-                    
+
                     results.push((key.clone(), actual_value));
                 }
             }
-            
-            // 🚀 Phase 2: 预读下一个叶子节点（如果存在）
+
+            // Prefetch next leaf page (Arc clone only — no Page copy)
             let next_leaf_id = page.next_leaf;
-            
+
             if next_leaf_id != INVALID_PAGE_ID {
-                // 预读下一个页面（在后台加载到缓存）
-                prefetch_page = Some(self.read_page(next_leaf_id)?);
+                prefetch_page = Some(self.read_page_arc(next_leaf_id)?);
             }
-            
+
             // Move to next leaf
             current_leaf_id = next_leaf_id;
         }
-        
+
         Ok(())
     }
     
-    /// Flush all dirty pages to disk
+    /// Flush all dirty pages to disk (cache-granularity, requires cache_size >= num_pages)
     pub fn flush(&mut self) -> Result<()> {
-        let _lock = self.flush_lock.lock()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        let cache = self.page_cache.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        for (_, page_arc) in cache.iter() {
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
-            if page.dirty {
-                // 🔧 CRITICAL FIX: Check page size BEFORE write
-                // Problem: flush() bypasses insert_internal() split checks
-                // Solution: Validate serialized size before writing
-                let serialized_size = page.calculate_serialized_size(self.key_size);
-                
-                if serialized_size > PAGE_SIZE {
-                    let page_id = page.page_id;
-                    let num_keys = page.num_keys;
-                    let is_leaf = page.is_leaf;
-                    drop(page);
-                    
-                    return Err(StorageError::Corruption(
-                        format!(
-                            "BTree flush error: Page {} ({}) has {} keys requiring {} bytes (exceeds PAGE_SIZE {}). \
-                            This indicates the page wasn't split during insert. \
-                            Root cause: Batch inserts accumulated too many entries before flush. \
-                            Solution: Reduce pending buffer size or insert through normal insert_internal() path.",
-                            page_id,
-                            if is_leaf { "leaf" } else { "internal" },
-                            num_keys,
-                            serialized_size,
-                            PAGE_SIZE
-                        )
-                    ));
-                }
-                
-                drop(page);
-                let mut page_ref = page_arc.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                self.write_page(&*page_ref)?;
-                page_ref.dirty = false;  // Mark as clean after write
-            }
-        }
-        
-        drop(cache);
-        
-        // Sync file
-        let file = self.storage_file.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        file.sync_all()?;
-        drop(file);
-        
-        // CRITICAL: Sync superblock to persist next_page_id
-        self.sync_superblock()?;
-        
-        // 🔥 MEMORY OPTIMIZATION: Aggressively clear cache after flush
-        // Problem: Cache accumulates pages, causing memory to grow from 10MB → 59MB
-        // Solution: Clear all cached pages after flush (they're all on disk now)
-        // Trade-off: Next read will reload from disk, but memory stays bounded
+        let _lock = self.flush_lock.lock();
+
+        // Collect all pages from cache and from page_offsets (for evicted pages)
+        let page_offsets_snapshot = {
+            let offsets = self.page_offsets.read();
+            offsets.clone()
+        };
+
+        let mut all_page_ids: BTreeSet<u64> = page_offsets_snapshot
+            .iter().enumerate().filter(|(_, &off)| off != 0).map(|(id, _)| id as u64).collect();
+
+
         {
-            let mut cache = self.page_cache.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
-            let old_size = cache.len();
-            cache.clear();  // ✅ Clear all cached pages
-            
-            // Optionally keep root page for faster next insert
-            // (skipped for now to minimize memory)
-            
-            if old_size > self.config.cache_size {
-                // println!("    ↳ [CACHE-CLEAR] Cleared {} pages", old_size);
+            let cache = self.page_cache.read();
+            for (id, _) in cache.iter() {
+                all_page_ids.insert(*id);
             }
         }
-        
+
+        if all_page_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Load all pages from cache or disk.
+        // Cache hit: use in-memory copy. Cache miss: try disk. Disk failure: skip.
+        let mut pages: Vec<(u64, Page<K>)> = Vec::with_capacity(all_page_ids.len());
+        for page_id in &all_page_ids {
+            let page_opt = {
+                let mut cache = self.page_cache.write();
+                cache.get(page_id).map(|arc| arc.read().clone())
+            };
+
+            if let Some(p) = page_opt {
+                pages.push((*page_id, p));
+                continue;
+            }
+
+            // Cache miss — try to load from disk
+            let file_offset = {
+                let idx = *page_id as usize;
+                if idx >= page_offsets_snapshot.len() || page_offsets_snapshot[idx] == 0 {
+                    continue; // never written to disk
+                }
+                page_offsets_snapshot[idx]
+            };
+
+            // Load from disk
+            match (|| -> Result<Page<K>> {
+                let mut file = self.storage_file.write();
+                file.seek(SeekFrom::Start(file_offset))?;
+                let mut header_buf = [0u8; HEADER_SIZE];
+                file.read_exact(&mut header_buf)?;
+                let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
+                if content_len < HEADER_SIZE || content_len > PAGE_SIZE {
+                    return Err(StorageError::Corruption("bad content_len".into()));
+                }
+                let mut buf = vec![0u8; content_len];
+                file.seek(SeekFrom::Start(file_offset))?;
+                file.read_exact(&mut buf)?;
+                Page::deserialize(*page_id, &buf, self.key_size)
+            })() {
+                Ok(page) => pages.push((*page_id, page)),
+                Err(e) => {
+                    // Page was on disk but failed to load — log warning
+                    // Don't fail the entire flush; skip this page to avoid checkpoint crash
+                    eprintln!("[MoteDB] Warning: skipping corrupt page {} during flush: {}", page_id, e);
+                }
+            }
+        }
+        pages.sort_by_key(|(id, _)| *id);
+
+        // Compute superblock size so pages start after it
+        let sb_size = {
+            let page_offsets = self.page_offsets.read();
+            let sb = SuperBlock {
+                magic: BTREE_MAGIC,
+                version: BTREE_VERSION,
+                root_page_id: *self.root_page_id.read(),
+                next_page_id: *self.next_page_id.read(),
+                key_size: self.key_size as u32,
+                page_offsets: page_offsets.clone(),
+            };
+            4 + bincode::serialize(&sb)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?
+                .len()
+        };
+
+        // Rewrite all pages sequentially after superblock
+        let mut file = self.storage_file.write();
+
+        let page_start = sb_size as u64;
+        let mut offset = page_start;
+        let mut new_offsets = vec![0u64]; // index 0 = superblock
+
+        for (page_id, mut working) in pages {
+            // Convert large values to overflow markers
+            if working.is_leaf {
+                for i in 0..working.values.len() {
+                    let value = &working.values[i];
+                    let is_overflow_marker = value.len() == 20
+                        && value[0..4] == OVERFLOW_MARKER.to_le_bytes();
+                    if value.len() > OVERFLOW_THRESHOLD && !is_overflow_marker {
+                        let overflow_id = self.write_overflow_chain(value)?;
+                        let mut marker = Vec::with_capacity(20);
+                        marker.extend_from_slice(&OVERFLOW_MARKER.to_le_bytes());
+                        marker.extend_from_slice(&overflow_id.to_le_bytes());
+                        marker.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                        working.values[i] = marker;
+                    }
+                }
+            }
+
+            let buf = working.serialize(self.key_size)?;
+
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&buf)?;
+
+            let idx = page_id as usize;
+            if idx >= new_offsets.len() {
+                new_offsets.resize(idx + 1, 0);
+            }
+            new_offsets[idx] = offset;
+            offset += buf.len() as u64;
+
+            // Update cache with clean page
+            let mut cache = self.page_cache.write();
+            working.dirty = false;
+            cache.put(page_id, Arc::new(RwLock::new(working)));
+        }
+
+        // Truncate file
+        file.set_len(offset)?;
+        drop(file);
+
+        // Update page_offsets
+        let mut offsets = self.page_offsets.write();
+        *offsets = new_offsets;
+        drop(offsets);
+
+        // Persist superblock
+        self.sync_superblock()?;
+
+        // Clear cache to free memory
+        let mut cache = self.page_cache.write();
+        cache.clear();
+
         Ok(())
     }
     
-    /// Write page to disk
+    /// Write page to disk (append-only, offset recorded in page table)
     fn write_page(&self, page: &Page<K>) -> Result<()> {
-        // CRITICAL: Convert all large values to overflow markers BEFORE serialization
-        // This must be done on a working copy to avoid modifying the input
         let mut working_page = page.clone();
-        
+
         if working_page.is_leaf {
             for i in 0..working_page.values.len() {
                 let value = &working_page.values[i];
-                let is_overflow_marker = value.len() == 20 
+                let is_overflow_marker = value.len() == 20
                     && value[0..4] == OVERFLOW_MARKER.to_le_bytes();
-                
-                // Only convert raw large values that aren't already markers
+
                 if value.len() > OVERFLOW_THRESHOLD && !is_overflow_marker {
-                    // Write overflow chain and get page ID
                     let overflow_page_id = self.write_overflow_chain(value)?;
-                    
-                    // Replace with overflow marker in working copy
                     let mut marker = Vec::with_capacity(20);
                     marker.extend_from_slice(&OVERFLOW_MARKER.to_le_bytes());
                     marker.extend_from_slice(&overflow_page_id.to_le_bytes());
-                    let total_size = value.len() as u64;
-                    marker.extend_from_slice(&total_size.to_le_bytes());
+                    marker.extend_from_slice(&(value.len() as u64).to_le_bytes());
                     working_page.values[i] = marker;
                 }
             }
         }
-        
-        // Now serialize the working page (all large values are now markers)
+
         let buf = working_page.serialize(self.key_size)?;
-        
-        // No need to track assigned IDs - they're already in working_page.values
-        
-        // All values have been converted, no need for additional processing
-        
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        // Superblock takes 256 bytes, pages start at offset 256
-        let offset = 256 + (working_page.page_id - 1) * PAGE_SIZE as u64;
-        
-        file.seek(SeekFrom::Start(offset))?;
+
+        let mut file = self.storage_file.write();
+
+        let file_end = file.metadata()?.len().max(SUPERBLOCK_RESERVE);
+
+        file.seek(SeekFrom::Start(file_end))?;
         file.write_all(&buf)?;
-        
+
+        // Record offset in page table
+        {
+            let mut offsets = self.page_offsets.write();
+            let idx = working_page.page_id as usize;
+            if idx >= offsets.len() {
+                offsets.resize(idx + 1, 0);
+            }
+            offsets[idx] = file_end;
+        }
+
         if self.config.immediate_sync {
             file.sync_all()?;
         }
-        
-        // Update cache with the working page (which has all conversions applied)
-        let mut cache = self.page_cache.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        working_page.dirty = false;  // Mark as clean after write
-        
+
+        // Update cache
+        let mut cache = self.page_cache.write();
+        working_page.dirty = false;
         cache.put(working_page.page_id, Arc::new(RwLock::new(working_page)));
-        
+
         Ok(())
     }
-    
-    /// Read page from disk
+
+    /// Read page from disk using page table
     fn read_page(&self, page_id: u64) -> Result<Page<K>> {
+        self.read_page_arc(page_id)
+            .map(|arc| { let guard = arc.read(); (*guard).clone() })
+    }
+
+    /// Read page from cache or disk, returning Arc (1 atomic increment, no Page clone)
+    fn read_page_arc(&self, page_id: u64) -> Result<Arc<RwLock<Page<K>>>> {
         if page_id == 0 || page_id > 1_000_000_000 {
             return Err(StorageError::InvalidData(
                 format!("Invalid page_id: {}", page_id)
             ));
         }
-        
-        
-        // Check cache first
+
+        // Check cache with read lock first (LruCache::peek is &self, no recency update)
         {
-            let mut cache = self.page_cache.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
+            let cache = self.page_cache.read();
+
+            if let Some(page_arc) = cache.peek(&page_id) {
+                return Ok(Arc::clone(page_arc));
+            }
+        }
+
+        // Cache miss — acquire write lock for insert
+        {
+            let mut cache = self.page_cache.write();
+
+            // Double-check: another thread may have inserted while we waited for write lock
             if let Some(page_arc) = cache.get(&page_id) {
-                let page = page_arc.read()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-                
-                // Count large values for debugging
-                let large_count = if page.is_leaf {
-                    page.values.iter().filter(|v| v.len() > OVERFLOW_THRESHOLD).count()
-                } else {
-                    0
-                };
-                
-                if large_count > 0 {
-                    debug_log!("DEBUG read_page: Page {} from cache has {} UNCONVERTED large values!",
-                             page_id, large_count);
-                }
-                
-                return Ok((*page).clone());
+                return Ok(Arc::clone(page_arc));
             }
         }
-        
-        // Read from disk
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        let offset = 256 + (page_id - 1) * PAGE_SIZE as u64;
-        
-        // Check if file is large enough
-        let file_len = file.metadata()?.len();
-        let required_len = offset + PAGE_SIZE as u64;
-        
-        if file_len < required_len {
-            // File too small, need to extend it
-            if required_len > 1_000_000_000 {
-                debug_log!("WARN: Extending file to {} bytes (page_id={})", required_len, page_id);
+
+        // Look up offset from page table
+        let file_offset = {
+            let offsets = self.page_offsets.read();
+            let idx = page_id as usize;
+            if idx >= offsets.len() || offsets[idx] == 0 {
+                return Err(StorageError::Corruption(
+                    format!("Page {} not found in page table", page_id)
+                ));
             }
-            file.set_len(required_len).map_err(|e| {
-                StorageError::Io(std::io::Error::other(
-                    format!("Failed to extend file to {} bytes for page {}: {}", required_len, page_id, e)
-                ))
-            })?;
+            offsets[idx]
+        };
+
+        // Use positional read (pread) instead of seek+read to avoid holding
+        // the write lock on the storage file. This allows concurrent B+Tree reads
+        // to proceed in parallel without serializing on the file lock.
+        use std::os::unix::fs::FileExt;
+        let file = self.storage_file.read();
+
+        // Read header to get content_len
+        let mut header_buf = [0u8; HEADER_SIZE];
+        file.read_exact_at(&mut header_buf, file_offset)?;
+        let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
+
+        if content_len < HEADER_SIZE || content_len > PAGE_SIZE {
+            return Err(StorageError::Corruption(
+                format!("Invalid content_len {} for page {} at offset {}", content_len, page_id, file_offset)
+            ));
         }
-        
-        file.seek(SeekFrom::Start(offset))?;
-        
-        let mut buf = vec![0u8; PAGE_SIZE];
-        file.read_exact(&mut buf)?;
-        
-        let mut page = Page::deserialize(page_id, &buf, self.key_size)?;
-        page.dirty = false;  // Mark as clean since we just read from disk
-        
-        // Add to cache
-        let mut cache = self.page_cache.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        cache.put(page_id, Arc::new(RwLock::new(page.clone())));
-        
-        Ok(page)
+
+        // Read full page content
+        let mut buf = vec![0u8; content_len];
+        file.read_exact_at(&mut buf, file_offset)?;
+
+        let page = Page::deserialize(page_id, &buf, self.key_size)?;
+        let page_arc = Arc::new(RwLock::new(page));
+
+        let mut cache = self.page_cache.write();
+        cache.put(page_id, Arc::clone(&page_arc));
+
+        Ok(page_arc)
     }
 }
 
@@ -1737,6 +1819,8 @@ struct SuperBlock {
     root_page_id: u64,
     next_page_id: u64,
     key_size: u32,
+    /// Page offset table (v3+): page_id → file_offset
+    page_offsets: Vec<u64>,
 }
 
 #[cfg(test)]

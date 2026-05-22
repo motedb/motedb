@@ -39,7 +39,7 @@ fn get_row(db: &Database, id: i64) -> Option<Vec<Value>> {
 fn get_val(db: &Database, id: i64) -> String {
     let row = get_row(db, id).unwrap_or_else(|| panic!("Row {} should exist", id));
     match &row[1] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => (**s).clone(),
         other => panic!("Row {} col 1 expected Text, got {:?}", id, other),
     }
 }
@@ -507,9 +507,9 @@ fn test_update_then_scan_preserves_all() {
         if let StreamingQueryResult::SelectStreaming { ref mut rows, .. } = result {
             while let Some(Ok(row)) = rows.next() {
                 match &row[1] {
-                    Value::Text(s) if s == "final" => final_count += 1,
-                    Value::Text(s) if s == "completed" => completed_count += 1,
-                    Value::Text(s) if s == "pending" => pending_count += 1,
+                    Value::Text(s) if s.as_str() == "final" => final_count += 1,
+                    Value::Text(s) if s.as_str() == "completed" => completed_count += 1,
+                    Value::Text(s) if s.as_str() == "pending" => pending_count += 1,
                     other => panic!("Unexpected status: {:?}", other),
                 }
             }
@@ -636,7 +636,7 @@ fn test_data_survives_restart() {
                 motedb::sql::QueryResult::Select { rows, .. } => {
                     let row = rows.into_iter().next()
                         .unwrap_or_else(|| panic!("Row {} missing after restart", i));
-                    assert_eq!(row[1], Value::Text(format!("val_{}", i)),
+                    assert_eq!(row[1], Value::text(format!("val_{}", i)),
                         "Row {} value mismatch after restart", i);
                 }
                 _ => panic!("Expected Select result for row {}", i),

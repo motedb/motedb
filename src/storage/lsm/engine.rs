@@ -1251,13 +1251,20 @@ impl LSMEngine {
     /// 
     /// This allows Database layer to backfill indexes from flushed data.
     pub fn flush_with_paths(&self) -> Result<Vec<PathBuf>> {
-        debug_log!("💾 [flush] 开始flush操作...");        
+        debug_log!("💾 [flush] 开始flush操作...");
         // 🔧 检查存储目录是否存在（防止在数据库关闭后flush）
         if !self.storage_dir.exists() {
             debug_log!("⚠️  [flush] 存储目录不存在，跳过flush: {:?}", self.storage_dir);
             return Ok(Vec::new());
         }
-        
+
+        // 0. Sync blob store — ensures large values are durable BEFORE
+        //    any SSTable referencing them is created and synced.
+        //    Without this, a crash between SSTable fsync and blob data reaching
+        //    disk would cause CRC errors on recovery (recoverable via WAL, but
+        //    better to prevent the inconsistency).
+        self.blob_store.flush()?;
+
         // 1. Force rotate active MemTable (even if not full)
         // 🔥 CRITICAL: Use a scope to release flush_lock immediately after rotate
         {
@@ -1320,6 +1327,16 @@ impl LSMEngine {
     /// 
     /// ✅ 统一入口：手动Flush和后台Flush都会触发此回调
     /// ✅ 高效：传入MemTable引用，避免数据拷贝
+    /// Force compaction: run one compaction cycle (best-effort).
+    /// Returns true if more compaction is needed.
+    pub fn compact(&self) -> Result<bool> {
+        let needs = self.compaction_worker.needs_compaction()?;
+        if needs {
+            self.compaction_worker.run_compaction()?;
+        }
+        Ok(needs)
+    }
+
     pub fn set_flush_callback<F>(&self, callback: F) -> Result<()>
     where
         F: Fn(&UnifiedMemTable) -> Result<()> + Send + Sync + 'static,
@@ -1833,27 +1850,27 @@ impl LSMEngine {
                 let memtable = self.memtable.read();
                 let immutable = self.immutable.read();
 
-                // Source 1: Active MemTable
+                // Source 1: Active MemTable — use scan_arcs to defer data cloning
                 {
-                    let entries = memtable.scan(start, end)?;
-                    let iter = entries.into_iter().map(|(k, entry)| {
+                    let entries = memtable.scan_arcs(start, end);
+                    let iter = entries.into_iter().map(|(k, arc, _vector)| {
                         Ok((k, Value {
-                            data: entry.data,
-                            timestamp: entry.timestamp,
-                            deleted: entry.deleted,
+                            data: arc.data.clone(),
+                            timestamp: arc.timestamp,
+                            deleted: arc.deleted,
                         }))
                     });
                     sources.push(Box::new(iter));
                 }
 
-                // Source 2-N: Immutable queue
+                // Source 2-N: Immutable queue — same deferred-clone scan
                 for mt in immutable.iter() {
-                    let entries = mt.scan(start, end)?;
-                    let iter = entries.into_iter().map(|(k, entry)| {
+                    let entries = mt.scan_arcs(start, end);
+                    let iter = entries.into_iter().map(|(k, arc, _vector)| {
                         Ok((k, Value {
-                            data: entry.data,
-                            timestamp: entry.timestamp,
-                            deleted: entry.deleted,
+                            data: arc.data.clone(),
+                            timestamp: arc.timestamp,
+                            deleted: arc.deleted,
                         }))
                     });
                     sources.push(Box::new(iter));
@@ -1876,19 +1893,20 @@ impl LSMEngine {
                     }
                 };
 
-                let entries = {
+                // 🚀 Streaming SSTable scan — reads blocks on demand, O(1) memory
+                let sst_iter = {
                     let sstable = cached.handle.read();
-                    match sstable.scan(start, end) {
-                        Ok(entries) => entries,
+                    match crate::storage::lsm::sstable::SSTableIterator::with_range(
+                        &sstable, Some(start), Some(end),
+                    ) {
+                        Ok(iter) => iter,
                         Err(e) => {
-                            debug_log!("[scan_range_streaming] Failed to scan SSTable {:?}: {:?}", meta.path, e);
+                            debug_log!("[scan_range_streaming] Failed to create SSTable iterator {:?}: {:?}", meta.path, e);
                             continue;
                         }
                     }
                 };
-
-                let iter = entries.into_iter().map(Ok);
-                sources.push(Box::new(iter));
+                sources.push(Box::new(sst_iter.map(|(k, v)| Ok((k, v)))));
             }
 
             // Phase 3: Validate consistency — if either epoch changed during our
@@ -2010,5 +2028,135 @@ mod tests {
             .collect();
         
         assert!(!sstables.is_empty(), "Should have created at least one SSTable");
+    }
+
+    #[test]
+    fn test_put_get_1000() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), LSMConfig::default()).unwrap();
+
+        for i in 0..1000u64 {
+            engine.put(i, Value::new(i.to_le_bytes().to_vec(), i)).unwrap();
+        }
+        for i in 0..1000u64 {
+            let val = engine.get(i).unwrap().expect("key should exist");
+            assert_eq!(val.data, ValueData::Inline(i.to_le_bytes().to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_scan_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), LSMConfig::default()).unwrap();
+
+        for i in 100..200u64 {
+            engine.put(i, Value::new(vec![(i % 256) as u8], i)).unwrap();
+        }
+        // Insert some keys outside range
+        engine.put(50, Value::new(vec![1], 50)).unwrap();
+        engine.put(250, Value::new(vec![1], 250)).unwrap();
+
+        let iter = engine.scan_range_streaming(100, 200).unwrap();
+        let results: Vec<_> = iter.filter_map(|r| r.ok()).collect();
+        assert_eq!(results.len(), 100, "should have exactly 100 entries in range [100,200)");
+        for (i, (key, _)) in results.iter().enumerate() {
+            assert_eq!(*key, 100 + i as u64);
+        }
+    }
+
+    #[test]
+    fn test_scan_range_after_flush() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = LSMConfig { memtable_size: 256, ..Default::default() };
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
+
+        // Insert enough to trigger flush
+        for i in 0..100u64 {
+            engine.put(i, Value::new(vec![0u8; 20], i)).unwrap();
+        }
+        engine.flush().unwrap();
+
+        // Scan after flush — should still see all data
+        let iter = engine.scan_range_streaming(0, 100).unwrap();
+        let results: Vec<_> = iter.filter_map(|r| r.ok()).collect();
+        assert_eq!(results.len(), 100, "all keys should be visible after flush");
+    }
+
+    #[test]
+    fn test_delete_visibility() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), LSMConfig::default()).unwrap();
+
+        engine.put(1, Value::new(b"alive".to_vec(), 100)).unwrap();
+        engine.delete(1, 200).unwrap();
+
+        // Delete with higher timestamp makes key invisible
+        assert!(engine.get(1).unwrap().is_none(), "deleted key should be invisible");
+
+        // Put with even higher timestamp revives
+        engine.put(1, Value::new(b"revived".to_vec(), 300)).unwrap();
+        let val = engine.get(1).unwrap().unwrap();
+        assert_eq!(val.data, ValueData::Inline(b"revived".to_vec()));
+    }
+
+    #[test]
+    fn test_scan_streaming_empty_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), LSMConfig::default()).unwrap();
+
+        let iter = engine.scan_range_streaming(1000, 2000).unwrap();
+        let results: Vec<_> = iter.filter_map(|r| r.ok()).collect();
+        assert!(results.is_empty());
+    }
+
+    // ━━━ Compaction ━━━
+
+    #[test]
+    fn test_flush_and_compact_preserves_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = LSMConfig { memtable_size: 512, ..Default::default() };
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
+        for i in 0..200u64 {
+            engine.put(i, Value::new(i.to_le_bytes().to_vec(), i)).unwrap();
+        }
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        for i in 0..200u64 {
+            assert!(engine.get(i).unwrap().is_some(), "key {} lost after compaction", i);
+        }
+    }
+
+    #[test]
+    fn test_scan_after_compact() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = LSMConfig { memtable_size: 1024, ..Default::default() };
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
+        for i in 0..100u64 {
+            engine.put(i, Value::new(vec![(i % 256) as u8], i)).unwrap();
+        }
+        engine.flush().unwrap();
+        // Compaction may or may not be needed depending on data size
+        let _ = engine.compact();
+        let iter = engine.scan_range_streaming(0, 100).unwrap();
+        let results: Vec<_> = iter.filter_map(|r| r.ok()).collect();
+        assert_eq!(results.len(), 100, "all keys should be visible after flush+compact");
+    }
+
+    #[test]
+    fn test_data_survives_multiple_flushes() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = LSMConfig { memtable_size: 1024, ..Default::default() };
+        let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
+        // Multiple flush rounds
+        for round in 0..3 {
+            let base = round * 100;
+            for i in 0..100u64 {
+                engine.put(base + i, Value::new((base + i).to_le_bytes().to_vec(), base + i)).unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        for i in 0..300u64 {
+            assert!(engine.get(i).unwrap().is_some(), "key {} lost after multi-flush", i);
+        }
     }
 }

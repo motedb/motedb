@@ -381,7 +381,16 @@ pub struct DBConfig {
     /// - 50000 (default) ≈ 4MB per table
     /// - 10000 ≈ 800KB per table (memory-constrained)
     pub pk_lookup_capacity: usize,
-    
+
+    /// Column index in-memory write buffer size (bytes)
+    ///
+    /// Larger buffers reduce B+Tree drain frequency during bulk inserts.
+    /// Memory usage: per-index allocation (one per indexed column).
+    /// - 1048576 (1MB, default): good for most workloads
+    /// - 4194304 (4MB): better for bulk insert throughput
+    /// - 262144 (256KB): memory-constrained environments
+    pub column_index_buffer_size: usize,
+
     /// 🚀 Phase 3+: Index update strategy
     /// 
     /// Controls when indexes are updated:
@@ -461,6 +470,7 @@ impl Default for DBConfig {
             lsm_config: LSMConfig::default(),
             row_cache_size: None,  // Use default 10000
             pk_lookup_capacity: 50_000,  // ~4MB per table
+            column_index_buffer_size: 1024 * 1024,  // 1MB
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
             query_timeout_secs: None,  // No timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
@@ -584,6 +594,11 @@ pub struct LSMConfig {
 
     /// SSTable block size in bytes (None = storage default 64KB)
     pub block_size: Option<usize>,
+
+    /// Tombstone TTL in seconds: deleted entries older than this are physically
+    /// dropped during compaction. 0 = drop all tombstones immediately.
+    /// None = use internal default (86400 = 24h).
+    pub tombstone_ttl_secs: Option<u64>,
 }
 
 impl Default for LSMConfig {
@@ -595,6 +610,7 @@ impl Default for LSMConfig {
             sstable_cache_size: None,
             sstable_cache_memory_limit_mb: None,
             block_size: None,
+            tombstone_ttl_secs: None,
         }
     }
 }

@@ -140,15 +140,19 @@ impl MoteDB {
         let indexes_with_data: Vec<_> = {
             schema.columns.iter().filter_map(|col_def| {
                 let index_name = format!("{}.{}", table_name, col_def.name);
-                self.column_indexes.get(&index_name).map(|index_ref| {
-                    let index = index_ref.value().clone();
+                self.column_indexes.get(&index_name).and_then(|index_ref| {
+                    let index = index_ref.value();
+                    // Skip if index is already up-to-date from synchronous path
+                    if !index.needs_rebuild() {
+                        return None;
+                    }
                     let mut batch: Vec<(RowId, Value)> = Vec::with_capacity(rows.len());
                     for (row_id, row) in rows {
                         if let Some(value) = row.get(col_def.position) {
                             batch.push((*row_id, value.clone()));
                         }
                     }
-                    (index, col_def.name.clone(), batch)
+                    Some((index.clone(), col_def.name.clone(), batch))
                 })
             }).collect()
         };
@@ -160,6 +164,7 @@ impl MoteDB {
                     .collect();
 
                 index.insert_batch(&batch_refs)?;
+                index.mark_rebuilt();
                 debug_log!("[ColumnIndex]   ✓ Built {} entries for column '{}'",
                          batch.len(), _col_name);
             }
@@ -252,8 +257,8 @@ impl MoteDB {
                     let filtered: Vec<(RowId, Vec<Value>)> = rows.iter()
                         .filter_map(|(row_id, row)| {
                             row.get(col_pos).and_then(|v| match v {
-                                Value::Text(t) => Some((*row_id, vec![Value::Text(t.clone())])),
-                                Value::TextDoc(t) => Some((*row_id, vec![Value::Text(t.content().to_string())])),
+                                Value::Text(t) => Some((*row_id, vec![Value::text((**t).clone())])),
+                                Value::TextDoc(t) => Some((*row_id, vec![Value::text(t.content().to_string())])),
                                 _ => None,
                             })
                         })

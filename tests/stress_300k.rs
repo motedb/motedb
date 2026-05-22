@@ -80,14 +80,14 @@ fn test_300k_insert_integrity() {
     // 首行
     let first = select_row(&db, "SELECT * FROM t1 WHERE id = 1").expect("id=1");
     assert_eq!(first[0], Value::Integer(1));
-    assert_eq!(first[1], Value::Text("user_1".into()));
+    assert_eq!(first[1], Value::text("user_1".into()));
 
     // 尾行
     let last_id = n as i64;
     let last = select_row(&db, &format!("SELECT * FROM t1 WHERE id = {}", last_id))
         .unwrap_or_else(|| panic!("id={}", last_id));
     assert_eq!(last[0], Value::Integer(last_id));
-    assert_eq!(last[1], Value::Text(format!("user_{}", last_id)));
+    assert_eq!(last[1], Value::text(format!("user_{}", last_id)));
 
     // 中间行
     let mid_id = n as i64 / 2;
@@ -137,14 +137,14 @@ fn test_300k_update_correctness() {
     // 偶数行已更新
     for i in (2..=200i64).step_by(2) {
         let row = select_row(&db, &format!("SELECT * FROM t2 WHERE id = {}", i)).unwrap();
-        assert_eq!(row[1], Value::Text("updated".into()), "row {} val", i);
+        assert_eq!(row[1], Value::text("updated".into()), "row {} val", i);
         assert_eq!(row[2], Value::Integer(i * 10), "row {} counter", i);
     }
 
     // 奇数行不变
     for i in (1..=199i64).step_by(2) {
         let row = select_row(&db, &format!("SELECT * FROM t2 WHERE id = {}", i)).unwrap();
-        assert_eq!(row[1], Value::Text("original".into()), "row {} val", i);
+        assert_eq!(row[1], Value::text("original".into()), "row {} val", i);
         assert_eq!(row[2], Value::Integer(0), "row {} counter", i);
     }
 
@@ -187,7 +187,7 @@ fn test_300k_delete_correctness() {
     for i in 1..=200i64 {
         if i % 3 != 0 {
             let row = select_row(&db, &format!("SELECT * FROM t3 WHERE id = {}", i)).unwrap();
-            assert_eq!(row[1], Value::Text(format!("d_{}", i)), "row {} data", i);
+            assert_eq!(row[1], Value::text(format!("d_{}", i)), "row {} data", i);
         }
     }
 
@@ -217,7 +217,7 @@ fn test_300k_pk_lookup_consistency() {
     for &id in &samples {
         let row = select_row(&db, &format!("SELECT * FROM t4 WHERE id = {}", id)).unwrap();
         assert_eq!(row[0], Value::Integer(id));
-        assert_eq!(row[1], Value::Text(format!("p_{}", id)));
+        assert_eq!(row[1], Value::text(format!("p_{}", id)));
         assert_eq!(row[2], Value::Integer(id * 7));
     }
 
@@ -228,7 +228,7 @@ fn test_300k_pk_lookup_consistency() {
     for &id in &samples {
         let row = select_row(&db, &format!("SELECT * FROM t4 WHERE id = {}", id)).unwrap();
         assert_eq!(row[0], Value::Integer(id), "id mismatch after flush");
-        assert_eq!(row[1], Value::Text(format!("p_{}", id)), "payload after flush");
+        assert_eq!(row[1], Value::text(format!("p_{}", id)), "payload after flush");
         assert_eq!(row[2], Value::Integer(id * 7), "value after flush");
     }
 
@@ -304,12 +304,12 @@ fn test_300k_mixed_crud_correctness() {
 
     // 验证前半 inactive
     let r100 = select_row(&db, "SELECT * FROM t6 WHERE id = 100").unwrap();
-    assert_eq!(r100[1], Value::Text("inactive".into()));
+    assert_eq!(r100[1], Value::text("inactive".into()));
     assert_eq!(r100[2], Value::Integer(2));
 
     // 验证后半 active
     let rend = select_row(&db, &format!("SELECT * FROM t6 WHERE id = {}", M)).unwrap();
-    assert_eq!(rend[1], Value::Text("active".into()));
+    assert_eq!(rend[1], Value::text("active".into()));
     assert_eq!(rend[2], Value::Integer(1));
 
     // Phase 3: DELETE 前四分之一
@@ -330,7 +330,7 @@ fn test_300k_mixed_crud_correctness() {
 
     // quarter+1 存在且 inactive
     let r_q = select_row(&db, &format!("SELECT * FROM t6 WHERE id = {}", quarter as i64 + 1)).unwrap();
-    assert_eq!(r_q[1], Value::Text("inactive".into()));
+    assert_eq!(r_q[1], Value::text("inactive".into()));
 
     println!("  ✓ Mixed CRUD: insert={}, update={}, delete={}, final={}", M, half, quarter, expected);
 }
@@ -415,10 +415,10 @@ fn test_300k_restart_durability() {
         count_before = count_rows(&db, "t8");
         // 验证 UPDATE 生效：id=1 被改了
         let r1_before = select_row(&db, "SELECT * FROM t8 WHERE id = 1").unwrap();
-        assert_eq!(r1_before[1], Value::Text("modified".into()), "id=1 should be modified before close");
+        assert_eq!(r1_before[1], Value::text("modified".into()), "id=1 should be modified before close");
         // id=2 没改
         let r2_before = select_row(&db, "SELECT * FROM t8 WHERE id = 2").unwrap();
-        assert_eq!(r2_before[1], Value::Text("v_2".into()), "id=2 should be v_2 before close");
+        assert_eq!(r2_before[1], Value::text("v_2".into()), "id=2 should be v_2 before close");
 
         db.checkpoint().expect("checkpoint");
         db.close().expect("close");
@@ -432,11 +432,11 @@ fn test_300k_restart_durability() {
 
     // id=1 仍为 modified
     let r1 = select_row(&db2, "SELECT * FROM t8 WHERE id = 1").expect("id=1 after restart");
-    assert_eq!(r1[1], Value::Text("modified".into()), "id=1 should retain 'modified' after restart");
+    assert_eq!(r1[1], Value::text("modified".into()), "id=1 should retain 'modified' after restart");
 
     // id=2 仍为 v_2
     let r2 = select_row(&db2, "SELECT * FROM t8 WHERE id = 2").expect("id=2 after restart");
-    assert_eq!(r2[1], Value::Text("v_2".into()), "id=2 should be v_2 after restart");
+    assert_eq!(r2[1], Value::text("v_2".into()), "id=2 should be v_2 after restart");
 
     // 首尾行
     assert!(select_row(&db2, "SELECT * FROM t8 WHERE id = 1").is_some());

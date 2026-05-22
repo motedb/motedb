@@ -251,21 +251,23 @@ where
 
     /// Drain all entries (for testing/flushing)
     ///
-    /// Returns all entries and clears the buffer
+    /// Returns all entries and clears the buffer.
+    ///
+    /// Holds the active write lock across both phases (active + immutable drain)
+    /// to prevent an interleaving insert from pushing entries to immutable between
+    /// Phase 1 and Phase 2, which could cause stale values to win in deduplication.
     pub fn drain(&self) -> Vec<(K, V)> {
-        let mut results = Vec::new();
+        // Hold active.write through the ENTIRE drain to prevent an insert
+        // from swapping the newly-emptied active to immutable between phases.
+        // Lock order: active.write → immutable.write, consistent with insert().
+        let mut active = self.active.write();
+        let mut results: Vec<(K, V)> = active.data.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        active.data.clear();
+        active.size = 0;
 
-        // 1. Drain active
-        {
-            let mut active = self.active.write();
-            results.extend(
-                active.data.iter().map(|(k, v)| (k.clone(), v.clone()))
-            );
-            active.data.clear();
-            active.size = 0;
-        }
-        
-        // 2. Drain immutable
+        // Drain immutable while still holding active.write
         {
             let mut immutable = self.immutable.write();
             for buffer in immutable.iter() {
@@ -275,11 +277,10 @@ where
             }
             immutable.clear();
         }
-        
-        // 3. Deduplicate
+        drop(active);
+
         results.sort_by(|a, b| a.0.cmp(&b.0));
         results.dedup_by(|a, b| a.0 == b.0);
-        
         results
     }
 
@@ -478,5 +479,78 @@ mod tests {
         let stats = buffer.stats();
         debug_log!("Stats: {:?}", stats);
         assert!(stats.fullness >= 100);
+    }
+
+    #[test]
+    fn test_drain_prevents_insert_interleaving() {
+        // Verifies that drain() holds active.write lock long enough
+        // to prevent an insert from pushing entries to immutable between
+        // the active drain and the immutable drain phases.
+        use std::thread;
+        use std::sync::{Arc, Barrier};
+
+        let buffer = Arc::new(IndexMemBuffer::<i32, String>::new(128));
+        let n: i32 = 500;
+
+        // Pre-populate with entries that fill to just below the limit
+        for i in 0..n {
+            let _ = buffer.insert(i, format!("val_{}", i));
+        }
+
+        // Drain should get all entries even with concurrent inserts
+        let b1 = Arc::clone(&buffer);
+        let barrier = Arc::new(Barrier::new(2));
+        let b2 = Arc::clone(&barrier);
+
+        let handle = thread::spawn(move || {
+            b2.wait(); // synchronize with drain
+            for i in 0..100 {
+                let _ = b1.insert(n + i, format!("extra_{}", i));
+            }
+        });
+
+        barrier.wait();
+        let drained = buffer.drain();
+
+        handle.join().unwrap();
+
+        // After drain, the buffer should NOT have pre-populated entries.
+        // Extra inserts might remain in active.
+        assert!(drained.len() >= n as usize, "drain should collect at least {} pre-populated entries, got {}", n, drained.len());
+
+        // Verify no duplicates in drained output
+        let mut keys: Vec<i32> = drained.iter().map(|(k, _)| *k).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), drained.len(), "drain output contains duplicate keys");
+
+        // Extra entries from concurrent inserts should still be in active buffer
+        // or drained — either way, no data is lost.
+    }
+
+    #[test]
+    fn test_drain_concurrent_with_full_buffer() {
+        // Stress: repeatedly fill buffer, drain, and verify all data accounted for.
+        use std::sync::Arc;
+        let buffer = Arc::new(IndexMemBuffer::<i32, i32>::new(256));
+
+        for round in 0..20 {
+            let mut inserted = 0usize;
+            loop {
+                let full = buffer.insert(inserted as i32, inserted as i32).unwrap();
+                inserted += 1;
+                if full && buffer.should_flush() {
+                    break;
+                }
+            }
+            // Should have at least 1 immutable buffer
+            assert!(buffer.immutable_count() >= 1,
+                "round {}: expected immutable buffers after filling", round);
+
+            let drained = buffer.drain();
+            assert!(!drained.is_empty(), "round {}: drain should not be empty", round);
+            assert!(buffer.is_empty(), "round {}: buffer should be empty after drain", round);
+            assert_eq!(buffer.size(), 0, "round {}: buffer size should be 0", round);
+        }
     }
 }

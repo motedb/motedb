@@ -37,9 +37,9 @@ fn test_batch_insert_routes_to_named_table() {
     exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
 
     let input_rows = vec![
-        vec![Value::Integer(1), Value::Text("Alice".to_string()), Value::Integer(30)],
-        vec![Value::Integer(2), Value::Text("Bob".to_string()), Value::Integer(25)],
-        vec![Value::Integer(3), Value::Text("Charlie".to_string()), Value::Integer(35)],
+        vec![Value::Integer(1), Value::text("Alice".to_string()), Value::Integer(30)],
+        vec![Value::Integer(2), Value::text("Bob".to_string()), Value::Integer(25)],
+        vec![Value::Integer(3), Value::text("Charlie".to_string()), Value::Integer(35)],
     ];
 
     let row_ids = db.batch_insert("users", input_rows).expect("batch insert");
@@ -48,9 +48,9 @@ fn test_batch_insert_routes_to_named_table() {
     // Verify data is in the correct table via SQL
     let result = query_rows(&db, "SELECT * FROM users ORDER BY id");
     assert_eq!(result.len(), 3);
-    assert_eq!(result[0][1], Value::Text("Alice".to_string()));
-    assert_eq!(result[1][1], Value::Text("Bob".to_string()));
-    assert_eq!(result[2][1], Value::Text("Charlie".to_string()));
+    assert_eq!(result[0][1], Value::text("Alice".to_string()));
+    assert_eq!(result[1][1], Value::text("Bob".to_string()));
+    assert_eq!(result[2][1], Value::text("Charlie".to_string()));
 }
 
 #[test]
@@ -61,12 +61,12 @@ fn test_batch_insert_multiple_tables_isolation() {
     exec(&db, "CREATE TABLE table_b (id INTEGER PRIMARY KEY, val TEXT)");
 
     let rows_a = vec![
-        vec![Value::Integer(1), Value::Text("A1".to_string())],
-        vec![Value::Integer(2), Value::Text("A2".to_string())],
+        vec![Value::Integer(1), Value::text("A1".to_string())],
+        vec![Value::Integer(2), Value::text("A2".to_string())],
     ];
     let rows_b = vec![
-        vec![Value::Integer(1), Value::Text("B1".to_string())],
-        vec![Value::Integer(2), Value::Text("B2".to_string())],
+        vec![Value::Integer(1), Value::text("B1".to_string())],
+        vec![Value::Integer(2), Value::text("B2".to_string())],
     ];
 
     db.batch_insert("table_a", rows_a).expect("batch insert A");
@@ -77,8 +77,8 @@ fn test_batch_insert_multiple_tables_isolation() {
 
     assert_eq!(result_a.len(), 2);
     assert_eq!(result_b.len(), 2);
-    assert_eq!(result_a[0][1], Value::Text("A1".to_string()));
-    assert_eq!(result_b[0][1], Value::Text("B1".to_string()));
+    assert_eq!(result_a[0][1], Value::text("A1".to_string()));
+    assert_eq!(result_b[0][1], Value::text("B1".to_string()));
 }
 
 // ============================================================================
@@ -92,20 +92,20 @@ fn test_get_row_named_table() {
     exec(&db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
 
     // Insert via API to get the internal row_id
-    let row = vec![Value::Integer(1), Value::Text("widget".to_string())];
+    let row = vec![Value::Integer(1), Value::text("widget".to_string())];
     let row_id = db.insert_row("items", row).expect("insert_row");
 
     // get_row should find the row using internal row_id
     let read_back = db.get_row("items", row_id).expect("get_row");
     assert!(read_back.is_some(), "Should find row in 'items' table via row_id");
     let read_back = read_back.unwrap();
-    assert_eq!(read_back[1], Value::Text("widget".to_string()));
+    assert_eq!(read_back[1], Value::text("widget".to_string()));
 
     // get_row_map should also work
     let map = db.get_row_map("items", row_id).expect("get_row_map");
     assert!(map.is_some(), "Should find row via get_row_map");
     let map = map.unwrap();
-    assert_eq!(map.get("name"), Some(&Value::Text("widget".to_string())));
+    assert_eq!(map.get("name"), Some(&Value::text("widget".to_string())));
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn test_get_row_map_wrong_table_returns_none() {
     exec(&db, "CREATE TABLE table_y (id INTEGER PRIMARY KEY, val TEXT)");
 
     // Insert into table_x via API to get internal row_id
-    let row = vec![Value::Integer(1), Value::Text("X".to_string())];
+    let row = vec![Value::Integer(1), Value::text("X".to_string())];
     let row_id = db.insert_row("table_x", row).expect("insert_row");
 
     // Row exists in table_x but not table_y
@@ -134,13 +134,13 @@ fn test_get_row_with_table_name() {
     exec(&db, "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT)");
 
     // Insert via API to capture internal row_id
-    let row = vec![Value::Integer(42), Value::Text("gadget".to_string())];
+    let row = vec![Value::Integer(42), Value::text("gadget".to_string())];
     let row_id = db.insert_row("products", row).expect("insert_row");
 
     let found = db.get_row("products", row_id).expect("get_row");
     assert!(found.is_some(), "Should find row in products table");
     let found = found.unwrap();
-    assert_eq!(found[1], Value::Text("gadget".to_string()));
+    assert_eq!(found[1], Value::text("gadget".to_string()));
 
     // Non-existent row_id
     let not_found = db.get_row("products", 999999).expect("get_row");
@@ -158,21 +158,21 @@ fn test_insert_get_update_delete_cycle() {
     exec(&db, "CREATE TABLE sensors (id INTEGER PRIMARY KEY, temp FLOAT, label TEXT)");
 
     // Insert via API
-    let row = vec![Value::Integer(1), Value::Float(23.5), Value::Text("indoor".to_string())];
+    let row = vec![Value::Integer(1), Value::Float(23.5), Value::text("indoor".to_string())];
     let row_id = db.insert_row("sensors", row).expect("insert_row");
 
     // Read back
     let read_back = db.get_row("sensors", row_id).expect("get_row").expect("row exists");
     assert_eq!(read_back[0], Value::Integer(1));
-    assert_eq!(read_back[2], Value::Text("indoor".to_string()));
+    assert_eq!(read_back[2], Value::text("indoor".to_string()));
 
     // Update via API
-    let new_row = vec![Value::Integer(1), Value::Float(26.0), Value::Text("outdoor".to_string())];
+    let new_row = vec![Value::Integer(1), Value::Float(26.0), Value::text("outdoor".to_string())];
     db.update_row("sensors", row_id, new_row).expect("update_row");
 
     let updated = db.get_row("sensors", row_id).expect("get_row").expect("row exists");
     assert_eq!(updated[1], Value::Float(26.0));
-    assert_eq!(updated[2], Value::Text("outdoor".to_string()));
+    assert_eq!(updated[2], Value::text("outdoor".to_string()));
 
     // Delete via API
     db.delete_row("sensors", row_id).expect("delete_row");
@@ -192,14 +192,14 @@ fn test_insert_row_map() {
 
     let mut row = std::collections::HashMap::new();
     row.insert("id".to_string(), Value::Integer(1));
-    row.insert("level".to_string(), Value::Text("INFO".to_string()));
-    row.insert("msg".to_string(), Value::Text("started".to_string()));
+    row.insert("level".to_string(), Value::text("INFO".to_string()));
+    row.insert("msg".to_string(), Value::text("started".to_string()));
 
     let _row_id = db.insert_row_map("logs", row).expect("insert_row_map");
 
     let result = query_rows(&db, "SELECT * FROM logs WHERE id = 1");
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0][1], Value::Text("INFO".to_string()));
+    assert_eq!(result[0][1], Value::text("INFO".to_string()));
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn test_batch_insert_map() {
     for i in 1..=5 {
         let mut row = std::collections::HashMap::new();
         row.insert("id".to_string(), Value::Integer(i));
-        row.insert("type".to_string(), Value::Text(format!("event_{}", i)));
+        row.insert("type".to_string(), Value::text(format!("event_{}", i)));
         input_rows.push(row);
     }
 
@@ -251,7 +251,7 @@ fn test_batch_insert_wrong_schema() {
 
     // Wrong number of columns
     let input_rows = vec![
-        vec![Value::Integer(1), Value::Text("ok".to_string()), Value::Integer(999)],
+        vec![Value::Integer(1), Value::text("ok".to_string()), Value::Integer(999)],
     ];
     let result = db.batch_insert("t", input_rows);
     assert!(result.is_err(), "Should fail validation for wrong schema");

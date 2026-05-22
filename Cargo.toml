@@ -1,6 +1,6 @@
 [package]
 name = "motedb"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
 license = "MIT"
@@ -80,6 +80,9 @@ tikv-jemallocator = { version = "0.5", optional = true, features = ["background_
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# SQLite comparison benchmark
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Temporary directories for testing
 tempfile = "3.0"
 
@@ -92,7 +95,7 @@ clap = { version = "4.4", features = ["derive"] }
 
 # Enable jieba tokenizer by default
 [features]
-default = ["tokenizer-jieba", "rayon", "jemalloc"]  # Full build: jieba + parallelism + jemalloc
+default = ["tokenizer-jieba", "rayon"]  # Full build: jieba + parallelism, system allocator
 default-edge = []  # Edge/IoT minimal: no tokenizer, no rayon, system allocator
 # 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
@@ -105,20 +108,22 @@ jemalloc = ["tikv-jemallocator"]
 rayon = ["dep:rayon"]  # 启用 Rayon 并行处理
 
 [profile.release]
-opt-level = 3  # 🚀 优化性能（3 = 最快，z = 最小）
-lto = "fat"    # 🔥 Fat LTO：最激进的优化（+20% 性能）
-codegen-units = 1  # 单一代码生成单元（更好的优化）
-strip = true   # 移除符号表（-30% 大小）
-panic = "abort"  # panic 直接 abort（-10% 大小）
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# panic = "unwind" (default) — allows `cargo test --release` to work without conflicts
+
+[profile.production]
+# Smallest/fastest binary for deployment (use `cargo build --profile production`)
+inherits = "release"
+panic = "abort"
 
 [profile.release-small]
-# 🆕 嵌入式模式：优化二进制大小
 inherits = "release"
-opt-level = "z"  # 优化大小
+opt-level = "z"
 lto = "fat"
 
 [profile.release-test]
-# Benchmark profile: release optimizations but unwind for test harness
+# Benchmark profile: same as release, kept for backward compat
 inherits = "release"
-panic = "unwind"
-strip = false

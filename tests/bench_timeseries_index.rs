@@ -33,7 +33,7 @@ fn ingest_batch(db: &Database, table: &str, count: usize, base_ts: i64) {
             Value::Timestamp(Timestamp::from_micros(base_ts + i as i64 * 100)),
             Value::Float(20.0 + (i as f64 % 30.0)),
             Value::Float(40.0 + (i as f64 % 20.0)),
-            Value::Text(format!("label_{}", i % 50)),
+            Value::text(format!("label_{}", i % 50)),
             Value::Integer((i % 10) as i64),
         ]);
     }
@@ -108,7 +108,7 @@ fn bench_timeseries_full_suite() {
     // 3b: Label equals (bloom filter)
     let label_cond = vec![ColumnCondition::Equals {
         column_idx: 3,
-        value: Value::Text("label_7".to_string()),
+        value: Value::text("label_7".to_string()),
     }];
     let t0 = Instant::now();
     let label_results = db.columnar_store().query_with_conditions(
@@ -120,7 +120,7 @@ fn bench_timeseries_full_suite() {
     // 3c: Label nonexistent (bloom filter negative — fast path)
     let no_cond = vec![ColumnCondition::Equals {
         column_idx: 3,
-        value: Value::Text("NONEXISTENT_LABEL".to_string()),
+        value: Value::text("NONEXISTENT_LABEL".to_string()),
     }];
     let t0 = Instant::now();
     let no_results = db.columnar_store().query_with_conditions(

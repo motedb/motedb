@@ -59,10 +59,83 @@ pub fn rows_to_sql_rows(rows: Vec<(u64, Row)>, schema: &TableSchema) -> Result<V
         .collect()
 }
 
+/// Build a storage Row directly from resolved values, using column names to map into schema order.
+/// Skips the HashMap intermediary when the caller has already resolved expressions to Values.
+pub fn values_to_row_by_columns(
+    values: &[Value],
+    columns: &[String],
+    schema: &TableSchema,
+) -> Result<Row> {
+    let mut row = vec![Value::Null; schema.columns.len()];
+
+    for (i, col_name) in columns.iter().enumerate() {
+        let val = values.get(i).cloned().unwrap_or(Value::Null);
+        // Find the column position in schema
+        if let Some(col_def) = schema.get_column(col_name) {
+            // Skip AUTO_INCREMENT columns — system fills them
+            if col_def.auto_increment {
+                continue;
+            }
+            // Enforce NOT NULL
+            if !col_def.nullable && matches!(val, Value::Null) {
+                return Err(crate::error::MoteDBError::InvalidArgument(
+                    format!("Column '{}' cannot be null", col_name)
+                ));
+            }
+            // Type coercion
+            let coerced = match (&col_def.col_type, &val) {
+                (ColumnType::Timestamp, Value::Integer(ts)) => {
+                    Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
+                }
+                (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+                _ => val,
+            };
+            row[col_def.position] = coerced;
+        }
+    }
+
+    Ok(row)
+}
+
+/// Build a storage Row directly from values already in schema order.
+/// Used by fast INSERT path where column list matches schema exactly.
+pub fn values_to_row_schema_order(
+    values: &[Value],
+    schema: &TableSchema,
+) -> Result<Row> {
+    let mut row = Vec::with_capacity(schema.columns.len());
+
+    for (i, col_def) in schema.columns.iter().enumerate() {
+        if col_def.auto_increment {
+            row.push(Value::Null);
+            continue;
+        }
+        let val = values.get(i).cloned().unwrap_or(Value::Null);
+        // Enforce NOT NULL
+        if !col_def.nullable && matches!(val, Value::Null) {
+            return Err(crate::error::MoteDBError::InvalidArgument(
+                format!("Column '{}' cannot be null", col_def.name)
+            ));
+        }
+        // Type coercion
+        let coerced = match (&col_def.col_type, &val) {
+            (ColumnType::Timestamp, Value::Integer(ts)) => {
+                Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
+            }
+            (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+            _ => val,
+        };
+        row.push(coerced);
+    }
+
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, ColumnType};
+    use crate::types::{ColumnDef, ColumnType, ArcString};
+    use std::sync::Arc;
 
     #[test]
     fn test_row_to_sql_row() {
@@ -76,13 +149,13 @@ mod tests {
         
         let row = vec![
             Value::Integer(1),
-            Value::Text("Alice".to_string()),
+            Value::Text(ArcString(Arc::new("Alice".to_string()))),
         ];
-        
+
         let sql_row = row_to_sql_row(&row, &schema).unwrap();
-        
+
         assert_eq!(sql_row.get("id"), Some(&Value::Integer(1)));
-        assert_eq!(sql_row.get("name"), Some(&Value::Text("Alice".to_string())));
+        assert_eq!(sql_row.get("name"), Some(&Value::Text(ArcString(Arc::new("Alice".to_string())))));
     }
 
     #[test]
@@ -94,16 +167,16 @@ mod tests {
                 ColumnDef::new("name".to_string(), ColumnType::Text, 1),
             ],
         );
-        
+
         let mut sql_row = SqlRow::new();
         sql_row.insert("id".to_string(), Value::Integer(1));
-        sql_row.insert("name".to_string(), Value::Text("Alice".to_string()));
-        
+        sql_row.insert("name".to_string(), Value::Text(ArcString(Arc::new("Alice".to_string()))));
+
         let row = sql_row_to_row(&sql_row, &schema).unwrap();
-        
+
         assert_eq!(row.len(), 2);
         assert_eq!(row[0], Value::Integer(1));
-        assert_eq!(row[1], Value::Text("Alice".to_string()));
+        assert_eq!(row[1], Value::Text(ArcString(Arc::new("Alice".to_string()))));
     }
 
     #[test]
@@ -119,7 +192,7 @@ mod tests {
         
         let original_row = vec![
             Value::Integer(42),
-            Value::Text("Bob".to_string()),
+            Value::Text(ArcString(Arc::new("Bob".to_string()))),
             Value::Integer(30),
         ];
         

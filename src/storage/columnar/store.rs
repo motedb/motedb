@@ -466,7 +466,7 @@ impl ColumnarStore {
                         };
                         decode_strings(&block.data, row_count, enc)
                             .into_iter()
-                            .map(|v| v.map_or(Value::Null, Value::Text))
+                            .map(|v| v.map_or(Value::Null, |s| Value::text(s)))
                             .collect()
                     }
                     _ => {
@@ -824,9 +824,11 @@ impl ColumnarStore {
         for cond in conditions {
             match cond {
                 ColumnCondition::Equals { column_idx, value } => {
-                    let (_, col_name) = column_ids.iter()
+                    let Some((_, col_name)) = column_ids.iter()
                         .find(|(id, _)| *id as usize == *column_idx)
-                        .unwrap();
+                    else {
+                        continue;
+                    };
                     if let Some(v) = sql_row.get(col_name) {
                         if v != value {
                             return false;
@@ -834,9 +836,11 @@ impl ColumnarStore {
                     }
                 }
                 ColumnCondition::Range { column_idx, low, high } => {
-                    let (_, col_name) = column_ids.iter()
+                    let Some((_, col_name)) = column_ids.iter()
                         .find(|(id, _)| *id as usize == *column_idx)
-                        .unwrap();
+                    else {
+                        continue;
+                    };
                     if let Some(v) = sql_row.get(col_name) {
                         if v < low || v > high {
                             return false;
@@ -1082,7 +1086,7 @@ impl ColumnarStore {
                             };
                             decode_strings(&block.data, row_count, enc)
                                 .into_iter()
-                                .map(|v| v.map_or(Value::Null, Value::Text))
+                                .map(|v| v.map_or(Value::Null, |s| Value::text(s)))
                                 .collect()
                         }
                         _ => {
@@ -1287,7 +1291,7 @@ mod tests {
             rows.push(vec![
                 Value::Timestamp(Timestamp::from_micros(i * 1000)),
                 Value::Float(20.0 + i as f64 * 0.1),
-                Value::Text(format!("sensor_{}", i)),
+                Value::text(format!("sensor_{}", i)),
             ]);
         }
 
@@ -1336,7 +1340,7 @@ mod tests {
                 rows.push(vec![
                     Value::Timestamp(Timestamp::from_micros(ts)),
                     Value::Float(ts as f64),
-                    Value::Text("x".to_string()),
+                    Value::text("x".to_string()),
                 ]);
             }
             store.ingest("sensors", rows).unwrap();
@@ -1369,7 +1373,7 @@ mod tests {
         let rows = vec![vec![
             Value::Timestamp(Timestamp::from_micros(1000)),
             Value::Float(25.0),
-            Value::Text("test".to_string()),
+            Value::text("test".to_string()),
         ]];
         store.ingest("sensors", rows).unwrap();
         store.flush_all().unwrap();
@@ -1401,17 +1405,17 @@ mod tests {
             vec![
                 Value::Timestamp(Timestamp::from_micros(1000)),
                 Value::Float(25.0),
-                Value::Text("a".to_string()),
+                Value::text("a".to_string()),
             ],
             vec![
                 Value::Timestamp(Timestamp::from_micros(2000)),
                 Value::Float(26.0),
-                Value::Text("b".to_string()),
+                Value::text("b".to_string()),
             ],
             vec![
                 Value::Timestamp(Timestamp::from_micros(3000)),
                 Value::Float(27.0),
-                Value::Text("c".to_string()),
+                Value::text("c".to_string()),
             ],
         ];
         store.ingest("sensors", rows).unwrap();
@@ -1464,7 +1468,7 @@ mod tests {
                 rows.push(vec![
                     Value::Timestamp(Timestamp::from_micros(ts)),
                     Value::Float(20.0 + ts as f64 * 0.001),
-                    Value::Text(format!("s_{}_{}", batch, i)),
+                    Value::text(format!("s_{}_{}", batch, i)),
                 ]);
             }
             store.ingest("sensors", rows).unwrap();

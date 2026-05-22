@@ -24,17 +24,17 @@ use std::io::{Read, Write, Seek, SeekFrom};
 use serde::{Serialize, Deserialize};
 
 /// B+Tree node order (max keys per node)
-/// 4KB page layout: Header(13) + Keys(255*8) + Values(255*8) = 4093 bytes
-/// Leaves room for 3 bytes padding to stay within 4096
+/// Compact layout: Header(15) + Keys(n*8) + Values(n*8) — no fixed stride
+/// Max page content: 15 + 255*8 + 255*8 = 4095 bytes
 pub const BTREE_ORDER: usize = 255;
 
-/// Page size (16KB aligned)
-/// 
-/// 🚀 Performance: Larger page size reduces the number of leaf pages to scan
-/// - 4KB:  ~833 leaf pages for 50K entries (60 keys/page)
-/// - 16KB: ~208 leaf pages for 50K entries (240 keys/page)
-/// - Impact: Range query latency reduced by 4x
-pub const PAGE_SIZE: usize = 16384;
+/// Max serialized page size (header + max keys + max values)
+/// Used as upper bound for buffer allocation and page cache alignment
+pub const MAX_PAGE_SIZE: usize = 15 + BTREE_ORDER * 8 * 2;
+
+/// Compact page header size: [is_leaf:1][num_keys:4][next_leaf:8][content_len:2]
+const PAGE_HEADER_SIZE: usize = 15;
+
 
 /// Default page cache size
 pub const DEFAULT_PAGE_CACHE: usize = 1024;
@@ -46,41 +46,44 @@ const INVALID_PAGE_ID: u64 = u64::MAX;
 const BTREE_MAGIC: u32 = 0x42545245;
 
 /// Current B+Tree format version
-const BTREE_VERSION: u32 = 1;
+const BTREE_VERSION: u32 = 2;
 
 /// Type alias for the insert result: (old_value, optional split_info)
 type InsertResult = Result<(Option<u64>, Option<(u64, u64)>)>;
 
-/// SuperBlock for B+Tree metadata (stored in Page 0)
-/// This ensures we can recover critical metadata on reopen
+/// SuperBlock for B+Tree metadata (stored at file offset 0)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SuperBlock {
     /// Magic number for file validation
     magic: u32,
-    
+
     /// Format version
     version: u32,
-    
+
     /// Root page ID (where the B+Tree root is stored)
     root_page_id: u64,
-    
+
     /// Next available page ID
     next_page_id: u64,
-    
+
     /// Total number of keys in the tree
     total_keys: usize,
-    
+
     /// Total number of pages allocated
     total_pages: usize,
-    
+
     /// Number of leaf pages
     leaf_pages: usize,
-    
+
     /// Number of internal pages
     internal_pages: usize,
-    
+
     /// Tree height
     tree_height: usize,
+
+    /// Page offset table: page_id → file_offset
+    /// Empty for legacy files (v1), populated for v2+ compact format
+    page_offsets: Vec<u64>,
 }
 
 /// Persistent B+Tree Index
@@ -90,37 +93,35 @@ struct SuperBlock {
 pub struct BTree {
     /// Root page ID
     root_page_id: Arc<RwLock<u64>>,
-    
+
     /// Page cache (page_id -> Page)
     page_cache: Arc<RwLock<LruCache<u64, Arc<RwLock<Page>>>>>,
-    
+
     /// Next free page ID
     next_page_id: Arc<RwLock<u64>>,
-    
+
     /// Storage file
     storage_file: Arc<RwLock<File>>,
-    
+
     /// Flush lock (prevents concurrent flushes from corrupting file)
-    /// 
-    /// 🔧 Critical fix: Without this lock, multiple threads can interleave writes:
-    /// - Thread A: seek(page 0) → write(page 0 data)
-    /// - Thread B: seek(page 1) ← interrupts Thread A!
-    /// - Thread A: continues write ← now writing to wrong offset!
-    ///   Result: Data corruption (invalid num_keys, etc.)
     flush_lock: Arc<Mutex<()>>,
-    
+
     /// Storage path
     _storage_path: PathBuf,
 
     /// Configuration
     config: BTreeConfig,
-    
+
     /// Statistics
     stats: Arc<RwLock<BTreeStats>>,
-    
+
+    /// Page offset table: page_id → file_offset (for compact storage)
+    page_offsets: Arc<RwLock<Vec<u64>>>,
+
     /// File reference manager (for mmap safety)
+    #[allow(dead_code)]
     file_manager: Option<Arc<FileRefManager>>,
-    
+
     /// File handle (RAII protection)
     _file_handle: Option<FileHandle>,
 }
@@ -130,10 +131,7 @@ pub struct BTree {
 pub struct BTreeConfig {
     /// Node order (max keys per node)
     pub order: usize,
-    
-    /// Page size for disk storage
-    pub page_size: usize,
-    
+
     /// Page cache size
     pub cache_size: usize,
     
@@ -151,11 +149,10 @@ impl Default for BTreeConfig {
     fn default() -> Self {
         Self {
             order: BTREE_ORDER,
-            page_size: PAGE_SIZE,
             cache_size: DEFAULT_PAGE_CACHE,
             unique_keys: false,
             allow_updates: true,
-            immediate_sync: false,  // 默认延迟刷盘，跟随 MemTable 一起刷
+            immediate_sync: false,
         }
     }
 }
@@ -217,76 +214,81 @@ impl Page {
         }
     }
     
-    /// Serialize page to bytes (4KB)
-    fn serialize(&self) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; PAGE_SIZE];
+    /// Serialize page to compact bytes (only actual content, no padding)
+    fn serialize_compact(&self) -> Result<Vec<u8>> {
+        let data_len = PAGE_HEADER_SIZE
+            + self.num_keys * 8
+            + if self.is_leaf { self.num_keys * 8 } else { (self.num_keys + 1) * 8 };
+        let mut buf = vec![0u8; data_len];
         let mut offset = 0;
-        
-        // Header: [is_leaf:1][num_keys:4][next_leaf:8] = 13 bytes
+
+        // Header: [is_leaf:1][num_keys:4][next_leaf:8][content_len:2]
         buf[offset] = if self.is_leaf { 1 } else { 0 };
         offset += 1;
-        
+
         buf[offset..offset+4].copy_from_slice(&(self.num_keys as u32).to_le_bytes());
         offset += 4;
-        
+
         buf[offset..offset+8].copy_from_slice(&self.next_leaf.to_le_bytes());
         offset += 8;
-        
-        // Keys (256 * 8 bytes max)
+
+        buf[offset..offset+2].copy_from_slice(&(data_len as u16).to_le_bytes());
+        offset += 2;
+
+        // Keys (num_keys * 8 bytes)
         for &key in &self.keys {
             buf[offset..offset+8].copy_from_slice(&key.to_le_bytes());
             offset += 8;
         }
-        
-        // Align to next section (offset = 13 + 256*8 = 2061)
-        offset = 13 + BTREE_ORDER * 8;
-        
+
         if self.is_leaf {
-            // Values (256 * 8 bytes max)
+            // Values (num_keys * 8 bytes)
             for &value in &self.values {
                 buf[offset..offset+8].copy_from_slice(&value.to_le_bytes());
                 offset += 8;
             }
         } else {
-            // Children (257 * 8 bytes max)
+            // Children ((num_keys + 1) * 8 bytes)
             for &child in &self.children {
                 buf[offset..offset+8].copy_from_slice(&child.to_le_bytes());
                 offset += 8;
             }
         }
-        
+
         Ok(buf)
     }
-    
-    /// Deserialize page from bytes
-    fn deserialize(page_id: u64, buf: &[u8]) -> Result<Self> {
-        if buf.len() < PAGE_SIZE {
+
+    /// Deserialize page from compact bytes
+    fn deserialize_compact(page_id: u64, buf: &[u8]) -> Result<Self> {
+        if buf.len() < PAGE_HEADER_SIZE {
             return Err(StorageError::InvalidData(
-                format!("Page size too small: {}", buf.len())
+                format!("Page buffer too small: {} < header size {}", buf.len(), PAGE_HEADER_SIZE)
             ));
         }
-        
+
         let mut offset = 0;
-        
+
         let is_leaf = buf[offset] == 1;
         offset += 1;
-        
+
         let num_keys = u32::from_le_bytes([buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]]) as usize;
         offset += 4;
-        
-        // Validate num_keys to prevent corruption-induced panics
+
         if num_keys > BTREE_ORDER {
             return Err(StorageError::Corruption(
                 format!("Invalid num_keys in page {}: {} exceeds max {}", page_id, num_keys, BTREE_ORDER)
             ));
         }
-        
+
         let next_leaf = u64::from_le_bytes([
             buf[offset], buf[offset+1], buf[offset+2], buf[offset+3],
             buf[offset+4], buf[offset+5], buf[offset+6], buf[offset+7],
         ]);
         offset += 8;
-        
+
+        let _content_len = u16::from_le_bytes([buf[offset], buf[offset+1]]) as usize;
+        offset += 2;
+
         // Read keys
         let mut keys = Vec::with_capacity(num_keys);
         for _ in 0..num_keys {
@@ -297,15 +299,11 @@ impl Page {
             keys.push(key);
             offset += 8;
         }
-        
-        // Align
-        offset = 13 + BTREE_ORDER * 8;
-        
+
         let mut values = Vec::new();
         let mut children = Vec::new();
-        
+
         if is_leaf {
-            // Read values
             for _ in 0..num_keys {
                 let value = u64::from_le_bytes([
                     buf[offset], buf[offset+1], buf[offset+2], buf[offset+3],
@@ -315,9 +313,6 @@ impl Page {
                 offset += 8;
             }
         } else {
-            // Read children (num_keys + 1)
-            // 🔧 Fix: Only read children if num_keys > 0
-            // An internal node with num_keys=0 is invalid
             if num_keys > 0 {
                 for _ in 0..=num_keys {
                     let child = u64::from_le_bytes([
@@ -329,7 +324,7 @@ impl Page {
                 }
             }
         }
-        
+
         Ok(Self {
             page_id,
             is_leaf,
@@ -423,25 +418,27 @@ impl BTree {
         let file_size = metadata.len();
         let is_new_file = file_size == 0;
         
-        let (_superblock, root_page_id, next_page_id, stats) = if is_new_file {
+        let (_superblock, root_page_id, next_page_id, stats, page_offsets) = if is_new_file {
             // New file: create empty superblock
             // Reserve Page 0 for SuperBlock, data starts from Page 1
             let superblock = SuperBlock {
                 magic: BTREE_MAGIC,
                 version: BTREE_VERSION,
-                root_page_id: 0,  // No root yet
-                next_page_id: 1,  // Page 0 is reserved for SuperBlock
+                root_page_id: 0,
+                next_page_id: 1,
                 total_keys: 0,
                 total_pages: 0,
                 leaf_pages: 0,
                 internal_pages: 0,
                 tree_height: 0,
+                page_offsets: vec![0],  // index 0 = superblock offset
             };
             
             // Write initial superblock
             Self::write_superblock(&mut file, &superblock)?;
-            
-            (superblock, 0, 1, BTreeStats::default())
+
+            let page_offsets = vec![0u64];  // index 0 = superblock offset
+            (superblock, 0, 1, BTreeStats::default(), page_offsets)
         } else {
             // Existing file: load superblock from Page 0
             let superblock = Self::read_superblock(&mut file)?;
@@ -456,9 +453,10 @@ impl BTree {
             
             // Check version compatibility
             if superblock.version != BTREE_VERSION {
-                return Err(StorageError::Corruption(
-                    format!("Unsupported B+Tree version: {}", superblock.version)
-                ));
+                // v1 files use fixed PAGE_SIZE layout — silently reinitialize
+                drop(file);
+                let _ = std::fs::remove_file(&storage_path);
+                return Self::with_config(storage_path, config);
             }
             
             // Extract values before moving superblock
@@ -475,9 +473,11 @@ impl BTree {
                 page_cache_misses: 0,
             };
             
-            (superblock, root_id, next_id, stats)
+            let page_offsets = superblock.page_offsets.clone();
+
+            (superblock, root_id, next_id, stats, page_offsets)
         };
-        
+
         Ok(Self {
             root_page_id: Arc::new(RwLock::new(root_page_id)),
             page_cache: Arc::new(RwLock::new(LruCache::new(
@@ -489,38 +489,44 @@ impl BTree {
             _storage_path: storage_path,
             config,
             stats: Arc::new(RwLock::new(stats)),
+            page_offsets: Arc::new(RwLock::new(page_offsets)),
             file_manager: None,
             _file_handle: None,
         })
     }
     
-    /// Read SuperBlock from Page 0
+    /// Superblock allocation size (first 4KB of file reserved for superblock)
+    const SUPERBLOCK_SIZE: usize = 4096;
+
+    /// Read SuperBlock from file start
     fn read_superblock(file: &mut File) -> Result<SuperBlock> {
         file.seek(SeekFrom::Start(0))?;
-        
-        let mut buf = vec![0u8; PAGE_SIZE];
+
+        let mut buf = vec![0u8; Self::SUPERBLOCK_SIZE];
         file.read_exact(&mut buf)?;
-        
-        // Deserialize superblock (bincode handles size automatically)
+
         bincode::deserialize(&buf)
             .map_err(|e| StorageError::Corruption(format!("Failed to deserialize SuperBlock: {}", e)))
     }
-    
-    /// Write SuperBlock to Page 0
+
+    /// Write SuperBlock at file start
     fn write_superblock(file: &mut File, superblock: &SuperBlock) -> Result<()> {
         file.seek(SeekFrom::Start(0))?;
-        
-        // Serialize superblock
+
         let data = bincode::serialize(superblock)
             .map_err(|e| StorageError::Index(format!("Failed to serialize SuperBlock: {}", e)))?;
-        
-        // Pad to PAGE_SIZE
-        let mut buf = vec![0u8; PAGE_SIZE];
+
+        if data.len() > Self::SUPERBLOCK_SIZE {
+            return Err(StorageError::Index(
+                format!("SuperBlock too large: {} bytes exceeds {} reservation", data.len(), Self::SUPERBLOCK_SIZE)
+            ));
+        }
+
+        let mut buf = vec![0u8; Self::SUPERBLOCK_SIZE];
         buf[..data.len()].copy_from_slice(&data);
-        
+
         file.write_all(&buf)?;
-        // SuperBlock 写入不强制 fsync，等待 flush() 统一刷盘
-        
+
         Ok(())
     }
     
@@ -533,6 +539,9 @@ impl BTree {
         let stats = self.stats.read()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
         
+        let page_offsets = self.page_offsets.read()
+            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+
         let superblock = SuperBlock {
             magic: BTREE_MAGIC,
             version: BTREE_VERSION,
@@ -543,6 +552,7 @@ impl BTree {
             leaf_pages: stats.leaf_pages,
             internal_pages: stats.internal_pages,
             tree_height: stats.tree_height,
+            page_offsets: page_offsets.clone(),
         };
         
         let mut file = self.storage_file.write()
@@ -553,21 +563,19 @@ impl BTree {
     
     /// Load page from disk or cache
     fn load_page(&self, page_id: u64) -> Result<Arc<RwLock<Page>>> {
-        // 🔧 Critical fix: Page 0 is reserved for SuperBlock, not a BTree page!
         if page_id == 0 {
-            // Get root_id for debugging
             let root_id = *self.root_page_id.read()
                 .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
             return Err(StorageError::Corruption(
                 format!("Cannot load Page 0: reserved for SuperBlock (root_id={})", root_id)
             ));
         }
-        
+
         // Check cache first
         {
             let mut cache = self.page_cache.write()
                 .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
+
             if let Some(page) = cache.get(&page_id) {
                 let mut stats = self.stats.write()
                     .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
@@ -575,72 +583,99 @@ impl BTree {
                 return Ok(Arc::clone(page));
             }
         }
-        
+
         // Miss - load from disk
         let mut stats = self.stats.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
         stats.page_cache_misses += 1;
         drop(stats);
-        
+
+        // Look up page offset from page table
+        let file_offset = {
+            let offsets = self.page_offsets.read()
+                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let idx = page_id as usize;
+            if idx >= offsets.len() || offsets[idx] == 0 {
+                return Err(StorageError::Corruption(
+                    format!("Page {} not found in page table", page_id)
+                ));
+            }
+            offsets[idx]
+        };
+
         let mut file = self.storage_file.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        // Seek to page offset
-        let offset = page_id * PAGE_SIZE as u64;
-        file.seek(SeekFrom::Start(offset))?;
-        
-        // Read page
-        let mut buf = vec![0u8; PAGE_SIZE];
+
+        // Read header to get content_len
+        file.seek(SeekFrom::Start(file_offset))?;
+        let mut header_buf = [0u8; 15];
+        file.read_exact(&mut header_buf)?;
+        let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
+
+        if content_len < 15 || content_len > MAX_PAGE_SIZE {
+            return Err(StorageError::Corruption(
+                format!("Invalid content_len {} for page {} at offset {}", content_len, page_id, file_offset)
+            ));
+        }
+
+        // Read full page content
+        let mut buf = vec![0u8; content_len];
+        file.seek(SeekFrom::Start(file_offset))?;
         file.read_exact(&mut buf)?;
-        
-        let page = Page::deserialize(page_id, &buf)?;
-        
-        // 🔧 Validate page invariants after loading from disk
+
+        let page = Page::deserialize_compact(page_id, &buf)?;
         page.validate()?;
-        
+
         let page_arc = Arc::new(RwLock::new(page));
-        
-        // Add to cache
+
         let mut cache = self.page_cache.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
         cache.put(page_id, Arc::clone(&page_arc));
-        
+
         Ok(page_arc)
     }
-    
-    /// Flush page to disk (thread-safe with global flush lock)
-    /// 
-    /// 🔧 Critical fix: Acquire flush_lock before seek+write to prevent interleaved writes
+
+    /// Flush page to disk with compact storage
+    /// Flush a single page immediately (used during insert for root page safety)
     fn flush_page(&self, page: &Page) -> Result<()> {
         if !page.dirty {
             return Ok(());
         }
-        
-        // 🔧 Critical fix: Page 0 is reserved for SuperBlock
+
         if page.page_id == 0 {
             return Err(StorageError::Corruption(
                 "Cannot flush Page 0: reserved for SuperBlock".into()
             ));
         }
-        
-        let buf = page.serialize()?;
-        
-        // 🔒 Acquire flush lock to prevent concurrent writes from corrupting file
+
+        let buf = page.serialize_compact()?;
+
         let _flush_guard = self.flush_lock.lock()
             .map_err(|_| StorageError::Index("Flush lock poisoned".into()))?;
-        
+
         let mut file = self.storage_file.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        let offset = page.page_id * PAGE_SIZE as u64;
-        file.seek(SeekFrom::Start(offset))?;
+
+        // Always append — page_offsets will be corrected during flush()
+        let file_end = file.metadata()?.len().max(Self::SUPERBLOCK_SIZE as u64);
+        file.seek(SeekFrom::Start(file_end))?;
         file.write_all(&buf)?;
-        
-        // 只在配置要求立即同步时才调用 fsync
+
+        // Record offset in page table
+        {
+            let mut offsets = self.page_offsets.write()
+                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let idx = page.page_id as usize;
+            if idx >= offsets.len() {
+                offsets.resize(idx + 1, 0);
+            }
+            offsets[idx] = file_end;
+        }
+
         if self.config.immediate_sync {
             file.sync_all()?;
         }
-        
+
         Ok(())
     }
     
@@ -923,8 +958,8 @@ impl BTree {
     /// Split a leaf node
     /// Returns (split_key, new_page_id)
     fn split_leaf(&mut self, page: &mut Page) -> Result<(u64, u64)> {
-        let mid = page.num_keys / 2;
-        
+        let mid = page.num_keys * 7 / 10;
+
         // Create new leaf page
         let new_page_arc = self.alloc_page(true)?;
         let new_page_id = {
@@ -993,8 +1028,8 @@ impl BTree {
         // Standard B+tree: split when node is FULL (order keys), so always have enough
         
         // For num_keys >= 2:
-        // Mid selection: (num_keys + 1) / 2 ensures right side gets ceiling
-        let mid = page.num_keys / 2;
+        // Mid selection: 70/30 split to pack more into left page
+        let mid = page.num_keys * 7 / 10;
         
         // Validate mid won't cause empty right side
         if mid >= page.num_keys {
@@ -1216,52 +1251,6 @@ impl BTree {
         Ok(results)
     }
     
-    /// Scan leaf chain with statistics
-    fn scan_leaf_chain_with_stats(&self, start_leaf_id: u64, start: u64, end: u64, 
-                                   results: &mut Vec<(u64, u64)>,
-                                   pages_scanned: &mut usize,
-                                   keys_examined: &mut usize) -> Result<()> {
-        let mut current_leaf_id = start_leaf_id;
-        
-        while current_leaf_id != INVALID_PAGE_ID {
-            let page_arc = self.load_page(current_leaf_id)?;
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            
-            if !page.is_leaf {
-                return Err(StorageError::Index("Expected leaf node".into()));
-            }
-            
-            *pages_scanned += 1;
-            
-            // Scan keys in this leaf
-            let mut found_end = false;
-            for i in 0..page.num_keys {
-                let key = page.keys[i];
-                *keys_examined += 1;
-                
-                if key > end {
-                    found_end = true;
-                    break;
-                }
-                
-                if key >= start {
-                    results.push((key, page.values[i]));
-                }
-            }
-            
-            // Stop if we've passed the end key
-            if found_end {
-                break;
-            }
-            
-            // Move to next leaf
-            current_leaf_id = page.next_leaf;
-        }
-        
-        Ok(())
-    }
-    
     /// Find the leaf node that should contain the given key
     /// (or the first leaf with keys >= key if key doesn't exist)
     fn find_leaf_for_key(&self, page_id: u64, key: u64) -> Result<u64> {
@@ -1382,30 +1371,73 @@ impl BTree {
         Ok(())
     }
 
-    /// Flush all dirty pages
+    /// Flush all pages: rewrite compactly and truncate file
     pub fn flush(&self) -> Result<()> {
-        // Flush all dirty pages
+        // Collect all pages from cache, sorted by page_id for deterministic layout
         let cache = self.page_cache.read()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        
-        for (_, page_arc) in cache.iter() {
+
+        let mut pages: Vec<(u64, Arc<RwLock<Page>>)> = cache.iter()
+            .map(|(id, arc)| (*id, Arc::clone(arc)))
+            .collect();
+        pages.sort_by_key(|(id, _)| *id);
+
+        drop(cache);
+
+        // Write all pages sequentially after superblock
+        let _flush_guard = self.flush_lock.lock()
+            .map_err(|_| StorageError::Index("Flush lock poisoned".into()))?;
+
+        let mut file = self.storage_file.write()
+            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+
+        let mut offset = Self::SUPERBLOCK_SIZE as u64;
+        let mut new_offsets = vec![0u64]; // index 0 = superblock
+
+        for (page_id, page_arc) in &pages {
             let page = page_arc.read()
                 .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-            if page.dirty {
-                self.flush_page(&page)?;
+
+            let buf = page.serialize_compact()?;
+
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&buf)?;
+
+            // Extend offsets table
+            let idx = *page_id as usize;
+            if idx >= new_offsets.len() {
+                new_offsets.resize(idx + 1, 0);
             }
+            new_offsets[idx] = offset;
+            offset += buf.len() as u64;
         }
-        
-        drop(cache);
-        
-        // Sync SuperBlock with latest metadata
+
+        // Truncate file to remove dead space
+        file.set_len(offset)?;
+
+        // Update page_offsets table
+        let mut offsets = self.page_offsets.write()
+            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        *offsets = new_offsets;
+        drop(offsets);
+
+        // Mark all pages clean
+        for (_, page_arc) in &pages {
+            let mut page = page_arc.write()
+                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            page.dirty = false;
+        }
+
+        drop(file);
+
+        // Persist superblock with new page_offsets
         self.sync_superblock()?;
-        
-        // 显式调用 flush() 时，强制 fsync 所有数据
+
+        // Final fsync
         let file = self.storage_file.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
         file.sync_all()?;
-        
+
         Ok(())
     }
     

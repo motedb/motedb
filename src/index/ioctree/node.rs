@@ -141,13 +141,6 @@ pub fn overlaps(center: &[f32; 3], extent: f32, min: &[f32; 3], max: &[f32; 3]) 
         && center[2] + extent >= min[2] && center[2] - extent <= max[2]
 }
 
-/// Check if an octant fully contains a 3D box [min, max]
-pub fn contains_box(center: &[f32; 3], extent: f32, min: &[f32; 3], max: &[f32; 3]) -> bool {
-    center[0] - extent <= min[0] && center[0] + extent >= max[0]
-        && center[1] - extent <= min[1] && center[1] + extent >= max[1]
-        && center[2] - extent <= min[2] && center[2] + extent >= max[2]
-}
-
 /// Minimum squared distance from a point to an octant's boundary (0 if inside)
 pub fn min_dist_sq_to_octant(center: &[f32; 3], extent: f32, point: &[f32; 3]) -> f32 {
     let mut dist_sq = 0.0f32;

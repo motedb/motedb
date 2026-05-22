@@ -139,7 +139,7 @@ fn test_consistency_pk_uniqueness_rejected() {
     // Verify original data untouched
     let rows = query_rows(&db, "SELECT * FROM t");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1], Value::Text("first".to_string()));
+    assert_eq!(rows[0][1], Value::text("first".to_string()));
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn test_isolation_committed_tx_data_persists() {
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 42");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1], Value::Text("committed".to_string()));
+    assert_eq!(rows[0][1], Value::text("committed".to_string()));
 }
 
 #[test]
@@ -327,8 +327,8 @@ fn test_durability_wal_recovery_no_checkpoint() {
         let db = Database::open(&path).unwrap();
         let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
         assert_eq!(rows.len(), 50, "WAL recovery: all 50 rows must survive");
-        assert_eq!(rows[0][1], Value::Text("val_1".to_string()));
-        assert_eq!(rows[49][1], Value::Text("val_50".to_string()));
+        assert_eq!(rows[0][1], Value::text("val_1".to_string()));
+        assert_eq!(rows[49][1], Value::text("val_50".to_string()));
     }
 }
 
@@ -375,7 +375,7 @@ fn test_durability_delete_recovery() {
         let db = Database::open(&path).unwrap();
         let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][1], Value::Text("keep".to_string()));
+        assert_eq!(rows[0][1], Value::text("keep".to_string()));
     }
 }
 
@@ -449,7 +449,7 @@ fn test_durability_prepared_stmt_after_recovery() {
         for i in 1..=20 {
             db.execute_prepared(
                 "INSERT INTO t VALUES (?, ?)",
-                vec![Value::Integer(i), Value::Text(format!("name_{}", i))],
+                vec![Value::Integer(i), Value::text(format!("name_{}", i))],
             ).unwrap();
         }
         db.checkpoint().unwrap();
@@ -467,7 +467,7 @@ fn test_durability_prepared_stmt_after_recovery() {
         match rows {
             motedb::sql::QueryResult::Select { rows, .. } => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0][1], Value::Text("name_15".to_string()));
+                assert_eq!(rows[0][1], Value::text("name_15".to_string()));
             }
             _ => panic!("Expected SELECT result"),
         }
@@ -559,7 +559,7 @@ fn test_integrity_string_values_preserved() {
 
     for (i, (_label, expected)) in special.iter().enumerate() {
         let actual = &rows[i][1];
-        assert_eq!(actual, &Value::Text(expected.to_string()),
+        assert_eq!(actual, &Value::text(expected.to_string()),
             "String mismatch at index {}: expected {:?}, got {:?}", i, expected, actual);
     }
 }
@@ -609,7 +609,7 @@ fn test_integrity_update_all_columns() {
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 1");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][1], Value::Integer(20));
-    assert_eq!(rows[0][2], Value::Text("world".to_string()));
+    assert_eq!(rows[0][2], Value::text("world".to_string()));
     match rows[0][3] {
         Value::Float(f) => assert!((f - 2.71).abs() < 0.01),
         _ => panic!("Expected Float"),
@@ -663,7 +663,7 @@ fn test_edge_delete_reinsert_different_value() {
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 1");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1], Value::Text("restored".to_string()));
+    assert_eq!(rows[0][1], Value::text("restored".to_string()));
 }
 
 #[test]
@@ -709,7 +709,7 @@ fn test_edge_table_qualified_columns() {
 
     let rows = query_rows(&db, "SELECT t.v FROM t WHERE t.id = 1");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], Value::Text("test".to_string()));
+    assert_eq!(rows[0][0], Value::text("test".to_string()));
 }
 
 #[test]
@@ -750,7 +750,7 @@ fn test_edge_prepared_insert_and_select_cycle() {
     for i in 0..50 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::Text(format!("user{}", i)), Value::Integer(20 + i)],
+            vec![Value::Integer(i), Value::text(format!("user{}", i)), Value::Integer(20 + i)],
         ).unwrap();
     }
 
@@ -764,7 +764,7 @@ fn test_edge_prepared_insert_and_select_cycle() {
             match r { motedb::sql::QueryResult::Select { rows, .. } => rows, _ => vec![] }
         };
         assert_eq!(rows.len(), 1, "Prepared select for id={} should return 1 row", i);
-        assert_eq!(rows[0][1], Value::Text(format!("user{}", i)));
+        assert_eq!(rows[0][1], Value::text(format!("user{}", i)));
         assert_eq!(rows[0][2], Value::Integer(20 + i));
     }
 }

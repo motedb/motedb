@@ -12,7 +12,6 @@
 use crate::database::{MoteDB, TransactionStats};
 use crate::database::indexes::VectorIndexStats;
 use crate::sql::StreamingQueryResult;
-use crate::sql::sql_row_to_row;
 use crate::sql::ast::Statement;
 use crate::types::{Value, Row, RowId, SqlRow};
 use crate::{Result, DBConfig};
@@ -24,11 +23,17 @@ use std::sync::Arc;
 /// Pre-computed metadata for fast PK SELECT execution.
 #[allow(dead_code)]
 struct FastPkMeta {
+    /// "select", "update", or "delete"
+    stmt_type: &'static str,
     table_name: String,
     col_name: String,
     param_idx: usize,
+    /// Only for SELECT: whether it's SELECT *
     is_star: bool,
+    /// Only for SELECT: column positions to project
     select_col_positions: Vec<usize>,
+    /// Only for UPDATE: (col_position, param_idx) for SET col = ?
+    set_param_positions: Vec<(usize, usize)>,
     is_auto_increment: bool,
     column_names: Arc<Vec<String>>,
     schema: Arc<crate::types::TableSchema>,
@@ -37,7 +42,7 @@ struct FastPkMeta {
 /// Cached statement entry — statement + optional fast-PK metadata
 struct CachedStmt {
     stmt: Arc<Statement>,
-    /// Pre-computed fast PK path metadata (set on second call if pattern matches)
+    /// Pre-computed fast PK path metadata (set on first call if pattern matches)
     fast_pk: Option<FastPkMeta>,
 }
 
@@ -218,6 +223,24 @@ impl Database {
         self.inner.checkpoint_full()
     }
 
+    /// VACUUM: reclaim space by forcing compaction and dropping tombstones.
+    ///
+    /// This runs a full compaction cycle across all LSM levels, dropping
+    /// tombstone entries and reclaiming disk space. Also flushes column
+    /// indexes to disk and ensures they are consistent.
+    ///
+    /// # Cost
+    /// - Blocks writes during compaction (may take seconds to minutes).
+    /// - Rewrites all SSTables.
+    ///
+    /// # When to use
+    /// - After bulk DELETE operations
+    /// - Before taking a backup
+    /// - Periodically in long-running deployments (e.g., weekly)
+    pub fn vacuum(&self) -> Result<()> {
+        self.inner.vacuum()
+    }
+
     /// 关闭数据库（显式调用，通常由 Drop 自动处理）
     ///
     /// Sets the closed flag so all subsequent operations return `DatabaseClosed` error.
@@ -233,12 +256,12 @@ impl Database {
             return Ok(());
         }
 
-        // Signal background threads to stop so checkpoint_full() can acquire
-        // all index write locks without contention.
+        // Signal background threads to stop
         self.inner.signal_background_threads_stop();
 
-        // Give background threads time to finish their current work.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Wait for threads to actually finish before checkpoint to prevent
+        // deadlock (threads may hold locks that checkpoint needs).
+        self.inner.wait_for_background_threads_stop(std::time::Duration::from_secs(5));
 
         let result = self.inner.checkpoint_full();
         self.inner.is_closed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -380,24 +403,19 @@ impl Database {
             }
         };
 
-        // 🚀 First call (no fast_pk yet): detect pattern and cache metadata
+        // 🚀 First call (no fast_pk yet): detect pattern, cache metadata, execute immediately
         if cached_fast_pk {
             if let Some(meta) = Self::detect_fast_pk_pattern(&statement, &self.inner)? {
-                // Cache the metadata for future calls
+                // Execute using the metadata we just computed (no extra lock)
+                let result = self.execute_fast_pk_with_meta(&meta, &params)?;
+                // Cache for future calls (write lock only, no read-back)
                 {
                     let mut cache = self.stmt_cache.write();
                     if let Some(cached) = cache.get_mut(sql) {
                         cached.fast_pk = Some(meta);
                     }
                 }
-                // Execute using the new metadata
-                let read_cache = self.stmt_cache.read();
-                if let Some(cached) = read_cache.peek(sql) {
-                    if let Some(ref meta) = cached.fast_pk {
-                        let result = self.execute_fast_pk_with_meta(meta, &params)?;
-                        return Ok(result);
-                    }
-                }
+                return Ok(result);
             }
         }
 
@@ -428,23 +446,28 @@ impl Database {
     ) -> Result<Option<FastPkMeta>> {
         use crate::sql::ast::{Statement as S, Expr, BinaryOperator, TableRef, SelectColumn};
 
-        let stmt = match statement {
-            S::Select(s) => s,
+        let (stmt_type, table_ref, where_expr, select_cols) = match statement {
+            S::Select(s) => ("select",
+                s.from.as_ref().and_then(|t| match t { TableRef::Table { name, .. } => Some(name.as_str()), _ => None }),
+                s.where_clause.as_ref(),
+                Some(s.columns.as_slice())),
+            S::Update(s) => ("update",
+                Some(s.table.as_str()),
+                s.where_clause.as_ref(),
+                None),
+            S::Delete(s) => ("delete",
+                Some(s.table.as_str()),
+                s.where_clause.as_ref(),
+                None),
             _ => return Ok(None),
         };
 
-        if stmt.group_by.is_some() || stmt.having.is_some() ||
-           stmt.order_by.is_some() || stmt.limit.is_some() ||
-           stmt.offset.is_some() || stmt.distinct {
-            return Ok(None);
-        }
-
-        let table_name = match stmt.from.as_ref() {
-            Some(TableRef::Table { name, .. }) => name.as_str(),
-            _ => return Ok(None),
+        let table_ref = match table_ref {
+            Some(name) => name,
+            None => return Ok(None),
         };
 
-        let (col_name, param_idx) = match stmt.where_clause.as_ref() {
+        let (col_name, param_idx) = match where_expr {
             Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) => {
                 match (left.as_ref(), right.as_ref()) {
                     (Expr::Column(c), Expr::Parameter(idx)) => (c.as_str(), *idx),
@@ -455,7 +478,7 @@ impl Database {
             _ => return Ok(None),
         };
 
-        let schema = match db.table_registry.get_table(table_name) {
+        let schema = match db.table_registry.get_table(table_ref) {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
@@ -463,42 +486,57 @@ impl Database {
         let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
         if !is_pk { return Ok(None); }
 
-        let is_star = stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star);
+        let is_star = select_cols.map_or(false, |cols| cols.len() == 1 && matches!(cols[0], SelectColumn::Star));
 
-        let select_col_positions: Vec<usize> = if is_star {
-            vec![]
+        let select_col_positions: Vec<usize> = if let Some(cols) = select_cols {
+            if is_star {
+                vec![]
+            } else {
+                cols.iter().filter_map(|col_spec| {
+                    let cname = match col_spec {
+                        SelectColumn::Column(n) => n.as_str(),
+                        SelectColumn::ColumnWithAlias(n, _) => n.as_str(),
+                        _ => return None,
+                    };
+                    let lookup = if cname.contains('.') { cname.rsplit('.').next().unwrap_or(cname) } else { cname };
+                    schema.get_column_position(lookup)
+                }).collect()
+            }
         } else {
-            stmt.columns.iter().filter_map(|col_spec| {
-                let cname = match col_spec {
-                    SelectColumn::Column(n) => n.as_str(),
-                    SelectColumn::ColumnWithAlias(n, _) => n.as_str(),
-                    _ => return None,
-                };
-                let lookup = if cname.contains('.') { cname.rsplit('.').next().unwrap_or(cname) } else { cname };
-                schema.get_column_position(lookup)
-            }).collect()
+            vec![]
         };
 
+        // For UPDATE: detect SET col = ? patterns
+        let set_param_positions: Vec<(usize, usize)> = if stmt_type == "update" {
+            if let S::Update(s) = statement {
+                s.assignments.iter().filter_map(|(col_name, expr)| {
+                    if let Expr::Parameter(idx) = expr {
+                        schema.get_column_position(col_name).map(|pos| (pos, *idx))
+                    } else { None }
+                }).collect()
+            } else { vec![] }
+        } else { vec![] };
+
         Ok(Some(FastPkMeta {
-            table_name: table_name.to_string(),
+            stmt_type,
+            table_name: table_ref.to_string(),
             col_name: col_name.to_string(),
             param_idx,
             is_star,
             select_col_positions,
+            set_param_positions,
             is_auto_increment: schema.is_primary_key_auto_increment(),
             column_names: schema.column_names_arc(),
             schema,
         }))
     }
 
-    /// Execute a fast PK SELECT using pre-computed metadata.
-    /// This is the hottest path — minimal overhead.
+    /// Execute a fast PK query (SELECT, UPDATE, DELETE) using pre-computed metadata.
     fn execute_fast_pk_with_meta(
         &self,
         meta: &FastPkMeta,
         params: &[Value],
     ) -> Result<StreamingQueryResult> {
-        // Get param value — direct Vec index
         let pk_value = match params.get(meta.param_idx - 1) {
             Some(v) => v,
             None => return Err(crate::error::MoteDBError::InvalidArgument(format!(
@@ -506,46 +544,69 @@ impl Database {
             ))),
         };
 
-        // Fetch row — Arc<Row> avoids cloning row data for cache hits
-        let row_opt = if meta.is_auto_increment {
+        // Resolve PK → row_id
+        let row_id = if meta.is_auto_increment {
             match pk_value {
-                Value::Integer(id) if *id >= 0 => {
-                    self.inner.get_table_row_arc(&meta.table_name, *id as RowId, &meta.schema)?
-                }
-                _ => None,
+                Value::Integer(id) if *id >= 0 => *id as RowId,
+                _ => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
             }
         } else {
             let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-            let row_id = if let Some(lookup) = self.inner.pk_lookup.get(&meta.table_name) {
-                lookup.get_pk(&pk_key)
-            } else {
-                None
-            };
-            match row_id {
-                Some(rid) => self.inner.get_table_row_arc(&meta.table_name, rid, &meta.schema)?,
-                None => None,
+            match self.inner.pk_lookup.get(&meta.table_name)
+                .and_then(|lookup| lookup.get_pk(&pk_key))
+            {
+                Some(rid) => rid,
+                None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
             }
         };
 
-        // Project and return
-        let result_vec: Vec<Vec<Value>> = match row_opt {
-            Some(row_arc) => {
-                if meta.is_star {
-                    // Clone the values from Arc — only one clone needed
-                    vec![(*row_arc).clone()]
-                } else {
-                    vec![meta.select_col_positions.iter()
-                        .map(|&pos| row_arc.get(pos).cloned().unwrap_or(Value::Null))
-                        .collect()]
+        match meta.stmt_type {
+            "delete" => {
+                let row = match self.inner.get_table_row(&meta.table_name, row_id)? {
+                    Some(r) => r,
+                    None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
+                };
+                self.inner.delete_row_from_table(&meta.table_name, row_id, row)?;
+                Ok(StreamingQueryResult::Modification { affected_rows: 1 })
+            }
+            "update" => {
+                let old_row = match self.inner.get_table_row(&meta.table_name, row_id)? {
+                    Some(r) => r,
+                    None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
+                };
+                let mut new_row = old_row.clone();
+                for &(col_pos, param_idx) in &meta.set_param_positions {
+                    if let Some(new_val) = params.get(param_idx - 1) {
+                        while new_row.len() <= col_pos {
+                            new_row.push(Value::Null);
+                        }
+                        new_row[col_pos] = new_val.clone();
+                    }
                 }
+                self.inner.update_row_in_table_with_schema(&meta.table_name, row_id, old_row, new_row, &meta.schema)?;
+                Ok(StreamingQueryResult::Modification { affected_rows: 1 })
             }
-            None => vec![],
-        };
-
-        Ok(StreamingQueryResult::SelectReady {
-            columns: (*meta.column_names).clone(),
-            rows: result_vec,
-        })
+            _ => {
+                // SELECT
+                let row_opt = self.inner.get_table_row_arc(&meta.table_name, row_id, &meta.schema)?;
+                let result_vec: Vec<Vec<Value>> = match row_opt {
+                    Some(row_arc) => {
+                        if meta.is_star {
+                            vec![(*row_arc).clone()]
+                        } else {
+                            vec![meta.select_col_positions.iter()
+                                .map(|&pos| row_arc.get(pos).cloned().unwrap_or(Value::Null))
+                                .collect()]
+                        }
+                    }
+                    None => vec![],
+                };
+                Ok(StreamingQueryResult::SelectReady {
+                    columns: (*meta.column_names).clone(),
+                    rows: result_vec,
+                })
+            }
+        }
     }
 
 
@@ -604,18 +665,8 @@ impl Database {
         let columns: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
         if values.len() != columns.len() { return Ok(None); }
 
-        // Build SqlRow
-        let mut sql_row = crate::types::SqlRow::new();
-        for (i, col_def) in schema.columns.iter().enumerate() {
-            let pk_name = schema.primary_key();
-            let should_ignore = pk_name.map(|pk| pk == col_def.name && schema.is_primary_key_auto_increment()).unwrap_or(false);
-            if !should_ignore {
-                sql_row.insert(col_def.name.clone(), values[i].clone());
-            }
-        }
-
-        // Convert to storage Row
-        let row = match sql_row_to_row(&sql_row, &schema) {
+        // Build Row directly (skip HashMap intermediary)
+        let row = match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
             Ok(r) => r,
             Err(_) => return Ok(None),
         };
@@ -701,7 +752,69 @@ impl Database {
 
         // Only optimize primary key lookups
         let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
-        if !is_pk { return Ok(None); }
+
+        // Determine select columns (shared by both PK and column-index paths)
+        let select_part = after_select[..from_pos].trim();
+        let is_star = select_part == "*";
+
+        if !is_pk {
+            // Column index fast path: bypass parser for indexed non-PK columns
+            let index_name = format!("{}.{}", table_name, col_name);
+            if let Some(index_ref) = self.inner.column_indexes.get(&index_name) {
+                let row_ids_arc = index_ref.value().get_arc(&value)?;
+
+                // If index returns empty, the async pipeline may not have built it yet.
+                // Fall through to full SQL path to avoid false empty results.
+                if !row_ids_arc.is_empty() {
+                    drop(index_ref);
+                    let column_names: Vec<String> = if is_star {
+                        schema.column_names()
+                    } else {
+                        select_part.split(',').map(|s| s.trim().to_string()).collect()
+                    };
+
+                    if is_star {
+                        // SELECT * — batch fetch (ArcString makes clone cheap)
+                        let batch = self.inner.get_table_rows_batch_arc(table_name, &row_ids_arc)?;
+                        let rows: Vec<Vec<Value>> = batch.into_iter()
+                            .filter_map(|(_, opt)| opt.map(|a| match Arc::try_unwrap(a) {
+                                Ok(row) => row,
+                                Err(arc) => (*arc).clone(),
+                            }))
+                            .collect();
+                        return Ok(Some(StreamingQueryResult::SelectReady {
+                            columns: column_names,
+                            rows,
+                        }));
+                    }
+
+                    // Non-star: project specific columns
+                    let batch = self.inner.get_table_rows_batch_arc(table_name, &row_ids_arc)?;
+                    let mut result_vec = Vec::with_capacity(batch.len());
+                    {
+                        let col_list: Vec<&str> = select_part.split(',').map(|s| s.trim()).collect();
+                        let col_positions: Vec<usize> = col_list.iter()
+                            .filter_map(|c| schema.get_column(c).map(|cd| cd.position))
+                            .collect();
+                        result_vec.extend(
+                            batch.into_iter().filter_map(|(_, opt_arc)| {
+                                opt_arc.map(|a| {
+                                    col_positions.iter()
+                                        .map(|&pos| a.get(pos).cloned().unwrap_or(Value::Null))
+                                        .collect()
+                                })
+                            })
+                        );
+                    }
+                    return Ok(Some(StreamingQueryResult::SelectReady {
+                        columns: column_names,
+                        rows: result_vec,
+                    }));
+                }
+            }
+            return Ok(None);
+        }
+
         let is_ai = schema.is_primary_key_auto_increment();
 
         // Fetch row using Arc<Row> (avoids cloning row data for cache hits)
@@ -715,8 +828,8 @@ impl Database {
             let pk_key = crate::database::pk_cache::PkKey::from_value(&value);
             let resolve_fallback = |db: &MoteDB, table: &str, col: &str, val: &Value| -> Option<RowId> {
                 match db.query_by_column(table, col, val) {
-                    Ok(ids) => ids.into_iter().next(),
-                    Err(_) => {
+                    Ok(ids) if !ids.is_empty() => ids.into_iter().next(),
+                    _ => {
                         // Column index missing (e.g. after restart) — full scan
                         let s = db.get_table_schema(table).ok()?;
                         let pos = s.get_column_position(col)?;
@@ -751,10 +864,6 @@ impl Database {
             }
         };
 
-        // Determine select columns
-        let select_part = after_select[..from_pos].trim();
-        let is_star = select_part == "*";
-
         // Build result — clone values from Arc<Row>
         let result_vec: Vec<Vec<Value>> = match row_opt {
             Some(row_arc) => {
@@ -788,12 +897,13 @@ impl Database {
         }))
     }
 
-    /// Parse a single SQL literal (integer, float, or string).
+    /// Parse a single SQL literal (integer, float, string, or simple expr like col + lit).
+    /// Returns None if the value isn't a literal (falls through to full parser).
     fn parse_single_literal(s: &str) -> Option<Value> {
         let s = s.trim();
         if s.is_empty() { return None; }
         if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-            return Some(Value::Text(s[1..s.len()-1].to_string()));
+            return Some(Value::text(s[1..s.len()-1].to_string()));
         }
         if s.starts_with('-') || s.as_bytes().first()?.is_ascii_digit() {
             if let Ok(i) = s.parse::<i64>() { return Some(Value::Integer(i)); }
@@ -801,6 +911,72 @@ impl Database {
         }
         if s.eq_ignore_ascii_case("NULL") { return Some(Value::Null); }
         None
+    }
+
+    /// Try to evaluate a simple SET expression like `col + 10` or `col * 2`
+    /// against the old row. Returns None if the expression is too complex.
+    fn evaluate_simple_set_expr(expr_str: &str, old_row: &[Value], schema: &crate::types::TableSchema) -> Option<Value> {
+        // Pattern: column_name operator literal
+        let expr_str = expr_str.trim();
+        for &op in &[" + ", " - ", " * ", " / "] {
+            if let Some(pos) = expr_str.find(op) {
+                let col_name = expr_str[..pos].trim();
+                let lit_str = expr_str[pos + op.len()..].trim();
+                let lit = Self::parse_single_literal(lit_str)?;
+                let col_pos = schema.get_column_position(col_name)?;
+                let old_val = old_row.get(col_pos)?;
+                return match op.trim() {
+                    "+" => Self::positional_fast_add(old_val, &lit),
+                    "-" => Self::positional_fast_sub(old_val, &lit),
+                    "*" => Self::positional_fast_mul(old_val, &lit),
+                    "/" => Self::positional_fast_div(old_val, &lit),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// Fast arithmetic (no HashMap, no evaluator) for simple UPDATE expressions.
+    fn positional_fast_add(a: &Value, b: &Value) -> Option<Value> {
+        use crate::types::Value;
+        match (a, b) {
+            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a + b)),
+            (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
+            (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 + b)),
+            (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a + *b as f64)),
+            _ => None,
+        }
+    }
+    fn positional_fast_sub(a: &Value, b: &Value) -> Option<Value> {
+        use crate::types::Value;
+        match (a, b) {
+            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a - b)),
+            (Value::Float(a), Value::Float(b)) => Some(Value::Float(a - b)),
+            (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 - b)),
+            (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a - *b as f64)),
+            _ => None,
+        }
+    }
+    fn positional_fast_mul(a: &Value, b: &Value) -> Option<Value> {
+        use crate::types::Value;
+        match (a, b) {
+            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a * b)),
+            (Value::Float(a), Value::Float(b)) => Some(Value::Float(a * b)),
+            (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 * b)),
+            (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a * *b as f64)),
+            _ => None,
+        }
+    }
+    fn positional_fast_div(a: &Value, b: &Value) -> Option<Value> {
+        use crate::types::Value;
+        match (a, b) {
+            (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
+            (Value::Float(a), Value::Integer(b)) if *b != 0 => Some(Value::Float(a / *b as f64)),
+            (Value::Integer(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 / b)),
+            (Value::Integer(a), Value::Integer(b)) if *b != 0 => Some(Value::Float(*a as f64 / *b as f64)),
+            _ => None,
+        }
     }
 
     /// Fast UPDATE path: parses `UPDATE <table> SET col1=v1, col2=v2 WHERE pk = value`
@@ -859,20 +1035,16 @@ impl Database {
         let is_pk = schema.primary_key().map(|pk| pk == where_col).unwrap_or(false);
         if !is_pk { return Ok(None); }
 
-        // Parse SET assignments: col1=v1, col2=v2
-        let mut assignments: Vec<(String, Value)> = Vec::new();
+        // Parse SET assignments: col1=v1, col2=v2 (store raw value strings)
+        let mut set_items: Vec<(String, String)> = Vec::new();
         for pair in set_part.split(',') {
             let eq = match pair.find('=') {
                 Some(p) => p,
                 None => return Ok(None),
             };
             let col = pair[..eq].trim().to_string();
-            let val_str = pair[eq + 1..].trim();
-            let val = match Self::parse_single_literal(val_str) {
-                Some(v) => v,
-                None => return Ok(None),
-            };
-            assignments.push((col, val));
+            let val_str = pair[eq + 1..].trim().to_string();
+            set_items.push((col, val_str));
         }
 
         // Resolve PK → row_id
@@ -907,23 +1079,30 @@ impl Database {
             }
         };
 
-        // Load old row, apply updates, write back
+        // Load old row, resolve SET values, apply updates, write back
         let old_row = match self.inner.get_table_row_with_schema(table_name, row_id, &schema)? {
             Some(r) => r,
             None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
         };
 
         let mut new_row = old_row.clone();
-        for (col_name, val) in &assignments {
+        for (col_name, val_str) in &set_items {
             if let Some(cd) = schema.get_column(col_name) {
+                let val = match Self::parse_single_literal(val_str) {
+                    Some(v) => v,
+                    None => match Self::evaluate_simple_set_expr(val_str, &old_row, &schema) {
+                        Some(v) => v,
+                        None => return Ok(None), // complex expression → fall through to full parser
+                    },
+                };
                 while new_row.len() <= cd.position {
                     new_row.push(Value::Null);
                 }
-                new_row[cd.position] = val.clone();
+                new_row[cd.position] = val;
             }
         }
 
-        self.inner.update_row_in_table(table_name, row_id, old_row, new_row)?;
+        self.inner.update_row_in_table_with_schema(table_name, row_id, old_row, new_row, &schema)?;
         Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
     }
 
@@ -1048,7 +1227,7 @@ impl Database {
                         None => return None, // unterminated string
                     }
                 }
-                values.push(Value::Text(text));
+                values.push(Value::text(text));
             } else if start_char == '-' || start_char.is_ascii_digit() {
                 // Number (integer or float)
                 let mut num_str = String::new();
@@ -1506,6 +1685,13 @@ impl Database {
         self.inner.insert_row_to_table(table_name, row)
     }
 
+    /// Insert a row within a transaction. The row is buffered and only written
+    /// to storage when the transaction commits. Use this instead of `insert_row`
+    /// when operating inside a transaction.
+    pub fn insert_row_with_txn(&self, table_name: &str, txn_id: u64, row: Row) -> Result<RowId> {
+        self.inner.insert_row_with_txn(table_name, txn_id, row)
+    }
+
     /// 插入行（使用 HashMap）
     ///
     /// 这是 `insert_row()` 的友好版本，接受 `HashMap<String, Value>` 格式的行数据。
@@ -1578,6 +1764,8 @@ impl Database {
 // 自动在 Drop 时关闭数据库
 impl Drop for Database {
     fn drop(&mut self) {
-        let _ = self.close();
+        if let Err(e) = self.close() {
+            warn_log!("[Database::Drop] close() failed: {}", e);
+        }
     }
 }

@@ -12,7 +12,7 @@
 //! - 分片设计：put/get 只锁单个分片，并发写入 ~16x 扩展
 
 use super::{Key, Value, ValueData, LSMConfig};
-use crate::index::fresh_graph::{FreshVamanaGraph, FreshGraphConfig, VectorNode};
+use crate::index::fresh_graph::{FreshVamanaGraph, FreshGraphConfig};
 use crate::distance::DistanceKind;
 use crate::{Result, StorageError};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -424,6 +424,29 @@ impl UnifiedMemTable {
         }).collect();
 
         Ok(results)
+    }
+
+    /// Lightweight scan: returns Arc<DataEntry> references without cloning row bytes.
+    /// Memory usage is O(N * 24) instead of O(N * avg_data_size).
+    /// Caller must clone the data when needed (lazily during iteration).
+    pub fn scan_arcs(&self, start: Key, end: Key) -> Vec<(Key, Arc<DataEntry>, Option<Vec<f32>>)> {
+        let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
+        for shard in &self.shards {
+            let s = shard.read();
+            use std::ops::Bound;
+            let range = s.range((
+                Bound::Included(&start),
+                Bound::Excluded(&end)
+            ));
+            all.extend(range.map(|(k, v)| (*k, Arc::clone(v))));
+        }
+        all.sort_by_key(|(k, _)| *k);
+
+        let vec_map = self.vectors.as_ref();
+        all.into_iter().map(|(k, arc)| {
+            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+            (k, arc, vector)
+        }).collect()
     }
 
     /// Full table scan — merge from all shards

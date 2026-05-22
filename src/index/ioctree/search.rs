@@ -4,21 +4,26 @@
 
 use super::leaf_store::LeafStore;
 use super::node::{min_dist_sq_to_octant, overlaps, Octant};
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-/// KNN search using priority-ordered child traversal with pruning
+/// KNN search using priority-ordered child traversal with pruning.
+///
+/// Uses a max-heap of size k where the heap top is the WORST (largest distance)
+/// among the k closest candidates found so far. This serves as the pruning
+/// threshold: points/octants further than the threshold can be skipped.
 pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) -> Vec<(u64, f64)> {
     if k == 0 {
         return Vec::new();
     }
 
-    let mut result: BinaryHeap<Reverse<(OrderedF32, u64)>> = BinaryHeap::new();
+    let mut result: BinaryHeap<(OrderedF32, u64)> = BinaryHeap::new();
     let mut stack: Vec<(&Octant, f32)> = vec![(root, 0.0)];
 
     while let Some((octant, min_dist)) = stack.pop() {
+        // Prune: if we already have k results and this octant is further
+        // than the worst (largest) among the k closest, skip it.
         if result.len() >= k {
-            if let Some(Reverse((OrderedF32(threshold), _))) = result.peek() {
+            if let Some((OrderedF32(threshold), _)) = result.peek() {
                 if min_dist >= *threshold {
                     continue;
                 }
@@ -39,7 +44,7 @@ pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) 
                 for child in children.iter().flatten() {
                     let d = min_dist_sq_to_octant(child.center(), child.extent(), query);
                     if result.len() >= k {
-                        if let Some(Reverse((OrderedF32(threshold), _))) = result.peek() {
+                        if let Some((OrderedF32(threshold), _)) = result.peek() {
                             if d >= *threshold {
                                 continue;
                             }
@@ -47,33 +52,39 @@ pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) 
                     }
                     child_dist.push((child, d));
                 }
+                // Sort descending by distance so that closest children
+                // are pushed last and popped first (stack is LIFO).
                 child_dist.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 stack.extend(child_dist);
             }
         }
     }
 
-    let mut results: Vec<(u64, f64)> = result
+    // Max-heap → into_sorted_vec() returns ascending (smallest distance first).
+    // This is the correct KNN order: closest point first.
+    result
         .into_sorted_vec()
         .into_iter()
-        .map(|Reverse((OrderedF32(d), id))| (id, d as f64))
-        .collect();
-    results.reverse();
-    results
+        .map(|(OrderedF32(d), id)| (id, d as f64))
+        .collect()
 }
 
+/// Push a candidate point into the KNN result heap, maintaining exactly k entries.
+/// The heap is a max-heap where the top is the WORST (largest distance) among
+/// the k closest points found so far.
 fn push_knn_result(
-    result: &mut BinaryHeap<Reverse<(OrderedF32, u64)>>,
+    result: &mut BinaryHeap<(OrderedF32, u64)>,
     dist_sq: f32,
     row_id: u64,
     k: usize,
 ) {
     if result.len() < k {
-        result.push(Reverse((OrderedF32(dist_sq), row_id)));
-    } else if let Some(Reverse((OrderedF32(threshold), _))) = result.peek() {
+        result.push((OrderedF32(dist_sq), row_id));
+    } else if let Some((OrderedF32(threshold), _)) = result.peek() {
+        // threshold = worst (largest distance) among the k closest
         if dist_sq < *threshold {
-            result.pop();
-            result.push(Reverse((OrderedF32(dist_sq), row_id)));
+            result.pop();  // remove the worst
+            result.push((OrderedF32(dist_sq), row_id));  // insert the better
         }
     }
 }

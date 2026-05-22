@@ -34,7 +34,6 @@ pub mod mem_buffer;
 pub mod index_metadata;
 pub mod pk_cache;
 pub mod timeseries;
-pub mod write_controller;
 
 // Re-export main types
 pub use core::MoteDB;

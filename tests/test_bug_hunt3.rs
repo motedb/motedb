@@ -153,8 +153,8 @@ fn test_utf8_string_insert_select() {
 
     let r = rows(&db, "SELECT name FROM t ORDER BY id");
     assert_eq!(r.len(), 2);
-    assert_eq!(r[0][0], Value::Text("日本語".to_string()));
-    assert_eq!(r[1][0], Value::Text("中文测试".to_string()));
+    assert_eq!(r[0][0], Value::text("日本語".to_string()));
+    assert_eq!(r[1][0], Value::text("中文测试".to_string()));
 }
 
 // === Bug: SQL standard doubled-quote escaping ===
@@ -167,7 +167,7 @@ fn test_sql_standard_quote_escape() {
 
     let r = rows(&db, "SELECT name FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Text("it's".to_string()));
+    assert_eq!(r[0][0], Value::text("it's".to_string()));
 }
 
 // === Complex combined expression parsing ===

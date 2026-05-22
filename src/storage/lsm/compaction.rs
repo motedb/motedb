@@ -785,7 +785,7 @@ impl CompactionWorker {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as u64;
-        let tombstone_ttl_micros: u64 = 86_400 * 1_000_000;
+        let tombstone_ttl_micros: u64 = self.config.lsm_config.tombstone_ttl_secs * 1_000_000;
 
         let mut last_key: Option<u64> = None;
         let mut last_value: Option<super::Value> = None;
@@ -971,7 +971,7 @@ impl CompactionWorker {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as u64;
-        let tombstone_ttl_micros: u64 = 86_400 * 1_000_000; // 24 hours in microseconds
+        let tombstone_ttl_micros: u64 = self.config.lsm_config.tombstone_ttl_secs * 1_000_000; // 24 hours in microseconds
 
         let mut last_key: Option<u64> = None;
         let mut last_value: Option<super::Value> = None;

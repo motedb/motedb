@@ -189,6 +189,11 @@ pub struct LSMConfig {
 
     /// Only compact when write load is idle (default false)
     pub compaction_idle_only: bool,
+
+    /// Tombstone TTL in seconds before entries are physically dropped during compaction.
+    /// 0 = drop all tombstones immediately during compaction.
+    /// Default: 86400 (24 hours).
+    pub tombstone_ttl_secs: u64,
 }
 
 impl Default for LSMConfig {
@@ -211,6 +216,7 @@ impl Default for LSMConfig {
             compaction_max_open_sstables: 4,
             compaction_yield_every_n_blocks: 4,
             compaction_idle_only: false,
+            tombstone_ttl_secs: 86400, // 24 hours
         }
     }
 }
@@ -228,6 +234,7 @@ impl LSMConfig {
             sstable_cache_size: db_config.sstable_cache_size.unwrap_or(defaults.sstable_cache_size),
             sstable_cache_memory_limit_mb: db_config.sstable_cache_memory_limit_mb.or(defaults.sstable_cache_memory_limit_mb),
             block_size: db_config.block_size.unwrap_or(defaults.block_size),
+            tombstone_ttl_secs: db_config.tombstone_ttl_secs.unwrap_or(defaults.tombstone_ttl_secs),
             ..defaults
         }
     }

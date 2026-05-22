@@ -285,7 +285,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
                     if s.len() > 50 {
                         format!("{}...", &s[..47])
                     } else {
-                        s.clone()
+                        (**s).clone()
                     }
                 }
                 Value::Bool(b) => b.to_string(),

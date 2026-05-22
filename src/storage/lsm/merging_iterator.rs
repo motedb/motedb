@@ -71,32 +71,39 @@ impl Ord for HeapItem {
 pub struct MergingIterator {
     /// 最小堆（存储每个数据源的当前最小元素）
     heap: BinaryHeap<Reverse<HeapItem>>,
-    
+
     /// 各个数据源的迭代器
     sources: Vec<KVIterator>,
-    
+
     /// 上一次返回的 key（用于去重）
     last_key: Option<Key>,
-    
+
     /// 是否已结束
     finished: bool,
 
     /// First error from any source (propagated when heap drains)
     first_error: Option<crate::StorageError>,
+
+    /// 🚀 Single-source fast path: skip heap entirely when only 1 source
+    single_source: bool,
 }
 
 impl MergingIterator {
     /// Create a new merging iterator
     pub fn new(sources: Vec<KVIterator>) -> Self {
+        let single = sources.len() == 1;
         let mut iter = Self {
             heap: BinaryHeap::new(),
             sources,
             last_key: None,
             finished: false,
             first_error: None,
+            single_source: single,
         };
 
-        iter.fill_heap();
+        if !single {
+            iter.fill_heap();
+        }
 
         iter
     }
@@ -136,12 +143,45 @@ impl MergingIterator {
 
 impl Iterator for MergingIterator {
     type Item = Result<(Key, Value)>;
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
         }
-        
+
+        // 🚀 Single-source fast path: skip heap entirely
+        if self.single_source {
+            let source = match self.sources.get_mut(0) {
+                Some(s) => s,
+                None => { self.finished = true; return None; }
+            };
+            loop {
+                match source.next() {
+                    Some(Ok((key, value))) => {
+                        // Dedup check
+                        if let Some(last_key) = self.last_key {
+                            if key == last_key { continue; }
+                        }
+                        // Tombstone filter
+                        if value.deleted {
+                            self.last_key = Some(key);
+                            continue;
+                        }
+                        self.last_key = Some(key);
+                        return Some(Ok((key, value)));
+                    }
+                    Some(Err(e)) => {
+                        self.finished = true;
+                        return Some(Err(e));
+                    }
+                    None => {
+                        self.finished = true;
+                        return None;
+                    }
+                }
+            }
+        }
+
         loop {
             // 1. 从堆顶取出最小的元素
             let Reverse(item) = match self.heap.pop() {
@@ -155,10 +195,10 @@ impl Iterator for MergingIterator {
                     return None;
                 }
             };
-            
+
             // 2. 从对应的数据源读取下一个元素，放回堆
             self.refill_from_source(item.source_id);
-            
+
             // 3. 处理 MVCC 去重：相同 key 只返回最新版本
             if let Some(last_key) = self.last_key {
                 if item.key == last_key {
@@ -166,13 +206,13 @@ impl Iterator for MergingIterator {
                     continue;
                 }
             }
-            
+
             // 4. 过滤 tombstone（删除标记）
             if item.value.deleted {
                 self.last_key = Some(item.key);
                 continue;
             }
-            
+
             // 5. 返回当前 key-value
             self.last_key = Some(item.key);
             return Some(Ok((item.key, item.value)));

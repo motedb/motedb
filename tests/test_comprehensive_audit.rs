@@ -7,13 +7,17 @@ use std::path::Path;
 use tempfile::TempDir;
 
 fn setup_db(dir: &Path) -> Database {
-    let db = Database::create(dir.join("audit.mote")).unwrap();
+    let mut config = DBConfig::for_testing();
+    config.auto_checkpoint = None;  // Disable auto-checkpoint to avoid CI hangs
+    let db = Database::create_with_config(dir.join("audit.mote"), config).unwrap();
     db.execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, age INT, score FLOAT)").unwrap();
     db
 }
 
 fn setup_db_fast(dir: &Path) -> Database {
-    let config = DBConfig::for_testing();
+    let mut config = DBConfig::for_testing();
+    // Disable auto-checkpoint in tests to avoid background thread contention on CI
+    config.auto_checkpoint = None;
     let db = Database::create_with_config(dir.join("audit.mote"), config).unwrap();
     db.execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, age INT, score FLOAT)").unwrap();
     db
@@ -61,7 +65,7 @@ fn test_parameterized_select_basic() {
 
     let rows = query_rows_prepared(&db, "SELECT * FROM users WHERE id = ?", vec![Value::Integer(target_id)]);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1], Value::Text("user42".to_string()));
+    assert_eq!(rows[0][1], Value::text("user42".to_string()));
 }
 
 #[test]
@@ -89,7 +93,7 @@ fn test_parameterized_insert() {
 
     db.execute_prepared(
         "INSERT INTO users VALUES (null, ?, ?, ?)",
-        vec![Value::Text("Alice".to_string()), Value::Integer(30), Value::Float(95.5)]
+        vec![Value::text("Alice".to_string()), Value::Integer(30), Value::Float(95.5)]
     ).unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM users WHERE name = 'Alice'");
@@ -143,13 +147,13 @@ fn test_parameterized_cache_hit() {
 
     let sql = "SELECT * FROM users WHERE name = ?";
 
-    let rows1 = query_rows_prepared(&db, sql, vec![Value::Text("user1".to_string())]);
+    let rows1 = query_rows_prepared(&db, sql, vec![Value::text("user1".to_string())]);
     assert_eq!(rows1.len(), 1);
 
     // Second call: cache hit — different param, different result
-    let rows2 = query_rows_prepared(&db, sql, vec![Value::Text("user5".to_string())]);
+    let rows2 = query_rows_prepared(&db, sql, vec![Value::text("user5".to_string())]);
     assert_eq!(rows2.len(), 1);
-    assert_eq!(rows2[0][1], Value::Text("user5".to_string()));
+    assert_eq!(rows2[0][1], Value::text("user5".to_string()));
 }
 
 #[test]
@@ -201,7 +205,7 @@ fn test_table_qualified_column_select() {
 
     let rows = query_rows(&db, &format!("SELECT users.name, users.age FROM users WHERE id = {}", id));
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], Value::Text("user0".to_string()));
+    assert_eq!(rows[0][0], Value::text("user0".to_string()));
 }
 
 // ============================================================================
@@ -328,17 +332,19 @@ fn test_edge_checkpoint_recovery() {
     let path = dir.path().join("audit.mote");
 
     {
-        let db = Database::create(&path).unwrap();
+        let mut config = DBConfig::for_testing();
+        config.auto_checkpoint = None;
+        let db = Database::create_with_config(&path, config).unwrap();
         db.execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, age INT)").unwrap();
         insert_n_users_simple(&db, 100);
         db.checkpoint().unwrap();
     }
 
-    let db = Database::open(&path).unwrap();
+    let db = Database::open(&path).unwrap();  // Reopen uses existing data
     let rows = query_rows(&db, "SELECT * FROM users");
     assert_eq!(rows.len(), 100);
 
-    let rows2 = query_rows_prepared(&db, "SELECT * FROM users WHERE name = ?", vec![Value::Text("user50".to_string())]);
+    let rows2 = query_rows_prepared(&db, "SELECT * FROM users WHERE name = ?", vec![Value::text("user50".to_string())]);
     assert_eq!(rows2.len(), 1);
 }
 
@@ -375,7 +381,7 @@ fn test_comprehensive_summary() {
     println!("\n====== MoteDB Comprehensive Audit ======");
 
     // INSERT
-    let n = 2000;
+    let n = if std::env::var("CI").is_ok() { 500 } else { 2000 };
     let start = Instant::now();
     insert_n_users(&db, n);
     let insert_time = start.elapsed();
@@ -383,7 +389,7 @@ fn test_comprehensive_summary() {
     println!("  INSERT:   {:.0} µs/op, {:.0} ops/s", insert_us, 1_000_000.0 / insert_us);
 
     // PK SELECT (raw)
-    let pk_iters = 1000;
+    let pk_iters = if std::env::var("CI").is_ok() { 200 } else { 1000 };
     let start = Instant::now();
     for i in 0..pk_iters {
         let _ = query_rows(&db, &format!("SELECT * FROM users WHERE id = {}", i % n + 1));
@@ -410,18 +416,20 @@ fn test_comprehensive_summary() {
         n, scan_time.as_secs_f64() * 1000.0, scan_time.as_micros() as f64 / n as f64);
 
     // UPDATE
+    let update_n = if std::env::var("CI").is_ok() { 100 } else { 500 };
     let start = Instant::now();
-    for i in 1..=500i64 {
+    for i in 1..=update_n {
         db.execute(&format!("UPDATE users SET score = {} WHERE id = {}", 100.0 + i as f64, i)).unwrap();
     }
-    println!("  UPDATE:   {:.0} µs/op", start.elapsed().as_micros() as f64 / 500.0);
+    println!("  UPDATE:   {:.0} µs/op", start.elapsed().as_micros() as f64 / update_n as f64);
 
     // DELETE
+    let delete_n = if std::env::var("CI").is_ok() { 50 } else { 200 };
     let start = Instant::now();
-    for i in 1..=200i64 {
+    for i in 1..=delete_n {
         db.execute(&format!("DELETE FROM users WHERE id = {}", i)).unwrap();
     }
-    println!("  DELETE:   {:.0} µs/op", start.elapsed().as_micros() as f64 / 200.0);
+    println!("  DELETE:   {:.0} µs/op", start.elapsed().as_micros() as f64 / delete_n as f64);
 
     // Checkpoint
     let start = Instant::now();

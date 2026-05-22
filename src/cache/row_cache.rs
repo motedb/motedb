@@ -145,6 +145,26 @@ impl RowCache {
         None
     }
 
+    /// Batch get: checks all row_ids under a single lock acquisition.
+    /// Returns Vec<Option<Arc<Row>>> in the same order as input.
+    /// Eliminates N lock/unlock cycles — 1 lock for all rows.
+    pub fn batch_get(&self, table_name: &str, row_ids: &[RowId]) -> Vec<Option<Arc<Row>>> {
+        let thash = table_hash(table_name);
+        let cache = self.cache.read();
+        let mut results = Vec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            let key = (thash, row_id);
+            if let Some(row) = cache.peek(&key) {
+                results.push(Some(Arc::clone(row)));
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                results.push(None);
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        results
+    }
+
     /// Get a row from cache — ultra-fast path without prefetch tracking.
     /// Use for single-row PK lookups where sequential prefetch is irrelevant.
     pub fn get_fast(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
@@ -242,11 +262,14 @@ impl RowCache {
         None
     }
 
-    /// Put a row into cache
+    /// Put a row into cache (takes ownership, wraps in Arc)
     pub fn put(&self, table_name: String, row_id: RowId, row: Row) {
-        let key = (table_hash(&table_name), row_id);
-        let row_arc = Arc::new(row);
+        self.put_arc(table_name, row_id, Arc::new(row));
+    }
 
+    /// Put an Arc<Row> into cache (avoids clone when caller already has Arc)
+    pub fn put_arc(&self, table_name: String, row_id: RowId, row_arc: Arc<Row>) {
+        let key = (table_hash(&table_name), row_id);
         let mut cache = self.cache.write();
         cache.put(key, row_arc);
         self.size.store(cache.len(), Ordering::Relaxed);
@@ -343,13 +366,14 @@ impl RowCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
+    use crate::types::{Value, ArcString};
+    use std::sync::Arc;
 
     #[test]
     fn test_row_cache_basic() {
         let cache = RowCache::new(100);
 
-        let row = vec![Value::Integer(1), Value::Text("test".to_string())];
+        let row = vec![Value::Integer(1), Value::Text(ArcString(Arc::new("test".to_string())))];
 
         assert!(cache.get("users", 1).is_none());
 

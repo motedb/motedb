@@ -45,8 +45,8 @@ fn test_where_count_accuracy() {
         while let Some(Ok(row)) = rows.next() {
             manual_total += 1;
             if let motedb::types::Value::Text(s) = &row[1] {
-                if s == "pending" { manual_pending += 1; }
-                else if s == "completed" { manual_completed += 1; }
+                if s.as_str() == "pending" { manual_pending += 1; }
+                else if s.as_str() == "completed" { manual_completed += 1; }
             }
         }
     }

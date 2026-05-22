@@ -26,7 +26,7 @@ fn test_columnar_sql_insert_and_query() {
             Value::Timestamp(Timestamp::from_micros(1_000_000 + i as i64 * 10_000)),
             Value::Float(25.0 + i as f64 * 0.1),
             Value::Float(60.0 + i as f64 * 0.05),
-            Value::Text(format!("sensor_{}", i)),
+            Value::text(format!("sensor_{}", i)),
         ]);
     }
     let result = db.columnar_store().ingest("sensors", rows).unwrap();
@@ -49,7 +49,7 @@ fn test_columnar_api_ingest_and_query() {
             Value::Timestamp(Timestamp::from_micros(1_000_000 + i as i64 * 5_000)),
             Value::Float(20.0 + (i as f64) * 0.05),
             Value::Float(50.0 + (i as f64) * 0.02),
-            Value::Text(format!("point_{}", i)),
+            Value::text(format!("point_{}", i)),
         ]);
     }
 
@@ -92,7 +92,7 @@ fn test_columnar_ttl_gc() {
             Value::Timestamp(Timestamp::from_micros(100_000 + i as i64 * 2_000)),
             Value::Float(25.0),
             Value::Float(60.0),
-            Value::Text("old".to_string()),
+            Value::text("old".to_string()),
         ]);
     }
     db.columnar_store().ingest("old_data", old_rows).unwrap();
@@ -105,7 +105,7 @@ fn test_columnar_ttl_gc() {
             Value::Timestamp(Timestamp::from_micros(1_000_000 + i as i64 * 2_000)),
             Value::Float(30.0),
             Value::Float(55.0),
-            Value::Text("new".to_string()),
+            Value::text("new".to_string()),
         ]);
     }
     db.columnar_store().ingest("old_data", new_rows).unwrap();
@@ -139,7 +139,7 @@ fn test_columnar_gorilla_compression_roundtrip() {
             Value::Float(25.0 + (i as f64) * 0.01),
             Value::Integer(i),
             Value::Bool(i % 2 == 0),
-            Value::Text(format!("entry_{}", i % 10)),
+            Value::text(format!("entry_{}", i % 10)),
         ]);
     }
 
@@ -165,7 +165,7 @@ fn test_columnar_gorilla_compression_roundtrip() {
             assert_eq!(*active, i % 2 == 0, "Bool mismatch at row {}", i);
         }
         if let Some(Value::Text(name)) = sql_row.get("name") {
-            assert_eq!(name, &format!("entry_{}", i % 10), "Name mismatch at row {}", i);
+            assert_eq!(name.as_str(), format!("entry_{}", i % 10), "Name mismatch at row {}", i);
         }
     }
 }
@@ -186,7 +186,7 @@ fn test_dual_engine_standard_and_timeseries() {
         Value::Timestamp(Timestamp::from_micros(1_000_000)),
         Value::Float(25.5),
         Value::Float(60.0),
-        Value::Text("ok".to_string()),
+        Value::text("ok".to_string()),
     ]];
     db.columnar_store().ingest("sensor_log", rows).unwrap();
     db.flush().unwrap();

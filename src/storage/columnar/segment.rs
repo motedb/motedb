@@ -1145,7 +1145,8 @@ mod tests {
 
     #[test]
     fn test_value_to_raw_bytes() {
-        use crate::types::{Timestamp, Value};
+        use crate::types::{Timestamp, Value, ArcString};
+        use std::sync::Arc;
 
         let v_int = Value::Integer(42);
         let bytes = value_to_raw_bytes(&v_int);
@@ -1159,7 +1160,7 @@ mod tests {
         let bytes = value_to_raw_bytes(&v_ts);
         assert_eq!(i64::from_le_bytes(bytes), 9999);
 
-        let v_text = Value::Text("hello".to_string());
+        let v_text = Value::Text(ArcString(Arc::new("hello".to_string())));
         let bytes = value_to_raw_bytes(&v_text);
         assert_eq!(&bytes[..5], b"hello");
     }

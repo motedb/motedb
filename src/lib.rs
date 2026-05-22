@@ -38,6 +38,24 @@ macro_rules! debug_log {
     };
 }
 
+/// Always-on warning log — prints to stderr in all builds
+#[macro_export]
+macro_rules! warn_log {
+    ($($arg:tt)*) => {
+        eprintln!("[MoteDB WARN] {}", format_args!($($arg)*));
+    };
+}
+
+/// Info log — prints to stderr when MOTEDB_LOG env var is set
+#[macro_export]
+macro_rules! info_log {
+    ($($arg:tt)*) => {
+        if std::env::var("MOTEDB_LOG").is_ok() {
+            eprintln!("[MoteDB] {}", format_args!($($arg)*));
+        }
+    };
+}
+
 pub mod config;
 pub mod storage;
 pub mod index;

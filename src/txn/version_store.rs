@@ -249,6 +249,7 @@ impl VersionStore {
         &self,
         row_id: RowId,
         snapshot: &Snapshot,
+        isolation: crate::txn::IsolationLevel,
     ) -> Result<Option<Row>> {
         let chain = match self.versions.get(&row_id) {
             Some(c) => c,
@@ -260,7 +261,7 @@ impl VersionStore {
         let mut current = head.as_deref();
         
         while let Some(version) = current {
-            if self.is_visible(version, snapshot) {
+            if self.is_visible(version, snapshot, isolation) {
                 if !version.deleted.load(Ordering::Acquire) {
                     return Ok(Some(version.data.clone()));
                 } else {
@@ -273,24 +274,29 @@ impl VersionStore {
         Ok(None) // No visible version
     }
     
-    /// Check if a version is visible to a snapshot
-    fn is_visible(&self, version: &RowVersion, snapshot: &Snapshot) -> bool {
+    /// Check if a version is visible to a snapshot under the given isolation level.
+    fn is_visible(&self, version: &RowVersion, snapshot: &Snapshot,
+                  isolation: crate::txn::IsolationLevel) -> bool
+    {
         // Rule 1: Version must have been created before snapshot
         if version.begin_ts > snapshot.timestamp {
             return false;
         }
-        
+
         // Rule 2: Version must not have been invalidated before snapshot
         let end_ts = version.end_ts.load(Ordering::Acquire);
         if end_ts != 0 && end_ts <= snapshot.timestamp {
             return false;
         }
-        
-        // Rule 3: Creating transaction must not be active in snapshot
-        if snapshot.active_txns.contains(&version.txn_id) {
+
+        // Rule 3: Creating transaction must not be active in snapshot.
+        // Skip for ReadUncommitted — dirty reads are allowed.
+        if isolation != crate::txn::IsolationLevel::ReadUncommitted
+            && snapshot.active_txns.contains(&version.txn_id)
+        {
             return false;
         }
-        
+
         true
     }
     
@@ -472,7 +478,7 @@ mod tests {
             active_txns: HashSet::new(),
         };
         
-        let result = store.get_visible_version(row_id, &snapshot).unwrap();
+        let result = store.get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(result, Some(data));
     }
 
@@ -492,15 +498,15 @@ mod tests {
             timestamp: 15,
             active_txns: HashSet::new(),
         };
-        let result = store.get_visible_version(row_id, &snapshot_old).unwrap();
+        let result = store.get_visible_version(row_id, &snapshot_old, crate::txn::IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(result, Some(vec![Value::Timestamp(Timestamp::from_micros(100))]));
-        
+
         // Snapshot at ts=25 should see new value
         let snapshot_new = Snapshot {
             timestamp: 25,
             active_txns: HashSet::new(),
         };
-        let result = store.get_visible_version(row_id, &snapshot_new).unwrap();
+        let result = store.get_visible_version(row_id, &snapshot_new, crate::txn::IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(result, Some(vec![Value::Timestamp(Timestamp::from_micros(200))]));
     }
 
@@ -522,7 +528,7 @@ mod tests {
         };
         
         // Should not see uncommitted data
-        let result = store.get_visible_version(row_id, &snapshot).unwrap();
+        let result = store.get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(result, None);
     }
 
@@ -542,7 +548,7 @@ mod tests {
             timestamp: 15,
             active_txns: HashSet::new(),
         };
-        let result = store.get_visible_version(row_id, &snapshot_before).unwrap();
+        let result = store.get_visible_version(row_id, &snapshot_before, crate::txn::IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(result, Some(vec![Value::Timestamp(Timestamp::from_micros(100))]));
         
         // Snapshot after delete should not see data
@@ -550,7 +556,7 @@ mod tests {
             timestamp: 25,
             active_txns: HashSet::new(),
         };
-        let result = store.get_visible_version(row_id, &snapshot_after).unwrap();
+        let result = store.get_visible_version(row_id, &snapshot_after, crate::txn::IsolationLevel::ReadCommitted).unwrap();
         assert_eq!(result, None);
     }
 

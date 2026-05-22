@@ -35,20 +35,14 @@ impl ColumnBuffer {
             (Self::Float(v), Value::Float(f)) => v.push(f),
             (Self::Bool(v), Value::Bool(b)) => v.push(Some(b)),
             (Self::Bool(v), Value::Null) => v.push(None),
-            (Self::Text(v), Value::Text(s)) => v.push(Some(s)),
+            (Self::Text(v), Value::Text(s)) => v.push(Some((*s).clone())),
             (Self::Text(v), Value::Null) => v.push(None),
             (Self::Other(v), val) => v.push(val),
-            // Type mismatch: push as Other-compatible
-            (Self::Timestamp(v), val) => {
-                // Coerce to integer if possible
-                v.push(val_to_i64(&val).unwrap_or(0));
-            }
-            (Self::Integer(v), val) => {
-                v.push(val_to_i64(&val).unwrap_or(0));
-            }
-            (Self::Float(v), val) => {
-                v.push(val_to_f64(&val).unwrap_or(0.0));
-            }
+            // Null → use default for type
+            (Self::Timestamp(v), Value::Null) => v.push(0),
+            (Self::Integer(v), Value::Null) => v.push(0),
+            (Self::Float(v), Value::Null) => v.push(0.0),
+            // Type mismatch: skip rather than silently corrupt
             _ => {}
         }
     }
@@ -157,31 +151,13 @@ impl ColumnBuffer {
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 Some(ColumnStatistics {
                     column_id: col_id,
-                    min_value_raw: value_to_raw_bytes(&Value::Text(min.to_string())),
-                    max_value_raw: value_to_raw_bytes(&Value::Text(max.to_string())),
+                    min_value_raw: value_to_raw_bytes(&Value::text(min.to_string())),
+                    max_value_raw: value_to_raw_bytes(&Value::text(max.to_string())),
                     null_count,
                 })
             }
             _ => None,
         }
-    }
-}
-
-fn val_to_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::Integer(i) => Some(*i),
-        Value::Float(f) => Some(*f as i64),
-        Value::Bool(b) => Some(if *b { 1 } else { 0 }),
-        Value::Timestamp(ts) => Some(ts.as_micros()),
-        _ => None,
-    }
-}
-
-fn val_to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Float(f) => Some(*f),
-        Value::Integer(i) => Some(*i as f64),
-        _ => None,
     }
 }
 
@@ -426,7 +402,7 @@ impl ColumnarWriteBuffer {
                         vals.get(row_idx).and_then(|v| v.map(Value::Bool)).or(Some(Value::Null))
                     }
                     ColumnBuffer::Text(vals) => {
-                        vals.get(row_idx).and_then(|v| v.as_ref().map(|s| Value::Text(s.clone()))).or(Some(Value::Null))
+                        vals.get(row_idx).and_then(|v| v.as_ref().map(|s| Value::text(s.clone()))).or(Some(Value::Null))
                     }
                     ColumnBuffer::Other(vals) => {
                         vals.get(row_idx).cloned()
@@ -473,7 +449,7 @@ mod tests {
         let row = vec![
             Value::Timestamp(Timestamp::from_micros(1000)),
             Value::Float(25.5),
-            Value::Text("ok".to_string()),
+            Value::text("ok".to_string()),
         ];
 
         let decision = buf.append(0, &row);
@@ -495,7 +471,7 @@ mod tests {
             let row = vec![
                 Value::Timestamp(Timestamp::from_micros(i * 1000)),
                 Value::Float(i as f64),
-                Value::Text(format!("row_{}", i)),
+                Value::text(format!("row_{}", i)),
             ];
             let decision = buf.append(i as u64, &row);
             if i < 4 {
@@ -516,7 +492,7 @@ mod tests {
         let row = vec![
             Value::Timestamp(Timestamp::from_micros(1000)),
             Value::Float(25.0),
-            Value::Text("hello".to_string()),
+            Value::text("hello".to_string()),
         ];
         buf.append(0, &row);
 
@@ -540,7 +516,7 @@ mod tests {
             let row = vec![
                 Value::Timestamp(Timestamp::from_micros(1000 + i * 500)),
                 Value::Float(i as f64),
-                Value::Text("x".to_string()),
+                Value::text("x".to_string()),
             ];
             buf.append(i as u64, &row);
         }

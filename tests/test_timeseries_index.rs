@@ -37,7 +37,7 @@ fn ingest_rows(db: &Database, table: &str, count: usize, base_ts: i64, ts_step: 
             Value::Timestamp(Timestamp::from_micros(base_ts + i as i64 * ts_step)),
             Value::Float(20.0 + (i as f64 % 10.0)),
             Value::Float(50.0 + (i as f64 % 5.0)),
-            Value::Text(format!("label_{}", i % 20)),
+            Value::text(format!("label_{}", i % 20)),
             Value::Integer((i % 5) as i64),
         ]);
     }
@@ -63,7 +63,7 @@ fn test_timestamp_sort_binary_search() {
                 Value::Timestamp(Timestamp::from_micros(ts)),
                 Value::Float(25.0 + batch as f64),
                 Value::Float(60.0),
-                Value::Text(format!("b{}_{}", batch, i)),
+                Value::text(format!("b{}_{}", batch, i)),
                 Value::Integer(batch as i64),
             ]);
         }
@@ -120,7 +120,7 @@ fn test_zone_map_segment_pruning() {
             Value::Timestamp(Timestamp::from_micros(100_000 + i as i64 * 100)),
             Value::Float(10.0 + i as f64 * 0.05),
             Value::Float(50.0),
-            Value::Text("cold".to_string()),
+            Value::text("cold".to_string()),
             Value::Integer(0),
         ]);
     }
@@ -134,7 +134,7 @@ fn test_zone_map_segment_pruning() {
             Value::Timestamp(Timestamp::from_micros(200_000 + i as i64 * 100)),
             Value::Float(20.0 + i as f64 * 0.05),
             Value::Float(55.0),
-            Value::Text("warm".to_string()),
+            Value::text("warm".to_string()),
             Value::Integer(1),
         ]);
     }
@@ -148,7 +148,7 @@ fn test_zone_map_segment_pruning() {
             Value::Timestamp(Timestamp::from_micros(300_000 + i as i64 * 100)),
             Value::Float(30.0 + i as f64 * 0.05),
             Value::Float(60.0),
-            Value::Text("hot".to_string()),
+            Value::text("hot".to_string()),
             Value::Integer(2),
         ]);
     }
@@ -211,7 +211,7 @@ fn test_bloom_filter_text_pruning() {
             Value::Timestamp(Timestamp::from_micros(100_000 + i as i64 * 100)),
             Value::Float(20.0),
             Value::Float(50.0),
-            Value::Text(if i % 2 == 0 { "alpha".to_string() } else { "beta".to_string() }),
+            Value::text(if i % 2 == 0 { "alpha".to_string() } else { "beta".to_string() }),
             Value::Integer(0),
         ]);
     }
@@ -225,7 +225,7 @@ fn test_bloom_filter_text_pruning() {
             Value::Timestamp(Timestamp::from_micros(200_000 + i as i64 * 100)),
             Value::Float(25.0),
             Value::Float(55.0),
-            Value::Text(if i % 2 == 0 { "gamma".to_string() } else { "delta".to_string() }),
+            Value::text(if i % 2 == 0 { "gamma".to_string() } else { "delta".to_string() }),
             Value::Integer(1),
         ]);
     }
@@ -236,7 +236,7 @@ fn test_bloom_filter_text_pruning() {
     let conditions = vec![
         ColumnCondition::Equals {
             column_idx: 3, // label column
-            value: Value::Text("alpha".to_string()),
+            value: Value::text("alpha".to_string()),
         },
     ];
     let results = db.columnar_store().query_with_conditions(
@@ -245,7 +245,7 @@ fn test_bloom_filter_text_pruning() {
 
     for (_rid, row) in &results {
         if let Some(Value::Text(label)) = row.get("label") {
-            assert_eq!(label, "alpha", "Label should be 'alpha', got '{}'", label);
+            assert_eq!(label.as_str(), "alpha", "Label should be 'alpha', got '{}'", label);
         }
     }
 
@@ -253,7 +253,7 @@ fn test_bloom_filter_text_pruning() {
     let no_conditions = vec![
         ColumnCondition::Equals {
             column_idx: 3,
-            value: Value::Text("nonexistent".to_string()),
+            value: Value::text("nonexistent".to_string()),
         },
     ];
     let no_results = db.columnar_store().query_with_conditions(
@@ -279,7 +279,7 @@ fn test_segment_manager_binary_search_pruning() {
                 Value::Timestamp(Timestamp::from_micros((seg * 1_000_000 + i * 1_000) as i64)),
                 Value::Float(20.0 + seg as f64),
                 Value::Float(50.0),
-                Value::Text(format!("seg_{}", seg)),
+                Value::text(format!("seg_{}", seg)),
                 Value::Integer(seg as i64),
             ]);
         }
@@ -332,7 +332,7 @@ fn test_combined_time_and_column_pruning() {
                 Value::Timestamp(Timestamp::from_micros((zone * 1_000_000 + i * 1_000) as i64)),
                 Value::Float(20.0 + zone as f64 * 10.0),
                 Value::Float(50.0),
-                Value::Text(format!("zone_{}", zone)),
+                Value::text(format!("zone_{}", zone)),
                 Value::Integer(zone as i64),
             ]);
         }
@@ -358,7 +358,7 @@ fn test_combined_time_and_column_pruning() {
             assert_eq!(*zone, 1, "All results should have zone=1");
         }
         if let Some(Value::Text(label)) = row.get("label") {
-            assert_eq!(label, "zone_1", "Label should be 'zone_1'");
+            assert_eq!(label.as_str(), "zone_1", "Label should be 'zone_1'");
         }
     }
 
@@ -394,7 +394,7 @@ fn test_10k_rows_multi_segment() {
                 Value::Timestamp(Timestamp::from_micros(ts)),
                 Value::Float(20.0 + (batch as f64 % 10.0)),
                 Value::Float(50.0 + (i as f64 % 5.0)),
-                Value::Text(format!("label_{}", batch % 10)),
+                Value::text(format!("label_{}", batch % 10)),
                 Value::Integer((batch % 5) as i64),
             ]);
         }
@@ -415,7 +415,7 @@ fn test_10k_rows_multi_segment() {
     let label_cond = vec![
         ColumnCondition::Equals {
             column_idx: 3,
-            value: Value::Text("label_3".to_string()),
+            value: Value::text("label_3".to_string()),
         },
     ];
     let label_results = db.columnar_store().query_with_conditions(
@@ -428,7 +428,7 @@ fn test_10k_rows_multi_segment() {
     // Verify all results have correct label
     for (_rid, row) in &label_results {
         if let Some(Value::Text(label)) = row.get("label") {
-            assert_eq!(label, "label_3");
+            assert_eq!(label.as_str(), "label_3");
         }
     }
 }
@@ -448,7 +448,7 @@ fn test_buffer_query_with_conditions() {
             Value::Timestamp(Timestamp::from_micros(100_000 + i as i64 * 100)),
             Value::Float(20.0 + i as f64 * 0.1),
             Value::Float(50.0),
-            Value::Text(if i < 25 { "type_a".to_string() } else { "type_b".to_string() }),
+            Value::text(if i < 25 { "type_a".to_string() } else { "type_b".to_string() }),
             Value::Integer(if i < 25 { 0 } else { 1 }),
         ]
     }).collect();
@@ -585,7 +585,7 @@ fn test_data_integrity_roundtrip() {
             Value::Timestamp(Timestamp::from_micros(1_000_000 + i as i64 * 4_000)),
             Value::Float(20.0 + (i as f64) * 0.1),
             Value::Float(50.0 + (i as f64) * 0.05),
-            Value::Text(format!("sensor_{}", i % 50)),
+            Value::text(format!("sensor_{}", i % 50)),
             Value::Integer((i % 5) as i64),
         ]);
     }
@@ -620,7 +620,7 @@ fn test_data_integrity_roundtrip() {
             assert_eq!(*zone, expected_zone, "zone mismatch at row {}", i);
         }
         if let Some(Value::Text(label)) = sql_row.get("label") {
-            assert_eq!(label, &expected_label, "label mismatch at row {}", i);
+            assert_eq!(label.as_str(), expected_label, "label mismatch at row {}", i);
         }
     }
 }
@@ -692,7 +692,7 @@ fn test_merge_preserves_indexing() {
             rows.push(vec![
                 Value::Timestamp(Timestamp::from_micros((batch * 100_000 + i * 1_000) as i64)),
                 Value::Float(batch as f64 * 10.0 + i as f64 * 0.1),
-                Value::Text(format!("tag_{}", batch % 3)),
+                Value::text(format!("tag_{}", batch % 3)),
             ]);
         }
         db.columnar_store().ingest("merge_idx", rows).unwrap();
@@ -709,7 +709,7 @@ fn test_merge_preserves_indexing() {
     let conditions = vec![
         ColumnCondition::Equals {
             column_idx: 2,
-            value: Value::Text("tag_1".to_string()),
+            value: Value::text("tag_1".to_string()),
         },
     ];
     let tagged = db.columnar_store().query_with_conditions(
@@ -719,7 +719,7 @@ fn test_merge_preserves_indexing() {
     assert_eq!(tagged.len(), 100, "tag_1 should match 100 rows, got {}", tagged.len());
     for (_rid, row) in &tagged {
         if let Some(Value::Text(tag)) = row.get("tag") {
-            assert_eq!(tag, "tag_1");
+            assert_eq!(tag.as_str(), "tag_1");
         }
     }
 }
@@ -747,7 +747,7 @@ fn test_crash_recovery_with_indexing() {
             rows.push(vec![
                 Value::Timestamp(Timestamp::from_micros(1_000_000 + i as i64 * 1_000)),
                 Value::Float(20.0 + i as f64 * 0.05),
-                Value::Text(format!("tag_{}", i % 10)),
+                Value::text(format!("tag_{}", i % 10)),
             ]);
         }
         db.columnar_store().ingest("recover_test", rows).unwrap();

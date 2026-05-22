@@ -376,21 +376,22 @@ impl<'a> Lexer<'a> {
     }
     
     fn read_identifier(&mut self) -> TokenType {
-        let mut value = String::with_capacity(16);
+        let start = self.position;
 
         while !self.is_eof() {
             let ch = self.current_utf8_char();
             if ch.is_alphanumeric() || ch == '_' {
-                value.push(ch);
                 self.advance_utf8();
             } else {
                 break;
             }
         }
 
-        // Check if it's a keyword
-        TokenType::from_keyword(&value)
-            .unwrap_or(TokenType::Identifier(value))
+        let word = &self.input[start..self.position];
+
+        // Zero-allocation keyword check (from_keyword uses stack buffer)
+        TokenType::from_keyword(word)
+            .unwrap_or_else(|| TokenType::Identifier(word.to_string()))
     }
 }
 

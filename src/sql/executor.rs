@@ -8,7 +8,6 @@ use crate::{StorageError};
 use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId, Row};
 use crate::storage::row_format;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 fn decode_row(data: &[u8], schema: &TableSchema) -> crate::Result<Row> {
     row_format::decode(data, schema.col_types())
@@ -19,6 +18,29 @@ type FromScanResult = Result<(Vec<(u64, SqlRow)>, Arc<TableSchema>)>;
 
 #[allow(clippy::type_complexity)]
 type RowPredicate = Option<Box<dyn Fn(&SqlRow) -> bool + Send + Sync>>;
+
+/// Prefix all column names in rows with `table.prefix` and add metadata fields.
+fn prefix_rows(rows: &mut [(u64, SqlRow)], table: &str, prefix: &str) {
+    for (row_id, sql_row) in rows.iter_mut() {
+        let mut new = SqlRow::new();
+        new.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
+        new.insert("__table__".to_string(), Value::text(table.to_string()));
+        let old = std::mem::take(sql_row);
+        for (col_name, val) in old {
+            new.insert(format!("{}.{}", prefix, col_name), val);
+        }
+        *sql_row = new;
+    }
+}
+
+/// Clone a schema and prefix every column name with `prefix.`
+fn prefix_schema(schema: &TableSchema, prefix: &str) -> TableSchema {
+    let mut s = schema.clone();
+    for col in &mut s.columns {
+        col.name = format!("{}.{}", prefix, col.name);
+    }
+    s
+}
 
 /// Query result
 #[derive(Debug)]
@@ -202,29 +224,28 @@ impl StreamingQueryResult {
         order_clauses: &[OrderByExpr],
     ) -> Result<()> {
         use std::cmp::Ordering;
-        
+
+        // Pre-compute column indices and ascending flags to avoid O(columns) per comparison
+        let sort_specs: Vec<(usize, bool)> = order_clauses.iter().filter_map(|clause| {
+            let col_name = match &clause.expr {
+                Expr::Column(name) => name,
+                _ => return None,
+            };
+            let col_idx = columns.iter().position(|c| c == col_name)?;
+            Some((col_idx, clause.asc))
+        }).collect();
+
+        if sort_specs.is_empty() {
+            return Ok(());
+        }
+
         rows.sort_by(|a, b| {
-            for clause in order_clauses {
-                // ORDER BY 支持表达式，但这里先只处理简单列名
-                let col_name = match &clause.expr {
-                    Expr::Column(name) => name,
-                    _ => continue, // 暂时跳过复杂表达式
-                };
-                
-                // 找到排序列的索引
-                let col_idx = match columns.iter().position(|c| c == col_name) {
-                    Some(idx) => idx,
-                    None => continue, // 列不存在，跳过
-                };
-                
+            for &(col_idx, asc) in &sort_specs {
                 if col_idx >= a.len() || col_idx >= b.len() {
                     continue;
                 }
-                
-                let val_a = &a[col_idx];
-                let val_b = &b[col_idx];
-                
-                let cmp = match (val_a, val_b) {
+
+                let cmp = match (&a[col_idx], &b[col_idx]) {
                     (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
                     (Value::Float(a), Value::Float(b)) => {
                         if a.is_nan() && b.is_nan() {
@@ -242,48 +263,50 @@ impl StreamingQueryResult {
                     (Value::Null, Value::Null) => Ordering::Equal,
                     (Value::Null, _) => Ordering::Less,
                     (_, Value::Null) => Ordering::Greater,
-                    _ => Ordering::Equal, // 不同类型，视为相等
+                    _ => Ordering::Equal,
                 };
-                
-                let final_cmp = if clause.asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                };
-                
+
+                let final_cmp = if asc { cmp } else { cmp.reverse() };
+
                 if final_cmp != Ordering::Equal {
                     return final_cmp;
                 }
             }
             Ordering::Equal
         });
-        
+
         Ok(())
     }
     
-    /// 🔧 应用 DISTINCT（静态方法，在 materialize() 中调用）
     fn apply_distinct(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         use std::collections::HashSet;
-        
+
         let mut seen = HashSet::new();
         let mut result = Vec::new();
-        
+
         for row in rows {
-            // 使用调试格式作为哈希键（简单但有效）
-            let key = format!("{:?}", row);
-            if seen.insert(key) {
+            if seen.insert(row.clone()) {
                 result.push(row);
             }
         }
-        
+
         result
     }
+}
+
+/// Metadata for a single aggregate function extracted from a SELECT column.
+/// Used by the positional GROUP BY fast path.
+#[derive(Clone)]
+struct AggregateInfo {
+    func: String,           // COUNT, SUM, AVG, MIN, MAX
+    col_pos: Option<usize>, // Column position; None means COUNT(*) or COUNT(1)
+    distinct: bool,
 }
 
 pub struct QueryExecutor {
     db: Arc<MoteDB>,
     evaluator: ExprEvaluator,
-    optimizer: Mutex<super::optimizer::QueryOptimizer>,
+    optimizer: super::optimizer::QueryOptimizer,
     /// Store the last AUTO_INCREMENT value inserted (mirrors evaluator)
     last_insert_id: std::sync::atomic::AtomicI64,
 }
@@ -292,7 +315,7 @@ impl QueryExecutor {
     pub fn new(db: Arc<MoteDB>) -> Self {
         Self {
             evaluator: ExprEvaluator::with_db(db.clone()),
-            optimizer: Mutex::new(super::optimizer::QueryOptimizer::new(db.clone())),
+            optimizer: super::optimizer::QueryOptimizer::new(db.clone()),
             last_insert_id: std::sync::atomic::AtomicI64::new(i64::MIN),
             db,
         }
@@ -351,7 +374,7 @@ impl QueryExecutor {
         match stmt {
             Statement::Select(s) => self.execute_select_streaming_ref(s),
             Statement::Insert(i) => {
-                let result = self.execute_insert(i.clone())?;
+                let result = self.execute_insert_ref(i)?;
                 Ok(StreamingQueryResult::Modification {
                     affected_rows: result.affected_rows(),
                 })
@@ -435,98 +458,32 @@ impl QueryExecutor {
     }
 
     pub fn execute_streaming(&self, stmt: Statement) -> Result<StreamingQueryResult> {
-        match stmt {
-            Statement::Select(s) => self.execute_select_streaming(s),
-            // 其他语句直接物化（无需流式）
-            Statement::Insert(i) => {
-                let result = self.execute_insert(i)?;
-                Ok(StreamingQueryResult::Modification {
-                    affected_rows: result.affected_rows(),
-                })
-            }
-            Statement::Update(u) => {
-                let result = self.execute_update(u)?;
-                Ok(StreamingQueryResult::Modification {
-                    affected_rows: result.affected_rows(),
-                })
-            }
-            Statement::Delete(d) => {
-                let result = self.execute_delete(d)?;
-                Ok(StreamingQueryResult::Modification {
-                    affected_rows: result.affected_rows(),
-                })
-            }
-            Statement::CreateTable(c) => {
-                let result = self.execute_create_table(c)?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Table created".to_string(),
-                    },
-                })
-            }
-            Statement::CreateIndex(c) => {
-                let result = self.execute_create_index(c)?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Index created".to_string(),
-                    },
-                })
-            }
-            Statement::DropTable(d) => {
-                let result = self.execute_drop_table(d)?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Table dropped".to_string(),
-                    },
-                })
-            }
-            Statement::DropIndex(d) => {
-                let result = self.execute_drop_index(d)?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Index dropped".to_string(),
-                    },
-                })
-            }
-            Statement::ShowTables => {
-                let result = self.execute_show_tables()?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Tables shown".to_string(),
-                    },
-                })
-            }
-            Statement::DescribeTable(table_name) => {
-                let result = self.execute_describe_table(table_name)?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Table described".to_string(),
-                    },
-                })
-            }
-            Statement::AlterTable(a) => {
-                let result = self.execute_alter_table(a)?;
-                Ok(StreamingQueryResult::Definition {
-                    message: match result {
-                        QueryResult::Definition { message } => message,
-                        _ => "Table altered".to_string(),
-                    },
-                })
-            }
-        }
+        self.execute_streaming_ref(&stmt)
     }
-    
+
     /// Execute SELECT statement
     fn execute_select(&self, stmt: SelectStmt) -> Result<QueryResult> {
         self.execute_select_internal(&stmt)
     }
     
+    /// Materialize a SELECT via `execute_select_internal` and wrap as streaming.
+    fn materialize_as_streaming(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
+        let result = self.execute_select_internal(stmt)?;
+        match result {
+            QueryResult::Select { columns, rows } => {
+                Ok(StreamingQueryResult::SelectStreaming {
+                    columns,
+                    rows: Box::new(rows.into_iter().map(Ok)),
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    distinct: false,
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// 🚀 Execute SELECT statement (streaming version, zero-clone)
     ///
     /// Takes &SelectStmt — no cloning of the AST at all.
@@ -534,39 +491,18 @@ impl QueryExecutor {
     fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
         // Aggregate queries (COUNT, SUM, etc.) require materialization — fall back
         if self.has_aggregates(&stmt.columns) {
-            let result = self.execute_select_internal(stmt)?;
-            return match result {
-                QueryResult::Select { columns, rows } => {
-                    Ok(StreamingQueryResult::SelectStreaming {
-                        columns,
-                        rows: Box::new(rows.into_iter().map(Ok)),
-                        order_by: None,
-                        limit: None,
-                        offset: None,
-                        distinct: false,
-                    })
-                }
-                _ => unreachable!(),
-            };
+            return self.materialize_as_streaming(stmt);
+        }
+
+        // Handle SELECT without FROM clause (e.g., SELECT ROUND(3.7), SELECT TRIM('  hi  '))
+        if stmt.from.is_none() {
+            return self.materialize_as_streaming(stmt);
         }
 
         // Handle JOIN/Subquery by falling back to materialization
         match stmt.from.as_ref().unwrap() {
             TableRef::Join { .. } | TableRef::Subquery { .. } => {
-                let result = self.execute_select_internal(stmt)?;
-                return match result {
-                    QueryResult::Select { columns, rows } => {
-                        Ok(StreamingQueryResult::SelectStreaming {
-                            columns,
-                            rows: Box::new(rows.into_iter().map(Ok)),
-                            order_by: None,
-                            limit: None,
-                            offset: None,
-                            distinct: false,
-                        })
-                    }
-                    _ => unreachable!(),
-                };
+                return self.materialize_as_streaming(stmt);
             }
             _ => {}
         }
@@ -577,59 +513,33 @@ impl QueryExecutor {
         // FullScan which would be O(N) for these queries.
         if let Some(ref where_clause) = stmt.where_clause {
             if Self::expr_needs_materialized_path(where_clause) {
-                let result = self.execute_select_internal(stmt)?;
-                return match result {
-                    QueryResult::Select { columns, rows } => {
-                        Ok(StreamingQueryResult::SelectStreaming {
-                            columns,
-                            rows: Box::new(rows.into_iter().map(Ok)),
-                            order_by: None,
-                            limit: None,
-                            offset: None,
-                            distinct: false,
-                        })
-                    }
-                    _ => unreachable!(),
-                };
+                return self.materialize_as_streaming(stmt);
             }
         }
 
-        // 🚀 Fast path: ORDER BY ST_DISTANCE should use spatial KNN index
-        // Check if ORDER BY contains ST_DISTANCE or a column alias referencing ST_DISTANCE
+        // 🚀 Fast path: ORDER BY ST_DISTANCE uses spatial KNN index
         if let Some(ref order_by) = stmt.order_by {
             if order_by.iter().any(|ob| Self::expr_is_or_aliases_st_distance(&ob.expr, &stmt.columns)) {
-                let result = self.execute_select_internal(stmt)?;
-                return match result {
-                    QueryResult::Select { columns, rows } => {
-                        Ok(StreamingQueryResult::SelectStreaming {
-                            columns,
-                            rows: Box::new(rows.into_iter().map(Ok)),
-                            order_by: None,
-                            limit: None,
-                            offset: None,
-                            distinct: false,
-                        })
-                    }
-                    _ => unreachable!(),
-                };
+                // Try KNN spatial optimization first
+                if let Some(QueryResult::Select { columns, rows }) = self.try_optimize_spatial_order_by(stmt)? {
+                    return Ok(StreamingQueryResult::SelectReady { columns, rows });
+                }
+                // Fall back to full scan if KNN index not available
+                return self.materialize_as_streaming(stmt);
             }
         }
 
-        // 🚀 Pass bind parameters to optimizer (resolves ? inline, no AST clone needed).
+        // Pass bind parameters to optimizer (resolves ? inline, no AST clone needed).
         let has_params = Self::contains_parameter_stmt(stmt);
-        if has_params {
+        let plan = if has_params {
             let params = self.evaluator.get_params();
             if let Some(err) = Self::validate_params_bound(stmt, &params) {
                 return Err(err);
             }
-            self.optimizer.lock().unwrap().set_params(params);
-        }
-
-        let plan = self.optimizer.lock().unwrap().optimize_select(stmt)?;
-
-        if has_params {
-            self.optimizer.lock().unwrap().clear_params();
-        }
+            self.optimizer.optimize_select(stmt, &params)?
+        } else {
+            self.optimizer.optimize_select(stmt, &[])?
+        };
 
         // For PointQuery/RangeQuery, the plan already has resolved values — use original stmt.
         // For FullScan, WHERE still contains Parameter nodes — substitute needed.
@@ -646,31 +556,18 @@ impl QueryExecutor {
                 self.execute_full_scan_streaming(&resolved, plan.scan_method.table_name())
             }
             super::optimizer::ScanMethod::FullScan { ref table } => {
+                // ORDER BY / DISTINCT on full scan: use positional path via materialize
+                // which has the optimized positional ORDER BY / DISTINCT fast path
+                if stmt.order_by.is_some() || stmt.distinct {
+                    return self.materialize_as_streaming(stmt);
+                }
                 self.execute_full_scan_streaming(stmt, table)
             }
             _ => {
                 // Fallback to materialized path (handles params via eval())
-                let result = self.execute_select_internal(stmt)?;
-                match result {
-                    QueryResult::Select { columns, rows } => {
-                        Ok(StreamingQueryResult::SelectStreaming {
-                            columns,
-                            rows: Box::new(rows.into_iter().map(Ok)),
-                            order_by: None,
-                            limit: None,
-                            offset: None,
-                            distinct: false,
-                        })
-                    }
-                    _ => unreachable!(),
-                }
+                self.materialize_as_streaming(stmt)
             }
         }
-    }
-
-    /// Execute SELECT streaming (owned version — clones into ref version)
-    fn execute_select_streaming(&self, stmt: SelectStmt) -> Result<StreamingQueryResult> {
-        self.execute_select_streaming_ref(&stmt)
     }
 
     /// Check if an expression contains MATCH, ST_WITHIN, or ST_KNN that needs
@@ -708,6 +605,14 @@ impl QueryExecutor {
     /// 🔥 点查询流式扫描（使用列索引）
     /// 
     /// ⚠️ 注意：这个方法通常只返回少量行（点查询），不需要批量优化
+    /// Check if any SELECT expression needs the materialized path (full evaluator).
+    fn select_needs_materialized(stmt: &SelectStmt) -> bool {
+        stmt.columns.iter().any(|c| match c {
+            SelectColumn::Expr(e, _) => !Self::can_eval_positional(e),
+            _ => false,
+        })
+    }
+
     fn execute_point_query_streaming(
         &self,
         stmt: &SelectStmt,
@@ -724,6 +629,11 @@ impl QueryExecutor {
             .unwrap_or(false);
 
         let is_auto_increment_pk = is_pk && schema.is_primary_key_auto_increment();
+
+        // If SELECT expressions need the full evaluator, fall back to materialized path
+        if Self::select_needs_materialized(stmt) {
+            return self.materialize_as_streaming(stmt);
+        }
 
         // 🚀 Fast path for non-AUTO_INCREMENT PK: use in-memory PK lookup
         // Bypasses disk-based column index (1.5ms → <5µs)
@@ -853,21 +763,19 @@ impl QueryExecutor {
                     .map(|row| Ok(Self::project_row_direct(&row, &sel_c, &col_c, &schema_c)))
             }).collect()
         } else {
-            // Sparse result set: individual LSM gets
-            sorted_ids.into_iter().filter_map(|row_id| {
-                let key = self.db.make_composite_key(table, row_id);
-                match self.db.lsm_engine.get(key) {
-                    Ok(Some(vd)) if !vd.deleted => {
-                        let data = match &vd.data {
-                            crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                            _ => return None,
-                        };
-                        decode_row(data, &schema)
-                            .ok()
-                            .map(|row| Ok(Self::project_row_direct(&row, &stmt.columns, &columns, &schema)))
-                    }
-                    _ => None,
-                }
+            // Sparse result set: batch read via row cache + LSM range scan
+            let batch = self.db.get_table_rows_batch_arc(table, &sorted_ids)
+                .map_err(|e| StorageError::Query(format!(
+                    "Failed to fetch rows for table '{}': {}", table, e
+                )))?;
+            let sel = stmt.columns.clone();
+            let col = columns.clone();
+            let sch = schema.clone();
+            batch.into_iter().filter_map(move |(_, opt_arc)| {
+                opt_arc.map(|row_arc| {
+                    let result = Self::project_row_direct(&row_arc, &sel, &col, &sch);
+                    Ok(result)
+                })
             }).collect()
         };
 
@@ -904,75 +812,89 @@ impl QueryExecutor {
         end_inclusive: bool,
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
+
+        // If SELECT expressions need the full evaluator, fall back to materialized path
+        if Self::select_needs_materialized(stmt) {
+            return self.materialize_as_streaming(stmt);
+        }
+
+        // 🚀 Fast path for SELECT *: bypass SqlRow + project overhead
+        let is_star = stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star)
+            && stmt.order_by.is_none() && !stmt.distinct;
+        if is_star {
+            let pk_col = schema.primary_key().unwrap_or("id");
+            if column != pk_col {
+                let index_name = format!("{}.{}", table, column);
+                if let Some(index_ref) = self.db.column_indexes.get(&index_name) {
+                    let row_ids = index_ref.value().query_between(start, start_inclusive, end, end_inclusive)?;
+                    drop(index_ref);
+                    if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() {
+                        let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                        let arc_rows = self.db.get_table_rows_batch_arc(table, &row_ids)?;
+                        let skip_n = stmt.offset.unwrap_or(0);
+                        let take_n = stmt.limit.unwrap_or(usize::MAX);
+                        let rows: Vec<Result<Vec<Value>>> = arc_rows.into_iter()
+                            .filter_map(|(_, opt)| opt)
+                            .skip(skip_n)
+                            .map(|arc| Ok(match Arc::try_unwrap(arc) {
+                                Ok(row) => row,
+                                Err(arc) => (*arc).clone(),
+                            }))
+                            .take(take_n)
+                            .collect();
+                        return Ok(StreamingQueryResult::SelectReady {
+                            columns: column_names,
+                            rows: rows.into_iter().filter_map(|r| r.ok()).collect(),
+                        });
+                    }
+                }
+            }
+        }
+
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
-        
+
         // 🚀 优化路径1：主键范围查询使用 LSM range scan（顺序扫描）
         let pk_col = schema.primary_key().unwrap_or("id");
         if column == pk_col {
             return self.execute_primary_key_range_streaming(stmt, table, start, start_inclusive, end, end_inclusive);
         }
-        
-        // 🔧 路径2：非主键列使用列索引 + batch_get
+
+        // 🔧 路径2：非主键列使用列索引 + batch_get (with row cache)
         let row_ids = self.db.query_by_column_between(table, column, start, start_inclusive, end, end_inclusive)?;
-        
-        // 🚀 批量读取行数据（减少锁竞争）
+
+        // 🚀 批量读取行数据（通过 row_cache 减少锁竞争和 LSM 开销）
         let db = self.db.clone();
         let table_name = table.to_string();
         let schema_clone = schema.clone();
         let select_cols = stmt.columns.clone();
         let columns_clone = columns.clone();
-        
+
         // 批量 get 迭代器
         const BATCH_SIZE: usize = 1000;
         let total_rows = row_ids.len();
-        
+
         let rows_iter = (0..total_rows).step_by(BATCH_SIZE).flat_map(move |batch_start| {
             let batch_end = (batch_start + BATCH_SIZE).min(total_rows);
             let batch_row_ids = &row_ids[batch_start..batch_end];
-            
-            // 构造批量 keys
-            let keys: Vec<u64> = batch_row_ids.iter()
-                .map(|&row_id| db.make_composite_key(&table_name, row_id))
-                .collect();
-            
-            // 🔥 批量 get（关键优化）
-            let batch_results = match db.lsm_engine.batch_get(&keys) {
+
+            let batch_results = match db.get_table_rows_batch(&table_name, batch_row_ids) {
                 Ok(results) => results,
                 Err(e) => {
-                    debug_log!("[range_streaming] batch_get failed: {:?}", e);
                     return vec![Err(e)];
                 }
             };
-            
-            // 反序列化并投影
+
             let mut processed = Vec::with_capacity(batch_results.len());
-            for value_opt in batch_results {
-                match value_opt {
-                    Some(value_data) if !value_data.deleted => {
-                        // 反序列化行
-                        let data = match &value_data.data {
-                            crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                            _ => {
-                                processed.push(Err(StorageError::InvalidData("Unexpected blob".into())));
-                                continue;
-                            }
-                        };
-                        
-                        match decode_row(data, &schema_clone) {
-                            Ok(row) => {
-                                let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
-                                processed.push(Ok(projected));
-                            }
-                            Err(e) => processed.push(Err(StorageError::InvalidData(format!("Deserialization failed: {}", e)))),
-                        }
-                    }
-                    _ => {} // Deleted or not found, skip
+            for (_row_id, row_opt) in batch_results {
+                if let Some(row) = row_opt {
+                    let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
+                    processed.push(Ok(projected));
                 }
             }
-            
+
             processed
         });
-        
+
         Ok(StreamingQueryResult::SelectStreaming {
             columns,
             rows: Box::new(rows_iter),
@@ -1006,7 +928,12 @@ impl QueryExecutor {
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
-        
+
+        // If SELECT expressions need the full evaluator, fall back to materialized path
+        if Self::select_needs_materialized(stmt) {
+            return self.materialize_as_streaming(stmt);
+        }
+
         // 提取 row_id 范围
         let start_row_id = match start {
             Value::Integer(i) => *i as u64,
@@ -1072,9 +999,35 @@ impl QueryExecutor {
     /// 🔥 全表扫描流式（现有实现）
     fn execute_full_scan_streaming(&self, stmt: &SelectStmt, table: &str) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
-        let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
-        let row_iter = self.db.scan_table_rows_streaming(table)?;
+        // 🚀 Fast path for SELECT * with no WHERE/ORDER BY/DISTINCT/LIMIT/OFFSET:
+        // Skip project_row_direct entirely — decoded row IS the final result.
+        let is_simple_star = stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star)
+            && stmt.where_clause.is_none() && stmt.order_by.is_none()
+            && !stmt.distinct && stmt.limit.is_none() && stmt.offset.is_none();
+        if is_simple_star {
+            let row_iter = self.db.scan_table_rows_streaming(table)?;
+            let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            // Pre-allocate result Vec using row count hint (avoids ~14 reallocations for 10K rows)
+            let estimated = self.db.fast_row_count(table).unwrap_or(0) as usize;
+            let rows: Vec<Vec<Value>> = if estimated > 0 {
+                let mut buf = Vec::with_capacity(estimated);
+                for r in row_iter {
+                    if let Ok((_row_id, row)) = r {
+                        buf.push(row);
+                    }
+                }
+                buf
+            } else {
+                row_iter.filter_map(|r| r.ok()).map(|(_, row)| row).collect()
+            };
+            return Ok(StreamingQueryResult::SelectReady {
+                columns: column_names,
+                rows,
+            });
+        }
+
+        let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
         let where_clause = stmt.where_clause.clone();
         let _db = self.db.clone();
@@ -1085,18 +1038,19 @@ impl QueryExecutor {
 
         // Check if WHERE can be evaluated positionally (bypasses HashMap)
         let use_positional = where_clause.as_ref().is_none_or(Self::can_eval_positional);
-        // Metadata columns (__row_id__, __table__) are only needed for JOINs.
-        // SELECT * is handled by project_row_direct without HashMap.
-        let needs_metadata = select_cols.iter().any(|c| matches!(c,
-            SelectColumn::Expr(_, _)
-        )) || columns.iter().any(|c| c.starts_with("__"));
+        // Metadata columns are only needed when an expression actually
+        // references __row_id__ or __table__ (JOIN / subquery paths).
+        let needs_metadata = select_cols.iter().any(|c| match c {
+            SelectColumn::Expr(e, _) => Self::expr_uses_metadata(e),
+            _ => false,
+        }) || where_clause.as_ref().is_some_and(|w| Self::expr_uses_metadata(w));
 
         if use_positional && !needs_metadata {
             // Fast path: no HashMap at all
+            let row_iter = self.db.scan_table_rows_streaming(table)?;
             let filtered_iter = row_iter.filter_map(move |result| {
                 match result {
                     Ok((_row_id, row)) => {
-                        // WHERE filter using positional evaluation
                         if let Some(ref clause) = where_clause {
                             let matches = match Self::eval_expr_on_row(clause, &row, &schema_clone) {
                                 Ok(Value::Bool(b)) => b,
@@ -1106,8 +1060,6 @@ impl QueryExecutor {
                             };
                             if !matches { return None; }
                         }
-
-                        // Direct projection from Vec<Value>
                         let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
                         Some(Ok(projected))
                     }
@@ -1125,8 +1077,22 @@ impl QueryExecutor {
             });
         }
 
-        // Fallback: HashMap path for complex expressions / metadata columns
-        let filtered_iter = row_iter.filter_map(move |result| {
+        // Fallback: HashMap path for complex expressions / metadata columns.
+        // If any expression can't be evaluated by eval_expr_simple, fall back to
+        // the materialized path which uses the full evaluator.
+        let can_stream = where_clause.as_ref().is_none_or(Self::can_eval_simple)
+            && select_cols.iter().all(|c| match c {
+                SelectColumn::Expr(e, _) => Self::can_eval_simple(e),
+                _ => true,
+            });
+        if !can_stream {
+            return self.materialize_as_streaming(stmt);
+        }
+
+        let fallback_iter = self.db.scan_table_rows_streaming(table)?;
+
+        // HashMap path: eval_expr_simple can handle all expressions
+        let filtered_iter = fallback_iter.filter_map(move |result| {
             match result {
                 Ok((row_id, row)) => {
                     let mut sql_row = match row_to_sql_row(&row, &schema_clone) {
@@ -1135,7 +1101,7 @@ impl QueryExecutor {
                     };
 
                     sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                    sql_row.insert("__table__".to_string(), Value::Text(table_clone.clone()));
+                    sql_row.insert("__table__".to_string(), Value::text(table_clone.clone()));
 
                     if let Some(ref clause) = where_clause {
                         let matches = match Self::eval_expr_simple(clause, &sql_row) {
@@ -1354,19 +1320,19 @@ impl QueryExecutor {
                         other => result.push_str(&format!("{:?}", other)),
                     }
                 }
-                Ok(Value::Text(result))
+                Ok(Value::text(result))
             }
             "upper" | "lower" | "length" | "trim" | "ltrim" | "rtrim" => {
                 let val = Self::eval_expr_on_row(&args[0], row, schema)?;
                 match val {
                     Value::Text(s) => match fname.as_str() {
-                        "upper" => Ok(Value::Text(s.to_uppercase())),
-                        "lower" => Ok(Value::Text(s.to_lowercase())),
+                        "upper" => Ok(Value::text(s.to_uppercase())),
+                        "lower" => Ok(Value::text(s.to_lowercase())),
                         "length" => Ok(Value::Integer(s.chars().count() as i64)),
-                        "trim" => Ok(Value::Text(s.trim().to_string())),
-                        "ltrim" => Ok(Value::Text(s.trim_start().to_string())),
-                        "rtrim" => Ok(Value::Text(s.trim_end().to_string())),
-                        _ => Ok(Value::Text(s)),
+                        "trim" => Ok(Value::text(s.trim().to_string())),
+                        "ltrim" => Ok(Value::text(s.trim_start().to_string())),
+                        "rtrim" => Ok(Value::text(s.trim_end().to_string())),
+                        _ => Ok(Value::text((*s).clone())),
                     },
                     _ => Ok(Value::Null),
                 }
@@ -1435,13 +1401,19 @@ impl QueryExecutor {
 
                 use crate::types::Geometry;
                 let (px, py) = match point {
-                    Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
-                    Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+                    Value::Spatial(geom) => match &*geom {
+                        Geometry::Point(p) => (p.x, p.y),
+                        Geometry::Point3D(p) => (p.x, p.y),
+                        _ => return Ok(Value::Bool(false)),
+                    },
                     _ => return Ok(Value::Bool(false)),
                 };
                 let (cx, cy) = match center {
-                    Value::Spatial(Geometry::Point(p)) => (p.x, p.y),
-                    Value::Spatial(Geometry::Point3D(p)) => (p.x, p.y),
+                    Value::Spatial(geom) => match &*geom {
+                        Geometry::Point(p) => (p.x, p.y),
+                        Geometry::Point3D(p) => (p.x, p.y),
+                        _ => return Ok(Value::Bool(false)),
+                    },
                     _ => return Ok(Value::Bool(false)),
                 };
                 let r = match radius {
@@ -1458,12 +1430,12 @@ impl QueryExecutor {
                     let p2 = Self::eval_expr_on_row(&args[1], row, schema)?;
                     match (&p1, &p2) {
                         (Value::Spatial(a), Value::Spatial(b)) => {
-                            let (x1, y1) = match a {
+                            let (x1, y1) = match &**a {
                                 crate::types::Geometry::Point(p) => (p.x, p.y),
                                 crate::types::Geometry::Point3D(p) => (p.x, p.y),
                                 _ => return Ok(Value::Null),
                             };
-                            let (x2, y2) = match b {
+                            let (x2, y2) = match &**b {
                                 crate::types::Geometry::Point(p) => (p.x, p.y),
                                 crate::types::Geometry::Point3D(p) => (p.x, p.y),
                                 _ => return Ok(Value::Null),
@@ -1486,7 +1458,7 @@ impl QueryExecutor {
                 };
                 let query_val = Self::eval_expr_on_row(&args[1], row, schema)?;
                 let query_text = match query_val {
-                    Value::Text(s) => s,
+                    Value::Text(s) => s.as_str().to_string(),
                     _ => return Ok(Value::Bool(false)),
                 };
                 let pos = schema.get_column_position(&col_name);
@@ -1501,10 +1473,14 @@ impl QueryExecutor {
                         let terms: Vec<&str> = query_lower.split_whitespace().collect();
                         Ok(Value::Bool(terms.iter().all(|t| text_lower.contains(t))))
                     }
-                    _ => Ok(Value::Bool(false)),
+                    _ => Err(MoteDBError::Query(
+                        format!("eval_function_positional: unsupported function: {}", fname)
+                    )),
                 }
             }
-            _ => Ok(Value::Bool(false)),
+            _ => Err(MoteDBError::Query(
+                format!("eval_function_positional: unsupported expression type")
+            )),
         }
     }
 
@@ -1615,19 +1591,19 @@ impl QueryExecutor {
                                 other => result.push_str(&format!("{:?}", other)),
                             }
                         }
-                        Ok(Value::Text(result))
+                        Ok(Value::text(result))
                     }
                     "upper" | "lower" | "length" | "trim" | "ltrim" | "rtrim" => {
                         let val = Self::eval_expr_simple(&args[0], row)?;
                         match val {
                             Value::Text(s) => match fname.as_str() {
-                                "upper" => Ok(Value::Text(s.to_uppercase())),
-                                "lower" => Ok(Value::Text(s.to_lowercase())),
+                                "upper" => Ok(Value::text(s.to_uppercase())),
+                                "lower" => Ok(Value::text(s.to_lowercase())),
                                 "length" => Ok(Value::Integer(s.chars().count() as i64)),
-                                "trim" => Ok(Value::Text(s.trim().to_string())),
-                                "ltrim" => Ok(Value::Text(s.trim_start().to_string())),
-                                "rtrim" => Ok(Value::Text(s.trim_end().to_string())),
-                                _ => Ok(Value::Text(s)),
+                                "trim" => Ok(Value::text(s.trim().to_string())),
+                                "ltrim" => Ok(Value::text(s.trim_start().to_string())),
+                                "rtrim" => Ok(Value::text(s.trim_end().to_string())),
+                                _ => Ok(Value::text((*s).clone())),
                             },
                             _ => Ok(Value::Null),
                         }
@@ -1665,10 +1641,14 @@ impl QueryExecutor {
                             _ => Ok(Value::Null),
                         }
                     }
-                    _ => Ok(Value::Bool(false)),
+                    _ => Err(MoteDBError::Query(
+                        format!("eval_expr_simple: unsupported function: {}", fname)
+                    )),
                 }
             }
-            _ => Ok(Value::Bool(false)),
+            _ => Err(MoteDBError::Query(
+                format!("eval_expr_simple: unsupported expression: {:?}", expr)
+            )),
         }
     }
 
@@ -1766,6 +1746,60 @@ impl QueryExecutor {
                 handled && args.iter().all(Self::can_eval_positional)
             }
             Expr::Match { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Check if an expression can be evaluated by eval_expr_simple (HashMap path).
+    /// This is a stricter subset than can_eval_positional — fewer functions are supported.
+    fn can_eval_simple(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(_) | Expr::Literal(_) => true,
+            Expr::BinaryOp { left, op, right } => {
+                matches!(op,
+                    BinaryOperator::Eq | BinaryOperator::Ne |
+                    BinaryOperator::Lt | BinaryOperator::Le |
+                    BinaryOperator::Gt | BinaryOperator::Ge |
+                    BinaryOperator::And | BinaryOperator::Or |
+                    BinaryOperator::Add | BinaryOperator::Sub |
+                    BinaryOperator::Mul | BinaryOperator::Div |
+                    BinaryOperator::Mod |
+                    BinaryOperator::L2Distance | BinaryOperator::CosineDistance | BinaryOperator::DotProduct
+                ) && Self::can_eval_simple(left)
+                  && Self::can_eval_simple(right)
+            }
+            Expr::UnaryOp { op: UnaryOperator::Not, expr } => Self::can_eval_simple(expr),
+            Expr::IsNull { .. } => true,
+            Expr::In { .. } | Expr::Between { .. } | Expr::Like { .. } => true,
+            Expr::FunctionCall { name, args, .. } => {
+                let fname = name.to_lowercase();
+                let handled = matches!(fname.as_str(),
+                    "concat" | "upper" | "lower" | "length" | "trim" | "ltrim" | "rtrim" |
+                    "abs" | "round" | "floor" | "ceil" | "log" | "ln" | "log10" | "sqrt" | "exp"
+                );
+                handled && args.iter().all(Self::can_eval_simple)
+            }
+            Expr::Match { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Recursively check if an expression references __row_id__ or __table__ metadata.
+    fn expr_uses_metadata(expr: &Expr) -> bool {
+        match expr {
+            Expr::Column(name) => name == "__row_id__" || name == "__table__",
+            Expr::BinaryOp { left, right, .. } =>
+                Self::expr_uses_metadata(left) || Self::expr_uses_metadata(right),
+            Expr::UnaryOp { expr, .. } |
+            Expr::IsNull { expr, .. } => Self::expr_uses_metadata(expr),
+            Expr::In { expr, list, .. } =>
+                Self::expr_uses_metadata(expr) || list.iter().any(Self::expr_uses_metadata),
+            Expr::Between { expr, low, high, .. } =>
+                Self::expr_uses_metadata(expr) || Self::expr_uses_metadata(low) || Self::expr_uses_metadata(high),
+            Expr::Like { expr, pattern, .. } =>
+                Self::expr_uses_metadata(expr) || Self::expr_uses_metadata(pattern),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_uses_metadata),
+            Expr::Match { .. } => false,
             _ => false,
         }
     }
@@ -1905,14 +1939,14 @@ impl QueryExecutor {
                 match op {
                     BinaryOperator::Eq => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Bool(false))
+                            Ok(Value::Null) // SQL: NULL = anything => NULL
                         } else {
                             Ok(Value::Bool(lv == rv))
                         }
                     }
                     BinaryOperator::Ne => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Bool(false))
+                            Ok(Value::Null) // SQL: NULL != anything => NULL
                         } else {
                             Ok(Value::Bool(lv != rv))
                         }
@@ -1959,8 +1993,10 @@ impl QueryExecutor {
             }
             Expr::Literal(val) => Ok(val.clone()),
             Expr::Parameter(_) => {
-                // Parameters need evaluator state, skip for positional eval
-                Ok(Value::Bool(false))
+                // Parameters need evaluator state — trigger fallback
+                Err(MoteDBError::Query(
+                    "Cannot evaluate parameter in positional path".to_string()
+                ))
             }
             Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } => {
                 let v = Self::eval_expr_on_row(inner, row, schema)?;
@@ -1969,6 +2005,15 @@ impl QueryExecutor {
                     Ok(Value::Bool(false))
                 } else {
                     Ok(Value::Bool(!Self::is_truthy(&v)))
+                }
+            }
+            Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+                let v = Self::eval_expr_on_row(inner, row, schema)?;
+                match v {
+                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Float(f) => Ok(Value::Float(-f)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(MoteDBError::Query(format!("Cannot negate {:?}", v))),
                 }
             }
             Expr::IsNull { expr, negated } => {
@@ -2036,7 +2081,35 @@ impl QueryExecutor {
                     None => Ok(Value::Bool(false)),
                 }
             }
-            _ => Ok(Value::Bool(false)),
+            _ => Err(MoteDBError::Query(
+                format!("eval_expr_on_row: unsupported expression: {:?}", expr)
+            )),
+        }
+    }
+
+    /// Generate a human-readable column name for an expression (e.g., "SUM(amount)", "COUNT(*)")
+    fn expr_to_column_name(expr: &Expr) -> String {
+        match expr {
+            Expr::Column(name) => name.clone(),
+            Expr::Literal(v) => format!("{:?}", v),
+            Expr::FunctionCall { name, args, .. } => {
+                let arg_str = if args.is_empty() {
+                    "*".to_string()
+                } else {
+                    args.iter()
+                        .map(Self::expr_to_column_name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!("{}({})", name.to_uppercase(), arg_str)
+            }
+            Expr::BinaryOp { left, op, right } => {
+                format!("{} {:?} {}", Self::expr_to_column_name(left), op, Self::expr_to_column_name(right))
+            }
+            Expr::UnaryOp { op, expr } => {
+                format!("{:?}{}", op, Self::expr_to_column_name(expr))
+            }
+            _ => format!("{:?}", expr),
         }
     }
 
@@ -2254,21 +2327,8 @@ impl QueryExecutor {
                         }
                         
                         // Add table prefix
-                        // 🚀 P1 优化：使用 take() 避免克隆所有值
-                        for (row_id, sql_row) in &mut sql_rows {
-                            let mut new_sql_row = SqlRow::new();
-                            new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                            new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-                            
-                            // 使用 drain() 移动值而不是克隆
-                            let old_row = std::mem::take(sql_row);
-                            for (col_name, val) in old_row.into_iter() {
-                                let qualified_name = Self::make_qualified_name(&table_name, &col_name);
-                                new_sql_row.insert(qualified_name, val);  // ✅ 移动，不克隆
-                            }
-                            *sql_row = new_sql_row;
-                        }
-                        
+                        prefix_rows(&mut sql_rows, &table_name, &table_name);
+
                         // Project columns and return
                         let (column_names, result_rows) = self.project_columns(&stmt.columns, &sql_rows, &schema)?;
                         
@@ -2355,7 +2415,107 @@ impl QueryExecutor {
                 }
             }
         }
-        
+
+        // 🚀 FAST PATH 1b: Positional GROUP BY — skip HashMap conversion entirely.
+        // Works directly on Vec<Value> rows for simple single-table GROUP BY / aggregate queries.
+        if stmt.group_by.is_some() || self.has_aggregates(&stmt.columns) {
+            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let Ok(schema) = self.db.get_table_schema(table_name) {
+                    if let Some((column_names, projected_rows)) =
+                        self.try_apply_group_by_positional(stmt, &schema, table_name)?
+                    {
+                        return Ok(QueryResult::Select {
+                            columns: column_names,
+                            rows: projected_rows,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 🚀 FAST PATH 1c: Positional ORDER BY / DISTINCT — skip HashMap conversion entirely.
+        // Works directly on Vec<Value> rows for simple single-table ORDER BY / DISTINCT queries.
+        if (stmt.order_by.is_some() || stmt.distinct) && stmt.group_by.is_none() {
+            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let Ok(schema) = self.db.get_table_schema(table_name) {
+                    if let Some(result) = self.try_positional_order_by_distinct(stmt, &schema, table_name)? {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
+        // 🚀 FAST PATH 1.5: Direct Vec<Value> for SELECT * FROM table
+        // Bypasses SqlRow HashMap entirely — eliminates 2 HashMap allocs + 2N String clones per row.
+        // Handles: SELECT * FROM t WHERE indexed_col =/>/>=/</<= value [LIMIT n]
+        //          SELECT * FROM t [LIMIT n]
+        let is_simple_star = stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star)
+            && stmt.group_by.is_none() && stmt.order_by.is_none() && !stmt.distinct;
+
+        if is_simple_star {
+            if let Some(ref where_clause) = stmt.where_clause {
+                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                    // Try point query: WHERE col = value
+                    if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
+                        let index_name = format!("{}.{}", table_name, col_name);
+                        if let Some(index_ref) = self.db.column_indexes.get(&index_name) {
+                            if let Ok(row_ids) = index_ref.value().get_arc(&target_value) {
+                                if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() {
+                                    drop(index_ref);
+                                    return self.fast_star_indexed_result(table_name, &row_ids, stmt.limit, stmt.offset);
+                                }
+                            }
+                        }
+                    }
+                    // Try range query: WHERE col >= a AND col <= b
+                    else if let Some((col_name, lower_value, lower_op, upper_value, upper_op)) = self.try_extract_range_query(where_clause) {
+                        let index_name = format!("{}.{}", table_name, col_name);
+                        if let Some(index_ref) = self.db.column_indexes.get(&index_name) {
+                            use crate::sql::ast::BinaryOperator;
+                            let lower_inclusive = matches!(lower_op, BinaryOperator::Ge);
+                            let upper_inclusive = matches!(upper_op, BinaryOperator::Le);
+                            if let Ok(row_ids) = index_ref.value().query_between(
+                                &lower_value, lower_inclusive,
+                                &upper_value, upper_inclusive
+                            ) {
+                                if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() {
+                                    drop(index_ref);
+                                    return self.fast_star_indexed_result(table_name, &row_ids, stmt.limit, stmt.offset);
+                                }
+                            }
+                        }
+                    }
+                    // Try inequality: WHERE col > value, col < value, etc.
+                    else if let Some((col_name, op, value)) = self.try_extract_inequality(where_clause) {
+                        let index_name = format!("{}.{}", table_name, col_name);
+                        if let Some(index_ref) = self.db.column_indexes.get(&index_name) {
+                            use crate::sql::ast::BinaryOperator;
+                            let row_ids_result = match op {
+                                BinaryOperator::Lt => index_ref.value().query_less_than(&value),
+                                BinaryOperator::Le => index_ref.value().query_less_than_or_equal(&value),
+                                BinaryOperator::Gt => index_ref.value().query_greater_than(&value),
+                                BinaryOperator::Ge => index_ref.value().query_greater_than_or_equal(&value),
+                                _ => Err(crate::error::MoteDBError::NotImplemented("Unsupported operator".into())),
+                            };
+                            if let Ok(row_ids) = row_ids_result {
+                                if !row_ids.is_empty() || !self.db.is_async_index_pipeline_active() {
+                                    drop(index_ref);
+                                    return self.fast_star_indexed_result(table_name, &row_ids, stmt.limit, stmt.offset);
+                                }
+                            }
+                        }
+                    }
+                    // Non-indexed WHERE — fall through to general path (needs SqlRow for eval)
+                }
+            } else {
+                // No WHERE — full scan fast path
+                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                    return self.fast_star_scan_result(table_name, stmt.limit, stmt.offset);
+                }
+            }
+            // Fall through to general path for unsupported patterns
+        }
+
         // 🚀 FAST PATH 2: Try to use column index for WHERE optimization
         // 🆕 P0 OPTIMIZATION: Extract LIMIT early and pass to storage layer
         let storage_limit = self.calculate_storage_limit(stmt);
@@ -2394,21 +2554,8 @@ impl QueryExecutor {
                                 sql_rows.push((row_id, sql_row));
                             }
                             let prefix = table_name;
-                            for (row_id, sql_row) in &mut sql_rows {
-                                let mut new_sql_row = SqlRow::new();
-                                new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                                new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-                                let old_row = std::mem::take(sql_row);
-                                for (col_name, val) in old_row.into_iter() {
-                                    let qualified_name = Self::make_qualified_name(prefix, &col_name);
-                                    new_sql_row.insert(qualified_name, val);
-                                }
-                                *sql_row = new_sql_row;
-                            }
-                            let mut prefixed_schema = (*schema).clone();
-                            for col in &mut prefixed_schema.columns {
-                                col.name = format!("{}.{}", prefix, col.name);
-                            }
+                            prefix_rows(&mut sql_rows, table_name, prefix);
+                            let prefixed_schema = prefix_schema(&schema, prefix);
                             (sql_rows, Arc::new(prefixed_schema))
                         } else {
                         
@@ -2459,27 +2606,10 @@ impl QueryExecutor {
                         }
                         
                         // Add table prefix
-                        // 🚀 P1 优化：使用 take() 避免克隆所有值
                         let prefix = table_name;
-                        for (row_id, sql_row) in &mut sql_rows {
-                            let mut new_sql_row = SqlRow::new();
-                            new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                            new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-                            
-                            // 使用 drain() 移动值而不是克隆
-                            let old_row = std::mem::take(sql_row);
-                            for (col_name, val) in old_row.into_iter() {
-                                let qualified_name = Self::make_qualified_name(prefix, &col_name);
-                                new_sql_row.insert(qualified_name, val);  // ✅ 移动，不克隆
-                            }
-                            *sql_row = new_sql_row;
-                        }
-                        
-                        let mut prefixed_schema = (*schema).clone();
-                        for col in &mut prefixed_schema.columns {
-                            col.name = format!("{}.{}", prefix, col.name);
-                        }
-                        
+                        prefix_rows(&mut sql_rows, table_name, prefix);
+                        let prefixed_schema = prefix_schema(&schema, prefix);
+
                         (sql_rows, Arc::new(prefixed_schema))
                         } else {
                             // 🚀 High selectivity (>= 15%): Use真正的流式扫描 (O(1) memory!)
@@ -2530,24 +2660,9 @@ impl QueryExecutor {
                             
                             // Add table prefix
                             let prefix = table_name;
-                            for (row_id, sql_row) in &mut filtered_rows {
-                                let mut new_sql_row = SqlRow::new();
-                                new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                                new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-                                
-                                let old_row = std::mem::take(sql_row);
-                                for (col_name, val) in old_row.into_iter() {
-                                    let qualified_name = Self::make_qualified_name(prefix, &col_name);
-                                    new_sql_row.insert(qualified_name, val);
-                                }
-                                *sql_row = new_sql_row;
-                            }
-                            
-                            let mut prefixed_schema = (*schema).clone();
-                            for col in &mut prefixed_schema.columns {
-                                col.name = format!("{}.{}", prefix, col.name);
-                            }
-                            
+                            prefix_rows(&mut filtered_rows, table_name, prefix);
+                            let prefixed_schema = prefix_schema(&schema, prefix);
+
                             (filtered_rows, Arc::new(prefixed_schema))
                         }
                         } // row_ids non-empty or pipeline inactive
@@ -2585,26 +2700,9 @@ impl QueryExecutor {
                                 }
 
                                 // Add table prefix
-                                // 🚀 P1 优化：使用 take() 避免克隆所有值
                                 let prefix = table_name;
-                                for (row_id, sql_row) in &mut sql_rows {
-                                    let mut new_sql_row = SqlRow::new();
-                                    new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                                    new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-
-                                    // 使用 drain() 移动值而不是克隆
-                                    let old_row = std::mem::take(sql_row);
-                                    for (col_name, val) in old_row.into_iter() {
-                                        let qualified_name = format!("{}.{}", prefix, col_name);
-                                        new_sql_row.insert(qualified_name, val);  // ✅ 移动，不克隆
-                                    }
-                                    *sql_row = new_sql_row;
-                                }
-
-                                let mut prefixed_schema = (*schema).clone();
-                                for col in &mut prefixed_schema.columns {
-                                    col.name = format!("{}.{}", prefix, col.name);
-                                }
+                                prefix_rows(&mut sql_rows, table_name, prefix);
+                                let prefixed_schema = prefix_schema(&schema, prefix);
 
                                 (sql_rows, Arc::new(prefixed_schema))
                             }
@@ -2657,26 +2755,9 @@ impl QueryExecutor {
                                 }
 
                                 // Add table prefix
-                                // 🚀 P1 优化：使用 take() 避免克隆所有值
                                 let prefix = table_name;
-                                for (row_id, sql_row) in &mut sql_rows {
-                                    let mut new_sql_row = SqlRow::new();
-                                    new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                                    new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-
-                                    // 使用 drain() 移动值而不是克隆
-                                    let old_row = std::mem::take(sql_row);
-                                    for (col_name, val) in old_row.into_iter() {
-                                        let qualified_name = format!("{}.{}", prefix, col_name);
-                                        new_sql_row.insert(qualified_name, val);  // ✅ 移动，不克隆
-                                    }
-                                    *sql_row = new_sql_row;
-                                }
-
-                                let mut prefixed_schema = (*schema).clone();
-                                for col in &mut prefixed_schema.columns {
-                                    col.name = format!("{}.{}", prefix, col.name);
-                                }
+                                prefix_rows(&mut sql_rows, table_name, prefix);
+                                let prefixed_schema = prefix_schema(&schema, prefix);
 
                                 (sql_rows, Arc::new(prefixed_schema))
                             }
@@ -2805,7 +2886,7 @@ impl QueryExecutor {
             // ❌ Not safe to truncate - need all rows for ORDER BY/GROUP BY/DISTINCT
             filtered_rows
         };
-        
+
         // GROUP BY aggregation (if present) OR implicit aggregation (if columns contain aggregates)
         let (column_names, projected_rows) = if let Some(ref group_by_cols) = stmt.group_by {
             // Explicit GROUP BY
@@ -2901,6 +2982,51 @@ impl QueryExecutor {
         })
     }
     
+    /// Direct Vec<Value> output for SELECT * with indexed WHERE.
+    /// Bypasses SqlRow HashMap — eliminates ~2 HashMap allocs + ~2N String allocs per row.
+    fn fast_star_indexed_result(&self, table_name: &str, row_ids: &[RowId],
+        limit: Option<usize>, offset: Option<usize>) -> Result<QueryResult> {
+        let schema = self.db.get_table_schema(table_name)?;
+        let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let arc_rows = self.db.get_table_rows_batch_arc(table_name, row_ids)?;
+        let skip_n = offset.unwrap_or(0);
+        let take_n = limit.unwrap_or(usize::MAX);
+        let rows: Vec<Vec<Value>> = arc_rows.into_iter()
+            .filter_map(|(_, opt)| opt)
+            .skip(skip_n)
+            .map(|arc| match Arc::try_unwrap(arc) {
+                Ok(row) => row,
+                Err(arc) => (*arc).clone(),
+            })
+            .take(take_n)
+            .collect();
+        Ok(QueryResult::Select { columns: column_names, rows })
+    }
+
+    /// Direct Vec<Value> output for SELECT * with full scan.
+    /// Uses streaming iterator — avoids materializing all rows via SqlRow.
+    fn fast_star_scan_result(&self, table_name: &str,
+        limit: Option<usize>, offset: Option<usize>) -> Result<QueryResult> {
+        let schema = self.db.get_table_schema(table_name)?;
+        let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let skip_n = offset.unwrap_or(0);
+        let take_n = limit.unwrap_or(usize::MAX);
+        let max_rows = skip_n.saturating_add(take_n);
+
+        let row_iter = self.db.scan_table_rows_streaming(table_name)?;
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(take_n.min(1024));
+        let mut count = 0usize;
+        for result in row_iter {
+            let (_, row) = result?;
+            count += 1;
+            if count <= skip_n { continue; }
+            rows.push(row);
+            if rows.len() >= take_n { break; }
+            if count >= max_rows { break; }
+        }
+        Ok(QueryResult::Select { columns: column_names, rows })
+    }
+
     /// 🚀 P0 OPTIMIZATION: Calculate the limit to pass to storage layer
     /// 
     /// This prevents loading all rows when LIMIT is specified:
@@ -2984,26 +3110,12 @@ impl QueryExecutor {
                 
                 // Always prefix column names with table or alias for JOIN compatibility
                 let prefix = alias.as_ref().unwrap_or(name);
-                
+
                 // Update SqlRow keys to include table prefix + add metadata
-                for (row_id, sql_row) in &mut sql_rows {
-                    let mut new_sql_row = SqlRow::new();
-                    new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                    new_sql_row.insert("__table__".to_string(), Value::Text(name.clone()));
-                    
-                    let old_row = std::mem::take(sql_row);
-                    for (col_name, val) in old_row.into_iter() {
-                        let qualified_name = format!("{}.{}", prefix, col_name);
-                        new_sql_row.insert(qualified_name, val);
-                    }
-                    *sql_row = new_sql_row;
-                }
-                
+                prefix_rows(&mut sql_rows, name, prefix);
+
                 // Update schema column names
-                let mut prefixed_schema = (*schema).clone();
-                for col in &mut prefixed_schema.columns {
-                    col.name = format!("{}.{}", prefix, col.name);
-                }
+                let prefixed_schema = prefix_schema(&schema, prefix);
 
                 Ok((sql_rows, Arc::new(prefixed_schema)))
             }
@@ -3166,7 +3278,7 @@ impl QueryExecutor {
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
                 Value::Integer(i) => Some(HashKey::Integer(*i)),
-                Value::Text(s) => Some(HashKey::Text(s.clone())),
+                Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Float(f) => Some(HashKey::Float(f.to_bits())),
                 Value::Null => Some(HashKey::Null),
@@ -3684,11 +3796,14 @@ impl QueryExecutor {
 
                 use crate::types::Geometry;
                 let geom = match point_value {
-                    Value::Spatial(Geometry::Point3D(p)) => p,
-                    Value::Spatial(Geometry::Point(p)) => {
-                        // 2D point treated as z=0
-                        crate::types::Point3D::new(p.x, p.y, 0.0)
-                    }
+                    Value::Spatial(g) => match &*g {
+                        Geometry::Point3D(p) => *p,
+                        Geometry::Point(p) => {
+                            // 2D point treated as z=0
+                            crate::types::Point3D::new(p.x, p.y, 0.0)
+                        }
+                        _ => return Err(MoteDBError::TypeError(format!("Column '{}' is not a 3D Point", column))),
+                    },
                     _ => return Err(MoteDBError::TypeError(format!("Column '{}' is not a 3D Point", column))),
                 };
 
@@ -3707,10 +3822,13 @@ impl QueryExecutor {
 
                 use crate::types::Geometry;
                 let geom = match point_value {
-                    Value::Spatial(Geometry::Point3D(p)) => p,
-                    Value::Spatial(Geometry::Point(p)) => {
-                        crate::types::Point3D::new(p.x, p.y, 0.0)
-                    }
+                    Value::Spatial(g) => match &*g {
+                        Geometry::Point3D(p) => *p,
+                        Geometry::Point(p) => {
+                            crate::types::Point3D::new(p.x, p.y, 0.0)
+                        }
+                        _ => return Ok(Value::Bool(false)),
+                    },
                     _ => return Ok(Value::Bool(false)),
                 };
 
@@ -3751,10 +3869,13 @@ impl QueryExecutor {
 
                 use crate::types::Geometry;
                 let geom = match point_value {
-                    Value::Spatial(Geometry::Point3D(p)) => p,
-                    Value::Spatial(Geometry::Point(p)) => {
-                        crate::types::Point3D::new(p.x, p.y, 0.0)
-                    }
+                    Value::Spatial(g) => match &*g {
+                        Geometry::Point3D(p) => *p,
+                        Geometry::Point(p) => {
+                            crate::types::Point3D::new(p.x, p.y, 0.0)
+                        }
+                        _ => return Ok(Value::Bool(false)),
+                    },
                     _ => return Ok(Value::Bool(false)),
                 };
 
@@ -3769,22 +3890,18 @@ impl QueryExecutor {
         }
     }
     
-    /// Apply DISTINCT clause - remove duplicate rows
     fn apply_distinct(&self, rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         use std::collections::HashSet;
-        
+
         let mut seen = HashSet::new();
         let mut result = Vec::new();
-        
+
         for row in rows {
-            // Create a hashable key from the row
-            let key: Vec<String> = row.iter().map(|v| format!("{:?}", v)).collect();
-            
-            if seen.insert(key) {
+            if seen.insert(row.clone()) {
                 result.push(row);
             }
         }
-        
+
         result
     }
     
@@ -3817,7 +3934,7 @@ impl QueryExecutor {
                     full_row.get(col_name)
                         .ok_or_else(|| MoteDBError::ColumnNotFound(col_name.clone()))
                         .map(|val| match val {
-                            Value::Text(s) => s.clone(),
+                            Value::Text(s) => (**s).clone(),
                             Value::Integer(i) => i.to_string(),
                             Value::Float(f) => f.to_string(),
                             _ => format!("{:?}", val),
@@ -3825,7 +3942,7 @@ impl QueryExecutor {
                 })
                 .collect();
             let group_key = group_key?;
-            
+
             // Extract timestamp
             let timestamp = full_row.get(timestamp_col_name)
                 .ok_or_else(|| MoteDBError::ColumnNotFound(timestamp_col_name.clone()))?;
@@ -3855,6 +3972,18 @@ impl QueryExecutor {
     }
     
     /// Apply GROUP BY aggregation
+    /// Look up a value from a SqlRow, falling back to table-prefixed key search.
+    fn get_value_from_row(row: &SqlRow, name: &str) -> Value {
+        if let Some(val) = row.get(name) {
+            val.clone()
+        } else {
+            row.iter()
+                .find(|(key, _)| key.ends_with(&format!(".{}", name)))
+                .map(|(_, val)| val.clone())
+                .unwrap_or(Value::Null)
+        }
+    }
+
     fn apply_group_by(
         &self,
         columns: &[SelectColumn],
@@ -3863,38 +3992,38 @@ impl QueryExecutor {
         having: Option<&Expr>,
     ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
         use std::collections::HashMap;
-        
-        // Build groups: group_key -> list of rows
-        let mut groups: HashMap<Vec<String>, Vec<&SqlRow>> = HashMap::new();
-        
+
+        // Pre-resolve group column names to their actual keys in the SqlRow HashMap.
+        let resolved_col_names: Vec<String> = if !rows.is_empty() {
+            let first_row = &rows[0].1;
+            group_by_cols.iter().map(|col_name| {
+                if first_row.contains_key(col_name) {
+                    col_name.clone()
+                } else {
+                    first_row.keys()
+                        .find(|key| key.ends_with(&format!(".{}", col_name)) || key.as_str() == col_name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| col_name.clone())
+                }
+            }).collect()
+        } else {
+            group_by_cols.to_vec()
+        };
+
+        // Build groups: Vec<Value> key avoids per-row String allocations
+        let mut groups: HashMap<Vec<Value>, Vec<&SqlRow>> =
+            HashMap::with_capacity(rows.len().min(1024));
+
         for (_, row) in rows {
-            // Extract grouping key
-            let group_key: Result<Vec<String>> = group_by_cols.iter()
+            let group_key: Result<Vec<Value>> = resolved_col_names.iter()
                 .map(|col_name| {
-                    // ⭐ 支持自动解析列名：先尝试原名，再尝试所有带前缀的版本
-                    let value = if let Some(val) = row.get(col_name) {
-                        Some(val)
-                    } else {
-                        // 尝试查找带表前缀的列名 (table.column)
-                        row.iter()
-                            .find(|(key, _)| {
-                                key.ends_with(&format!(".{}", col_name)) || key == &col_name
-                            })
-                            .map(|(_, val)| val)
-                    };
-                    
-                    value
+                    row.get(col_name)
+                        .cloned()
                         .ok_or_else(|| MoteDBError::ColumnNotFound(col_name.clone()))
-                        .map(|val| match val {
-                            Value::Text(s) => s.clone(),
-                            Value::Integer(i) => i.to_string(),
-                            Value::Float(f) => f.to_string(),
-                            _ => format!("{:?}", val),
-                        })
                 })
                 .collect();
             let group_key = group_key?;
-            
+
             groups.entry(group_key).or_default().push(row);
         }
         
@@ -3912,7 +4041,7 @@ impl QueryExecutor {
                     SelectColumn::Column(name) => name.clone(),
                     SelectColumn::ColumnWithAlias(_, alias) => alias.clone(),
                     SelectColumn::Expr(_, Some(alias)) => alias.clone(),
-                    SelectColumn::Expr(expr, None) => format!("{:?}", expr),
+                    SelectColumn::Expr(expr, None) => Self::expr_to_column_name(expr),
                     SelectColumn::Star => {
                         return Err(MoteDBError::Query(
                             "SELECT * not allowed with GROUP BY".to_string()
@@ -3947,7 +4076,7 @@ impl QueryExecutor {
                     SelectColumn::Column(name) => name.clone(),
                     SelectColumn::ColumnWithAlias(_, alias) => alias.clone(),
                     SelectColumn::Expr(_, Some(alias)) => alias.clone(),
-                    SelectColumn::Expr(expr, None) => format!("{:?}", expr),
+                    SelectColumn::Expr(expr, None) => Self::expr_to_column_name(expr),
                     SelectColumn::Star => {
                         return Err(MoteDBError::Query(
                             "SELECT * not allowed with GROUP BY".to_string()
@@ -3965,22 +4094,12 @@ impl QueryExecutor {
             for col_spec in columns {
                 let col_value = match col_spec {
                     SelectColumn::Column(name) => {
-                        // Regular column (must be in GROUP BY)
                         if !group_by_cols.contains(name) {
                             return Err(MoteDBError::Query(
                                 format!("Column '{}' must appear in GROUP BY or be in aggregate function", name)
                             ));
                         }
-                        // ⭐ 支持自动解析列名
-                        if let Some(val) = group_rows[0].get(name) {
-                            val.clone()
-                        } else {
-                            // 尝试查找带表前缀的列名 (table.column)
-                            group_rows[0].iter()
-                                .find(|(key, _)| key.ends_with(&format!(".{}", name)))
-                                .map(|(_, val)| val.clone())
-                                .unwrap_or(Value::Null)
-                        }
+                        Self::get_value_from_row(group_rows[0], name)
                     }
                     SelectColumn::ColumnWithAlias(name, _) => {
                         if !group_by_cols.contains(name) {
@@ -3988,16 +4107,7 @@ impl QueryExecutor {
                                 format!("Column '{}' must appear in GROUP BY", name)
                             ));
                         }
-                        // ⭐ 支持自动解析列名
-                        if let Some(val) = group_rows[0].get(name) {
-                            val.clone()
-                        } else {
-                            // 尝试查找带表前缀的列名 (table.column)
-                            group_rows[0].iter()
-                                .find(|(key, _)| key.ends_with(&format!(".{}", name)))
-                                .map(|(_, val)| val.clone())
-                                .unwrap_or(Value::Null)
-                        }
+                        Self::get_value_from_row(group_rows[0], name)
                     }
                     SelectColumn::Expr(expr, _) => {
                         // Aggregate function or expression
@@ -4053,13 +4163,11 @@ impl QueryExecutor {
                             
                             use std::collections::HashSet;
                             let mut distinct_values = HashSet::new();
-                            
+
                             for row in rows {
                                 let val = self.evaluator.eval(&args[0], row)?;
                                 if !matches!(val, Value::Null) {
-                                    // Create a hashable key
-                                    let key = format!("{:?}", val);
-                                    distinct_values.insert(key);
+                                    distinct_values.insert(val);
                                 }
                             }
                             
@@ -4223,7 +4331,388 @@ impl QueryExecutor {
             _ => false,
         }
     }
-    
+
+    // ───────────────────────────────────────────────────────────────
+    // Positional GROUP BY fast path — bypasses HashMap conversion
+    // ───────────────────────────────────────────────────────────────
+
+    /// Try to parse an expression as a simple aggregate function.
+    /// Returns `None` for complex expressions that need the materialized path.
+    fn try_parse_aggregate(&self, expr: &Expr, schema: &TableSchema) -> Option<AggregateInfo> {
+        match expr {
+            Expr::FunctionCall { name, args, distinct } => {
+                let func = name.to_uppercase();
+                match func.as_str() {
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                        let col_pos = if args.len() == 1 {
+                            match &args[0] {
+                                Expr::Column(col_name) => {
+                                    // Strip table prefix for qualified names (e.g. "users.id" -> "id")
+                                    let bare = if col_name.contains('.') {
+                                        col_name.rsplit('.').next().unwrap_or(col_name)
+                                    } else {
+                                        col_name
+                                    };
+                                    schema.get_column_position(bare)
+                                }
+                                Expr::Literal(Value::Integer(1)) => None, // COUNT(1) ≡ COUNT(*)
+                                Expr::Column(c) if c == "*" => None,     // COUNT(*)
+                                _ => return None,
+                            }
+                        } else if args.is_empty() && func == "COUNT" {
+                            None // COUNT(*)
+                        } else {
+                            return None;
+                        };
+                        Some(AggregateInfo {
+                            func,
+                            col_pos,
+                            distinct: *distinct,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Positional GROUP BY fast path — works directly on `Vec<Value>` rows,
+    /// bypassing the expensive `row_to_sql_row` + `prefix_rows` HashMap conversions.
+    ///
+    /// Returns `None` if the query is too complex for this path (joins, subqueries,
+    /// complex expressions, etc.), in which case the caller falls back to the
+    /// materialized path.
+    fn try_apply_group_by_positional(
+        &self,
+        stmt: &SelectStmt,
+        schema: &TableSchema,
+        table_name: &str,
+    ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+        use std::collections::HashMap;
+
+        let group_by_cols = match &stmt.group_by {
+            Some(cols) => cols,
+            None => &Vec::new(), // implicit aggregation
+        };
+
+        // Resolve group column positions
+        let group_col_positions: Vec<usize> = group_by_cols.iter()
+            .filter_map(|name| {
+                let bare = if name.contains('.') {
+                    name.rsplit('.').next().unwrap_or(name)
+                } else {
+                    name
+                };
+                schema.get_column_position(bare)
+            })
+            .collect();
+
+        // If not all group columns resolved, fall back
+        if group_col_positions.len() != group_by_cols.len() {
+            return Ok(None);
+        }
+
+        // Resolve SELECT column positions and types
+        let mut select_col_info: Vec<(String, Option<usize>, Option<AggregateInfo>)> = Vec::new();
+        for col_spec in &stmt.columns {
+            match col_spec {
+                SelectColumn::Column(name) => {
+                    let bare = if name.contains('.') {
+                        name.rsplit('.').next().unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    if let Some(pos) = schema.get_column_position(bare) {
+                        select_col_info.push((name.clone(), Some(pos), None));
+                    } else {
+                        return Ok(None); // can't resolve
+                    }
+                }
+                SelectColumn::ColumnWithAlias(name, alias) => {
+                    let bare = if name.contains('.') {
+                        name.rsplit('.').next().unwrap_or(name)
+                    } else {
+                        name
+                    };
+                    if let Some(pos) = schema.get_column_position(bare) {
+                        select_col_info.push((alias.clone(), Some(pos), None));
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                SelectColumn::Expr(expr, alias) => {
+                    if let Some(agg) = self.try_parse_aggregate(expr, schema) {
+                        let col_name = alias.clone()
+                            .unwrap_or_else(|| Self::expr_to_column_name(expr));
+                        select_col_info.push((col_name, None, Some(agg)));
+                    } else {
+                        return Ok(None); // complex expression, fall back
+                    }
+                }
+                SelectColumn::Star => return Ok(None),
+            }
+        }
+
+        // Scan rows positionally
+        let row_iter = self.db.scan_table_rows_streaming(table_name)?;
+
+        // Collect matching rows (apply WHERE filter positionally if simple)
+        let raw_rows: Vec<Row> = if let Some(ref where_clause) = stmt.where_clause {
+            let mut matching = Vec::new();
+            for result in row_iter {
+                let (_row_id, row) = result?;
+                match Self::eval_expr_on_row(where_clause, &row, schema) {
+                    Ok(Value::Bool(true)) => matching.push(row),
+                    Ok(_) => {} // false or null -> skip
+                    Err(_) => return Ok(None), // can't evaluate positionally
+                }
+            }
+            matching
+        } else {
+            row_iter.filter_map(|r| r.ok()).map(|(_, row)| row).collect()
+        };
+
+        // Build groups using Vec<Value> keys
+        let mut groups: HashMap<Vec<Value>, Vec<&Row>> =
+            HashMap::with_capacity(raw_rows.len().min(1024));
+        for row in &raw_rows {
+            let group_key: Vec<Value> = group_col_positions.iter()
+                .map(|&pos| row.get(pos).cloned().unwrap_or(Value::Null))
+                .collect();
+            groups.entry(group_key).or_default().push(row);
+        }
+
+        // Handle implicit aggregation with no input rows
+        let groups: Vec<(Vec<Value>, Vec<&Row>)> = if groups.is_empty() && group_by_cols.is_empty() {
+            vec![(vec![], vec![])] // one empty group for implicit aggregation
+        } else {
+            groups.into_iter().collect()
+        };
+
+        // Compute result
+        let column_names: Vec<String> = select_col_info.iter()
+            .map(|(name, _, _)| name.clone()).collect();
+        let mut result_rows: Vec<Vec<Value>> = Vec::new();
+
+        for (_group_key, group_rows) in groups {
+            let mut result_row = Vec::new();
+            for (_col_name, col_pos, agg_info) in &select_col_info {
+                let value = if let Some(pos) = col_pos {
+                    // Bare column in GROUP BY — take from first row
+                    group_rows.first()
+                        .and_then(|r| r.get(*pos))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                } else if let Some(agg) = agg_info {
+                    self.compute_aggregate_positional(agg, &group_rows)?
+                } else {
+                    Value::Null
+                };
+                result_row.push(value);
+            }
+
+            // Apply HAVING filter
+            if let Some(having_expr) = &stmt.having {
+                let mut temp_row = SqlRow::new();
+                for (i, name) in column_names.iter().enumerate() {
+                    temp_row.insert(name.clone(), result_row[i].clone());
+                }
+                // Also add aggregate values keyed by their SQL name (e.g., "SUM(amount)")
+                // so the evaluator can look them up when evaluating HAVING expressions
+                for (i, (col_name, _, agg_info)) in select_col_info.iter().enumerate() {
+                    if agg_info.is_some() && i < result_row.len() {
+                        let sql_name = col_name.clone();
+                        if !temp_row.contains_key(&sql_name) {
+                            temp_row.insert(sql_name, result_row[i].clone());
+                        }
+                    }
+                }
+                let passes = self.evaluator.eval(having_expr, &temp_row)
+                    .and_then(|val| self.to_bool(&val))
+                    .unwrap_or(false);
+                if !passes { continue; }
+            }
+
+            result_rows.push(result_row);
+        }
+
+        // Apply ORDER BY if present (fast path was skipping this)
+        if let Some(ref order_by) = stmt.order_by {
+            let order_specs: Vec<(usize, bool)> = order_by.iter().filter_map(|ob| {
+                if let Expr::Column(ref col_name) = ob.expr {
+                    let idx = column_names.iter().position(|c| c == col_name)?;
+                    Some((idx, ob.asc))
+                } else {
+                    None
+                }
+            }).collect();
+
+            result_rows.sort_by(|a, b| {
+                for &(idx, asc) in &order_specs {
+                    let cmp = a[idx].partial_cmp(&b[idx]).unwrap_or(std::cmp::Ordering::Equal);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if asc { cmp } else { cmp.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        Ok(Some((column_names, result_rows)))
+    }
+
+    /// Compute an aggregate function over positional rows (Vec<Value> slices).
+    fn compute_aggregate_positional(
+        &self,
+        agg: &AggregateInfo,
+        rows: &[&Row],
+    ) -> Result<Value> {
+        use std::collections::HashSet;
+        match agg.func.as_str() {
+            "COUNT" => {
+                if agg.distinct {
+                    if agg.col_pos.is_none() {
+                        return Err(MoteDBError::InvalidArgument(
+                            "COUNT(DISTINCT *) is not supported".to_string()
+                        ));
+                    }
+                    let mut seen = HashSet::new();
+                    for row in rows {
+                        if let Some(pos) = agg.col_pos {
+                            if let Some(val) = row.get(pos) {
+                                if !matches!(val, Value::Null) {
+                                    seen.insert(val.clone());
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Integer(seen.len() as i64))
+                } else if agg.col_pos.is_none() {
+                    // COUNT(*)
+                    Ok(Value::Integer(rows.len() as i64))
+                } else {
+                    // COUNT(col) - exclude NULLs
+                    let count = rows.iter()
+                        .filter(|row| {
+                            agg.col_pos.and_then(|pos| row.get(pos))
+                                .map_or(false, |v| !matches!(v, Value::Null))
+                        })
+                        .count();
+                    Ok(Value::Integer(count as i64))
+                }
+            }
+            "SUM" => {
+                let mut int_sum: i64 = 0;
+                let mut float_sum: f64 = 0.0;
+                let mut has_float = false;
+                let mut has_value = false;
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            match val {
+                                Value::Integer(i) => {
+                                    has_value = true;
+                                    if has_float {
+                                        float_sum += *i as f64;
+                                    } else if let Some(s) = int_sum.checked_add(*i) {
+                                        int_sum = s;
+                                    } else {
+                                        has_float = true;
+                                        float_sum = int_sum as f64 + *i as f64;
+                                    }
+                                }
+                                Value::Float(f) => {
+                                    has_value = true;
+                                    if !has_float {
+                                        has_float = true;
+                                        float_sum = int_sum as f64;
+                                    }
+                                    float_sum += *f;
+                                }
+                                Value::Null => {}
+                                _ => return Err(MoteDBError::TypeError("SUM requires numeric values".to_string())),
+                            }
+                        }
+                    }
+                }
+                if !has_value {
+                    Ok(Value::Null)
+                } else if has_float {
+                    Ok(Value::Float(float_sum))
+                } else {
+                    Ok(Value::Integer(int_sum))
+                }
+            }
+            "AVG" => {
+                let mut sum = 0.0;
+                let mut count = 0;
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            match val {
+                                Value::Integer(i) => { sum += *i as f64; count += 1; }
+                                Value::Float(f) => { sum += *f; count += 1; }
+                                Value::Null => {}
+                                _ => return Err(MoteDBError::TypeError("AVG requires numeric values".to_string())),
+                            }
+                        }
+                    }
+                }
+                if count > 0 {
+                    Ok(Value::Float(sum / count as f64))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "MIN" => {
+                let mut min_val: Option<Value> = None;
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            if !matches!(val, Value::Null) {
+                                min_val = Some(match min_val {
+                                    None => val.clone(),
+                                    Some(current) => {
+                                        if val.partial_cmp(&current) == Some(std::cmp::Ordering::Less) {
+                                            val.clone()
+                                        } else {
+                                            current
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(min_val.unwrap_or(Value::Null))
+            }
+            "MAX" => {
+                let mut max_val: Option<Value> = None;
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            if !matches!(val, Value::Null) {
+                                max_val = Some(match max_val {
+                                    None => val.clone(),
+                                    Some(current) => {
+                                        if val.partial_cmp(&current) == Some(std::cmp::Ordering::Greater) {
+                                            val.clone()
+                                        } else {
+                                            current
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(max_val.unwrap_or(Value::Null))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
     /// 🆕 Check if columns only contain COUNT(*) aggregate (for fast-path optimization)
     fn has_only_count_aggregate(&self, columns: &[SelectColumn]) -> bool {
         if columns.len() != 1 {
@@ -4323,11 +4812,172 @@ impl QueryExecutor {
         
         Ok((column_names, projected_rows))
     }
-    
-    /// Execute INSERT statement
+
+    /// Positional ORDER BY / DISTINCT fast path — skip HashMap conversion.
+    /// Works for: SELECT cols FROM table [WHERE cond] ORDER BY col [ASC/DESC] [LIMIT n]
+    ///            SELECT DISTINCT cols FROM table [WHERE cond]
+    fn try_positional_order_by_distinct(
+        &self,
+        stmt: &SelectStmt,
+        schema: &crate::types::TableSchema,
+        table_name: &str,
+    ) -> Result<Option<QueryResult>> {
+        // Only handle single-table queries with ORDER BY and/or DISTINCT
+        let has_order_by = stmt.order_by.is_some();
+        let has_distinct = stmt.distinct;
+        if !has_order_by && !has_distinct { return Ok(None); }
+        if stmt.group_by.is_some() { return Ok(None); } // GROUP BY handles its own path
+
+        // Resolve SELECT columns to (display_name, schema_position)
+        let mut resolved_cols = Vec::new();
+        for col_spec in &stmt.columns {
+            match col_spec {
+                SelectColumn::Star => return Ok(None), // complex
+                SelectColumn::Column(name) => {
+                    if let Some(pos) = schema.get_column_position(name) {
+                        resolved_cols.push((name.clone(), Some(pos)));
+                    } else { return Ok(None); }
+                }
+                SelectColumn::ColumnWithAlias(name, alias) => {
+                    if let Some(pos) = schema.get_column_position(name) {
+                        resolved_cols.push((alias.clone(), Some(pos)));
+                    } else { return Ok(None); }
+                }
+                SelectColumn::Expr(_, _) => return Ok(None), // expressions need evaluator
+            }
+        }
+        let column_names: Vec<String> = resolved_cols.iter().map(|(n, _)| n.clone()).collect();
+        let col_positions: Vec<Option<usize>> = resolved_cols.iter().map(|(_, p)| *p).collect();
+
+        // Resolve ORDER BY columns to projected column indices
+        let order_positions: Vec<(usize, bool)> = if let Some(ref order_by) = stmt.order_by {
+            let mut positions = Vec::new();
+            for order in order_by {
+                match &order.expr {
+                    Expr::Column(col_name) => {
+                        // Check alias / column name in SELECT list first
+                        if let Some(idx) = column_names.iter().position(|n| n == col_name) {
+                            positions.push((idx, order.asc));
+                        } else if let Some(_pos) = schema.get_column_position(col_name) {
+                            // ORDER BY references a column not in SELECT — bail to slow path
+                            return Ok(None);
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                    _ => return Ok(None), // complex expression
+                }
+            }
+            positions
+        } else {
+            Vec::new()
+        };
+
+        // Gather required column positions (unwrap None positions to simple Vec)
+        let scan_positions: Vec<usize> = col_positions.iter().filter_map(|p| *p).collect();
+
+        // Scan rows — use partial column decode for the no-WHERE case (most common)
+        let mut projected_rows: Vec<Vec<Value>> = if stmt.where_clause.is_some() {
+            let row_iter = self.db.scan_table_rows_streaming(table_name)?;
+            let where_clause = stmt.where_clause.as_ref().unwrap();
+            let mut matching = Vec::new();
+            for result in row_iter {
+                let (_, row) = result?;
+                match Self::eval_expr_on_row(where_clause, &row, schema) {
+                    Ok(Value::Bool(true)) => {
+                        let projected: Vec<Value> = col_positions.iter()
+                            .map(|pos| pos.and_then(|p| row.get(p)).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        matching.push(projected);
+                    }
+                    Ok(_) => {},
+                    Err(_) => return Ok(None),
+                }
+            }
+            matching
+        } else {
+            // 🚀 Partial column scan: only decode columns we need
+            let partial_iter = self.db.scan_table_rows_partial(
+                table_name, &scan_positions,
+            )?;
+            partial_iter.filter_map(|r| r.ok()).map(|(_, row)| row).collect()
+        };
+
+        let offset = stmt.offset.unwrap_or(0);
+        let limit = stmt.limit;
+        let need_top_k = !order_positions.is_empty() && limit.is_some() && !has_distinct;
+
+        let final_rows = if need_top_k && !projected_rows.is_empty() {
+            // 🚀 Top-K via select_nth_unstable: O(N) average to partition, then sort only K rows
+            let k = limit.unwrap();
+            let keep = offset + k;
+            let nth = (offset + k).saturating_sub(1).min(projected_rows.len() - 1);
+            projected_rows.select_nth_unstable_by(nth, |a, b| {
+                for &(col_idx, asc) in &order_positions {
+                    let cmp = a.get(col_idx)
+                        .and_then(|va| b.get(col_idx).map(|vb| (va, vb)))
+                        .map(|(va, vb)| va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if asc { cmp } else { cmp.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            let mut top: Vec<Vec<Value>> = projected_rows;
+            top.truncate(keep.min(top.len()));
+            top.sort_by(|a, b| {
+                for &(col_idx, asc) in &order_positions {
+                    let cmp = a.get(col_idx)
+                        .and_then(|va| b.get(col_idx).map(|vb| (va, vb)))
+                        .map(|(va, vb)| va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if asc { cmp } else { cmp.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            top.into_iter().skip(offset).collect()
+        } else {
+            // Full sort path (no LIMIT, or DISTINCT requires full dedup)
+            if !order_positions.is_empty() {
+                projected_rows.sort_by(|a, b| {
+                    for &(col_idx, asc) in &order_positions {
+                        let cmp = a.get(col_idx)
+                            .and_then(|va| b.get(col_idx).map(|vb| (va, vb)))
+                            .map(|(va, vb)| va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal))
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                        if cmp != std::cmp::Ordering::Equal {
+                            return if asc { cmp } else { cmp.reverse() };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            if has_distinct {
+                let mut seen = std::collections::HashSet::new();
+                projected_rows.retain(|row| seen.insert(row.clone()));
+            }
+            let lim = limit.unwrap_or(usize::MAX);
+            projected_rows.into_iter().skip(offset).take(lim).collect()
+        };
+
+        Ok(Some(QueryResult::Select {
+            columns: column_names,
+            rows: final_rows,
+        }))
+    }
+
+    /// Execute INSERT statement (owned, for execute() path)
     fn execute_insert(&self, stmt: InsertStmt) -> Result<QueryResult> {
+        self.execute_insert_ref(&stmt)
+    }
+
+    /// Execute INSERT statement (borrowed, avoids clone in streaming path)
+    fn execute_insert_ref(&self, stmt: &InsertStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
-        
+
         // Determine column order
         let columns = if let Some(ref cols) = stmt.columns {
             cols.clone()
@@ -4341,80 +4991,56 @@ impl QueryExecutor {
             return self.execute_columnar_insert(&stmt, &schema, &columns);
         }
 
-        // 🔥 召回率优化: 使用批量插入提升向量索引图质量
-        // 原因: 逐条插入导致DiskANN图连通性差，批量插入可以构建更优质的图
-        // 策略: 
-        // 1. 先批量准备所有行（不写入数据库）
-        // 2. 判断是否涉及向量索引（检测TENSOR列）
-        // 3. 如果有向量列，使用批量向量插入 API（会触发图重建）
-        // 4. 如果无向量列，使用普通逐条插入
-        
         let has_vector_column = schema.columns.iter()
             .any(|col| matches!(col.col_type, crate::types::ColumnType::Tensor(_)));
-        
-        // Prepare all rows first
+
+        // Prepare all rows — resolve expressions to Values, build Row directly
         let mut prepared_rows = Vec::new();
-        
+
         for value_row in &stmt.values {
             if value_row.len() != columns.len() {
                 return Err(MoteDBError::InvalidArgument(
                     format!("Column count mismatch: expected {}, got {}", columns.len(), value_row.len())
                 ));
             }
-            
-            // Build SqlRow
-            let mut sql_row = SqlRow::new();
-            for (i, col_name) in columns.iter().enumerate() {
-                let val = match &value_row[i] {
-                    Expr::Literal(v) => v.clone(),
+
+            // Resolve all expressions to Values (skip HashMap intermediary)
+            let resolved: Vec<Value> = value_row.iter().map(|expr| {
+                match expr {
+                    Expr::Literal(v) => Ok(v.clone()),
                     Expr::Parameter(_) => {
                         let empty_row = SqlRow::new();
-                        self.evaluator.eval(&value_row[i], &empty_row)?
+                        self.evaluator.eval(expr, &empty_row)
                     }
-                    expr => return Err(MoteDBError::InvalidArgument(
-                        format!("INSERT VALUES must be literals or parameters, got {:?}", expr)
+                    other => Err(MoteDBError::InvalidArgument(
+                        format!("INSERT VALUES must be literals or parameters, got {:?}", other)
                     )),
-                };
-
-                // 🚀 P3 OPTIMIZATION: For AUTO_INCREMENT primary key, ignore user-provided value
-                // The system will use row_id as primary key value automatically
-                let should_ignore = schema.primary_key()
-                    .map(|pk| pk == col_name && schema.is_primary_key_auto_increment())
-                    .unwrap_or(false);
-                
-                if !should_ignore {
-                    sql_row.insert(col_name.clone(), val);
                 }
-                // If ignored, skip inserting this column (system will fill in row_id later)
-            }
-            
-            // Convert to storage Row
-            let row = sql_row_to_row(&sql_row, &schema)?;
-            prepared_rows.push((sql_row, row));
+            }).collect::<Result<Vec<_>>>()?;
+
+            // Build Row directly using column mapping (no HashMap)
+            let row = crate::sql::row_converter::values_to_row_by_columns(
+                &resolved, &columns, &schema
+            )?;
+            prepared_rows.push(row);
         }
-        
+
         let affected_rows = prepared_rows.len();
-        
-        // 🔥 Track last_insert_id for AUTO_INCREMENT primary key
+
+        // Track last_insert_id for AUTO_INCREMENT primary key
         let mut last_row_id: Option<u64> = None;
-        
+
         if has_vector_column && prepared_rows.len() > 1 {
-            // 🚀 批量插入路径：提升向量索引质量
-            debug_log!("[SQL] 🔥 Batch inserting {} rows with vector columns...", prepared_rows.len());
-            
-            // 提取所有row_id和向量数据
-            let mut vector_batches: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>> = 
+            // Batch insert path for vector columns
+            let mut vector_batches: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>> =
                 std::collections::HashMap::new();
-            
-            // 先插入所有行到表（获取row_id）
-            for (_sql_row, row) in prepared_rows {
+
+            for row in &prepared_rows {
                 let row_id = self.db.insert_row_to_table(&stmt.table, row.clone())?;
-                last_row_id = Some(row_id); // Track last inserted row_id
-                
-                // 检查是否有向量列需要索引
+                last_row_id = Some(row_id);
+
                 for (idx, col_def) in schema.columns.iter().enumerate() {
                     if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                        // 提取向量值
                         if let Some(Value::Vector(vec)) = row.get(idx) {
                             let index_name = format!("{}_{}", stmt.table, col_def.name);
                             vector_batches.entry(index_name)
@@ -4424,30 +5050,22 @@ impl QueryExecutor {
                     }
                 }
             }
-            
-            // 批量插入向量到索引（使用公开API）
-            // 🔧 修复：如果索引不存在，跳过（稍后通过CREATE INDEX构建）
+
             for (index_name, batch) in vector_batches {
-                debug_log!("[SQL]   ↳ Batch indexing {} vectors to '{}'...", batch.len(), index_name);
-                let insert_start = std::time::Instant::now();
                 match self.db.batch_update_vectors(&index_name, batch) {
-                    Ok(_) => {
-                        debug_log!("[SQL]   ✓ Indexed in {:?}", insert_start.elapsed());
-                    },
-                    Err(e) if e.to_string().contains("not found") => {
-                        debug_log!("[SQL]   ⚠️  Index '{}' not found, skipping (will be built by CREATE INDEX)", index_name);
-                    },
+                    Ok(_) => {},
+                    Err(e) if e.to_string().contains("not found") => {},
                     Err(e) => return Err(e),
                 }
             }
         } else {
-            // 普通逐条插入路径（无向量列或单行插入）
-            for (_sql_row, row) in prepared_rows {
+            // Normal row-by-row insert path
+            for row in prepared_rows {
                 let row_id = self.db.insert_row_to_table(&stmt.table, row)?;
-                last_row_id = Some(row_id); // Track last inserted row_id
+                last_row_id = Some(row_id);
             }
         }
-        
+
         // Update last_insert_id if table has AUTO_INCREMENT primary key
         if schema.is_primary_key_auto_increment() {
             if let Some(row_id) = last_row_id {
@@ -4455,10 +5073,10 @@ impl QueryExecutor {
                 self.evaluator.last_insert_id.store(row_id as i64, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        
+
         Ok(QueryResult::Modification { affected_rows })
     }
-    
+
     /// Execute UPDATE statement
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
@@ -4481,8 +5099,8 @@ impl QueryExecutor {
                 ) {
                     if let Some(index) = self.db.column_indexes.get(&index_name) {
                         let matching_row_ids = index.value()
-                            .get(&target_value)
-                            .unwrap_or_default();
+                            .get_arc(&target_value)
+                            .unwrap_or_else(|_| Arc::new(Vec::new()));
                         if matching_row_ids.is_empty() {
                             return Ok(QueryResult::Modification { affected_rows: 0 });
                         }
@@ -4499,51 +5117,44 @@ impl QueryExecutor {
         
         for result in row_iter {
             let (row_id, row) = result?;
-            let sql_row = row_to_sql_row(&row, &schema)?;
-            
-            // Filter rows (WHERE clause)
+
+            // WHERE filter using positional evaluation (no HashMap)
             let should_update = if let Some(ref where_clause) = stmt.where_clause {
-                self.evaluator.eval(where_clause, &sql_row)
-                    .and_then(|val| self.to_bool(&val))
+                Self::eval_expr_on_row(where_clause, &row, &schema)
+                    .map(|v| Self::is_truthy(&v))
                     .unwrap_or(false)
             } else {
                 true
             };
-            
+
             if !should_update {
                 continue;
             }
-            
-            let mut sql_row = sql_row;
 
-            // Evaluate all assignments against the ORIGINAL row values (SQL semantics)
-            let original_row = sql_row.clone();
-            let new_values: Vec<(String, Value)> = stmt.assignments.iter().map(|(col_name, expr)| {
-                let new_val = if let Expr::Literal(v) = expr {
-                    v.clone()
-                } else {
-                    self.evaluator.eval(expr, &original_row).unwrap_or(Value::Null)
-                };
-                (col_name.clone(), new_val)
-            }).collect();
-
-            for (col_name, new_val) in new_values {
-                sql_row.insert(col_name, new_val);
+            // Evaluate assignments positionally against the raw Vec<Value>
+            let mut new_row = row.clone();
+            for (col_name, expr) in &stmt.assignments {
+                if let Some(cd) = schema.get_column(col_name) {
+                    let new_val = if let Expr::Literal(v) = expr {
+                        v.clone()
+                    } else {
+                        Self::eval_expr_on_row(expr, &row, &schema)
+                            .unwrap_or(Value::Null)
+                    };
+                    while new_row.len() <= cd.position {
+                        new_row.push(Value::Null);
+                    }
+                    new_row[cd.position] = new_val;
+                }
             }
-            
-            // Convert back to storage Row
-            let new_row = sql_row_to_row(&sql_row, &schema)?;
-            
-            // 🚀 底层已实现增量索引更新，传入 old_row 避免重复加载
-            self.db.update_row_in_table(&stmt.table, row_id, row, new_row)?;
-            
+
+            self.db.update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, &schema)?;
+
             affected_rows += 1;
         }
-        
+
         Ok(QueryResult::Modification { affected_rows })
     }
-    
-    /// Execute DELETE statement
     fn execute_delete(&self, stmt: DeleteStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
 
@@ -4565,8 +5176,8 @@ impl QueryExecutor {
                 ) {
                     if let Some(index) = self.db.column_indexes.get(&index_name) {
                         let matching_row_ids = index.value()
-                            .get(&target_value)
-                            .unwrap_or_default();
+                            .get_arc(&target_value)
+                            .unwrap_or_else(|_| Arc::new(Vec::new()));
                         if matching_row_ids.is_empty() {
                             return Ok(QueryResult::Modification { affected_rows: 0 });
                         }
@@ -4660,90 +5271,94 @@ impl QueryExecutor {
         Ok(row_ids.into_iter().next())
     }
 
+    /// Resolve a PK value to row IDs, handling both AUTO_INCREMENT and non-AUTO_INCREMENT cases.
+    fn resolve_pk_row_ids(
+        &self,
+        table_name: &str,
+        schema: &crate::types::TableSchema,
+        target_value: &Value,
+    ) -> Result<Vec<RowId>> {
+        let pk_col_name = schema.primary_key()
+            .ok_or_else(|| StorageError::InvalidData("No primary key".into()))?;
+
+        if schema.is_primary_key_auto_increment() {
+            // AUTO_INCREMENT: pk value IS row_id — direct O(1) mapping
+            match target_value {
+                Value::Integer(id) if *id >= 0 => Ok(vec![*id as RowId]),
+                _ => Ok(vec![]),
+            }
+        } else {
+            // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
+            let pk_key = crate::database::pk_cache::PkKey::from_value(target_value);
+            match self.resolve_pk_with_cache(table_name, &pk_key, pk_col_name, target_value)? {
+                Some(rid) => Ok(vec![rid]),
+                None => Ok(vec![]),
+            }
+        }
+    }
+
     fn execute_update_pk(
         &self,
         stmt: &UpdateStmt,
         schema: &crate::types::TableSchema,
         target_value: &Value,
     ) -> Result<QueryResult> {
-        let pk_col_name = schema.primary_key()
-            .ok_or_else(|| StorageError::InvalidData("No primary key".into()))?;
-
-        // Resolve row_id(s) for the PK value
-        let row_ids = if schema.is_primary_key_auto_increment() {
-            // AUTO_INCREMENT: pk value IS row_id — direct O(1) mapping
-            match target_value {
-                Value::Integer(id) if *id >= 0 => vec![*id as RowId],
-                _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
-            }
-        } else {
-            // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
-            let pk_key = crate::database::pk_cache::PkKey::from_value(target_value);
-            match self.resolve_pk_with_cache(&stmt.table, &pk_key, pk_col_name, target_value)? {
-                Some(rid) => vec![rid],
-                None => vec![],
-            }
-        };
+        let row_ids = self.resolve_pk_row_ids(&stmt.table, schema, target_value)?;
+        if row_ids.is_empty() {
+            return Ok(QueryResult::Modification { affected_rows: 0 });
+        }
 
         let mut affected_rows = 0;
+
         for row_id in row_ids {
             let row = match self.db.get_table_row(&stmt.table, row_id)? {
                 Some(r) => r,
                 None => continue,
             };
 
-            let mut sql_row = row_to_sql_row(&row, schema)?;
-            // Evaluate all assignments against ORIGINAL row (SQL semantics)
-            let original_row = sql_row.clone();
-            let new_values: Vec<(String, Value)> = stmt.assignments.iter().map(|(col_name, expr)| {
-                let new_val = if let Expr::Literal(v) = expr {
-                    v.clone()
-                } else {
-                    self.evaluator.eval(expr, &original_row).unwrap_or(Value::Null)
-                };
-                (col_name.clone(), new_val)
-            }).collect();
-            for (col_name, new_val) in new_values {
-                sql_row.insert(col_name, new_val);
+            // Evaluate assignments positionally against the raw Vec<Value>
+            // (no HashMap creation, no cloning) — SQL semantics: all EXPRs
+            // evaluated against the ORIGINAL row before any modifications.
+            let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(stmt.assignments.len());
+            for (col_name, expr) in &stmt.assignments {
+                if let Some(cd) = schema.get_column(col_name) {
+                    let new_val = if let Expr::Literal(v) = expr {
+                        v.clone()
+                    } else {
+                        Self::eval_expr_on_row(expr, &row, &schema)
+                            .unwrap_or(Value::Null)
+                    };
+                    new_values.push((cd.position, new_val));
+                }
             }
 
-            let new_row = sql_row_to_row(&sql_row, schema)?;
-            self.db.update_row_in_table(&stmt.table, row_id, row, new_row)?;
+            // Clone old row and apply changes by position
+            let mut new_row = row.clone();
+            for (pos, val) in &new_values {
+                while new_row.len() <= *pos {
+                    new_row.push(Value::Null);
+                }
+                new_row[*pos] = val.clone();
+            }
+
+            self.db.update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, schema)?;
             affected_rows += 1;
         }
 
         Ok(QueryResult::Modification { affected_rows })
     }
 
-    /// 🚀 PK fast path for DELETE: direct lookup instead of full table scan
-    ///
-    /// For `DELETE FROM t WHERE pk = value`:
-    /// - AUTO_INCREMENT: direct LSM get by row_id (O(log n))
-    /// - Non-AUTO_INCREMENT: column index lookup then LSM get
+    /// PK fast path for DELETE: direct lookup instead of full table scan
     fn execute_delete_pk(
         &self,
         stmt: &DeleteStmt,
         schema: &crate::types::TableSchema,
         target_value: &Value,
     ) -> Result<QueryResult> {
-        let pk_col_name = schema.primary_key()
-            .ok_or_else(|| StorageError::InvalidData("No primary key".into()))?;
-
-        // Resolve row_id(s) for the PK value
-        let row_ids = if schema.is_primary_key_auto_increment() {
-            // AUTO_INCREMENT: pk value IS row_id — direct O(1) mapping
-            match target_value {
-                Value::Integer(id) if *id >= 0 => vec![*id as RowId],
-                _ => return Ok(QueryResult::Modification { affected_rows: 0 }),
-            }
-        } else {
-            // Non-AUTO_INCREMENT: resolve via pk_lookup cache (with disk fallback + cache refill)
-            let pk_key = crate::database::pk_cache::PkKey::from_value(target_value);
-            match self.resolve_pk_with_cache(&stmt.table, &pk_key, pk_col_name, target_value)? {
-                Some(rid) => vec![rid],
-                None => vec![],
-            }
-        };
+        let row_ids = self.resolve_pk_row_ids(&stmt.table, schema, target_value)?;
+        if row_ids.is_empty() {
+            return Ok(QueryResult::Modification { affected_rows: 0 });
+        }
 
         let mut affected_rows = 0;
         for row_id in row_ids {
@@ -4775,38 +5390,38 @@ impl QueryExecutor {
                 None => continue,
             };
 
-            // Re-check WHERE condition against actual row data to guard
-            // against stale index entries pointing to modified rows.
+            // Re-check WHERE condition against actual row data
             if let Some(col) = schema.get_column(where_col) {
                 if let Some(actual_val) = row.get(col.position) {
                     if actual_val != where_val { continue; }
                 } else { continue; }
             }
 
-            let mut sql_row = row_to_sql_row(&row, schema)?;
-            // Evaluate all assignments against ORIGINAL row (SQL semantics)
-            let original_row = sql_row.clone();
-            let new_values: Vec<(String, Value)> = stmt.assignments.iter().map(|(col_name, expr)| {
-                let new_val = if let Expr::Literal(v) = expr {
-                    v.clone()
-                } else {
-                    self.evaluator.eval(expr, &original_row).unwrap_or(Value::Null)
-                };
-                (col_name.clone(), new_val)
-            }).collect();
-            for (col_name, new_val) in new_values {
-                sql_row.insert(col_name, new_val);
+            // Evaluate assignments positionally against the raw Vec<Value>
+            let mut new_row = row.clone();
+            for (col_name, expr) in &stmt.assignments {
+                if let Some(cd) = schema.get_column(col_name) {
+                    let new_val = if let Expr::Literal(v) = expr {
+                        v.clone()
+                    } else {
+                        Self::eval_expr_on_row(expr, &row, &schema)
+                            .unwrap_or(Value::Null)
+                    };
+                    while new_row.len() <= cd.position {
+                        new_row.push(Value::Null);
+                    }
+                    new_row[cd.position] = new_val;
+                }
             }
 
-            let new_row = sql_row_to_row(&sql_row, schema)?;
-            self.db.update_row_in_table(&stmt.table, row_id, row, new_row)?;
+            self.db.update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, schema)?;
             affected_rows += 1;
         }
 
         Ok(QueryResult::Modification { affected_rows })
     }
 
-    /// 🚀 Column index fast path for DELETE: lookup by row_ids from index
+    /// Column index fast path for DELETE: lookup by row_ids from index
     fn execute_delete_by_row_ids(
         &self,
         stmt: &DeleteStmt,
@@ -5300,7 +5915,7 @@ impl QueryExecutor {
         
         let columns = vec!["Tables".to_string()];
         let rows = tables.into_iter()
-            .map(|table_name| vec![Value::Text(table_name)])
+            .map(|table_name| vec![Value::text(table_name)])
             .collect();
         
         Ok(QueryResult::Select { columns, rows })
@@ -5319,9 +5934,9 @@ impl QueryExecutor {
         
         let rows = schema.columns.iter().map(|col| {
             vec![
-                Value::Text(col.name.clone()),
-                Value::Text(format!("{:?}", col.col_type)),
-                Value::Text(if col.nullable { "YES" } else { "NO" }.into()),
+                Value::text(col.name.clone()),
+                Value::text(format!("{:?}", col.col_type)),
+                Value::text(if col.nullable { "YES" } else { "NO" }.into()),
                 Value::Integer(col.position as i64),
             ]
         }).collect();
@@ -5596,13 +6211,13 @@ impl QueryExecutor {
             if let Some(row) = batch_rows.get(i).and_then(|(_, opt)| opt.as_ref()) {
                 let mut sql_row = row_to_sql_row(row, &schema)?;
                 sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                sql_row.insert("__table__".to_string(), Value::Text(table_name.to_string()));
+                sql_row.insert("__table__".to_string(), Value::text(table_name.to_string()));
                 let score = 1.0f32;
                 sql_row.insert(format!("__text_score_{}__", column), Value::Float(score as f64));
                 let old_row = std::mem::take(&mut sql_row);
                 let mut qualified = SqlRow::new();
                 qualified.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                qualified.insert("__table__".to_string(), Value::Text(table_name.to_string()));
+                qualified.insert("__table__".to_string(), Value::text(table_name.to_string()));
                 qualified.insert(format!("__text_score_{}__", column), Value::Float(score as f64));
                 for (col_name, val) in old_row.into_iter() {
                     let qname = Self::make_qualified_name(table_name, &col_name);
@@ -5612,16 +6227,32 @@ impl QueryExecutor {
             }
         }
 
-        // Handle ORDER BY score DESC — results are already sorted by BM25 score descending
-        // Check if ORDER BY is compatible (DESC or absent)
-        let order_compatible = stmt.order_by.as_ref().is_none_or(|ob| {
-            // If ORDER BY exists, it must be DESC (which matches BM25 ranking)
-            ob.len() == 1 && !ob[0].asc
-        });
-
-        if !order_compatible {
-            // Non-compatible ORDER BY — fall back to normal path
-            return Ok(None);
+        // Apply ORDER BY if present.
+        // Default order is BM25 score descending (already sorted by text_search_ranked).
+        // If ORDER BY specifies other columns, re-sort by those columns.
+        if let Some(ref order_by) = stmt.order_by {
+            let is_score_desc = order_by.len() == 1
+                && matches!(&order_by[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
+                && !order_by[0].asc;
+            if !is_score_desc {
+                sql_rows.sort_by(|a, b| {
+                    for ob in order_by {
+                        if let Expr::Column(ref col_name) = ob.expr {
+                            let a_val = a.1.get(col_name).or_else(|| a.1.get(&Self::make_qualified_name(table_name, col_name)));
+                            let b_val = b.1.get(col_name).or_else(|| b.1.get(&Self::make_qualified_name(table_name, col_name)));
+                            let cmp = match (a_val, b_val) {
+                                (Some(Value::Integer(ai)), Some(Value::Integer(bi))) => ai.cmp(bi),
+                                (Some(Value::Float(af)), Some(Value::Float(bf))) => af.partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal),
+                                (Some(Value::Text(at)), Some(Value::Text(bt))) => at.cmp(bt),
+                                _ => std::cmp::Ordering::Equal,
+                            };
+                            let result = if ob.asc { cmp } else { cmp.reverse() };
+                            if result != std::cmp::Ordering::Equal { return result; }
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
         }
 
         // Build scores from sql_rows metadata
@@ -5821,14 +6452,14 @@ impl QueryExecutor {
             if let Ok(Some(row)) = self.db.get_table_row(&table_name, row_id) {
                 let mut sql_row = row_to_sql_row(&row, &schema)?;
                 sql_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                sql_row.insert("__table__".to_string(), Value::text(table_name.clone()));
                 if let Some(d) = dist_map.get(&row_id) {
                     sql_row.insert("__spatial_distance__".to_string(), Value::Float(*d));
                 }
                 let old_row = std::mem::take(&mut sql_row);
                 let mut qualified = SqlRow::new();
                 qualified.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                qualified.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                qualified.insert("__table__".to_string(), Value::text(table_name.clone()));
                 if let Some(d) = dist_map.get(&row_id) {
                     qualified.insert("__spatial_distance__".to_string(), Value::Float(*d));
                 }
@@ -6220,7 +6851,7 @@ impl QueryExecutor {
                 let sql_row = row_to_sql_row(&cached_row, &schema)?;
                 let mut prefixed_row = SqlRow::new();
                 prefixed_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                prefixed_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                prefixed_row.insert("__table__".to_string(), Value::text(table_name.clone()));
                 for (col_name, val) in sql_row {
                     let qualified_name = format!("{}.{}", table_name, col_name);
                     prefixed_row.insert(qualified_name, val);
@@ -6283,7 +6914,7 @@ impl QueryExecutor {
                     // Add table prefix
                     let mut prefixed_row = SqlRow::new();
                     prefixed_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                    prefixed_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                    prefixed_row.insert("__table__".to_string(), Value::text(table_name.clone()));
                     
                     for (col_name, val) in sql_row {
                         let qualified_name = format!("{}.{}", table_name, col_name);
@@ -6378,7 +7009,7 @@ impl QueryExecutor {
                 // Add table prefix
                 let mut prefixed_row = SqlRow::new();
                 prefixed_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
-                prefixed_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
+                prefixed_row.insert("__table__".to_string(), Value::text(table_name.clone()));
                 
                 for (col_name, val) in sql_row {
                     let qualified_name = format!("{}.{}", table_name, col_name);
@@ -6525,19 +7156,8 @@ impl QueryExecutor {
         }
         
         // Add table prefix
-        for (row_id, sql_row) in &mut sql_rows {
-            let mut new_sql_row = SqlRow::new();
-            new_sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-            new_sql_row.insert("__table__".to_string(), Value::Text(table_name.clone()));
-            
-            let old_row = std::mem::take(sql_row);
-            for (col_name, val) in old_row.into_iter() {
-                let qualified_name = Self::make_qualified_name(table_name, &col_name);
-                new_sql_row.insert(qualified_name, val);
-            }
-            *sql_row = new_sql_row;
-        }
-        
+        prefix_rows(&mut sql_rows, table_name, table_name);
+
         // Project columns
         let (column_names, result_rows) = self.project_columns(&stmt.columns, &sql_rows, &schema)?;
         
@@ -7157,4 +7777,231 @@ struct VectorOrderByPlan {
     column: String,
     query_vector: Vec<f32>,
     k: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{TableSchema, ColumnDef, ColumnType, Value};
+
+    fn make_schema() -> TableSchema {
+        let columns = vec![
+            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, position: 0, nullable: false, auto_increment: false, auto_increment_start: None },
+            ColumnDef { name: "name".into(), col_type: ColumnType::Text, position: 1, nullable: true, auto_increment: false, auto_increment_start: None },
+            ColumnDef { name: "score".into(), col_type: ColumnType::Float, position: 2, nullable: true, auto_increment: false, auto_increment_start: None },
+            ColumnDef { name: "active".into(), col_type: ColumnType::Boolean, position: 3, nullable: true, auto_increment: false, auto_increment_start: None },
+        ];
+        TableSchema::new("t".into(), columns)
+    }
+
+    fn row(id: i64, name: &str, score: f64, active: bool) -> Vec<Value> {
+        vec![
+            Value::Integer(id),
+            Value::Text(crate::types::ArcString::from(name)),
+            Value::Float(score),
+            Value::Bool(active),
+        ]
+    }
+
+    fn col(name: &str) -> Expr {
+        Expr::Column(name.to_string())
+    }
+
+    // ━━━ Column reference ━━━
+
+    #[test]
+    fn test_eval_column() {
+        let schema = make_schema();
+        let r = row(1, "alice", 9.5, true);
+        assert_eq!(
+            QueryExecutor::eval_expr_on_row(&col("id"), &r, &schema).unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            QueryExecutor::eval_expr_on_row(&col("name"), &r, &schema).unwrap(),
+            Value::Text(crate::types::ArcString::from("alice"))
+        );
+    }
+
+    // ━━━ Binary operators ━━━
+
+    #[test]
+    fn test_eval_eq() {
+        let schema = make_schema();
+        let r = row(1, "alice", 9.5, true);
+        let eq = Expr::BinaryOp {
+            left: Box::new(col("id")),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Literal(Value::Integer(1))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&eq, &r, &schema).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn test_eval_eq_null_returns_null() {
+        let schema = make_schema();
+        let r = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let eq = Expr::BinaryOp {
+            left: Box::new(col("id")),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Literal(Value::Integer(1))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&eq, &r, &schema).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_eval_comparisons() {
+        let schema = make_schema();
+        let r = row(5, "", 10.0, true);
+
+        let lt = Expr::BinaryOp { left: Box::new(col("id")), op: BinaryOperator::Lt, right: Box::new(Expr::Literal(Value::Integer(10))) };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&lt, &r, &schema).unwrap(), Value::Bool(true));
+
+        let gt = Expr::BinaryOp { left: Box::new(col("score")), op: BinaryOperator::Gt, right: Box::new(Expr::Literal(Value::Float(5.0))) };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&gt, &r, &schema).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ NULL handling in comparisons ━━━
+
+    #[test]
+    fn test_eval_lt_null_returns_false() {
+        let schema = make_schema();
+        let r = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let lt = Expr::BinaryOp {
+            left: Box::new(col("score")),
+            op: BinaryOperator::Lt,
+            right: Box::new(Expr::Literal(Value::Float(5.0))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&lt, &r, &schema).unwrap(), Value::Bool(false));
+    }
+
+    // ━━━ IsNull / IsNotNull ━━━
+
+    #[test]
+    fn test_eval_is_null() {
+        let schema = make_schema();
+        let r = vec![Value::Integer(1), Value::Null, Value::Float(1.0), Value::Bool(false)];
+        let isnull = Expr::IsNull { expr: Box::new(col("name")), negated: false };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&isnull, &r, &schema).unwrap(), Value::Bool(true));
+
+        let notnull = Expr::IsNull { expr: Box::new(col("id")), negated: true };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&notnull, &r, &schema).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ Arithmetic ━━━
+
+    #[test]
+    fn test_eval_add() {
+        let schema = make_schema();
+        let r = row(1, "", 10.0, true);
+        let add = Expr::BinaryOp {
+            left: Box::new(col("id")),
+            op: BinaryOperator::Add,
+            right: Box::new(Expr::Literal(Value::Integer(3))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&add, &r, &schema).unwrap(), Value::Integer(4));
+    }
+
+    #[test]
+    fn test_eval_mul() {
+        let schema = make_schema();
+        let r = row(0, "", 10.0, true);
+        let mul = Expr::BinaryOp {
+            left: Box::new(col("score")),
+            op: BinaryOperator::Mul,
+            right: Box::new(Expr::Literal(Value::Float(2.0))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&mul, &r, &schema).unwrap(), Value::Float(20.0));
+    }
+
+    // ━━━ AND / OR ━━━
+
+    #[test]
+    fn test_eval_and_or() {
+        let schema = make_schema();
+        let r = row(1, "", 10.0, true);
+        let and = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Value::Bool(true))),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::Literal(Value::Bool(true))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&and, &r, &schema).unwrap(), Value::Bool(true));
+
+        let or = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Value::Bool(false))),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::Literal(Value::Bool(true))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&or, &r, &schema).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ Parameter returns error (fallback path) ━━━
+
+    #[test]
+    fn test_eval_parameter_returns_error() {
+        let schema = make_schema();
+        let r = row(1, "", 10.0, true);
+        let param = Expr::Parameter(1);
+        assert!(QueryExecutor::eval_expr_on_row(&param, &r, &schema).is_err(),
+            "Parameter should return Err to trigger fallback to full evaluator");
+    }
+
+    // ━━━ IN list ━━━
+
+    #[test]
+    fn test_eval_in() {
+        let schema = make_schema();
+        let r = row(1, "", 10.0, true);
+        let in_expr = Expr::In {
+            expr: Box::new(col("id")),
+            list: vec![Expr::Literal(Value::Integer(1)), Expr::Literal(Value::Integer(2))],
+            negated: false,
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&in_expr, &r, &schema).unwrap(), Value::Bool(true));
+
+        let not_in = Expr::In {
+            expr: Box::new(col("id")),
+            list: vec![Expr::Literal(Value::Integer(5)), Expr::Literal(Value::Integer(6))],
+            negated: true,
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&not_in, &r, &schema).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ BETWEEN ━━━
+
+    #[test]
+    fn test_eval_between() {
+        let schema = make_schema();
+        let r = row(5, "", 10.0, true);
+        let between = Expr::Between {
+            expr: Box::new(col("id")),
+            low: Box::new(Expr::Literal(Value::Integer(1))),
+            high: Box::new(Expr::Literal(Value::Integer(10))),
+            negated: false,
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&between, &r, &schema).unwrap(), Value::Bool(true));
+    }
+
+    // ━━━ Unsupported expression returns error ━━━
+
+    #[test]
+    fn test_eval_unsupported_returns_error() {
+        let schema = make_schema();
+        let r = row(1, "", 10.0, true);
+        // Subquery is unsupported in eval_expr_on_row
+        let sub = Expr::Subquery(Box::new(crate::sql::ast::SelectStmt {
+            columns: vec![],
+            from: None,
+            where_clause: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distinct: false,
+            group_by: None,
+            having: None,
+            latest_by: None,
+        }));
+        assert!(QueryExecutor::eval_expr_on_row(&sub, &r, &schema).is_err(),
+            "Unsupported expression should return Err for fallback path");
+    }
 }

@@ -668,93 +668,6 @@ impl DiskANNIndex {
         Ok(())
     }
     
-    /// Insert with DiskANN-style inter_insert (smart reverse edge handling)
-    fn insert_vector_with_inter_insert(&self, id: RowId, medoid_id: RowId) -> Result<()> {
-        let query_vec = match self.vectors.get(id) {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-        
-        // 1. Greedy search to find candidates
-        let ef_construction = 400;
-        let candidates = self.greedy_search(
-            &query_vec,
-            medoid_id,
-            ef_construction,
-                        )?;
-        
-        // 2. Robust prune to select forward edges
-        let neighbors = robust_prune(
-            candidates,
-            self.config.max_degree,
-            self.config.alpha,
-            |a, b| {
-                match (self.vectors.get(a), self.vectors.get(b)) {
-                    (Some(vec_a), Some(vec_b)) => self.metric.distance(&vec_a, &vec_b),
-                    _ => f32::MAX,
-                }
-            },
-        );
-        
-        // 3. Set forward edges
-        self.graph.set_neighbors(id, neighbors.clone())?;
-        
-        // 4. DiskANN-style inter_insert: smart reverse edge updates
-        // 🚀 优化：增大slack避免频繁prune，flush时统一清理
-        let slack_factor = 1.5;  // 🔧 从1.2增大到1.5，大幅减少prune频率
-        let soft_limit = (self.config.max_degree as f32 * slack_factor) as usize;
-        
-        for &neighbor_id in neighbors.iter() {  // ✅ P1: Arc auto-derefs
-            let neighbor_neighbors_arc = self.graph.neighbors(neighbor_id);
-            let mut neighbor_neighbors = (*neighbor_neighbors_arc).clone();  // ✅ P1: Clone for modification
-            
-            // Skip if already connected
-            if neighbor_neighbors.contains(&id) {
-                continue;
-            }
-            
-            // ✅ KEY OPTIMIZATION: Only prune if strictly necessary
-            if neighbor_neighbors.len() < soft_limit {
-                // Just add, no pruning needed (99% of cases)
-                neighbor_neighbors.push(id);
-                self.graph.set_neighbors(neighbor_id, neighbor_neighbors)?;
-            } else {
-                // Node is full, need to prune
-                neighbor_neighbors.push(id);
-                
-                let neighbor_vec = match self.vectors.get(neighbor_id) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                
-                let candidates: Vec<Candidate> = neighbor_neighbors
-                    .iter()
-                    .filter_map(|&nid| {
-                        let vec = self.vectors.get(nid)?;
-                        let dist = self.metric.distance(&neighbor_vec, &vec);
-                        Some(Candidate { id: nid, distance: dist })
-                    })
-                    .collect();
-                
-                let pruned = robust_prune(
-                    candidates,
-                    self.config.max_degree,
-                    self.config.alpha,
-                    |a, b| {
-                        match (self.vectors.get(a), self.vectors.get(b)) {
-                            (Some(vec_a), Some(vec_b)) => self.metric.distance(&vec_a, &vec_b),
-                            _ => f32::MAX,
-                        }
-                    },
-                );
-                
-                self.graph.set_neighbors(neighbor_id, pruned)?;
-            }
-        }
-        
-        Ok(())
-    }
-    
     /// 🚀 **增量更新（只更新受影响的边）**
     pub fn update(&self, row_id: RowId, vector: Vec<f32>) -> Result<bool> {
         let existed = self.vectors.update(row_id, vector)?;
@@ -1362,11 +1275,6 @@ impl DiskANNIndex {
         best_id
     }
     
-    fn insert_vector_into_graph(&self, id: RowId, medoid_id: RowId) -> Result<()> {
-        // Use DiskANN-style inter_insert
-        self.insert_vector_with_inter_insert(id, medoid_id)
-    }
-    
     fn greedy_search(
         &self,
         query: &[f32],
@@ -1397,6 +1305,15 @@ impl DiskANNIndex {
             (beam_width * 20).min(10000)
         };
         
+        // FIXME: `candidates` is BinaryHeap<Reverse<Candidate>>. Candidate::cmp
+        // is already reversed (smaller distance = "greater"), so Reverse creates a
+        // double-reversal: heap top becomes the WORST (largest distance). The limit
+        // pop below (line ~1341) correctly removes the worst. But this loop explores
+        // the WORST candidate first instead of the BEST. This is inefficient but not
+        // incorrect — all candidates within beam_width are eventually explored up to
+        // max_iterations. Fix requires separate data structures for exploration order
+        // vs. beam-width limiting, or switching to a best-first heap + tracking the
+        // worst distance manually.
         while let Some(Reverse(current)) = candidates.pop() {
             result.push(current.clone());
             iterations += 1;

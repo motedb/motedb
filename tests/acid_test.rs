@@ -69,7 +69,7 @@ fn test_crud_insert_and_select() {
 
     let rows = select_maps(&db, "SELECT * FROM users");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
+    assert_eq!(rows[0].get("name"), Some(&Value::text("Alice".into())));
     assert_eq!(rows[0].get("age"), Some(&Value::Integer(30)));
 }
 
@@ -84,7 +84,7 @@ fn test_crud_update() {
 
     let rows = select_maps(&db, "SELECT * FROM users");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get("name"), Some(&Value::Text("Bob".into())));
+    assert_eq!(rows[0].get("name"), Some(&Value::text("Bob".into())));
     assert_eq!(rows[0].get("age"), Some(&Value::Integer(25)));
 }
 
@@ -100,7 +100,7 @@ fn test_crud_delete() {
 
     let rows = select_maps(&db, "SELECT * FROM users");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get("name"), Some(&Value::Text("Bob".into())));
+    assert_eq!(rows[0].get("name"), Some(&Value::text("Bob".into())));
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn test_consistency_reinsert_after_delete() {
 
     let rows = select_maps(&db, "SELECT * FROM kv");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get("val"), Some(&Value::Text("restored".into())));
+    assert_eq!(rows[0].get("val"), Some(&Value::text("restored".into())));
 }
 
 #[test]
@@ -260,7 +260,7 @@ fn test_isolation_separate_tables_independent() {
 
     assert_eq!(t1_rows.len(), 0, "t1 should be empty after delete");
     assert_eq!(t2_rows.len(), 1, "t2 should still have its row");
-    assert_eq!(t2_rows[0].get("val"), Some(&Value::Text("table2".into())));
+    assert_eq!(t2_rows[0].get("val"), Some(&Value::text("table2".into())));
 }
 
 #[test]
@@ -275,8 +275,8 @@ fn test_isolation_same_key_different_tables() {
     let alpha = select_maps(&db, "SELECT * FROM alpha WHERE id = 42");
     let beta = select_maps(&db, "SELECT * FROM beta WHERE id = 42");
 
-    assert_eq!(alpha[0].get("data"), Some(&Value::Text("alpha_data".into())));
-    assert_eq!(beta[0].get("data"), Some(&Value::Text("beta_data".into())));
+    assert_eq!(alpha[0].get("data"), Some(&Value::text("alpha_data".into())));
+    assert_eq!(beta[0].get("data"), Some(&Value::text("beta_data".into())));
 }
 
 #[test]
@@ -313,14 +313,14 @@ fn test_isolation_three_tables_full_crud() {
 
     let users = select_maps(&db, "SELECT * FROM users");
     assert_eq!(users.len(), 1);
-    assert_eq!(users[0].get("name"), Some(&Value::Text("Bob".into())));
+    assert_eq!(users[0].get("name"), Some(&Value::text("Bob".into())));
 
     let orders = select_maps(&db, "SELECT * FROM orders");
     assert_eq!(orders.len(), 0);
 
     let products = select_maps(&db, "SELECT * FROM products");
     assert_eq!(products.len(), 1);
-    assert_eq!(products[0].get("title"), Some(&Value::Text("Widget".into())));
+    assert_eq!(products[0].get("title"), Some(&Value::text("Widget".into())));
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -340,8 +340,8 @@ fn test_durability_flush_then_read() {
 
     let rows = select_maps(&db, "SELECT * FROM durable ORDER BY id");
     assert_eq!(rows.len(), 10);
-    assert_eq!(rows[0].get("data"), Some(&Value::Text("data_1".into())));
-    assert_eq!(rows[9].get("data"), Some(&Value::Text("data_10".into())));
+    assert_eq!(rows[0].get("data"), Some(&Value::text("data_1".into())));
+    assert_eq!(rows[9].get("data"), Some(&Value::text("data_10".into())));
 }
 
 #[test]
@@ -365,8 +365,8 @@ fn test_durability_data_persists_across_close() {
 
         let rows = select_maps(&db, "SELECT * FROM persist_test ORDER BY id");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get("val"), Some(&Value::Text("hello".into())));
-        assert_eq!(rows[1].get("val"), Some(&Value::Text("world".into())));
+        assert_eq!(rows[0].get("val"), Some(&Value::text("hello".into())));
+        assert_eq!(rows[1].get("val"), Some(&Value::text("world".into())));
     }
 }
 
@@ -474,7 +474,7 @@ fn test_durability_full_crud_cycle_across_restart() {
         let rows = select_maps(&db, "SELECT * FROM cycle ORDER BY id");
         assert_eq!(rows.len(), 4, "Should have 4 rows (5 inserted - 1 deleted)");
 
-        assert_eq!(rows[2].get("v"), Some(&Value::Text("updated".into())));
+        assert_eq!(rows[2].get("v"), Some(&Value::text("updated".into())));
         let ids: Vec<i64> = rows.iter()
             .filter_map(|r| if let Some(Value::Integer(id)) = r.get("id") { Some(*id) } else { None })
             .collect();
@@ -508,8 +508,8 @@ fn test_multi_table_same_key_persists_across_restart() {
         let alpha = select_maps(&db, "SELECT * FROM alpha WHERE id = 42");
         let beta = select_maps(&db, "SELECT * FROM beta WHERE id = 42");
 
-        assert_eq!(alpha[0].get("data"), Some(&Value::Text("alpha_data".into())));
-        assert_eq!(beta[0].get("data"), Some(&Value::Text("beta_data".into())));
+        assert_eq!(alpha[0].get("data"), Some(&Value::text("alpha_data".into())));
+        assert_eq!(beta[0].get("data"), Some(&Value::text("beta_data".into())));
     }
 }
 

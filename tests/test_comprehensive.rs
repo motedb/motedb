@@ -47,7 +47,7 @@ fn test_ddl_create_drop_create() {
     db.execute("DROP TABLE t").unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
-    assert_eq!(qv(&db, "SELECT name FROM t WHERE id = 1"), Value::Text("alice".into()));
+    assert_eq!(qv(&db, "SELECT name FROM t WHERE id = 1"), Value::text("alice".into()));
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn test_ddl_table_with_all_types() {
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0][1], Value::Integer(-42));
-    assert_eq!(rows[0][3], Value::Text("hello".into()));
+    assert_eq!(rows[0][3], Value::text("hello".into()));
     assert_eq!(rows[2][1], Value::Null);
 }
 
@@ -115,7 +115,7 @@ fn test_insert_null_columns() {
     assert_eq!(rows[0], vec![Value::Integer(1), Value::Null, Value::Null, Value::Null]);
     assert_eq!(rows[1][1], Value::Integer(10));
     assert_eq!(rows[1][2], Value::Null);
-    assert_eq!(rows[2][2], Value::Text("text".into()));
+    assert_eq!(rows[2][2], Value::text("text".into()));
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn test_select_star() {
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 42, 'hello')").unwrap();
     let row = qr(&db, "SELECT * FROM t").unwrap();
-    assert_eq!(row, vec![Value::Integer(1), Value::Integer(42), Value::Text("hello".into())]);
+    assert_eq!(row, vec![Value::Integer(1), Value::Integer(42), Value::text("hello".into())]);
 }
 
 #[test]
@@ -201,8 +201,8 @@ fn test_select_functions() {
     let db = setup_db(dir.path());
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT, v INT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'Hello World', -5)").unwrap();
-    assert_eq!(qv(&db, "SELECT UPPER(s) FROM t"), Value::Text("HELLO WORLD".into()));
-    assert_eq!(qv(&db, "SELECT LOWER(s) FROM t"), Value::Text("hello world".into()));
+    assert_eq!(qv(&db, "SELECT UPPER(s) FROM t"), Value::text("HELLO WORLD".into()));
+    assert_eq!(qv(&db, "SELECT LOWER(s) FROM t"), Value::text("hello world".into()));
     assert_eq!(qv(&db, "SELECT LENGTH(s) FROM t"), Value::Integer(11));
     assert_eq!(qv(&db, "SELECT ABS(v) FROM t"), Value::Integer(5));
 }
@@ -213,7 +213,7 @@ fn test_select_concat() {
     let db = setup_db(dir.path());
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello', 'world')").unwrap();
-    assert_eq!(qv(&db, "SELECT CONCAT(a, ' ', b) FROM t"), Value::Text("hello world".into()));
+    assert_eq!(qv(&db, "SELECT CONCAT(a, ' ', b) FROM t"), Value::text("hello world".into()));
 }
 
 #[test]
@@ -610,7 +610,7 @@ fn test_delete_reinsert() {
     db.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'new')").unwrap();
-    assert_eq!(qv(&db, "SELECT v FROM t WHERE id = 1"), Value::Text("new".into()));
+    assert_eq!(qv(&db, "SELECT v FROM t WHERE id = 1"), Value::text("new".into()));
 }
 
 #[test]
@@ -637,7 +637,7 @@ fn test_prepared_insert_select() {
     for i in 1..=5 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::Text(format!("user{}", i)), Value::Integer(20 + i)],
+            vec![Value::Integer(i), Value::text(format!("user{}", i)), Value::Integer(20 + i)],
         ).unwrap();
     }
 
@@ -647,7 +647,7 @@ fn test_prepared_insert_select() {
             vec![Value::Integer(i)],
         ).unwrap().materialize().unwrap();
         if let QueryResult::Select { rows, .. } = r {
-            assert_eq!(rows[0][0], Value::Text(format!("user{}", i)));
+            assert_eq!(rows[0][0], Value::text(format!("user{}", i)));
         }
     }
 }
@@ -675,8 +675,8 @@ fn test_reopen_full_crud() {
     let db = Database::open(&path).unwrap();
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec![Value::Integer(1), Value::Text("a".into())]);
-    assert_eq!(rows[1], vec![Value::Integer(2), Value::Text("updated".into())]);
+    assert_eq!(rows[0], vec![Value::Integer(1), Value::text("a".into())]);
+    assert_eq!(rows[1], vec![Value::Integer(2), Value::text("updated".into())]);
 }
 
 #[test]
