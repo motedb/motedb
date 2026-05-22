@@ -37,7 +37,6 @@ jobs:
           CI: "1"
         run: |
           cargo test --release --workspace --all-features -- \
-            --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear
 
   publish:

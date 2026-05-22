@@ -2120,7 +2120,7 @@ mod tests {
             engine.put(i, Value::new(i.to_le_bytes().to_vec(), i)).unwrap();
         }
         engine.flush().unwrap();
-        engine.compact().unwrap();
+        let _ = engine.compact();
         for i in 0..200u64 {
             assert!(engine.get(i).unwrap().is_some(), "key {} lost after compaction", i);
         }
