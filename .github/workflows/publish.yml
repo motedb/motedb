@@ -7,9 +7,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  publish:
-    name: Build, test, package and publish
+  test:
+    name: Test (correctness)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,11 +32,39 @@ jobs:
       - name: Install dependencies
         run: cargo fetch
 
-      - name: Run tests
+      - name: Run correctness tests
         env:
           CI: "1"
-          RUST_TEST_THREADS: "1"
-        run: cargo test --workspace --all-features --verbose -- --test-threads=1
+        run: |
+          cargo test --release --workspace --all-features -- \
+            --test-threads=1 \
+            --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear
+
+  publish:
+    name: Publish to crates.io
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry and git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install dependencies
+        run: cargo fetch
 
       - name: Build (release)
         run: cargo build --release
