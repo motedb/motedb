@@ -572,6 +572,30 @@ impl DBConfig {
             ..Default::default()
         }
     }
+
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.num_partitions == 0 {
+            return Err(crate::StorageError::InvalidData(
+                "num_partitions must be >= 1".into()
+            ));
+        }
+        if self.lsm_config.memtable_size_limit == 0 {
+            return Err(crate::StorageError::InvalidData(
+                "lsm.memtable_size_limit must be > 0".into()
+            ));
+        }
+        if self.row_cache_size == Some(0) {
+            return Err(crate::StorageError::InvalidData(
+                "row_cache_size must be > 0 if set".into()
+            ));
+        }
+        if self.query_timeout_secs == Some(0) {
+            return Err(crate::StorageError::InvalidData(
+                "query_timeout_secs must be > 0 if set".into()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// LSM 树配置
@@ -583,8 +607,8 @@ pub struct LSMConfig {
     /// Level 0 SSTable 数量阈值（触发合并）
     pub level0_compaction_threshold: usize,
 
-    /// 布隆过滤器假阳性率
-    pub bloom_filter_false_positive_rate: f64,
+    /// Bloom filter bits per key (higher = less false positives, more memory)
+    pub bloom_bits_per_key: usize,
 
     /// SSTable cache entry count (None = storage default 128)
     pub sstable_cache_size: Option<usize>,
@@ -606,7 +630,7 @@ impl Default for LSMConfig {
         Self {
             memtable_size_limit: 4 * 1024 * 1024, // 4MB
             level0_compaction_threshold: 4,
-            bloom_filter_false_positive_rate: 0.01, // 1%
+            bloom_bits_per_key: 10,
             sstable_cache_size: None,
             sstable_cache_memory_limit_mb: None,
             block_size: None,
@@ -618,7 +642,7 @@ impl Default for LSMConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_durability_levels() {
         let sync = DurabilityLevel::Synchronous;

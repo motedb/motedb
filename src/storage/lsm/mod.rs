@@ -230,7 +230,7 @@ impl LSMConfig {
         Self {
             memtable_size: db_config.memtable_size_limit,
             l0_compaction_trigger: db_config.level0_compaction_threshold,
-            bloom_bits_per_key: db_config.bloom_filter_false_positive_rate as usize,
+            bloom_bits_per_key: db_config.bloom_bits_per_key,
             sstable_cache_size: db_config.sstable_cache_size.unwrap_or(defaults.sstable_cache_size),
             sstable_cache_memory_limit_mb: db_config.sstable_cache_memory_limit_mb.or(defaults.sstable_cache_memory_limit_mb),
             block_size: db_config.block_size.unwrap_or(defaults.block_size),

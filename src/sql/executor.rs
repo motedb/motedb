@@ -229,14 +229,16 @@ impl StreamingQueryResult {
         let sort_specs: Vec<(usize, bool)> = order_clauses.iter().filter_map(|clause| {
             let col_name = match &clause.expr {
                 Expr::Column(name) => name,
-                _ => return None,
+                _ => return None, // Expression ORDER BY not supported in streaming path
             };
             let col_idx = columns.iter().position(|c| c == col_name)?;
             Some((col_idx, clause.asc))
         }).collect();
 
-        if sort_specs.is_empty() {
-            return Ok(());
+        if sort_specs.is_empty() && !order_clauses.is_empty() {
+            return Err(MoteDBError::NotImplemented(
+                "ORDER BY with expressions not supported in streaming queries; use materialize().".into()
+            ));
         }
 
         rows.sort_by(|a, b| {
@@ -1051,6 +1053,8 @@ impl QueryExecutor {
                                 Ok(Value::Bool(b)) => b,
                                 Ok(Value::Integer(i)) => i != 0,
                                 Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                                Ok(Value::Null) => false, // NULL → unknown → exclude row
+                                Err(e) => return Some(Err(e)),
                                 _ => false,
                             };
                             if !matches { return None; }
@@ -1103,6 +1107,8 @@ impl QueryExecutor {
                             Ok(Value::Bool(b)) => b,
                             Ok(Value::Integer(i)) => i != 0,
                             Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                            Ok(Value::Null) => false,
+                            Err(e) => return Some(Err(e)),
                             _ => false,
                         };
                         if !matches { return None; }

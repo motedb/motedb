@@ -1286,6 +1286,10 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
+                // SQL: CAST(NULL AS <any_type>) → NULL
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let target_type = match self.eval(&args[1], row)? {
                     Value::Text(s) => s.to_uppercase(),
                     _ => return Err(MoteDBError::TypeError("CAST() target type must be text".to_string())),
@@ -1328,7 +1332,7 @@ impl ExprEvaluator {
                             Value::Integer(i) => i.to_string(),
                             Value::Float(f) => f.to_string(),
                             Value::Bool(b) => b.to_string(),
-                            Value::Null => "NULL".to_string(),
+                            Value::Null => return Ok(Value::Null),
                             _ => format!("{:?}", val),
                         };
                         Ok(Value::text(text))

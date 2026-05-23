@@ -207,10 +207,16 @@ impl MoteDB {
     
     /// Create a new database with custom configuration
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        config.validate()?;
         let path = path.as_ref();
         let db_path = path.with_extension("mote");
         
         // 🎯 统一目录结构：所有文件放在 {name}.mote/ 目录下
+        if db_path.exists() && db_path.join("lsm").exists() {
+            return Err(StorageError::InvalidData(
+                format!("Database already exists at {:?}; use open() instead of create()", db_path)
+            ));
+        }
         std::fs::create_dir_all(&db_path)?;
 
         // 🔒 Acquire exclusive file lock to prevent concurrent opens
@@ -518,6 +524,7 @@ impl MoteDB {
     /// let db = MoteDB::open_with_config("data.mote", config)?;
     /// ```
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        config.validate()?;
         let path = path.as_ref();
         let db_path = path.with_extension("mote");
 
