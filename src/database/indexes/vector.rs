@@ -73,24 +73,20 @@ impl MoteDB {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
 
-                debug_log!("[create_vector_index] 🔍 使用scan_range扫描LSM（方案B高性能）...");
+                debug_log!("[create_vector_index] 使用scan_range扫描LSM...");
                 let start_time = std::time::Instant::now();
 
-                // 🚀 关键：计算该表的key范围 — 使用与 make_composite_key 一致的 sequential table_id
                 let table_id = self.table_registry.get_table_id(table_name)
                     .unwrap_or(0) as u64;
                 let start_key = table_id << 32;
                 let end_key = (table_id + 1) << 32;
 
-                // 🚀 高性能：一次scan_range扫描所有数据
                 let mut vectors_to_index = Vec::new();
                 match self.lsm_engine.scan_range(start_key, end_key) {
                     Ok(entries) => {
                         for (composite_key, value) in entries {
-                            // 提取row_id
                             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
 
-                            // 反序列化行数据
                             let data_bytes: Vec<u8> = match &value.data {
                                 crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
                                 crate::storage::lsm::ValueData::Blob(blob_ref) => {
@@ -105,31 +101,35 @@ impl MoteDB {
                             };
 
                             if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
-                                if let Some(crate::types::Value::Vector(vec_data)) = row.get(col_position) {
-                                        vectors_to_index.push((row_id, vec_data.to_vec()));
-                                    }
+                                if let Some(f32_vec) = row.get(col_position).and_then(|v| match v {
+                                    crate::types::Value::Vector(vec_data) => Some(vec_data.to_vec()),
+                                    crate::types::Value::Tensor(tensor) => Some(tensor.to_f32()),
+                                    _ => None,
+                                }) {
+                                    vectors_to_index.push((row_id, f32_vec));
                                 }
                             }
                         }
-                        Err(e) => {
-                            debug_log!("[create_vector_index] ⚠️ scan_range失败: {}", e);
-                        }
                     }
-                    
-                    let scan_time = start_time.elapsed();
-
-                    if !vectors_to_index.is_empty() {
-                        debug_log!("[create_vector_index] 🚀 扫描完成：{} 个向量，耗时 {:?}",
-                                 vectors_to_index.len(), scan_time);
-
-                        let build_time = std::time::Instant::now();
-                        index_arc.write().batch_insert(&vectors_to_index)?;
-                        debug_log!("[create_vector_index] ✅ 批量建索引完成！耗时 {:?}", build_time.elapsed());
-                    } else {
-                        debug_log!("[create_vector_index] ⚠️ 未找到任何向量数据（扫描耗时 {:?}）", scan_time);
+                    Err(e) => {
+                        debug_log!("[create_vector_index] scan_range失败: {}", e);
                     }
                 }
+
+                let scan_time = start_time.elapsed();
+
+                if !vectors_to_index.is_empty() {
+                    debug_log!("[create_vector_index] 扫描完成：{} 个向量，耗时 {:?}",
+                             vectors_to_index.len(), scan_time);
+
+                    let build_time = std::time::Instant::now();
+                    index_arc.write().batch_insert(&vectors_to_index)?;
+                    debug_log!("[create_vector_index] 批量建索引完成！耗时 {:?}", build_time.elapsed());
+                } else {
+                    debug_log!("[create_vector_index] 未找到任何向量数据（扫描耗时 {:?}）", scan_time);
+                }
             }
+        }
 
         Ok(())
     }

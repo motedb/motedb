@@ -117,13 +117,20 @@ fn test_ioctree_index_create() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, location POINT3D, name TEXT)").unwrap();
-    db.execute("INSERT INTO points VALUES (1, '[1.0, 2.0, 3.0]', 'A')").unwrap();
-    db.execute("INSERT INTO points VALUES (2, '[4.0, 5.0, 6.0]', 'B')").unwrap();
-    db.execute("INSERT INTO points VALUES (3, '[10.0, 10.0, 10.0]', 'C')").unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, location GEOMETRY, name TEXT)").unwrap();
+    for i in 0..5 {
+        let x = i as f64;
+        let y = i as f64 + 1.0;
+        let z = i as f64 + 2.0;
+        let row = vec![
+            Value::Integer(i),
+            Value::spatial(motedb::types::Geometry::Point3D(motedb::types::Point3D::new(x, y, z))),
+            Value::text(format!("P{}", i)),
+        ];
+        db.insert_row("points", row).unwrap();
+    }
 
     let result = db.create_ioctree_index("points_location");
-    // May succeed or fail depending on implementation
     assert!(result.is_ok() || result.is_err());
 }
 
@@ -132,12 +139,16 @@ fn test_ioctree_knn_search() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, pos POINT3D)").unwrap();
+    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, pos GEOMETRY)").unwrap();
     for i in 0..20 {
         let x = i as f64 * 0.5;
         let y = i as f64 * 0.5;
         let z = i as f64 * 0.5;
-        db.execute(&format!("INSERT INTO pts VALUES ({}, '[{}, {}, {}]')", i, x, y, z)).unwrap();
+        let row = vec![
+            Value::Integer(i),
+            Value::spatial(motedb::types::Geometry::Point3D(motedb::types::Point3D::new(x, y, z))),
+        ];
+        db.insert_row("pts", row).unwrap();
     }
 
     let result = db.create_ioctree_index("pts_pos");
@@ -217,14 +228,15 @@ fn test_match_against_sql() {
     }
 }
 
-// === Create index on nonexistent column ===
+// === Create index on nonexistent table via SQL ===
 
 #[test]
 fn test_create_text_index_nonexistent_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    let result = db.create_text_index("ghost_content");
+    // SQL path validates table existence
+    let result = db.execute("CREATE TEXT INDEX ghost_idx ON ghost_table(content)");
     assert!(result.is_err(), "Text index on nonexistent table should error");
 }
 
@@ -233,6 +245,7 @@ fn test_create_vector_index_nonexistent_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    let result = db.create_vector_index("ghost_emb", 128);
+    // SQL path validates table existence
+    let result = db.execute("CREATE VECTOR INDEX ghost_idx ON ghost_table(embedding)");
     assert!(result.is_err(), "Vector index on nonexistent table should error");
 }

@@ -5670,30 +5670,10 @@ impl QueryExecutor {
                 self.db.index_registry.register(metadata)?;
             }
             IndexType::Vector => {
-                // 1️⃣ Create empty vector index
+                // create_vector_index already scans existing data and builds the index
                 if let ColumnType::Tensor(dim) = column.col_type {
                     self.db.create_vector_index(&index_name, dim, stmt.metric.as_deref())?;
-                    
-                    // 2️⃣ Backfill existing data (critical fix!)
-                    let column_pos = schema.get_column_position(&stmt.column)
-                        .ok_or_else(|| MoteDBError::ColumnNotFound(stmt.column.clone()))?;
-                    
-                    let mut vectors_to_insert = Vec::new();
-                    let iter = self.db.scan_table_rows_streaming(&stmt.table)?;
 
-                    for result in iter {
-                        let (row_id, row) = result?;
-                        if let Some(Value::Tensor(tensor)) = row.get(column_pos) {
-                            let f32_vec = tensor.to_f32();
-                            vectors_to_insert.push((row_id, f32_vec));
-                        }
-                    }
-                    
-                    if !vectors_to_insert.is_empty() {
-                        let _backfill_count = self.db.batch_insert_vectors(&index_name, &vectors_to_insert)?;
-                    }
-                    
-                    // 3️⃣ Register metadata
                     let mut metadata = crate::database::index_metadata::IndexMetadata::new(
                         index_name.clone(),
                         stmt.table.clone(),

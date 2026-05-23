@@ -561,6 +561,7 @@ impl Parser {
             TokenType::Boolean => DataType::Boolean,
             TokenType::Timestamp => DataType::Timestamp,
             TokenType::Geometry => DataType::Geometry,
+            TokenType::Identifier(name) if name.to_uppercase() == "POINT3D" => DataType::Geometry,
             TokenType::Vector => {
                 self.advance();
                 if self.match_token(TokenType::LParen) {
@@ -994,7 +995,7 @@ impl Parser {
                         };
                         use crate::types::{Geometry as G3, Point3D};
                         Ok(Expr::Literal(Value::spatial(G3::Point3D(Point3D::new(x, y, z)))))
-                    } else if name.to_uppercase() == "MATCH" {
+                    } else if name.to_uppercase() == "MATCH" || name.to_uppercase() == "MATCH_AGAINST" {
                         // MATCH(column) AGAINST(query) or MATCH(column, query)
                         if args.len() == 2 {
                             // Short form: MATCH(column, query_text)

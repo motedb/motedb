@@ -1203,6 +1203,8 @@ pub struct SSTableIterator {
     current_block_idx: usize,
     current_block_entries: Vec<(Key, Value)>,
     position_in_block: usize,
+    /// Skip entries with key < start_key (inclusive lower bound)
+    start_key: Option<Key>,
     /// Stop when key >= end_key (exclusive upper bound)
     end_key: Option<Key>,
 }
@@ -1223,7 +1225,7 @@ impl SSTableIterator {
 
         Ok(Self {
             file, index_entries, current_block_idx: start_block_idx,
-            current_block_entries: Vec::new(), position_in_block: 0, end_key,
+            current_block_entries: Vec::new(), position_in_block: 0, start_key, end_key,
         })
     }
 
@@ -1271,6 +1273,13 @@ impl Iterator for SSTableIterator {
         loop {
             if self.position_in_block < self.current_block_entries.len() {
                 let (key, value) = &self.current_block_entries[self.position_in_block];
+                // Range check: skip entries below start_key
+                if let Some(start) = self.start_key {
+                    if *key < start {
+                        self.position_in_block += 1;
+                        continue;
+                    }
+                }
                 // Range check: stop at end_key (exclusive upper bound)
                 if let Some(end) = self.end_key {
                     if *key >= end { return None; }
