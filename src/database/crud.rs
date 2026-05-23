@@ -422,7 +422,7 @@ impl MoteDB {
                 .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
 
         // 5. Write to WAL first (durability) — raw bytes
-        self.wal.log_update_raw_ref(table_name, partition, composite_key, &raw_old, &raw_new, 0)?;
+        self.wal.log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
 
         // 6. Update in LSM MemTable (same bytes as WAL)
         // Use unified write_lsn for monotonically increasing timestamps.

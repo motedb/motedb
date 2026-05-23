@@ -96,7 +96,7 @@ impl SQ8Vectors {
             index_count: Arc::new(RwLock::new(0)),
             count: Arc::new(RwLock::new(0)),
             cache: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_size).unwrap(),
+                NonZeroUsize::new(cache_size.max(1)).unwrap(),
             ))),
             quantized_cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size * 2).unwrap(),
@@ -157,7 +157,7 @@ impl SQ8Vectors {
             index_count: Arc::new(RwLock::new(index_count)),
             count: Arc::new(RwLock::new(index_count)),
             cache: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_size).unwrap(),
+                NonZeroUsize::new(cache_size.max(1)).unwrap(),
             ))),
             quantized_cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size * 2).unwrap(),

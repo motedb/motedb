@@ -101,7 +101,7 @@ impl DiskGraph {
             index_count: Arc::new(RwLock::new(0)),
             count: Arc::new(RwLock::new(0)),
             cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(cache_capacity).unwrap(),
+                NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
             hot_nodes: Arc::new(RwLock::new(HashSet::new())),
             hot_cache: Arc::new(RwLock::new(LruCache::new(
@@ -179,7 +179,7 @@ impl DiskGraph {
             index_count: Arc::new(RwLock::new(index_count)),
             count: Arc::new(RwLock::new(index_count)),
             cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(cache_capacity).unwrap(),
+                NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
             hot_nodes: Arc::new(RwLock::new(HashSet::new())),
             hot_cache: Arc::new(RwLock::new(LruCache::new(

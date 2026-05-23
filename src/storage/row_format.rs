@@ -25,13 +25,19 @@ const FIXED_COL_SIZE: usize = 8;
 
 /// Encode a row into compact RawRow format.
 pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
-    let col_count = row.len().min(64);
-    if col_count != col_types.len() {
+    if row.len() != col_types.len() {
         return Err(StorageError::InvalidData(format!(
             "Row column count ({}) doesn't match schema ({})",
-            col_count, col_types.len()
+            row.len(), col_types.len()
         )));
     }
+    if row.len() > 64 {
+        return Err(StorageError::InvalidData(format!(
+            "Row has {} columns, max 64 supported",
+            row.len()
+        )));
+    }
+    let col_count = row.len();
 
     let mut buf = Vec::with_capacity(64 + col_count * 16);
     let mut null_bitmap: u64 = 0;

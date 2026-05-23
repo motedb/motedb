@@ -2027,12 +2027,20 @@ impl QueryExecutor {
                     return Ok(Value::Bool(false));
                 }
                 let mut found = false;
+                let mut has_null = false;
                 for item in list {
                     let item_val = Self::eval_expr_on_row(item, row, schema)?;
+                    if matches!(item_val, Value::Null) {
+                        has_null = true;
+                        continue;
+                    }
                     if val == item_val {
                         found = true;
                         break;
                     }
+                }
+                if *negated && !found && has_null {
+                    return Ok(Value::Bool(false));
                 }
                 Ok(Value::Bool(if *negated { !found } else { found }))
             }
@@ -2894,7 +2902,7 @@ impl QueryExecutor {
         } else if self.has_aggregates(&stmt.columns) {
             // Implicit aggregation (e.g., SELECT COUNT(*) FROM table)
             // Treat as GROUP BY with no grouping columns (entire table is one group)
-            self.apply_group_by(&stmt.columns, &filtered_rows, &[], None)?
+            self.apply_group_by(&stmt.columns, &filtered_rows, &[], stmt.having.as_ref())?
         } else {
             // No aggregation - simple projection
             self.project_columns(&stmt.columns, &filtered_rows, &combined_schema)?

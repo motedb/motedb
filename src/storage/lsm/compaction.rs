@@ -389,7 +389,7 @@ impl CompactionWorker {
                             min_key,
                             max_key,
                             min_timestamp,
-                            max_timestamp: min_timestamp,
+                            max_timestamp: u64::MAX,
                             bloom_filter: None,
                         };
                         discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
@@ -771,7 +771,7 @@ impl CompactionWorker {
 
         let now_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as u64;
         let tombstone_ttl_micros: u64 = self.config.lsm_config.tombstone_ttl_secs * 1_000_000;
 

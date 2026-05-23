@@ -278,18 +278,29 @@ impl ExprEvaluator {
             Expr::In { expr, list, negated } => {
                 let val = self.eval(expr, row)?;
 
-                // SQL NULL semantics: NULL IN (...) returns NULL (unknown)
+                // SQL NULL semantics: NULL IN (...) returns false (unknown)
                 if matches!(val, Value::Null) {
-                    return Ok(Value::Bool(false)); // NULL rows excluded from WHERE
+                    return Ok(Value::Bool(false));
                 }
 
                 let mut found = false;
+                let mut has_null = false;
 
                 for item in list {
                     let item_val = self.eval(item, row)?;
+                    if matches!(item_val, Value::Null) {
+                        has_null = true;
+                        continue;
+                    }
                     if val == item_val {
                         found = true;
                         break;
+                    }
+                }
+                // SQL: NOT IN (list with NULL) → unknown → false if no match
+                if *negated && !found {
+                    if has_null {
+                        return Ok(Value::Bool(false));
                     }
                 }
                 Ok(Value::Bool(if *negated { !found } else { found }))
@@ -371,11 +382,23 @@ impl ExprEvaluator {
     }
     
     fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
-        // SQL NULL semantics: any comparison with NULL yields false (not NULL).
-        // This prevents `WHERE col = NULL` from matching rows and
-        // `DELETE WHERE col = NULL` from deleting unintended rows.
-        if matches!(&left, Value::Null) || matches!(&right, Value::Null) {
-            return Ok(Value::Bool(false));
+        // SQL NULL semantics: NULL comparison → false (for WHERE filtering),
+        // NULL arithmetic → NULL (for SELECT projection correctness).
+        let either_null = matches!(&left, Value::Null) || matches!(&right, Value::Null);
+        if either_null {
+            match op {
+                // Comparison/boolean: NULL → UNKNOWN → false for filtering
+                BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt |
+                BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge |
+                BinaryOperator::And | BinaryOperator::Or => return Ok(Value::Bool(false)),
+                // Arithmetic/distance: NULL propagates
+                BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul |
+                BinaryOperator::Div | BinaryOperator::Mod |
+                BinaryOperator::L2Distance | BinaryOperator::CosineDistance |
+                BinaryOperator::DotProduct => {
+                    return Ok(Value::Null);
+                }
+            }
         }
 
         match op {

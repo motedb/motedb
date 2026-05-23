@@ -1290,7 +1290,10 @@ impl Iterator for SSTableIterator {
             match self.load_next_block() {
                 Ok(true) => continue,
                 Ok(false) => return None,
-                Err(_) => return None,
+                Err(e) => {
+                    eprintln!("[MoteDB] SSTableIterator: failed to load block: {}", e);
+                    return None;
+                }
             }
         }
     }

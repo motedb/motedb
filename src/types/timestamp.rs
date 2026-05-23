@@ -34,7 +34,7 @@ impl Timestamp {
     pub fn now() -> Self {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+            .unwrap_or_default();
         
         Self {
             micros: duration.as_micros() as i64,
