@@ -1573,25 +1573,25 @@ impl ExprEvaluator {
     fn st_distance(&self, p1: Value, p2: Value) -> Result<Value> {
         use crate::types::Geometry;
 
-        let (x1, y1) = match p1 {
+        let (x1, y1, z1) = match p1 {
             Value::Spatial(g) => match &*g {
-                Geometry::Point(p) => (p.x, p.y),
-                Geometry::Point3D(p) => (p.x, p.y),
+                Geometry::Point(p) => (p.x, p.y, 0.0),
+                Geometry::Point3D(p) => (p.x, p.y, p.z),
                 _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
             },
             _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
         };
 
-        let (x2, y2) = match p2 {
+        let (x2, y2, z2) = match p2 {
             Value::Spatial(g) => match &*g {
-                Geometry::Point(p) => (p.x, p.y),
-                Geometry::Point3D(p) => (p.x, p.y),
+                Geometry::Point(p) => (p.x, p.y, 0.0),
+                Geometry::Point3D(p) => (p.x, p.y, p.z),
                 _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
             },
             _ => return Err(MoteDBError::TypeError("ST_Distance requires spatial point arguments".to_string())),
         };
 
-        let dist = ((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt();
+        let dist = ((x1 - x2).powi(2) + (y1 - y2).powi(2) + (z1 - z2).powi(2)).sqrt();
         Ok(Value::Float(dist))
     }
 

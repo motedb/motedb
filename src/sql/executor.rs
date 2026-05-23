@@ -1442,17 +1442,17 @@ impl QueryExecutor {
                     let p2 = Self::eval_expr_on_row(&args[1], row, schema)?;
                     match (&p1, &p2) {
                         (Value::Spatial(a), Value::Spatial(b)) => {
-                            let (x1, y1) = match &**a {
-                                crate::types::Geometry::Point(p) => (p.x, p.y),
-                                crate::types::Geometry::Point3D(p) => (p.x, p.y),
+                            let (x1, y1, z1) = match &**a {
+                                crate::types::Geometry::Point(p) => (p.x, p.y, 0.0),
+                                crate::types::Geometry::Point3D(p) => (p.x, p.y, p.z),
                                 _ => return Ok(Value::Null),
                             };
-                            let (x2, y2) = match &**b {
-                                crate::types::Geometry::Point(p) => (p.x, p.y),
-                                crate::types::Geometry::Point3D(p) => (p.x, p.y),
+                            let (x2, y2, z2) = match &**b {
+                                crate::types::Geometry::Point(p) => (p.x, p.y, 0.0),
+                                crate::types::Geometry::Point3D(p) => (p.x, p.y, p.z),
                                 _ => return Ok(Value::Null),
                             };
-                            Ok(Value::Float(((x1 - x2).powi(2) + (y1 - y2).powi(2)).sqrt()))
+                            Ok(Value::Float(((x1 - x2).powi(2) + (y1 - y2).powi(2) + (z1 - z2).powi(2)).sqrt()))
                         }
                         _ => Ok(Value::Null),
                     }
