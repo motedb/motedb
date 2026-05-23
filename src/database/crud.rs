@@ -205,8 +205,13 @@ impl MoteDB {
                     col_name,
                     crate::database::index_metadata::IndexType::Vector
                 ) {
-                    if let crate::types::Value::Vector(vec) = col_value {
-                        if let Err(_e) = self.update_vector(row_id, &index_name, vec.as_slice()) {
+                    let f32_vec = match col_value {
+                        crate::types::Value::Vector(vec) => Some(vec.as_slice().to_vec()),
+                        crate::types::Value::Tensor(tensor) => Some(tensor.to_f32()),
+                        _ => None,
+                    };
+                    if let Some(vec) = f32_vec {
+                        if let Err(_e) = self.update_vector(row_id, &index_name, &vec) {
                             debug_log!("[insert_row] Failed to update vector index '{}': {}", index_name, _e);
                             index_errors.push(index_name.clone());
                         }
@@ -492,16 +497,23 @@ impl MoteDB {
 
             // 6.2 Vector Index
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.vector_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Vector
+                ) {
                     let mut failed = false;
                     if let Err(_e) = self.delete_vector(row_id, &index_name) {
                         debug_log!("[update_row] Failed to delete old vector '{}': {}", index_name, _e);
                         failed = true;
                     }
 
-                    if let Some(crate::types::Value::Vector(new_vec)) = new_value {
-                        if let Err(_e) = self.update_vector(row_id, &index_name, new_vec.as_slice()) {
+                    if let Some(new_vec) = new_value.and_then(|v| match v {
+                        crate::types::Value::Vector(vec) => Some(vec.as_slice().to_vec()),
+                        crate::types::Value::Tensor(tensor) => Some(tensor.to_f32()),
+                        _ => None,
+                    }) {
+                        if let Err(_e) = self.update_vector(row_id, &index_name, &new_vec) {
                             debug_log!("[update_row] Failed to update vector index '{}': {}", index_name, _e);
                             failed = true;
                         }
@@ -514,8 +526,7 @@ impl MoteDB {
 
             // 6.3 Text Index
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.text_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
                     if let (Some(crate::types::Value::Text(old_text)), Some(crate::types::Value::Text(new_text))) = (old_value, new_value) {
                         if let Err(_e) = self.update_text(row_id, &index_name, old_text, new_text) {
                             debug_log!("[update_row] Failed to update text index '{}': {}", index_name, _e);
@@ -679,8 +690,11 @@ impl MoteDB {
 
             // Vector Index
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.vector_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Vector
+                ) {
                     if let Err(_e) = self.delete_vector(row_id, &index_name) {
                         debug_log!("[delete_row] Failed to delete from vector index '{}': {}", index_name, _e);
                         self.index_registry.mark_stale(&index_name);
@@ -690,8 +704,7 @@ impl MoteDB {
 
             // Text Index
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                let index_name = format!("{}_{}", table_name, col_name);
-                if self.text_indexes.contains_key(&index_name) {
+                if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Text) {
                     if let crate::types::Value::Text(text) = col_value {
                         if let Err(_e) = self.delete_text(row_id, &index_name, text) {
                             debug_log!("[delete_row] Failed to delete from text index '{}': {}", index_name, _e);

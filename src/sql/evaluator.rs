@@ -406,8 +406,8 @@ impl ExprEvaluator {
         }
 
         match op {
-            BinaryOperator::Eq => Ok(Value::Bool(left == right)),
-            BinaryOperator::Ne => Ok(Value::Bool(left != right)),
+            BinaryOperator::Eq => Ok(Value::Bool(left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal))),
+            BinaryOperator::Ne => Ok(Value::Bool(left.partial_cmp(&right) != Some(std::cmp::Ordering::Equal))),
             BinaryOperator::Lt => {
                 // 🐛 DEBUG: Print comparison for debugging
                 let result = left < right;

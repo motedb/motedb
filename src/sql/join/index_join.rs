@@ -81,10 +81,10 @@ impl IndexNestedLoopJoin {
         Ok(results)
     }
     
-    /// Check if index exists
+    /// Check if a column index exists (metadata-only check, no I/O)
     fn check_index_exists(&self, table_name: &str, column_name: &str) -> bool {
-        // 尝试查询一个虚拟值来检测索引是否存在
-        self.db.query_by_column(table_name, column_name, &Value::Integer(0)).is_ok()
+        let index_name = format!("{}.{}", table_name, column_name);
+        self.db.column_indexes.contains_key(&index_name)
     }
     
     /// Index lookup: query by column value

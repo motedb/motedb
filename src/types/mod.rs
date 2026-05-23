@@ -201,9 +201,6 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
-            // Cross-type: Integer == Float
-            (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(a), Value::Integer(b)) => *a == (*b as f64),
             _ => false,
         }
     }

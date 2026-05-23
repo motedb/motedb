@@ -844,9 +844,10 @@ impl QueryExecutor {
                             }))
                             .take(take_n)
                             .collect();
+                        let collected: Result<Vec<_>> = rows.into_iter().collect();
                         return Ok(StreamingQueryResult::SelectReady {
                             columns: column_names,
-                            rows: rows.into_iter().filter_map(|r| r.ok()).collect(),
+                            rows: collected?,
                         });
                     }
                 }
@@ -1507,14 +1508,14 @@ impl QueryExecutor {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Bool(false))
                         } else {
-                            Ok(Value::Bool(lv == rv))
+                            Ok(Value::Bool(lv.partial_cmp(&rv) == Some(std::cmp::Ordering::Equal)))
                         }
                     }
                     BinaryOperator::Ne => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Bool(false))
                         } else {
-                            Ok(Value::Bool(lv != rv))
+                            Ok(Value::Bool(lv.partial_cmp(&rv) != Some(std::cmp::Ordering::Equal)))
                         }
                     }
                     BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
@@ -1953,14 +1954,14 @@ impl QueryExecutor {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Null) // SQL: NULL = anything => NULL
                         } else {
-                            Ok(Value::Bool(lv == rv))
+                            Ok(Value::Bool(lv.partial_cmp(&rv) == Some(std::cmp::Ordering::Equal)))
                         }
                     }
                     BinaryOperator::Ne => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
                             Ok(Value::Null) // SQL: NULL != anything => NULL
                         } else {
-                            Ok(Value::Bool(lv != rv))
+                            Ok(Value::Bool(lv.partial_cmp(&rv) != Some(std::cmp::Ordering::Equal)))
                         }
                     }
                     BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
@@ -6143,9 +6144,12 @@ impl QueryExecutor {
                     _ => return None,
                 };
                 
-                // Extract k
+                // Extract k (reject non-positive values to prevent OOM)
                 let k = match &args[2] {
-                    Expr::Literal(Value::Integer(k)) => *k as usize,
+                    Expr::Literal(Value::Integer(k)) => {
+                        if *k <= 0 { return None; }
+                        (*k).min(10000) as usize
+                    }
                     _ => return None,
                 };
                 

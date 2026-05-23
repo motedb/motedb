@@ -15,6 +15,7 @@ use crate::error::Result;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum HashKey {
     Integer(i64),
+    Float(u64), // f64 bits for hashable representation
     Text(String),
     Bool(bool),
 }
@@ -23,10 +24,14 @@ impl HashKey {
     fn from_value(value: &Value) -> Option<Self> {
         match value {
             Value::Integer(i) => Some(HashKey::Integer(*i)),
+            Value::Float(f) => {
+                let canonical = if *f == 0.0 { 0.0f64 } else { *f };
+                Some(HashKey::Float(canonical.to_bits()))
+            }
             Value::Text(s) => Some(HashKey::Text(s.clone())),
             Value::Bool(b) => Some(HashKey::Bool(*b)),
             Value::Null => None, // SQL: NULL != NULL in joins
-            _ => None, // Float/Vector/Tensor 等不能直接 hash
+            _ => None, // Vector/Tensor etc. cannot hash directly
         }
     }
 }

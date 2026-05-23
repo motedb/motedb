@@ -124,7 +124,10 @@ impl VersionStore {
         Ok(())
     }
     
-    /// Update a row (creates a new version)
+    /// Update a row (creates a new version).
+    ///
+    /// Atomically marks the old version's `end_ts` and prepends the new version
+    /// under the same write lock, preventing lost-update races.
     pub fn update_version(
         &self,
         row_id: RowId,
@@ -132,19 +135,41 @@ impl VersionStore {
         txn_id: TransactionId,
         timestamp: Timestamp,
     ) -> Result<()> {
-        // Mark old version as invalid
+        let mut new_version = Box::new(RowVersion {
+            data: new_data,
+            txn_id,
+            begin_ts: timestamp,
+            end_ts: AtomicU64::new(0),
+            deleted: AtomicBool::new(false),
+            next: None,
+        });
+
+        // Ensure chain exists
+        self.versions.entry(row_id).or_insert_with(VersionChain::new);
+
         if let Some(chain) = self.versions.get(&row_id) {
-            let head = chain.head.read();
+            let mut head = chain.head.write();
+
+            // Mark old version as superseded
             if let Some(old_version) = head.as_ref() {
                 old_version.end_ts.store(timestamp, Ordering::Release);
             }
+
+            // Link and prepend atomically under the same write lock
+            new_version.next = head.take();
+            *head = Some(new_version);
+            chain.version_count.fetch_add(1, Ordering::Relaxed);
         }
-        
-        // Insert new version
-        self.insert_version(row_id, new_data, txn_id, timestamp)
+
+        self.evict_if_needed();
+
+        Ok(())
     }
     
-    /// Delete a row (marks latest version as deleted)
+    /// Delete a row (marks latest version as deleted).
+    ///
+    /// Atomically sets `end_ts` on the old head and prepends a tombstone
+    /// under the same write lock, preventing lost-update races.
     pub fn delete_version(
         &self,
         row_id: RowId,
@@ -153,18 +178,8 @@ impl VersionStore {
     ) -> Result<()> {
         let chain = self.versions.get(&row_id)
             .ok_or_else(|| StorageError::InvalidData(format!("Row {} not found", row_id)))?;
-        
-        // Mark current version as deleted
-        {
-            let head = chain.head.read();
-            if let Some(version) = head.as_ref() {
-                version.end_ts.store(timestamp, Ordering::Release);
-            }
-            // Drop read lock before prepend
-        }
-        
-        // Insert tombstone
-        let tombstone = Box::new(RowVersion {
+
+        let mut tombstone = Box::new(RowVersion {
             data: vec![],
             txn_id,
             begin_ts: timestamp,
@@ -172,8 +187,17 @@ impl VersionStore {
             deleted: AtomicBool::new(true),
             next: None,
         });
-        
-        chain.prepend(tombstone);
+
+        // Atomically mark old head and prepend tombstone under one write lock
+        {
+            let mut head = chain.head.write();
+            if let Some(old_version) = head.as_ref() {
+                old_version.end_ts.store(timestamp, Ordering::Release);
+            }
+            tombstone.next = head.take();
+            *head = Some(tombstone);
+        }
+        chain.version_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
