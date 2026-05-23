@@ -17,7 +17,6 @@ enum HashKey {
     Integer(i64),
     Text(String),
     Bool(bool),
-    Null,
 }
 
 impl HashKey {
@@ -26,7 +25,7 @@ impl HashKey {
             Value::Integer(i) => Some(HashKey::Integer(*i)),
             Value::Text(s) => Some(HashKey::Text(s.clone())),
             Value::Bool(b) => Some(HashKey::Bool(*b)),
-            Value::Null => Some(HashKey::Null),
+            Value::Null => None, // SQL: NULL != NULL in joins
             _ => None, // Float/Vector/Tensor 等不能直接 hash
         }
     }
@@ -97,37 +96,34 @@ impl HashJoinExecutor {
     /// LEFT OUTER JOIN probe
     /// Returns all probe rows, with NULLs for non-matching build rows
     pub fn probe_left(&self, rows: Vec<SqlRow>, key_col: &str, build_columns: &[String]) -> Result<Vec<SqlRow>> {
-        // 🚀 P1 优化：LEFT JOIN 至少返回所有左表行
         let mut results = Vec::with_capacity(rows.len());
-        
+
         for probe_row in rows {
+            let mut matched = false;
             if let Some(value) = probe_row.get(key_col) {
                 if let Some(key) = HashKey::from_value(value) {
                     if let Some(build_rows) = self.hash_table.get(&key) {
-                        // Match found
                         for build_row in build_rows {
                             let merged = Self::merge_rows(build_row, &probe_row);
                             results.push(merged);
+                            matched = true;
                         }
-                    } else {
-                        // No match: add probe row with NULLs for build columns
-                        // 🚀 P2 优化：预分配容量
-                        let mut merged = SqlRow::with_capacity(probe_row.len() + build_columns.len());
-                        
-                        // 移动 probe_row
-                        for (col, val) in probe_row.into_iter() {
-                            merged.insert(col, val);
-                        }
-                        
-                        for col in build_columns {
-                            merged.insert(col.clone(), Value::Null);
-                        }
-                        results.push(merged);
                     }
                 }
             }
+            if !matched {
+                // No match: add probe row with NULLs for build columns
+                let mut merged = SqlRow::with_capacity(probe_row.len() + build_columns.len());
+                for (col, val) in probe_row.iter() {
+                    merged.insert(col.clone(), val.clone());
+                }
+                for col in build_columns {
+                    merged.insert(col.clone(), Value::Null);
+                }
+                results.push(merged);
+            }
         }
-        
+
         Ok(results)
     }
     

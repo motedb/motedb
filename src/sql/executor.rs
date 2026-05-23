@@ -3270,10 +3270,9 @@ impl QueryExecutor {
             Text(String),
             Bool(bool),
             Float(u64), // Use bits representation for float
-            Null,
         }
         
-        // Fast conversion from Value to HashKey
+        // Fast conversion from Value to HashKey (NULL excluded for SQL semantics)
         #[inline]
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
@@ -3281,7 +3280,7 @@ impl QueryExecutor {
                 Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Float(f) => Some(HashKey::Float(f.to_bits())),
-                Value::Null => Some(HashKey::Null),
+                Value::Null => None, // SQL: NULL != NULL in joins
                 _ => None, // Vector/Tensor cannot hash directly
             }
         }

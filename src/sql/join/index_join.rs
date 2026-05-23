@@ -99,34 +99,25 @@ impl IndexNestedLoopJoin {
         inner_table: &str,
         join_column: &str,
     ) -> Result<Vec<SqlRow>> {
-        // 🚀 P1 优化：预分配容量（嵌套循环可能返回很多行）
         let mut results = Vec::with_capacity(outer_rows.len() * 2);
-        
-        // Scan inner table (estimate max 100K rows)
-        let max_rows = 100_000_u64;
-        
+
         for outer_row in outer_rows {
             let outer_key = outer_row.get(join_column);
-            
-            for row_id in 0..max_rows {
-                match self.db.get_table_row(inner_table, row_id) {
-                    Ok(Some(inner_row_data)) => {
-                        let inner_row = self.vec_to_sql_row(&inner_row_data, inner_table)?;
-                        
-                        // Check if join keys match
-                        if let Some(inner_key) = inner_row.get(join_column) {
-                            if outer_key == Some(inner_key) {
-                                let merged = Self::merge_rows(&outer_row, &inner_row);
-                                results.push(merged);
-                            }
-                        }
+
+            // Scan inner table via proper iterator (handles gaps, deleted rows)
+            let iter = self.db.scan_table_rows(inner_table)?;
+            for inner_row_data in iter {
+                let inner_row = self.vec_to_sql_row(&inner_row_data, inner_table)?;
+
+                if let Some(inner_key) = inner_row.get(join_column) {
+                    if outer_key == Some(inner_key) {
+                        let merged = Self::merge_rows(&outer_row, &inner_row);
+                        results.push(merged);
                     }
-                    Ok(None) => break, // No more rows
-                    Err(_) => break,   // Error or end of table
                 }
             }
         }
-        
+
         Ok(results)
     }
     

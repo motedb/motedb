@@ -1296,13 +1296,12 @@ impl<K: BTreeKey> GenericBTree<K> {
                 offsets[idx]
             };
 
-            let mut file = self.storage_file.write();
-
-            file.seek(SeekFrom::Start(file_offset))?;
+            use std::os::unix::fs::FileExt;
+            let file = self.storage_file.read();
 
             let mut page_buf = vec![0u8; PAGE_SIZE];
-            file.read_exact(&mut page_buf)?;
-            
+            file.read_exact_at(&mut page_buf, file_offset)?;
+
             // Parse overflow page
             let next_page_id = u64::from_le_bytes([
                 page_buf[0], page_buf[1], page_buf[2], page_buf[3],
@@ -1580,19 +1579,19 @@ impl<K: BTreeKey> GenericBTree<K> {
                 page_offsets_snapshot[idx]
             };
 
-            // Load from disk
+            // Load from disk using positional read (no write lock)
             match (|| -> Result<Page<K>> {
-                let mut file = self.storage_file.write();
-                file.seek(SeekFrom::Start(file_offset))?;
+                use std::os::unix::fs::FileExt;
+                let file = self.storage_file.read();
+
                 let mut header_buf = [0u8; HEADER_SIZE];
-                file.read_exact(&mut header_buf)?;
+                file.read_exact_at(&mut header_buf, file_offset)?;
                 let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
                 if content_len < HEADER_SIZE || content_len > PAGE_SIZE {
                     return Err(StorageError::Corruption("bad content_len".into()));
                 }
                 let mut buf = vec![0u8; content_len];
-                file.seek(SeekFrom::Start(file_offset))?;
-                file.read_exact(&mut buf)?;
+                file.read_exact_at(&mut buf, file_offset)?;
                 Page::deserialize(*page_id, &buf, self.key_size)
             })() {
                 Ok(page) => pages.push((*page_id, page)),
