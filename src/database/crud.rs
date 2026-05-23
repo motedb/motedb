@@ -145,7 +145,10 @@ impl MoteDB {
             .or_else(|_| bincode::serialize(&row)
                 .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
 
-        // 6. Write to WAL first (durability) — by reference, zero clone
+        // 6. Increment pending counter BEFORE WAL write (checkpoint uses this as barrier)
+        self.increment_pending_updates();
+
+        // 7. Write to WAL first (durability) — by reference, zero clone
         self.wal.log_insert_raw_ref(table_name, partition, row_id, &row_data, 0)?;
 
         // 7. Write to LSM MemTable (invalidate cache first for TOCTOU safety)
@@ -246,10 +249,7 @@ impl MoteDB {
         }
         } // end index_update_strategy check
 
-        // 9. Increment pending counter
-        self.increment_pending_updates();
-
-        // 10. Increment row count for COUNT(*) fast path
+        // 9. Increment row count for COUNT(*) fast path
         if let Some(counter) = self.table_row_count.get(table_name) {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -419,7 +419,10 @@ impl MoteDB {
             .or_else(|_| bincode::serialize(&new_row)
                 .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
 
-        // 5. Write to WAL first (durability) — raw bytes
+        // 5. Increment pending counter BEFORE WAL write (checkpoint barrier)
+        self.increment_pending_updates();
+
+        // 6. Write to WAL first (durability) — raw bytes
         self.wal.log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
 
         // 6. Update in LSM MemTable (same bytes as WAL)
@@ -606,6 +609,7 @@ impl MoteDB {
         let raw_old = row_format::encode(&old_row, col_types)
             .or_else(|_| bincode::serialize(&old_row)
                 .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
+        self.increment_pending_updates();
         self.wal.log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
 
         // 6. Invalidate cache BEFORE tombstone write (prevent TOCTOU stale reads)
@@ -1074,7 +1078,10 @@ impl MoteDB {
             kvs.push((composite_key, value));
         }
 
-        // 5. Batch write WAL (single fsync)
+        // 5. Increment pending counter BEFORE batch WAL write (checkpoint barrier)
+        let old_count = self.pending_updates.fetch_add(rows.len(), std::sync::atomic::Ordering::Release);
+
+        // 6. Batch write WAL (single fsync)
         self.wal.batch_append(0, wal_records)?;
 
         // 6. Batch write LSM MemTable (single lock)
@@ -1196,17 +1203,9 @@ impl MoteDB {
             counter.fetch_add(rows.len() as u64, Ordering::SeqCst);
         }
 
-        // 9. Increment pending counter
-        // 🚀 P0 CRITICAL FIX: 使用原子操作避免锁竞争
-        {
-            use std::sync::atomic::Ordering;
-            let old_count = self.pending_updates.fetch_add(rows.len(), Ordering::Relaxed);
-            
-            // 每2000条触发flush（与LSM一致）
-            if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
-                debug_log!("[AUTO-FLUSH] Batch insert triggered after {} writes", old_count + rows.len());
-                self.request_auto_flush();
-            }
+        // Auto-flush trigger (pending counter already incremented before WAL write)
+        if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
+            self.request_auto_flush();
         }
 
         Ok(row_ids)
@@ -1311,7 +1310,7 @@ impl MoteDB {
     fn increment_pending_updates(&self) {
         use std::sync::atomic::Ordering;
         
-        let count = self.pending_updates.fetch_add(1, Ordering::Relaxed);
+        let count = self.pending_updates.fetch_add(1, Ordering::Release);
         
         // 每2000条触发一次flush（与LSM一致）
         if count.is_multiple_of(2_000) && count > 0 {

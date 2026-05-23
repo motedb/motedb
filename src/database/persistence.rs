@@ -117,8 +117,8 @@ impl MoteDB {
     }
 
     fn checkpoint_impl(&self, rebuild_indexes: bool) -> Result<()> {
-        let pending_count = self.pending_updates.load(Ordering::Relaxed);
-        if pending_count == 0 {
+        let pending_before = self.pending_updates.load(Ordering::Acquire);
+        if pending_before == 0 {
             let wal_dir = self.path.join("wal");
             if let Ok(wal_size) = super::helpers::dir_size(&wal_dir) {
                 if wal_size == 0 {
@@ -135,8 +135,12 @@ impl MoteDB {
 
         self.flush_all_indexes()?;
 
+        // Re-check pending_updates: if a write was WAL-logged between flush()
+        // and here, its data is only in the active memtable. Skip checkpoint to
+        // avoid truncating the WAL before that data reaches an SSTable.
+        let pending_after = self.pending_updates.load(Ordering::Acquire);
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
-        if immutable_queue_len == 0 {
+        if immutable_queue_len == 0 && pending_after == pending_before {
             self.wal.checkpoint_all()?;
         }
 
