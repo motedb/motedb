@@ -740,6 +740,9 @@ impl MoteDB {
 
         // Load existing i-Octree indexes
         let ioctree_indexes = Self::load_ioctree_indexes(&db_path)?;
+
+        // Load existing column indexes
+        let column_indexes = Self::load_column_indexes(&db_path, &index_registry)?;
         
         // 🚀 P1: Create row cache (use config or default 10000)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
@@ -852,7 +855,7 @@ impl MoteDB {
             vector_indexes: Arc::new(Self::hashmap_to_dashmap(vector_indexes)),
             ioctree_indexes: Arc::new(Self::hashmap_to_dashmap(ioctree_indexes)),
             text_indexes: Arc::new(Self::hashmap_to_dashmap(text_indexes)),
-            column_indexes: Arc::new(DashMap::new()),
+            column_indexes: Arc::new(Self::hashmap_to_dashmap(column_indexes)),
             columnar_store,
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
@@ -1145,6 +1148,62 @@ impl MoteDB {
             }
         }
 
+        Ok(indexes)
+    }
+
+    /// Load existing column value indexes from disk.
+    /// Scans {db}.mote/indexes/ for column_*.idx files and reopens the BTree.
+    fn load_column_indexes(
+        db_path: &Path,
+        index_registry: &crate::database::index_metadata::IndexRegistry,
+    ) -> Result<HashMap<String, Arc<ColumnValueIndex>>> {
+        let mut indexes = HashMap::new();
+        let indexes_dir = db_path.join("indexes");
+        if !indexes_dir.exists() {
+            return Ok(indexes);
+        }
+        let entries = match std::fs::read_dir(&indexes_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(indexes),
+        };
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // Expected pattern: column_{index_name}.idx
+            if !name.starts_with("column_") || !name.ends_with(".idx") {
+                continue;
+            }
+            let stem = &name["column_".len()..name.len() - ".idx".len()];
+            let index_name = stem.to_string();
+
+            // Resolve table/column name from registry
+            let (table_name, column_name) = match index_registry.resolve_index_name(&index_name) {
+                Some((t, c)) => (t, c),
+                None => {
+                    // Fallback: parse "table.column" format
+                    let parts: Vec<&str> = stem.splitn(2, '.').collect();
+                    if parts.len() == 2 {
+                        (parts[0].to_string(), parts[1].to_string())
+                    } else {
+                        debug_log!("[load_column_indexes] Skipping {}: cannot resolve table/column", name);
+                        continue;
+                    }
+                }
+            };
+
+            let config = crate::index::column_value::ColumnValueIndexConfig::default();
+            match ColumnValueIndex::open(&entry.path(), table_name, column_name, config) {
+                Ok(index) => {
+                    debug_log!("[MoteDB] Loaded column index: {}", index_name);
+                    indexes.insert(index_name, Arc::new(index));
+                }
+                Err(e) => {
+                    debug_log!("[MoteDB] Failed to load column index {}: {:?}", index_name, e);
+                }
+            }
+        }
         Ok(indexes)
     }
 
