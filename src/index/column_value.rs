@@ -962,7 +962,17 @@ impl ColumnValueIndex {
         let mut buf = [0u8; VALUE_DATA_SIZE];
         match value {
             Value::Integer(i) => buf[..8].copy_from_slice(&i.to_be_bytes()),
-            Value::Float(f) => buf[..8].copy_from_slice(&f.to_be_bytes()),
+            Value::Float(f) => {
+                // Convert to sortable bytes: ensures negative < positive in byte order
+                let canonical = if *f == 0.0 { 0.0f64 } else { *f }; // normalize -0.0
+                let bits = canonical.to_bits();
+                let sortable = if bits & (1u64 << 63) != 0 {
+                    !bits // negative: flip all bits so -inf sorts first
+                } else {
+                    bits ^ (1u64 << 63) // positive: flip sign bit
+                };
+                buf[..8].copy_from_slice(&sortable.to_be_bytes());
+            },
             Value::Timestamp(ts) => buf[..8].copy_from_slice(&ts.as_micros().to_be_bytes()),
             Value::Bool(b) => buf[0] = if *b { 1 } else { 0 },
             Value::Text(s) => {

@@ -626,12 +626,11 @@ impl<K: BTreeKey> GenericBTree<K> {
                 return Err(StorageError::InvalidData("Invalid magic number".into()));
             }
 
-            if superblock.version < 2 || superblock.version > BTREE_VERSION {
-                // Old-format file — delete and recreate
-                drop(file);
-                let _ = std::fs::remove_file(&storage_path);
-                drop(sb_bytes);
-                return Self::with_config(storage_path, config);
+            if superblock.version != BTREE_VERSION {
+                return Err(StorageError::InvalidData(format!(
+                    "Unsupported BTree file version {} (expected {}). The index file at {:?} was created by a different version of MoteDB.",
+                    superblock.version, BTREE_VERSION, storage_path
+                )));
             }
 
             if superblock.key_size as usize != key_size {

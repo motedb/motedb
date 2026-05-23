@@ -426,7 +426,7 @@ impl TableRegistry {
         self.persist()
     }
 
-    /// Persist metadata to disk
+    /// Persist metadata to disk (atomic: write to temp, fsync, rename)
     fn persist(&self) -> Result<()> {
         let meta = self.metadata.read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
@@ -434,8 +434,13 @@ impl TableRegistry {
         let data = bincode::serialize(&*meta)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        fs::write(&self.persist_path, data)
-            .map_err(StorageError::Io)?;
+        let tmp_path = self.persist_path.with_extension("bin.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
+            std::io::Write::write_all(&mut f, &data).map_err(StorageError::Io)?;
+            f.sync_data().map_err(StorageError::Io)?;
+        }
+        std::fs::rename(&tmp_path, &self.persist_path).map_err(StorageError::Io)?;
 
         Ok(())
     }

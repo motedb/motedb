@@ -215,7 +215,11 @@ impl std::hash::Hash for Value {
         std::mem::discriminant(self).hash(state);
         match self {
             Value::Integer(i) => i.hash(state),
-            Value::Float(f) => f.to_bits().hash(state),
+            Value::Float(f) => {
+                // Normalize -0.0 to +0.0 for hash consistency with Eq
+                let canonical = if *f == 0.0 { 0.0f64 } else { *f };
+                canonical.to_bits().hash(state);
+            },
             Value::Text(s) => s.hash(state),
             Value::Bool(b) => b.hash(state),
             Value::Timestamp(t) => t.as_micros().hash(state),

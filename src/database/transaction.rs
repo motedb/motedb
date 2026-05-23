@@ -56,6 +56,9 @@ impl MoteDB {
                 .value()
                 .clone();
             let id = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !(0..=i64::MAX - 1000).contains(&id) {
+                return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
+            }
             if let Some(pk_col) = schema.primary_key().and_then(|n| schema.get_column(n)) {
                 while row.len() <= pk_col.position { row.push(Value::Null); }
                 row[pk_col.position] = Value::Integer(id);
