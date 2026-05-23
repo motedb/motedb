@@ -341,52 +341,50 @@ impl LSMEngine {
         let compaction_wakeup = engine.compaction_wakeup.clone();
         
         let compaction_thread = thread::spawn(move || {
-            let mut consecutive_no_work = 0;
-            
+            let mut _consecutive_no_work = 0;
+
             while let Some(shutdown) = shutdown_weak.upgrade() {
-                // 🔧 Check shutdown signal (upgrade Weak to Arc)
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                
-                // 🚀 Edge optimization: event-driven via condvar (replaces 500ms polling)
-                // Sleeps until notified or 30s timeout (near-zero CPU when idle)
+
                 {
                     let (lock, cvar) = &*compaction_wakeup;
                     let guard = lock.lock().unwrap();
                     let _ = cvar.wait_timeout(guard, Duration::from_secs(30));
                 }
-                
-                // Upgrade Weak to Arc for compaction work
+
                 let compaction_worker = match compaction_worker_weak.upgrade() {
                     Some(w) => w,
-                    None => break,  // Engine dropped
+                    None => break,
                 };
-                
-                match compaction_worker.needs_compaction() {
-                    Ok(true) => {
-                        // 🔥 P1: 连续运行 compaction 直到不需要为止
-                        let mut rounds = 0;
-                        while let Ok(true) = compaction_worker.needs_compaction() {
-                            if let Err(e) = compaction_worker.run_compaction() {
-                                debug_log!("❌ Compaction error: {:?}", e);
-                                break;
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match compaction_worker.needs_compaction() {
+                        Ok(true) => {
+                            let mut rounds = 0;
+                            while let Ok(true) = compaction_worker.needs_compaction() {
+                                if let Err(e) = compaction_worker.run_compaction() {
+                                    debug_log!("Compaction error: {:?}", e);
+                                    break;
+                                }
+                                rounds += 1;
+                                if rounds > 10 { break; }
                             }
-                            rounds += 1;
-                            if rounds > 10 {
-                                break; // 防止无限循环
-                            }
+                            true // had work
                         }
-                        consecutive_no_work = 0;
+                        Ok(false) => false, // no work
+                        Err(e) => { debug_log!("Compaction check error: {:?}", e); false }
                     }
-                    Ok(false) => {
-                        consecutive_no_work += 1;
+                }));
+
+                match result {
+                    Ok(true) => _consecutive_no_work = 0,
+                    Ok(false) => _consecutive_no_work += 1,
+                    Err(_) => {
+                        eprintln!("[MoteDB] Compaction thread panicked, restarting...");
+                        std::thread::sleep(Duration::from_secs(1));
                     }
-                    Err(e) => { debug_log!("❌ Compaction check error: {:?}", e); }
-                }
-                
-                if consecutive_no_work > 60 {
-                    consecutive_no_work = 0;
                 }
             }
         });

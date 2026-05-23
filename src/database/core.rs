@@ -1157,29 +1157,44 @@ impl MoteDB {
         let handle = std::thread::Builder::new()
             .name("index-builder".into())
             .spawn(move || {
-                debug_log!("[IndexBuilder] 🚀 Background thread started");
+                debug_log!("[IndexBuilder] Background thread started");
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                        Ok(batch) => {
-                            for (table_name, raw_rows) in &batch.tables_data {
-                                if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
-                                    warn_log!("[IndexBuilder] Index build failed for '{}': {:?}",
-                                        table_name, e);
-                                    db.index_build_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                            Ok(batch) => {
+                                for (table_name, raw_rows) in &batch.tables_data {
+                                    if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
+                                        warn_log!("[IndexBuilder] Index build failed for '{}': {:?}",
+                                            table_name, e);
+                                        db.index_build_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
+                                db.pending_index_batches.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                debug_log!("[IndexBuilder] Processed batch ({} tables)",
+                                    batch.tables_data.len());
                             }
-                            db.pending_index_batches.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                            debug_log!("[IndexBuilder] ✅ Processed batch ({} tables)",
-                                batch.tables_data.len());
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                debug_log!("[IndexBuilder] Channel disconnected, exiting");
+                                return false; // signal to exit loop
+                            }
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            debug_log!("[IndexBuilder] Channel disconnected, exiting");
-                            break;
+                        true // continue
+                    }));
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => {
+                            // Panic or disconnected: continue (don't let thread die)
+                            if result.is_err() {
+                                eprintln!("[MoteDB] Index builder thread panicked, restarting...");
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            } else {
+                                break;
+                            }
                         }
                     }
                 }
-                debug_log!("[IndexBuilder] 👋 Background thread stopped");
+                debug_log!("[IndexBuilder] Background thread stopped");
             })
             .expect("Failed to spawn index-builder thread");
 
@@ -1263,25 +1278,33 @@ impl MoteDB {
             .name("motedb-auto-flush".into())
             .spawn(move || {
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    match flush_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                        Ok(()) => {
-                            if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match flush_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                            Ok(()) => {
+                                if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return false;
+                                }
+                                while flush_rx.try_recv().is_ok() {}
+                                if let Err(e) = db.flush() {
+                                    warn_log!("[AutoFlush] Flush failed: {}", e);
+                                    db.flush_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                true
                             }
-                            // Drain any queued requests — coalesce multiple flushes into one
-                            while flush_rx.try_recv().is_ok() {}
-                            if let Err(e) = db.flush() {
-                                warn_log!("[AutoFlush] Flush failed: {}", e);
-                                db.flush_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => true,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // No flush request — don't flush empty memtable
+                    }));
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => {
+                            if result.is_ok() { break; } // disconnected
+                            eprintln!("[MoteDB] Auto-flush thread panicked, restarting...");
+                            std::thread::sleep(std::time::Duration::from_millis(100));
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                debug_log!("[AutoFlush] 👋 Background thread stopped");
+                debug_log!("[AutoFlush] Background thread stopped");
             })
             .expect("Failed to spawn auto-flush thread");
 

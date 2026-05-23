@@ -1010,17 +1010,12 @@ impl QueryExecutor {
             let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
             // Pre-allocate result Vec using row count hint (avoids ~14 reallocations for 10K rows)
             let estimated = self.db.fast_row_count(table).unwrap_or(0) as usize;
-            let rows: Vec<Vec<Value>> = if estimated > 0 {
-                let mut buf = Vec::with_capacity(estimated);
-                for r in row_iter {
-                    if let Ok((_row_id, row)) = r {
-                        buf.push(row);
-                    }
-                }
-                buf
-            } else {
-                row_iter.filter_map(|r| r.ok()).map(|(_, row)| row).collect()
-            };
+            let mut buf = Vec::with_capacity(estimated.max(1) as usize);
+            for r in row_iter {
+                let (_row_id, row) = r?;
+                buf.push(row);
+            }
+            let rows = buf;
             return Ok(StreamingQueryResult::SelectReady {
                 columns: column_names,
                 rows,
@@ -1186,7 +1181,10 @@ impl QueryExecutor {
 
     fn positional_add(l: &Value, r: &Value) -> Result<Value> {
         match (l, r) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_add(*b))),
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_add(*b) {
+                Some(v) => Ok(Value::Integer(v)),
+                None => Ok(Value::Float(*a as f64 + *b as f64)),
+            },
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
             (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a + *b as f64)),
@@ -1195,7 +1193,10 @@ impl QueryExecutor {
     }
     fn positional_sub(l: &Value, r: &Value) -> Result<Value> {
         match (l, r) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_sub(*b))),
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_sub(*b) {
+                Some(v) => Ok(Value::Integer(v)),
+                None => Ok(Value::Float(*a as f64 - *b as f64)),
+            },
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a - *b as f64)),
@@ -1204,7 +1205,10 @@ impl QueryExecutor {
     }
     fn positional_mul(l: &Value, r: &Value) -> Result<Value> {
         match (l, r) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_mul(*b))),
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_mul(*b) {
+                Some(v) => Ok(Value::Integer(v)),
+                None => Ok(Value::Float(*a as f64 * *b as f64)),
+            },
             (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a * *b as f64)),
@@ -1215,7 +1219,9 @@ impl QueryExecutor {
         match (l, r) {
             (Value::Integer(a), Value::Integer(b)) => {
                 if *b == 0 { return Err(MoteDBError::DivisionByZero); }
-                Ok(Value::Integer(a / b))
+                a.checked_div(*b)
+                    .map(Value::Integer)
+                    .ok_or_else(|| MoteDBError::Query("Integer division overflow".into()))
             }
             (Value::Float(a), Value::Float(b)) => {
                 if *b == 0.0 { return Err(MoteDBError::DivisionByZero); }
@@ -4476,7 +4482,12 @@ impl QueryExecutor {
             }
             matching
         } else {
-            row_iter.filter_map(|r| r.ok()).map(|(_, row)| row).collect()
+            let mut matching = Vec::new();
+            for result in row_iter {
+                let (_row_id, row) = result?;
+                matching.push(row);
+            }
+            matching
         };
 
         // Build groups using Vec<Value> keys
@@ -4906,7 +4917,14 @@ impl QueryExecutor {
             let partial_iter = self.db.scan_table_rows_partial(
                 table_name, &scan_positions,
             )?;
-            partial_iter.filter_map(|r| r.ok()).map(|(_, row)| row).collect()
+            {
+                let mut matching = Vec::new();
+                for result in partial_iter {
+                    let (_row_id, row) = result?;
+                    matching.push(row);
+                }
+                matching
+            }
         };
 
         let offset = stmt.offset.unwrap_or(0);

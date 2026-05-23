@@ -324,14 +324,18 @@ impl ExprEvaluator {
             Expr::Like { expr, pattern, negated } => {
                 let val = self.eval(expr, row)?;
                 let pattern_val = self.eval(pattern, row)?;
-                
+
+                // SQL NULL semantics: LIKE NULL = UNKNOWN → false for filtering
+                if matches!(val, Value::Null) || matches!(pattern_val, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+
                 let matches = if let (Value::Text(s), Value::Text(p)) = (val, pattern_val) {
-                    // ⚡ Use compiled pattern cache for fast matching
                     self.like_match_cached(&s, &p)
                 } else {
                     false
                 };
-                
+
                 Ok(Value::Bool(if *negated { !matches } else { matches }))
             }
             
