@@ -53,16 +53,15 @@ impl SQ8Quantizer {
             )));
         }
 
-        // Find min and max
+        // Find min and max, rejecting NaN values
         let mut min = f32::INFINITY;
         let mut max = f32::NEG_INFINITY;
         for &val in vector.iter() {
-            if val < min {
-                min = val;
+            if val.is_nan() {
+                return Err(StorageError::InvalidData("Vector contains NaN values".into()));
             }
-            if val > max {
-                max = val;
-            }
+            if val < min { min = val; }
+            if val > max { max = val; }
         }
 
         // Handle constant vectors

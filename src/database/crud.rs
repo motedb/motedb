@@ -148,13 +148,12 @@ impl MoteDB {
         // 6. Write to WAL first (durability) — by reference, zero clone
         self.wal.log_insert_raw_ref(table_name, partition, row_id, &row_data, 0)?;
 
-        // 7. Write to LSM MemTable with table prefix (move row_data, no clone)
+        // 7. Write to LSM MemTable (invalidate cache first for TOCTOU safety)
         let composite_key = self.make_composite_key(table_name, row_id);
+        self.row_cache.invalidate(table_name, row_id);
         let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value = crate::storage::lsm::Value::new(row_data, ts);
         self.lsm_engine.put(composite_key, value)?;
-
-        // 6.5 Populate row cache so subsequent reads hit memory (avoid LSM get overhead)
         self.row_cache.put(table_name.to_string(), row_id, row.clone());
 
         // 7. Update indexes
@@ -424,13 +423,12 @@ impl MoteDB {
         self.wal.log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
 
         // 6. Update in LSM MemTable (same bytes as WAL)
-        // Use unified write_lsn for monotonically increasing timestamps.
+        // Invalidate cache BEFORE LSM write to prevent TOCTOU stale reads
+        self.row_cache.invalidate(table_name, row_id);
+
         let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value = crate::storage::lsm::Value::new(raw_new, timestamp);
         self.lsm_engine.put(composite_key, value)?;
-
-        // Invalidate cache after update (prevent stale reads)
-        self.row_cache.invalidate(table_name, row_id);
         
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
         let mut index_errors = Vec::new();
@@ -610,11 +608,11 @@ impl MoteDB {
                 .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
         self.wal.log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
 
-        // 6. Delete from LSM (using tombstone)
-        self.lsm_engine.delete(composite_key, timestamp)?;
-
-        // 7. Invalidate cache (prevent reading deleted data)
+        // 6. Invalidate cache BEFORE tombstone write (prevent TOCTOU stale reads)
         self.row_cache.invalidate(table_name, row_id);
+
+        // 7. Delete from LSM (using tombstone)
+        self.lsm_engine.delete(composite_key, timestamp)?;
 
         // 7.1 Decrement row count for COUNT(*) fast path
         // Guard against underflow on double-delete (counter wraps on u64)

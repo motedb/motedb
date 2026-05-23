@@ -710,7 +710,12 @@ impl DiskANNIndex {
         Ok(removed)
     }
     
-    /// Search for k nearest neighbors with 🚀 **自适应Beam width + 提前终止**
+    /// Return the distance metric used by this index
+    pub fn metric(&self) -> DistanceKind {
+        self.config.metric
+    }
+
+    /// Search for k nearest neighbors
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(RowId, f32)>> {
         if query.len() != self.dimension {
             return Err(StorageError::InvalidData(format!(

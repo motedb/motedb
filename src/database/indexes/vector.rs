@@ -226,10 +226,10 @@ impl MoteDB {
         
         debug_log!("[vector_search] 获取index_guard...");
         let index_guard = index_ref.value().read();
-        
+        let metric = index_guard.metric();
+
         debug_log!("[vector_search] 开始搜索DiskANN index...");
-        // 1. Search from DiskANN index (persisted data in SST)
-        let mut index_results = index_guard.search(query, k * 2)?;  // 🔧 取 2k 为后续合并留空间
+        let mut index_results = index_guard.search(query, k * 2)?;
         drop(index_guard);
         
         // 🔍 Debug: 打印前5个结果
@@ -294,12 +294,19 @@ impl MoteDB {
             if let Ok(row_values) = crate::storage::row_format::decode_any(row_bytes) {
                 if let Some(Value::Vector(vec_data)) = row_values.get(col_position) {
                     if vec_data.len() == query.len() {
-                        // Compute squared L2 distance (consistent with DiskANN SQ8 quantizer)
-                        let distance: f32 = vec_data.iter()
-                            .zip(query.iter())
-                            .map(|(a, b)| (a - b).powi(2))
-                            .sum::<f32>();
-                        
+                        let distance = match metric {
+                            crate::distance::DistanceKind::Cosine => {
+                                let dot: f32 = vec_data.iter().zip(query.iter()).map(|(a, b)| a * b).sum();
+                                let norm_a: f32 = vec_data.iter().map(|a| a * a).sum::<f32>().sqrt();
+                                let norm_b: f32 = query.iter().map(|b| b * b).sum::<f32>().sqrt();
+                                1.0 - dot / (norm_a * norm_b).max(1e-10)
+                            }
+                            crate::distance::DistanceKind::Euclidean => {
+                                vec_data.iter().zip(query.iter())
+                                    .map(|(a, b)| (a - b).powi(2))
+                                    .sum::<f32>()
+                            }
+                        };
                         memtable_results.push((row_id, distance));
                     }
                 }
