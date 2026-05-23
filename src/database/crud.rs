@@ -186,9 +186,12 @@ impl MoteDB {
                 index_key_buf.push('.');
                 index_key_buf.push_str(col_name);
                 if let Some(index_ref) = self.column_indexes.get(&index_key_buf) {
-                    if let Err(_e) = index_ref.value().insert(col_value, row_id) {
-                        debug_log!("[insert_row] Failed to update column index '{}': {}", col_name, _e);
-                        index_errors.push(index_key_buf.clone());
+                    // NULL values are valid SQL but not indexable — skip silently
+                    if !matches!(col_value, Value::Null) {
+                        if let Err(_e) = index_ref.value().insert(col_value, row_id) {
+                            debug_log!("[insert_row] Failed to update column index '{}': {}", col_name, _e);
+                            index_errors.push(index_key_buf.clone());
+                        }
                     }
                 }
             }
@@ -234,16 +237,12 @@ impl MoteDB {
             }
         }
 
-        // If any index update failed, mark ALL indexes for this table stale
-        // so queries fall back to full scan consistently
+        // Mark only the individual failed indexes as stale
         if !index_errors.is_empty() {
-            debug_log!("[insert_row] {} index updates failed for table '{}', marking all stale",
+            debug_log!("[insert_row] {} index updates failed for table '{}', marking stale",
                      index_errors.len(), table_name);
             for idx_name in &index_errors {
                 self.index_registry.mark_stale(idx_name);
-            }
-            for meta in self.index_registry.list_table_indexes(table_name) {
-                self.index_registry.mark_stale(&meta.name);
             }
         }
         } // end index_update_strategy check

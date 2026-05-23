@@ -5821,6 +5821,15 @@ impl QueryExecutor {
             self.db.text_indexes.remove(&idx_name);
         }
 
+        // 4. Drop i-Octree indexes for this table
+        let ioctree_idx_names: Vec<String> = self.db.ioctree_indexes.iter()
+            .filter(|entry| entry.key().starts_with(&prefix) || entry.key().contains(&format!("_{}", table_name)))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for idx_name in ioctree_idx_names {
+            self.db.ioctree_indexes.remove(&idx_name);
+        }
+
         // 5. Drop table metadata (schema, auto_increment, pk_lookup)
         self.db.drop_table(table_name)?;
 

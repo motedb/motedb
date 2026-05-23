@@ -182,8 +182,10 @@ impl UnifiedMemTable {
         });
         self.insert_entry(key, entry)?;
 
-        // Store vector separately
+        // Store vector separately and track memory (each f32 = 4 bytes)
         if let Some(ref vec_map) = self.vectors {
+            let vec_size = vector.len() * 4;
+            self.size.fetch_add(vec_size, Ordering::Relaxed);
             vec_map.write().insert(key, vector.clone());
         }
 
@@ -571,7 +573,8 @@ mod tests {
         assert!(size_after > 0);
         debug_log!("Memory size: {} bytes", size_after);
 
-        assert!((15..=30).contains(&size_after));
+        // data (4 bytes + 16 overhead) + vector (128 f32 * 4 bytes)
+        assert!(size_after > 500, "expected >500 bytes with vector, got {}", size_after);
     }
 
     #[test]

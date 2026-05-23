@@ -610,7 +610,11 @@ impl PartitionWAL {
 
         match self.config.durability_level {
             DurabilityLevel::Synchronous => { self.sync_flush()?; }
-            DurabilityLevel::GroupCommit { .. } | DurabilityLevel::Periodic { .. } | DurabilityLevel::NoSync => {}
+            DurabilityLevel::GroupCommit { .. } => {
+                // Flush BufWriter to OS buffers; group commit thread handles fsync
+                self.file.flush()?;
+            }
+            DurabilityLevel::Periodic { .. } | DurabilityLevel::NoSync => {}
         }
 
         Ok(lsn)

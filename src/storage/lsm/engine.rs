@@ -494,8 +494,8 @@ impl LSMEngine {
                                     for attempt in 0..3 {
                                         match SSTableBuilder::new(&sst_path, config_clone.clone(), memtable_len) {
                                             Ok(mut builder) => {
-                                                // Read from front memtable (still in queue, visible to scans)
                                                 let immutable_guard = immutable.read();
+                                                let mut add_failed = false;
                                                 if let Some(front_mt) = immutable_guard.front() {
                                                     for (key, entry) in front_mt.iter() {
                                                         let value = Value {
@@ -504,11 +504,16 @@ impl LSMEngine {
                                                             deleted: entry.deleted,
                                                         };
                                                         if let Err(e) = builder.add(key, value) {
-                                                            debug_log!("[LSM Flush] ❌ Error adding key {}: {:?}", key, e);
+                                                            debug_log!("[LSM Flush] Error adding key {}: {:?}", key, e);
+                                                            add_failed = true;
+                                                            break;
                                                         }
                                                     }
                                                 }
                                                 drop(immutable_guard);
+                                                if add_failed {
+                                                    continue; // retry this attempt
+                                                }
 
                                                 match builder.finish() {
                                                     Ok(meta) => {
