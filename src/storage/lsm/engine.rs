@@ -869,11 +869,14 @@ impl LSMEngine {
     /// - 减少锁竞争：N次get() → 1次batch_get()
     /// - 避免读者饥饿：减少与flush线程的锁竞争
     pub fn batch_get(&self, keys: &[Key]) -> Result<Vec<Option<Value>>> {
-        debug_log!("🔍 [batch_get] 开始批量查询 {} 个keys", keys.len());
+        debug_log!("[batch_get] batch query {} keys", keys.len());
         let mut results = vec![None; keys.len()];
         let mut remaining_keys: Vec<(usize, Key)> = keys.iter().enumerate().map(|(i, &k)| (i, k)).collect();
-        
-        // 1. Check active memtable (批量查询，只获取一次锁)
+
+        // Capture epoch for re-check after immutable scan
+        let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
+
+        // 1. Check active memtable
         {
             let memtable = self.memtable.read();
 
@@ -949,9 +952,41 @@ impl LSMEngine {
             }
             // immutable lock released here
         }
-        
+
+        // Re-check epoch: if a rotation happened between active and immutable scans,
+        // re-scan immutable queue for any remaining keys that rotated in.
+        let epoch_after = self.rotation_epoch.load(Ordering::Acquire);
+        if epoch_after != epoch_before && !remaining_keys.is_empty() {
+            let immutable = self.immutable.read();
+            for memtable in immutable.iter().rev() {
+                let mut i = 0;
+                while i < remaining_keys.len() {
+                    let (idx, key) = remaining_keys[i];
+                    if let Some(entry) = memtable.get(key)? {
+                        let mut value = Value {
+                            data: entry.data,
+                            timestamp: entry.timestamp,
+                            deleted: entry.deleted,
+                        };
+                        if let ValueData::Blob(ref blob_ref) = value.data {
+                            if let Ok(blob_data) = self.blob_store.get(blob_ref) {
+                                value.data = ValueData::Inline(blob_data);
+                            }
+                        }
+                        if !value.deleted {
+                            results[idx] = Some(value);
+                        }
+                        remaining_keys.swap_remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+                if remaining_keys.is_empty() { break; }
+            }
+        }
+
         if remaining_keys.is_empty() {
-            debug_log!("✅ [batch_get] 所有keys已找到，跳过SSTable查询");
+            debug_log!("[batch_get] all keys found in memory, skip SSTable");
             return Ok(results);
         }
         
@@ -1120,26 +1155,21 @@ impl LSMEngine {
         let tombstone = Value::tombstone(timestamp);
         let mut count = 0;
 
-        // 1. Write tombstones to memtable for all existing keys in range
-        let keys_in_range: Vec<Key> = {
-            let memtable = self.memtable.read();
-            memtable.keys_in_range(start, end)
-        };
-
-        for key in &keys_in_range {
-            self.put(*key, tombstone.clone())?;
-            count += 1;
-        }
-
-        // 2. Also insert range tombstone boundaries so future compactions
-        //    know the entire [start, end] range is deleted.
-        //    We write tombstones at start and end — compaction will merge.
-        if keys_in_range.is_empty() {
-            // Even if no keys in memtable, SSTables might have data in this range.
-            // Write boundary tombstones so compaction knows to drop them.
-            self.put(start, tombstone.clone())?;
-            self.put(end, tombstone)?;
-            count = 2;
+        // Scan ALL sources (memtable, immutable, SSTables) for keys in range
+        // and write individual tombstones. This is O(N) in keys but correct.
+        match self.scan_range(start, end) {
+            Ok(entries) => {
+                for (key, _value) in &entries {
+                    self.put(*key, tombstone.clone())?;
+                    count += 1;
+                }
+            }
+            Err(_) => {
+                // Fallback: write tombstones at boundaries as best-effort
+                self.put(start, tombstone.clone())?;
+                self.put(end, tombstone)?;
+                count = 2;
+            }
         }
 
         Ok(count)
@@ -1435,9 +1465,13 @@ impl LSMEngine {
             for mem in immutable.iter() {
                 let entries = mem.scan(start, end)?;
                 for (k, entry) in entries {
-                    if let ValueData::Inline(ref d) = entry.data {
-                        if !entry.deleted {
-                            merged.insert(k, d.clone());
+                    if entry.deleted { continue; }
+                    match &entry.data {
+                        ValueData::Inline(d) => { merged.insert(k, d.clone()); }
+                        ValueData::Blob(blob_ref) => {
+                            if let Ok(data) = self.blob_store.get(blob_ref) {
+                                merged.insert(k, data);
+                            }
                         }
                     }
                 }
@@ -1449,9 +1483,13 @@ impl LSMEngine {
             let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             for (k, entry) in entries {
-                if let ValueData::Inline(ref d) = entry.data {
-                    if !entry.deleted {
-                        merged.insert(k, d.clone());
+                if entry.deleted { continue; }
+                match &entry.data {
+                    ValueData::Inline(d) => { merged.insert(k, d.clone()); }
+                    ValueData::Blob(blob_ref) => {
+                        if let Ok(data) = self.blob_store.get(blob_ref) {
+                            merged.insert(k, data);
+                        }
                     }
                 }
             }
@@ -1507,33 +1545,40 @@ impl LSMEngine {
                     
                     match &entry.data {
                         ValueData::Inline(d) => {
-                            all_entries.push((k, d.clone())); // Clone data while holding lock
+                            all_entries.push((k, d.clone()));
                         },
-                        ValueData::Blob(_) => {},
+                        ValueData::Blob(blob_ref) => {
+                            match self.blob_store.get(blob_ref) {
+                                Ok(data) => all_entries.push((k, data)),
+                                Err(_) => {}, // blob resolution failed, skip entry
+                            }
+                        },
                     }
                 }
             }
-            // 🔓 immutable锁在这里释放
         }
-        
-        // 1.2 扫描 active MemTable (正在写入的数据)
+
+        // 1.2 Scan active MemTable
         {
             let memtable = self.memtable.read();
             let entries = memtable.scan_all()?;
             for (k, entry) in entries {
-                // 🔧 FIX: Skip tombstones (deleted entries)
                 if entry.deleted {
                     continue;
                 }
-                
+
                 match &entry.data {
                     ValueData::Inline(d) => {
-                        all_entries.push((k, d.clone())); // Clone data while holding lock
+                        all_entries.push((k, d.clone()));
                     },
-                    ValueData::Blob(_) => {},
+                    ValueData::Blob(blob_ref) => {
+                        match self.blob_store.get(blob_ref) {
+                            Ok(data) => all_entries.push((k, data)),
+                            Err(_) => {}, // blob resolution failed, skip entry
+                        }
+                    },
                 }
             }
-            // 🔓 memtable锁在这里释放
         }
         
         // Step 2: 释放所有锁后，再调用回调处理数据（避免在持锁期间执行慢操作）

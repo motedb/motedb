@@ -595,8 +595,8 @@ impl PartitionWAL {
     /// Flush BufWriter to OS buffer + fsync (for durability)
     fn sync_flush(&mut self) -> Result<()> {
         self.file.flush()?;
-        // Get the inner File ref for sync_data
-        self.file.get_ref().sync_data()?;
+        // fsync: flush both data and metadata (file size) for durability on all platforms
+        self.file.get_ref().sync_all()?;
         Ok(())
     }
 
