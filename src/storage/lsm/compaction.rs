@@ -753,6 +753,7 @@ impl CompactionWorker {
         impl Ord for MergeEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
                 other.key.cmp(&self.key) // min-heap
+                    .then_with(|| other.iter_idx.cmp(&self.iter_idx)) // break ties: prefer earlier iterator
             }
         }
 

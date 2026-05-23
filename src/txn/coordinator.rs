@@ -439,7 +439,7 @@ impl TransactionCoordinator {
             .iter()
             .map(|entry| entry.value().start_ts)
             .min()
-            .unwrap_or(self.version_store.allocate_timestamp())
+            .unwrap_or(self.version_store.current_timestamp())
     }
     
     /// Get statistics

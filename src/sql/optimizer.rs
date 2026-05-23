@@ -200,6 +200,24 @@ impl QueryOptimizer {
         }
     }
 
+    /// Returns a type-appropriate "positive infinity" sentinel for range bounds.
+    fn positive_inf(val: &Value) -> Value {
+        match val {
+            Value::Float(_) => Value::Float(f64::MAX),
+            Value::Timestamp(_) => Value::Timestamp(crate::types::Timestamp::from_micros(i64::MAX)),
+            _ => Value::Integer(i64::MAX),
+        }
+    }
+
+    /// Returns a type-appropriate "negative infinity" sentinel for range bounds.
+    fn negative_inf(val: &Value) -> Value {
+        match val {
+            Value::Float(_) => Value::Float(f64::MIN),
+            Value::Timestamp(_) => Value::Timestamp(crate::types::Timestamp::from_micros(i64::MIN)),
+            _ => Value::Integer(i64::MIN),
+        }
+    }
+
     /// Resolve an expression to a literal Value if possible.
     /// Handles Literal directly and Parameter(idx) via bound params.
     fn resolve_to_value(params: &[crate::types::Value], expr: &crate::sql::ast::Expr) -> Option<crate::types::Value> {
@@ -378,11 +396,13 @@ impl QueryOptimizer {
             Expr::BinaryOp { left, op: BinaryOperator::Gt, right } => {
                 if let Some(val) = Self::resolve_to_value(params,right) {
                     if let Expr::Column(col) = left.as_ref() {
-                        self.try_range_query_plan(table_name, col, val.clone(), false, Value::Integer(i64::MAX), true, plans)?;
+                        let pos_inf = Self::positive_inf(&val);
+                        self.try_range_query_plan(table_name, col, val.clone(), false, pos_inf, true, plans)?;
                     }
                 } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
-                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), false, plans)?;
+                        let neg_inf = Self::negative_inf(&val);
+                        self.try_range_query_plan(table_name, col, neg_inf, true, val.clone(), false, plans)?;
                     }
                 }
             }
@@ -391,11 +411,13 @@ impl QueryOptimizer {
             Expr::BinaryOp { left, op: BinaryOperator::Ge, right } => {
                 if let Some(val) = Self::resolve_to_value(params,right) {
                     if let Expr::Column(col) = left.as_ref() {
-                        self.try_range_query_plan(table_name, col, val.clone(), true, Value::Integer(i64::MAX), true, plans)?;
+                        let pos_inf = Self::positive_inf(&val);
+                        self.try_range_query_plan(table_name, col, val.clone(), true, pos_inf, true, plans)?;
                     }
                 } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
-                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), false, plans)?;
+                        let neg_inf = Self::negative_inf(&val);
+                        self.try_range_query_plan(table_name, col, neg_inf, true, val.clone(), false, plans)?;
                     }
                 }
             }
@@ -404,11 +426,13 @@ impl QueryOptimizer {
             Expr::BinaryOp { left, op: BinaryOperator::Lt, right } => {
                 if let Some(val) = Self::resolve_to_value(params,right) {
                     if let Expr::Column(col) = left.as_ref() {
-                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), false, plans)?;
+                        let neg_inf = Self::negative_inf(&val);
+                        self.try_range_query_plan(table_name, col, neg_inf, true, val.clone(), false, plans)?;
                     }
                 } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
-                        self.try_range_query_plan(table_name, col, val.clone(), true, Value::Integer(i64::MAX), true, plans)?;
+                        let pos_inf = Self::positive_inf(&val);
+                        self.try_range_query_plan(table_name, col, val.clone(), true, pos_inf, true, plans)?;
                     }
                 }
             }
@@ -417,11 +441,13 @@ impl QueryOptimizer {
             Expr::BinaryOp { left, op: BinaryOperator::Le, right } => {
                 if let Some(val) = Self::resolve_to_value(params,right) {
                     if let Expr::Column(col) = left.as_ref() {
-                        self.try_range_query_plan(table_name, col, Value::Integer(i64::MIN), true, val.clone(), true, plans)?;
+                        let neg_inf = Self::negative_inf(&val);
+                        self.try_range_query_plan(table_name, col, neg_inf, true, val.clone(), true, plans)?;
                     }
                 } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
-                        self.try_range_query_plan(table_name, col, val.clone(), true, Value::Integer(i64::MAX), true, plans)?;
+                        let pos_inf = Self::positive_inf(&val);
+                        self.try_range_query_plan(table_name, col, val.clone(), true, pos_inf, true, plans)?;
                     }
                 }
             }

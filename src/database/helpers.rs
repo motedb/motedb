@@ -38,21 +38,30 @@ impl MoteDB {
 
         let schema = match self.table_registry.get_table(table_name) {
             Ok(s) => s,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                debug_log!("[BatchIndexBuilder] Table '{}' not found during index build: {}", table_name, e);
+                return Ok(());
+            }
         };
 
         // Decode all rows using schema (fast, no brute-force)
         let col_types = schema.col_types();
         let mut rows: Vec<(RowId, Row)> = Vec::with_capacity(raw_rows.len());
+        let mut decode_failures = 0u32;
         for (row_id, raw) in raw_rows {
             match crate::storage::row_format::decode(raw, col_types) {
                 Ok(r) => rows.push((*row_id, r)),
                 Err(_) => {
                     if let Ok(r) = crate::storage::row_format::decode_any(raw) {
                         rows.push((*row_id, r));
+                    } else {
+                        decode_failures += 1;
                     }
                 }
             }
+        }
+        if decode_failures > 0 {
+            debug_log!("[BatchIndexBuilder] Table '{}': {} rows failed to decode", table_name, decode_failures);
         }
 
         if rows.is_empty() {

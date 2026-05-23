@@ -32,16 +32,19 @@ impl MoteDB {
     pub fn insert_ioctree_point(&self, row_id: RowId, index_name: &str, geometry: &Geometry) -> Result<()> {
         if let Some(index) = self.ioctree_indexes.get(index_name) {
             index.write().insert(row_id, geometry)?;
+            Ok(())
+        } else {
+            Err(StorageError::Index(format!("i-Octree index '{}' not found", index_name)))
         }
-        Ok(())
     }
 
     /// Delete a point from an i-Octree index by row_id
     pub fn delete_ioctree_point(&self, row_id: RowId, index_name: &str) -> Result<bool> {
         if let Some(index) = self.ioctree_indexes.get(index_name) {
-            return Ok(index.write().delete(row_id));
+            Ok(index.write().delete(row_id))
+        } else {
+            Err(StorageError::Index(format!("i-Octree index '{}' not found", index_name)))
         }
-        Ok(false)
     }
 
     /// 3D range query: find all points within a bounding box

@@ -146,15 +146,20 @@ impl BloomFilter {
         if data.len() < 12 {
             return None;
         }
-        
+
         let num_hashes = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let num_bits = u64::from_le_bytes([
             data[4], data[5], data[6], data[7],
             data[8], data[9], data[10], data[11]
         ]) as usize;
-        
+
         let bits = data[12..].to_vec();
-        
+
+        // Validate: num_bits must fit in actual data, num_hashes must be sane
+        if num_bits > bits.len() * 8 || num_hashes == 0 || num_hashes > 30 {
+            return None;
+        }
+
         Some(Self {
             bits,
             num_hashes,
