@@ -432,7 +432,11 @@ impl MoteDB {
         let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value = crate::storage::lsm::Value::new(raw_new, timestamp);
         self.lsm_engine.put(composite_key, value)?;
-        
+
+        // Re-invalidate: catch concurrent readers that cached old data between
+        // the first invalidate and the LSM write
+        self.row_cache.invalidate(table_name, row_id);
+
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
         let mut index_errors = Vec::new();
 
@@ -617,6 +621,10 @@ impl MoteDB {
 
         // 7. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
+
+        // Re-invalidate: catch concurrent readers that cached old data between
+        // the first invalidate and the LSM write
+        self.row_cache.invalidate(table_name, row_id);
 
         // 7.1 Decrement row count for COUNT(*) fast path
         // Guard against underflow on double-delete (counter wraps on u64)

@@ -259,7 +259,9 @@ impl Database {
 
         // Wait for threads to actually finish before checkpoint to prevent
         // deadlock (threads may hold locks that checkpoint needs).
-        self.inner.wait_for_background_threads_stop(std::time::Duration::from_secs(5));
+        if !self.inner.wait_for_background_threads_stop(std::time::Duration::from_secs(30)) {
+            warn_log!("[close] Background threads did not stop within timeout");
+        }
 
         let result = self.inner.checkpoint_full();
         self.inner.is_closed.store(true, std::sync::atomic::Ordering::Relaxed);
