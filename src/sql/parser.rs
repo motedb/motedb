@@ -845,12 +845,14 @@ impl Parser {
             TokenType::Number(n) => {
                 let n = *n;
                 self.advance();
-                // If the number has no fractional part, parse as Integer
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                    Ok(Expr::Literal(Value::Integer(n as i64)))
-                } else {
-                    Ok(Expr::Literal(Value::Float(n)))
+                // Integer if no fraction and within i64 range (beware f64 precision loss)
+                if n.fract() == 0.0 && n > i64::MIN as f64 - 1.0 && n < i64::MAX as f64 + 1.0 {
+                    let v = n as i64;
+                    if (v as f64 - n).abs() < 0.5 {
+                        return Ok(Expr::Literal(Value::Integer(v)));
+                    }
                 }
+                Ok(Expr::Literal(Value::Float(n)))
             }
             TokenType::String(s) => {
                 let s = s.clone();

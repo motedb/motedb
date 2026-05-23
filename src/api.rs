@@ -900,7 +900,29 @@ impl Database {
         let s = s.trim();
         if s.is_empty() { return None; }
         if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-            return Some(Value::text(s[1..s.len()-1].to_string()));
+            let inner = &s[1..s.len()-1];
+            let mut text = String::with_capacity(inner.len());
+            let mut chars = inner.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.next() {
+                        Some('n') => text.push('\n'),
+                        Some('t') => text.push('\t'),
+                        Some('r') => text.push('\r'),
+                        Some('\\') => text.push('\\'),
+                        Some('\'') => text.push('\''),
+                        Some(c2) => { text.push('\\'); text.push(c2); }
+                        None => text.push('\\'),
+                    },
+                    '\'' if chars.peek() == Some(&'\'') => {
+                        // Doubled quote: '' → literal single quote
+                        text.push('\'');
+                        chars.next();
+                    }
+                    c => text.push(c),
+                }
+            }
+            return Some(Value::text(text));
         }
         if s.starts_with('-') || s.as_bytes().first()?.is_ascii_digit() {
             if let Ok(i) = s.parse::<i64>() { return Some(Value::Integer(i)); }
@@ -1215,13 +1237,30 @@ impl Database {
                 // String literal
                 chars.next(); // consume opening quote
                 let mut text = String::new();
-                let mut escaped = false;
                 loop {
                     match chars.next() {
-                        Some((_, '\'')) if !escaped => break,
-                        Some((_, '\\')) => { escaped = true; text.push('\\'); }
-                        Some((_, c)) => { escaped = false; text.push(c); }
-                        None => return None, // unterminated string
+                        Some((_, '\'')) => {
+                            // SQL doubled-quote: '' → literal single quote
+                            if chars.peek().map(|(_, c)| *c == '\'').unwrap_or(false) {
+                                text.push('\'');
+                                chars.next(); // consume second quote
+                            } else {
+                                break; // end of string
+                            }
+                        }
+                        Some((_, '\\')) => {
+                            match chars.next() {
+                                Some((_, 'n')) => text.push('\n'),
+                                Some((_, 't')) => text.push('\t'),
+                                Some((_, 'r')) => text.push('\r'),
+                                Some((_, '\\')) => text.push('\\'),
+                                Some((_, '\'')) => text.push('\''),
+                                Some((_, c)) => { text.push('\\'); text.push(c); }
+                                None => return None,
+                            }
+                        }
+                        Some((_, c)) => text.push(c),
+                        None => return None,
                     }
                 }
                 values.push(Value::text(text));

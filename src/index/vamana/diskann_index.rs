@@ -723,8 +723,11 @@ impl DiskANNIndex {
             Some(id) => id,
             None => return Ok(Vec::new()),
         };
-        
-        // 🔧 FIX: 使用标准 greedy_search（无激进优化）
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
         let search_list_size = self.config.search_list_size.max(k * 2);
         let candidates = self.greedy_search(query, medoid, search_list_size)?;
         

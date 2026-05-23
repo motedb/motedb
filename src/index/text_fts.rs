@@ -649,6 +649,7 @@ impl TextFTSIndex {
         let pending = self.pending_posting_lists.read();
         let btree = self.btree.read();
         let deleted = self.deleted_docs.read();
+        let deleted_term_docs = self.deleted_term_docs.read();
 
         // Load posting lists for all phrase tokens (with positions for phrase matching)
         let mut postings: Vec<(TermId, PostingList)> = Vec::new();
@@ -669,14 +670,15 @@ impl TextFTSIndex {
 
         // Single-token phrase: just return docs containing it
         if postings.len() == 1 {
+            let term_id = postings[0].0;
             let mut doc_ids = postings.into_iter().next().unwrap().1.doc_ids();
-            doc_ids.retain(|id| !deleted.contains(&(*id as DocId)));
+            doc_ids.retain(|id| {
+                let did = *id as DocId;
+                !deleted.contains(&did) && !deleted_term_docs.contains(&(term_id, did))
+            });
             return Ok(doc_ids);
         }
 
-        // Multi-token phrase: intersect by consecutive positions
-        // Start with the candidate set from the first (rarest) term
-        // Sort by doc frequency ascending for better intersection
         postings.sort_by_key(|(_, p)| p.doc_count());
 
         let candidates = &postings[0].1;
@@ -685,6 +687,10 @@ impl TextFTSIndex {
         'outer: for doc_id in candidates.doc_ids() {
             let doc_id = doc_id as DocId;
             if deleted.contains(&doc_id) {
+                continue;
+            }
+            // Check if any term's association with this doc was deleted
+            if postings.iter().any(|(tid, _)| deleted_term_docs.contains(&(*tid, doc_id))) {
                 continue;
             }
 
