@@ -36,7 +36,7 @@ impl SSTableCache {
         use std::num::NonZeroUsize;
         Self {
             cache: RwLock::new(lru::LruCache::new(
-                NonZeroUsize::new(max_size).unwrap()
+                NonZeroUsize::new(max_size.max(1)).unwrap()
             )),
             max_entries: max_size,
         }

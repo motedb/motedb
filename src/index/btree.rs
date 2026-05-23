@@ -477,7 +477,7 @@ impl BTree {
         Ok(Self {
             root_page_id: Arc::new(RwLock::new(root_page_id)),
             page_cache: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(config.cache_size).unwrap()
+                NonZeroUsize::new(config.cache_size.max(1)).unwrap()
             ))),
             next_page_id: Arc::new(RwLock::new(next_page_id)),
             storage_file: Arc::new(RwLock::new(file)),

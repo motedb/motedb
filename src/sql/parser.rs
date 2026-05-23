@@ -35,7 +35,12 @@ impl Parser {
         if matches!(self.current().token_type, TokenType::Semicolon) {
             self.advance();
         }
-        
+
+        // Reject multiple statements (security: prevents silent truncation)
+        if !matches!(self.current().token_type, TokenType::Eof) {
+            return Err(self.error("Multiple statements are not supported; unexpected input after statement"));
+        }
+
         Ok(stmt)
     }
     
@@ -731,6 +736,10 @@ impl Parser {
             TokenType::Index => {
                 self.advance();
                 let index_name = self.parse_identifier()?;
+                // Optionally consume ON table_name (MySQL-compatible syntax)
+                if self.match_token(TokenType::On) {
+                    let _ = self.parse_identifier()?;
+                }
                 Ok(Statement::DropIndex(DropIndexStmt { index_name }))
             }
             _ => Err(self.error("Expected TABLE or INDEX after DROP")),
