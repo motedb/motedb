@@ -336,6 +336,18 @@ impl QueryOptimizer {
         // Analyze WHERE clause for index opportunities
         self.analyze_where_clause(table_name, where_clause, params, &mut plans)?;
 
+        // Ensure all index plans carry the full WHERE clause as post_filter.
+        // For simple predicates (e.g., `col = 5`) the index scan covers the full
+        // condition and post_filter will be redundant but harmless. For compound
+        // predicates (e.g., `col = 5 AND status = 'active'`) the index plan only
+        // handles one side — the post_filter ensures the other side isn't dropped.
+        let full_where = where_clause.clone();
+        for plan in &mut plans {
+            if plan.post_filters.is_empty() {
+                plan.post_filters.push(full_where.clone());
+            }
+        }
+
         Ok(plans)
     }
     
@@ -417,7 +429,7 @@ impl QueryOptimizer {
                 } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
                         let neg_inf = Self::negative_inf(&val);
-                        self.try_range_query_plan(table_name, col, neg_inf, true, val.clone(), false, plans)?;
+                        self.try_range_query_plan(table_name, col, neg_inf, true, val.clone(), true, plans)?;
                     }
                 }
             }
@@ -432,7 +444,7 @@ impl QueryOptimizer {
                 } else if let Some(val) = Self::resolve_to_value(params,left) {
                     if let Expr::Column(col) = right.as_ref() {
                         let pos_inf = Self::positive_inf(&val);
-                        self.try_range_query_plan(table_name, col, val.clone(), true, pos_inf, true, plans)?;
+                        self.try_range_query_plan(table_name, col, val.clone(), false, pos_inf, true, plans)?;
                     }
                 }
             }

@@ -545,11 +545,21 @@ impl QueryExecutor {
 
         // For PointQuery/RangeQuery, the plan already has resolved values — use original stmt.
         // For FullScan, WHERE still contains Parameter nodes — substitute needed.
+        //
+        // When post_filters is non-empty, the index plan only covers part of the WHERE
+        // clause (e.g., `col = 5` in `col = 5 AND status = 'active'`). The streaming
+        // point/range paths don't re-evaluate the full WHERE, so fall back to FullScan
+        // which applies the complete WHERE clause per row.
+        let has_post_filters = !plan.post_filters.is_empty();
         match plan.scan_method {
-            super::optimizer::ScanMethod::PointQuery { ref table, ref column, ref value } => {
+            super::optimizer::ScanMethod::PointQuery { ref table, ref column, ref value }
+                if !has_post_filters =>
+            {
                 self.execute_point_query_streaming(stmt, table, column, value)
             }
-            super::optimizer::ScanMethod::RangeQuery { ref table, ref column, ref start, start_inclusive, ref end, end_inclusive } => {
+            super::optimizer::ScanMethod::RangeQuery { ref table, ref column, ref start, start_inclusive, ref end, end_inclusive }
+                if !has_post_filters =>
+            {
                 self.execute_range_query_streaming(stmt, table, column, start, start_inclusive, end, end_inclusive)
             }
             super::optimizer::ScanMethod::FullScan { .. } if has_params => {

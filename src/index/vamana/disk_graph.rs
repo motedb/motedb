@@ -453,6 +453,11 @@ impl DiskGraph {
         }
 
         *self.dirty.write() = true;
+
+        // Invalidate mmap — file has grown but mmap still maps the old range.
+        // Subsequent reads will use seek+read fallback until next flush() remaps.
+        *self.mmap.write() = None;
+
         Ok(())
     }
 
@@ -640,22 +645,21 @@ impl DiskGraph {
             let guard = self.mmap.read();
             if let Some(ref mmap) = *guard {
                 let off = offset as usize;
-                if off + 12 > mmap.len() {
-                    return Err(StorageError::InvalidData("Graph mmap offset out of bounds".into()));
+                if off + 12 <= mmap.len() {
+                    let _node_id = u64::from_le_bytes(mmap[off..off+8].try_into().unwrap());
+                    let count = u32::from_le_bytes(mmap[off+8..off+12].try_into().unwrap()) as usize;
+                    let neighbors_start = off + 12;
+                    let neighbors_end = neighbors_start + count * 8;
+                    if neighbors_end <= mmap.len() {
+                        let mut neighbors = Vec::with_capacity(count);
+                        for i in 0..count {
+                            let n_off = neighbors_start + i * 8;
+                            neighbors.push(u64::from_le_bytes(mmap[n_off..n_off+8].try_into().unwrap()));
+                        }
+                        return Ok(neighbors);
+                    }
                 }
-                let _node_id = u64::from_le_bytes(mmap[off..off+8].try_into().unwrap());
-                let count = u32::from_le_bytes(mmap[off+8..off+12].try_into().unwrap()) as usize;
-                let neighbors_start = off + 12;
-                let neighbors_end = neighbors_start + count * 8;
-                if neighbors_end > mmap.len() {
-                    return Err(StorageError::InvalidData("Graph mmap neighbor data out of bounds".into()));
-                }
-                let mut neighbors = Vec::with_capacity(count);
-                for i in 0..count {
-                    let n_off = neighbors_start + i * 8;
-                    neighbors.push(u64::from_le_bytes(mmap[n_off..n_off+8].try_into().unwrap()));
-                }
-                return Ok(neighbors);
+                // mmap out of bounds — stale mmap after write, fall through to seek+read
             }
         }
 

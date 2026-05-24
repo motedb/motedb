@@ -392,8 +392,8 @@ impl TableSchema {
 
             // Type checking
             let type_match = match (&col.col_type, value) {
-                // NULL is valid for any nullable column
-                (_, crate::types::Value::Null) if col.nullable => true,
+                // NULL is valid for nullable columns or AUTO_INCREMENT (system fills value)
+                (_, crate::types::Value::Null) if col.nullable || col.auto_increment => true,
 
                 // New SQL types
                 (ColumnType::Integer, crate::types::Value::Integer(_)) => true,

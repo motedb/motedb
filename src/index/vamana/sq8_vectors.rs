@@ -388,6 +388,9 @@ impl SQ8Vectors {
             qcache.pop(&row_id);
         }
 
+        // Invalidate mmap — file has grown, stale mmap will cause out-of-bounds
+        *self.data_mmap.write() = None;
+
         Ok(true)
     }
 
@@ -491,13 +494,13 @@ impl SQ8Vectors {
                 // Entry layout: [row_id: 8] [min: 4] [max: 4] [codes: dimension]
                 let off = offset as usize + 8; // skip row_id
                 let end = off + 8 + self.dimension;
-                if end > mmap.len() {
-                    return Err(StorageError::InvalidData("SQ8 mmap offset out of bounds".into()));
+                if end <= mmap.len() {
+                    let min = f32::from_le_bytes(mmap[off..off+4].try_into().unwrap());
+                    let max = f32::from_le_bytes(mmap[off+4..off+8].try_into().unwrap());
+                    let codes = mmap[off+8..off+8+self.dimension].to_vec();
+                    return Ok(QuantizedVector { codes, min, max });
                 }
-                let min = f32::from_le_bytes(mmap[off..off+4].try_into().unwrap());
-                let max = f32::from_le_bytes(mmap[off+4..off+8].try_into().unwrap());
-                let codes = mmap[off+8..off+8+self.dimension].to_vec();
-                return Ok(QuantizedVector { codes, min, max });
+                // mmap out of bounds — stale mmap after append, fall through to seek+read
             }
         }
 

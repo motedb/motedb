@@ -33,6 +33,7 @@ pub struct ColumnarStore {
     schemas: DashMap<u32, Arc<TableSchema>>,
     config: ColumnarConfig,
     next_row_id: Arc<AtomicU64>,
+    next_segment_id: Arc<AtomicU64>,
     table_registry: Arc<TableRegistry>,
     /// WAL for crash recovery (set after construction via set_wal).
     wal: RwLock<Option<Arc<WALManager>>>,
@@ -55,6 +56,7 @@ impl ColumnarStore {
             schemas: DashMap::new(),
             config,
             next_row_id,
+            next_segment_id: Arc::new(AtomicU64::new(0)),
             table_registry,
             wal: RwLock::new(None),
         })
@@ -272,7 +274,8 @@ impl ColumnarStore {
 
         // Write merged segment
         let dir = self.base_dir.join(table_id.to_string());
-        let path = dir.join(format!("seg_{}_{}.mcdb", merged_min_ts, merged_max_ts));
+        let seg_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("seg_{:020}.mcdb", seg_id));
         let mut builder = SegmentBuilder::new(&path, table_id, column_count)?;
 
         // Sort merged data by timestamp if enabled
@@ -370,16 +373,22 @@ impl ColumnarStore {
     ) -> Result<()> {
         match col_buf {
             ColumnBuffer::Timestamp(vals) => {
-                let data = gorilla::encode_timestamps(vals);
-                builder.write_column(col_id, ColumnEncoding::GorillaTimestamp, &data, (vals.len() * 8) as u32, 0)?;
+                let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                let non_null: Vec<i64> = vals.iter().filter_map(|v| *v).collect();
+                let data = gorilla::encode_timestamps(&non_null);
+                builder.write_column(col_id, ColumnEncoding::GorillaTimestamp, &data, (vals.len() * 8) as u32, null_count)?;
             }
             ColumnBuffer::Integer(vals) => {
-                let data = gorilla::encode_integers(vals);
-                builder.write_column(col_id, ColumnEncoding::DeltaVarint, &data, (vals.len() * 8) as u32, 0)?;
+                let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                let non_null: Vec<i64> = vals.iter().filter_map(|v| *v).collect();
+                let data = gorilla::encode_integers(&non_null);
+                builder.write_column(col_id, ColumnEncoding::DeltaVarint, &data, (vals.len() * 8) as u32, null_count)?;
             }
             ColumnBuffer::Float(vals) => {
-                let data = gorilla::encode_floats(vals);
-                builder.write_column(col_id, ColumnEncoding::GorillaXorFloat, &data, (vals.len() * 8) as u32, 0)?;
+                let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                let non_null: Vec<f64> = vals.iter().filter_map(|v| *v).collect();
+                let data = gorilla::encode_floats(&non_null);
+                builder.write_column(col_id, ColumnEncoding::GorillaXorFloat, &data, (vals.len() * 8) as u32, null_count)?;
             }
             ColumnBuffer::Bool(vals) => {
                 let (packed, null_bm) = encode_bools(vals);
@@ -484,9 +493,10 @@ impl ColumnarStore {
         let dir = self.base_dir.join(table_id.to_string());
         std::fs::create_dir_all(&dir).map_err(StorageError::Io)?;
 
+        let seg_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
-            "seg_{}_{}.mcdb",
-            batch.min_timestamp, batch.max_timestamp
+            "seg_{:020}.mcdb",
+            seg_id
         ));
 
         let column_count = batch.columns.len() as u16;
@@ -503,33 +513,39 @@ impl ColumnarStore {
         for (col_id, col_buf) in batch.columns.iter().enumerate() {
             match col_buf {
                 ColumnBuffer::Timestamp(vals) => {
-                    let data = gorilla::encode_timestamps(vals);
+                    let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                    let non_null: Vec<i64> = vals.iter().filter_map(|v| *v).collect();
+                    let data = gorilla::encode_timestamps(&non_null);
                     builder.write_column(
                         col_id as u16,
                         ColumnEncoding::GorillaTimestamp,
                         &data,
                         (vals.len() * 8) as u32,
-                        0,
+                        null_count,
                     )?;
                 }
                 ColumnBuffer::Integer(vals) => {
-                    let data = gorilla::encode_integers(vals);
+                    let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                    let non_null: Vec<i64> = vals.iter().filter_map(|v| *v).collect();
+                    let data = gorilla::encode_integers(&non_null);
                     builder.write_column(
                         col_id as u16,
                         ColumnEncoding::DeltaVarint,
                         &data,
                         (vals.len() * 8) as u32,
-                        0,
+                        null_count,
                     )?;
                 }
                 ColumnBuffer::Float(vals) => {
-                    let data = gorilla::encode_floats(vals);
+                    let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                    let non_null: Vec<f64> = vals.iter().filter_map(|v| *v).collect();
+                    let data = gorilla::encode_floats(&non_null);
                     builder.write_column(
                         col_id as u16,
                         ColumnEncoding::GorillaXorFloat,
                         &data,
                         (vals.len() * 8) as u32,
-                        0,
+                        null_count,
                     )?;
                 }
                 ColumnBuffer::Bool(vals) => {

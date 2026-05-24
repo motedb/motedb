@@ -7,9 +7,9 @@ use super::config::ColumnarConfig;
 /// Per-column typed buffer. Stores values in a type-homogeneous vector
 /// for efficient compression during flush.
 pub enum ColumnBuffer {
-    Timestamp(Vec<i64>),
-    Integer(Vec<i64>),
-    Float(Vec<f64>),
+    Timestamp(Vec<Option<i64>>),
+    Integer(Vec<Option<i64>>),
+    Float(Vec<Option<f64>>),
     Bool(Vec<Option<bool>>),
     Text(Vec<Option<String>>),
     /// Fallback for Tensor, Spatial, Vector, etc. (rare in TimeSeries)
@@ -30,20 +30,23 @@ impl ColumnBuffer {
 
     pub(crate) fn push(&mut self, value: Value) {
         match (self, value) {
-            (Self::Timestamp(v), Value::Timestamp(ts)) => v.push(ts.as_micros()),
-            (Self::Integer(v), Value::Integer(i)) => v.push(i),
-            (Self::Float(v), Value::Float(f)) => v.push(f),
+            (Self::Timestamp(v), Value::Timestamp(ts)) => v.push(Some(ts.as_micros())),
+            (Self::Timestamp(v), Value::Null) => v.push(None),
+            (Self::Integer(v), Value::Integer(i)) => v.push(Some(i)),
+            (Self::Integer(v), Value::Null) => v.push(None),
+            (Self::Float(v), Value::Float(f)) => v.push(Some(f)),
+            (Self::Float(v), Value::Null) => v.push(None),
             (Self::Bool(v), Value::Bool(b)) => v.push(Some(b)),
             (Self::Bool(v), Value::Null) => v.push(None),
             (Self::Text(v), Value::Text(s)) => v.push(Some((*s).clone())),
             (Self::Text(v), Value::Null) => v.push(None),
             (Self::Other(v), val) => v.push(val),
-            // Null → use default for type
-            (Self::Timestamp(v), Value::Null) => v.push(0),
-            (Self::Integer(v), Value::Null) => v.push(0),
-            (Self::Float(v), Value::Null) => v.push(0.0),
-            // Type mismatch: skip rather than silently corrupt
-            _ => {}
+            // Type mismatch: push NULL to keep column alignment
+            (Self::Timestamp(v), _) => v.push(None),
+            (Self::Integer(v), _) => v.push(None),
+            (Self::Float(v), _) => v.push(None),
+            (Self::Bool(v), _) => v.push(None),
+            (Self::Text(v), _) => v.push(None),
         }
     }
 
@@ -54,7 +57,7 @@ impl ColumnBuffer {
             Self::Float(v) => v.len() * 8,
             Self::Bool(v) => v.len(),
             Self::Text(v) => v.iter().map(|s| s.as_ref().map_or(1, |s| s.len() + 8)).sum(),
-            Self::Other(v) => v.len() * 32, // rough estimate
+            Self::Other(v) => v.len() * 32,
         }
     }
 
@@ -77,33 +80,66 @@ impl ColumnBuffer {
 
         match self {
             Self::Timestamp(vals) if !vals.is_empty() => {
-                let min = *vals.iter().min().unwrap();
-                let max = *vals.iter().max().unwrap();
+                let non_null: Vec<&i64> = vals.iter().filter_map(|v| v.as_ref()).collect();
+                if non_null.is_empty() {
+                    return Some(ColumnStatistics {
+                        column_id: col_id,
+                        min_value_raw: [0u8; 8],
+                        max_value_raw: [0u8; 8],
+                        null_count: vals.len() as u32,
+                    });
+                }
+                let min = *non_null.iter().min().unwrap();
+                let max = *non_null.iter().max().unwrap();
+                let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 Some(ColumnStatistics {
                     column_id: col_id,
                     min_value_raw: min.to_le_bytes(),
                     max_value_raw: max.to_le_bytes(),
-                    null_count: 0,
+                    null_count,
                 })
             }
             Self::Integer(vals) if !vals.is_empty() => {
-                let min = *vals.iter().min().unwrap();
-                let max = *vals.iter().max().unwrap();
+                let non_null: Vec<&i64> = vals.iter().filter_map(|v| v.as_ref()).collect();
+                if non_null.is_empty() {
+                    return Some(ColumnStatistics {
+                        column_id: col_id,
+                        min_value_raw: [0u8; 8],
+                        max_value_raw: [0u8; 8],
+                        null_count: vals.len() as u32,
+                    });
+                }
+                let min = *non_null.iter().min().unwrap();
+                let max = *non_null.iter().max().unwrap();
+                let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 Some(ColumnStatistics {
                     column_id: col_id,
                     min_value_raw: min.to_le_bytes(),
                     max_value_raw: max.to_le_bytes(),
-                    null_count: 0,
+                    null_count,
                 })
             }
             Self::Float(vals) if !vals.is_empty() => {
-                let min = *vals.iter().reduce(|a, b| if a < b { a } else { b }).unwrap();
-                let max = *vals.iter().reduce(|a, b| if a > b { a } else { b }).unwrap();
+                let non_null: Vec<&f64> = vals.iter().filter_map(|v| v.as_ref())
+                    .filter(|f| !f.is_nan())
+                    .collect();
+                if non_null.is_empty() {
+                    let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
+                    return Some(ColumnStatistics {
+                        column_id: col_id,
+                        min_value_raw: [0u8; 8],
+                        max_value_raw: [0u8; 8],
+                        null_count,
+                    });
+                }
+                let min = non_null.iter().map(|&&v| v).fold(f64::INFINITY, f64::min);
+                let max = non_null.iter().map(|&&v| v).fold(f64::NEG_INFINITY, f64::max);
+                let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 Some(ColumnStatistics {
                     column_id: col_id,
                     min_value_raw: min.to_le_bytes(),
                     max_value_raw: max.to_le_bytes(),
-                    null_count: 0,
+                    null_count,
                 })
             }
             Self::Bool(vals) if !vals.is_empty() => {
@@ -202,7 +238,7 @@ impl BufferedBatch {
         }
 
         // Extract timestamps for sorting
-        let timestamps: Vec<i64> = match &self.columns[ts_idx] {
+        let timestamps: Vec<Option<i64>> = match &self.columns[ts_idx] {
             ColumnBuffer::Timestamp(vals) => vals.clone(),
             _ => return, // not a timestamp column
         };
@@ -372,7 +408,7 @@ impl ColumnarWriteBuffer {
             if let Some(ts_idx) = self.ts_column_idx {
                 let in_range = match &self.columns[ts_idx] {
                     ColumnBuffer::Timestamp(vals) => {
-                        vals.get(row_idx).is_some_and(|&ts| ts >= start_ts && ts <= end_ts)
+                        vals.get(row_idx).is_some_and(|ts| ts.is_some_and(|ts| ts >= start_ts && ts <= end_ts))
                     }
                     _ => false,
                 };
@@ -390,13 +426,13 @@ impl ColumnarWriteBuffer {
                 }
                 let val = match &self.columns[idx] {
                     ColumnBuffer::Timestamp(vals) => {
-                        vals.get(row_idx).map(|&ts| Value::Timestamp(Timestamp::from_micros(ts)))
+                        vals.get(row_idx).and_then(|v| v.map(|ts| Value::Timestamp(Timestamp::from_micros(ts)))).or(Some(Value::Null))
                     }
                     ColumnBuffer::Integer(vals) => {
-                        vals.get(row_idx).copied().map(Value::Integer)
+                        vals.get(row_idx).and_then(|v| v.map(Value::Integer)).or(Some(Value::Null))
                     }
                     ColumnBuffer::Float(vals) => {
-                        vals.get(row_idx).copied().map(Value::Float)
+                        vals.get(row_idx).and_then(|v| v.map(Value::Float)).or(Some(Value::Null))
                     }
                     ColumnBuffer::Bool(vals) => {
                         vals.get(row_idx).and_then(|v| v.map(Value::Bool)).or(Some(Value::Null))

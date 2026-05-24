@@ -44,6 +44,20 @@ impl MoteDB {
         ensure_open!(self);
         let schema = self.table_registry.get_table(table_name)?;
 
+        // Ensure row has enough slots for AUTO_INCREMENT PK column before validation
+        if schema.is_primary_key_auto_increment() {
+            if let Some(pk_col) = schema.primary_key().and_then(|n| schema.get_column(n)) {
+                while row.len() <= pk_col.position {
+                    row.push(Value::Null);
+                }
+            }
+        }
+
+        // Validate row against schema (before allocating ID to avoid waste on failure)
+        schema.validate_row(&row).map_err(|e| {
+            StorageError::InvalidData(format!("Row validation failed: {}", e))
+        })?;
+
         // Allocate row_id
         let row_id = if schema.is_primary_key_auto_increment() {
             let counter = self.table_auto_increment
@@ -67,11 +81,6 @@ impl MoteDB {
         } else {
             self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
-
-        // Validate row against schema
-        schema.validate_row(&row).map_err(|e| {
-            StorageError::InvalidData(format!("Row validation failed: {}", e))
-        })?;
 
         // Add to transaction write_set — NOT written to WAL or LSM yet
         let ctx = self.txn_coordinator.get_context(txn_id)?;

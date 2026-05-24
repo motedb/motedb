@@ -87,6 +87,24 @@ impl MoteDB {
         }
         
         // 2. 🚀 P3+4: For AUTO_INCREMENT primary key, use per-table counter
+        // Ensure row has enough slots for AUTO_INCREMENT PK column before validation
+        if schema.is_primary_key_auto_increment() {
+            if let Some(pk_col_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_col_name) {
+                    while row.len() <= pk_col.position {
+                        row.push(Value::Null);
+                    }
+                }
+            }
+        }
+
+        // 3. Validate row (before allocating AUTO_INCREMENT to avoid ID waste)
+        schema.validate_row(&row)
+            .map_err(|e| StorageError::InvalidData(format!(
+                "Row validation failed for table '{}': {}",
+                table_name, e
+            )))?;
+
         let row_id = if schema.is_primary_key_auto_increment() {
             // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
             // 🚀 Optimized: DashMap — first insert per table acquires shard lock, then lock-free
@@ -109,7 +127,7 @@ impl MoteDB {
             if let Err(e) = self.table_registry.update_auto_increment_counter(table_name, id) {
                 warn_log!("[MoteDB] Auto-increment counter update failed for {}: {}", table_name, e);
             }
-            
+
             // Fill AUTO_INCREMENT primary key with id
             if let Some(pk_col_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_col_name) {
@@ -121,19 +139,12 @@ impl MoteDB {
                     row[pk_col.position] = Value::Integer(id);
                 }
             }
-            
+
             id as RowId
         } else {
             // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
             self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
-        
-        // 3. Validate row
-        schema.validate_row(&row)
-            .map_err(|e| StorageError::InvalidData(format!(
-                "Row validation failed for table '{}': {}",
-                table_name, e
-            )))?;
 
         // 4. Determine partition
         let composite_key = self.make_composite_key(table_name, row_id);
@@ -959,7 +970,7 @@ impl MoteDB {
     /// ];
     /// let row_ids = db.batch_insert_rows_to_table("users", rows)?;
     /// ```ignore
-    pub fn batch_insert_rows_to_table(&self, table_name: &str, rows: Vec<Row>) -> Result<Vec<RowId>> {
+    pub fn batch_insert_rows_to_table(&self, table_name: &str, mut rows: Vec<Row>) -> Result<Vec<RowId>> {
         ensure_open!(self);
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -1026,6 +1037,31 @@ impl MoteDB {
         // 3. Batch allocate row IDs
         let mut row_ids = Vec::with_capacity(rows.len());
         let auto_inc = schema.is_primary_key_auto_increment();
+
+        // Ensure all rows have enough slots for AUTO_INCREMENT PK column
+        if auto_inc {
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    for row in rows.iter_mut() {
+                        while row.len() <= pk_col.position {
+                            row.push(Value::Null);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pre-validate all rows before allocating IDs (avoid wasting AUTO_INCREMENT IDs on invalid rows)
+        {
+            for (idx, row) in rows.iter().enumerate() {
+                schema.validate_row(row)
+                    .map_err(|e| StorageError::InvalidData(format!(
+                        "Row {} validation failed for table '{}': {}",
+                        idx, table_name, e
+                    )))?;
+            }
+        }
+
         if auto_inc {
             // Use per-table AUTO_INCREMENT counter (consistent with insert_row_to_table)
             let counter = {
@@ -1063,14 +1099,6 @@ impl MoteDB {
                         row[pk_col.position] = Value::Integer(row_ids[i] as i64);
                     }
                 }
-            }
-            // Re-validate rows after filling PK
-            for (idx, row) in rows.iter().enumerate() {
-                schema.validate_row(row)
-                    .map_err(|e| StorageError::InvalidData(format!(
-                        "Row {} validation failed for table '{}': {}",
-                        idx, table_name, e
-                    )))?;
             }
         }
 
