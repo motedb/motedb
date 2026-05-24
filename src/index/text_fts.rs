@@ -771,13 +771,16 @@ impl TextFTSIndex {
 
             let df = posting.doc_count() as f32;
             if df == 0.0 { continue; }
+            // BM25 IDF: non-negative variant (Lucene-compatible). The +1 ensures
+            // terms appearing in every document still get a small positive weight.
             let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
 
             // Compute max possible BM25 score for this term (upper bound)
             let max_tf = posting.max_tf();
             let upper_bound = {
                 let tf = max_tf as f32;
-                let min_norm = 1.0 - b; // minimal norm (doc_len = 0)
+                // Use dl=1 as the minimum possible doc length for a tighter bound
+                let min_norm = 1.0 - b + b / self.avg_doc_length.max(1.0);
                 idf * (tf * (k1 + 1.0)) / (tf + k1 * min_norm)
             };
 
@@ -1110,11 +1113,13 @@ impl TextFTSIndex {
         }
 
         let meta_path = self.storage_dir.join("index_meta.bin");
+        let tmp_path = self.storage_dir.join("index_meta.bin.tmp");
+
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&meta_path)?;
+            .open(&tmp_path)?;
         
         let deleted_docs: Vec<DocId> = self.deleted_docs.read().iter().copied().collect();
         let deleted_term_docs: Vec<(TermId, DocId)> = self.deleted_term_docs.read().iter().copied().collect();
@@ -1133,7 +1138,11 @@ impl TextFTSIndex {
         
         file.write_all(&serialized)?;
         file.sync_all()?;
-        
+        drop(file);
+
+        // Atomic rename for crash safety
+        std::fs::rename(&tmp_path, &meta_path).map_err(StorageError::Io)?;
+
         Ok(())
     }
     
@@ -1259,7 +1268,7 @@ impl TextFTSIndex {
                         if let Ok(block_list) = super::text_types::BlockPostingList::deserialize(&bytes) {
                             let mut cursor = block_list.cursor();
                             while cursor.is_valid() {
-                                merged.add(cursor.current_doc() as u64, None);
+                                merged.add_with_freq(cursor.current_doc() as u64, None, cursor.current_tf());
                                 cursor.advance();
                             }
                         }

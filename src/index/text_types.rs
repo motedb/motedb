@@ -65,16 +65,18 @@ impl Tokenizer for WhitespaceTokenizer {
         } else {
             text.to_lowercase()
         };
-        
+
+        let mut pos = 0u32;
         normalized
             .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .enumerate()
-            .filter_map(|(i, s)| {
+            .filter_map(|s| {
                 if s.len() >= self.min_len && s.len() <= self.max_len {
-                    Some(Token {
+                    let token = Token {
                         text: s.to_string(),
-                        position: i as Position,
-                    })
+                        position: pos,
+                    };
+                    pos += 1;
+                    Some(token)
                 } else {
                     None
                 }
@@ -112,8 +114,15 @@ impl Tokenizer for NgramTokenizer {
         };
         
         let chars: Vec<char> = normalized.chars().collect();
-        if chars.len() < self.n {
+        if chars.is_empty() {
             return vec![];
+        }
+        // For strings shorter than n, return the full string as a single token
+        if chars.len() < self.n {
+            return vec![Token {
+                text: chars.iter().collect(),
+                position: 0,
+            }];
         }
         
         chars
@@ -340,6 +349,15 @@ impl PostingList {
         // Keep doc_freqs in sync for TF queries
         if is_new {
             self.doc_freqs.push(1);
+        } else {
+            // Increment TF for duplicate occurrences of the term in this doc
+            let rank = self.doc_ids.rank(doc_id as u32);
+            if rank > 0 {
+                let idx = (rank - 1) as usize;
+                if idx < self.doc_freqs.len() {
+                    self.doc_freqs[idx] += 1;
+                }
+            }
         }
     }
 
@@ -1024,12 +1042,11 @@ mod tests {
     fn test_term_frequency_without_positions() {
         let mut posting = PostingList::new_without_positions(true);
         posting.add(1, None);
-        posting.add(1, None); // second occurrence — TF should be 1 (fallback)
+        posting.add(1, None); // second occurrence — TF increments
         posting.add(2, None);
 
         assert_eq!(posting.doc_count(), 2);
-        // Without positions, term_frequency returns 1 (doc_freqs not in sync)
-        assert_eq!(posting.term_frequency(1), 1);
+        assert_eq!(posting.term_frequency(1), 2);
         assert_eq!(posting.term_frequency(2), 1);
     }
 
