@@ -1162,4 +1162,81 @@ mod tests {
         }
         assert_eq!(count, 50);
     }
+
+    #[test]
+    fn test_whitespace_tokenizer_position_sequential() {
+        // Before fix: positions had gaps from filtered tokens (punctuation).
+        // "hello--world" would give positions [0, 3] instead of [0, 1].
+        // After fix: positions are sequential [0, 1].
+        let tokenizer = WhitespaceTokenizer { case_sensitive: false, min_len: 1, max_len: 100 };
+        let tokens = tokenizer.tokenize("hello--world");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "hello");
+        assert_eq!(tokens[0].position, 0);
+        assert_eq!(tokens[1].text, "world");
+        assert_eq!(tokens[1].position, 1);
+    }
+
+    #[test]
+    fn test_whitespace_tokenizer_mixed_delimiters() {
+        let tokenizer = WhitespaceTokenizer { case_sensitive: false, min_len: 1, max_len: 100 };
+        let tokens = tokenizer.tokenize("foo  bar\tbaz");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0].position, 0);
+        assert_eq!(tokens[1].position, 1);
+        assert_eq!(tokens[2].position, 2);
+    }
+
+    #[test]
+    fn test_ngram_short_string_returns_single_token() {
+        // Before fix: strings shorter than n returned empty tokens.
+        // After fix: "好" with n=2 returns single token "好".
+        let tokenizer = NgramTokenizer::new(2);
+        let tokens = tokenizer.tokenize("好");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "好");
+        assert_eq!(tokens[0].position, 0);
+    }
+
+    #[test]
+    fn test_ngram_empty_string_returns_nothing() {
+        let tokenizer = NgramTokenizer::new(2);
+        let tokens = tokenizer.tokenize("");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_ngram_exact_length_returns_single_token() {
+        let tokenizer = NgramTokenizer::new(2);
+        let tokens = tokenizer.tokenize("ab");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].text, "ab");
+    }
+
+    #[test]
+    fn test_posting_list_tf_increments_on_duplicate() {
+        // Before fix: duplicate add() calls didn't increment TF in doc_freqs.
+        // After fix: TF correctly reflects occurrence count.
+        let mut posting = PostingList::new_without_positions(true);
+        posting.add(1, None);
+        posting.add(1, None); // second occurrence
+        posting.add(1, None); // third occurrence
+        posting.add(2, None);
+
+        assert_eq!(posting.doc_count(), 2);
+        assert_eq!(posting.term_frequency(1), 3);
+        assert_eq!(posting.term_frequency(2), 1);
+    }
+
+    #[test]
+    fn test_posting_list_tf_with_positions_on_duplicate() {
+        // With positions enabled, TF should also increment correctly.
+        let mut posting = PostingList::new();
+        posting.add(1, Some(0));
+        posting.add(1, Some(5));
+        posting.add(1, Some(10));
+
+        assert_eq!(posting.term_frequency(1), 3);
+        assert_eq!(posting.max_tf(), 3);
+    }
 }

@@ -563,4 +563,109 @@ mod tests {
         assert_eq!(batch.min_timestamp, 1000);
         assert_eq!(batch.max_timestamp, 5500);
     }
+
+    #[test]
+    fn test_null_preserved_not_converted_to_zero() {
+        // Before fix: NULL was stored as 0 in Integer/Timestamp/Float columns.
+        // After fix: NULL is stored as None in Option<T>.
+        let schema = make_schema();
+        let config = ColumnarConfig::default();
+        let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
+
+        // Insert row with NULL in the Float column
+        let row = vec![
+            Value::Timestamp(Timestamp::from_micros(1000)),
+            Value::Null,
+            Value::text("label".to_string()),
+        ];
+        buf.append(0, &row);
+
+        // Verify the float column has None, not Some(0.0)
+        let batch = buf.take().unwrap();
+        match &batch.columns[1] {
+            ColumnBuffer::Float(vals) => {
+                assert_eq!(vals.len(), 1);
+                assert!(vals[0].is_none(), "NULL should be None, not Some(0.0)");
+            }
+            _ => panic!("Expected Float column"),
+        }
+    }
+
+    #[test]
+    fn test_type_mismatch_preserves_alignment() {
+        // Before fix: type mismatch silently dropped values, causing column misalignment.
+        // After fix: type mismatch pushes NULL to maintain alignment.
+        let schema = make_schema();
+        let config = ColumnarConfig::default();
+        let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
+
+        // Insert row with Integer in Float column (type mismatch)
+        let row = vec![
+            Value::Timestamp(Timestamp::from_micros(1000)),
+            Value::Integer(42), // wrong type for Float column
+            Value::text("ok".to_string()),
+        ];
+        buf.append(0, &row);
+
+        let batch = buf.take().unwrap();
+        assert_eq!(batch.row_count, 1);
+        // Float column should have one entry (None for the mismatch)
+        match &batch.columns[1] {
+            ColumnBuffer::Float(vals) => {
+                assert_eq!(vals.len(), 1, "Column alignment must be preserved");
+                assert!(vals[0].is_none(), "Type mismatch should push NULL");
+            }
+            _ => panic!("Expected Float column"),
+        }
+    }
+
+    #[test]
+    fn test_null_tracking_in_statistics() {
+        // Before fix: null_count was always 0 for Integer/Timestamp/Float.
+        // After fix: null_count correctly reflects NULL values.
+        let schema = make_schema();
+        let config = ColumnarConfig::default();
+        let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
+
+        // Insert two rows, one with NULL float
+        buf.append(0, &[
+            Value::Timestamp(Timestamp::from_micros(1000)),
+            Value::Float(1.5),
+            Value::text("a".to_string()),
+        ]);
+        buf.append(1, &[
+            Value::Timestamp(Timestamp::from_micros(2000)),
+            Value::Null,
+            Value::text("b".to_string()),
+        ]);
+
+        let batch = buf.take().unwrap();
+        let stats = batch.columns[1].compute_statistics(1);
+        assert!(stats.is_some());
+        let s = stats.unwrap();
+        assert_eq!(s.null_count, 1, "Should count 1 NULL in Float column");
+    }
+
+    #[test]
+    fn test_snapshot_rows_with_nulls() {
+        // Verify snapshot_rows returns Null for NULL values, not 0.
+        let schema = make_schema();
+        let config = ColumnarConfig::default();
+        let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
+
+        buf.append(0, &[
+            Value::Timestamp(Timestamp::from_micros(1000)),
+            Value::Null,
+            Value::text("test".to_string()),
+        ]);
+
+        let column_ids = vec![
+            (0u16, "ts".to_string()),
+            (1u16, "temp".to_string()),
+            (2u16, "label".to_string()),
+        ];
+        let rows = buf.snapshot_rows(0, 2000, &schema, &column_ids);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.get("temp"), Some(&Value::Null));
+    }
 }

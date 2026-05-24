@@ -249,4 +249,59 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[1].get("name"), Some(&Value::Null)); // NULL for non-match
     }
+
+    #[test]
+    fn test_hash_join_float_keys() {
+        // Before fix: HashKey didn't support Float, so Float column joins returned 0 results.
+        let mut executor = HashJoinExecutor::new();
+
+        let mut left1 = SqlRow::new();
+        left1.insert("price".to_string(), Value::Float(9.99));
+        left1.insert("item".to_string(), Value::Text("apple".to_string()));
+
+        let mut left2 = SqlRow::new();
+        left2.insert("price".to_string(), Value::Float(19.99));
+        left2.insert("item".to_string(), Value::Text("banana".to_string()));
+
+        executor.build(vec![left1, left2], "price").unwrap();
+
+        let mut probe_row = SqlRow::new();
+        probe_row.insert("price".to_string(), Value::Float(9.99));
+        probe_row.insert("order_id".to_string(), Value::Integer(100));
+
+        let results = executor.probe(vec![probe_row], "price").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("item"), Some(&Value::Text("apple".to_string())));
+        assert_eq!(results[0].get("order_id"), Some(&Value::Integer(100)));
+    }
+
+    #[test]
+    fn test_hash_join_float_no_false_match() {
+        // Verify that 9.99 doesn't match 9.98
+        let mut executor = HashJoinExecutor::new();
+
+        let mut build_row = SqlRow::new();
+        build_row.insert("val".to_string(), Value::Float(9.99));
+        executor.build(vec![build_row], "val").unwrap();
+
+        let mut probe_row = SqlRow::new();
+        probe_row.insert("val".to_string(), Value::Float(9.98));
+        let results = executor.probe(vec![probe_row], "val").unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_hash_join_float_zero() {
+        // Verify +0.0 and -0.0 match (IEEE 754 equivalence)
+        let mut executor = HashJoinExecutor::new();
+
+        let mut build_row = SqlRow::new();
+        build_row.insert("val".to_string(), Value::Float(0.0));
+        executor.build(vec![build_row], "val").unwrap();
+
+        let mut probe_row = SqlRow::new();
+        probe_row.insert("val".to_string(), Value::Float(-0.0));
+        let results = executor.probe(vec![probe_row], "val").unwrap();
+        assert_eq!(results.len(), 1);
+    }
 }

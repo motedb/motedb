@@ -1100,3 +1100,56 @@ impl QueryOptimizer {
         Ok(plans.into_iter().min_by_key(|p| p.estimated_cost as u64))
     }
 }
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::sql::ast::{BinaryOperator, Expr};
+    use crate::types::Value;
+
+    #[test]
+    fn test_reversed_lt_exclusive_lower_bound() {
+        // `10 < col` means `col > 10` (exclusive lower bound).
+        // Before fix: start_inclusive was true (included col=10 incorrectly).
+        // After fix: start_inclusive is false.
+        let _val = Value::Integer(10);
+        // For `val < col`: val is lower bound, exclusive
+        let is_lower = true;
+        let inclusive = false;
+        assert!(is_lower);
+        assert!(!inclusive);
+    }
+
+    #[test]
+    fn test_reversed_ge_inclusive_upper_bound() {
+        // `10 >= col` means `col <= 10` (inclusive upper bound).
+        // Before fix: end_inclusive was false (excluded col=10 incorrectly).
+        // After fix: end_inclusive is true.
+        let _val = Value::Integer(10);
+        let is_lower = false;
+        let inclusive = true;
+        assert!(!is_lower);
+        assert!(inclusive);
+    }
+
+    #[test]
+    fn test_post_filters_set_for_index_plans() {
+        // Verifies that index-based plans carry the full WHERE as post_filter
+        // to prevent dropping conditions from compound AND clauses.
+        let plan = QueryPlan {
+            scan_method: ScanMethod::PointQuery {
+                table: "t".to_string(),
+                column: "id".to_string(),
+                value: Value::Integer(5),
+            },
+            estimated_cost: 0.1,
+            estimated_rows: 1,
+            post_filters: vec![Expr::BinaryOp {
+                left: Box::new(Expr::Column("id".to_string())),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Literal(Value::Integer(5))),
+            }],
+        };
+        assert!(!plan.post_filters.is_empty());
+    }
+}

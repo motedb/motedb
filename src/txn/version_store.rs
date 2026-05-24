@@ -621,4 +621,63 @@ mod tests {
         let stats_after = store.stats();
         assert!(stats_after.total_versions < stats_before.total_versions);
     }
+
+    #[test]
+    fn test_concurrent_update_no_lost_version() {
+        // Verifies that concurrent updates to the same row don't lose versions.
+        // Before the TOCTOU fix, two concurrent updates could interleave:
+        // Thread A reads head, Thread B reads same head, both prepend, one is lost.
+        let store = VersionStore::new();
+        let row_id = 1;
+        let snapshot = Snapshot {
+            timestamp: 100,
+            active_txns: HashSet::new(),
+        };
+
+        // Insert initial version
+        store.insert_version(row_id, vec![Value::Integer(0)], 1, 10).unwrap();
+
+        // Simulate two concurrent updates (sequential but testing the atomic prepend)
+        store.update_version(row_id, vec![Value::Integer(1)], 2, 20).unwrap();
+        store.update_version(row_id, vec![Value::Integer(2)], 3, 30).unwrap();
+
+        // The latest snapshot should see the most recent version
+        let result = store.get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted).unwrap();
+        assert_eq!(result, Some(vec![Value::Integer(2)]));
+
+        // Snapshot at ts=25 should see the first update
+        let snapshot_25 = Snapshot { timestamp: 25, active_txns: HashSet::new() };
+        let result_25 = store.get_visible_version(row_id, &snapshot_25, crate::txn::IsolationLevel::ReadCommitted).unwrap();
+        assert_eq!(result_25, Some(vec![Value::Integer(1)]));
+
+        // Verify version chain has 3 entries
+        let stats = store.stats();
+        assert_eq!(stats.total_versions, 3);
+    }
+
+    #[test]
+    fn test_delete_version_atomic_tombstone() {
+        // Verifies delete_version atomically sets end_ts and prepends tombstone.
+        let store = VersionStore::new();
+        let row_id = 1;
+
+        store.insert_version(row_id, vec![Value::Integer(42)], 1, 10).unwrap();
+
+        // Delete should succeed and create a tombstone
+        store.delete_version(row_id, 2, 20).unwrap();
+
+        // Snapshot before delete sees the data
+        let before = Snapshot { timestamp: 15, active_txns: HashSet::new() };
+        assert_eq!(
+            store.get_visible_version(row_id, &before, crate::txn::IsolationLevel::ReadCommitted).unwrap(),
+            Some(vec![Value::Integer(42)])
+        );
+
+        // Snapshot after delete sees nothing
+        let after = Snapshot { timestamp: 25, active_txns: HashSet::new() };
+        assert_eq!(
+            store.get_visible_version(row_id, &after, crate::txn::IsolationLevel::ReadCommitted).unwrap(),
+            None
+        );
+    }
 }
