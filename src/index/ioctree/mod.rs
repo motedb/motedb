@@ -290,6 +290,11 @@ fn split_leaf(store: &LeafStore, octant: &mut Octant) -> Result<()> {
         }
     }
 
+    // Flush new child leaves to disk before freeing the old leaf.
+    // This ensures the data exists on disk before the old copy is destroyed,
+    // preventing data loss if a crash occurs between free_leaf and flush.
+    store.flush()?;
+
     store.free_leaf(old_leaf_id)?;
     Ok(())
 }
@@ -306,17 +311,15 @@ fn tree_delete(store: &LeafStore, octant: &mut Octant, row_id: u64) -> bool {
             }
         }
         Octant::Inner { children, size, .. } => {
-            for child in children.iter_mut() {
-                if let Some(ref mut c) = child {
+            for child_slot in children.iter_mut() {
+                if let Some(ref mut c) = child_slot {
                     if tree_delete(store, c, row_id) {
                         *size = size.saturating_sub(1);
-                        if let Some(ref c2) = child {
-                            if c2.size() == 0 {
-                                if let Some(lid) = c2.leaf_id() {
-                                    let _ = store.free_leaf(lid);
-                                }
-                                *child = None;
+                        if c.size() == 0 {
+                            if let Some(lid) = c.leaf_id() {
+                                let _ = store.free_leaf(lid);
                             }
+                            *child_slot = None;
                         }
                         return true;
                     }

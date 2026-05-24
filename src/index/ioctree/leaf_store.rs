@@ -164,7 +164,7 @@ impl LeafStore {
 
         if let Some(entry) = inner.cache.get_mut(&leaf_id) {
             if let Some(pos) = entry.points.iter().position(|p| p.row_id == row_id) {
-                entry.points.swap_remove(pos);
+                entry.points.remove(pos);
                 inner.dirty.insert(leaf_id);
                 return Ok(true);
             }

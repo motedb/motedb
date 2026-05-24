@@ -1378,9 +1378,6 @@ impl BTree {
             offset += buf.len() as u64;
         }
 
-        // Truncate file to remove dead space
-        file.set_len(offset)?;
-
         // Update page_offsets table
         let mut offsets = self.page_offsets.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
@@ -1394,14 +1391,17 @@ impl BTree {
             page.dirty = false;
         }
 
+        // Persist superblock BEFORE truncating, so a crash between the two
+        // leaves the file consistent with the new page offsets.
         drop(file);
-
-        // Persist superblock with new page_offsets
         self.sync_superblock()?;
 
-        // Final fsync
+        // Now truncate file to remove dead space
         let file = self.storage_file.write()
             .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        file.set_len(offset)?;
+
+        // Final fsync
         file.sync_all()?;
 
         Ok(())
