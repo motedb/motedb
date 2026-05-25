@@ -49,37 +49,59 @@ impl MoteDB {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if let Some(pk_value) = row.get(pk_col.position) {
-                        // Fast path: check in-memory PK cache
                         let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-                        let exists_in_cache = self.pk_lookup.get(table_name)
-                            .map(|lookup| lookup.get_pk(&pk_key).is_some())
-                            .unwrap_or(false);
 
-                        if exists_in_cache {
-                            return Err(StorageError::InvalidData(format!(
-                                "Duplicate primary key {:?} for table '{}'", pk_value, table_name
-                            )));
-                        }
-
-                        // Slow path: check column index (covers cache misses after restart)
-                        match self.query_by_column(table_name, pk_name, pk_value) {
-                            Ok(found) if !found.is_empty() => {
-                                // Verify at least one RowId still exists in LSM.
-                                // Column indexes can return stale RowIds after compaction.
-                                let mut has_live = false;
-                                for &rid in &found {
-                                    if self.get_table_row(table_name, rid)?.is_some() {
-                                        has_live = true;
-                                        break;
+                        // Fast path: atomic check-and-reserve in PK cache.
+                        // Uses insert_if_absent to prevent TOCTOU race between
+                        // concurrent inserts of the same PK value.
+                        if let Some(lookup) = self.pk_lookup.get(table_name) {
+                            if lookup.insert_if_absent(pk_key.clone(), 0).is_err() {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                )));
+                            }
+                            // Reserved in cache — but row_id is placeholder (0).
+                            // Slow path: check column index (covers cache misses after restart).
+                            // If index check finds nothing, the reservation stands.
+                            // If it finds something, remove reservation and error.
+                            match self.query_by_column(table_name, pk_name, pk_value) {
+                                Ok(found) if !found.is_empty() => {
+                                    let mut has_live = false;
+                                    for &rid in &found {
+                                        if self.get_table_row(table_name, rid)?.is_some() {
+                                            has_live = true;
+                                            break;
+                                        }
+                                    }
+                                    if has_live {
+                                        lookup.remove_pk(&pk_key);
+                                        return Err(StorageError::InvalidData(format!(
+                                            "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                        )));
                                     }
                                 }
-                                if has_live {
-                                    return Err(StorageError::InvalidData(format!(
-                                        "Duplicate primary key {:?} for table '{}'", pk_value, table_name
-                                    )));
-                                }
+                                _ => {}
                             }
-                            _ => {} // Not found or index not available — proceed
+                        } else {
+                            // No PK lookup cache — fall back to index check only (not race-safe,
+                            // but matches existing behavior for tables without pk_lookup)
+                            match self.query_by_column(table_name, pk_name, pk_value) {
+                                Ok(found) if !found.is_empty() => {
+                                    let mut has_live = false;
+                                    for &rid in &found {
+                                        if self.get_table_row(table_name, rid)?.is_some() {
+                                            has_live = true;
+                                            break;
+                                        }
+                                    }
+                                    if has_live {
+                                        return Err(StorageError::InvalidData(format!(
+                                            "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                        )));
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -1626,35 +1648,42 @@ impl Iterator for TableRowStreamingIterator {
     type Item = Result<(RowId, Row)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.lsm_iter.next() {
-            Some(Ok((composite_key, value))) => {
-                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-
-                let data = match &value.data {
-                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                    crate::storage::lsm::ValueData::Blob(_) => {
-                        return Some(Err(StorageError::InvalidData(
-                            "Blob references should be resolved by LSM engine".into()
-                        )));
+        loop {
+            match self.lsm_iter.next() {
+                Some(Ok((composite_key, value))) => {
+                    // Skip deleted (tombstone) rows
+                    if value.deleted {
+                        continue;
                     }
-                };
 
-                let row: Row = if let Some(ref col_types) = self.col_types {
-                    match crate::storage::row_format::decode_fast(data, col_types, self.fixed_count) {
-                        Ok(row) => row,
-                        Err(e) => return Some(Err(e)),
-                    }
-                } else {
-                    match crate::storage::row_format::decode_any(data) {
-                        Ok(row) => row,
-                        Err(e) => return Some(Err(e)),
-                    }
-                };
+                    let row_id = (composite_key & 0xFFFFFFFF) as RowId;
 
-                Some(Ok((row_id, row)))
+                    let data = match &value.data {
+                        crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                        crate::storage::lsm::ValueData::Blob(_) => {
+                            return Some(Err(StorageError::InvalidData(
+                                "Blob references should be resolved by LSM engine".into()
+                            )));
+                        }
+                    };
+
+                    let row: Row = if let Some(ref col_types) = self.col_types {
+                        match crate::storage::row_format::decode_fast(data, col_types, self.fixed_count) {
+                            Ok(row) => row,
+                            Err(e) => return Some(Err(e)),
+                        }
+                    } else {
+                        match crate::storage::row_format::decode_any(data) {
+                            Ok(row) => row,
+                            Err(e) => return Some(Err(e)),
+                        }
+                    };
+
+                    return Some(Ok((row_id, row)));
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
             }
-            Some(Err(e)) => Some(Err(e)),
-            None => None,
         }
     }
 }

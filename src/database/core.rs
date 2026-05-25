@@ -348,8 +348,9 @@ impl MoteDB {
                 .ok_or_else(|| StorageError::Index("Index builder pipeline not initialized".into()))?;
             let registry = db.table_registry.clone();
             let pending = db.pending_index_batches.clone();
+            let lsm = db.lsm_engine.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
-                let result = Self::extract_and_send_index_batch(memtable, &tx, &registry);
+                let result = Self::extract_and_send_index_batch(memtable, &tx, &registry, &lsm);
                 if result.is_ok() && memtable.len() > 0 {
                     pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -908,8 +909,9 @@ impl MoteDB {
             let tx = db.index_build_tx.clone().unwrap();
             let registry = db.table_registry.clone();
             let pending = db.pending_index_batches.clone();
+            let lsm = db.lsm_engine.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
-                let result = Self::extract_and_send_index_batch(memtable, &tx, &registry);
+                let result = Self::extract_and_send_index_batch(memtable, &tx, &registry, &lsm);
                 if result.is_ok() && memtable.len() > 0 {
                     pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1314,6 +1316,7 @@ impl MoteDB {
         memtable: &crate::storage::lsm::UnifiedMemTable,
         tx: &std::sync::mpsc::Sender<IndexBuildBatch>,
         registry: &crate::catalog::TableRegistry,
+        lsm_engine: &crate::storage::lsm::LSMEngine,
     ) -> crate::Result<()> {
         let memtable_len = memtable.len();
         if memtable_len == 0 {
@@ -1336,7 +1339,12 @@ impl MoteDB {
 
             let row_bytes: Vec<u8> = match &entry.data {
                 crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
-                crate::storage::lsm::ValueData::Blob(_) => continue,
+                crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                    match lsm_engine.resolve_blob(blob_ref) {
+                        Ok(data) => data,
+                        Err(_) => continue,
+                    }
+                }
             };
 
             // Resolve table_id → table_name (cached, no decode needed)

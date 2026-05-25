@@ -192,23 +192,35 @@ impl PartialOrd for Value {
     }
 }
 
+/// Total equality for f64: NaN == NaN, -0.0 == 0.0, otherwise bit-equality.
+fn float_eq(a: f64, b: f64) -> bool {
+    if a.is_nan() && b.is_nan() { return true; }
+    if a == 0.0 && b == 0.0 { return true; }
+    a.to_bits() == b.to_bits()
+}
+
+/// Canonical f64 bits for hashing: normalizes NaN to a single representation, -0.0 → 0.0.
+fn canonical_float_bits(f: f64) -> u64 {
+    if f.is_nan() { return u64::MAX; }
+    if f == 0.0 { return 0.0f64.to_bits(); }
+    f.to_bits()
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => float_eq(*a, *b),
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
-            // Cross-type numeric equality: Integer(1) == Float(1.0)
-            (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b,
-            (Value::Float(a), Value::Integer(b)) => *a == (*b as f64),
-            // Cross-type Timestamp equality (must match partial_cmp semantics)
+            (Value::Integer(a), Value::Float(b)) => float_eq(*a as f64, *b),
+            (Value::Float(a), Value::Integer(b)) => float_eq(*a, *b as f64),
             (Value::Timestamp(a), Value::Integer(b)) => a.as_micros() == *b,
             (Value::Integer(a), Value::Timestamp(b)) => *a == b.as_micros(),
-            (Value::Timestamp(a), Value::Float(b)) => (a.as_micros() as f64) == *b,
-            (Value::Float(a), Value::Timestamp(b)) => *a == (b.as_micros() as f64),
+            (Value::Timestamp(a), Value::Float(b)) => float_eq(a.as_micros() as f64, *b),
+            (Value::Float(a), Value::Timestamp(b)) => float_eq(*a, b.as_micros() as f64),
             _ => false,
         }
     }
@@ -217,19 +229,15 @@ impl Eq for Value {}
 
 impl std::hash::Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // For Integer/Float: hash the normalized f64 representation so that
-        // equal cross-type values (e.g., Integer(1) == Float(1.0)) produce the same hash.
         match self {
             Value::Integer(i) => {
-                // Hash using the same canonical representation as Float would
                 let f = *i as f64;
                 state.write_u8(0); // numeric discriminant
-                f.to_bits().hash(state);
+                canonical_float_bits(f).hash(state);
             }
             Value::Float(f) => {
-                let canonical = if *f == 0.0 { 0.0f64 } else { *f };
                 state.write_u8(0); // numeric discriminant
-                canonical.to_bits().hash(state);
+                canonical_float_bits(*f).hash(state);
             }
             Value::Text(s) => {
                 state.write_u8(1);
@@ -243,12 +251,10 @@ impl std::hash::Hash for Value {
                 state.write_u8(3);
             }
             Value::Timestamp(t) => {
-                // Timestamp is cross-type equal to Integer/Float with same micros value,
-                // so must hash to the same discriminant + representation.
                 let micros = t.as_micros();
                 let f = micros as f64;
                 state.write_u8(0); // numeric discriminant (same as Integer/Float)
-                f.to_bits().hash(state);
+                canonical_float_bits(f).hash(state);
             }
             other => {
                 state.write_u8(5);

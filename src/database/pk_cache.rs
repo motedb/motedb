@@ -101,6 +101,17 @@ impl PkLookupCache {
         let mut cache = self.cache.lock();
         cache.pop(key);
     }
+
+    /// Atomically check-and-insert: returns `Err(row_id)` if key already exists,
+    /// or `Ok(())` after inserting the new mapping.
+    pub fn insert_if_absent(&self, key: PkKey, row_id: RowId) -> Result<(), RowId> {
+        let mut cache = self.cache.lock();
+        if let Some(&existing) = cache.get(&key) {
+            return Err(existing);
+        }
+        cache.put(key, row_id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

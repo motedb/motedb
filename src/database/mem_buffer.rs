@@ -198,10 +198,10 @@ where
             );
         }
         
-        // 2. Collect from immutable buffers
+        // 2. Collect from immutable buffers (newest first for correct dedup)
         {
             let immutable = self.immutable.read();
-            for buffer in immutable.iter() {
+            for buffer in immutable.iter().rev() {
                 results.extend(
                     buffer.data
                         .range((Bound::Included(start), Bound::Included(end)))
@@ -213,7 +213,7 @@ where
         // 3. Deduplicate (keep newest value for each key)
         results.sort_by_key(|a| a.0.clone()); // stable sort: equal keys retain insert order
         results.dedup_by(|a, b| a.0 == b.0);
-        
+
         results
     }
 
@@ -231,19 +231,19 @@ where
                 active.data.iter().map(|(k, v)| (k.clone(), v.clone()))
             );
         }
-        
-        // 2. Collect from immutable
+
+        // 2. Collect from immutable (newest first for correct dedup)
         {
             let immutable = self.immutable.read();
-            for buffer in immutable.iter() {
+            for buffer in immutable.iter().rev() {
                 results.extend(
                     buffer.data.iter().map(|(k, v)| (k.clone(), v.clone()))
                 );
             }
         }
-        
-        // 3. Deduplicate
-        results.sort_by_key(|a| a.0.clone()); // stable sort: equal keys retain insert order
+
+        // 3. Deduplicate (keep newest value for each key)
+        results.sort_by_key(|a| a.0.clone());
         results.dedup_by(|a, b| a.0 == b.0);
         
         results
@@ -268,9 +268,10 @@ where
         active.size = 0;
 
         // Drain immutable while still holding active.write
+        // Collect in reverse order (newest first) so dedup keeps newest values
         {
             let mut immutable = self.immutable.write();
-            for buffer in immutable.iter() {
+            for buffer in immutable.iter().rev() {
                 results.extend(
                     buffer.data.iter().map(|(k, v)| (k.clone(), v.clone()))
                 );
