@@ -94,8 +94,9 @@ struct TextFTSMetadata {
     total_tokens: u64,
     avg_doc_length: f32,
     enable_positions: bool,
-    deleted_docs: Vec<DocId>,  // Persisted deleted documents
-    deleted_term_docs: Vec<(TermId, DocId)>,  // Persisted deleted (term, doc) pairs
+    deleted_docs: Vec<DocId>,
+    deleted_term_docs: Vec<(TermId, DocId)>,
+    known_docs: Vec<DocId>,
 }
 
 /// Document length map
@@ -202,10 +203,10 @@ impl TextFTSIndex {
         
         // Load statistics metadata
         let meta_path = storage_dir.join("index_meta.bin");
-        let (total_docs, total_tokens, avg_doc_length, deleted_docs_vec, deleted_term_docs_vec) = if meta_path.exists() {
+        let (total_docs, total_tokens, avg_doc_length, deleted_docs_vec, deleted_term_docs_vec, known_docs_vec) = if meta_path.exists() {
             Self::load_metadata(&meta_path)?
         } else {
-            (0, 0, 0.0, Vec::new(), Vec::new())
+            (0, 0, 0.0, Vec::new(), Vec::new(), Vec::new())
         };
         
         // Convert deleted_docs from Vec to HashSet
@@ -228,7 +229,7 @@ impl TextFTSIndex {
             doc_length_cache: Arc::new(RwLock::new(None)),
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
-            known_docs: Arc::new(RwLock::new(HashSet::new())),
+            known_docs: Arc::new(RwLock::new(known_docs_vec.into_iter().collect())),
         })
     }
     
@@ -1156,7 +1157,8 @@ impl TextFTSIndex {
         
         let deleted_docs: Vec<DocId> = self.deleted_docs.read().iter().copied().collect();
         let deleted_term_docs: Vec<(TermId, DocId)> = self.deleted_term_docs.read().iter().copied().collect();
-        
+        let known_docs: Vec<DocId> = self.known_docs.read().iter().copied().collect();
+
         let metadata = TextFTSMetadata {
             total_docs: self.total_docs,
             total_tokens: self.total_tokens,
@@ -1164,6 +1166,7 @@ impl TextFTSIndex {
             enable_positions: self.enable_positions,
             deleted_docs,
             deleted_term_docs,
+            known_docs,
         };
         
         let serialized = bincode::serialize(&metadata)
@@ -1181,25 +1184,26 @@ impl TextFTSIndex {
     
     /// Load metadata from disk
     #[allow(clippy::type_complexity)]
-    fn load_metadata(stats_path: &PathBuf) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>)> {
+    fn load_metadata(stats_path: &PathBuf) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>, Vec<DocId>)> {
         let mut file = File::open(stats_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
-        
+
         if buffer.is_empty() {
-            return Ok((0, 0, 0.0, Vec::new(), Vec::new()));
+            return Ok((0, 0, 0.0, Vec::new(), Vec::new(), Vec::new()));
         }
-        
-        let metadata: TextFTSMetadata = 
+
+        let metadata: TextFTSMetadata =
             bincode::deserialize(&buffer)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        
+
         Ok((
             metadata.total_docs,
             metadata.total_tokens,
             metadata.avg_doc_length,
             metadata.deleted_docs,
             metadata.deleted_term_docs,
+            metadata.known_docs,
         ))
     }
     

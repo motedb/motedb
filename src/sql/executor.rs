@@ -2063,7 +2063,7 @@ impl QueryExecutor {
             Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
                 let v = Self::eval_expr_on_row(inner, row, schema)?;
                 match v {
-                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Integer(i) => Ok(Value::Integer(i.checked_neg().unwrap_or(i64::MIN))),
                     Value::Float(f) => Ok(Value::Float(-f)),
                     Value::Null => Ok(Value::Null),
                     _ => Err(MoteDBError::Query(format!("Cannot negate {:?}", v))),
@@ -3417,13 +3417,19 @@ impl QueryExecutor {
         on_condition: &Expr,
         right_schema: &crate::types::TableSchema,
     ) -> Result<Vec<(u64, SqlRow)>> {
-        let mut result = Vec::new();
-        let mut next_id = 1u64;
-
-        // Pre-compute NULL row for right side from schema (handles empty table)
+        // Pre-compute NULL row for right side from schema
         let null_right_row: SqlRow = right_schema.columns.iter()
             .map(|col| (col.name.clone(), Value::Null))
             .collect();
+
+        // Try hash join optimization for equi-join
+        if let Some((left_col, right_col)) = self.extract_equi_join_columns(on_condition) {
+            return self.hash_join_left(left_rows, right_rows, &left_col, &right_col, &null_right_row);
+        }
+
+        // Fallback: nested loop
+        let mut result = Vec::new();
+        let mut next_id = 1u64;
 
         for (_, left_row) in left_rows {
             let mut matched = false;
@@ -3441,10 +3447,71 @@ impl QueryExecutor {
                 }
             }
 
-            // If no match, add left row with NULL values for right columns
             if !matched {
                 let combined_row = self.combine_rows(left_row, &null_right_row);
                 result.push((next_id, combined_row));
+                next_id += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Hash Join for LEFT JOIN equi-join
+    fn hash_join_left(
+        &self,
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        left_col: &str,
+        right_col: &str,
+        null_right_row: &SqlRow,
+    ) -> Result<Vec<(u64, SqlRow)>> {
+        use std::collections::HashMap;
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        enum HashKey { Numeric(u64), Text(String), Bool(bool) }
+
+        #[inline]
+        fn to_hash_key(value: &Value) -> Option<HashKey> {
+            match value {
+                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                Value::Text(s) => Some(HashKey::Text((**s).clone())),
+                Value::Bool(b) => Some(HashKey::Bool(*b)),
+                _ => None,
+            }
+        }
+
+        // Build hash table on right
+        let mut hash_table: HashMap<HashKey, Vec<&SqlRow>> = HashMap::with_capacity(
+            (right_rows.len() as f64 / 0.75) as usize
+        );
+        for (_, right_row) in right_rows {
+            if let Some(key_val) = right_row.get(right_col) {
+                if let Some(key) = to_hash_key(key_val) {
+                    hash_table.entry(key).or_default().push(right_row);
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(left_rows.len());
+        let mut next_id = 1u64;
+
+        for (_, left_row) in left_rows {
+            let matched = if let Some(key_val) = left_row.get(left_col) {
+                if let Some(key) = to_hash_key(key_val) {
+                    if let Some(matching) = hash_table.get(&key) {
+                        for right_row in matching {
+                            result.push((next_id, self.combine_rows(left_row, right_row)));
+                            next_id += 1;
+                        }
+                        true
+                    } else { false }
+                } else { false }
+            } else { false };
+
+            if !matched {
+                result.push((next_id, self.combine_rows(left_row, null_right_row)));
                 next_id += 1;
             }
         }
@@ -3460,13 +3527,19 @@ impl QueryExecutor {
         on_condition: &Expr,
         left_schema: &crate::types::TableSchema,
     ) -> Result<Vec<(u64, SqlRow)>> {
-        let mut result = Vec::new();
-        let mut next_id = 1u64;
-
-        // Pre-compute NULL row for left side from schema (handles empty table)
+        // Pre-compute NULL row for left side from schema
         let null_left_row: SqlRow = left_schema.columns.iter()
             .map(|col| (col.name.clone(), Value::Null))
             .collect();
+
+        // Try hash join optimization for equi-join
+        if let Some((left_col, right_col)) = self.extract_equi_join_columns(on_condition) {
+            return self.hash_join_right(left_rows, right_rows, &left_col, &right_col, &null_left_row);
+        }
+
+        // Fallback: nested loop
+        let mut result = Vec::new();
+        let mut next_id = 1u64;
 
         for (_, right_row) in right_rows {
             let mut matched = false;
@@ -3484,10 +3557,71 @@ impl QueryExecutor {
                 }
             }
 
-            // If no match, add right row with NULL values for left columns
             if !matched {
                 let combined_row = self.combine_rows(&null_left_row, right_row);
                 result.push((next_id, combined_row));
+                next_id += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Hash Join for RIGHT JOIN equi-join
+    fn hash_join_right(
+        &self,
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        left_col: &str,
+        right_col: &str,
+        null_left_row: &SqlRow,
+    ) -> Result<Vec<(u64, SqlRow)>> {
+        use std::collections::HashMap;
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        enum HashKey { Numeric(u64), Text(String), Bool(bool) }
+
+        #[inline]
+        fn to_hash_key(value: &Value) -> Option<HashKey> {
+            match value {
+                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                Value::Text(s) => Some(HashKey::Text((**s).clone())),
+                Value::Bool(b) => Some(HashKey::Bool(*b)),
+                _ => None,
+            }
+        }
+
+        // Build hash table on left
+        let mut hash_table: HashMap<HashKey, Vec<&SqlRow>> = HashMap::with_capacity(
+            (left_rows.len() as f64 / 0.75) as usize
+        );
+        for (_, left_row) in left_rows {
+            if let Some(key_val) = left_row.get(left_col) {
+                if let Some(key) = to_hash_key(key_val) {
+                    hash_table.entry(key).or_default().push(left_row);
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(right_rows.len());
+        let mut next_id = 1u64;
+
+        for (_, right_row) in right_rows {
+            let matched = if let Some(key_val) = right_row.get(right_col) {
+                if let Some(key) = to_hash_key(key_val) {
+                    if let Some(matching) = hash_table.get(&key) {
+                        for left_row in matching {
+                            result.push((next_id, self.combine_rows(left_row, right_row)));
+                            next_id += 1;
+                        }
+                        true
+                    } else { false }
+                } else { false }
+            } else { false };
+
+            if !matched {
+                result.push((next_id, self.combine_rows(null_left_row, right_row)));
                 next_id += 1;
             }
         }
@@ -3504,11 +3638,7 @@ impl QueryExecutor {
         left_schema: &crate::types::TableSchema,
         right_schema: &crate::types::TableSchema,
     ) -> Result<Vec<(u64, SqlRow)>> {
-        let mut result = Vec::new();
-        let mut next_id = 1u64;
-        let mut right_matched = vec![false; right_rows.len()];
-
-        // Pre-compute NULL rows from schema (handles empty table)
+        // Pre-compute NULL rows from schema
         let null_right_row: SqlRow = right_schema.columns.iter()
             .map(|col| (col.name.clone(), Value::Null))
             .collect();
@@ -3516,7 +3646,16 @@ impl QueryExecutor {
             .map(|col| (col.name.clone(), Value::Null))
             .collect();
 
-        // First pass: process all left rows
+        // Try hash join optimization for equi-join
+        if let Some((left_col, right_col)) = self.extract_equi_join_columns(on_condition) {
+            return self.hash_join_full(left_rows, right_rows, &left_col, &right_col, &null_left_row, &null_right_row);
+        }
+
+        // Fallback: nested loop
+        let mut result = Vec::new();
+        let mut next_id = 1u64;
+        let mut right_matched = vec![false; right_rows.len()];
+
         for (_, left_row) in left_rows {
             let mut left_matched = false;
 
@@ -3534,7 +3673,6 @@ impl QueryExecutor {
                 }
             }
 
-            // If left row didn't match, add with NULL right values
             if !left_matched {
                 let combined_row = self.combine_rows(left_row, &null_right_row);
                 result.push((next_id, combined_row));
@@ -3542,11 +3680,84 @@ impl QueryExecutor {
             }
         }
 
-        // Second pass: add unmatched right rows
         for (right_idx, (_, right_row)) in right_rows.iter().enumerate() {
             if !right_matched[right_idx] {
                 let combined_row = self.combine_rows(&null_left_row, right_row);
                 result.push((next_id, combined_row));
+                next_id += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Hash Join for FULL OUTER JOIN equi-join
+    fn hash_join_full(
+        &self,
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        left_col: &str,
+        right_col: &str,
+        null_left_row: &SqlRow,
+        null_right_row: &SqlRow,
+    ) -> Result<Vec<(u64, SqlRow)>> {
+        use std::collections::HashMap;
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        enum HashKey { Numeric(u64), Text(String), Bool(bool) }
+
+        #[inline]
+        fn to_hash_key(value: &Value) -> Option<HashKey> {
+            match value {
+                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                Value::Text(s) => Some(HashKey::Text((**s).clone())),
+                Value::Bool(b) => Some(HashKey::Bool(*b)),
+                _ => None,
+            }
+        }
+
+        // Build hash table on right
+        let mut hash_table: HashMap<HashKey, Vec<(usize, &SqlRow)>> = HashMap::with_capacity(
+            (right_rows.len() as f64 / 0.75) as usize
+        );
+        for (idx, (_, right_row)) in right_rows.iter().enumerate() {
+            if let Some(key_val) = right_row.get(right_col) {
+                if let Some(key) = to_hash_key(key_val) {
+                    hash_table.entry(key).or_default().push((idx, right_row));
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(left_rows.len() + right_rows.len());
+        let mut next_id = 1u64;
+        let mut right_matched = vec![false; right_rows.len()];
+
+        // Probe with left
+        for (_, left_row) in left_rows {
+            let left_matched = if let Some(key_val) = left_row.get(left_col) {
+                if let Some(key) = to_hash_key(key_val) {
+                    if let Some(matching) = hash_table.get(&key) {
+                        for &(idx, right_row) in matching {
+                            result.push((next_id, self.combine_rows(left_row, right_row)));
+                            next_id += 1;
+                            right_matched[idx] = true;
+                        }
+                        true
+                    } else { false }
+                } else { false }
+            } else { false };
+
+            if !left_matched {
+                result.push((next_id, self.combine_rows(left_row, null_right_row)));
+                next_id += 1;
+            }
+        }
+
+        // Add unmatched right rows
+        for (idx, (_, right_row)) in right_rows.iter().enumerate() {
+            if !right_matched[idx] {
+                result.push((next_id, self.combine_rows(null_left_row, right_row)));
                 next_id += 1;
             }
         }

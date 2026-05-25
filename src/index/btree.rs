@@ -589,12 +589,12 @@ impl BTree {
             offsets[idx]
         };
 
-        let mut file = self.storage_file.write();
+        let file = self.storage_file.read();
 
-        // Read header to get content_len
-        file.seek(SeekFrom::Start(file_offset))?;
+        // Read header to get content_len using positional read (no seek needed)
+        use std::os::unix::fs::FileExt;
         let mut header_buf = [0u8; 15];
-        file.read_exact(&mut header_buf)?;
+        file.read_exact_at(&mut header_buf, file_offset)?;
         let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
 
         if content_len < 15 || content_len > MAX_PAGE_SIZE {
@@ -603,10 +603,9 @@ impl BTree {
             ));
         }
 
-        // Read full page content
+        // Read full page content using positional read
         let mut buf = vec![0u8; content_len];
-        file.seek(SeekFrom::Start(file_offset))?;
-        file.read_exact(&mut buf)?;
+        file.read_exact_at(&mut buf, file_offset)?;
 
         let page = Page::deserialize_compact(page_id, &buf)?;
         page.validate()?;

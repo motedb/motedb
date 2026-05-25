@@ -1090,11 +1090,24 @@ impl LSMEngine {
             return Ok(());
         }
 
+        // Offload large values to blob storage before inserting into memtable
+        let processed: Vec<(Key, Value)> = kvs.iter().map(|(k, v)| {
+            let mut v = v.clone();
+            if let ValueData::Inline(ref data) = v.data {
+                if data.len() >= self.config.blob_threshold {
+                    if let Ok(blob_ref) = self.blob_store.put(data) {
+                        v.data = ValueData::Blob(blob_ref);
+                    }
+                }
+            }
+            (k.clone(), v)
+        }).collect();
+
         // Process in chunks to apply backpressure when memtable fills up.
         // Without this, a batch of 1M rows would grow the memtable unboundedly.
         const CHUNK_SIZE: usize = 1024;
 
-        for chunk in kvs.chunks(CHUNK_SIZE) {
+        for chunk in processed.chunks(CHUNK_SIZE) {
             // Same backpressure logic as put()
             let mut backpressure_count = 0;
             loop {

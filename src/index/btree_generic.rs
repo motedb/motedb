@@ -669,8 +669,14 @@ impl<K: BTreeKey> GenericBTree<K> {
             tree.write_page(&root_page)?;
             // Persist page_offsets so reopens can find the root page
             tree.sync_superblock()?;
+        } else {
+            // Reconstruct overflow_page_ids by scanning page_offsets.
+            // Overflow pages have format [next_page_id:8][data_len:4][data...] where data_len ≤ 4084.
+            // B+Tree pages have content_len at bytes[13..15] which is in [HEADER_SIZE, PAGE_SIZE].
+            // If bytes[13..15] is out of that range, it's an overflow page.
+            tree.reconstruct_overflow_ids();
         }
-        
+
         Ok(tree)
     }
     
@@ -1539,7 +1545,34 @@ impl<K: BTreeKey> GenericBTree<K> {
 
         Ok(())
     }
-    
+
+    /// Reconstruct overflow_page_ids by scanning page_offsets on file load.
+    /// Overflow pages have format [next_page_id:8][data_len:4][data...].
+    /// B+Tree pages have content_len at bytes[13..15] in [HEADER_SIZE, PAGE_SIZE].
+    fn reconstruct_overflow_ids(&self) {
+        use std::os::unix::fs::FileExt;
+        let offsets = self.page_offsets.read();
+        let file = self.storage_file.read();
+        let mut overflow_ids = HashSet::new();
+
+        for (page_id, &file_offset) in offsets.iter().enumerate() {
+            if file_offset == 0 || page_id == 0 {
+                continue;
+            }
+            let mut buf = [0u8; HEADER_SIZE];
+            if file.read_exact_at(&mut buf, file_offset).is_err() {
+                continue;
+            }
+            let content_len = u16::from_le_bytes([buf[13], buf[14]]) as usize;
+            if content_len < HEADER_SIZE || content_len > PAGE_SIZE {
+                // Not a valid B+Tree page — must be an overflow page
+                overflow_ids.insert(page_id as u64);
+            }
+        }
+
+        *self.overflow_page_ids.write() = overflow_ids;
+    }
+
     /// Flush all dirty pages to disk (cache-granularity, requires cache_size >= num_pages)
     pub fn flush(&mut self) -> Result<()> {
         let _lock = self.flush_lock.lock();
