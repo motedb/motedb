@@ -242,7 +242,17 @@ impl IOctreeIndex {
 fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bucket_size: usize, min_extent: f64) -> Result<()> {
     match octant {
         Octant::Leaf { center: _, extent, leaf_id, point_count } => {
-            store.add_point(*leaf_id, point)?;
+            let added = store.add_point(*leaf_id, point)?;
+            if !added {
+                // Leaf is full — split first, then retry insert into the new child
+                if *extent > 2.0 * min_extent {
+                    split_leaf(store, octant)?;
+                    // Re-insert into the now-split tree
+                    return tree_insert(store, octant, point, bucket_size, min_extent);
+                }
+                // Can't split further (at min_extent) — force the insert anyway
+                store.add_point(*leaf_id, point)?;
+            }
             *point_count = store.point_count(*leaf_id)? as u32;
 
             if *point_count as usize > bucket_size && *extent > 2.0 * min_extent {

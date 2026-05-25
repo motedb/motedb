@@ -832,10 +832,16 @@ impl Parser {
     
     fn parse_prefix_expr(&mut self) -> Result<Expr> {
         match &self.current().token_type {
-            // Unary operators
+            // Unary operators (with depth guard to prevent stack overflow on chained NOT/-)
             TokenType::Not => {
                 self.advance();
-                let expr = self.parse_expr(10)?; // High precedence
+                self.recursion_depth += 1;
+                if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    self.recursion_depth -= 1;
+                    return Err(self.error("Expression nesting too deep"));
+                }
+                let expr = self.parse_expr(10)?;
+                self.recursion_depth -= 1;
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Not,
                     expr: Box::new(expr),
@@ -843,7 +849,13 @@ impl Parser {
             }
             TokenType::Minus => {
                 self.advance();
+                self.recursion_depth += 1;
+                if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    self.recursion_depth -= 1;
+                    return Err(self.error("Expression nesting too deep"));
+                }
                 let expr = self.parse_expr(10)?;
+                self.recursion_depth -= 1;
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Minus,
                     expr: Box::new(expr),
@@ -851,7 +863,13 @@ impl Parser {
             }
             TokenType::Plus => {
                 self.advance();
+                self.recursion_depth += 1;
+                if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    self.recursion_depth -= 1;
+                    return Err(self.error("Expression nesting too deep"));
+                }
                 let expr = self.parse_expr(10)?;
+                self.recursion_depth -= 1;
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Plus,
                     expr: Box::new(expr),
@@ -1498,13 +1516,17 @@ impl Parser {
             if n > usize::MAX as f64 {
                 return Err(self.error("Number too large for usize"));
             }
+            let v = n as usize;
+            if (v as f64 - n).abs() > 0.5 {
+                return Err(self.error("Number too large for usize (precision loss)"));
+            }
             self.advance();
-            Ok(n as usize)
+            Ok(v)
         } else {
             Err(self.error("Expected number"))
         }
     }
-    
+
     /// 🚀 Phase 4: Parse i64 (支持负数)
     fn parse_i64(&mut self) -> Result<i64> {
         if let TokenType::Number(n) = self.current().token_type {
@@ -1514,15 +1536,22 @@ impl Parser {
             if n > i64::MAX as f64 || n < i64::MIN as f64 {
                 return Err(self.error("Integer out of range"));
             }
+            let v = n as i64;
+            if (v as f64 - n).abs() > 0.5 {
+                return Err(self.error("Integer out of range (precision loss)"));
+            }
             self.advance();
-            Ok(n as i64)
+            Ok(v)
         } else {
             Err(self.error("Expected number"))
         }
     }
     
     fn current(&self) -> &Token {
-        &self.tokens[self.position]
+        self.tokens.get(self.position).unwrap_or_else(|| {
+            static EOF: Token = Token { token_type: TokenType::Eof, line: 0, column: 0 };
+            &EOF
+        })
     }
 
     fn peek_token_type(&self) -> &TokenType {
@@ -1534,7 +1563,7 @@ impl Parser {
     }
 
     fn advance(&mut self) {
-        if self.position < self.tokens.len() - 1 {
+        if !self.tokens.is_empty() && self.position < self.tokens.len() - 1 {
             self.position += 1;
         }
     }

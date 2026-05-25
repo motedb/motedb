@@ -136,7 +136,7 @@ impl LeafStore {
     }
 
     /// Add a point to a leaf
-    pub fn add_point(&self, leaf_id: u64, point: IndexedPoint3D) -> Result<()> {
+    pub fn add_point(&self, leaf_id: u64, point: IndexedPoint3D) -> Result<bool> {
         let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if inner.cache.get(&leaf_id).is_none() {
@@ -146,10 +146,13 @@ impl LeafStore {
         }
 
         if let Some(entry) = inner.cache.get_mut(&leaf_id) {
+            if entry.points.len() >= MAX_POINTS_PER_SLOT {
+                return Ok(false); // Leaf is full — caller should split
+            }
             entry.points.push(point);
         }
         inner.dirty.insert(leaf_id);
-        Ok(())
+        Ok(true)
     }
 
     /// Remove a point by row_id, returns true if found
@@ -229,18 +232,20 @@ impl LeafStore {
     pub fn clear_leaf(&self, leaf_id: u64) -> Result<usize> {
         let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
 
-        if inner.cache.get(&leaf_id).is_none() {
-            return Ok(0);
-        }
-
         if let Some(entry) = inner.cache.get_mut(&leaf_id) {
             let count = entry.points.len();
             entry.points.clear();
             inner.dirty.insert(leaf_id);
-            Ok(count)
-        } else {
-            Ok(0)
+            return Ok(count);
         }
+
+        // Leaf not in cache — write empty slot to disk to ensure it's cleared
+        let disk_points = Self::read_slot(&mut inner.file, leaf_id)?;
+        let count = disk_points.len();
+        if count > 0 {
+            Self::write_slot(&mut inner.file, leaf_id, &[])?;
+        }
+        Ok(count)
     }
 
     /// Free a leaf slot

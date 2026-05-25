@@ -144,10 +144,9 @@ impl VersionStore {
             next: None,
         });
 
-        self.versions.entry(row_id).or_insert_with(VersionChain::new);
-
-        if let Some(chain) = self.versions.get(&row_id) {
-            let mut head = chain.head.write();
+        let chain_ref = self.versions.entry(row_id).or_insert_with(VersionChain::new);
+        {
+            let mut head = chain_ref.head.write();
             // Re-validate under the write lock: no other transaction could have
             // committed between our earlier validation and this insertion.
             if let Some(ref version) = *head {
@@ -163,8 +162,9 @@ impl VersionStore {
             // Atomic: validated inside the same critical section as the prepend
             new_version.next = head.take();
             *head = Some(new_version);
-            chain.version_count.fetch_add(1, Ordering::Relaxed);
+            chain_ref.version_count.fetch_add(1, Ordering::Relaxed);
         }
+        drop(chain_ref); // Release DashMap shard guard BEFORE evict (prevents deadlock)
 
         self.evict_if_needed();
 
@@ -191,11 +191,10 @@ impl VersionStore {
             next: None,
         });
 
-        // Ensure chain exists
-        self.versions.entry(row_id).or_insert_with(VersionChain::new);
-
-        if let Some(chain) = self.versions.get(&row_id) {
-            let mut head = chain.head.write();
+        // Ensure chain exists and operate on it directly (no eviction race)
+        let chain_ref = self.versions.entry(row_id).or_insert_with(VersionChain::new);
+        {
+            let mut head = chain_ref.head.write();
 
             // Mark old version as superseded
             if let Some(old_version) = head.as_ref() {
@@ -205,8 +204,9 @@ impl VersionStore {
             // Link and prepend atomically under the same write lock
             new_version.next = head.take();
             *head = Some(new_version);
-            chain.version_count.fetch_add(1, Ordering::Relaxed);
+            chain_ref.version_count.fetch_add(1, Ordering::Relaxed);
         }
+        drop(chain_ref); // Release DashMap shard guard BEFORE evict (prevents deadlock)
 
         self.evict_if_needed();
 

@@ -757,7 +757,12 @@ impl ExprEvaluator {
                     _ => return Err(MoteDBError::TypeError("repeat() first argument must be text".to_string())),
                 };
                 let count = match self.eval(&args[1], row)? {
-                    Value::Integer(i) => i.max(0) as usize,
+                    Value::Integer(i) => {
+                        if i > 1_000_000 {
+                            return Err(MoteDBError::InvalidArgument("repeat() count exceeds maximum (1,000,000)".to_string()));
+                        }
+                        i.max(0) as usize
+                    },
                     _ => return Err(MoteDBError::TypeError("repeat() second argument must be integer".to_string())),
                 };
                 Ok(Value::text(text.repeat(count)))
@@ -1345,7 +1350,7 @@ impl ExprEvaluator {
                         let days = secs / 86400;
                         // Unix epoch (1970-01-01) was Thursday (day 4)
                         // Calculate day of week: (days + 4) % 7, then map to 1-7
-                        let dow = ((days + 3) % 7) + 1; // +3 because epoch was Thursday (4-1=3)
+                        let dow = ((days + 3).rem_euclid(7)) + 1; // rem_euclid handles negative days
                         Ok(Value::Integer(dow))
                     }
                     _ => Err(MoteDBError::TypeError("DAY_OF_WEEK() requires timestamp argument".to_string())),
