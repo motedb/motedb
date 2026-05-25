@@ -444,7 +444,34 @@ impl MoteDB {
     /// Update a row with pre-resolved schema (avoids redundant lookup).
     pub fn update_row_in_table_with_schema(&self, table_name: &str, row_id: RowId, old_row: Row, new_row: Row, schema: &crate::types::TableSchema) -> Result<()> {
         ensure_open!(self);
-        
+
+        // 1. Check PK uniqueness if primary key is being changed
+        if !schema.is_primary_key_auto_increment() {
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    let old_pk = old_row.get(pk_col.position);
+                    let new_pk = new_row.get(pk_col.position);
+                    if old_pk != new_pk {
+                        if let Some(new_val) = new_pk {
+                            if !matches!(new_val, Value::Null) {
+                                let pk_key = crate::database::pk_cache::PkKey::from_value(new_val);
+                                // Check PK cache for existing entry with different row_id
+                                if let Some(lookup) = self.pk_lookup.get(table_name) {
+                                    if let Some(existing_rid) = lookup.get_pk(&pk_key) {
+                                        if existing_rid != row_id {
+                                            return Err(StorageError::InvalidData(format!(
+                                                "Duplicate primary key {:?} for table '{}'", new_val, table_name
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. Construct composite key
         let composite_key = self.make_composite_key(table_name, row_id);
         

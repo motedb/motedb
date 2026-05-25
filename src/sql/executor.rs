@@ -5410,6 +5410,15 @@ impl QueryExecutor {
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
 
+        // Validate all assignment columns exist before modifying any rows
+        for (col_name, _) in &stmt.assignments {
+            if schema.get_column(col_name).is_none() {
+                return Err(StorageError::ColumnNotFound(
+                    format!("'{}' in table '{}'", col_name, stmt.table)
+                ));
+            }
+        }
+
         // 🚀 PK fast path: skip full table scan for WHERE pk = value
         if let Some(ref where_clause) = stmt.where_clause {
             if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {

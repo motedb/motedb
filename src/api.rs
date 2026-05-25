@@ -10,6 +10,7 @@
 //! - **性能监控**: 统计信息和性能分析
 
 use crate::database::{MoteDB, TransactionStats};
+use crate::StorageError;
 use crate::database::indexes::VectorIndexStats;
 use crate::sql::StreamingQueryResult;
 use crate::sql::ast::Statement;
@@ -1121,19 +1122,25 @@ impl Database {
 
         let mut new_row = old_row.clone();
         for (col_name, val_str) in &set_items {
-            if let Some(cd) = schema.get_column(col_name) {
-                let val = match Self::parse_single_literal(val_str) {
-                    Some(v) => v,
-                    None => match Self::evaluate_simple_set_expr(val_str, &old_row, &schema) {
-                        Some(v) => v,
-                        None => return Ok(None), // complex expression → fall through to full parser
-                    },
-                };
-                while new_row.len() <= cd.position {
-                    new_row.push(Value::Null);
+            let cd = match schema.get_column(col_name) {
+                Some(cd) => cd,
+                None => {
+                    return Err(StorageError::ColumnNotFound(
+                        format!("'{}' in table '{}'", col_name, table_name)
+                    ));
                 }
-                new_row[cd.position] = val;
+            };
+            let val = match Self::parse_single_literal(val_str) {
+                Some(v) => v,
+                None => match Self::evaluate_simple_set_expr(val_str, &old_row, &schema) {
+                    Some(v) => v,
+                    None => return Ok(None), // complex expression → fall through to full parser
+                },
+            };
+            while new_row.len() <= cd.position {
+                new_row.push(Value::Null);
             }
+            new_row[cd.position] = val;
         }
 
         self.inner.update_row_in_table_with_schema(table_name, row_id, old_row, new_row, &schema)?;
