@@ -102,52 +102,58 @@ impl CompiledPattern {
         }
     }
     
-    /// Match complex pattern with segments
+    /// Match complex pattern with segments using DP (O(n*m) instead of exponential)
     fn match_complex(text: &str, segments: &[PatternSegment]) -> bool {
-        let text_chars: Vec<char> = text.chars().collect();
-        Self::match_segments(&text_chars, segments, 0, 0)
-    }
-    
-    fn match_segments(text: &[char], segments: &[PatternSegment], ti: usize, si: usize) -> bool {
-        // All segments matched
-        if si >= segments.len() {
-            return ti >= text.len();
+        let t: Vec<char> = text.chars().collect();
+        let n = t.len();
+        let m = segments.len();
+
+        // dp[ti][si] = can we match text[ti..] against segments[si..]
+        let mut dp = vec![vec![false; m + 1]; n + 1];
+        dp[n][m] = true; // both empty → match
+
+        // Fill base case: text consumed but segments remain (only % can match empty)
+        for si in (0..m).rev() {
+            if matches!(segments[si], PatternSegment::AnyChars) && dp[n][si + 1] {
+                dp[n][si] = true;
+            }
         }
-        
-        match &segments[si] {
-            PatternSegment::AnyChars => {
-                // Try matching 0 or more characters
-                if Self::match_segments(text, segments, ti, si + 1) {
-                    return true;
-                }
-                if ti < text.len() && Self::match_segments(text, segments, ti + 1, si) {
-                    return true;
-                }
-                false
-            }
-            PatternSegment::AnyChar => {
-                // Match exactly one character
-                if ti < text.len() {
-                    Self::match_segments(text, segments, ti + 1, si + 1)
-                } else {
-                    false
-                }
-            }
-            PatternSegment::Literal(literal) => {
-                // Match literal string
-                let chars: Vec<char> = literal.chars().collect();
-                if ti + chars.len() > text.len() {
-                    return false;
-                }
-                for (i, &c) in chars.iter().enumerate() {
-                    if text[ti + i] != c {
-                        return false;
+
+        // Fill from bottom-right
+        for ti in (0..n).rev() {
+            for si in (0..m).rev() {
+                match &segments[si] {
+                    PatternSegment::AnyChars => {
+                        // Match 0 chars (skip %) or 1+ chars (consume char, keep %)
+                        dp[ti][si] = dp[ti][si + 1] || dp[ti + 1][si];
+                    }
+                    PatternSegment::AnyChar => {
+                        // Match exactly one character
+                        dp[ti][si] = dp[ti + 1][si + 1];
+                    }
+                    PatternSegment::Literal(literal) => {
+                        let chars: Vec<char> = literal.chars().collect();
+                        let len = chars.len();
+                        if ti + len <= n {
+                            let mut matches = true;
+                            for (i, &c) in chars.iter().enumerate() {
+                                if t[ti + i] != c {
+                                    matches = false;
+                                    break;
+                                }
+                            }
+                            if matches {
+                                dp[ti][si] = dp[ti + len][si + 1];
+                            }
+                        }
                     }
                 }
-                Self::match_segments(text, segments, ti + chars.len(), si + 1)
             }
         }
+
+        dp[0][0]
     }
+    
 }
 
 pub struct ExprEvaluator {
@@ -220,26 +226,45 @@ impl ExprEvaluator {
                 }
                 
                 // Try 2: Match with table prefix (e.g., "id" matches "test.id")
-                for (key, value) in row.iter() {
-                    // Skip metadata columns
+                let mut prefix_matches: Vec<&str> = Vec::new();
+                for key in row.keys() {
                     if key.starts_with("__") {
                         continue;
                     }
-                    
-                    // Match: key ends with ".{name}"
                     if key.ends_with(&format!(".{}", name)) {
-                        return Ok(value.clone());
+                        prefix_matches.push(key.as_str());
                     }
                 }
+                if prefix_matches.len() == 1 {
+                    return Ok(row[prefix_matches[0]].clone());
+                } else if prefix_matches.len() > 1 {
+                    return Err(MoteDBError::ColumnNotFound(format!(
+                        "Ambiguous column '{}' matches: {}",
+                        name,
+                        prefix_matches.join(", ")
+                    )));
+                }
                 
-                // Try 3: Case-insensitive match (for robustness)
+                // Try 3: Case-insensitive match (for robustness).
+                // Collect all matches to detect ambiguity — picking the first
+                // match silently could return the wrong column on collision.
                 let name_lower = name.to_lowercase();
-                for (key, value) in row.iter() {
+                let mut matches: Vec<&str> = Vec::new();
+                for key in row.keys() {
                     if key.to_lowercase() == name_lower {
-                        return Ok(value.clone());
+                        matches.push(key.as_str());
                     }
                 }
-                
+                if matches.len() == 1 {
+                    return Ok(row[matches[0]].clone());
+                } else if matches.len() > 1 {
+                    return Err(MoteDBError::ColumnNotFound(format!(
+                        "Ambiguous column '{}' matches: {}",
+                        name,
+                        matches.join(", ")
+                    )));
+                }
+
                 Err(MoteDBError::ColumnNotFound(name.clone()))
             }
             
@@ -391,10 +416,33 @@ impl ExprEvaluator {
         let either_null = matches!(&left, Value::Null) || matches!(&right, Value::Null);
         if either_null {
             match op {
-                // Comparison/boolean: NULL → UNKNOWN → false for filtering
+                // Comparison: NULL → UNKNOWN → false for filtering
                 BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt |
-                BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge |
-                BinaryOperator::And | BinaryOperator::Or => return Ok(Value::Bool(false)),
+                BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge => {
+                    return Ok(Value::Bool(false));
+                }
+                // AND: FALSE AND anything = FALSE; TRUE AND NULL = NULL → false
+                BinaryOperator::And => {
+                    let lb = match &left { Value::Null => None, v => Some(self.to_bool(v)?) };
+                    let rb = match &right { Value::Null => None, v => Some(self.to_bool(v)?) };
+                    // If either side is definitively false, result is false.
+                    // Otherwise (both true or one true + one null), treat as false
+                    // since the null side makes the result unknown.
+                    if lb == Some(false) || rb == Some(false) {
+                        return Ok(Value::Bool(false));
+                    }
+                    return Ok(Value::Bool(false)); // unknown → false for WHERE
+                }
+                // OR: TRUE OR anything = TRUE; FALSE OR NULL = NULL → false
+                BinaryOperator::Or => {
+                    let lb = match &left { Value::Null => None, v => Some(self.to_bool(v)?) };
+                    let rb = match &right { Value::Null => None, v => Some(self.to_bool(v)?) };
+                    // If either side is definitively true, result is true.
+                    if lb == Some(true) || rb == Some(true) {
+                        return Ok(Value::Bool(true));
+                    }
+                    return Ok(Value::Bool(false)); // both false or false+null
+                }
                 // Arithmetic/distance: NULL propagates
                 BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul |
                 BinaryOperator::Div | BinaryOperator::Mod |
@@ -456,7 +504,12 @@ impl ExprEvaluator {
             }
             UnaryOperator::Minus => {
                 match val {
-                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Integer(i) => {
+                        match i.checked_neg() {
+                            Some(n) => Ok(Value::Integer(n)),
+                            None => Ok(Value::Float(-(i as f64))), // i64::MIN → float
+                        }
+                    }
                     Value::Float(f) => Ok(Value::Float(-f)),
                     _ => Err(MoteDBError::TypeError("Cannot negate non-numeric value".to_string())),
                 }
@@ -562,21 +615,18 @@ impl ExprEvaluator {
                     _ => return Err(MoteDBError::TypeError("substr() first argument must be text".to_string())),
                 };
                 let start = match self.eval(&args[1], row)? {
-                    Value::Integer(i) => i.max(0) as usize, // 1-indexed in SQL
-                    _ => return Err(MoteDBError::TypeError("substr() start must be integer".to_string())),
+                    Value::Integer(i) if i >= 1 => (i as usize) - 1, // 1-indexed → 0-indexed
+                    _ => return Ok(Value::text(String::new())), // 0 or negative → empty string
                 };
-                
-                // SQL uses 1-based indexing
-                let start_idx = if start > 0 { start - 1 } else { 0 };
                 
                 let result = if args.len() == 3 {
                     let length = match self.eval(&args[2], row)? {
                         Value::Integer(i) => i.max(0) as usize,
                         _ => return Err(MoteDBError::TypeError("substr() length must be integer".to_string())),
                     };
-                    text.chars().skip(start_idx).take(length).collect()
+                    text.chars().skip(start).take(length).collect()
                 } else {
-                    text.chars().skip(start_idx).collect()
+                    text.chars().skip(start).collect()
                 };
                 Ok(Value::text(result))
             }
@@ -720,7 +770,10 @@ impl ExprEvaluator {
                 }
                 let val = self.eval(&args[0], row)?;
                 match val {
-                    Value::Integer(i) => Ok(Value::Integer(i.abs())),
+                    Value::Integer(i) => match i.checked_abs() {
+                        Some(n) => Ok(Value::Integer(n)),
+                        None => Ok(Value::Float(-(i as f64))), // i64::MIN → float
+                    },
                     Value::Float(f) => Ok(Value::Float(f.abs())),
                     _ => Err(MoteDBError::TypeError("abs() requires numeric argument".to_string())),
                 }
@@ -757,19 +810,33 @@ impl ExprEvaluator {
                 }
                 let val = self.eval(&args[0], row)?;
                 match val {
-                    Value::Float(f) => Ok(Value::Integer(f.floor() as i64)),
+                    Value::Float(f) => {
+                        let floored = f.floor();
+                        if floored >= i64::MIN as f64 && floored <= i64::MAX as f64 {
+                            Ok(Value::Integer(floored as i64))
+                        } else {
+                            Ok(Value::Float(floored))
+                        }
+                    }
                     Value::Integer(i) => Ok(Value::Integer(i)),
                     _ => Err(MoteDBError::TypeError("floor() requires numeric argument".to_string())),
                 }
             }
-            
+
             "ceil" | "ceiling" => {
                 if args.len() != 1 {
                     return Err(MoteDBError::InvalidArgument("ceil() takes 1 argument".to_string()));
                 }
                 let val = self.eval(&args[0], row)?;
                 match val {
-                    Value::Float(f) => Ok(Value::Integer(f.ceil() as i64)),
+                    Value::Float(f) => {
+                        let ceiled = f.ceil();
+                        if ceiled >= i64::MIN as f64 && ceiled <= i64::MAX as f64 {
+                            Ok(Value::Integer(ceiled as i64))
+                        } else {
+                            Ok(Value::Float(ceiled))
+                        }
+                    }
                     Value::Integer(i) => Ok(Value::Integer(i)),
                     _ => Err(MoteDBError::TypeError("ceil() requires numeric argument".to_string())),
                 }
@@ -838,7 +905,11 @@ impl ExprEvaluator {
                         if *b == 0 {
                             return Err(MoteDBError::InvalidArgument("Division by zero in mod()".to_string()));
                         }
-                        Ok(Value::Integer(a % b))
+                        // checked_rem guards against i64::MIN % -1 overflow
+                        Ok(match a.checked_rem(*b) {
+                            Some(n) => Value::Integer(n),
+                            None => Value::Integer(0), // x % -1 == 0 for any x
+                        })
                     }
                     _ => {
                         let a = self.to_float(&dividend)?;
@@ -1200,8 +1271,11 @@ impl ExprEvaluator {
                 };
                 
                 use crate::types::Timestamp;
-                let new_micros = ts.as_micros() + (seconds * 1_000_000);
-                Ok(Value::Timestamp(Timestamp::from_micros(new_micros)))
+                let delta_micros = seconds.checked_mul(1_000_000)
+                    .and_then(|d| ts.as_micros().checked_add(d))
+                    .ok_or_else(|| MoteDBError::InvalidArgument(
+                        "DATE_ADD() argument overflow".to_string()))?;
+                Ok(Value::Timestamp(Timestamp::from_micros(delta_micros)))
             }
             
             "date_diff" | "datediff" => {
@@ -1220,7 +1294,9 @@ impl ExprEvaluator {
                     _ => return Err(MoteDBError::TypeError("DATE_DIFF() second argument must be timestamp".to_string())),
                 };
                 
-                let diff_micros = ts1.as_micros() - ts2.as_micros();
+                let diff_micros = ts1.as_micros().checked_sub(ts2.as_micros())
+                    .ok_or_else(|| MoteDBError::InvalidArgument(
+                        "DATE_DIFF() timestamp difference overflow".to_string()))?;
                 let diff_seconds = diff_micros / 1_000_000;
                 Ok(Value::Integer(diff_seconds))
             }
@@ -1381,7 +1457,10 @@ impl ExprEvaluator {
     
     fn add_values(&self, left: Value, right: Value) -> Result<Value> {
         match (left, right) {
-            (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l + r)),
+            (Value::Integer(l), Value::Integer(r)) => match l.checked_add(r) {
+                Some(n) => Ok(Value::Integer(n)),
+                None => Ok(Value::Float(l as f64 + r as f64)),
+            },
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 + r)),
             (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l + r as f64)),
@@ -1392,7 +1471,10 @@ impl ExprEvaluator {
     
     fn sub_values(&self, left: Value, right: Value) -> Result<Value> {
         match (left, right) {
-            (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l - r)),
+            (Value::Integer(l), Value::Integer(r)) => match l.checked_sub(r) {
+                Some(n) => Ok(Value::Integer(n)),
+                None => Ok(Value::Float(l as f64 - r as f64)),
+            },
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 - r)),
             (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l - r as f64)),
@@ -1402,7 +1484,10 @@ impl ExprEvaluator {
     
     fn mul_values(&self, left: Value, right: Value) -> Result<Value> {
         match (left, right) {
-            (Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l * r)),
+            (Value::Integer(l), Value::Integer(r)) => match l.checked_mul(r) {
+                Some(n) => Ok(Value::Integer(n)),
+                None => Ok(Value::Float(l as f64 * r as f64)),
+            },
             (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
             (Value::Integer(l), Value::Float(r)) => Ok(Value::Float(l as f64 * r)),
             (Value::Float(l), Value::Integer(r)) => Ok(Value::Float(l * r as f64)),
@@ -1416,7 +1501,10 @@ impl ExprEvaluator {
                 if r == 0 {
                     return Err(MoteDBError::DivisionByZero);
                 }
-                Ok(Value::Integer(l / r))
+                match l.checked_div(r) {
+                    Some(n) => Ok(Value::Integer(n)),
+                    None => Ok(Value::Float(l as f64 / r as f64)), // i64::MIN / -1
+                }
             }
             (Value::Float(l), Value::Float(r)) => {
                 if r == 0.0 {
@@ -1446,7 +1534,11 @@ impl ExprEvaluator {
                 if r == 0 {
                     return Err(MoteDBError::DivisionByZero);
                 }
-                Ok(Value::Integer(l % r))
+                // checked_rem guards against i64::MIN % -1 overflow
+                Ok(match l.checked_rem(r) {
+                    Some(n) => Value::Integer(n),
+                    None => Value::Integer(0), // x % -1 == 0 for any x
+                })
             }
             _ => Err(MoteDBError::TypeError("Modulo only works on integers".to_string())),
         }
@@ -1679,14 +1771,18 @@ fn parse_interval_to_micros(interval: &str) -> crate::Result<i64> {
     }
 
     let micros = match unit {
-        "s" | "sec" | "second" | "seconds" => num * 1_000_000,
-        "m" | "min" | "minute" | "minutes" => num * 60 * 1_000_000,
-        "h" | "hr" | "hour" | "hours" => num * 3600 * 1_000_000,
-        "d" | "day" | "days" => num * 86400 * 1_000_000,
+        "s" | "sec" | "second" | "seconds" => num.checked_mul(1_000_000),
+        "m" | "min" | "minute" | "minutes" => num.checked_mul(60).and_then(|v| v.checked_mul(1_000_000)),
+        "h" | "hr" | "hour" | "hours" => num.checked_mul(3600).and_then(|v| v.checked_mul(1_000_000)),
+        "d" | "day" | "days" => num.checked_mul(86400).and_then(|v| v.checked_mul(1_000_000)),
         _ => return Err(crate::MoteDBError::InvalidArgument(
             format!("Unknown interval unit: '{}'. Use s/m/h/d", unit)
         )),
     };
+
+    let micros = micros.ok_or_else(|| {
+        crate::MoteDBError::InvalidArgument(format!("Interval value overflow: {}", interval))
+    })?;
 
     Ok(micros)
 }
@@ -1971,5 +2067,192 @@ mod tests {
             distinct: false,
         };
         assert_eq!(eval(&len, &r).unwrap(), Value::Integer(5));
+    }
+
+    // ========== Regression tests ==========
+
+    #[test]
+    fn test_or_with_null_true_returns_true() {
+        // TRUE OR NULL should be TRUE (not false)
+        let r = row(&[]);
+        let true_expr = Expr::BinaryOp {
+            left: Box::new(lit_int(1)),
+            op: BinaryOperator::Eq,
+            right: Box::new(lit_int(1)),
+        };
+        let null_expr = Expr::Literal(Value::Null);
+
+        // TRUE OR NULL
+        let or_expr = Expr::BinaryOp {
+            left: Box::new(true_expr.clone()),
+            op: BinaryOperator::Or,
+            right: Box::new(null_expr.clone()),
+        };
+        assert_eq!(eval(&or_expr, &r).unwrap(), Value::Bool(true),
+            "TRUE OR NULL should be TRUE");
+
+        // NULL OR TRUE
+        let or_expr2 = Expr::BinaryOp {
+            left: Box::new(null_expr),
+            op: BinaryOperator::Or,
+            right: Box::new(true_expr),
+        };
+        assert_eq!(eval(&or_expr2, &r).unwrap(), Value::Bool(true),
+            "NULL OR TRUE should be TRUE");
+
+        // FALSE OR NULL should be FALSE (unknown → false for WHERE)
+        let false_expr = Expr::BinaryOp {
+            left: Box::new(lit_int(1)),
+            op: BinaryOperator::Eq,
+            right: Box::new(lit_int(2)),
+        };
+        let or_expr3 = Expr::BinaryOp {
+            left: Box::new(false_expr),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::Literal(Value::Null)),
+        };
+        assert_eq!(eval(&or_expr3, &r).unwrap(), Value::Bool(false),
+            "FALSE OR NULL should be FALSE");
+    }
+
+    #[test]
+    fn test_and_with_null_false_returns_false() {
+        let r = row(&[]);
+        let false_expr = Expr::BinaryOp {
+            left: Box::new(lit_int(1)),
+            op: BinaryOperator::Eq,
+            right: Box::new(lit_int(2)),
+        };
+
+        // FALSE AND NULL should be FALSE
+        let and_expr = Expr::BinaryOp {
+            left: Box::new(false_expr),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::Literal(Value::Null)),
+        };
+        assert_eq!(eval(&and_expr, &r).unwrap(), Value::Bool(false),
+            "FALSE AND NULL should be FALSE");
+    }
+
+    #[test]
+    fn test_unary_minus_i64_min() {
+        // i64::MIN negation should not panic
+        let r = row(&[]);
+        let expr = Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(lit_int(i64::MIN)),
+        };
+        let result = eval(&expr, &r).unwrap();
+        // Should promote to float since -i64::MIN overflows
+        match result {
+            Value::Float(f) => assert!(f > 0.0, "negated i64::MIN should be positive float"),
+            Value::Integer(i) => assert!(i > 0, "negated i64::MIN should be positive"),
+            other => panic!("expected numeric, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_integer_float_cross_type_equality() {
+        // Integer(1) == Float(1.0) should be true
+        let r = row(&[]);
+        let expr = Expr::BinaryOp {
+            left: Box::new(lit_int(1)),
+            op: BinaryOperator::Eq,
+            right: Box::new(lit_float(1.0)),
+        };
+        assert_eq!(eval(&expr, &r).unwrap(), Value::Bool(true),
+            "Integer(1) == Float(1.0) should be true");
+
+        // Integer(1) != Float(2.0)
+        let expr2 = Expr::BinaryOp {
+            left: Box::new(lit_int(1)),
+            op: BinaryOperator::Eq,
+            right: Box::new(lit_float(2.0)),
+        };
+        assert_eq!(eval(&expr2, &r).unwrap(), Value::Bool(false),
+            "Integer(1) == Float(2.0) should be false");
+    }
+
+    #[test]
+    fn test_abs_i64_min() {
+        // abs(i64::MIN) should promote to float, not panic or wrap
+        let r = row(&[]);
+        let expr = Expr::FunctionCall {
+            name: "abs".to_string(),
+            args: vec![lit_int(i64::MIN)],
+            distinct: false,
+        };
+        let result = eval(&expr, &r).unwrap();
+        match result {
+            Value::Float(f) => assert!(f > 0.0, "abs(i64::MIN) should be positive float, got {}", f),
+            Value::Integer(i) => assert!(i > 0, "abs(i64::MIN) should be positive"),
+            other => panic!("expected numeric, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_add_i64_max_overflow() {
+        // i64::MAX + 1 should promote to float
+        let r = row(&[]);
+        let expr = Expr::BinaryOp {
+            left: Box::new(lit_int(i64::MAX)),
+            op: BinaryOperator::Add,
+            right: Box::new(lit_int(1)),
+        };
+        let result = eval(&expr, &r).unwrap();
+        assert!(matches!(result, Value::Float(_)), "overflow add should be float, got {:?}", result);
+    }
+
+    #[test]
+    fn test_sub_i64_min_overflow() {
+        // i64::MIN - 1 should promote to float
+        let r = row(&[]);
+        let expr = Expr::BinaryOp {
+            left: Box::new(lit_int(i64::MIN)),
+            op: BinaryOperator::Sub,
+            right: Box::new(lit_int(1)),
+        };
+        let result = eval(&expr, &r).unwrap();
+        assert!(matches!(result, Value::Float(_)), "overflow sub should be float, got {:?}", result);
+    }
+
+    #[test]
+    fn test_mul_i64_max_overflow() {
+        // i64::MAX * 2 should promote to float
+        let r = row(&[]);
+        let expr = Expr::BinaryOp {
+            left: Box::new(lit_int(i64::MAX)),
+            op: BinaryOperator::Mul,
+            right: Box::new(lit_int(2)),
+        };
+        let result = eval(&expr, &r).unwrap();
+        assert!(matches!(result, Value::Float(_)), "overflow mul should be float, got {:?}", result);
+    }
+
+    #[test]
+    fn test_div_i64_min_by_neg1() {
+        // i64::MIN / -1 should promote to float
+        let r = row(&[]);
+        let expr = Expr::BinaryOp {
+            left: Box::new(lit_int(i64::MIN)),
+            op: BinaryOperator::Div,
+            right: Box::new(lit_int(-1)),
+        };
+        let result = eval(&expr, &r).unwrap();
+        assert!(matches!(result, Value::Float(_)), "i64::MIN / -1 should be float, got {:?}", result);
+    }
+
+    #[test]
+    fn test_mod_i64_min_by_neg1() {
+        // i64::MIN % -1 should return 0 (math: -1 divides any integer evenly)
+        let r = row(&[]);
+        let expr = Expr::FunctionCall {
+            name: "mod".to_string(),
+            args: vec![lit_int(i64::MIN), lit_int(-1)],
+            distinct: false,
+        };
+        let result = eval(&expr, &r).unwrap();
+        assert_eq!(result, Value::Integer(0),
+            "i64::MIN % -1 should be 0");
     }
 }

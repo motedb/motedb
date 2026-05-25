@@ -70,7 +70,12 @@ impl MoteDB {
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         ensure_open!(self);
 
-        // 1. Delete row data from LSM (tombstones for compaction to reclaim)
+        // 1. Remove from catalog FIRST — prevents concurrent INSERT/UPDATE/DELETE
+        //    from writing new data while we're cleaning up. Operations on this
+        //    table will get "table not found" from this point forward.
+        self.table_registry.drop_table(table_name)?;
+
+        // 2. Delete row data from LSM (tombstones for compaction to reclaim)
         let table_prefix = self.compute_table_prefix(table_name);
         let start_key = table_prefix << 32;
         let end_key = (table_prefix << 32) | 0xFFFF_FFFF;
@@ -78,25 +83,30 @@ impl MoteDB {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let _ = self.lsm_engine.delete_range(start_key, end_key, timestamp);
+        if let Err(e) = self.lsm_engine.delete_range(start_key, end_key, timestamp) {
+            warn_log!("[drop_table] delete_range failed for '{}': {:?}", table_name, e);
+        }
 
-        // 2. Flush so tombstones reach SSTables (enables compaction cleanup)
-        let _ = self.lsm_engine.flush();
+        // 3. Flush so tombstones reach SSTables (enables compaction cleanup)
+        if let Err(e) = self.lsm_engine.flush() {
+            warn_log!("[drop_table] flush failed for '{}': {:?}", table_name, e);
+        }
 
-        // 3. Drop columnar store for TimeSeries tables
-        let _ = self.columnar_store.drop_table(table_name);
+        // 4. Drop columnar store for TimeSeries tables
+        if let Err(e) = self.columnar_store.drop_table(table_name) {
+            warn_log!("[drop_table] columnar drop failed for '{}': {:?}", table_name, e);
+        }
 
-        // 4. Drop in-memory index handles
+        // 5. Drop in-memory index handles
         self.vector_indexes.remove(table_name);
         self.ioctree_indexes.remove(table_name);
         self.text_indexes.remove(table_name);
         self.column_indexes.remove(table_name);
 
-        // 5. Invalidate row cache for this table
+        // 6. Invalidate row cache for this table
         self.row_cache.invalidate_table(table_name);
 
-        // 6. Remove catalog metadata
-        self.table_registry.drop_table(table_name)?;
+        // 7. Remove remaining runtime state
         self.pk_lookup.remove(table_name);
         self.table_auto_increment.remove(table_name);
         Ok(())
@@ -147,8 +157,16 @@ impl MoteDB {
     /// Uses stable sequential table_id from registry (collision-free),
     /// replacing the old hash-based scheme that had birthday-attack collision risk.
     pub(crate) fn make_composite_key(&self, table_name: &str, row_id: RowId) -> u64 {
-        let table_id = self.table_registry.get_table_id(table_name)
-            .unwrap_or(0); // fallback to 0 for unregistered tables
+        let table_id = match self.table_registry.get_table_id(table_name) {
+            Ok(id) => id,
+            Err(_) => {
+                // Table not found — use a fallback that won't collide with valid
+                // sequential table_ids (which start at 1). This is defensive;
+                // callers should validate table_name before reaching this point.
+                debug_log!("[make_composite_key] table '{}' not registered, using reserved id", table_name);
+                u32::MAX
+            }
+        };
         ((table_id as u64) << 32) | (row_id & 0xFFFFFFFF)
     }
 

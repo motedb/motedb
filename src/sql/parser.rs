@@ -9,11 +9,18 @@ pub struct Parser {
     position: usize,
     /// Auto-increment counter for unnamed ? parameters
     next_param_idx: usize,
+    /// Recursion depth guard for expression parsing (prevents stack overflow)
+    recursion_depth: usize,
 }
+
+/// Maximum recursion depth for parenthesized expressions
+const MAX_RECURSION_DEPTH: usize = 256;
+/// Maximum identifier length (table/column names) — prevents DoS via memory exhaustion
+const MAX_IDENTIFIER_LENGTH: usize = 4096;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, position: 0, next_param_idx: 1 }
+        Self { tokens, position: 0, next_param_idx: 1, recursion_depth: 0 }
     }
     
     /// Parse a SQL statement
@@ -302,6 +309,12 @@ impl Parser {
                 self.expect(TokenType::Join)?;
                 JoinType::Right
             }
+            TokenType::Full => {
+                self.advance();
+                self.match_token(TokenType::Outer); // OUTER is optional
+                self.expect(TokenType::Join)?;
+                JoinType::Full
+            }
             TokenType::Join => {
                 self.advance();
                 JoinType::Inner // Default to INNER JOIN
@@ -532,7 +545,11 @@ impl Parser {
                         return Err(self.error("AUTO_INCREMENT can only be used with INTEGER or BIGINT columns"));
                     }
                     if self.match_token(TokenType::Eq) {
-                        auto_increment_start = Some(self.parse_i64()?);
+                        let start = self.parse_i64()?;
+                        if start < 0 {
+                            return Err(self.error("AUTO_INCREMENT start must be non-negative"));
+                        }
+                        auto_increment_start = Some(start);
                     }
                     continue;
                 }
@@ -548,7 +565,15 @@ impl Parser {
                 auto_increment,
                 auto_increment_start,
             });
-            
+
+            // Check for duplicate column names
+            if columns.len() > 1 {
+                let new_name = &columns.last().unwrap().name;
+                if columns[..columns.len() - 1].iter().any(|c| c.name == *new_name) {
+                    return Err(self.error(&format!("Duplicate column name '{}'", new_name)));
+                }
+            }
+
             if !self.match_token(TokenType::Comma) {
                 break;
             }
@@ -836,18 +861,27 @@ impl Parser {
             // Parenthesized expression OR subquery
             TokenType::LParen => {
                 self.advance();
-                
+
+                // Guard against stack overflow on deeply nested parens
+                self.recursion_depth += 1;
+                if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    return Err(self.error("Expression nesting too deep"));
+                }
+
                 // Check if this is a subquery (SELECT ...)
-                if matches!(self.current().token_type, TokenType::Select) {
+                let result = if matches!(self.current().token_type, TokenType::Select) {
                     let subquery = self.parse_select()?;
                     self.expect(TokenType::RParen)?;
-                    return Ok(Expr::Subquery(Box::new(subquery)));
-                }
-                
-                // Otherwise, it's a regular parenthesized expression
-                let expr = self.parse_expr(0)?;
-                self.expect(TokenType::RParen)?;
-                Ok(expr)
+                    Ok(Expr::Subquery(Box::new(subquery)))
+                } else {
+                    // Otherwise, it's a regular parenthesized expression
+                    let expr = self.parse_expr(0)?;
+                    self.expect(TokenType::RParen)?;
+                    Ok(expr)
+                };
+
+                self.recursion_depth -= 1;
+                result
             }
             
             // Literals
@@ -1423,6 +1457,9 @@ impl Parser {
     
     fn parse_identifier(&mut self) -> Result<String> {
         if let TokenType::Identifier(name) = &self.current().token_type {
+            if name.len() > MAX_IDENTIFIER_LENGTH {
+                return Err(self.error("Identifier too long"));
+            }
             let name = name.clone();
             self.advance();
             Ok(name)
@@ -1473,6 +1510,9 @@ impl Parser {
         if let TokenType::Number(n) = self.current().token_type {
             if n.fract() != 0.0 {
                 return Err(self.error("Expected integer"));
+            }
+            if n > i64::MAX as f64 || n < i64::MIN as f64 {
+                return Err(self.error("Integer out of range"));
             }
             self.advance();
             Ok(n as i64)
@@ -1550,7 +1590,11 @@ impl Parser {
         
         let value = match &self.current().token_type {
             TokenType::Number(n) => {
-                let value = (*n) as i64;  // Convert f64 to i64
+                let f = *n;
+                if f < 0.0 || f > i64::MAX as f64 || f.fract() != 0.0 {
+                    return Err(self.error("AUTO_INCREMENT value must be a non-negative integer"));
+                }
+                let value = f as i64;
                 self.advance();
                 value
             }

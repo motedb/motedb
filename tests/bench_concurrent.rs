@@ -184,7 +184,7 @@ fn bench_concurrent_transactions() {
                 let mut rolled_back = 0;
                 for i in 0..txns_per_thread {
                     let tx = db_clone.begin_transaction().expect("begin");
-                    let id = 100 + t * txns_per_thread + i;
+                    let id = 101 + t * txns_per_thread + i;
                     let row = vec![
                         motedb::types::Value::Integer(id as i64),
                         motedb::types::Value::Integer(id as i64 * 10),

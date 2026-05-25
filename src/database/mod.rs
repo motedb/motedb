@@ -17,7 +17,7 @@
 /// Called at the entry point of all public operations.
 macro_rules! ensure_open {
     ($self:expr) => {
-        if $self.is_closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if $self.is_closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(crate::StorageError::InvalidData("Database is closed".into()));
         }
     };

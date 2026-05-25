@@ -8,7 +8,8 @@
 
 use crate::{Result, StorageError};
 use super::btree::{BTree, BTreeConfig};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::path::PathBuf;
 
 /// Primary Key Index
@@ -42,21 +43,19 @@ impl PrimaryKeyIndex {
     /// Insert with explicit primary key
     pub fn insert(&mut self, pk: u64, row_id: u64) -> Result<()> {
         self.btree.insert(pk, row_id)?;
-        
+
         // Update auto-increment if needed
-        let mut counter = self.auto_increment.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut counter = self.auto_increment.write();
         if pk >= *counter {
             *counter = pk + 1;
         }
-        
+
         Ok(())
     }
-    
+
     /// Insert with auto-increment primary key
     pub fn insert_auto(&mut self, row_id: u64) -> Result<u64> {
-        let mut counter = self.auto_increment.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut counter = self.auto_increment.write();
         
         let pk = *counter;
         *counter += 1;
@@ -120,7 +119,6 @@ impl PrimaryKeyIndex {
     /// Get next auto-increment value
     pub fn next_auto_increment(&self) -> u64 {
         *self.auto_increment.read()
-            .expect("PrimaryKey auto_increment lock poisoned")
     }
     
     /// Total number of keys

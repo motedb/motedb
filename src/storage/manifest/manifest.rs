@@ -5,7 +5,8 @@ use crate::{Result, StorageError};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Write, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use crc32fast::Hasher;
 
@@ -137,17 +138,13 @@ impl Manifest {
     
     /// 获取当前版本（只读）
     pub fn current_version(&self) -> Version {
-        self.current_version.lock()
-            .expect("Manifest current_version lock poisoned")
-            .clone()
+        self.current_version.lock().clone()
     }
     
     /// 应用版本编辑（原子性提交，带文件验证）
     pub fn apply_edit(&self, edit: VersionEdit) -> Result<u64> {
         if edit.is_empty() {
-            return Ok(self.current_version.lock()
-                .expect("Manifest lock poisoned")
-                .version_number);
+            return Ok(self.current_version.lock().version_number);
         }
         
         // Step 1: 验证所有文件存在且完整
@@ -178,12 +175,9 @@ impl Manifest {
             }
         }
         
-        let mut version = self.current_version.lock()
-            .map_err(|_| StorageError::Lock("Version lock poisoned".into()))?;
-        let mut file = self.manifest_file.lock()
-            .map_err(|_| StorageError::Lock("Manifest file lock poisoned".into()))?;
-        let mut next_ver = self.next_version.lock()
-            .map_err(|_| StorageError::Lock("Next version lock poisoned".into()))?;
+        let mut version = self.current_version.lock();
+        let mut file = self.manifest_file.lock();
+        let mut next_ver = self.next_version.lock();
         
         // Step 2: 写入添加文件记录
         for meta in &edit.add_files {

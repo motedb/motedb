@@ -53,6 +53,10 @@ pub struct DiskGraph {
     /// Dirty flag
     dirty: Arc<RwLock<bool>>,
 
+    /// Serializes flush with set_neighbors to prevent stale node_count
+    /// in sidecar index (flush acquires exclusively, set_neighbors shared)
+    flush_lock: Arc<Mutex<()>>,
+
     file_path: PathBuf,
 }
 
@@ -110,6 +114,7 @@ impl DiskGraph {
             max_hot_nodes,
             next_offset: Arc::new(Mutex::new(HEADER_SIZE)),
             dirty: Arc::new(RwLock::new(false)),
+            flush_lock: Arc::new(Mutex::new(())),
             file_path,
         })
     }
@@ -188,6 +193,7 @@ impl DiskGraph {
             max_hot_nodes,
             next_offset: Arc::new(Mutex::new(next_off)),
             dirty: Arc::new(RwLock::new(false)),
+            flush_lock: Arc::new(Mutex::new(())),
             file_path,
         })
     }
@@ -421,6 +427,8 @@ impl DiskGraph {
 
     /// Set neighbors (replaces existing)
     pub fn set_neighbors(&self, node_id: RowId, mut neighbors: Vec<RowId>) -> Result<()> {
+        // Block during flush to prevent sidecar from being built with stale node_count
+        let _flush_guard = self.flush_lock.lock();
         neighbors.retain(|&id| id != node_id);
         neighbors.sort_unstable();
         neighbors.dedup();
@@ -475,8 +483,17 @@ impl DiskGraph {
         neighbors
     }
 
-    /// Flush to disk
+    /// Flush to disk — blocks concurrent set_neighbors to prevent
+    /// the sidecar index from being built with stale node_count.
     pub fn flush(&self) -> Result<()> {
+        if !*self.dirty.read() { return Ok(()); }
+
+        // Prevent concurrent writes during flush so node_count and
+        // sidecar index are consistent. Flush is infrequent enough
+        // that the serialization cost is negligible.
+        let _flush_guard = self.flush_lock.lock();
+        // Re-check dirty after acquiring lock (could have been flushed
+        // by another thread while we waited).
         if !*self.dirty.read() { return Ok(()); }
 
         let node_count = self.node_count();
@@ -555,8 +572,10 @@ impl DiskGraph {
 
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
         *self.index_file.write() = idx_read;
-        // Clear LRU index (offsets changed)
+        // Clear LRU index (offsets changed) and neighbor caches (stale data)
         self.index.write().clear();
+        self.cache.lock().clear();
+        self.hot_cache.write().clear();
 
         // Remap after compact
         self.remap();

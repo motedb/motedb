@@ -45,7 +45,7 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::marker::PhantomData;
 
 /// Max page content size (upper bound for buffer allocation)
@@ -126,6 +126,9 @@ pub struct GenericBTree<K: BTreeKey> {
 
     /// Page offset table: page_id → file_offset
     page_offsets: Arc<RwLock<Vec<u64>>>,
+
+    /// Set of page IDs that are overflow pages (different format from B+Tree pages)
+    overflow_page_ids: Arc<RwLock<HashSet<u64>>>,
 
     _phantom: PhantomData<K>,
 }
@@ -656,6 +659,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             key_size,
             max_keys,
             page_offsets: Arc::new(RwLock::new(page_offsets)),
+            overflow_page_ids: Arc::new(RwLock::new(HashSet::new())),
             _phantom: PhantomData,
         };
         
@@ -1251,7 +1255,7 @@ impl<K: BTreeKey> GenericBTree<K> {
             file.seek(SeekFrom::Start(file_end))?;
             file.write_all(&page_buf)?;
 
-            // Record offset in page table
+            // Record offset in page table and track as overflow page
             {
                 let mut offsets = self.page_offsets.write();
                 let idx = page_id as usize;
@@ -1260,7 +1264,8 @@ impl<K: BTreeKey> GenericBTree<K> {
                 }
                 offsets[idx] = file_end;
             }
-            
+            self.overflow_page_ids.write().insert(page_id);
+
             remaining = &remaining[chunk_size..];
         }
         
@@ -1310,8 +1315,13 @@ impl<K: BTreeKey> GenericBTree<K> {
             let data_len = u32::from_le_bytes([
                 page_buf[8], page_buf[9], page_buf[10], page_buf[11],
             ]) as usize;
-            
-            
+
+            if data_len > OVERFLOW_DATA_SIZE {
+                return Err(StorageError::Corruption(
+                    format!("Invalid overflow data_len {} at page {} (max {})", data_len, page_id, OVERFLOW_DATA_SIZE)
+                ));
+            }
+
             // Append data
             result.extend_from_slice(&page_buf[12..12+data_len]);
             
@@ -1540,8 +1550,14 @@ impl<K: BTreeKey> GenericBTree<K> {
             offsets.clone()
         };
 
+        // Identify overflow pages — they share page_offsets but have different binary format
+        let overflow_ids: HashSet<u64> = self.overflow_page_ids.read().clone();
+
         let mut all_page_ids: BTreeSet<u64> = page_offsets_snapshot
-            .iter().enumerate().filter(|(_, &off)| off != 0).map(|(id, _)| id as u64).collect();
+            .iter().enumerate()
+            .filter(|(id, &off)| off != 0 && !overflow_ids.contains(&(*id as u64)))
+            .map(|(id, _)| id as u64)
+            .collect();
 
 
         {
@@ -1627,22 +1643,10 @@ impl<K: BTreeKey> GenericBTree<K> {
         let mut new_offsets = vec![0u64]; // index 0 = superblock
 
         for (page_id, mut working) in pages {
-            // Convert large values to overflow markers
-            if working.is_leaf {
-                for i in 0..working.values.len() {
-                    let value = &working.values[i];
-                    let is_overflow_marker = value.len() == 20
-                        && value[0..4] == OVERFLOW_MARKER.to_le_bytes();
-                    if value.len() > OVERFLOW_THRESHOLD && !is_overflow_marker {
-                        let overflow_id = self.write_overflow_chain(value)?;
-                        let mut marker = Vec::with_capacity(20);
-                        marker.extend_from_slice(&OVERFLOW_MARKER.to_le_bytes());
-                        marker.extend_from_slice(&overflow_id.to_le_bytes());
-                        marker.extend_from_slice(&(value.len() as u64).to_le_bytes());
-                        working.values[i] = marker;
-                    }
-                }
-            }
+            // Note: large values should already be converted to overflow markers
+            // during insert. We don't convert them here because that would require
+            // calling write_overflow_chain which acquires storage_file.write(),
+            // but we already hold it in this flush method.
 
             let buf = working.serialize(self.key_size)?;
 
@@ -1660,6 +1664,32 @@ impl<K: BTreeKey> GenericBTree<K> {
             let mut cache = self.page_cache.write();
             working.dirty = false;
             cache.put(page_id, Arc::new(RwLock::new(working)));
+        }
+
+        // Copy overflow pages to their new positions in the compacted file.
+        // Overflow pages are PAGE_SIZE bytes with format [next_page_id:8][data_len:4][data...].
+        for overflow_id in &overflow_ids {
+            let old_offset = {
+                let idx = *overflow_id as usize;
+                if idx >= page_offsets_snapshot.len() || page_offsets_snapshot[idx] == 0 {
+                    continue; // not on disk yet
+                }
+                page_offsets_snapshot[idx]
+            };
+
+            // Read overflow page from its old position and rewrite at new offset
+            use std::os::unix::fs::FileExt;
+            let mut page_buf = vec![0u8; PAGE_SIZE];
+            file.read_exact_at(&mut page_buf, old_offset)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&page_buf)?;
+
+            let idx = *overflow_id as usize;
+            if idx >= new_offsets.len() {
+                new_offsets.resize(idx + 1, 0);
+            }
+            new_offsets[idx] = offset;
+            offset += PAGE_SIZE as u64;
         }
 
         // Truncate file

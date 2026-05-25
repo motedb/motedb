@@ -200,7 +200,7 @@ impl MoteDB {
 
         for (row_id, row) in rows {
             if let Some(crate::types::Value::Timestamp(ts)) = row.get(ts_col.position) {
-                ts_index.insert(ts.as_micros() as u64, *row_id)?;
+                ts_index.insert(ts.as_micros_u64(), *row_id)?;
                 count += 1;
             }
         }

@@ -76,10 +76,13 @@ pub struct IOctreeIndex {
 
 impl IOctreeIndex {
     /// Create a new i-Octree with given config
-    pub fn new(config: IOctreeConfig, name: String) -> Self {
+    pub fn new(config: IOctreeConfig, name: String) -> Result<Self> {
         let world_bounds = BoundingBox3D::new(-500.0, -500.0, -500.0, 500.0, 500.0, 500.0);
-        let center = world_bounds.center().to_f32();
-        let extent = world_bounds.extent() as f32;
+        let center = {
+    let c = world_bounds.center();
+    [c.x, c.y, c.z]
+};
+        let extent = world_bounds.extent() /*as f64*/;
 
         // data_dir may point to a file (ioctree.bin) or directory; use parent for LeafStore/WAL
         let work_dir = config.data_dir.as_ref()
@@ -92,17 +95,19 @@ impl IOctreeIndex {
             })
             .unwrap_or_else(|| std::env::temp_dir().join(format!("motedb_ioctree_{}", name)));
 
-        let leaf_store = LeafStore::open(&work_dir, config.cache_capacity()).expect("Failed to create LeafStore");
-        let root_leaf_id = leaf_store.create_leaf(vec![]).expect("Failed to create root leaf");
+        let leaf_store = LeafStore::open(&work_dir, config.cache_capacity())
+            .map_err(|e| crate::StorageError::Index(format!("Failed to create LeafStore: {}", e)))?;
+        let root_leaf_id = leaf_store.create_leaf(vec![])
+            .map_err(|e| crate::StorageError::Index(format!("Failed to create root leaf: {}", e)))?;
 
-        Self {
+        Ok(Self {
             root: Octant::new_leaf(center, extent, root_leaf_id),
             config,
             size: 0,
             world_bounds,
             name,
             leaf_store,
-        }
+        })
     }
 
     /// Insert a 3D point into the index
@@ -123,7 +128,7 @@ impl IOctreeIndex {
         self.world_bounds.expand(point);
 
         // Expand root upward if point outside bounds
-        let p = [point.x as f32, point.y as f32, point.z as f32];
+        let p = [point.x /*as f64*/, point.y /*as f64*/, point.z /*as f64*/];
         while !self.root_contains(&p) {
             self.expand_root();
         }
@@ -137,7 +142,7 @@ impl IOctreeIndex {
     /// Insert a point directly into the octree structure
     fn insert_into_tree(&mut self, point: IndexedPoint3D) -> Result<()> {
         let bucket_size = self.config.bucket_size;
-        let min_extent = self.config.min_extent as f32;
+        let min_extent = self.config.min_extent /*as f64*/;
         tree_insert(&self.leaf_store, &mut self.root, point, bucket_size, min_extent)
     }
 
@@ -152,21 +157,21 @@ impl IOctreeIndex {
 
     /// Range query: find all points within a 3D bounding box
     pub fn range_query(&self, bbox: &BoundingBox3D) -> Vec<u64> {
-        let min = [bbox.min_x as f32, bbox.min_y as f32, bbox.min_z as f32];
-        let max = [bbox.max_x as f32, bbox.max_y as f32, bbox.max_z as f32];
+        let min = [bbox.min_x /*as f64*/, bbox.min_y /*as f64*/, bbox.min_z /*as f64*/];
+        let max = [bbox.max_x /*as f64*/, bbox.max_y /*as f64*/, bbox.max_z /*as f64*/];
         search::range_search(&self.root, &min, &max, &self.leaf_store)
     }
 
     /// KNN query: find k nearest neighbors
     pub fn knn_query(&self, point: &Point3D, k: usize) -> Vec<(u64, f64)> {
-        let query = [point.x as f32, point.y as f32, point.z as f32];
+        let query = [point.x /*as f64*/, point.y /*as f64*/, point.z /*as f64*/];
         search::knn_search(&self.root, &query, k, &self.leaf_store)
     }
 
     /// Radius search: find all points within a given radius
     pub fn radius_search(&self, center: &Point3D, radius: f64) -> Vec<(u64, f64)> {
-        let c = [center.x as f32, center.y as f32, center.z as f32];
-        search::radius_search(&self.root, &c, radius as f32, &self.leaf_store)
+        let c = [center.x /*as f64*/, center.y /*as f64*/, center.z /*as f64*/];
+        search::radius_search(&self.root, &c, radius /*as f64*/, &self.leaf_store)
     }
 
     /// Number of indexed points
@@ -207,7 +212,7 @@ impl IOctreeIndex {
         Ok(())
     }
 
-    fn root_contains(&self, p: &[f32; 3]) -> bool {
+    fn root_contains(&self, p: &[f64; 3]) -> bool {
         let (center, extent) = match &self.root {
             Octant::Inner { center, extent, .. } => (center, extent),
             Octant::Leaf { center, extent, .. } => (center, extent),
@@ -234,7 +239,7 @@ impl IOctreeIndex {
 
 // === Free functions for tree operations (avoids borrow checker issues) ===
 
-fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bucket_size: usize, min_extent: f32) -> Result<()> {
+fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bucket_size: usize, min_extent: f64) -> Result<()> {
     match octant {
         Octant::Leaf { center: _, extent, leaf_id, point_count } => {
             store.add_point(*leaf_id, point)?;

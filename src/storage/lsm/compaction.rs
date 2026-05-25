@@ -558,11 +558,13 @@ impl CompactionWorker {
         if level_idx >= levels.len() - 1 {
             return Ok(());  // Last level, can't compact further
         }
-        
+
+        let is_last_level = level_idx + 1 >= levels.len() - 1;
+
         // Select source files
         let sources = levels[level_idx].select_for_compaction(&self.config.lsm_config);
         let overlapping = levels[level_idx].get_overlapping(&levels[level_idx + 1], &sources);
-        
+
         drop(levels); // Release lock during I/O
         
         // ✅ 检查文件是否存在
@@ -593,7 +595,7 @@ impl CompactionWorker {
         
         // Merge SSTables — returns output plus the set of paths that were actually
         // merged (files that survived the TOCTOU window between exists() and open()).
-        let (output_meta, merged_paths) = self.merge_sstables(level_idx + 1, &valid_sources, &valid_overlapping)?;
+        let (output_meta, merged_paths) = self.merge_sstables(level_idx + 1, is_last_level, &valid_sources, &valid_overlapping)?;
 
         // Update levels
         // Invalidate snapshot BEFORE modifying levels so that concurrent scans
@@ -681,6 +683,7 @@ impl CompactionWorker {
     fn merge_sstables(
         &self,
         output_level: usize,
+        is_last_level: bool,
         sources: &[SSTableMeta],
         overlapping: &[SSTableMeta],
     ) -> Result<(SSTableMeta, HashSet<PathBuf>)> {
@@ -791,7 +794,10 @@ impl CompactionWorker {
                 }
             } else {
                 if let (Some(key), Some(value)) = (last_key, last_value.take()) {
-                    if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
+                    // Keep live entries. Keep tombstones unless we're in the last level AND they're expired.
+                    // Dropping tombstones at intermediate levels risks resurrecting keys that have
+                    // live copies in deeper levels not included in this compaction.
+                    if !value.deleted || !is_last_level || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                         builder.add(key, value)?;
                         entries_written += 1;
 
@@ -823,7 +829,7 @@ impl CompactionWorker {
 
         // Write final key
         if let (Some(key), Some(value)) = (last_key, last_value) {
-            if !value.deleted || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
+            if !value.deleted || !is_last_level || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
                 builder.add(key, value)?;
             }
         }

@@ -363,6 +363,44 @@ impl BlobStore {
 
         Ok(())
     }
+
+    /// Garbage collect unreferenced blob files.
+    ///
+    /// `live_blob_refs` should be the set of all BlobRefs currently referenced
+    /// by live SSTable entries. Any blob file (other than the current active one)
+    /// with zero live references is deleted.
+    ///
+    /// This should be called periodically or after major compaction cycles.
+    pub fn gc_unreferenced_blobs(&self, live_blob_refs: &std::collections::HashSet<(u32, u64)>) -> Result<usize> {
+        let state = self.state.lock()
+            .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
+        let current_file_id = state.current_file_id;
+        drop(state);
+
+        let mut deleted = 0;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if let Ok(file_id) = u32::from_str_radix(name, 10) {
+                    // Never delete the current active file
+                    if file_id == current_file_id {
+                        continue;
+                    }
+                    // Check if any live reference points to this file
+                    let has_ref = live_blob_refs.iter().any(|(fid, _)| *fid == file_id);
+                    if !has_ref {
+                        if let Err(e) = std::fs::remove_file(&path) {
+                            warn_log!("[BlobStore::gc] Failed to delete {}: {}", path.display(), e);
+                        } else {
+                            deleted += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 impl BlobFile {

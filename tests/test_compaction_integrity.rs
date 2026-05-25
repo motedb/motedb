@@ -685,3 +685,75 @@ fn test_compaction_result_survives_restart() {
         }
     }
 }
+
+// ── Category 6: Tombstone Resurrection Prevention ──────────────────────
+
+/// Regression test: tombstones must NOT be dropped during intermediate-level compaction.
+///
+/// Before the fix, compaction at level N→N+1 would drop expired tombstones even when
+/// deeper levels (N+2, ...) still held live copies of the key. After compaction removed
+/// the tombstone, reads would "resurrect" the old value from the deeper level.
+///
+/// This test uses tombstone_ttl_secs=0 to maximize the chance of premature dropping,
+/// then verifies that deleted keys stay deleted after intermediate compaction.
+#[test]
+fn test_tombstone_not_dropped_at_intermediate_level() {
+    let dir = TempDir::new().unwrap();
+    let mut config = DBConfig::for_edge();
+    config.lsm_config.tombstone_ttl_secs = Some(0); // Drop tombstones ASAP — stresses the bug
+    let db = Database::create_with_config(dir.path(), config).unwrap();
+
+    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
+
+    // Insert 1000 rows across multiple flushes to create multi-level SSTables
+    for batch in 0..5i64 {
+        let start = batch * 200 + 1;
+        let end = start + 200;
+        for i in start..end {
+            exec(&db, &format!("INSERT INTO t VALUES ({}, 'original')", i));
+        }
+        db.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    // Wait for compaction to push data into deeper levels
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    db.flush().unwrap();
+
+    // Verify rows exist
+    assert_eq!(count_rows(&db), 1000, "Should have 1000 rows before delete");
+
+    // Delete half the rows
+    for i in 1..=500i64 {
+        exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
+    }
+    db.flush().unwrap();
+
+    // Trigger compaction at intermediate levels (NOT last level)
+    for batch in 0..3i64 {
+        let start = 2000 + batch * 100 + 1;
+        for i in 0..50i64 {
+            exec(&db, &format!("INSERT INTO t VALUES ({}, 'padding')", start + i));
+        }
+        db.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Wait for compaction to run on intermediate levels
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    db.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Deleted rows must NOT reappear (tombstone was not prematurely dropped)
+    assert_eq!(count_rows(&db), 650,
+        "Should have 500 (survivors) + 150 (padding) = 650 rows");
+
+    for i in 1..=500i64 {
+        assert!(get_row(&db, i).is_none(),
+            "Deleted row {} should NOT be resurrected", i);
+    }
+    for i in 501..=1000i64 {
+        assert!(get_row(&db, i).is_some(),
+            "Row {} should still exist", i);
+    }
+}

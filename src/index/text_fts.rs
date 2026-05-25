@@ -77,10 +77,14 @@ pub struct TextFTSIndex {
 
     /// Deleted documents (tombstones)
     deleted_docs: Arc<RwLock<HashSet<DocId>>>,
-    
+
     /// Deleted (term_id, doc_id) pairs (for update operations)
     /// Tracks which terms have been removed from which documents
     deleted_term_docs: Arc<RwLock<HashSet<(TermId, DocId)>>>,
+
+    /// Set of all distinct doc_ids ever inserted — used to avoid
+    /// double-counting total_docs on re-insert/update operations.
+    known_docs: Arc<RwLock<HashSet<DocId>>>,
 }
 
 /// Metadata for text FTS index
@@ -224,6 +228,7 @@ impl TextFTSIndex {
             doc_length_cache: Arc::new(RwLock::new(None)),
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
+            known_docs: Arc::new(RwLock::new(HashSet::new())),
         })
     }
     
@@ -305,8 +310,18 @@ impl TextFTSIndex {
         pending_doc_lens.extend(doc_lengths_batch);
         drop(pending_doc_lens);
 
-        // 3. Update statistics
-        self.total_docs += docs.len() as u64;
+        // 3. Update statistics — count only truly new documents
+        let new_doc_count = {
+            let mut known = self.known_docs.write();
+            let mut count = 0u64;
+            for (doc_id, _) in docs {
+                if known.insert(*doc_id) {
+                    count += 1;
+                }
+            }
+            count
+        };
+        self.total_docs += new_doc_count;
         self.total_tokens += batch_token_count;
 
         if self.total_docs > 0 {
@@ -338,9 +353,17 @@ impl TextFTSIndex {
     /// - Remove from pending posting lists
     /// - Update statistics
     pub fn delete(&mut self, doc_id: DocumentId, text: &str) -> Result<()> {
-        // Mark as deleted
+        // Mark as deleted (skip stats if already deleted)
+        let already_deleted = self.deleted_docs.read().contains(&doc_id);
         self.deleted_docs.write().insert(doc_id);
-        
+
+        if already_deleted {
+            return Ok(());
+        }
+
+        // Remove from known_docs so it counts as new if re-inserted
+        self.known_docs.write().remove(&doc_id);
+
         // Tokenize to get all terms for this doc
         let tokens = self.tokenizer.tokenize(text);
         
@@ -501,7 +524,7 @@ impl TextFTSIndex {
                 count
             } else {
                 drop(counters);
-                let count = self.discover_shard_count(term_id, btree)?;
+                let count = self.discover_shard_count(term_id, &*btree)?;
                 let mut counters = self.shard_counters.write();
                 counters.put(term_id, count);
                 count
@@ -567,7 +590,7 @@ impl TextFTSIndex {
     fn discover_shard_count(
         &self,
         term_id: TermId,
-        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+        btree: &GenericBTree<u32>,
     ) -> Result<u32> {
         let base_term_id = term_id & 0x00FFFFFF;
         let range_start = base_term_id; // shard 0 key
@@ -988,7 +1011,17 @@ impl TextFTSIndex {
 
         for (term_id, posting) in pending_data.iter() {
             let base_term_id = *term_id & 0x00FFFFFF;
-            let next_shard_idx = *shard_counters.get(term_id).unwrap_or(&0);
+            // If the shard counter was evicted from LRU, discover the actual
+            // count from the BTree to avoid overwriting consolidated shard 0.
+            let next_shard_idx = match shard_counters.get(term_id) {
+                Some(idx) => *idx,
+                None => {
+                    let discovered = self.discover_shard_count(
+                        *term_id, &*btree).unwrap_or(0);
+                    shard_counters.put(*term_id, discovered);
+                    discovered
+                }
+            };
 
             // Remove tombstoned docs from the new posting only
             let doc_ids = posting.doc_ids();
@@ -1451,6 +1484,24 @@ mod tests {
         assert!(doc_ids.contains(&2));
         // All scores should be positive
         assert!(results.iter().all(|(_, score)| *score > 0.0));
+    }
+
+    #[test]
+    fn test_total_docs_double_delete_no_underflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut index = TextFTSIndex::new(temp_dir.path().join("test")).unwrap();
+
+        index.insert(1, "apple").unwrap();
+        index.insert(2, "banana").unwrap();
+        assert_eq!(index.stats().total_docs, 2);
+
+        // First delete: decrements
+        index.delete(1, "apple").unwrap();
+        assert_eq!(index.stats().total_docs, 1);
+
+        // Double-delete: should NOT decrement again
+        index.delete(1, "apple").unwrap();
+        assert_eq!(index.stats().total_docs, 1, "double-delete should not underflow total_docs");
     }
 }
 

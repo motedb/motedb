@@ -227,11 +227,34 @@ impl StreamingQueryResult {
 
         // Pre-compute column indices and ascending flags to avoid O(columns) per comparison
         let sort_specs: Vec<(usize, bool)> = order_clauses.iter().filter_map(|clause| {
-            let col_name = match &clause.expr {
-                Expr::Column(name) => name,
+            let col_idx = match &clause.expr {
+                Expr::Column(name) => {
+                    // Try direct column name match
+                    match columns.iter().position(|c| c == name) {
+                        Some(idx) => idx,
+                        None => {
+                            // Try stripping table prefix (e.g., "t.id" → "id")
+                            if let Some(dot_pos) = name.rfind('.') {
+                                let base = &name[dot_pos + 1..];
+                                match columns.iter().position(|c| c == base) {
+                                    Some(idx) => return Some((idx, clause.asc)),
+                                    None => return None,
+                                }
+                            }
+                            return None;
+                        }
+                    }
+                }
+                Expr::Literal(Value::Integer(n)) => {
+                    // ORDER BY column position (1-based)
+                    let idx = (*n as usize).wrapping_sub(1);
+                    if idx >= columns.len() {
+                        return None; // Out of range — ignore
+                    }
+                    idx
+                }
                 _ => return None, // Expression ORDER BY not supported in streaming path
             };
-            let col_idx = columns.iter().position(|c| c == col_name)?;
             Some((col_idx, clause.asc))
         }).collect();
 
@@ -248,7 +271,6 @@ impl StreamingQueryResult {
                 }
 
                 let cmp = match (&a[col_idx], &b[col_idx]) {
-                    (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
                     (Value::Float(a), Value::Float(b)) => {
                         if a.is_nan() && b.is_nan() {
                             Ordering::Equal
@@ -260,12 +282,12 @@ impl StreamingQueryResult {
                             a.partial_cmp(b).unwrap_or(Ordering::Equal)
                         }
                     }
-                    (Value::Text(a), Value::Text(b)) => a.cmp(b),
-                    (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
                     (Value::Null, Value::Null) => Ordering::Equal,
                     (Value::Null, _) => Ordering::Less,
                     (_, Value::Null) => Ordering::Greater,
-                    _ => Ordering::Equal,
+                    // Delegate to Value::partial_cmp for all other type pairs,
+                    // including cross-type (Integer/Float), Timestamp, etc.
+                    (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                 };
 
                 let final_cmp = if asc { cmp } else { cmp.reverse() };
@@ -473,6 +495,8 @@ impl QueryExecutor {
         let result = self.execute_select_internal(stmt)?;
         match result {
             QueryResult::Select { columns, rows } => {
+                // execute_select_internal already applies ORDER BY, LIMIT, OFFSET, DISTINCT,
+                // so we pass None/defaults here to avoid double-application.
                 Ok(StreamingQueryResult::SelectStreaming {
                     columns,
                     rows: Box::new(rows.into_iter().map(Ok)),
@@ -1259,7 +1283,7 @@ impl QueryExecutor {
         match (l, r) {
             (Value::Integer(a), Value::Integer(b)) => {
                 if *b == 0 { return Err(MoteDBError::DivisionByZero); }
-                Ok(Value::Integer(a % b))
+                Ok(Value::Integer(a.checked_rem(*b).unwrap_or(0)))
             }
             _ => Ok(Value::Null),
         }
@@ -1364,7 +1388,10 @@ impl QueryExecutor {
                 let val = Self::eval_expr_on_row(&args[0], row, schema)?;
                 match val {
                     Value::Integer(i) => match fname.as_str() {
-                        "abs" => Ok(Value::Integer(i.abs())),
+                        "abs" => match i.checked_abs() {
+                            Some(n) => Ok(Value::Integer(n)),
+                            None => Ok(Value::Float(-(i as f64))),
+                        },
                         _ => {
                             let f = i as f64;
                             Ok(Value::Float(match fname.as_str() {
@@ -1635,7 +1662,10 @@ impl QueryExecutor {
                         let val = Self::eval_expr_simple(&args[0], row)?;
                         match val {
                             Value::Integer(i) => match fname.as_str() {
-                                "abs" => Ok(Value::Integer(i.abs())),
+                                "abs" => match i.checked_abs() {
+                                    Some(n) => Ok(Value::Integer(n)),
+                                    None => Ok(Value::Float(-(i as f64))),
+                                },
                                 _ => {
                                     let f = i as f64;
                                     Ok(Value::Float(match fname.as_str() {
@@ -1976,7 +2006,7 @@ impl QueryExecutor {
                     }
                     BinaryOperator::Lt | BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Bool(false))
+                            Ok(Value::Null) // SQL: NULL comparison => UNKNOWN
                         } else {
                             Ok(Value::Bool(match op {
                                 BinaryOperator::Lt => lv < rv,
@@ -2960,6 +2990,17 @@ impl QueryExecutor {
                                     // Use projected column value
                                     return Ok(proj_row[idx].clone());
                                 }
+                                // Try direct column lookup in full_row
+                                if let Some(val) = full_row.get(col_name) {
+                                    return Ok(val.clone());
+                                }
+                            }
+                            // ORDER BY column position (1-based integer literal)
+                            if let Expr::Literal(Value::Integer(n)) = &order.expr {
+                                let idx = (*n as usize).wrapping_sub(1);
+                                if idx < proj_row.len() {
+                                    return Ok(proj_row[idx].clone());
+                                }
                             }
                             // Otherwise, evaluate expression against original row
                             self.evaluator.eval(&order.expr, full_row)
@@ -3234,9 +3275,9 @@ impl QueryExecutor {
                 // Perform JOIN based on type
                 let joined_rows = match join_type {
                     JoinType::Inner => self.inner_join(&left_rows, &right_rows, on_condition)?,
-                    JoinType::Left => self.left_join(&left_rows, &right_rows, on_condition)?,
-                    JoinType::Right => self.right_join(&left_rows, &right_rows, on_condition)?,
-                    JoinType::Full => self.full_join(&left_rows, &right_rows, on_condition)?,
+                    JoinType::Left => self.left_join(&left_rows, &right_rows, on_condition, &right_schema)?,
+                    JoinType::Right => self.right_join(&left_rows, &right_rows, on_condition, &left_schema)?,
+                    JoinType::Full => self.full_join(&left_rows, &right_rows, on_condition, &left_schema, &right_schema)?,
                 };
                 
                 Ok((joined_rows, Arc::new(combined_schema)))
@@ -3294,25 +3335,23 @@ impl QueryExecutor {
     ) -> Result<Vec<(u64, SqlRow)>> {
         use std::collections::HashMap;
         
-        // Hash key type (supports Eq + Hash, no string allocation)
+        // Hash key type — canonicalizes Integer/Float to same representation
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         enum HashKey {
-            Integer(i64),
+            Numeric(u64), // f64::to_bits(): Integer(5) and Float(5.0) map to same key
             Text(String),
             Bool(bool),
-            Float(u64), // Use bits representation for float
         }
-        
-        // Fast conversion from Value to HashKey (NULL excluded for SQL semantics)
+
         #[inline]
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
-                Value::Integer(i) => Some(HashKey::Integer(*i)),
+                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
-                Value::Float(f) => Some(HashKey::Float(f.to_bits())),
                 Value::Null => None, // SQL: NULL != NULL in joins
-                _ => None, // Vector/Tensor cannot hash directly
+                _ => None,
             }
         }
         
@@ -3376,16 +3415,22 @@ impl QueryExecutor {
         left_rows: &[(u64, SqlRow)],
         right_rows: &[(u64, SqlRow)],
         on_condition: &Expr,
+        right_schema: &crate::types::TableSchema,
     ) -> Result<Vec<(u64, SqlRow)>> {
         let mut result = Vec::new();
         let mut next_id = 1u64;
-        
+
+        // Pre-compute NULL row for right side from schema (handles empty table)
+        let null_right_row: SqlRow = right_schema.columns.iter()
+            .map(|col| (col.name.clone(), Value::Null))
+            .collect();
+
         for (_, left_row) in left_rows {
             let mut matched = false;
-            
+
             for (_, right_row) in right_rows {
                 let combined_row = self.combine_rows(left_row, right_row);
-                
+
                 if self.evaluator.eval(on_condition, &combined_row)
                     .and_then(|val| self.to_bool(&val))
                     .unwrap_or(false)
@@ -3395,18 +3440,15 @@ impl QueryExecutor {
                     matched = true;
                 }
             }
-            
+
             // If no match, add left row with NULL values for right columns
             if !matched {
-                let null_right_row: SqlRow = right_rows.first()
-                    .map(|(_, row)| row.keys().map(|k| (k.clone(), Value::Null)).collect())
-                    .unwrap_or_default();
                 let combined_row = self.combine_rows(left_row, &null_right_row);
                 result.push((next_id, combined_row));
                 next_id += 1;
             }
         }
-        
+
         Ok(result)
     }
     
@@ -3416,18 +3458,22 @@ impl QueryExecutor {
         left_rows: &[(u64, SqlRow)],
         right_rows: &[(u64, SqlRow)],
         on_condition: &Expr,
+        left_schema: &crate::types::TableSchema,
     ) -> Result<Vec<(u64, SqlRow)>> {
-        // RIGHT JOIN = LEFT JOIN with tables swapped, but condition order matters
-        // We swap left and right, then swap back in the combined row
         let mut result = Vec::new();
         let mut next_id = 1u64;
-        
+
+        // Pre-compute NULL row for left side from schema (handles empty table)
+        let null_left_row: SqlRow = left_schema.columns.iter()
+            .map(|col| (col.name.clone(), Value::Null))
+            .collect();
+
         for (_, right_row) in right_rows {
             let mut matched = false;
-            
+
             for (_, left_row) in left_rows {
                 let combined_row = self.combine_rows(left_row, right_row);
-                
+
                 if self.evaluator.eval(on_condition, &combined_row)
                     .and_then(|val| self.to_bool(&val))
                     .unwrap_or(false)
@@ -3437,18 +3483,15 @@ impl QueryExecutor {
                     matched = true;
                 }
             }
-            
+
             // If no match, add right row with NULL values for left columns
             if !matched {
-                let null_left_row: SqlRow = left_rows.first()
-                    .map(|(_, row)| row.keys().map(|k| (k.clone(), Value::Null)).collect())
-                    .unwrap_or_default();
                 let combined_row = self.combine_rows(&null_left_row, right_row);
                 result.push((next_id, combined_row));
                 next_id += 1;
             }
         }
-        
+
         Ok(result)
     }
     
@@ -3458,18 +3501,28 @@ impl QueryExecutor {
         left_rows: &[(u64, SqlRow)],
         right_rows: &[(u64, SqlRow)],
         on_condition: &Expr,
+        left_schema: &crate::types::TableSchema,
+        right_schema: &crate::types::TableSchema,
     ) -> Result<Vec<(u64, SqlRow)>> {
         let mut result = Vec::new();
         let mut next_id = 1u64;
         let mut right_matched = vec![false; right_rows.len()];
-        
+
+        // Pre-compute NULL rows from schema (handles empty table)
+        let null_right_row: SqlRow = right_schema.columns.iter()
+            .map(|col| (col.name.clone(), Value::Null))
+            .collect();
+        let null_left_row: SqlRow = left_schema.columns.iter()
+            .map(|col| (col.name.clone(), Value::Null))
+            .collect();
+
         // First pass: process all left rows
         for (_, left_row) in left_rows {
             let mut left_matched = false;
-            
+
             for (right_idx, (_, right_row)) in right_rows.iter().enumerate() {
                 let combined_row = self.combine_rows(left_row, right_row);
-                
+
                 if self.evaluator.eval(on_condition, &combined_row)
                     .and_then(|val| self.to_bool(&val))
                     .unwrap_or(false)
@@ -3480,30 +3533,24 @@ impl QueryExecutor {
                     right_matched[right_idx] = true;
                 }
             }
-            
+
             // If left row didn't match, add with NULL right values
             if !left_matched {
-                let null_right_row: SqlRow = right_rows.first()
-                    .map(|(_, row)| row.keys().map(|k| (k.clone(), Value::Null)).collect())
-                    .unwrap_or_default();
                 let combined_row = self.combine_rows(left_row, &null_right_row);
                 result.push((next_id, combined_row));
                 next_id += 1;
             }
         }
-        
+
         // Second pass: add unmatched right rows
         for (right_idx, (_, right_row)) in right_rows.iter().enumerate() {
             if !right_matched[right_idx] {
-                let null_left_row: SqlRow = left_rows.first()
-                    .map(|(_, row)| row.keys().map(|k| (k.clone(), Value::Null)).collect())
-                    .unwrap_or_default();
                 let combined_row = self.combine_rows(&null_left_row, right_row);
                 result.push((next_id, combined_row));
                 next_id += 1;
             }
         }
-        
+
         Ok(result)
     }
     
@@ -4442,6 +4489,14 @@ impl QueryExecutor {
             return Ok(None);
         }
 
+        // Build a set of GROUP BY bare column names for validation
+        let group_bare_set: std::collections::HashSet<&str> = group_by_cols.iter()
+            .map(|name| {
+                if name.contains('.') { name.rsplit('.').next().unwrap_or(name) }
+                else { name.as_str() }
+            })
+            .collect();
+
         // Resolve SELECT column positions and types
         let mut select_col_info: Vec<(String, Option<usize>, Option<AggregateInfo>)> = Vec::new();
         for col_spec in &stmt.columns {
@@ -4453,6 +4508,10 @@ impl QueryExecutor {
                         name
                     };
                     if let Some(pos) = schema.get_column_position(bare) {
+                        // Validate: bare column must appear in GROUP BY (or be the only column with no GROUP BY)
+                        if !group_by_cols.is_empty() && !group_bare_set.contains(bare) {
+                            return Ok(None); // fall back to non-positional path for error
+                        }
                         select_col_info.push((name.clone(), Some(pos), None));
                     } else {
                         return Ok(None); // can't resolve
@@ -4465,6 +4524,9 @@ impl QueryExecutor {
                         name
                     };
                     if let Some(pos) = schema.get_column_position(bare) {
+                        if !group_by_cols.is_empty() && !group_bare_set.contains(bare) {
+                            return Ok(None);
+                        }
                         select_col_info.push((alias.clone(), Some(pos), None));
                     } else {
                         return Ok(None);
@@ -4571,7 +4633,7 @@ impl QueryExecutor {
             result_rows.push(result_row);
         }
 
-        // Apply ORDER BY if present (fast path was skipping this)
+        // Apply ORDER BY if present
         if let Some(ref order_by) = stmt.order_by {
             let order_specs: Vec<(usize, bool)> = order_by.iter().filter_map(|ob| {
                 if let Expr::Column(ref col_name) = ob.expr {
@@ -4591,6 +4653,13 @@ impl QueryExecutor {
                 }
                 std::cmp::Ordering::Equal
             });
+        }
+
+        // Apply LIMIT/OFFSET
+        if stmt.offset.is_some() || stmt.limit.is_some() {
+            let skip_n = stmt.offset.unwrap_or(0);
+            let take_n = stmt.limit.unwrap_or(usize::MAX);
+            result_rows = result_rows.into_iter().skip(skip_n).take(take_n).collect();
         }
 
         Ok(Some((column_names, result_rows)))
@@ -4898,6 +4967,14 @@ impl QueryExecutor {
                         } else {
                             return Ok(None);
                         }
+                    }
+                    Expr::Literal(Value::Integer(n)) => {
+                        // ORDER BY column position (1-based)
+                        let idx = (*n as usize).wrapping_sub(1);
+                        if idx >= column_names.len() {
+                            return Ok(None); // Out of range
+                        }
+                        positions.push((idx, order.asc));
                     }
                     _ => return Ok(None), // complex expression
                 }
@@ -7815,6 +7892,7 @@ struct VectorOrderByPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
     use crate::types::{TableSchema, ColumnDef, ColumnType, Value};
 
     fn make_schema() -> TableSchema {
@@ -7897,7 +7975,7 @@ mod tests {
     // ━━━ NULL handling in comparisons ━━━
 
     #[test]
-    fn test_eval_lt_null_returns_false() {
+    fn test_eval_lt_null_returns_null() {
         let schema = make_schema();
         let r = vec![Value::Null, Value::Null, Value::Null, Value::Null];
         let lt = Expr::BinaryOp {
@@ -7905,7 +7983,49 @@ mod tests {
             op: BinaryOperator::Lt,
             right: Box::new(Expr::Literal(Value::Float(5.0))),
         };
-        assert_eq!(QueryExecutor::eval_expr_on_row(&lt, &r, &schema).unwrap(), Value::Bool(false));
+        // SQL: NULL < 5 => UNKNOWN (NULL), not FALSE
+        assert_eq!(QueryExecutor::eval_expr_on_row(&lt, &r, &schema).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_eval_le_null_returns_null() {
+        let schema = make_schema();
+        let r = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let le = Expr::BinaryOp {
+            left: Box::new(col("score")),
+            op: BinaryOperator::Le,
+            right: Box::new(Expr::Literal(Value::Float(5.0))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&le, &r, &schema).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_eval_ge_null_returns_null() {
+        let schema = make_schema();
+        let r = vec![Value::Null, Value::Null, Value::Null, Value::Null];
+        let ge = Expr::BinaryOp {
+            left: Box::new(col("score")),
+            op: BinaryOperator::Ge,
+            right: Box::new(Expr::Literal(Value::Float(5.0))),
+        };
+        assert_eq!(QueryExecutor::eval_expr_on_row(&ge, &r, &schema).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn test_order_by_cross_type_handled() {
+        let schema = make_schema();
+        // Schema: id(0)=Int, name(1)=Text, score(2)=Float, active(3)=Bool
+        let row = vec![
+            Value::Integer(5),
+            Value::Text(crate::types::ArcString::from("test")),
+            Value::Float(3.0),
+            Value::Bool(true),
+        ];
+        // a = Integer(5) at "id" (pos 0), b = Float(3.0) at "score" (pos 2)
+        let a = QueryExecutor::eval_expr_on_row(&col("id"), &row, &schema).unwrap();
+        let b = QueryExecutor::eval_expr_on_row(&col("score"), &row, &schema).unwrap();
+        // Cross-type: Integer(5) vs Float(3.0) → 5 > 3.0 → Greater
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
     }
 
     // ━━━ IsNull / IsNotNull ━━━

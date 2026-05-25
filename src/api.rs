@@ -198,8 +198,9 @@ impl Database {
     /// Wait until all pending index build batches have been processed.
     ///
     /// Call after `flush()` to ensure indexes are fully built before querying.
-    pub fn wait_for_indexes_ready(&self) {
-        self.inner.wait_for_indexes_ready();
+    /// Returns `true` if all batches completed, `false` on timeout.
+    pub fn wait_for_indexes_ready(&self) -> bool {
+        self.inner.wait_for_indexes_ready()
     }
 
     /// Access the columnar segment store (for TimeSeries tables).
@@ -250,7 +251,7 @@ impl Database {
     /// // All subsequent operations will return an error
     /// ```
     pub fn close(&self) -> Result<()> {
-        if self.inner.is_closed.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.inner.is_closed.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
 
@@ -264,7 +265,7 @@ impl Database {
         }
 
         let result = self.inner.checkpoint_full();
-        self.inner.is_closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.is_closed.store(true, std::sync::atomic::Ordering::Release);
         result
     }
 
@@ -962,7 +963,10 @@ impl Database {
     fn positional_fast_add(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a + b)),
+            (Value::Integer(a), Value::Integer(b)) => Some(match a.checked_add(*b) {
+                Some(r) => Value::Integer(r),
+                None => Value::Float(*a as f64 + *b as f64),
+            }),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a + *b as f64)),
@@ -972,7 +976,10 @@ impl Database {
     fn positional_fast_sub(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a - b)),
+            (Value::Integer(a), Value::Integer(b)) => Some(match a.checked_sub(*b) {
+                Some(r) => Value::Integer(r),
+                None => Value::Float(*a as f64 - *b as f64),
+            }),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a - b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a - *b as f64)),
@@ -982,7 +989,10 @@ impl Database {
     fn positional_fast_mul(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a * b)),
+            (Value::Integer(a), Value::Integer(b)) => Some(match a.checked_mul(*b) {
+                Some(r) => Value::Integer(r),
+                None => Value::Float(*a as f64 * *b as f64),
+            }),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a * b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a * *b as f64)),
@@ -995,7 +1005,10 @@ impl Database {
             (Value::Float(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(a / b)),
             (Value::Float(a), Value::Integer(b)) if *b != 0 => Some(Value::Float(a / *b as f64)),
             (Value::Integer(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 / b)),
-            (Value::Integer(a), Value::Integer(b)) if *b != 0 => Some(Value::Float(*a as f64 / *b as f64)),
+            (Value::Integer(a), Value::Integer(b)) if *b != 0 => {
+                // Integer division truncates toward zero, matching SQL semantics
+                Some(Value::Integer(a.checked_div(*b).unwrap_or(0)))
+            }
             _ => None,
         }
     }

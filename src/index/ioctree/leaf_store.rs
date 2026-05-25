@@ -20,9 +20,9 @@ const LEAF_MAGIC: u32 = 0x10C7_1F00;
 const LEAF_VERSION: u32 = 1;
 const FILE_HEADER_SIZE: usize = 16;
 pub const MAX_POINTS_PER_SLOT: usize = 32;
-const POINT_SIZE: usize = 20; // f32(4) + f32(4) + f32(4) + u64(8)
+const POINT_SIZE: usize = 32; // f64(8) + f64(8) + f64(8) + u64(8)
 const SLOT_HEADER_SIZE: usize = 4; // point_count(u16) + reserved(u16)
-const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_POINTS_PER_SLOT * POINT_SIZE; // 516 bytes
+const SLOT_SIZE: usize = SLOT_HEADER_SIZE + MAX_POINTS_PER_SLOT * POINT_SIZE; // 1028 bytes
 const DEFAULT_CACHE_CAPACITY: usize = 4096;
 
 struct LeafEntry {
@@ -45,7 +45,7 @@ impl LeafStore {
     /// Open or create a LeafStore in the given directory
     ///
     /// `cache_capacity` controls the number of leaf slots kept in the LRU cache.
-    /// Each slot is ~516 bytes, so 4096 slots ≈ 2MB.
+    /// Each slot is ~1028 bytes, so 4096 slots ≈ 4MB.
     pub fn open(dir: &Path, cache_capacity: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("leaf_data.bin");
@@ -303,12 +303,21 @@ impl LeafStore {
         for i in 0..count.min(MAX_POINTS_PER_SLOT) {
             let base = SLOT_HEADER_SIZE + i * POINT_SIZE;
             points.push(IndexedPoint3D {
-                x: f32::from_le_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]),
-                y: f32::from_le_bytes([buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7]]),
-                z: f32::from_le_bytes([buf[base + 8], buf[base + 9], buf[base + 10], buf[base + 11]]),
-                row_id: u64::from_le_bytes([
+                x: f64::from_le_bytes([
+                    buf[base], buf[base + 1], buf[base + 2], buf[base + 3],
+                    buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7],
+                ]),
+                y: f64::from_le_bytes([
+                    buf[base + 8], buf[base + 9], buf[base + 10], buf[base + 11],
                     buf[base + 12], buf[base + 13], buf[base + 14], buf[base + 15],
+                ]),
+                z: f64::from_le_bytes([
                     buf[base + 16], buf[base + 17], buf[base + 18], buf[base + 19],
+                    buf[base + 20], buf[base + 21], buf[base + 22], buf[base + 23],
+                ]),
+                row_id: u64::from_le_bytes([
+                    buf[base + 24], buf[base + 25], buf[base + 26], buf[base + 27],
+                    buf[base + 28], buf[base + 29], buf[base + 30], buf[base + 31],
                 ]),
             });
         }
@@ -325,10 +334,10 @@ impl LeafStore {
 
         for (i, point) in points.iter().take(MAX_POINTS_PER_SLOT).enumerate() {
             let base = SLOT_HEADER_SIZE + i * POINT_SIZE;
-            buf[base..base + 4].copy_from_slice(&point.x.to_le_bytes());
-            buf[base + 4..base + 8].copy_from_slice(&point.y.to_le_bytes());
-            buf[base + 8..base + 12].copy_from_slice(&point.z.to_le_bytes());
-            buf[base + 12..base + 20].copy_from_slice(&point.row_id.to_le_bytes());
+            buf[base..base + 8].copy_from_slice(&point.x.to_le_bytes());
+            buf[base + 8..base + 16].copy_from_slice(&point.y.to_le_bytes());
+            buf[base + 16..base + 24].copy_from_slice(&point.z.to_le_bytes());
+            buf[base + 24..base + 32].copy_from_slice(&point.row_id.to_le_bytes());
         }
 
         file.write_all(&buf).map_err(StorageError::Io)?;

@@ -55,6 +55,10 @@ impl MoteDB {
                     Ok(entries) => {
                         for (batch_idx, chunk) in entries.chunks(BATCH_SIZE).enumerate() {
                             for (composite_key, value) in chunk {
+                                // Skip deleted (tombstone) entries — they don't belong in the index
+                                if value.deleted {
+                                    continue;
+                                }
                                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
 
                                 let data_bytes: Vec<u8> = match &value.data {
@@ -260,5 +264,53 @@ mod tests {
         // Query should still work (falls back to full scan)
         let result = db.execute("SELECT * FROM t WHERE tag = 'test'").unwrap();
         assert!(result.materialize().is_ok());
+    }
+
+    #[test]
+    fn test_wait_for_indexes_ready_completes_quickly() {
+        // Regression test: wait_for_indexes_ready must return quickly
+        // even if pending_index_batches is stale (e.g., due to a leaked counter
+        // from a panicked index builder thread).
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+
+        // With no flushes, pending should be 0 and return immediately
+        let start = std::time::Instant::now();
+        let ready = db.wait_for_indexes_ready();
+        assert!(ready, "should be ready with no pending batches");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2),
+            "wait_for_indexes_ready took {:?}", start.elapsed());
+
+        // Insert a row — still shouldn't trigger flush with small data
+        db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+        let start = std::time::Instant::now();
+        let ready = db.wait_for_indexes_ready();
+        assert!(ready, "should be ready after small insert");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2),
+            "wait_for_indexes_ready took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn test_create_index_and_concurrent_insert() {
+        // Regression test: CREATE INDEX + INSERT shouldn't deadlock
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, category TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_cat ON t (category) USING COLUMN").unwrap();
+
+        // Insert multiple rows rapidly (exercises index + mem_buffer)
+        for i in 0..20 {
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'cat_{}')", i, i % 3)).unwrap();
+        }
+
+        db.wait_for_indexes_ready();
+
+        let result = db.execute("SELECT id FROM t WHERE category = 'cat_0' ORDER BY id").unwrap();
+        use crate::sql::QueryResult;
+        if let QueryResult::Select { rows, .. } = result.materialize().unwrap() {
+            assert_eq!(rows.len(), 7, "should find 7 rows with cat_0");
+        }
     }
 }

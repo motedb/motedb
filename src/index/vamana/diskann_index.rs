@@ -20,7 +20,7 @@ use crate::{Result, StorageError};
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use std::cmp::Reverse;
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -527,7 +527,7 @@ impl DiskANNIndex {
             })
             .collect();
         
-        nodes_with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        nodes_with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         let sorted_ids: Vec<RowId> = nodes_with_dist.into_iter().map(|(id, _)| id).collect();
         
         // 分批处理
@@ -743,7 +743,7 @@ impl DiskANNIndex {
             .map(|c| (c.id, c.distance))
             .collect();
         
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         
         Ok(results)
     }
@@ -1290,78 +1290,67 @@ impl DiskANNIndex {
         beam_width: usize,
     ) -> Result<Vec<Candidate>> {
         let mut visited = HashSet::new();
-        let mut candidates = BinaryHeap::new();
-        
+        // Candidate::cmp is reversed (smaller distance = "greater") so
+        // BinaryHeap<Candidate> acts as a min-heap — pop() returns the BEST.
+        let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new();
+
         // Start with start_id
-        // 🚀 OPTIMIZED: Use optimized distance method
         let dist = self.vectors.distance(query, start_id, self.metric);
-        candidates.push(Reverse(Candidate {
+        candidates.push(Candidate {
             id: start_id,
             distance: dist,
-        }));
+        });
         visited.insert(start_id);
-        
+
         let mut result = Vec::new();
         let mut iterations = 0;
-        
-        // Adaptive iteration cap: beam_width * 20 is generous for recall,
-        // but bounded to prevent O(n²) hangs on large graphs.
+
         let graph_size = self.len();
         let max_iterations = if graph_size < 5000 {
             (beam_width * 10).min(3000)
         } else {
             (beam_width * 20).min(10000)
         };
-        
-        // FIXME: `candidates` is BinaryHeap<Reverse<Candidate>>. Candidate::cmp
-        // is already reversed (smaller distance = "greater"), so Reverse creates a
-        // double-reversal: heap top becomes the WORST (largest distance). The limit
-        // pop below (line ~1341) correctly removes the worst. But this loop explores
-        // the WORST candidate first instead of the BEST. This is inefficient but not
-        // incorrect — all candidates within beam_width are eventually explored up to
-        // max_iterations. Fix requires separate data structures for exploration order
-        // vs. beam-width limiting, or switching to a best-first heap + tracking the
-        // worst distance manually.
-        while let Some(Reverse(current)) = candidates.pop() {
+
+        while let Some(current) = candidates.pop() {
             result.push(current.clone());
             iterations += 1;
-            
-            // 渐进式迭代限制
+
             if iterations >= max_iterations {
                 break;
             }
-            
+
             // Explore neighbors
             let neighbors = self.graph.neighbors(current.id);
-            
-            // 🚀 OPTIMIZATION: Batch prefetch + optimized distance computation
+
             let prefetch_ids: Vec<_> = neighbors.iter()
                 .filter(|&&id| !visited.contains(&id))
                 .copied()
                 .collect();
-            
+
             if !prefetch_ids.is_empty() {
-                // Batch compute distances using optimized method
                 for neighbor_id in prefetch_ids {
                     visited.insert(neighbor_id);
-                    
-                    // 🚀 OPTIMIZED: Direct SQ8 distance (no decompression)
+
                     let dist = self.vectors.distance(query, neighbor_id, self.metric);
-                    
-                    candidates.push(Reverse(Candidate {
+                    candidates.push(Candidate {
                         id: neighbor_id,
                         distance: dist,
-                    }));
-                    
-                    // Keep only beam_width best candidates in queue
-                    if candidates.len() > beam_width {
-                        candidates.pop();
-                    }
+                    });
+                }
+
+                // Limit to beam_width best candidates. The heap gives
+                // the BEST on pop, so we drain, sort, and rebuild.
+                if candidates.len() > beam_width * 2 {
+                    let mut all: Vec<Candidate> = candidates.drain().collect();
+                    all.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+                    all.truncate(beam_width);
+                    candidates.extend(all);
                 }
             }
         }
         
-        result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        result.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
         
         Ok(result)
     }

@@ -275,6 +275,9 @@ impl MoteDB {
             .unwrap_or(1);
         let write_lsn = Arc::new(AtomicU64::new(init_lsn));
 
+        // Persist initial LSN so restart after clock change doesn't regress
+        Self::persist_lsn_counter(&db_path, init_lsn);
+
         // Create columnar store for TimeSeries tables (shares next_row_id and table_registry)
         let columnar_dir = db_path.join("columnar");
         let columnar_store = Arc::new(
@@ -341,7 +344,8 @@ impl MoteDB {
 
         // Set flush callback
         {
-            let tx = db.index_build_tx.clone().unwrap();
+            let tx = db.index_build_tx.clone()
+                .ok_or_else(|| StorageError::Index("Index builder pipeline not initialized".into()))?;
             let registry = db.table_registry.clone();
             let pending = db.pending_index_batches.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
@@ -381,11 +385,19 @@ impl MoteDB {
     ///
     /// Call this after `flush()` to ensure column/vector/text indexes are
     /// fully built before running queries that depend on them.
-    pub fn wait_for_indexes_ready(&self) {
+    ///
+    /// Returns `true` if all batches completed, `false` on timeout or if the
+    /// builder thread has exited.
+    pub fn wait_for_indexes_ready(&self) -> bool {
+        self.wait_for_indexes_ready_timeout(std::time::Duration::from_secs(10))
+    }
+
+    /// Wait for index readiness with a custom timeout.
+    pub fn wait_for_indexes_ready_timeout(&self, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
         loop {
             if self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                return;
+                return true;
             }
             // Check if index builder thread has crashed (thread handle finished but work remains)
             if let Some(ref thread) = self.index_builder_thread {
@@ -393,16 +405,16 @@ impl MoteDB {
                     if handle.is_finished() {
                         let pending = self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed);
                         warn_log!("[wait_for_indexes_ready] Index builder thread exited with {} batches pending", pending);
-                        return;
+                        return false;
                     }
                 }
             }
-            if start.elapsed() > std::time::Duration::from_secs(30) {
-                warn_log!("[wait_for_indexes_ready] Timed out after 30s, pending={}",
-                    self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed));
-                return;
+            if start.elapsed() > timeout {
+                warn_log!("[wait_for_indexes_ready] Timed out after {:?}, pending={}",
+                    timeout, self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed));
+                return false;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -613,7 +625,7 @@ impl MoteDB {
                         max_row_id = max_row_id.max(*row_id);
                         if *txn_id == 0 || committed_txns.contains(txn_id) {
                             if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
-                                if let Err(e) = timestamp_idx.insert(ts.as_micros() as u64, *row_id) {
+                                if let Err(e) = timestamp_idx.insert(ts.as_micros_u64(), *row_id) {
                                     warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
                                 }
                             }
@@ -625,7 +637,7 @@ impl MoteDB {
                             // Extract timestamp from raw data for index
                             if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
                                 if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                                    if let Err(e) = timestamp_idx.insert(ts.as_micros() as u64, *row_id) {
+                                    if let Err(e) = timestamp_idx.insert(ts.as_micros_u64(), *row_id) {
                                     warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
                                 }
                                 }
@@ -640,14 +652,18 @@ impl MoteDB {
         let timestamp_index = Arc::new(RwLock::new(timestamp_idx));
 
         // Initialize write_lsn early for WAL recovery replay.
-        // Must exceed any pre-existing timestamp (row_id or wall-clock micros).
+        // Must exceed any pre-existing timestamp AND the persisted LSN from
+        // the last checkpoint (to survive clock regression across restarts).
         let current_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(1);
-        let recovery_lsn = Arc::new(AtomicU64::new(
-            current_micros.max(max_row_id + 1).saturating_add(1_000_000)
-        ));
+        let persisted_lsn = Self::load_lsn_counter(&db_path);
+        let init_lsn = current_micros
+            .max(max_row_id + 1)
+            .max(persisted_lsn)
+            .saturating_add(1_000_000);
+        let recovery_lsn = Arc::new(AtomicU64::new(init_lsn));
 
         // Phase 2: Redo — replay only committed/auto-commit records
         for records in recovered_records.values() {
@@ -1049,7 +1065,10 @@ impl MoteDB {
                 for entry in entries.flatten() {
                     if let Ok(name) = entry.file_name().into_string() {
                         if name.starts_with("vector_") {
-                            let index_name = name.strip_prefix("vector_").unwrap();
+                            let index_name = match name.strip_prefix("vector_") {
+                                Some(n) => n,
+                                None => continue,
+                            };
                             let index_path = entry.path();
 
                             // Resolve metric from metadata registry
@@ -1099,7 +1118,10 @@ impl MoteDB {
                 for entry in entries.flatten() {
                     if let Ok(name) = entry.file_name().into_string() {
                         if name.starts_with("text_") {
-                            let index_name = name.strip_prefix("text_").unwrap();
+                            let index_name = match name.strip_prefix("text_") {
+                                Some(n) => n,
+                                None => continue,
+                            };
                             let index_path = entry.path();
                             
                             // Try to load the index
@@ -1130,7 +1152,10 @@ impl MoteDB {
                 for entry in entries.flatten() {
                     if let Ok(name) = entry.file_name().into_string() {
                         if name.starts_with("ioctree_") {
-                            let index_name = name.strip_prefix("ioctree_").unwrap();
+                            let index_name = match name.strip_prefix("ioctree_") {
+                                Some(n) => n,
+                                None => continue,
+                            };
                             let index_file = entry.path().join("ioctree.bin");
 
                             if index_file.exists() {
@@ -1228,6 +1253,18 @@ impl MoteDB {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match rx.recv_timeout(std::time::Duration::from_secs(2)) {
                             Ok(batch) => {
+                                // Drop guard ensures pending_index_batches is ALWAYS decremented,
+                                // even if batch_build_table_indexes_raw panics.
+                                struct BatchGuard {
+                                    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                                }
+                                impl Drop for BatchGuard {
+                                    fn drop(&mut self) {
+                                        self.pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                let _guard = BatchGuard { pending: db.pending_index_batches.clone() };
+
                                 for (table_name, raw_rows) in &batch.tables_data {
                                     if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
                                         warn_log!("[IndexBuilder] Index build failed for '{}': {:?}",
@@ -1235,7 +1272,6 @@ impl MoteDB {
                                         db.index_build_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
-                                db.pending_index_batches.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 debug_log!("[IndexBuilder] Processed batch ({} tables)",
                                     batch.tables_data.len());
                             }
@@ -1316,7 +1352,10 @@ impl MoteDB {
                 e.insert(name);
             }
 
-            let table_name = name_cache.get(&table_id).unwrap();
+            let table_name = match name_cache.get(&table_id) {
+                Some(name) => name,
+                None => continue, // Unknown table — skip
+            };
             tables_data.entry(table_name.to_string()).or_default().push((row_id, row_bytes));
         }
 
@@ -1572,6 +1611,55 @@ impl MoteDB {
 
         Ok(file)
     }
+
+    /// Join a background thread with a timeout. If the thread doesn't exit
+    /// within `timeout`, it is detached (the Weak references it holds will
+    /// naturally become invalid, causing it to exit on its next iteration).
+    fn join_with_timeout(
+        name: &'static str,
+        handle: std::thread::JoinHandle<()>,
+        timeout: std::time::Duration,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name(format!("{}-join-waiter", name))
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = tx.send(());
+            });
+
+        match rx.recv_timeout(timeout) {
+            Ok(()) => {
+                debug_log!("[MoteDB::Drop] ✅ {} thread stopped", name);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn_log!("[MoteDB::Drop] ⚠️  {} thread did not stop within {:?}, detaching", name, timeout);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                warn_log!("[MoteDB::Drop] ⚠️  {} thread join waiter panicked", name);
+            }
+        }
+    }
+
+    /// Persist the current write_lsn to a counter file.
+    /// Survives clock regression across restarts.
+    pub(crate) fn persist_lsn_counter(db_path: &Path, lsn: u64) {
+        let path = db_path.join("lsn_counter");
+        if let Err(e) = std::fs::write(&path, lsn.to_le_bytes()) {
+            warn_log!("[persist_lsn_counter] failed to write {}: {}", path.display(), e);
+        }
+    }
+
+    /// Load the persisted LSN counter. Returns 0 if the file doesn't exist.
+    fn load_lsn_counter(db_path: &Path) -> u64 {
+        let path = db_path.join("lsn_counter");
+        match std::fs::read(&path) {
+            Ok(data) if data.len() >= 8 => {
+                u64::from_le_bytes(data[..8].try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// Automatic cleanup when database is dropped
@@ -1598,9 +1686,7 @@ impl Drop for MoteDB {
             self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
             thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(handle) = thread.handle.take() {
-                if let Err(e) = handle.join() {
-                    warn_log!("[MoteDB::Drop] Index builder thread panicked: {:?}", e);
-                }
+                Self::join_with_timeout("index-builder", handle, std::time::Duration::from_secs(5));
             }
         }
         self.index_build_tx = None;
@@ -1611,9 +1697,7 @@ impl Drop for MoteDB {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-checkpoint thread...");
             thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(handle) = thread.handle.take() {
-                if let Err(e) = handle.join() {
-                    warn_log!("[MoteDB::Drop] Auto-checkpoint thread panicked: {:?}", e);
-                }
+                Self::join_with_timeout("auto-checkpoint", handle, std::time::Duration::from_secs(5));
             }
             debug_log!("[MoteDB::Drop] ✅ Auto-checkpoint thread stopped");
         }
@@ -1625,9 +1709,7 @@ impl Drop for MoteDB {
             // Drop sender to unblock recv
             drop(thread.flush_tx);
             if let Some(handle) = thread.handle.take() {
-                if let Err(e) = handle.join() {
-                    warn_log!("[MoteDB::Drop] Auto-flush thread panicked: {:?}", e);
-                }
+                Self::join_with_timeout("auto-flush", handle, std::time::Duration::from_secs(5));
             }
             debug_log!("[MoteDB::Drop] ✅ Auto-flush thread stopped");
         }

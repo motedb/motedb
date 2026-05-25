@@ -90,10 +90,10 @@ impl VersionStore {
 
     /// Get the current timestamp (for vacuum)
     pub fn current_timestamp(&self) -> Timestamp {
-        self.timestamp_gen.load(Ordering::Relaxed)
+        self.timestamp_gen.load(Ordering::Acquire)
     }
     
-    /// Insert a new version for a row
+    /// Insert a new version for a row (no conflict check — use during recovery/log replay).
     pub fn insert_version(
         &self,
         row_id: RowId,
@@ -109,14 +109,61 @@ impl VersionStore {
             deleted: AtomicBool::new(false),
             next: None,
         });
-        
-        // Use entry() API for atomic get-or-insert (prevents TOCTOU race where
-        // two threads could both observe contains_key=false and one overwrites
-        // the other's chain with an empty one, losing all prior versions)
+
+        // Atomically get-or-create chain and prepend in one DashMap operation.
+        // This eliminates the TOCTOU race between entry() and get() where
+        // an eviction could remove the chain between the two calls.
+        self.versions.entry(row_id).or_insert_with(VersionChain::new)
+            .prepend(new_version);
+
+        self.evict_if_needed();
+
+        Ok(())
+    }
+
+    /// Insert a new version for a row with atomic conflict validation.
+    ///
+    /// Acquires the version chain head write lock, validates that no concurrent
+    /// transaction has modified the row since the snapshot, and if valid, prepends
+    /// the new version. The validation and insertion happen under a single lock,
+    /// eliminating the TOCTOU gap present in separate validate+insert calls.
+    pub fn insert_version_atomic(
+        &self,
+        row_id: RowId,
+        data: Row,
+        txn_id: TransactionId,
+        timestamp: Timestamp,
+        snapshot: &Snapshot,
+    ) -> Result<()> {
+        let mut new_version = Box::new(RowVersion {
+            data,
+            txn_id,
+            begin_ts: timestamp,
+            end_ts: AtomicU64::new(0),
+            deleted: AtomicBool::new(false),
+            next: None,
+        });
+
         self.versions.entry(row_id).or_insert_with(VersionChain::new);
 
         if let Some(chain) = self.versions.get(&row_id) {
-            chain.prepend(new_version);
+            let mut head = chain.head.write();
+            // Re-validate under the write lock: no other transaction could have
+            // committed between our earlier validation and this insertion.
+            if let Some(ref version) = *head {
+                if (version.begin_ts > snapshot.timestamp
+                    || snapshot.active_txns.contains(&version.txn_id))
+                    && version.txn_id != txn_id
+                {
+                    return Err(StorageError::Transaction(
+                        format!("Write-write conflict on row {} in txn {}", row_id, txn_id)
+                    ));
+                }
+            }
+            // Atomic: validated inside the same critical section as the prepend
+            new_version.next = head.take();
+            *head = Some(new_version);
+            chain.version_count.fetch_add(1, Ordering::Relaxed);
         }
 
         self.evict_if_needed();
@@ -220,7 +267,7 @@ impl VersionStore {
             return;
         }
 
-        let current_ts = self.timestamp_gen.load(Ordering::Relaxed);
+        let current_ts = self.timestamp_gen.load(Ordering::Acquire);
         let recent_threshold = current_ts.saturating_sub(1000);
 
         let mut candidates = Vec::with_capacity(to_remove);
@@ -346,7 +393,7 @@ impl VersionStore {
                 0.0
             },
             max_chain_length,
-            current_timestamp: self.timestamp_gen.load(Ordering::Relaxed),
+            current_timestamp: self.timestamp_gen.load(Ordering::Acquire),
         }
     }
     
@@ -406,7 +453,14 @@ impl VersionChain {
     /// Prepend a new version to the chain
     fn prepend(&self, mut new_version: Box<RowVersion>) {
         let mut head = self.head.write();
-        
+
+        // Mark old head as superseded before linking
+        if let Some(old) = head.as_ref() {
+            if old.end_ts.load(Ordering::Acquire) == 0 {
+                old.end_ts.store(new_version.begin_ts, Ordering::Release);
+            }
+        }
+
         // Link new version to old head
         new_version.next = head.take();
         

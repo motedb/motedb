@@ -5,28 +5,28 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Compact 3D point with associated row ID (f32 for memory savings)
+/// Compact 3D point with associated row ID (f64 for precision)
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IndexedPoint3D {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
     pub row_id: u64,
 }
 
 impl IndexedPoint3D {
     pub fn from_point3d(p: &crate::types::Point3D, row_id: u64) -> Self {
-        Self { x: p.x as f32, y: p.y as f32, z: p.z as f32, row_id }
+        Self { x: p.x, y: p.y, z: p.z, row_id }
     }
 
-    pub fn distance_squared(&self, other: &[f32; 3]) -> f32 {
+    pub fn distance_squared(&self, other: &[f64; 3]) -> f64 {
         let dx = self.x - other[0];
         let dy = self.y - other[1];
         let dz = self.z - other[2];
         dx * dx + dy * dy + dz * dz
     }
 
-    pub fn as_array(&self) -> [f32; 3] {
+    pub fn as_array(&self) -> [f64; 3] {
         [self.x, self.y, self.z]
     }
 }
@@ -35,14 +35,14 @@ impl IndexedPoint3D {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Octant {
     Inner {
-        center: [f32; 3],
-        extent: f32,
+        center: [f64; 3],
+        extent: f64,
         children: Box<[Option<Box<Octant>>; 8]>,
         size: usize,
     },
     Leaf {
-        center: [f32; 3],
-        extent: f32,
+        center: [f64; 3],
+        extent: f64,
         /// Leaf ID referencing data in LeafStore
         leaf_id: u64,
         /// Cached point count (kept in sync with LeafStore)
@@ -51,7 +51,7 @@ pub enum Octant {
 }
 
 /// Compute which child octant a point belongs to (Morton code)
-pub fn octant_code(center: &[f32; 3], point: &[f32; 3]) -> usize {
+pub fn octant_code(center: &[f64; 3], point: &[f64; 3]) -> usize {
     let mut code = 0u8;
     if point[0] >= center[0] { code |= 1; }
     if point[1] >= center[1] { code |= 2; }
@@ -60,7 +60,7 @@ pub fn octant_code(center: &[f32; 3], point: &[f32; 3]) -> usize {
 }
 
 /// Compute child center given parent center, extent, and octant code
-pub fn child_center(parent_center: &[f32; 3], parent_extent: f32, code: usize) -> [f32; 3] {
+pub fn child_center(parent_center: &[f64; 3], parent_extent: f64, code: usize) -> [f64; 3] {
     let half = parent_extent / 2.0;
     let mut center = *parent_center;
     if code & 1 != 0 { center[0] += half; } else { center[0] -= half; }
@@ -70,11 +70,11 @@ pub fn child_center(parent_center: &[f32; 3], parent_extent: f32, code: usize) -
 }
 
 impl Octant {
-    pub fn new_leaf(center: [f32; 3], extent: f32, leaf_id: u64) -> Self {
+    pub fn new_leaf(center: [f64; 3], extent: f64, leaf_id: u64) -> Self {
         Octant::Leaf { center, extent, leaf_id, point_count: 0 }
     }
 
-    pub fn new_inner(center: [f32; 3], extent: f32) -> Self {
+    pub fn new_inner(center: [f64; 3], extent: f64) -> Self {
         Octant::Inner {
             center,
             extent,
@@ -90,13 +90,13 @@ impl Octant {
         }
     }
 
-    pub fn extent(&self) -> f32 {
+    pub fn extent(&self) -> f64 {
         match self {
             Octant::Inner { extent, .. } | Octant::Leaf { extent, .. } => *extent,
         }
     }
 
-    pub fn center(&self) -> &[f32; 3] {
+    pub fn center(&self) -> &[f64; 3] {
         match self {
             Octant::Inner { center, .. } | Octant::Leaf { center, .. } => center,
         }
@@ -135,15 +135,15 @@ impl Octant {
 }
 
 /// Check if an octant (center + extent) overlaps with a 3D box [min, max]
-pub fn overlaps(center: &[f32; 3], extent: f32, min: &[f32; 3], max: &[f32; 3]) -> bool {
+pub fn overlaps(center: &[f64; 3], extent: f64, min: &[f64; 3], max: &[f64; 3]) -> bool {
     center[0] + extent >= min[0] && center[0] - extent <= max[0]
         && center[1] + extent >= min[1] && center[1] - extent <= max[1]
         && center[2] + extent >= min[2] && center[2] - extent <= max[2]
 }
 
 /// Minimum squared distance from a point to an octant's boundary (0 if inside)
-pub fn min_dist_sq_to_octant(center: &[f32; 3], extent: f32, point: &[f32; 3]) -> f32 {
-    let mut dist_sq = 0.0f32;
+pub fn min_dist_sq_to_octant(center: &[f64; 3], extent: f64, point: &[f64; 3]) -> f64 {
+    let mut dist_sq = 0.0f64;
     for i in 0..3 {
         let lo = center[i] - extent;
         let hi = center[i] + extent;

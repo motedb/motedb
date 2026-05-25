@@ -525,6 +525,12 @@ impl PartitionWAL {
 
             let total_len = u32::from_le_bytes(len_buf) as usize;
 
+            // Sanity check: reject obviously corrupted total_len
+            if total_len < 20 || total_len > Self::MAX_WAL_FRAME_SIZE {
+                debug_log!("WAL open: Corrupted total_len={}, stopping", total_len);
+                break;
+            }
+
             // Read header: [u64 lsn][u32 checksum][u32 record_len] = 16 bytes
             let mut header = [0u8; 16];
             match file.read_exact(&mut header) {
@@ -539,6 +545,13 @@ impl PartitionWAL {
             let lsn = u64::from_le_bytes(header[0..8].try_into().unwrap());
             let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
             let record_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+            // record_len must fit inside total_len
+            if record_len > total_len.saturating_sub(20) || record_len > Self::MAX_WAL_FRAME_SIZE {
+                debug_log!("WAL open: Corrupted record_len={} (total_len={}), stopping",
+                    record_len, total_len);
+                break;
+            }
 
             // Read record data
             let mut record_data = vec![0u8; record_len];
@@ -880,6 +893,11 @@ impl PartitionWAL {
     /// 
     /// Verifies checksum for each record. Corrupted records are skipped with warning.
     /// Partial writes (incomplete records at end of file) are automatically detected.
+    /// Maximum sane WAL frame size (64 MB). Frames larger than this are almost
+    /// certainly the result of a corrupted `total_len` field. Using this guard
+    /// prevents a bogus `total_len` from causing seeks that skip valid records.
+    const MAX_WAL_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
     fn recover(&mut self) -> Result<Vec<WALRecord>> {
         let mut records = Vec::new();
         let mut file = File::open(&self.path)?;
@@ -898,6 +916,12 @@ impl PartitionWAL {
 
             let total_len = u32::from_le_bytes(len_buf) as usize;
 
+            // Sanity check: reject obviously corrupted total_len
+            if total_len < 20 || total_len > Self::MAX_WAL_FRAME_SIZE {
+                debug_log!("WAL recovery: Corrupted total_len={}, stopping", total_len);
+                break;
+            }
+
             // Read header: [u64 lsn][u32 checksum][u32 record_len] = 16 bytes
             let mut header = [0u8; 16];
             match file.read_exact(&mut header) {
@@ -912,6 +936,13 @@ impl PartitionWAL {
             let lsn = u64::from_le_bytes(header[0..8].try_into().unwrap());
             let checksum = u32::from_le_bytes(header[8..12].try_into().unwrap());
             let record_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+            // record_len must fit inside total_len (20 bytes = 4 len prefix + 16 header)
+            if record_len > total_len.saturating_sub(20) || record_len > Self::MAX_WAL_FRAME_SIZE {
+                debug_log!("WAL recovery: Corrupted record_len={} (total_len={}), stopping",
+                    record_len, total_len);
+                break;
+            }
 
             // Read record data
             let mut record_data = vec![0u8; record_len];
@@ -2074,5 +2105,75 @@ mod tests {
         assert_eq!(count_type(records, |r| matches!(r, WALRecord::Begin { .. })), 3);
         assert_eq!(count_type(records, |r| matches!(r, WALRecord::Commit { .. })), 2);
         assert_eq!(count_type(records, |r| matches!(r, WALRecord::Rollback { .. })), 1);
+    }
+
+    /// Regression test: corrupted total_len should stop recovery, not cause misaligned seeks.
+    /// Before the fix, a corrupted total_len (e.g., 0xFFFFFFFF) would cause a seek past
+    /// valid records, losing data that could have been recovered.
+    #[test]
+    fn test_wal_corrupted_total_len_stops_cleanly() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path();
+
+        // Write 3 valid records
+        {
+            let wal = WALManager::create(path, 1).unwrap();
+            for i in 0..3u64 {
+                wal.log_insert("t", 0, i, vec![Value::Integer(i as i64)], 0).unwrap();
+            }
+        }
+
+        // Corrupt the file: overwrite bytes at the start of the second record's
+        // total_len with garbage (0xFF bytes) to simulate corruption.
+        let wal_path = path.join("partition_0.wal");
+        let mut data = std::fs::read(&wal_path).unwrap();
+
+        if data.len() < 24 {
+            eprintln!("WAL data too short for corruption test, skipping");
+            return;
+        }
+        let first_total_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        // Corrupt the total_len of the 2nd record
+        let corrupt_offset = 4 + first_total_len;
+        if corrupt_offset + 4 <= data.len() {
+            data[corrupt_offset] = 0xFF;
+            data[corrupt_offset + 1] = 0xFF;
+            data[corrupt_offset + 2] = 0xFF;
+            data[corrupt_offset + 3] = 0x0F; // ~268MB — clearly corrupt
+            std::fs::write(&wal_path, &data).unwrap();
+        }
+
+        // Recovery should succeed and return at least the first record (before corruption)
+        let wal = WALManager::open(path, 1).unwrap();
+        let recovered = wal.recover().unwrap();
+        let records = recovered.get(&0).map(|r| r.len()).unwrap_or(0);
+        assert!(records >= 1, "Should recover at least 1 record before corruption, got {}", records);
+    }
+
+    /// Test that corrupted record_len (larger than total_len) stops recovery cleanly.
+    #[test]
+    fn test_wal_corrupted_record_len_stops_cleanly() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path();
+
+        {
+            let wal = WALManager::create(path, 1).unwrap();
+            wal.log_insert("t", 0, 1, vec![Value::Integer(42)], 0).unwrap();
+        }
+
+        // Corrupt record_len to be larger than total_len
+        let wal_path = path.join("partition_0.wal");
+        let mut data = std::fs::read(&wal_path).unwrap();
+
+        if data.len() >= 20 {
+            let total_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+            let bogus_record_len = (total_len + 1000) as u32;
+            data[16..20].copy_from_slice(&bogus_record_len.to_le_bytes());
+            std::fs::write(&wal_path, &data).unwrap();
+        }
+
+        // Recovery should not panic or hang
+        let wal = WALManager::open(path, 1).unwrap();
+        let _ = wal.recover();
     }
 }

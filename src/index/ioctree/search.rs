@@ -11,13 +11,13 @@ use std::collections::BinaryHeap;
 /// Uses a max-heap of size k where the heap top is the WORST (largest distance)
 /// among the k closest candidates found so far. This serves as the pruning
 /// threshold: points/octants further than the threshold can be skipped.
-pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) -> Vec<(u64, f64)> {
+pub fn knn_search(root: &Octant, query: &[f64; 3], k: usize, store: &LeafStore) -> Vec<(u64, f64)> {
     if k == 0 {
         return Vec::new();
     }
 
     let mut result: BinaryHeap<(OrderedF32, u64)> = BinaryHeap::new();
-    let mut stack: Vec<(&Octant, f32)> = vec![(root, 0.0)];
+    let mut stack: Vec<(&Octant, f64)> = vec![(root, 0.0)];
 
     while let Some((octant, min_dist)) = stack.pop() {
         // Prune: if we already have k results and this octant is further
@@ -40,7 +40,7 @@ pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) 
                 }
             }
             Octant::Inner { children, .. } => {
-                let mut child_dist: Vec<(&Octant, f32)> = Vec::new();
+                let mut child_dist: Vec<(&Octant, f64)> = Vec::new();
                 for child in children.iter().flatten() {
                     let d = min_dist_sq_to_octant(child.center(), child.extent(), query);
                     if result.len() >= k {
@@ -74,7 +74,7 @@ pub fn knn_search(root: &Octant, query: &[f32; 3], k: usize, store: &LeafStore) 
 /// the k closest points found so far.
 fn push_knn_result(
     result: &mut BinaryHeap<(OrderedF32, u64)>,
-    dist_sq: f32,
+    dist_sq: f64,
     row_id: u64,
     k: usize,
 ) {
@@ -90,13 +90,13 @@ fn push_knn_result(
 }
 
 /// Range search: find all row IDs within a 3D bounding box
-pub fn range_search(root: &Octant, min: &[f32; 3], max: &[f32; 3], store: &LeafStore) -> Vec<u64> {
+pub fn range_search(root: &Octant, min: &[f64; 3], max: &[f64; 3], store: &LeafStore) -> Vec<u64> {
     let mut results = Vec::new();
     range_search_recursive(root, min, max, store, &mut results);
     results
 }
 
-fn range_search_recursive(octant: &Octant, min: &[f32; 3], max: &[f32; 3], store: &LeafStore, results: &mut Vec<u64>) {
+fn range_search_recursive(octant: &Octant, min: &[f64; 3], max: &[f64; 3], store: &LeafStore, results: &mut Vec<u64>) {
     match octant {
         Octant::Leaf { center, extent, leaf_id, .. } => {
             if octant_inside_query(center, *extent, min, max) {
@@ -132,7 +132,7 @@ fn range_search_recursive(octant: &Octant, min: &[f32; 3], max: &[f32; 3], store
 }
 
 /// Radius search: find all points within distance `radius` of center
-pub fn radius_search(root: &Octant, center: &[f32; 3], radius: f32, store: &LeafStore) -> Vec<(u64, f64)> {
+pub fn radius_search(root: &Octant, center: &[f64; 3], radius: f64, store: &LeafStore) -> Vec<(u64, f64)> {
     let mut results = Vec::new();
     let radius_sq = radius * radius;
     radius_search_recursive(root, center, radius_sq, store, &mut results);
@@ -140,7 +140,7 @@ pub fn radius_search(root: &Octant, center: &[f32; 3], radius: f32, store: &Leaf
     results
 }
 
-fn radius_search_recursive(octant: &Octant, center: &[f32; 3], radius_sq: f32, store: &LeafStore, results: &mut Vec<(u64, f64)>) {
+fn radius_search_recursive(octant: &Octant, center: &[f64; 3], radius_sq: f64, store: &LeafStore, results: &mut Vec<(u64, f64)>) {
     match octant {
         Octant::Leaf { leaf_id, .. } => {
             if let Ok(points) = store.get_points(*leaf_id) {
@@ -163,7 +163,7 @@ fn radius_search_recursive(octant: &Octant, center: &[f32; 3], radius_sq: f32, s
     }
 }
 
-fn octant_inside_query(center: &[f32; 3], extent: f32, min: &[f32; 3], max: &[f32; 3]) -> bool {
+fn octant_inside_query(center: &[f64; 3], extent: f64, min: &[f64; 3], max: &[f64; 3]) -> bool {
     center[0] - extent >= min[0] && center[0] + extent <= max[0]
         && center[1] - extent >= min[1] && center[1] + extent <= max[1]
         && center[2] - extent >= min[2] && center[2] + extent <= max[2]
@@ -185,7 +185,7 @@ fn collect_all_row_ids(octant: &Octant, store: &LeafStore, results: &mut Vec<u64
 }
 
 #[derive(Debug, Clone, Copy)]
-struct OrderedF32(f32);
+struct OrderedF32(f64);
 
 impl PartialEq for OrderedF32 {
     fn eq(&self, other: &Self) -> bool { self.0 == other.0 }

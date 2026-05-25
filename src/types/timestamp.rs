@@ -46,6 +46,13 @@ impl Timestamp {
         self.micros
     }
 
+    /// Get timestamp as u64 for indexing, clamping negative values to 0.
+    /// Pre-epoch timestamps don't exist in practice, but this prevents
+    /// silent corruption if a negative value leaks through.
+    pub fn as_micros_u64(&self) -> u64 {
+        self.micros.max(0) as u64
+    }
+
     /// Get timestamp in milliseconds
     pub fn as_millis(&self) -> i64 {
         self.micros / 1000

@@ -156,18 +156,31 @@ impl TransactionCoordinator {
         
         // Get commit timestamp
         let commit_ts = self.version_store.allocate_timestamp();
-        
-        // Validate write set (conflict detection)
-        self.validate_write_set(&ctx)?;
-        
-        // Apply write set to version store
+
+        // For Serializable isolation: validate read-set (no write locks needed —
+        // this is a read-only consistency check and doesn't have a TOCTOU issue
+        // because reads don't modify state).
+        if ctx.isolation_level == IsolationLevel::Serializable {
+            self.validate_read_set(&ctx)?;
+        }
+
+        // Sort rows by row_id to avoid deadlocks when acquiring write locks
         let write_set = ctx.write_set.read();
-        for (row_id, (_table_name, data)) in write_set.iter() {
-            self.version_store.insert_version(
+        let mut sorted_rows: Vec<(RowId, Row)> = write_set.iter()
+            .map(|(row_id, (_, data))| (*row_id, data.clone()))
+            .collect();
+        drop(write_set);
+        sorted_rows.sort_by_key(|(row_id, _)| *row_id);
+
+        // Insert each row version with atomic validation (validation + insertion
+        // happen under a single write lock, eliminating the TOCTOU window).
+        for (row_id, data) in &sorted_rows {
+            self.version_store.insert_version_atomic(
                 *row_id,
                 data.clone(),
                 txn_id,
                 commit_ts,
+                &ctx.snapshot,
             )?;
         }
         
@@ -224,10 +237,21 @@ impl TransactionCoordinator {
         ctx.savepoints.write().push(savepoint);
         
         debug_log!("[Savepoint] Created delta savepoint '{}' for txn {} (mem: 0 bytes)", name, txn_id);
-        
+
         Ok(())
     }
-    
+
+    /// Record a write delta to the most recent savepoint (if any exist).
+    /// This enables rollback_to_savepoint to undo operations.
+    pub fn record_write_delta(&self, txn_id: TransactionId, delta: DeltaOperation) -> Result<()> {
+        let ctx = self.get_context(txn_id)?;
+        let mut savepoints = ctx.savepoints.write();
+        if let Some(last) = savepoints.last_mut() {
+            last.write_deltas.push(delta);
+        }
+        // If no savepoints, the delta is not tracked (full rollback still works via write_set)
+        Ok(())
+    }
     /// Rollback to a savepoint (Delta Snapshot optimized)
     /// 
     /// 🚀 Memory Optimization: Instead of restoring full snapshot,
@@ -388,48 +412,24 @@ impl TransactionCoordinator {
     }
     
     /// Validate write set for conflicts
-    fn validate_write_set(&self, ctx: &TransactionContext) -> Result<()> {
-        let write_set = ctx.write_set.read();
-
-        // Write-write conflict detection: check if any row in our write_set
-        // has been modified by another transaction after our snapshot.
-        for row_id in write_set.keys() {
+    /// Validate read-set for Serializable isolation (read-write conflict detection).
+    /// Write-write conflict detection is handled atomically by insert_version_atomic.
+    fn validate_read_set(&self, ctx: &TransactionContext) -> Result<()> {
+        let read_set = ctx.read_set.read();
+        for row_id in read_set.iter() {
             if let Some(chain) = self.version_store.versions.get(row_id) {
                 let head = chain.head.read();
                 if let Some(version) = head.as_ref() {
-                    if (version.begin_ts > ctx.snapshot.timestamp
-                        || ctx.snapshot.active_txns.contains(&version.txn_id))
+                    if version.begin_ts > ctx.snapshot.timestamp
                         && version.txn_id != ctx.txn_id
                     {
                         return Err(StorageError::Transaction(
-                            format!("Write-write conflict on row {} in txn {}", row_id, ctx.txn_id)
+                            format!("Read-write conflict on row {} in txn {}", row_id, ctx.txn_id)
                         ));
                     }
                 }
             }
         }
-
-        drop(write_set);
-
-        // For Serializable isolation, also check read-write conflicts
-        if ctx.isolation_level == IsolationLevel::Serializable {
-            let read_set = ctx.read_set.read();
-            for row_id in read_set.iter() {
-                if let Some(chain) = self.version_store.versions.get(row_id) {
-                    let head = chain.head.read();
-                    if let Some(version) = head.as_ref() {
-                        if version.begin_ts > ctx.snapshot.timestamp
-                            && version.txn_id != ctx.txn_id
-                        {
-                            return Err(StorageError::Transaction(
-                                format!("Read-write conflict on row {} in txn {}", row_id, ctx.txn_id)
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
     

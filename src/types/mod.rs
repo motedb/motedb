@@ -201,6 +201,14 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            // Cross-type numeric equality: Integer(1) == Float(1.0)
+            (Value::Integer(a), Value::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), Value::Integer(b)) => *a == (*b as f64),
+            // Cross-type Timestamp equality (must match partial_cmp semantics)
+            (Value::Timestamp(a), Value::Integer(b)) => a.as_micros() == *b,
+            (Value::Integer(a), Value::Timestamp(b)) => *a == b.as_micros(),
+            (Value::Timestamp(a), Value::Float(b)) => (a.as_micros() as f64) == *b,
+            (Value::Float(a), Value::Timestamp(b)) => *a == (b.as_micros() as f64),
             _ => false,
         }
     }
@@ -209,20 +217,43 @@ impl Eq for Value {}
 
 impl std::hash::Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
+        // For Integer/Float: hash the normalized f64 representation so that
+        // equal cross-type values (e.g., Integer(1) == Float(1.0)) produce the same hash.
         match self {
-            Value::Integer(i) => i.hash(state),
+            Value::Integer(i) => {
+                // Hash using the same canonical representation as Float would
+                let f = *i as f64;
+                state.write_u8(0); // numeric discriminant
+                f.to_bits().hash(state);
+            }
             Value::Float(f) => {
-                // Normalize -0.0 to +0.0 for hash consistency with Eq
                 let canonical = if *f == 0.0 { 0.0f64 } else { *f };
+                state.write_u8(0); // numeric discriminant
                 canonical.to_bits().hash(state);
-            },
-            Value::Text(s) => s.hash(state),
-            Value::Bool(b) => b.hash(state),
-            Value::Timestamp(t) => t.as_micros().hash(state),
-            Value::Null => {}
-            // For complex types, use Debug format as hash key
-            other => format!("{:?}", other).hash(state),
+            }
+            Value::Text(s) => {
+                state.write_u8(1);
+                s.hash(state);
+            }
+            Value::Bool(b) => {
+                state.write_u8(2);
+                b.hash(state);
+            }
+            Value::Null => {
+                state.write_u8(3);
+            }
+            Value::Timestamp(t) => {
+                // Timestamp is cross-type equal to Integer/Float with same micros value,
+                // so must hash to the same discriminant + representation.
+                let micros = t.as_micros();
+                let f = micros as f64;
+                state.write_u8(0); // numeric discriminant (same as Integer/Float)
+                f.to_bits().hash(state);
+            }
+            other => {
+                state.write_u8(5);
+                format!("{:?}", other).hash(state);
+            }
         }
     }
 }

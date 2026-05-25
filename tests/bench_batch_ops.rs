@@ -133,7 +133,8 @@ fn bench_batch_insert_vs_map() {
 
     // batch_insert_map (HashMap)
     let map_ms = {
-        let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
+        let dir2 = TempDir::new().expect("temp dir");
+        let db = Database::create_with_config(dir2.path(), edge_config()).expect("create db");
         exec(&db, "CREATE TABLE map_table (id INT PRIMARY KEY, name TEXT, score FLOAT)");
 
         let start = Instant::now();
@@ -238,7 +239,8 @@ fn bench_row_api_vs_sql_insert() {
 
     // Row API insert_row
     let row_api_ms = {
-        let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
+        let dir2 = TempDir::new().expect("temp dir");
+        let db = Database::create_with_config(dir2.path(), edge_config()).expect("create db");
         exec(&db, "CREATE TABLE row_ins (id INT PRIMARY KEY, name TEXT, val INT)");
 
         let start = Instant::now();
@@ -258,7 +260,8 @@ fn bench_row_api_vs_sql_insert() {
 
     // Batch insert
     let batch_ms = {
-        let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
+        let dir3 = TempDir::new().expect("temp dir");
+        let db = Database::create_with_config(dir3.path(), edge_config()).expect("create db");
         exec(&db, "CREATE TABLE batch_ins (id INT PRIMARY KEY, name TEXT, val INT)");
 
         let chunk_size = 100;

@@ -23,7 +23,7 @@ impl MoteDB {
             ..Default::default()
         };
 
-        let index = IOctreeIndex::new(config, name.to_string());
+        let index = IOctreeIndex::new(config, name.to_string())?;
         self.ioctree_indexes.insert(name.to_string(), Arc::new(RwLock::new(index)));
         Ok(())
     }

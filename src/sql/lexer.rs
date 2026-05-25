@@ -69,7 +69,7 @@ impl<'a> Lexer<'a> {
             '0'..='9' => self.read_number()?,
             
             // Identifiers and keywords
-            'a'..='z' | 'A'..='Z' | '_' => self.read_identifier(),
+            'a'..='z' | 'A'..='Z' | '_' => self.read_identifier()?,
             
             // Operators and delimiters
             '=' => {
@@ -370,12 +370,15 @@ impl<'a> Lexer<'a> {
             }
         }
         
-        value.parse::<f64>()
-            .map(TokenType::Number)
-            .map_err(|_| MoteDBError::ParseError(format!("Invalid number: {}", value)))
+        let num = value.parse::<f64>()
+            .map_err(|_| MoteDBError::ParseError(format!("Invalid number: {}", value)))?;
+        if num.is_infinite() || num.is_nan() {
+            return Err(MoteDBError::ParseError(format!("Number out of range: {}", value)));
+        }
+        Ok(TokenType::Number(num))
     }
     
-    fn read_identifier(&mut self) -> TokenType {
+    fn read_identifier(&mut self) -> Result<TokenType> {
         let start = self.position;
 
         while !self.is_eof() {
@@ -389,9 +392,14 @@ impl<'a> Lexer<'a> {
 
         let word = &self.input[start..self.position];
 
+        // Guard against DoS via extremely long identifiers (4KB limit)
+        if word.len() > 4096 {
+            return Err(MoteDBError::ParseError("Identifier too long".into()));
+        }
+
         // Zero-allocation keyword check (from_keyword uses stack buffer)
-        TokenType::from_keyword(word)
-            .unwrap_or_else(|| TokenType::Identifier(word.to_string()))
+        Ok(TokenType::from_keyword(word)
+            .unwrap_or_else(|| TokenType::Identifier(word.to_string())))
     }
 }
 

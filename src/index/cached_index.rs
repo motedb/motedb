@@ -38,7 +38,7 @@ impl FastKey {
                 s.hash(&mut h);
                 FastKey { tag: 4, data: h.finish() }
             }
-            Value::Timestamp(ts) => FastKey { tag: 5, data: ts.as_micros() as u64 },
+            Value::Timestamp(ts) => FastKey { tag: 5, data: ts.as_micros_u64() },
             Value::Null => FastKey { tag: 6, data: 0 },
             // Complex/boxed types: use distinct tags so they never collide with
             // simple types or each other in the cache. data=0 is acceptable because

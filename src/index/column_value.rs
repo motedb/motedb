@@ -227,10 +227,9 @@ impl ColumnValueIndex {
             StorageError::InvalidData(e)
         })?;
 
-        // Re-insert cancels any pending tombstone — non-blocking (skip if contended)
-        if let Some(mut ts) = self.tombstones.try_lock() {
-            ts.remove(&tombstone_key(&key));
-        }
+        // Re-insert cancels any pending tombstone — must succeed (blocking).
+        // A skipped tombstone removal would leave the re-inserted key invisible.
+        self.tombstones.lock().remove(&tombstone_key(&key));
 
         // If buffer is full, drain immutable buffers to btree (non-blocking)
         if full {
@@ -734,12 +733,14 @@ impl ColumnValueIndex {
         let upper_bytes = self.value_to_bytes(upper_bound)?;
 
         let start_key = IndexKey {
-            value_bytes: lower_bytes,
+            value_bytes: lower_bytes.clone(),
             row_id: if lower_inclusive { 0 } else { RowId::MAX },
         };
+        // For exclusive upper: scan one value past upper, then post-filter.
+        // Using (upper_bytes, 0) would incorrectly include row_id=0 entries.
         let end_key = IndexKey {
-            value_bytes: upper_bytes,
-            row_id: if upper_inclusive { RowId::MAX } else { 0 },
+            value_bytes: upper_bytes.clone(),
+            row_id: RowId::MAX,
         };
 
         // 🔒 tombstones before btree — consistent lock order
@@ -747,20 +748,31 @@ impl ColumnValueIndex {
         let mut results: Vec<IndexKey> = Vec::new();
         let mut seen = HashSet::new();
 
-        // 1. Mem buffer (filter inline)
+        let mut accept = |key: &IndexKey| -> bool {
+            // Post-filter exclusive boundaries
+            if !lower_inclusive && key.value_bytes == start_key.value_bytes {
+                return false;
+            }
+            if !upper_inclusive && key.value_bytes == end_key.value_bytes {
+                return false;
+            }
+            !tombstones.contains(&tombstone_key(key)) && seen.insert(key.row_id)
+        };
+
+        // 1. Mem buffer
         let buffer_results = self.mem_buffer.range(&start_key, &end_key);
         for (key, _) in buffer_results {
-            if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
+            if accept(&key) {
                 results.push(key);
             }
         }
 
-        // 2. Btree (filter inline)
+        // 2. Btree
         {
             let btree = self.btree.read();
             let btree_results = btree.range(&start_key, &end_key)?;
             for (key, _) in btree_results {
-                if !tombstones.contains(&tombstone_key(&key)) && seen.insert(key.row_id) {
+                if accept(&key) {
                     results.push(key);
                 }
             }
@@ -907,22 +919,39 @@ impl ColumnValueIndex {
         let has_deletes = !deletes.is_empty();
 
         if has_entries || has_deletes {
-            let tombstones = self.tombstones.lock();
-            let mut btree = self.btree.write();
-            // Insert buffered entries (skip tombstoned)
-            for (key, _) in &entries {
-                if !tombstones.contains(&tombstone_key(key)) {
-                    btree.insert(key.clone(), vec![])?;
+            // Collect tombstone keys to clear while holding the lock.
+            // We must NOT call clear() on re-acquire because a concurrent
+            // update()/delete() may have set new tombstones between the drop
+            // and re-acquire (clearing them would resurrect the deleted key).
+            let tombstone_keys_to_clear: Vec<IndexKey> = {
+                let tombstones = self.tombstones.lock();
+                let mut btree = self.btree.write();
+                let mut keys_to_clear = Vec::new();
+                // Insert buffered entries (skip tombstoned)
+                for (key, _) in &entries {
+                    let tk = tombstone_key(key);
+                    if tombstones.contains(&tk) {
+                        keys_to_clear.push(tk);
+                    } else {
+                        btree.insert(key.clone(), vec![])?;
+                    }
                 }
+                // Process deferred deletes from update path
+                for key in &deletes {
+                    let _ = btree.delete(key);
+                    keys_to_clear.push(tombstone_key(key));
+                }
+                drop(btree);
+                drop(tombstones);
+                keys_to_clear
+            };
+
+            // Remove only the tombstones we actually consumed — don't touch
+            // tombstones set concurrently by other threads.
+            let mut tombstones = self.tombstones.lock();
+            for tk in &tombstone_keys_to_clear {
+                tombstones.remove(tk);
             }
-            // Process deferred deletes from update path
-            for key in &deletes {
-                let _ = btree.delete(key);
-            }
-            drop(btree);
-            drop(tombstones);
-            // All buffers drained + deletes applied — tombstones no longer needed
-            self.tombstones.lock().clear();
         }
         Ok(())
     }
@@ -1463,6 +1492,42 @@ mod tests {
             "after update+flush: row 1 should be at new value");
         assert!(!index.get(&Value::Integer(10))?.contains(&1),
             "after update+flush: row 1 should NOT be at old value");
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_between_exclusive_boundaries() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let path = temp_dir.path().join("test_between.idx");
+        let index = ColumnValueIndex::create(
+            path,
+            "t".to_string(),
+            "v".to_string(),
+            ColumnValueIndexConfig::default(),
+        )?;
+
+        // Insert values: 10, 20, 30 with row_id = 0, 1, 2
+        index.insert(&Value::Integer(10), 0)?;
+        index.insert(&Value::Integer(20), 1)?;
+        index.insert(&Value::Integer(30), 2)?;
+
+        // Inclusive both ends: [10, 30] → should find all 3
+        let result = index.query_between(&Value::Integer(10), true, &Value::Integer(30), true)?;
+        assert_eq!(result.len(), 3, "[10,30] inclusive should find 3, got {}", result.len());
+
+        // Exclusive both ends: (10, 30) → should find only 20
+        let result = index.query_between(&Value::Integer(10), false, &Value::Integer(30), false)?;
+        assert_eq!(result.len(), 1, "(10,30) exclusive should find 1, got {}", result.len());
+        assert!(result.contains(&1), "should contain row_id=1 (value=20)");
+
+        // Lower exclusive, upper inclusive: (10, 30] → should find 20, 30
+        let result = index.query_between(&Value::Integer(10), false, &Value::Integer(30), true)?;
+        assert_eq!(result.len(), 2, "(10,30] should find 2, got {}", result.len());
+
+        // Lower inclusive, upper exclusive: [10, 30) → should find 10, 20
+        let result = index.query_between(&Value::Integer(10), true, &Value::Integer(30), false)?;
+        assert_eq!(result.len(), 2, "[10,30) should find 2, got {}", result.len());
+
         Ok(())
     }
 }

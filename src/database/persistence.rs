@@ -142,6 +142,9 @@ impl MoteDB {
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
         if immutable_queue_len == 0 && pending_after == pending_before {
             self.wal.checkpoint_all()?;
+            // Persist write_lsn so restarts survive clock regression
+            let current_lsn = self.write_lsn.load(std::sync::atomic::Ordering::SeqCst);
+            crate::database::core::MoteDB::persist_lsn_counter(&self.path, current_lsn);
         }
 
         let min_active_ts = self.txn_coordinator.get_min_active_timestamp();

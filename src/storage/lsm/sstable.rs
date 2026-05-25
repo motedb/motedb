@@ -74,6 +74,7 @@ struct Footer {
     num_entries: u64,
     min_timestamp: u64,
     max_timestamp: u64,
+    max_key: u64,
 }
 
 impl SSTable {
@@ -87,23 +88,19 @@ impl SSTable {
         let footer = Self::read_footer(&mut file)?;
         let file_size = file.metadata()?.len();
 
-        // Read index to extract min key and locate the last data block.
-        let (min_key, max_key) = if footer.index_size > 0 {
+        // Read index to extract min key. max_key is now stored in the footer
+        // (or u64::MAX for backward compat with old SSTables).
+        let max_key = footer.max_key;
+        let min_key = if footer.index_size > 0 {
             file.seek(SeekFrom::Start(footer.index_offset))?;
             let mut index_buf = vec![0u8; footer.index_size as usize];
             file.read_exact(&mut index_buf)?;
             match BlockIndex::deserialize(&index_buf) {
-                Ok(idx) if !idx.entries.is_empty() => {
-                    // Use u64::MAX for max_key (conservative). The first entry of
-                    // the last block is a lower bound; the true max key requires
-                    // parsing the last block which is error-prone (compression,
-                    // variable-length values). Bloom filter handles false positives.
-                    (idx.entries[0].0, u64::MAX)
-                }
-                _ => (0u64, u64::MAX),
+                Ok(idx) if !idx.entries.is_empty() => idx.entries[0].0,
+                _ => 0u64,
             }
         } else {
-            (0u64, u64::MAX)
+            0u64
         };
 
         Ok((footer.num_entries, footer.min_timestamp, file_size, min_key, max_key))
@@ -286,6 +283,10 @@ impl SSTable {
         // Heap-allocated key-offset pairs (a 64KB block can hold ~2800 entries
         // with minimal values — the old stack array of 256 silently dropped keys
         // beyond that limit, causing data loss on point queries).
+        // Cap num_entries to the maximum that can fit in the buffer (min 8 bytes/entry
+        // for the key offset). Prevents unbounded allocation on corrupted data.
+        let max_entries = buf.len() / 8;
+        let num_entries = num_entries.min(max_entries);
         let mut key_offsets: Vec<(u64, usize)> = Vec::with_capacity(num_entries);
         let mut off = 4usize;
 
@@ -653,6 +654,7 @@ impl SSTableBuilder {
             num_entries: self.num_entries,
             min_timestamp: if self.min_timestamp == u64::MAX { 0 } else { self.min_timestamp },
             max_timestamp: self.max_timestamp,
+            max_key: self.max_key.unwrap_or(u64::MAX),
         };
 
         let footer_data = footer.serialize()?;
@@ -1112,7 +1114,9 @@ impl Footer {
         buf[offset..offset+8].copy_from_slice(&self.min_timestamp.to_le_bytes());
         offset += 8;
         buf[offset..offset+8].copy_from_slice(&self.max_timestamp.to_le_bytes());
-        
+        offset += 8;
+        buf[offset..offset+8].copy_from_slice(&self.max_key.to_le_bytes());
+
         Ok(buf)
     }
     
@@ -1171,7 +1175,17 @@ impl Footer {
             data[offset], data[offset+1], data[offset+2], data[offset+3],
             data[offset+4], data[offset+5], data[offset+6], data[offset+7],
         ]);
-        
+        offset += 8;
+
+        let max_key = u64::from_le_bytes([
+            data[offset], data[offset+1], data[offset+2], data[offset+3],
+            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+        ]);
+
+        // Backward compat: old SSTables have max_key=0 in the last 8 bytes.
+        // If entries exist but max_key is 0, use u64::MAX (conservative).
+        let max_key = if max_key == 0 && num_entries > 0 { u64::MAX } else { max_key };
+
         Ok(Self {
             magic,
             version,
@@ -1182,6 +1196,7 @@ impl Footer {
             num_entries,
             min_timestamp,
             max_timestamp,
+            max_key,
         })
     }
 }

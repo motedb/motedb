@@ -15,7 +15,8 @@
 //! ```text
 use crate::{Result, StorageError};
 use crate::storage::file_manager::FileHandle;
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::Arc;
+use parking_lot::{RwLock, Mutex};
 use std::path::PathBuf;
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -527,15 +528,11 @@ impl BTree {
     
     /// Update and persist SuperBlock
     fn sync_superblock(&self) -> Result<()> {
-        let root_page_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        let next_page_id = *self.next_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
-        let stats = self.stats.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_page_id = *self.root_page_id.read();
+        let next_page_id = *self.next_page_id.read();
+        let stats = self.stats.read();
         
-        let page_offsets = self.page_offsets.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let page_offsets = self.page_offsets.read();
 
         let superblock = SuperBlock {
             magic: BTREE_MAGIC,
@@ -550,8 +547,7 @@ impl BTree {
             page_offsets: page_offsets.clone(),
         };
         
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut file = self.storage_file.write();
         
         Self::write_superblock(&mut file, &superblock)
     }
@@ -559,8 +555,7 @@ impl BTree {
     /// Load page from disk or cache
     fn load_page(&self, page_id: u64) -> Result<Arc<RwLock<Page>>> {
         if page_id == 0 {
-            let root_id = *self.root_page_id.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let root_id = *self.root_page_id.read();
             return Err(StorageError::Corruption(
                 format!("Cannot load Page 0: reserved for SuperBlock (root_id={})", root_id)
             ));
@@ -568,27 +563,23 @@ impl BTree {
 
         // Check cache first
         {
-            let mut cache = self.page_cache.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut cache = self.page_cache.write();
 
             if let Some(page) = cache.get(&page_id) {
-                let mut stats = self.stats.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut stats = self.stats.write();
                 stats.page_cache_hits += 1;
                 return Ok(Arc::clone(page));
             }
         }
 
         // Miss - load from disk
-        let mut stats = self.stats.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut stats = self.stats.write();
         stats.page_cache_misses += 1;
         drop(stats);
 
         // Look up page offset from page table
         let file_offset = {
-            let offsets = self.page_offsets.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let offsets = self.page_offsets.read();
             let idx = page_id as usize;
             if idx >= offsets.len() || offsets[idx] == 0 {
                 return Err(StorageError::Corruption(
@@ -598,8 +589,7 @@ impl BTree {
             offsets[idx]
         };
 
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut file = self.storage_file.write();
 
         // Read header to get content_len
         file.seek(SeekFrom::Start(file_offset))?;
@@ -623,8 +613,7 @@ impl BTree {
 
         let page_arc = Arc::new(RwLock::new(page));
 
-        let mut cache = self.page_cache.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut cache = self.page_cache.write();
         cache.put(page_id, Arc::clone(&page_arc));
 
         Ok(page_arc)
@@ -645,11 +634,9 @@ impl BTree {
 
         let buf = page.serialize_compact()?;
 
-        let _flush_guard = self.flush_lock.lock()
-            .map_err(|_| StorageError::Index("Flush lock poisoned".into()))?;
+        let _flush_guard = self.flush_lock.lock();
 
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut file = self.storage_file.write();
 
         // Always append — page_offsets will be corrected during flush()
         let file_end = file.metadata()?.len().max(Self::SUPERBLOCK_SIZE as u64);
@@ -658,8 +645,7 @@ impl BTree {
 
         // Record offset in page table
         {
-            let mut offsets = self.page_offsets.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut offsets = self.page_offsets.write();
             let idx = page.page_id as usize;
             if idx >= offsets.len() {
                 offsets.resize(idx + 1, 0);
@@ -677,8 +663,7 @@ impl BTree {
     /// Allocate a new page
     fn alloc_page(&self, is_leaf: bool) -> Result<Arc<RwLock<Page>>> {
         let page_id = {
-            let mut next_id = self.next_page_id.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut next_id = self.next_page_id.write();
             let id = *next_id;
             *next_id += 1;
             id
@@ -693,8 +678,7 @@ impl BTree {
         let page_arc = Arc::new(RwLock::new(page));
         
         // Add to cache
-        let mut cache = self.page_cache.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut cache = self.page_cache.write();
         cache.put(page_id, Arc::clone(&page_arc));
         
         Ok(page_arc)
@@ -703,8 +687,7 @@ impl BTree {
     /// Search for a key starting from a page
     fn search_internal(&self, page_id: u64, key: u64) -> Result<Option<u64>> {
         let page_arc = self.load_page(page_id)?;
-        let page = page_arc.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let page = page_arc.read();
         
         if page.is_leaf {
             // Leaf node: binary search
@@ -730,16 +713,14 @@ impl BTree {
     
     /// Insert a key-value pair
     pub fn insert(&mut self, key: u64, value: u64) -> Result<Option<u64>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         // If root doesn't exist, create it
         if root_id == 0 {
             // Create new root page (will be Page 1 since Page 0 is SuperBlock)
             let root_page = self.alloc_page(true)?;
             let new_root_id = {
-                let mut page = root_page.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut page = root_page.write();
                 page.keys.push(key);
                 page.values.push(value);
                 page.num_keys = 1;
@@ -749,16 +730,14 @@ impl BTree {
             
             // Flush the page
             {
-                let page_ref = root_page.read()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let page_ref = root_page.read();
                 // 🔧 Fix: Flush the root page immediately to ensure it's on disk
                 self.flush_page(&page_ref)?;
             }
             
             // Update root_page_id
             {
-                let mut root = self.root_page_id.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut root = self.root_page_id.write();
                 *root = new_root_id;
             }
             
@@ -767,8 +746,7 @@ impl BTree {
             self.sync_superblock()?;
             
             // Update stats
-            let mut stats = self.stats.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut stats = self.stats.write();
             stats.total_keys = 1;
             stats.total_pages = 1;
             stats.leaf_pages = 1;
@@ -783,8 +761,7 @@ impl BTree {
         if let Some((split_key, new_page_id)) = split_info {
             let new_root = self.alloc_page(false)?;
             {
-                let mut root = new_root.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut root = new_root.write();
                 root.keys.push(split_key);
                 root.children.push(root_id);
                 root.children.push(new_page_id);
@@ -794,15 +771,13 @@ impl BTree {
 
             // Flush new root to disk (critical: must persist before updating superblock)
             {
-                let page_ref = new_root.read()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let page_ref = new_root.read();
                 let new_root_id = page_ref.page_id;
                 self.flush_page(&page_ref)?;
                 drop(page_ref);
 
                 // Update root ID
-                let mut root_page_id = self.root_page_id.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut root_page_id = self.root_page_id.write();
                 *root_page_id = new_root_id;
             }
 
@@ -810,8 +785,7 @@ impl BTree {
             self.sync_superblock()?;
 
             // Update stats
-            let mut stats = self.stats.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut stats = self.stats.write();
             stats.total_pages += 1;
             stats.internal_pages += 1;
             stats.tree_height += 1;
@@ -819,8 +793,7 @@ impl BTree {
         
         // Update total keys
         if old_value.is_none() {
-            let mut stats = self.stats.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut stats = self.stats.write();
             stats.total_keys += 1;
         }
         
@@ -834,15 +807,13 @@ impl BTree {
         
         let page_arc = self.load_page(page_id)?;
         let is_leaf = {
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let page = page_arc.read();
             page.is_leaf
         };
         
         if is_leaf {
             // Leaf node: insert directly
-            let mut page = page_arc.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut page = page_arc.write();
             
             let search_result = page.keys.binary_search(&key);
             let old_value = match search_result {
@@ -883,14 +854,12 @@ impl BTree {
         } else {
             // Internal node: find child and recurse
             let child_idx = {
-                let page = page_arc.read()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let page = page_arc.read();
                 page.keys.binary_search(&key).unwrap_or_else(|idx| idx)
             };
             
             let child_page_id = {
-                let page = page_arc.read()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let page = page_arc.read();
                 page.children[child_idx]
             };
             
@@ -898,8 +867,7 @@ impl BTree {
             
             if let Some((split_key, new_child_id)) = child_split {
                 // Child was split, insert split key into this node
-                let mut page = page_arc.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut page = page_arc.write();
                 
                 let insert_idx = page.keys.binary_search(&split_key)
                     .unwrap_or_else(|idx| idx);
@@ -934,8 +902,7 @@ impl BTree {
         // Create new leaf page
         let new_page_arc = self.alloc_page(true)?;
         let new_page_id = {
-            let mut new_page = new_page_arc.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut new_page = new_page_arc.write();
             
             // Move half the keys/values to new page
             new_page.keys = page.keys.split_off(mid);
@@ -960,8 +927,7 @@ impl BTree {
         page.dirty = true;
         
         // Update stats
-        let mut stats = self.stats.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut stats = self.stats.write();
         stats.total_pages += 1;
         stats.leaf_pages += 1;
         
@@ -1010,8 +976,7 @@ impl BTree {
         // Create new internal page for right half
         let new_page_arc = self.alloc_page(false)?;
         let new_page_id = {
-            let mut new_page = new_page_arc.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut new_page = new_page_arc.write();
             
             // 🎯 Critical fix: Proper split sequence
             // Before: keys=[k0,...,k_mid,...,k_n], children=[c0,...,c_mid,c_{mid+1},...,c_{n+1}]
@@ -1078,8 +1043,7 @@ impl BTree {
         }
         
         // Update stats
-        let mut stats = self.stats.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut stats = self.stats.write();
         stats.total_pages += 1;
         stats.internal_pages += 1;
         
@@ -1088,8 +1052,7 @@ impl BTree {
     
     /// Get value by key
     pub fn get(&self, key: &u64) -> Result<Option<u64>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         // 🔧 Fix: Empty tree (root_id == 0)
         if root_id == 0 {
@@ -1106,8 +1069,7 @@ impl BTree {
     /// (merge/redistribute). Underflow is tolerated — the tree remains correct
     /// for lookups, just potentially unbalanced. Full rebalancing can be added later.
     pub fn remove(&mut self, key: &u64) -> Result<Option<u64>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
 
         // Empty tree (root_id == 0)
         if root_id == 0 {
@@ -1119,8 +1081,7 @@ impl BTree {
 
         // Delete from the leaf
         let leaf_arc = self.load_page(leaf_id)?;
-        let mut leaf = leaf_arc.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut leaf = leaf_arc.write();
 
         if !leaf.is_leaf {
             return Err(StorageError::Index(
@@ -1138,8 +1099,7 @@ impl BTree {
                 drop(leaf);
 
                 // Update stats
-                let mut stats = self.stats.write()
-                    .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+                let mut stats = self.stats.write();
                 stats.total_keys = stats.total_keys.saturating_sub(1);
 
                 Ok(Some(old_value))
@@ -1155,9 +1115,7 @@ impl BTree {
     
     /// Get number of entries
     pub fn len(&self) -> usize {
-        self.stats.read()
-            .map(|s| s.total_keys)
-            .unwrap_or(0)  // Fallback if poisoned
+        self.stats.read().total_keys
     }
     
     /// Check if empty
@@ -1167,9 +1125,7 @@ impl BTree {
     
     /// Get statistics
     pub fn stats(&self) -> BTreeStats {
-        self.stats.read()
-            .expect("BTree stats lock poisoned")
-            .clone()
+        self.stats.read().clone()
     }
     
     /// Range query with early termination limit
@@ -1177,8 +1133,7 @@ impl BTree {
     /// Returns at most `limit` key-value pairs where start <= key <= end.
     /// Significantly faster than range() + take() for large ranges with small limits.
     pub fn range_with_limit(&self, start: &u64, end: &u64, limit: usize) -> Result<Vec<(u64, u64)>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
 
         if root_id == 0 || limit == 0 {
             return Ok(Vec::new());
@@ -1199,8 +1154,7 @@ impl BTree {
     /// 2. Sequentially scan leaf nodes using next_leaf pointers
     /// 3. Stop when we encounter a key > end
     pub fn range(&self, start: &u64, end: &u64) -> Result<Vec<(u64, u64)>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         // 🔧 Fix: Empty tree (root_id == 0)
         if root_id == 0 {
@@ -1221,8 +1175,7 @@ impl BTree {
     /// (or the first leaf with keys >= key if key doesn't exist)
     fn find_leaf_for_key(&self, page_id: u64, key: u64) -> Result<u64> {
         let page_arc = self.load_page(page_id)?;
-        let page = page_arc.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let page = page_arc.read();
         
         if page.is_leaf {
             return Ok(page_id);
@@ -1270,8 +1223,7 @@ impl BTree {
         
         while current_leaf_id != INVALID_PAGE_ID {
             let page_arc = self.load_page(current_leaf_id)?;
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let page = page_arc.read();
             
             if !page.is_leaf {
                 return Err(StorageError::Index("Expected leaf node".into()));
@@ -1311,8 +1263,7 @@ impl BTree {
 
         while current_leaf_id != INVALID_PAGE_ID && results.len() < limit {
             let page_arc = self.load_page(current_leaf_id)?;
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let page = page_arc.read();
 
             if !page.is_leaf {
                 return Err(StorageError::Index("Expected leaf node".into()));
@@ -1340,8 +1291,7 @@ impl BTree {
     /// Flush all pages: rewrite compactly and truncate file
     pub fn flush(&self) -> Result<()> {
         // Collect all pages from cache, sorted by page_id for deterministic layout
-        let cache = self.page_cache.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let cache = self.page_cache.read();
 
         let mut pages: Vec<(u64, Arc<RwLock<Page>>)> = cache.iter()
             .map(|(id, arc)| (*id, Arc::clone(arc)))
@@ -1351,18 +1301,15 @@ impl BTree {
         drop(cache);
 
         // Write all pages sequentially after superblock
-        let _flush_guard = self.flush_lock.lock()
-            .map_err(|_| StorageError::Index("Flush lock poisoned".into()))?;
+        let _flush_guard = self.flush_lock.lock();
 
-        let mut file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut file = self.storage_file.write();
 
         let mut offset = Self::SUPERBLOCK_SIZE as u64;
         let mut new_offsets = vec![0u64]; // index 0 = superblock
 
         for (page_id, page_arc) in &pages {
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let page = page_arc.read();
 
             let buf = page.serialize_compact()?;
 
@@ -1379,15 +1326,13 @@ impl BTree {
         }
 
         // Update page_offsets table
-        let mut offsets = self.page_offsets.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let mut offsets = self.page_offsets.write();
         *offsets = new_offsets;
         drop(offsets);
 
         // Mark all pages clean
         for (_, page_arc) in &pages {
-            let mut page = page_arc.write()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let mut page = page_arc.write();
             page.dirty = false;
         }
 
@@ -1397,8 +1342,7 @@ impl BTree {
         self.sync_superblock()?;
 
         // Now truncate file to remove dead space
-        let file = self.storage_file.write()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let file = self.storage_file.write();
         file.set_len(offset)?;
 
         // Final fsync
@@ -1409,8 +1353,7 @@ impl BTree {
     
     /// Scan all entries (for debugging)
     pub fn scan(&self) -> Result<Vec<(u64, u64)>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
         
         // 🔧 Fix: Empty tree (root_id == 0)
         if root_id == 0 {
@@ -1425,8 +1368,7 @@ impl BTree {
     /// Internal scan helper - traverse to leftmost leaf and scan all leaves
     fn scan_internal(&self, page_id: u64, results: &mut Vec<(u64, u64)>) -> Result<()> {
         let page_arc = self.load_page(page_id)?;
-        let page = page_arc.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let page = page_arc.read();
         
         if page.is_leaf {
             // Leaf node: collect all entries
@@ -1454,8 +1396,7 @@ impl BTree {
     
     /// Get min key
     pub fn min_key(&self) -> Result<Option<u64>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
 
         if root_id == 0 {
             return Ok(None);
@@ -1465,8 +1406,7 @@ impl BTree {
         let mut page_id = root_id;
         loop {
             let page_arc = self.load_page(page_id)?;
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let page = page_arc.read();
 
             if page.is_leaf {
                 return Ok(page.keys.first().copied());
@@ -1480,8 +1420,7 @@ impl BTree {
 
     /// Get max key
     pub fn max_key(&self) -> Result<Option<u64>> {
-        let root_id = *self.root_page_id.read()
-            .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+        let root_id = *self.root_page_id.read();
 
         if root_id == 0 {
             return Ok(None);
@@ -1491,8 +1430,7 @@ impl BTree {
         let mut page_id = root_id;
         loop {
             let page_arc = self.load_page(page_id)?;
-            let page = page_arc.read()
-                .map_err(|_| StorageError::Index("Lock poisoned".into()))?;
+            let page = page_arc.read();
 
             if page.is_leaf {
                 return Ok(page.keys.last().copied());
@@ -1598,8 +1536,7 @@ mod tests {
             assert!(stats_after.total_pages > 0);
             
             // Verify root_page_id was restored correctly
-            let root_id = *btree.root_page_id.read()
-                .expect("BTree root_page_id lock poisoned in test");
+            let root_id = *btree.root_page_id.read();
             assert!(root_id > 0, "Root should be at Page 1 or higher (Page 0 is SuperBlock)");
             
             // Verify data integrity

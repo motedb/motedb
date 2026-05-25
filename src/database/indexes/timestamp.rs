@@ -78,7 +78,7 @@ impl MoteDB {
 
                 if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
                     if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                        let ts_micros = ts.as_micros() as u64;
+                        let ts_micros = ts.as_micros_u64();
                         if ts_micros > max_indexed_ts {
                             entries_to_index.push((ts_micros, row_id));
                         }

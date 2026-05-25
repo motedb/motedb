@@ -77,6 +77,11 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
                 var_entries.push((i, t.as_bytes().to_vec()));
             }
             (Value::Vector(v), _) => {
+                if v.len() > u16::MAX as usize {
+                    return Err(StorageError::InvalidData(
+                        format!("Vector dimension {} exceeds maximum {}", v.len(), u16::MAX)
+                    ));
+                }
                 let dim = v.len() as u16;
                 let mut encoded = Vec::with_capacity(2 + v.len() * 4);
                 encoded.extend_from_slice(&dim.to_le_bytes());
@@ -280,15 +285,11 @@ fn decode_raw(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
             fixed_idx += 1;
         } else {
             let (v_off, v_len) = var_offsets[i];
-            if v_len > 0 {
-                let abs_off = var_data_start + v_off;
-                if abs_off + v_len > data.len() {
-                    row.push(Value::Null);
-                } else {
-                    row.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
-                }
-            } else {
+            let abs_off = var_data_start + v_off;
+            if abs_off + v_len > data.len() {
                 row.push(Value::Null);
+            } else {
+                row.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
             }
         }
     }
@@ -386,15 +387,11 @@ fn decode_raw_fast_into(data: &[u8], col_types: &[ColumnType], fixed_count: usiz
             fixed_idx += 1;
         } else {
             let (v_off, v_len) = var_offsets[i];
-            if v_len > 0 {
-                let abs_off = var_data_start + v_off;
-                if abs_off + v_len > data.len() {
-                    row.push(Value::Null);
-                } else {
-                    row.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
-                }
-            } else {
+            let abs_off = var_data_start + v_off;
+            if abs_off + v_len > data.len() {
                 row.push(Value::Null);
+            } else {
+                row.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
             }
         }
     }
@@ -477,15 +474,13 @@ fn decode_raw_fast_partial_into(
             }
         } else {
             let (v_off, v_len) = var_offsets[col_idx];
-            if v_len > 0 {
-                let abs_off = var_data_start + v_off;
-                if abs_off + v_len > data.len() {
-                    out.push(Value::Null);
-                } else {
-                    out.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
-                }
-            } else {
+            let abs_off = var_data_start + v_off;
+            if abs_off + v_len > data.len() {
                 out.push(Value::Null);
+            } else {
+                // Empty variable-length values (v_len==0) are valid:
+                // empty string = "", empty vector = []. They are NOT NULL.
+                out.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
             }
         }
     }
@@ -921,5 +916,40 @@ mod tests {
         decode_fast_partial_into(&e2, &col_types, fixed_count, &[0, 1], &mut buf).unwrap();
         assert_eq!(buf[0], Value::Integer(2));
         assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn test_empty_string_not_null() {
+        // Regression: empty string must round-trip as Text(""), not Null
+        let col_types = vec![ColumnType::Integer, ColumnType::Text, ColumnType::Text];
+        let row = vec![
+            Value::Integer(1),
+            Value::text("".to_string()),
+            Value::text("hello".to_string()),
+        ];
+        let encoded = encode(&row, &col_types).unwrap();
+        let decoded = decode(&encoded, &col_types).unwrap();
+        assert_eq!(decoded[0], Value::Integer(1));
+        match &decoded[1] {
+            Value::Text(s) => assert_eq!(s.as_ref() as &str, ""),
+            other => panic!("expected Text(''), got {:?}", other),
+        }
+        match &decoded[2] {
+            Value::Text(s) => assert_eq!(s.as_ref() as &str, "hello"),
+            other => panic!("expected Text(\"hello\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_null_vs_empty_string_distinct() {
+        let col_types = vec![ColumnType::Text, ColumnType::Text];
+        let row_with_null = vec![Value::Null, Value::text("".to_string())];
+        let encoded = encode(&row_with_null, &col_types).unwrap();
+        let decoded = decode(&encoded, &col_types).unwrap();
+        assert!(matches!(decoded[0], Value::Null), "NULL should decode as Null");
+        match &decoded[1] {
+            Value::Text(s) => assert_eq!(s.as_ref() as &str, ""),
+            other => panic!("expected Text(''), got {:?}", other),
+        }
     }
 }

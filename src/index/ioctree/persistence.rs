@@ -60,6 +60,9 @@ pub fn save(tree: &IOctreeIndex, path: &std::path::Path) -> Result<()> {
     writer.write_all(&crc.to_le_bytes()).map_err(io_err)?;
 
     writer.flush().map_err(io_err)?;
+    // fsync for crash safety — without this, a power failure after save()
+    // could leave a truncated/corrupt index file
+    writer.get_ref().sync_all().map_err(io_err)?;
     Ok(())
 }
 
@@ -225,7 +228,7 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
     // Migrate v1 tree to v2: extract Vec<IndexedPoint3D> → LeafStore leaf_ids
     let legacy_root: LegacyOctant = bincode::deserialize(&tree_buf)
         .map_err(|e| StorageError::InvalidData(format!("Deserialize v1 tree: {}", e)))?;
-    let root = migrate_octant(legacy_root, &leaf_store);
+    let root = migrate_octant(legacy_root, &leaf_store)?;
 
     Ok(IOctreeIndex {
         root,
@@ -245,34 +248,38 @@ use super::node::IndexedPoint3D;
 #[derive(serde::Deserialize)]
 enum LegacyOctant {
     Inner {
-        center: [f32; 3],
-        extent: f32,
+        center: [f64; 3],
+        extent: f64,
         children: Box<[Option<Box<LegacyOctant>>; 8]>,
         size: usize,
     },
     Leaf {
-        center: [f32; 3],
-        extent: f32,
+        center: [f64; 3],
+        extent: f64,
         points: Vec<IndexedPoint3D>,
     },
 }
 
-fn migrate_octant(legacy: LegacyOctant, store: &LeafStore) -> super::node::Octant {
+fn migrate_octant(legacy: LegacyOctant, store: &LeafStore) -> Result<super::node::Octant> {
     match legacy {
         LegacyOctant::Inner { center, extent, children, size } => {
-            let new_children: Box<[Option<Box<super::node::Octant>>; 8]> = children
-                .into_iter()
-                .map(|opt| opt.map(|c| Box::new(migrate_octant(*c, store))))
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-                .try_into()
-                .unwrap();
-            super::node::Octant::Inner { center, extent, children: new_children, size }
+            let new_children: Box<[Option<Box<super::node::Octant>>; 8]> = {
+                let mut result: Vec<Option<Box<super::node::Octant>>> = Vec::with_capacity(8);
+                for opt in children.into_iter() {
+                    match opt {
+                        Some(c) => result.push(Some(Box::new(migrate_octant(*c, store)?))),
+                        None => result.push(None),
+                    }
+                }
+                result.into_boxed_slice().try_into().unwrap()
+            };
+            Ok(super::node::Octant::Inner { center, extent, children: new_children, size })
         }
         LegacyOctant::Leaf { center, extent, points } => {
             let point_count = points.len() as u32;
-            let leaf_id = store.create_leaf(points).expect("Failed to create leaf during migration");
-            super::node::Octant::Leaf { center, extent, leaf_id, point_count }
+            let leaf_id = store.create_leaf(points)
+                .map_err(|e| StorageError::Index(format!("Failed to create leaf during migration: {}", e)))?;
+            Ok(super::node::Octant::Leaf { center, extent, leaf_id, point_count })
         }
     }
 }

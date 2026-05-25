@@ -211,7 +211,7 @@ where
         }
         
         // 3. Deduplicate (keep newest value for each key)
-        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results.sort_by_key(|a| a.0.clone()); // stable sort: equal keys retain insert order
         results.dedup_by(|a, b| a.0 == b.0);
         
         results
@@ -243,7 +243,7 @@ where
         }
         
         // 3. Deduplicate
-        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results.sort_by_key(|a| a.0.clone()); // stable sort: equal keys retain insert order
         results.dedup_by(|a, b| a.0 == b.0);
         
         results
@@ -279,7 +279,7 @@ where
         }
         drop(active);
 
-        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results.sort_by_key(|a| a.0.clone()); // stable sort: equal keys retain insert order
         results.dedup_by(|a, b| a.0 == b.0);
         results
     }

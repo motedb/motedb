@@ -143,7 +143,7 @@ impl MoteDB {
             id as RowId
         } else {
             // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
-            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         };
 
         // 4. Determine partition
@@ -165,7 +165,7 @@ impl MoteDB {
         // 7. Write to LSM MemTable (invalidate cache first for TOCTOU safety)
         let composite_key = self.make_composite_key(table_name, row_id);
         self.row_cache.invalidate(table_name, row_id);
-        let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let value = crate::storage::lsm::Value::new(row_data, ts);
         self.lsm_engine.put(composite_key, value)?;
         self.row_cache.put(table_name.to_string(), row_id, row.clone());
@@ -307,18 +307,21 @@ impl MoteDB {
                 return Ok(None);
             }
 
-            let data = match &value.data {
-                crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
-                crate::storage::lsm::ValueData::Blob(_) => {
-                    return Err(StorageError::InvalidData(
-                        "Blob values not yet supported in get_table_row".into()
-                    ));
+            let data: Vec<u8> = match &value.data {
+                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                    match self.lsm_engine.resolve_blob(blob_ref) {
+                        Ok(data) => data,
+                        Err(e) => return Err(StorageError::Serialization(format!(
+                            "Failed to resolve blob for row {}: {}", row_id, e
+                        ))),
+                    }
                 }
             };
 
             let col_types = schema.col_types();
             let fc = row_format::compute_fixed_count(col_types);
-            let row: Row = row_format::decode_fast(data, col_types, fc)
+            let row: Row = row_format::decode_fast(&data, col_types, fc)
                 .map_err(|e| StorageError::Serialization(format!(
                     "Failed to deserialize row {}: {}",
                     row_id, e
@@ -445,7 +448,7 @@ impl MoteDB {
         // Invalidate cache BEFORE LSM write to prevent TOCTOU stale reads
         self.row_cache.invalidate(table_name, row_id);
 
-        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let value = crate::storage::lsm::Value::new(raw_new, timestamp);
         self.lsm_engine.put(composite_key, value)?;
 
@@ -625,7 +628,7 @@ impl MoteDB {
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
 
         // 4. Compute timestamp (used by both WAL and LSM)
-        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // 5. Write to WAL first (durability guarantee)
         //    WAL must be written BEFORE any mutation so that a crash at any
@@ -1121,7 +1124,7 @@ impl MoteDB {
                 txn_id: 0,
             });
 
-            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let value = crate::storage::lsm::Value::new(row_data, ts);
             let composite_key = self.make_composite_key(table_name, *row_id);
             kvs.push((composite_key, value));
@@ -1372,6 +1375,10 @@ impl MoteDB {
     /// 
     /// ⚠️ IMPORTANT: This method MUST NOT call get_table_rows_batch() to avoid infinite recursion!
     fn trigger_prefetch(&self, table_name: &str, start_row_id: RowId, count: usize, stride: i64) {
+        // stride == 0 means same row accessed repeatedly — skip prefetch
+        if stride == 0 {
+            return;
+        }
         let mut row_ids_to_fetch = Vec::with_capacity(count);
         let mut current_id = start_row_id as i64;
 

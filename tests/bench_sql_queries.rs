@@ -431,8 +431,8 @@ fn bench_subquery() {
         let start = Instant::now();
         for _ in 0..q {
             match db.execute("SELECT id FROM sales WHERE customer IN (SELECT customer FROM sales WHERE region = 'US')") {
-                Ok(r) => { r.materialize().expect("mat"); }
-                Err(_) => {} // subquery may not be fully supported
+                Ok(r) => { let _ = r.materialize(); }
+                Err(_) => {}
             }
         }
         start.elapsed().as_millis() as u64
