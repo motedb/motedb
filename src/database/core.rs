@@ -1252,7 +1252,7 @@ impl MoteDB {
             .name("index-builder".into())
             .spawn(move || {
                 debug_log!("[IndexBuilder] Background thread started");
-                while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match rx.recv_timeout(std::time::Duration::from_secs(2)) {
                             Ok(batch) => {
@@ -1391,11 +1391,11 @@ impl MoteDB {
         let handle = std::thread::Builder::new()
             .name("motedb-auto-flush".into())
             .spawn(move || {
-                while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match flush_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                             Ok(()) => {
-                                if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                                     return false;
                                 }
                                 while flush_rx.try_recv().is_ok() {}
@@ -1465,15 +1465,12 @@ impl MoteDB {
                 config.min_interval_secs,
                 check_interval.as_secs());
             
-            while !should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                 // 🚀 **CRITICAL FIX**: Use interruptible sleep (check every 1s)
                 // This allows fast shutdown when Drop is called
-                // 
-                // Before: sleep(60s) -> Drop waits 60s
-                // After: sleep(1s) × 60 -> Drop waits max 1s
                 let mut remaining = check_interval;
                 while remaining > Duration::ZERO {
-                    if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                         debug_log!("[AutoCheckpoint] 🛑 Shutdown signal received during sleep");
                         break;
                     }
@@ -1484,7 +1481,7 @@ impl MoteDB {
                 }
                 
                 // Check if stop signal was set during sleep
-                if should_stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
                 
@@ -1627,25 +1624,14 @@ impl MoteDB {
     fn join_with_timeout(
         name: &'static str,
         handle: std::thread::JoinHandle<()>,
-        timeout: std::time::Duration,
+        _timeout: std::time::Duration,
     ) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _ = std::thread::Builder::new()
-            .name(format!("{}-join-waiter", name))
-            .spawn(move || {
-                let _ = handle.join();
-                let _ = tx.send(());
-            });
-
-        match rx.recv_timeout(timeout) {
+        match handle.join() {
             Ok(()) => {
                 debug_log!("[MoteDB::Drop] ✅ {} thread stopped", name);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                warn_log!("[MoteDB::Drop] ⚠️  {} thread did not stop within {:?}, detaching", name, timeout);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn_log!("[MoteDB::Drop] ⚠️  {} thread join waiter panicked", name);
+            Err(e) => {
+                warn_log!("[MoteDB::Drop] ⚠️  {} thread panicked: {:?}", name, e);
             }
         }
     }
@@ -1704,18 +1690,18 @@ impl Drop for MoteDB {
             debug_log!("[MoteDB::Drop] 🛑 Stopping index builder thread...");
             self.index_build_tx = None;
             self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
             if let Some(handle) = thread.handle.take() {
                 Self::join_with_timeout("index-builder", handle, std::time::Duration::from_secs(5));
             }
         }
         self.index_build_tx = None;
-        self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Release);
 
         // 🛑 Step 2: Stop auto-checkpoint thread
         if let Some(mut thread) = self.auto_checkpoint_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-checkpoint thread...");
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
             if let Some(handle) = thread.handle.take() {
                 Self::join_with_timeout("auto-checkpoint", handle, std::time::Duration::from_secs(5));
             }
@@ -1725,7 +1711,7 @@ impl Drop for MoteDB {
         // 🛑 Step 2.5: Stop auto-flush thread
         if let Some(mut thread) = self.auto_flush_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-flush thread...");
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
             // Drop sender to unblock recv
             drop(thread.flush_tx);
             if let Some(handle) = thread.handle.take() {
