@@ -97,11 +97,27 @@ impl MoteDB {
             warn_log!("[drop_table] columnar drop failed for '{}': {:?}", table_name, e);
         }
 
-        // 5. Drop in-memory index handles
-        self.vector_indexes.remove(table_name);
-        self.ioctree_indexes.remove(table_name);
-        self.text_indexes.remove(table_name);
-        self.column_indexes.remove(table_name);
+        // 5. Drop in-memory index handles (iterate by prefix since keys are "table.column" format)
+        let prefix = format!("{}.", table_name);
+        let vec_keys: Vec<String> = self.vector_indexes.iter()
+            .filter(|e| e.key().starts_with(&prefix) || e.key() == table_name)
+            .map(|e| e.key().clone()).collect();
+        for k in vec_keys { self.vector_indexes.remove(&k); }
+
+        let ioct_keys: Vec<String> = self.ioctree_indexes.iter()
+            .filter(|e| e.key().starts_with(&prefix) || e.key() == table_name)
+            .map(|e| e.key().clone()).collect();
+        for k in ioct_keys { self.ioctree_indexes.remove(&k); }
+
+        let txt_keys: Vec<String> = self.text_indexes.iter()
+            .filter(|e| e.key().starts_with(&prefix) || e.key() == table_name)
+            .map(|e| e.key().clone()).collect();
+        for k in txt_keys { self.text_indexes.remove(&k); }
+
+        let col_keys: Vec<String> = self.column_indexes.iter()
+            .filter(|e| e.key().starts_with(&prefix) || e.key() == table_name)
+            .map(|e| e.key().clone()).collect();
+        for k in col_keys { self.column_indexes.remove(&k); }
 
         // 6. Invalidate row cache for this table
         self.row_cache.invalidate_table(table_name);
@@ -109,6 +125,7 @@ impl MoteDB {
         // 7. Remove remaining runtime state
         self.pk_lookup.remove(table_name);
         self.table_auto_increment.remove(table_name);
+        self.table_row_count.remove(table_name);
         Ok(())
     }
     

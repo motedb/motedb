@@ -230,6 +230,11 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         .map_err(|e| StorageError::InvalidData(format!("Deserialize v1 tree: {}", e)))?;
     let root = migrate_octant(legacy_root, &leaf_store)?;
 
+    // Flush migrated leaf data to disk before returning.
+    // Without this, a crash after migration would leave the tree structure
+    // referencing leaf IDs that have no persistent data on disk.
+    leaf_store.flush()?;
+
     Ok(IOctreeIndex {
         root,
         config,

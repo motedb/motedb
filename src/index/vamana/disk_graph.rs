@@ -521,6 +521,7 @@ impl DiskGraph {
 
     /// Compact graph file (full rewrite)
     pub fn compact(&self) -> Result<()> {
+        let _guard = self.flush_lock.lock(); // Prevent concurrent set_neighbors during compact
         let temp_path = self.file_path.with_extension("tmp");
         let idx_path = self.file_path.with_extension("idx");
 

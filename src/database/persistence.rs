@@ -140,18 +140,26 @@ impl MoteDB {
         // avoid truncating the WAL before that data reaches an SSTable.
         let pending_after = self.pending_updates.load(Ordering::Acquire);
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
-        if immutable_queue_len == 0 && pending_after == pending_before {
+        let checkpoint_done = if immutable_queue_len == 0 && pending_after == pending_before {
             self.wal.checkpoint_all()?;
             // Persist write_lsn so restarts survive clock regression
             let current_lsn = self.write_lsn.load(std::sync::atomic::Ordering::SeqCst);
             crate::database::core::MoteDB::persist_lsn_counter(&self.path, current_lsn);
-        }
+            true
+        } else {
+            false
+        };
 
         let min_active_ts = self.txn_coordinator.get_min_active_timestamp();
         if let Err(e) = self.version_store.vacuum(min_active_ts) {
             warn_log!("[Flush] Version store vacuum failed: {}", e);
         }
-        self.pending_updates.store(0, Ordering::Relaxed);
+        // Only reset pending_updates if WAL checkpoint was actually performed.
+        // If skipped (new writes arrived during flush), keep the counter so
+        // the next checkpoint knows there's outstanding data to flush.
+        if checkpoint_done {
+            self.pending_updates.store(0, Ordering::Relaxed);
+        }
         if let Err(e) = self.columnar_store.flush_all() {
             warn_log!("[Flush] Columnar store flush failed: {}", e);
         }

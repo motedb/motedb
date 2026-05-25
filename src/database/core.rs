@@ -7,6 +7,7 @@
 //! - open() with WAL recovery
 //! - Index loading helpers
 
+use std::io::Write;
 use crate::config::DBConfig;
 use crate::index::btree::{BTree, BTreeConfig};
 use crate::index::vamana::{DiskANNIndex, VamanaConfig};
@@ -1653,8 +1654,19 @@ impl MoteDB {
     /// Survives clock regression across restarts.
     pub(crate) fn persist_lsn_counter(db_path: &Path, lsn: u64) {
         let path = db_path.join("lsn_counter");
-        if let Err(e) = std::fs::write(&path, lsn.to_le_bytes()) {
-            warn_log!("[persist_lsn_counter] failed to write {}: {}", path.display(), e);
+        match std::fs::File::create(&path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(&lsn.to_le_bytes()) {
+                    warn_log!("[persist_lsn_counter] write failed {}: {}", path.display(), e);
+                    return;
+                }
+                if let Err(e) = file.sync_all() {
+                    warn_log!("[persist_lsn_counter] fsync failed {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => {
+                warn_log!("[persist_lsn_counter] create failed {}: {}", path.display(), e);
+            }
         }
     }
 
