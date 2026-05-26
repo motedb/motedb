@@ -425,14 +425,14 @@ impl MoteDB {
     /// index write locks without contention.
     pub(crate) fn signal_background_threads_stop(&self) {
         if let Some(ref thread) = self.index_builder_thread {
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
         }
         if let Some(ref thread) = self.auto_flush_thread {
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
             let _ = thread.flush_tx.send(());
         }
         if let Some(ref thread) = self.auto_checkpoint_thread {
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 

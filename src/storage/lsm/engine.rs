@@ -800,9 +800,12 @@ impl LSMEngine {
         }
         
         // 3. Check SSTables (Level 0 -> Level 1 -> ... -> Level N)
+        //    When the same key exists in multiple SSTables (e.g. after compaction
+        //    where old L0 files haven't been deleted yet), return the version with
+        //    the highest timestamp (newest).
         let sstable_metas = self.compaction_worker.get_all_sstables()?;
+        let mut best: Option<Value> = None;
 
-        // Search from L0 to LN — no Vec allocation per level
         for level in 0..self.config.num_levels {
             for meta in sstable_metas.iter()
                 .filter(|meta| self.get_level_from_path(&meta.path) == level)
@@ -814,49 +817,53 @@ impl LSMEngine {
                 }
 
                 // 🚀 Lock-free bloom filter pre-check from SSTableMeta
-                //    Avoids SSTableCache mutex acquisition for ~90% of SSTables.
-                //    If bloom is not in meta (startup discovery), fall through to get_or_open.
                 if let Some(ref bloom) = meta.bloom_filter {
                     if !bloom.may_contain(&key.to_be_bytes()) {
                         continue;
                     }
                 }
 
-                // Use cached SSTable handle (避免每次打开文件)
-                // ⭐ 处理 compaction 导致的文件删除：如果文件已被 compaction 删除，跳过该文件
                 let cached = match self.sstable_cache.get_or_open(&meta.path) {
                     Ok(cached) => cached,
                     Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // 文件被 compaction 删除了，跳过
                         continue;
                     }
-                    Err(e) => return Err(e),  // 其他错误需要返回
+                    Err(e) => return Err(e),
                 };
 
-                // 🚀 Lock-free bloom filter pre-check (for metas without bloom)
-                //    If meta had bloom, this is a redundant check but cheap.
                 if meta.bloom_filter.is_none() && !cached.bloom.may_contain(&key.to_be_bytes()) {
                     continue;
                 }
 
-                // Bloom says "maybe present" — acquire SSTable handle (read lock for concurrent access)
                 let sstable = cached.handle.read();
-                
+
                 if let Some(mut value) = sstable.get(key)? {
-                    // Resolve blob reference
                     if let ValueData::Blob(ref blob_ref) = value.data {
                         let blob_data = self.blob_store.get(blob_ref)?;
                         value.data = ValueData::Inline(blob_data);
                     }
-                    
-                    // Check tombstone
-                    if value.deleted {
-                        return Ok(None);
+
+                    // Keep the version with the highest timestamp
+                    if best.as_ref().is_none_or(|b| value.timestamp > b.timestamp) {
+                        best = Some(value);
                     }
-                    
-                    return Ok(Some(value));
                 }
             }
+
+            // Early exit: if we found a non-tombstone entry at this level,
+            // no need to check deeper levels (they have older data).
+            // But we DO need to finish scanning all SSTables at the SAME level
+            // because L0 SSTables are unordered and can overlap.
+            if best.is_some() && level > 0 {
+                break;
+            }
+        }
+
+        if let Some(value) = best {
+            if value.deleted {
+                return Ok(None);
+            }
+            return Ok(Some(value));
         }
         
         Ok(None)

@@ -46,11 +46,12 @@ impl PartialOrd for HeapItem {
 
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        // 1. 按 key 升序（小的优先）
-        // 2. 相同 key 按 timestamp 降序（新的优先）
-        // 3. 相同 key + timestamp 按 source_id 升序（MemTable 优先）
+        // 1. Key ascending (smallest first)
+        // 2. Same key: timestamp descending (newest first) so the freshest
+        //    version is yielded first and older duplicates are skipped by dedup.
+        // 3. Same key + timestamp: source_id ascending (MemTable first)
         self.key.cmp(&other.key)
-            .then(other.value.timestamp.cmp(&self.value.timestamp))  // 注意：反向比较
+            .then(other.value.timestamp.cmp(&self.value.timestamp))  // newest first
             .then(self.source_id.cmp(&other.source_id))
     }
 }
