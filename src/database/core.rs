@@ -429,6 +429,7 @@ impl MoteDB {
         }
         if let Some(ref thread) = self.auto_flush_thread {
             thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            // Wake the auto-flush thread from its recv_timeout
             let _ = thread.flush_tx.send(());
         }
         if let Some(ref thread) = self.auto_checkpoint_thread {
@@ -1254,7 +1255,7 @@ impl MoteDB {
                 debug_log!("[IndexBuilder] Background thread started");
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                             Ok(batch) => {
                                 // Drop guard ensures pending_index_batches is ALWAYS decremented,
                                 // even if batch_build_table_indexes_raw panics.
@@ -1393,7 +1394,7 @@ impl MoteDB {
             .spawn(move || {
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match flush_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                        match flush_rx.recv_timeout(std::time::Duration::from_millis(200)) {
                             Ok(()) => {
                                 if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                                     return false;
@@ -1475,7 +1476,8 @@ impl MoteDB {
                         break;
                     }
                     
-                    let sleep_chunk = Duration::from_secs(1).min(remaining);
+                    // Use 100ms chunks so shutdown is responsive (was 1s)
+                    let sleep_chunk = Duration::from_millis(100).min(remaining);
                     std::thread::sleep(sleep_chunk);
                     remaining = remaining.saturating_sub(sleep_chunk);
                 }
