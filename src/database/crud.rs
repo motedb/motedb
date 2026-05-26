@@ -49,6 +49,12 @@ impl MoteDB {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if let Some(pk_value) = row.get(pk_col.position) {
+                        // NULL primary key is invalid per SQL standard
+                        if matches!(pk_value, Value::Null) {
+                            return Err(StorageError::InvalidData(format!(
+                                "NULL primary key is not allowed for table '{}'", table_name
+                            )));
+                        }
                         let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
 
                         // Fast path: check PK cache (release DashMap guard immediately)
@@ -678,16 +684,14 @@ impl MoteDB {
         self.row_cache.invalidate(table_name, row_id);
 
         // 7.1 Decrement row count for COUNT(*) fast path
-        // Guard against underflow on double-delete (counter wraps on u64)
+        // Use saturating subtract via fetch_update to avoid both underflow
+        // AND the stuck-at-zero bug from CAS-based guard loops.
         if let Some(counter) = self.table_row_count.get(table_name) {
-            use std::sync::atomic::Ordering::SeqCst;
-            let mut current = counter.load(SeqCst);
-            while current > 0 {
-                match counter.compare_exchange_weak(current, current - 1, SeqCst, SeqCst) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
-            }
+            let _ = counter.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |c| Some(c.saturating_sub(1)),
+            );
         }
 
         // 7.2 Remove from PK lookup cache (prevents stale lookups)

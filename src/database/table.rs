@@ -79,10 +79,10 @@ impl MoteDB {
         let table_prefix = self.compute_table_prefix(table_name);
         let start_key = table_prefix << 32;
         let end_key = (table_prefix << 32) | 0xFFFF_FFFF;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
+        // Use write_lsn for tombstone timestamp, same as every other write path.
+        // SystemTime can jump backward (NTP, VM migration), which would cause the
+        // tombstone to be ignored and table rows to reappear after DROP.
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Err(e) = self.lsm_engine.delete_range(start_key, end_key, timestamp) {
             warn_log!("[drop_table] delete_range failed for '{}': {:?}", table_name, e);
         }

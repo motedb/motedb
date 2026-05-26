@@ -290,6 +290,10 @@ impl BlobStore {
                 }
                 let data_len = u32::from_le_bytes(dlen_buf) as u64;
 
+                if data_len > 16 * 1024 * 1024 {
+                    break;
+                }
+
                 // Read data
                 let mut data = vec![0u8; data_len as usize];
                 match file.read_exact(&mut data) {
@@ -327,6 +331,10 @@ impl BlobStore {
                     Err(_) => break,
                 }
                 let size = u32::from_le_bytes(size_buf);
+
+                if size > 16 * 1024 * 1024 {
+                    break;
+                }
 
                 let mut data = vec![0u8; size as usize];
                 match file.read_exact(&mut data) {

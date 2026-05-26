@@ -768,6 +768,9 @@ impl Database {
                 // Fall through to full SQL path to avoid false empty results.
                 if !row_ids_arc.is_empty() {
                     drop(index_ref);
+                    // Post-filter: column index truncates Text values to a prefix,
+                    // so verify the actual row value matches the search value.
+                    let filter_col_pos = schema.get_column_position(col_name);
                     let column_names: Vec<String> = if is_star {
                         schema.column_names()
                     } else {
@@ -782,6 +785,11 @@ impl Database {
                                 Ok(row) => row,
                                 Err(arc) => (*arc).clone(),
                             }))
+                            .filter(|row| {
+                                filter_col_pos
+                                    .map(|pos| row.get(pos) == Some(&value))
+                                    .unwrap_or(true)
+                            })
                             .collect();
                         return Ok(Some(StreamingQueryResult::SelectReady {
                             columns: column_names,
@@ -799,10 +807,16 @@ impl Database {
                             .collect();
                         result_vec.extend(
                             batch.into_iter().filter_map(|(_, opt_arc)| {
-                                opt_arc.map(|a| {
-                                    col_positions.iter()
+                                opt_arc.and_then(|a| {
+                                    // Post-filter: verify actual column value matches search value
+                                    if let Some(pos) = filter_col_pos {
+                                        if a.get(pos) != Some(&value) {
+                                            return None;
+                                        }
+                                    }
+                                    Some(col_positions.iter()
                                         .map(|&pos| a.get(pos).cloned().unwrap_or(Value::Null))
-                                        .collect()
+                                        .collect())
                                 })
                             })
                         );
@@ -964,10 +978,9 @@ impl Database {
     fn positional_fast_add(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => Some(match a.checked_add(*b) {
-                Some(r) => Value::Integer(r),
-                None => Value::Float(*a as f64 + *b as f64),
-            }),
+            (Value::Integer(a), Value::Integer(b)) => {
+                a.checked_add(*b).map(|r| Value::Integer(r))
+            }
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a + *b as f64)),
@@ -977,10 +990,9 @@ impl Database {
     fn positional_fast_sub(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => Some(match a.checked_sub(*b) {
-                Some(r) => Value::Integer(r),
-                None => Value::Float(*a as f64 - *b as f64),
-            }),
+            (Value::Integer(a), Value::Integer(b)) => {
+                a.checked_sub(*b).map(|r| Value::Integer(r))
+            }
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a - b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a - *b as f64)),
@@ -990,10 +1002,9 @@ impl Database {
     fn positional_fast_mul(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => Some(match a.checked_mul(*b) {
-                Some(r) => Value::Integer(r),
-                None => Value::Float(*a as f64 * *b as f64),
-            }),
+            (Value::Integer(a), Value::Integer(b)) => {
+                a.checked_mul(*b).map(|r| Value::Integer(r))
+            }
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a * b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a * *b as f64)),
@@ -1008,7 +1019,7 @@ impl Database {
             (Value::Integer(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 / b)),
             (Value::Integer(a), Value::Integer(b)) if *b != 0 => {
                 // Integer division truncates toward zero, matching SQL semantics
-                Some(Value::Integer(a.checked_div(*b).unwrap_or(0)))
+                a.checked_div(*b).map(|r| Value::Integer(r))
             }
             _ => None,
         }

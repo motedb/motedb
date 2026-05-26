@@ -300,8 +300,12 @@ impl<'a> Lexer<'a> {
     fn read_string(&mut self, quote: char) -> Result<TokenType> {
         self.advance(); // skip opening quote
         let mut value = String::with_capacity(32);
+        const MAX_STRING_LEN: usize = 16 * 1024 * 1024; // 16 MiB limit prevents OOM
 
         while !self.is_eof() {
+            if value.len() >= MAX_STRING_LEN {
+                return Err(MoteDBError::ParseError("String literal exceeds maximum length (16 MiB)".to_string()));
+            }
             let ch = self.current_utf8_char();
 
             if ch == quote {

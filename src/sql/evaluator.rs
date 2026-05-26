@@ -421,27 +421,35 @@ impl ExprEvaluator {
                 BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge => {
                     return Ok(Value::Bool(false));
                 }
-                // AND: FALSE AND anything = FALSE; TRUE AND NULL = NULL → false
+                // AND: FALSE AND anything = FALSE; TRUE AND NULL = NULL
                 BinaryOperator::And => {
                     let lb = match &left { Value::Null => None, v => Some(self.to_bool(v)?) };
                     let rb = match &right { Value::Null => None, v => Some(self.to_bool(v)?) };
-                    // If either side is definitively false, result is false.
-                    // Otherwise (both true or one true + one null), treat as false
-                    // since the null side makes the result unknown.
+                    // FALSE short-circuit (SQL three-valued logic)
                     if lb == Some(false) || rb == Some(false) {
                         return Ok(Value::Bool(false));
                     }
-                    return Ok(Value::Bool(false)); // unknown → false for WHERE
+                    // Both definitively true
+                    if lb == Some(true) && rb == Some(true) {
+                        return Ok(Value::Bool(true));
+                    }
+                    // One or both NULL with no FALSE → unknown
+                    return Ok(Value::Null);
                 }
-                // OR: TRUE OR anything = TRUE; FALSE OR NULL = NULL → false
+                // OR: TRUE OR anything = TRUE; FALSE OR NULL = NULL
                 BinaryOperator::Or => {
                     let lb = match &left { Value::Null => None, v => Some(self.to_bool(v)?) };
                     let rb = match &right { Value::Null => None, v => Some(self.to_bool(v)?) };
-                    // If either side is definitively true, result is true.
+                    // TRUE short-circuit
                     if lb == Some(true) || rb == Some(true) {
                         return Ok(Value::Bool(true));
                     }
-                    return Ok(Value::Bool(false)); // both false or false+null
+                    // Both definitively false
+                    if lb == Some(false) && rb == Some(false) {
+                        return Ok(Value::Bool(false));
+                    }
+                    // One or both NULL with no TRUE → unknown
+                    return Ok(Value::Null);
                 }
                 // Arithmetic/distance: NULL propagates
                 BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul |
@@ -615,8 +623,14 @@ impl ExprEvaluator {
                     _ => return Err(MoteDBError::TypeError("substr() first argument must be text".to_string())),
                 };
                 let start = match self.eval(&args[1], row)? {
-                    Value::Integer(i) if i >= 1 => (i as usize) - 1, // 1-indexed → 0-indexed
-                    _ => return Ok(Value::text(String::new())), // 0 or negative → empty string
+                    // SQL standard: position is 1-indexed; 0 is treated as 1
+                    Value::Integer(i) if i >= 0 => (i.max(1) as usize) - 1,
+                    // Negative position counts from end of string
+                    Value::Integer(i) if i < 0 => {
+                        let from_end = (-i) as usize;
+                        text.chars().count().saturating_sub(from_end)
+                    }
+                    _ => return Ok(Value::text(String::new())),
                 };
                 
                 let result = if args.len() == 3 {
@@ -2116,8 +2130,9 @@ mod tests {
             op: BinaryOperator::Or,
             right: Box::new(Expr::Literal(Value::Null)),
         };
-        assert_eq!(eval(&or_expr3, &r).unwrap(), Value::Bool(false),
-            "FALSE OR NULL should be FALSE");
+        // FALSE OR NULL = NULL in SQL three-valued logic (was incorrectly FALSE)
+        assert!(matches!(eval(&or_expr3, &r).unwrap(), Value::Null),
+            "FALSE OR NULL should be NULL");
     }
 
     #[test]

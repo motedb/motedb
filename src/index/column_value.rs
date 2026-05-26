@@ -14,8 +14,8 @@
 //! - Reads collect from buffer + btree, then filter tombstones (no deadlock)
 //!
 //! Tombstone key normalization:
-//! - BTreeKey serialization truncates value_bytes to 12 bytes (VALUE_DATA_SIZE)
-//! - Tombstone keys are normalized to the same 12-byte prefix so that
+//! - BTreeKey serialization truncates value_bytes to 64 bytes (VALUE_DATA_SIZE)
+//! - Tombstone keys are normalized to the same 64-byte prefix so that
 //!   deserialized btree results match their tombstones correctly for long text
 
 use crate::database::mem_buffer::IndexMemBuffer;
@@ -54,16 +54,16 @@ impl Default for ColumnValueIndexConfig {
     }
 }
 
-/// Compact key layout: [value_data: 12B zero-padded][row_id: 8B BE][value_len: 2B BE] = 22 bytes
-/// - Integer/Float/Timestamp: value_data = 8 bytes BE + 4 bytes zero pad
-/// - Text: value_data = up to 12 bytes UTF-8 + zero pad
-/// - Bool: value_data = 1 byte + 11 bytes zero pad
-const VALUE_DATA_SIZE: usize = 12;
+/// Compact key layout: [value_data: 64B zero-padded][row_id: 8B BE][value_len: 2B BE] = 74 bytes
+/// - Integer/Float/Timestamp: value_data = 8 bytes BE + 56 bytes zero pad
+/// - Text: value_data = up to 64 bytes UTF-8 + zero pad
+/// - Bool: value_data = 1 byte + 63 bytes zero pad
+const VALUE_DATA_SIZE: usize = 64;
 const ROW_ID_SIZE: usize = 8;
 const VALUE_LEN_SIZE: usize = 2;
 
 /// Key for the B-Tree: (column_value, row_id)
-/// value_bytes is a fixed 12-byte stack array — zero heap allocation on clone.
+/// value_bytes is a fixed 64-byte stack array — zero heap allocation on clone.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct IndexKey {
     value_bytes: [u8; VALUE_DATA_SIZE],
@@ -91,14 +91,14 @@ impl BTreeKey for IndexKey {
         let key_size = Self::key_size();
         let mut result = vec![0u8; key_size];
 
-        // Value data: copy 12 bytes as-is
+        // Value data: copy VALUE_DATA_SIZE bytes as-is
         result[..VALUE_DATA_SIZE].copy_from_slice(&self.value_bytes[..]);
 
         // Row ID (big-endian for proper ordering)
         result[VALUE_DATA_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE]
             .copy_from_slice(&self.row_id.to_be_bytes());
 
-        // Value length = VALUE_DATA_SIZE (always 12 for fixed-size)
+        // Value length = VALUE_DATA_SIZE (always 64 for fixed-size)
         let vlen = VALUE_DATA_SIZE as u16;
         result[VALUE_DATA_SIZE + ROW_ID_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE]
             .copy_from_slice(&vlen.to_be_bytes());
@@ -127,7 +127,7 @@ impl BTreeKey for IndexKey {
     }
 
     fn key_size() -> usize {
-        VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE // 22 bytes
+        VALUE_DATA_SIZE + ROW_ID_SIZE + VALUE_LEN_SIZE // 74 bytes
     }
 }
 
@@ -1060,7 +1060,7 @@ impl IndexBuilder for ColumnValueIndex {
             rows_processed: stats.total_row_ids,
             build_time_ms: 0,
             persist_time_ms: 0,
-            index_size_bytes: stats.total_row_ids * 22,
+            index_size_bytes: stats.total_row_ids * IndexKey::key_size(),
         }
     }
 }

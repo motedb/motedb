@@ -766,7 +766,12 @@ impl QueryOptimizer {
     fn estimate_range_fraction(start: &Value, end: &Value) -> f64 {
         match (start, end) {
             (Value::Integer(s), Value::Integer(e)) => {
-                let range = (*e - *s).unsigned_abs() as f64;
+                // Avoid overflow for extreme values (i64::MIN..i64::MAX)
+                let range = if *e >= *s {
+                    (*e as i128 - *s as i128) as f64
+                } else {
+                    (*s as i128 - *e as i128) as f64
+                };
                 // Heuristic: assume integer domain ~[-1B, +1B], clamp fraction
                 ((range / 2_000_000_000.0) * 2.0).clamp(0.001, 0.5)
             }

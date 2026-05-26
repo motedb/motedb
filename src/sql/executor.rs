@@ -2063,7 +2063,11 @@ impl QueryExecutor {
             Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
                 let v = Self::eval_expr_on_row(inner, row, schema)?;
                 match v {
-                    Value::Integer(i) => Ok(Value::Integer(i.checked_neg().unwrap_or(i64::MIN))),
+                    Value::Integer(i) => Ok(match i.checked_neg() {
+                        Some(r) => Value::Integer(r),
+                        // i64::MIN negated overflows — promote to Float (matches evaluator.rs)
+                        None => Value::Float(-(i as f64)),
+                    }),
                     Value::Float(f) => Ok(Value::Float(-f)),
                     Value::Null => Ok(Value::Null),
                     _ => Err(MoteDBError::Query(format!("Cannot negate {:?}", v))),
@@ -3335,10 +3339,11 @@ impl QueryExecutor {
     ) -> Result<Vec<(u64, SqlRow)>> {
         use std::collections::HashMap;
         
-        // Hash key type — canonicalizes Integer/Float to same representation
+        // Hash key type — preserves full i64 precision
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         enum HashKey {
-            Numeric(u64), // f64::to_bits(): Integer(5) and Float(5.0) map to same key
+            Numeric(u64),  // f64::to_bits() for Float and small Integer (< 2^53)
+            Integer(u64),  // i64::to_bits() for Integer, preserves full 64-bit range
             Text(String),
             Bool(bool),
         }
@@ -3346,7 +3351,17 @@ impl QueryExecutor {
         #[inline]
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
-                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Integer(i) => {
+                    // Small integers (within f64 exact range) use Numeric for cross-type
+                    // matching with Float columns. Large integers use Integer to preserve
+                    // full 64-bit precision.
+                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    if *i >= -EXACT_MAX && *i <= EXACT_MAX {
+                        Some(HashKey::Numeric((*i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
@@ -3469,12 +3484,22 @@ impl QueryExecutor {
         use std::collections::HashMap;
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-        enum HashKey { Numeric(u64), Text(String), Bool(bool) }
+        enum HashKey { Numeric(u64), Integer(u64), Text(String), Bool(bool) }
 
         #[inline]
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
-                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Integer(i) => {
+                    // Small integers (within f64 exact range) use Numeric for cross-type
+                    // matching with Float columns. Large integers use Integer to preserve
+                    // full 64-bit precision.
+                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    if *i >= -EXACT_MAX && *i <= EXACT_MAX {
+                        Some(HashKey::Numeric((*i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
@@ -3579,12 +3604,22 @@ impl QueryExecutor {
         use std::collections::HashMap;
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-        enum HashKey { Numeric(u64), Text(String), Bool(bool) }
+        enum HashKey { Numeric(u64), Integer(u64), Text(String), Bool(bool) }
 
         #[inline]
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
-                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Integer(i) => {
+                    // Small integers (within f64 exact range) use Numeric for cross-type
+                    // matching with Float columns. Large integers use Integer to preserve
+                    // full 64-bit precision.
+                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    if *i >= -EXACT_MAX && *i <= EXACT_MAX {
+                        Some(HashKey::Numeric((*i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
@@ -3704,12 +3739,22 @@ impl QueryExecutor {
         use std::collections::HashMap;
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-        enum HashKey { Numeric(u64), Text(String), Bool(bool) }
+        enum HashKey { Numeric(u64), Integer(u64), Text(String), Bool(bool) }
 
         #[inline]
         fn to_hash_key(value: &Value) -> Option<HashKey> {
             match value {
-                Value::Integer(i) => Some(HashKey::Numeric((*i as f64).to_bits())),
+                Value::Integer(i) => {
+                    // Small integers (within f64 exact range) use Numeric for cross-type
+                    // matching with Float columns. Large integers use Integer to preserve
+                    // full 64-bit precision.
+                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    if *i >= -EXACT_MAX && *i <= EXACT_MAX {
+                        Some(HashKey::Numeric((*i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text((**s).clone())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),

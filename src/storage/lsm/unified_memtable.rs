@@ -296,7 +296,10 @@ impl UnifiedMemTable {
 
         // Remove vector if present
         if let Some(ref vec_map) = self.vectors {
-            vec_map.write().remove(&key);
+            if let Some(old_vec) = vec_map.write().remove(&key) {
+                let vec_size = old_vec.len() * 4;
+                self.size.fetch_sub(vec_size, Ordering::Relaxed);
+            }
         }
 
         Ok(())

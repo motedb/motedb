@@ -696,9 +696,10 @@ fn test_substr_negative_start() {
     let (db, _dir) = create_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+    // SUBSTR with negative start counts from end of string (SQL standard)
     let r = rows(&db, "SELECT SUBSTR(name, -1) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::text(String::new()), "SUBSTR with negative start should be empty");
+    assert_eq!(r[0][0], Value::text("o".to_string()), "SUBSTR('hello', -1) should be 'o'");
 }
 
 // R6-9: SUBSTR with start=0 returns empty string
@@ -707,9 +708,10 @@ fn test_substr_zero_start() {
     let (db, _dir) = create_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+    // SUBSTR with start=0 is treated as position 1 per SQL standard
     let r = rows(&db, "SELECT SUBSTR(name, 0) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::text(String::new()), "SUBSTR with start=0 should be empty");
+    assert_eq!(r[0][0], Value::text("hello".to_string()), "SUBSTR('hello', 0) should be 'hello'");
 }
 
 // R6-10: FLOOR/CEIL on large float — should not produce garbage
