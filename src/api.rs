@@ -571,11 +571,11 @@ impl Database {
                 Ok(StreamingQueryResult::Modification { affected_rows: 1 })
             }
             "update" => {
-                let old_row = match self.inner.get_table_row(&meta.table_name, row_id)? {
+                let old_row_arc = match self.inner.get_table_row_arc(&meta.table_name, row_id, &meta.schema)? {
                     Some(r) => r,
                     None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
                 };
-                let mut new_row = old_row.clone();
+                let mut new_row = (*old_row_arc).clone();
                 for &(col_pos, param_idx) in &meta.set_param_positions {
                     if let Some(new_val) = params.get(param_idx - 1) {
                         while new_row.len() <= col_pos {
@@ -584,7 +584,8 @@ impl Database {
                         new_row[col_pos] = new_val.clone();
                     }
                 }
-                self.inner.update_row_in_table_with_schema(&meta.table_name, row_id, old_row, new_row, &meta.schema)?;
+                // Pass &Arc<Row> as &Row — avoids cloning old_row
+                self.inner.update_row_with_schema_ref(&meta.table_name, row_id, &*old_row_arc, new_row, &meta.schema)?;
                 Ok(StreamingQueryResult::Modification { affected_rows: 1 })
             }
             _ => {

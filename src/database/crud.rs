@@ -421,11 +421,17 @@ impl MoteDB {
     pub fn update_row_in_table(&self, table_name: &str, row_id: RowId, old_row: Row, new_row: Row) -> Result<()> {
         ensure_open!(self);
         let schema = self.table_registry.get_table(table_name)?;
-        self.update_row_in_table_with_schema(table_name, row_id, old_row, new_row, &schema)
+        self.update_row_with_schema_ref(table_name, row_id, &old_row, new_row, &schema)
     }
 
     /// Update a row with pre-resolved schema (avoids redundant lookup).
+    /// Takes ownership of old_row for backwards compatibility.
     pub fn update_row_in_table_with_schema(&self, table_name: &str, row_id: RowId, old_row: Row, new_row: Row, schema: &crate::types::TableSchema) -> Result<()> {
+        self.update_row_with_schema_ref(table_name, row_id, &old_row, new_row, schema)
+    }
+
+    /// Core UPDATE implementation — borrows old_row (avoids caller clone).
+    pub fn update_row_with_schema_ref(&self, table_name: &str, row_id: RowId, old_row: &Row, new_row: Row, schema: &crate::types::TableSchema) -> Result<()> {
         ensure_open!(self);
 
         // 1. Check PK uniqueness if primary key is being changed
@@ -481,10 +487,8 @@ impl MoteDB {
         let value = crate::storage::lsm::Value::new(raw_new, timestamp);
         self.lsm_engine.put(composite_key, value)?;
 
-        // Invalidate cache AFTER LSM write — single invalidation is sufficient
-        // because concurrent readers who miss this will either:
-        // (a) read old data from cache — harmless, they started before our update
-        // (b) read new data from LSM on cache miss — correct
+        // Invalidate cache after LSM write — the next read will get the new
+        // value from the active memtable (fast path, no disk I/O).
         self.row_cache.invalidate(table_name, row_id);
 
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
