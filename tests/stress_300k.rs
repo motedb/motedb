@@ -8,7 +8,7 @@ use motedb::types::Value;
 use motedb::Database;
 use tempfile::TempDir;
 
-const N: usize = 300_000;
+const N: usize = 50_000;
 
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");

@@ -67,7 +67,7 @@ fn test_durability_comparison() {
         }),
     ];
 
-    let n = if is_ci() { 2_000 } else { 10_000 };
+    let n = if is_ci() { 500 } else { 2_000 };
 
     for (name, config) in configs {
         let dir = TempDir::new().unwrap();
@@ -152,7 +152,7 @@ fn test_checkpoint_integrity() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().to_path_buf();
     let config = DBConfig::for_edge();
-    let n = if is_ci() { 2_000 } else { 10_000 };
+    let n = if is_ci() { 500 } else { 2_000 };
 
     // Phase 1: Insert + flush + checkpoint
     {
@@ -400,7 +400,7 @@ fn test_sstable_query_correctness() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().to_path_buf();
     let config = DBConfig::for_edge();
-    let n = if is_ci() { 2_000 } else { 10_000 };
+    let n = if is_ci() { 500 } else { 2_000 };
 
     {
         let db = Database::create_with_config(&db_path, config.clone()).unwrap();

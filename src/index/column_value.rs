@@ -823,31 +823,43 @@ impl ColumnValueIndex {
 
         let mut deleted_count = 0;
 
-        // Hold tombstones + btree write lock for the entire operation
+        // Phase 1: Collect mem_buffer keys (takes active.read() briefly, no tombstones held)
+        let buffer_keys: Vec<IndexKey> = self.mem_buffer.range(&start_key, &end_key)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        // Phase 2: BTree deletion (tombstones + btree, no mem_buffer access)
         let mut tombstones = self.tombstones.lock();
         let mut btree = self.btree.write();
 
-        // 1. Find and delete all keys in btree
-        let keys_to_delete: Vec<IndexKey> = btree.range(&start_key, &end_key)?
+        let btree_keys: Vec<IndexKey> = btree.range(&start_key, &end_key)?
             .into_iter()
             .map(|(key, _)| key)
             .collect();
 
-        for key in &keys_to_delete {
+        for key in &btree_keys {
             btree.delete(key)?;
             tombstones.insert(tombstone_key(key));
             deleted_count += 1;
         }
         drop(btree);
 
-        // 2. Delete from mem buffer
-        let buffer_results = self.mem_buffer.range(&start_key, &end_key);
-        for (key, _) in &buffer_results {
-            self.mem_buffer.delete(key);
-            tombstones.insert(tombstone_key(key));
+        // Tombstone mem_buffer keys while still holding tombstones lock
+        let mem_tombstone_keys: Vec<IndexKey> = buffer_keys.iter()
+            .map(|k| tombstone_key(k))
+            .collect();
+        for tk in &mem_tombstone_keys {
+            tombstones.insert(tk.clone());
             deleted_count += 1;
         }
         drop(tombstones);
+
+        // Phase 3: Delete from mem_buffer (no locks held — avoids lock inversion
+        // with flush_buffer which takes active.write() then tombstones)
+        for key in &buffer_keys {
+            self.mem_buffer.delete(key);
+        }
 
         self.lru_cache.invalidate_range(start, end);
 

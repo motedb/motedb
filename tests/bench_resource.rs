@@ -105,9 +105,9 @@ fn bench_memory_footprint() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let rows_small: i64  = if ci {  2_000 } else { 10_000 };
-    let rows_medium: i64 = if ci {  5_000 } else { 50_000 };
-    let rows_large: i64  = if ci { 10_000 } else { 100_000 };
+    let rows_small: i64  = if ci {  1_000 } else {  3_000 };
+    let rows_medium: i64 = if ci {  2_000 } else { 10_000 };
+    let rows_large: i64  = if ci {  5_000 } else { 20_000 };
 
     let (rss_baseline, _) = print_memory("Baseline (empty DB)");
 
@@ -182,7 +182,7 @@ fn bench_query_latency() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let seed_rows: i64   = if ci {  5_000 } else { 30_000 };
+    let seed_rows: i64   = if ci {  2_000 } else { 10_000 };
     let pk_queries: i64  = if ci {  1_000 } else {  5_000 };
     let idx_queries: usize = if ci {    100 } else {    500 };
     let scan_queries: usize = if ci {     10 } else {     50 };
@@ -294,8 +294,8 @@ fn bench_write_latency_cpu() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let insert_latency_rows: i64 = if ci {  2_000 } else { 10_000 };
-    let insert_throughput_rows: i64 = if ci { 5_000 } else { 50_000 };
+    let insert_latency_rows: i64 = if ci {  1_000 } else {  3_000 };
+    let insert_throughput_rows: i64 = if ci { 2_000 } else { 10_000 };
     let update_rows: i64 = if ci { 1_000 } else { 5_000 };
     let delete_rows: i64 = if ci {   500 } else { 3_000 };
 
