@@ -148,7 +148,7 @@ impl MoteDB {
             id as RowId
         } else {
             // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
-            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
 
         // 4. Determine partition
@@ -170,7 +170,7 @@ impl MoteDB {
         // 7. Write to LSM MemTable (invalidate cache first for TOCTOU safety)
         let composite_key = self.make_composite_key(table_name, row_id);
         self.row_cache.invalidate(table_name, row_id);
-        let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value = crate::storage::lsm::Value::new(row_data, ts);
         self.lsm_engine.put(composite_key, value)?;
         self.row_cache.put(table_name.to_string(), row_id, row.clone());
@@ -272,7 +272,7 @@ impl MoteDB {
 
         // 9. Increment row count for COUNT(*) fast path
         if let Some(counter) = self.table_row_count.get(table_name) {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(row_id)
@@ -477,15 +477,14 @@ impl MoteDB {
         self.wal.log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
 
         // 6. Update in LSM MemTable (same bytes as WAL)
-        // Invalidate cache BEFORE LSM write to prevent TOCTOU stale reads
-        self.row_cache.invalidate(table_name, row_id);
-
-        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let value = crate::storage::lsm::Value::new(raw_new, timestamp);
         self.lsm_engine.put(composite_key, value)?;
 
-        // Re-invalidate: catch concurrent readers that cached old data between
-        // the first invalidate and the LSM write
+        // Invalidate cache AFTER LSM write — single invalidation is sufficient
+        // because concurrent readers who miss this will either:
+        // (a) read old data from cache — harmless, they started before our update
+        // (b) read new data from LSM on cache miss — correct
         self.row_cache.invalidate(table_name, row_id);
 
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
@@ -660,7 +659,7 @@ impl MoteDB {
         let partition = (composite_key % self.num_partitions as u64) as PartitionId;
 
         // 4. Compute timestamp (used by both WAL and LSM)
-        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // 5. Write to WAL first (durability guarantee)
         //    WAL must be written BEFORE any mutation so that a crash at any
@@ -673,14 +672,10 @@ impl MoteDB {
         self.increment_pending_updates();
         self.wal.log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
 
-        // 6. Invalidate cache BEFORE tombstone write (prevent TOCTOU stale reads)
-        self.row_cache.invalidate(table_name, row_id);
-
-        // 7. Delete from LSM (using tombstone)
+        // 6. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
 
-        // Re-invalidate: catch concurrent readers that cached old data between
-        // the first invalidate and the LSM write
+        // Invalidate cache AFTER LSM write — single invalidation
         self.row_cache.invalidate(table_name, row_id);
 
         // 7.1 Decrement row count for COUNT(*) fast path
@@ -688,8 +683,8 @@ impl MoteDB {
         // AND the stuck-at-zero bug from CAS-based guard loops.
         if let Some(counter) = self.table_row_count.get(table_name) {
             let _ = counter.fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
                 |c| Some(c.saturating_sub(1)),
             );
         }
@@ -1114,7 +1109,7 @@ impl MoteDB {
             }
         } else {
             // Non-AUTO_INCREMENT: use global row_id
-            let start_id = self.next_row_id.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            let start_id = self.next_row_id.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
             for i in 0..rows.len() {
                 row_ids.push(start_id + i as u64);
             }
@@ -1154,7 +1149,7 @@ impl MoteDB {
                 txn_id: 0,
             });
 
-            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let value = crate::storage::lsm::Value::new(row_data, ts);
             let composite_key = self.make_composite_key(table_name, *row_id);
             kvs.push((composite_key, value));
@@ -1282,7 +1277,7 @@ impl MoteDB {
         // 8. Update row count for COUNT(*) fast path
         if let Some(counter) = self.table_row_count.get(table_name) {
             use std::sync::atomic::Ordering;
-            counter.fetch_add(rows.len() as u64, Ordering::SeqCst);
+            counter.fetch_add(rows.len() as u64, Ordering::Relaxed);
         }
 
         // Auto-flush trigger (pending counter already incremented before WAL write)

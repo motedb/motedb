@@ -533,6 +533,23 @@ impl QueryExecutor {
             _ => {}
         }
 
+        // 🚀 Pre-resolve scalar subqueries in WHERE clause.
+        // This converts `WHERE col > (SELECT AVG(col) FROM t)` into
+        // `WHERE col > Literal(avg_value)` early, allowing the optimizer to
+        // extract range/point query plans and the streaming path to evaluate
+        // the expression per-row without falling back to materialization.
+        let resolved_subq_stmt;
+        let stmt: &SelectStmt = if let Some(ref where_clause) = stmt.where_clause {
+            if Self::expr_contains_subquery(where_clause) {
+                resolved_subq_stmt = self.resolve_subqueries_stmt(stmt)?;
+                &resolved_subq_stmt
+            } else {
+                stmt
+            }
+        } else {
+            stmt
+        };
+
         // 🔥 核心改进：使用查询优化器生成执行计划
         // 🚀 Fast path: Text search and spatial queries must go through execute_select_internal
         // which has the optimized index pushdown paths. The streaming path only handles
@@ -604,6 +621,50 @@ impl QueryExecutor {
                 self.materialize_as_streaming(stmt)
             }
         }
+    }
+
+    /// Check if an expression tree contains any Subquery node.
+    fn expr_contains_subquery(expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(_) => true,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_contains_subquery(left) || Self::expr_contains_subquery(right)
+            }
+            Expr::UnaryOp { expr, .. } => Self::expr_contains_subquery(expr),
+            Expr::In { expr, list, .. } => {
+                Self::expr_contains_subquery(expr) || list.iter().any(Self::expr_contains_subquery)
+            }
+            Expr::Between { expr, low, high, .. } => {
+                Self::expr_contains_subquery(expr)
+                    || Self::expr_contains_subquery(low)
+                    || Self::expr_contains_subquery(high)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                Self::expr_contains_subquery(expr) || Self::expr_contains_subquery(pattern)
+            }
+            Expr::IsNull { expr, .. } => Self::expr_contains_subquery(expr),
+            _ => false,
+        }
+    }
+
+    /// Clone the statement with all subqueries in WHERE resolved to literal values.
+    fn resolve_subqueries_stmt(&self, stmt: &SelectStmt) -> Result<SelectStmt> {
+        let where_clause = match &stmt.where_clause {
+            Some(w) => Some(self.materialize_subqueries(w)?),
+            None => None,
+        };
+        Ok(SelectStmt {
+            columns: stmt.columns.clone(),
+            from: stmt.from.clone(),
+            where_clause,
+            order_by: stmt.order_by.clone(),
+            limit: stmt.limit,
+            offset: stmt.offset,
+            distinct: stmt.distinct,
+            group_by: stmt.group_by.clone(),
+            having: stmt.having.clone(),
+            latest_by: stmt.latest_by.clone(),
+        })
     }
 
     /// Check if an expression contains MATCH, ST_WITHIN, or ST_KNN that needs

@@ -204,14 +204,20 @@ impl ColumnValueIndex {
         })
     }
 
-    /// Open an existing index
+    /// Open an existing index from disk.
+    ///
+    /// Unlike `create()`, this marks `needs_rebuild = false` because the on-disk
+    /// B+Tree already contains all data from prior sessions. The sync INSERT/UPDATE
+    /// path keeps the index up-to-date; the async pipeline can safely skip it.
     pub fn open<P: AsRef<Path>>(
         path: P,
         table_name: String,
         column_name: String,
         config: ColumnValueIndexConfig,
     ) -> Result<Self> {
-        Self::create(path, table_name, column_name, config)
+        let index = Self::create(path, table_name, column_name, config)?;
+        index.needs_rebuild.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(index)
     }
 
     /// Insert a value → row_id mapping
