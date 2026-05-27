@@ -4862,10 +4862,22 @@ impl QueryExecutor {
             }
         }
 
-        // Scan rows positionally
+        // Scan rows positionally — single-pass aggregation
         let row_iter = self.db.scan_table_rows_streaming(table_name)?;
 
-        // Collect matching rows (apply WHERE filter positionally if simple)
+        // Check if we can use single-pass aggregation (no HAVING, or simple HAVING)
+        let can_single_pass = stmt.having.is_none()
+            && group_col_positions.len() <= 2
+            && !select_col_info.iter().any(|(_, _, agg)| agg.as_ref().is_some_and(|a| a.distinct));
+
+        if can_single_pass {
+            return self.single_pass_group_by(
+                row_iter, stmt, schema, table_name,
+                &group_col_positions, &select_col_info,
+            );
+        }
+
+        // Fallback: materialize rows then group
         let raw_rows: Vec<Row> = if let Some(ref where_clause) = stmt.where_clause {
             let mut matching = Vec::new();
             for result in row_iter {
@@ -4889,11 +4901,26 @@ impl QueryExecutor {
         // Build groups using Vec<Value> keys
         let mut groups: HashMap<Vec<Value>, Vec<&Row>> =
             HashMap::with_capacity(raw_rows.len().min(1024));
-        for row in &raw_rows {
-            let group_key: Vec<Value> = group_col_positions.iter()
-                .map(|&pos| row.get(pos).cloned().unwrap_or(Value::Null))
-                .collect();
-            groups.entry(group_key).or_default().push(row);
+
+        if group_col_positions.len() == 1 {
+            // Fast path: single GROUP BY column — avoid Vec allocation per row
+            let pos = group_col_positions[0];
+            let mut single_groups: HashMap<Value, Vec<&Row>> =
+                HashMap::with_capacity(64);
+            for row in &raw_rows {
+                let key = row.get(pos).cloned().unwrap_or(Value::Null);
+                single_groups.entry(key).or_default().push(row);
+            }
+            for (key, rows) in single_groups {
+                groups.insert(vec![key], rows);
+            }
+        } else {
+            for row in &raw_rows {
+                let group_key: Vec<Value> = group_col_positions.iter()
+                    .map(|&pos| row.get(pos).cloned().unwrap_or(Value::Null))
+                    .collect();
+                groups.entry(group_key).or_default().push(row);
+            }
         }
 
         // Handle implicit aggregation with no input rows
@@ -4951,6 +4978,255 @@ impl QueryExecutor {
         }
 
         // Apply ORDER BY if present
+        if let Some(ref order_by) = stmt.order_by {
+            let order_specs: Vec<(usize, bool)> = order_by.iter().filter_map(|ob| {
+                if let Expr::Column(ref col_name) = ob.expr {
+                    let idx = column_names.iter().position(|c| c == col_name)?;
+                    Some((idx, ob.asc))
+                } else {
+                    None
+                }
+            }).collect();
+
+            result_rows.sort_by(|a, b| {
+                for &(idx, asc) in &order_specs {
+                    let cmp = a[idx].partial_cmp(&b[idx]).unwrap_or(std::cmp::Ordering::Equal);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if asc { cmp } else { cmp.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        if stmt.offset.is_some() || stmt.limit.is_some() {
+            let skip_n = stmt.offset.unwrap_or(0);
+            let take_n = stmt.limit.unwrap_or(usize::MAX);
+            result_rows = result_rows.into_iter().skip(skip_n).take(take_n).collect();
+        }
+
+        Ok(Some((column_names, result_rows)))
+    }
+
+    /// Single-pass GROUP BY — accumulates aggregates inline without materializing rows.
+    /// Uses raw byte scan + partial column decode for maximum throughput.
+    fn single_pass_group_by(
+        &self,
+        _row_iter: crate::database::crud::TableRowStreamingIterator,
+        stmt: &SelectStmt,
+        schema: &TableSchema,
+        table_name: &str,
+        group_col_positions: &[usize],
+        select_col_info: &[(String, Option<usize>, Option<AggregateInfo>)],
+    ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+        use std::collections::HashMap;
+
+        // Use raw byte scan — avoid full row decode, only decode needed columns
+        let raw_iter = self.db.scan_table_raw_streaming(table_name)?;
+        let col_types = schema.col_types();
+        let fixed_count = crate::storage::row_format::compute_fixed_count(col_types);
+
+        // Pre-compute which select columns are aggregates and their positions
+        struct AggAccumulator {
+            count: u64,
+            int_sum: i64,
+            float_sum: f64,
+            has_float: bool,
+            has_value: bool,
+            min_val: Option<Value>,
+            max_val: Option<Value>,
+        }
+        impl AggAccumulator {
+            fn new() -> Self {
+                Self {
+                    count: 0, int_sum: 0, float_sum: 0.0,
+                    has_float: false, has_value: false,
+                    min_val: None, max_val: None,
+                }
+            }
+            fn update(&mut self, val: &Value, func: &str) {
+                if matches!(val, Value::Null) { return; }
+                match func {
+                    "COUNT" => { self.count += 1; }
+                    "SUM" | "AVG" => {
+                        self.has_value = true;
+                        self.count += 1;
+                        match val {
+                            Value::Integer(i) => {
+                                if self.has_float {
+                                    self.float_sum += *i as f64;
+                                } else if let Some(s) = self.int_sum.checked_add(*i) {
+                                    self.int_sum = s;
+                                } else {
+                                    self.has_float = true;
+                                    self.float_sum = self.int_sum as f64 + *i as f64;
+                                }
+                            }
+                            Value::Float(f) => {
+                                if !self.has_float { self.has_float = true; self.float_sum = self.int_sum as f64; }
+                                self.float_sum += *f;
+                            }
+                            _ => {}
+                        }
+                    }
+                    "MIN" => {
+                        self.has_value = true;
+                        if self.min_val.is_none() || val < self.min_val.as_ref().unwrap() {
+                            self.min_val = Some(val.clone());
+                        }
+                    }
+                    "MAX" => {
+                        self.has_value = true;
+                        if self.max_val.is_none() || val > self.max_val.as_ref().unwrap() {
+                            self.max_val = Some(val.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn finalize(&self, func: &str) -> Value {
+                match func {
+                    "COUNT" => Value::Integer(self.count as i64),
+                    "SUM" => {
+                        if !self.has_value { return Value::Null; }
+                        if self.has_float { Value::Float(self.float_sum) } else { Value::Integer(self.int_sum) }
+                    }
+                    "AVG" => {
+                        if self.count == 0 { return Value::Null; }
+                        let sum = if self.has_float { self.float_sum } else { self.int_sum as f64 };
+                        Value::Float(sum / self.count as f64)
+                    }
+                    "MIN" => self.min_val.clone().unwrap_or(Value::Null),
+                    "MAX" => self.max_val.clone().unwrap_or(Value::Null),
+                    _ => Value::Null,
+                }
+            }
+        }
+
+        // For each group, store: (group_key_values, Vec<AggAccumulator>)
+        // AggAccumulator per aggregate column in select_col_info
+        let num_aggs = select_col_info.iter().filter(|(_, _, a)| a.is_some()).count();
+        let num_group_cols = group_col_positions.len();
+
+        // Identify which select columns are aggregates (index into select_col_info)
+        let agg_indices: Vec<usize> = select_col_info.iter()
+            .enumerate()
+            .filter(|(_, (_, _, a))| a.is_some())
+            .map(|(i, _)| i)
+            .collect();
+
+        // Build key -> (first_row_group_col_values, accumulators)
+        // Use inline key for single column
+        let mut groups: HashMap<Vec<Value>, (Vec<Value>, Vec<AggAccumulator>)> =
+            HashMap::with_capacity(64);
+
+        let where_clause = &stmt.where_clause;
+        let has_where = where_clause.is_some();
+
+        // Pre-collect columns needed for partial decode (group cols + agg cols)
+        let needed_cols: Vec<usize> = {
+            let mut cols: Vec<usize> = group_col_positions.to_vec();
+            for (_, _, agg_info) in select_col_info {
+                if let Some(ref agg) = agg_info {
+                    if let Some(pos) = agg.col_pos {
+                        if !cols.contains(&pos) {
+                            cols.push(pos);
+                        }
+                    }
+                }
+            }
+            cols.sort_unstable();
+            cols
+        };
+
+        for result in raw_iter {
+            let (_row_id, raw_bytes) = match result {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+
+            // WHERE filter — needs full decode (fallback if WHERE present)
+            if let Some(ref clause) = where_clause {
+                let full_row = match crate::storage::row_format::decode_fast(&raw_bytes, col_types, fixed_count) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                };
+                match Self::eval_expr_on_row(clause, &full_row, schema) {
+                    Ok(Value::Bool(true)) => {}
+                    Ok(_) => continue,
+                    Err(_) => return Ok(None),
+                }
+                // If WHERE passed, decode needed columns from raw bytes for grouping
+            }
+
+            // Partial decode: only decode group key + aggregate columns
+            let get_col = |pos: usize| -> Value {
+                if has_where {
+                    // Already decoded — but we don't have the row here. Use get_column on raw bytes.
+                }
+                crate::storage::row_format::get_column(&raw_bytes, col_types, pos)
+                    .unwrap_or(Value::Null)
+            };
+
+            // Build group key using partial decode
+            let group_key: Vec<Value> = group_col_positions.iter()
+                .map(|&pos| get_col(pos))
+                .collect();
+
+            // Find or create group
+            let entry = groups.entry(group_key.clone()).or_insert_with(|| {
+                let accums = (0..num_aggs).map(|_| AggAccumulator::new()).collect();
+                (group_key, accums)
+            });
+
+            // Update each aggregate accumulator using partial decode
+            for (agg_idx, &select_idx) in agg_indices.iter().enumerate() {
+                if let Some(ref agg) = select_col_info[select_idx].2 {
+                    if let Some(pos) = agg.col_pos {
+                        let val = get_col(pos);
+                        entry.1[agg_idx].update(&val, &agg.func);
+                    } else {
+                        // COUNT(*) or COUNT(1)
+                        entry.1[agg_idx].count += 1;
+                    }
+                }
+            }
+        }
+
+        // Handle implicit aggregation (no GROUP BY, no rows)
+        if groups.is_empty() && group_col_positions.is_empty() {
+            let accums: Vec<AggAccumulator> = (0..num_aggs).map(|_| AggAccumulator::new()).collect();
+            groups.insert(vec![], (vec![], accums));
+        }
+
+        // Build result rows
+        let column_names: Vec<String> = select_col_info.iter()
+            .map(|(name, _, _)| name.clone()).collect();
+        let mut result_rows: Vec<Vec<Value>> = Vec::new();
+
+        for (_key, (group_vals, accums)) in groups {
+            let mut result_row = Vec::with_capacity(select_col_info.len());
+            let mut agg_iter = accums.into_iter();
+            for (_, col_pos, agg_info) in select_col_info {
+                if let Some(pos) = col_pos {
+                    // Group column — find its position in group_col_positions
+                    if let Some(gp_idx) = group_col_positions.iter().position(|p| *p == *pos) {
+                        result_row.push(group_vals.get(gp_idx).cloned().unwrap_or(Value::Null));
+                    } else {
+                        result_row.push(Value::Null);
+                    }
+                } else if let Some(agg) = agg_info {
+                    let accum = agg_iter.next().unwrap();
+                    result_row.push(accum.finalize(&agg.func));
+                } else {
+                    result_row.push(Value::Null);
+                }
+            }
+            result_rows.push(result_row);
+        }
+
+        // Apply ORDER BY
         if let Some(ref order_by) = stmt.order_by {
             let order_specs: Vec<(usize, bool)> = order_by.iter().filter_map(|ob| {
                 if let Expr::Column(ref col_name) = ob.expr {

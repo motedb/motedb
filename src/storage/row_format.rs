@@ -140,6 +140,16 @@ pub fn decode_fast(data: &[u8], col_types: &[ColumnType], fixed_count: usize) ->
     decode_raw_fast(data, col_types, fixed_count)
 }
 
+/// Reusable-buffer version of decode_fast — avoids per-row Vec allocation.
+pub fn decode_fast_into(data: &[u8], col_types: &[ColumnType], fixed_count: usize, buf: &mut Vec<Value>) -> Result<()> {
+    if !is_rawrow(data) {
+        *buf = bincode::deserialize(data)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        return Ok(());
+    }
+    decode_raw_fast_into(data, col_types, fixed_count, buf)
+}
+
 /// Compute the number of fixed-size columns in a schema.
 pub fn compute_fixed_count(col_types: &[ColumnType]) -> usize {
     col_types.iter().filter(|t| is_fixed(t)).count()

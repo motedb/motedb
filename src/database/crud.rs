@@ -911,7 +911,21 @@ impl MoteDB {
             fixed_count: crate::storage::row_format::compute_fixed_count(&col_types),
         })
     }
-    
+
+    /// Raw byte streaming scan — returns (row_id, raw_data_bytes) without decoding.
+    /// Caller can use row_format::get_column() for partial decode.
+    pub fn scan_table_raw_streaming(
+        &self,
+        table_name: &str,
+    ) -> Result<TableRawStreamingIterator> {
+        ensure_open!(self);
+        let table_prefix = self.compute_table_prefix(table_name);
+        let start_key = table_prefix << 32;
+        let end_key = (table_prefix + 1) << 32;
+        let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+        Ok(TableRawStreamingIterator { lsm_iter })
+    }
+
     /// Get approximate row count for a table (fast estimation)
     /// 
     /// Uses LSM storage statistics to estimate row count without full scan.
@@ -1638,6 +1652,38 @@ impl Iterator for TableRowBatchedIterator {
             }
             Some(Err(e)) => Some(Err(e)),
             None => None,
+        }
+    }
+}
+
+/// Raw byte streaming iterator — yields (row_id, raw_bytes) without row decode.
+pub struct TableRawStreamingIterator {
+    lsm_iter: crate::storage::lsm::MergingIterator,
+}
+
+impl Iterator for TableRawStreamingIterator {
+    type Item = Result<(RowId, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.lsm_iter.next() {
+                Some(Ok((composite_key, value))) => {
+                    if value.deleted { continue; }
+                    let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                    match &value.data {
+                        crate::storage::lsm::ValueData::Inline(bytes) => {
+                            return Some(Ok((row_id, bytes.clone())));
+                        }
+                        crate::storage::lsm::ValueData::Blob(_) => {
+                            return Some(Err(StorageError::InvalidData(
+                                "Blob references should be resolved by LSM engine".into()
+                            )));
+                        }
+                    }
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
         }
     }
 }

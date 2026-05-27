@@ -1790,30 +1790,34 @@ impl LSMEngine {
                 let memtable = self.memtable.read();
                 let immutable = self.immutable.read();
 
-                // Source 1: Active MemTable — use scan_arcs to defer data cloning
+                // Source 1: Active MemTable — zero-copy Arc<DataEntry>
                 {
                     let entries = memtable.scan_arcs(start, end);
-                    let iter = entries.into_iter().map(|(k, arc, _vector)| {
-                        Ok((k, Value {
-                            data: arc.data.clone(),
-                            timestamp: arc.timestamp,
-                            deleted: arc.deleted,
-                        }))
-                    });
-                    sources.push(Box::new(iter));
+                    if !entries.is_empty() {
+                        let iter = entries.into_iter().map(|(k, arc)| {
+                            Ok((k, Value {
+                                data: arc.data.clone(),
+                                timestamp: arc.timestamp,
+                                deleted: arc.deleted,
+                            }))
+                        });
+                        sources.push(Box::new(iter));
+                    }
                 }
 
-                // Source 2-N: Immutable queue — same deferred-clone scan
+                // Source 2-N: Immutable queue — zero-copy Arc<DataEntry>
                 for mt in immutable.iter() {
                     let entries = mt.scan_arcs(start, end);
-                    let iter = entries.into_iter().map(|(k, arc, _vector)| {
-                        Ok((k, Value {
-                            data: arc.data.clone(),
-                            timestamp: arc.timestamp,
-                            deleted: arc.deleted,
-                        }))
-                    });
-                    sources.push(Box::new(iter));
+                    if !entries.is_empty() {
+                        let iter = entries.into_iter().map(|(k, arc)| {
+                            Ok((k, Value {
+                                data: arc.data.clone(),
+                                timestamp: arc.timestamp,
+                                deleted: arc.deleted,
+                            }))
+                        });
+                        sources.push(Box::new(iter));
+                    }
                 }
             }
 

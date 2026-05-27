@@ -433,8 +433,8 @@ impl UnifiedMemTable {
 
     /// Lightweight scan: returns Arc<DataEntry> references without cloning row bytes.
     /// Memory usage is O(N * 24) instead of O(N * avg_data_size).
-    /// Caller must clone the data when needed (lazily during iteration).
-    pub fn scan_arcs(&self, start: Key, end: Key) -> Vec<(Key, Arc<DataEntry>, Option<Vec<f32>>)> {
+    /// Skips vector map lookup — use scan_arcs_with_vectors() if vectors needed.
+    pub fn scan_arcs(&self, start: Key, end: Key) -> Vec<(Key, Arc<DataEntry>)> {
         let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
         for shard in &self.shards {
             let s = shard.read();
@@ -446,7 +446,12 @@ impl UnifiedMemTable {
             all.extend(range.map(|(k, v)| (*k, Arc::clone(v))));
         }
         all.sort_by_key(|(k, _)| *k);
+        all
+    }
 
+    /// Like scan_arcs but also fetches vector data (for vector search paths).
+    pub fn scan_arcs_with_vectors(&self, start: Key, end: Key) -> Vec<(Key, Arc<DataEntry>, Option<Vec<f32>>)> {
+        let all = self.scan_arcs(start, end);
         let vec_map = self.vectors.as_ref();
         all.into_iter().map(|(k, arc)| {
             let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
