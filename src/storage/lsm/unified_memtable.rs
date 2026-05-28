@@ -60,7 +60,7 @@ impl UnifiedEntry {
 
     pub fn tombstone(timestamp: u64) -> Self {
         Self {
-            data: ValueData::Inline(Vec::new()),
+            data: ValueData::Inline(std::sync::Arc::new(Vec::new())),
             vector: None,
             timestamp,
             deleted: true,
@@ -279,7 +279,7 @@ impl UnifiedMemTable {
     /// Delete (insert tombstone) — single shard write lock
     pub fn delete(&self, key: Key, timestamp: u64) -> Result<()> {
         let entry = Arc::new(DataEntry {
-            data: ValueData::Inline(Vec::new()),
+            data: ValueData::Inline(std::sync::Arc::new(Vec::new())),
             timestamp,
             deleted: true,
         });
@@ -547,7 +547,7 @@ mod tests {
 
         for i in 0..10 {
             let key = i;
-            let data = ValueData::Inline(format!("data_{}", i).into_bytes());
+            let data = ValueData::Inline(std::sync::Arc::new(format!("data_{}", i).into_bytes()));
             let vector = vec![i as f32, (i + 1) as f32, (i + 2) as f32];
             memtable.put_with_vector(key, data, vector, i).unwrap();
         }

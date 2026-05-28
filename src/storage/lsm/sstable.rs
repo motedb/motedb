@@ -338,7 +338,7 @@ impl SSTable {
                         let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
                         pos += 4;
                         if pos + vlen > buf.len() { return Ok(None); }
-                        ValueData::Inline(buf[pos..pos+vlen].to_vec())
+                        ValueData::Inline(std::sync::Arc::new(buf[pos..pos+vlen].to_vec()))
                     }
                     1 => {
                         if pos + 16 > buf.len() { return Ok(None); }
@@ -941,7 +941,7 @@ impl DataBlock {
                     }
                     let inline_data = data[offset..offset+value_len].to_vec();
                     offset += value_len;
-                    ValueData::Inline(inline_data)
+                    ValueData::Inline(std::sync::Arc::new(inline_data))
                 }
                 1 => {
                     // Blob reference

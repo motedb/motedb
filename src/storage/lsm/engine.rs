@@ -741,7 +741,7 @@ impl LSMEngine {
 
             if let ValueData::Blob(ref blob_ref) = value.data {
                 let blob_data = self.blob_store.get(blob_ref)?;
-                value.data = ValueData::Inline(blob_data);
+                value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
             }
             return Ok(Some(value));
         }
@@ -794,7 +794,7 @@ impl LSMEngine {
             // Resolve blob reference
             if let ValueData::Blob(ref blob_ref) = value.data {
                 let blob_data = self.blob_store.get(blob_ref)?;
-                value.data = ValueData::Inline(blob_data);
+                value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
             }
             return Ok(Some(value));
         }
@@ -840,7 +840,7 @@ impl LSMEngine {
                 if let Some(mut value) = sstable.get(key)? {
                     if let ValueData::Blob(ref blob_ref) = value.data {
                         let blob_data = self.blob_store.get(blob_ref)?;
-                        value.data = ValueData::Inline(blob_data);
+                        value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                     }
 
                     // Keep the version with the highest timestamp
@@ -900,7 +900,7 @@ impl LSMEngine {
                     // Resolve blob reference if needed
                     if let ValueData::Blob(ref blob_ref) = value.data {
                         let blob_data = self.blob_store.get(blob_ref)?;
-                        value.data = ValueData::Inline(blob_data);
+                        value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                     }
                     
                     // Don't return tombstones (keep as None for deleted entries)
@@ -939,7 +939,7 @@ impl LSMEngine {
                         // Resolve blob reference
                         if let ValueData::Blob(ref blob_ref) = value.data {
                             let blob_data = self.blob_store.get(blob_ref)?;
-                            value.data = ValueData::Inline(blob_data);
+                            value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                         }
                         
                         // Don't return tombstones (keep as None for deleted entries)
@@ -977,7 +977,7 @@ impl LSMEngine {
                         };
                         if let ValueData::Blob(ref blob_ref) = value.data {
                             if let Ok(blob_data) = self.blob_store.get(blob_ref) {
-                                value.data = ValueData::Inline(blob_data);
+                                value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                             }
                         }
                         if !value.deleted {
@@ -1049,7 +1049,7 @@ impl LSMEngine {
                         // Resolve blob reference
                         if let ValueData::Blob(ref blob_ref) = value.data {
                             let blob_data = self.blob_store.get(blob_ref)?;
-                            value.data = ValueData::Inline(blob_data);
+                            value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                         }
                         
                         // Don't add tombstones to results (keep as None)
@@ -1476,7 +1476,7 @@ impl LSMEngine {
         use std::collections::BTreeMap;
 
         // BTreeMap: keeps keys sorted naturally, avoids separate sort step
-        let mut merged: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
+        let mut merged: BTreeMap<Key, std::sync::Arc<Vec<u8>>> = BTreeMap::new();
 
         // 1. Scan immutable queue (oldest to newest, so newer values overwrite)
         {
@@ -1490,7 +1490,7 @@ impl LSMEngine {
                         ValueData::Inline(d) => { merged.insert(k, d.clone()); }
                         ValueData::Blob(blob_ref) => {
                             if let Ok(data) = self.blob_store.get(blob_ref) {
-                                merged.insert(k, data);
+                                merged.insert(k, std::sync::Arc::new(data));
                             }
                         }
                     }
@@ -1508,7 +1508,7 @@ impl LSMEngine {
                     ValueData::Inline(d) => { merged.insert(k, d.clone()); }
                     ValueData::Blob(blob_ref) => {
                         if let Ok(data) = self.blob_store.get(blob_ref) {
-                            merged.insert(k, data);
+                            merged.insert(k, std::sync::Arc::new(data));
                         }
                     }
                 }
@@ -1569,7 +1569,7 @@ impl LSMEngine {
                         },
                         ValueData::Blob(blob_ref) => {
                             match self.blob_store.get(blob_ref) {
-                                Ok(data) => all_entries.push((k, data)),
+                                Ok(data) => all_entries.push((k, std::sync::Arc::new(data))),
                                 Err(_) => {}, // blob resolution failed, skip entry
                             }
                         },
@@ -1593,7 +1593,7 @@ impl LSMEngine {
                     },
                     ValueData::Blob(blob_ref) => {
                         match self.blob_store.get(blob_ref) {
-                            Ok(data) => all_entries.push((k, data)),
+                            Ok(data) => all_entries.push((k, std::sync::Arc::new(data))),
                             Err(_) => {}, // blob resolution failed, skip entry
                         }
                     },

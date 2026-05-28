@@ -48,13 +48,24 @@ pub struct BlobRef {
 }
 
 /// Value storage type
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ValueData {
-    /// Inline small value (< blob_threshold)
-    Inline(Vec<u8>),
+    /// Inline small value (< blob_threshold) — Arc for O(1) clone during scan
+    Inline(std::sync::Arc<Vec<u8>>),
     /// Reference to blob file for large value
     Blob(BlobRef),
 }
+
+impl PartialEq for ValueData {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ValueData::Inline(a), ValueData::Inline(b)) => a.as_slice() == b.as_slice(),
+            (ValueData::Blob(a), ValueData::Blob(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for ValueData {}
 
 impl ValueData {
     /// Get size of value data (for inline: actual data size, for blob: ref size)
@@ -89,7 +100,7 @@ pub struct Value {
 impl Value {
     pub fn new(data: Vec<u8>, timestamp: u64) -> Self {
         Self {
-            data: ValueData::Inline(data),
+            data: ValueData::Inline(std::sync::Arc::new(data)),
             timestamp,
             deleted: false,
         }
@@ -105,16 +116,16 @@ impl Value {
     
     pub fn tombstone(timestamp: u64) -> Self {
         Self {
-            data: ValueData::Inline(Vec::new()),
+            data: ValueData::Inline(std::sync::Arc::new(Vec::new())),
             timestamp,
             deleted: true,
         }
     }
-    
+
     /// Get inline data if available
     pub fn as_inline(&self) -> Option<&[u8]> {
         match &self.data {
-            ValueData::Inline(data) => Some(data),
+            ValueData::Inline(data) => Some(data.as_slice()),
             ValueData::Blob(_) => None,
         }
     }

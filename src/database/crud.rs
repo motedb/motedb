@@ -313,7 +313,7 @@ impl MoteDB {
             }
 
             let data: Vec<u8> = match &value.data {
-                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                crate::storage::lsm::ValueData::Inline(bytes) => bytes.to_vec(),
                 crate::storage::lsm::ValueData::Blob(blob_ref) => {
                     match self.lsm_engine.resolve_blob(blob_ref) {
                         Ok(data) => data,
@@ -1672,7 +1672,7 @@ impl Iterator for TableRawStreamingIterator {
                     let row_id = (composite_key & 0xFFFFFFFF) as RowId;
                     match &value.data {
                         crate::storage::lsm::ValueData::Inline(bytes) => {
-                            return Some(Ok((row_id, bytes.clone())));
+                            return Some(Ok((row_id, bytes.to_vec())));
                         }
                         crate::storage::lsm::ValueData::Blob(_) => {
                             return Some(Err(StorageError::InvalidData(

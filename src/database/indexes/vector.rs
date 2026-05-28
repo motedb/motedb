@@ -88,7 +88,7 @@ impl MoteDB {
                             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
 
                             let data_bytes: Vec<u8> = match &value.data {
-                                crate::storage::lsm::ValueData::Inline(bytes) => bytes.clone(),
+                                crate::storage::lsm::ValueData::Inline(bytes) => bytes.to_vec(),
                                 crate::storage::lsm::ValueData::Blob(blob_ref) => {
                                     match self.lsm_engine.resolve_blob(blob_ref) {
                                         Ok(data) => data,

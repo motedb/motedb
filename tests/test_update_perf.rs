@@ -70,3 +70,64 @@ fn test_update_correctness_and_perf() {
 
     db.close().ok();
 }
+
+#[test]
+fn test_value_size() {
+    use std::mem::size_of;
+    println!("Value: {} bytes", size_of::<motedb::types::Value>());
+    println!("Row (Vec<Value>): {} bytes", size_of::<motedb::types::Row>());
+    println!("ArcString: {} bytes", size_of::<motedb::types::ArcString>());
+    println!("String: {} bytes", size_of::<String>());
+}
+
+#[test]
+fn test_scan_layer_timing() {
+    use std::time::Instant;
+    let dir = TempDir::new().unwrap();
+    let db = Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v2 TEXT, v3 FLOAT, v4 TEXT)").unwrap();
+
+    let n = 10_000;
+    for i in 1..=n as i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, 'hello_{}', {}, 'R{}')", i, i % 100, i as f64, i % 4)).unwrap();
+    }
+
+    for _ in 0..3 { db.execute("SELECT * FROM t").unwrap(); }
+
+    let iters = 50;
+
+    // Layer 1: SELECT * (fast path, no WHERE)
+    let now = Instant::now();
+    for _ in 0..iters {
+        let _ = db.execute("SELECT * FROM t").unwrap().materialize().unwrap();
+    }
+    println!("SELECT * ({} rows): {:.1}µs", n, now.elapsed().as_micros() as f64 / iters as f64);
+
+    // Layer 2: GROUP BY region (single-pass partial decode)
+    let now = Instant::now();
+    for _ in 0..iters {
+        let _ = db.execute("SELECT v4, COUNT(*), AVG(v3) FROM t GROUP BY v4").unwrap().materialize().unwrap();
+    }
+    println!("GROUP BY v4: {:.1}µs", now.elapsed().as_micros() as f64 / iters as f64);
+
+    // Layer 3: WHERE
+    let now = Instant::now();
+    for _ in 0..iters {
+        let _ = db.execute("SELECT * FROM t WHERE v4 = 'R0'").unwrap().materialize().unwrap();
+    }
+    println!("WHERE v4='R0': {:.1}µs", now.elapsed().as_micros() as f64 / iters as f64);
+
+    // Layer 4: ORDER BY
+    let now = Instant::now();
+    for _ in 0..iters {
+        let _ = db.execute("SELECT * FROM t ORDER BY v3 DESC LIMIT 10").unwrap().materialize().unwrap();
+    }
+    println!("ORDER BY DESC LIMIT 10: {:.1}µs", now.elapsed().as_micros() as f64 / iters as f64);
+
+    // Layer 5: PK lookup
+    let now = Instant::now();
+    for i in 1..=1000i64 {
+        let _ = db.execute(&format!("SELECT * FROM t WHERE id = {}", i)).unwrap().materialize().unwrap();
+    }
+    println!("PK SELECT: {:.1}µs/op", now.elapsed().as_micros() as f64 / 1000.0);
+}

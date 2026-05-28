@@ -5528,7 +5528,12 @@ impl QueryExecutor {
         let mut resolved_cols = Vec::new();
         for col_spec in &stmt.columns {
             match col_spec {
-                SelectColumn::Star => return Ok(None), // complex
+                SelectColumn::Star => {
+                    // Expand SELECT * into all schema columns for positional path
+                    for col_def in &schema.columns {
+                        resolved_cols.push((col_def.name.clone(), Some(col_def.position)));
+                    }
+                }
                 SelectColumn::Column(name) => {
                     if let Some(pos) = schema.get_column_position(name) {
                         resolved_cols.push((name.clone(), Some(pos)));
