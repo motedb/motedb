@@ -114,9 +114,17 @@ impl Value {
         }
     }
     
+    /// Shared empty Arc for tombstones — avoids per-tombstone allocation.
+    /// Every tombstone has empty data, so they can all share the same Arc.
+    fn empty_arc() -> std::sync::Arc<Vec<u8>> {
+        // leak is fine: this is a global singleton, lives for the process lifetime
+        static EMPTY: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| std::sync::Arc::new(Vec::new())).clone()
+    }
+
     pub fn tombstone(timestamp: u64) -> Self {
         Self {
-            data: ValueData::Inline(std::sync::Arc::new(Vec::new())),
+            data: ValueData::Inline(Self::empty_arc()),
             timestamp,
             deleted: true,
         }

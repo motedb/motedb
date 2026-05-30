@@ -140,21 +140,49 @@ impl SSTable {
         // Read footer
         let footer = Self::read_footer(&mut file)?;
 
-        // Read index
-        file.seek(SeekFrom::Start(footer.index_offset))?;
-        let mut index_buf = vec![0u8; footer.index_size as usize];
-        file.read_exact(&mut index_buf)?;
-        let index = BlockIndex::deserialize(&index_buf)?;
-
-        // Read bloom filter
-        file.seek(SeekFrom::Start(footer.bloom_offset))?;
-        let mut bloom_buf = vec![0u8; footer.bloom_size as usize];
-        file.read_exact(&mut bloom_buf)?;
-        let bloom = BloomFilter::from_bytes_full(&bloom_buf)
-            .ok_or_else(|| StorageError::InvalidData("Invalid Bloom filter".into()))?;
-
-        // mmap the file for zero-syscall block reads (Arc-shared with iterators)
+        // mmap the file FIRST — enables zero-copy reads for index and bloom below
         let mmap = unsafe { Mmap::map(&file).ok() }.map(Arc::new);
+
+        // Read block index — prefer mmap zero-copy, fallback to read
+        let index = if let Some(ref mmap_data) = mmap {
+            let start = footer.index_offset as usize;
+            let end = start + footer.index_size as usize;
+            if end <= mmap_data.len() {
+                BlockIndex::deserialize(&mmap_data[start..end])?
+            } else {
+                file.seek(SeekFrom::Start(footer.index_offset))?;
+                let mut index_buf = vec![0u8; footer.index_size as usize];
+                file.read_exact(&mut index_buf)?;
+                BlockIndex::deserialize(&index_buf)?
+            }
+        } else {
+            file.seek(SeekFrom::Start(footer.index_offset))?;
+            let mut index_buf = vec![0u8; footer.index_size as usize];
+            file.read_exact(&mut index_buf)?;
+            BlockIndex::deserialize(&index_buf)?
+        };
+
+        // Read bloom filter — prefer mmap zero-copy, fallback to read
+        let bloom = if let Some(ref mmap_data) = mmap {
+            let start = footer.bloom_offset as usize;
+            let end = start + footer.bloom_size as usize;
+            if end <= mmap_data.len() {
+                BloomFilter::from_bytes_full(&mmap_data[start..end])
+                    .ok_or_else(|| StorageError::InvalidData("Invalid Bloom filter".into()))?
+            } else {
+                file.seek(SeekFrom::Start(footer.bloom_offset))?;
+                let mut bloom_buf = vec![0u8; footer.bloom_size as usize];
+                file.read_exact(&mut bloom_buf)?;
+                BloomFilter::from_bytes_full(&bloom_buf)
+                    .ok_or_else(|| StorageError::InvalidData("Invalid Bloom filter".into()))?
+            }
+        } else {
+            file.seek(SeekFrom::Start(footer.bloom_offset))?;
+            let mut bloom_buf = vec![0u8; footer.bloom_size as usize];
+            file.read_exact(&mut bloom_buf)?;
+            BloomFilter::from_bytes_full(&bloom_buf)
+                .ok_or_else(|| StorageError::InvalidData("Invalid Bloom filter".into()))?
+        };
 
         Ok(Self {
             path,
