@@ -1218,6 +1218,28 @@ impl QueryExecutor {
             }
         }
 
+        // 🆕 TimeSeries table routing: use columnar store with zone maps + bloom filters
+        // when the table is TimeSeries type. Falls through to LSM for complex queries.
+        if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let Ok(schema) = self.db.get_table_schema(table_name) {
+                if schema.table_type == crate::types::TableType::TimeSeries {
+                    if let Some(result) = self.try_columnar_select(stmt, &schema)? {
+                        // Convert QueryResult to StreamingQueryResult
+                        match result {
+                            QueryResult::Select { columns, rows } => {
+                                return Ok(StreamingQueryResult::SelectReady { columns, rows });
+                            }
+                            _ => return Ok(StreamingQueryResult::SelectReady {
+                                columns: vec![],
+                                rows: vec![],
+                            }),
+                        }
+                    }
+                    // Fall through to LSM full scan for complex queries
+                }
+            }
+        }
+
         // Pass bind parameters to optimizer (resolves ? inline, no AST clone needed).
         let has_params = Self::contains_parameter_stmt(stmt);
         let plan = if has_params {
@@ -1261,6 +1283,11 @@ impl QueryExecutor {
                     return self.materialize_as_streaming(stmt);
                 }
                 self.execute_full_scan_streaming(stmt, table)
+            }
+            super::optimizer::ScanMethod::IndexIntersection {
+                ref table, ref column1, ref value1, ref column2, ref value2,
+            } if !has_post_filters => {
+                self.execute_index_intersection_streaming(stmt, table, column1, value1, column2, value2)
             }
             _ => {
                 // Fallback to materialized path (handles params via eval())
@@ -1747,7 +1774,106 @@ impl QueryExecutor {
             max_result_rows: None,
         })
     }
-    
+
+    /// Execute an index intersection plan: look up both indexes, intersect row IDs,
+    /// batch-fetch matching rows, then project.
+    fn execute_index_intersection_streaming(
+        &self,
+        stmt: &SelectStmt,
+        table: &str,
+        column1: &str,
+        value1: &Value,
+        column2: &str,
+        value2: &Value,
+    ) -> Result<StreamingQueryResult> {
+        let schema = self.db.get_table_schema(table)?;
+        let columns = self.build_select_columns(&stmt.columns, &schema)?;
+
+        let idx1_name = format!("{}.{}", table, column1);
+        let idx2_name = format!("{}.{}", table, column2);
+
+        // Look up row IDs from first index
+        let row_ids1 = {
+            let idx_ref = self.db.column_indexes.get(&idx1_name)
+                .ok_or_else(|| MoteDBError::InvalidArgument(format!("Index {} not found", idx1_name)))?;
+            idx_ref.value().get(value1)?
+        };
+        let row_id_set1: std::collections::HashSet<u64> = row_ids1.into_iter().collect();
+
+        // Look up row IDs from second index and intersect
+        let row_ids2 = {
+            let idx_ref = self.db.column_indexes.get(&idx2_name)
+                .ok_or_else(|| MoteDBError::InvalidArgument(format!("Index {} not found", idx2_name)))?;
+            idx_ref.value().get(value2)?
+        };
+        let intersected: Vec<u64> = row_ids2.into_iter()
+            .filter(|id| row_id_set1.contains(id))
+            .collect();
+
+        if intersected.is_empty() {
+            return Ok(StreamingQueryResult::SelectReady {
+                columns,
+                rows: vec![],
+            });
+        }
+
+        // Batch fetch intersected rows
+        let rows_result = self.db.get_table_rows_batch_arc(table, &intersected)?;
+
+        // Project each row
+        let projected_rows: Vec<Vec<Value>> = rows_result.into_iter()
+            .filter_map(|(_row_id, opt_row)| opt_row)
+            .map(|row| {
+                let row: Vec<Value> = (*row).clone();
+                Self::project_row_direct(&row, &stmt.columns, &columns, &schema)
+            })
+            .collect();
+
+        // Apply modifiers
+        let mut rows = projected_rows;
+        if stmt.distinct {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|row| seen.insert(row.clone()));
+        }
+        if let Some(ref order_by) = stmt.order_by {
+            let sort_specs: Vec<(usize, bool)> = order_by.iter().filter_map(|ob| {
+                let col_name = match &ob.expr { Expr::Column(name) => name, _ => return None };
+                let bare = if col_name.contains('.') { col_name.rsplit('.').next().unwrap_or(col_name) } else { col_name };
+                columns.iter().position(|c| c == bare || c == col_name).map(|i| (i, ob.asc))
+            }).collect();
+            if !sort_specs.is_empty() {
+                rows.sort_by(|a, b| {
+                    for &(col_idx, asc) in &sort_specs {
+                        if col_idx >= a.len() || col_idx >= b.len() { continue; }
+                        let ord = match (&a[col_idx], &b[col_idx]) {
+                            (Value::Float(fa), Value::Float(fb)) => {
+                                if fa.is_nan() && fb.is_nan() { std::cmp::Ordering::Equal }
+                                else if fa.is_nan() { std::cmp::Ordering::Greater }
+                                else if fb.is_nan() { std::cmp::Ordering::Less }
+                                else { fa.partial_cmp(fb).unwrap_or(std::cmp::Ordering::Equal) }
+                            }
+                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                            (Value::Null, _) => std::cmp::Ordering::Less,
+                            (_, Value::Null) => std::cmp::Ordering::Greater,
+                            (va, vb) => va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal),
+                        };
+                        let final_ord = if asc { ord } else { ord.reverse() };
+                        if final_ord != std::cmp::Ordering::Equal { return final_ord; }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+        }
+        if let Some(offset) = stmt.offset {
+            rows = rows.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = stmt.limit {
+            rows.truncate(limit);
+        }
+
+        Ok(StreamingQueryResult::SelectReady { columns, rows })
+    }
+
     /// 🔥 全表扫描流式（现有实现）
     fn execute_full_scan_streaming(&self, stmt: &SelectStmt, table: &str) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;

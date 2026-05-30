@@ -87,11 +87,11 @@ pub enum ScanMethod {
     },
     
     /// Primary key index scan (ordered by primary key)
-    /// 
+    ///
     /// Used when:
     /// - ORDER BY primary_key [ASC/DESC]
     /// - Optional: LIMIT n
-    /// 
+    ///
     /// Benefits:
     /// - No in-memory sorting needed
     /// - Can early terminate with LIMIT
@@ -100,6 +100,17 @@ pub enum ScanMethod {
         table: String,
         ascending: bool,
         limit: Option<usize>,
+    },
+
+    /// Multi-index intersection: use two column indexes and intersect row IDs.
+    /// For `WHERE col1 = v1 AND col2 = v2`, look up both indexes and take
+    /// the intersection of matching row IDs, then batch-fetch only those rows.
+    IndexIntersection {
+        table: String,
+        column1: String,
+        value1: Value,
+        column2: String,
+        value2: Value,
     },
 }
 
@@ -112,7 +123,8 @@ impl ScanMethod {
             ScanMethod::TextSearch { table, .. } |
             ScanMethod::VectorSearch { table, .. } |
             ScanMethod::SpatialRange { table, .. } |
-            ScanMethod::PrimaryKeyScan { table, .. } => table,
+            ScanMethod::PrimaryKeyScan { table, .. } |
+            ScanMethod::IndexIntersection { table, .. } => table,
         }
     }
 }
@@ -372,15 +384,16 @@ impl QueryOptimizer {
         }
         
         match expr {
-            // AND: Try to use most selective index
+            // AND: Try to use most selective index, or intersect two indexes
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
                 // Try left operand
                 self.analyze_where_clause(table_name, left, params, plans)?;
-                
+
                 // Try right operand
                 self.analyze_where_clause(table_name, right, params, plans)?;
-                
-                // TODO: Try combining multiple indexes
+
+                // Try combining two indexes for intersection
+                self.try_index_intersection(table_name, left, right, params, plans)?;
             }
             
             // OR: Must evaluate all branches
@@ -594,6 +607,81 @@ impl QueryOptimizer {
     /// ## 示例
     /// - `id >= 100 AND id < 200` → `("id", 100, true, 200, false)`
     /// - `id > 100 AND id <= 200` → `("id", 100, false, 200, true)`
+    /// Try to create an index intersection plan for `AND` conditions.
+    /// If both sides of AND are simple `col = value` with column indexes,
+    /// intersect the row IDs from both indexes to reduce the result set.
+    fn try_index_intersection(
+        &self,
+        table_name: &str,
+        left: &Expr,
+        right: &Expr,
+        _params: &[crate::types::Value],
+        plans: &mut Vec<QueryPlan>,
+    ) -> Result<()> {
+        // Extract (column, value) from both sides of AND
+        let left_cv = Self::extract_eq_column_value(left);
+        let right_cv = Self::extract_eq_column_value(right);
+
+        if let (Some((col1, val1)), Some((col2, val2))) = (left_cv, right_cv) {
+            // Both sides are simple col = value — check for indexes on both
+            let idx1 = format!("{}.{}", table_name, col1);
+            let idx2 = format!("{}.{}", table_name, col2);
+
+            if col1 != col2
+                && self.db.column_indexes.contains_key(&idx1)
+                && self.db.column_indexes.contains_key(&idx2)
+            {
+                // Estimate: intersection is roughly the product of selectivities
+                let stats1 = self.get_index_stats(&idx1).unwrap_or(IndexStats {
+                    cardinality: 100, total_rows: 10000, size_bytes: 0, is_unique: false,
+                });
+                let stats2 = self.get_index_stats(&idx2).unwrap_or(IndexStats {
+                    cardinality: 100, total_rows: 10000, size_bytes: 0, is_unique: false,
+                });
+
+                let sel1 = stats1.selectivity();
+                let sel2 = stats2.selectivity();
+                let combined_sel = sel1 * sel2;
+                let estimated_rows = ((stats1.total_rows as f64) * combined_sel).max(1.0) as usize;
+
+                // Cost: two index lookups + intersection + row fetch
+                let cost = self.cost_params.index_lookup_cost * 2.0
+                    + (estimated_rows as f64 * self.cost_params.memory_read_cost);
+
+                // Only use intersection if it's cheaper than a single index + full scan
+                // Heuristic: intersection estimated_rows < total_rows * 0.3
+                if estimated_rows < stats1.total_rows / 3 {
+                    plans.push(QueryPlan {
+                        scan_method: ScanMethod::IndexIntersection {
+                            table: table_name.to_string(),
+                            column1: col1,
+                            value1: val1,
+                            column2: col2,
+                            value2: val2,
+                        },
+                        estimated_cost: cost,
+                        estimated_rows,
+                        post_filters: vec![],
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract (column_name, value) from a simple `col = literal` expression.
+    fn extract_eq_column_value(expr: &Expr) -> Option<(String, Value)> {
+        if let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr {
+            if let Expr::Column(col) = left.as_ref() {
+                if let Expr::Literal(val) = right.as_ref() {
+                    return Some((col.clone(), val.clone()));
+                }
+            }
+        }
+        None
+    }
+
     fn try_extract_range_query(&self, expr: &Expr, params: &[crate::types::Value]) -> Option<(String, Value, bool, Value, bool)> {
         match expr {
             Expr::BinaryOp { left, op: BinaryOperator::And, right } => {

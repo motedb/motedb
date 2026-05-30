@@ -55,11 +55,23 @@ pub struct SSTable {
     footer: Footer,
 }
 
-/// Block index for binary search
+/// Block index entry — per-block metadata for binary search + zone map skipping.
+#[derive(Clone, Debug)]
+pub struct BlockIndexEntry {
+    /// First (smallest) key in this block
+    pub first_key: Key,
+    /// Byte offset of this block in the SSTable file
+    pub offset: u64,
+    /// Size of this block in bytes (including CRC32)
+    pub size: u32,
+    /// Last (largest) key in this block (zone map upper bound)
+    pub last_key: Key,
+}
+
+/// Block index for binary search + zone map block skipping
 #[derive(Clone, Debug)]
 pub struct BlockIndex {
-    /// Entries: (first_key, offset, size)
-    entries: Vec<(Key, u64, u32)>,
+    entries: Vec<BlockIndexEntry>,
 }
 
 /// SSTable footer (stored at end of file)
@@ -96,7 +108,7 @@ impl SSTable {
             let mut index_buf = vec![0u8; footer.index_size as usize];
             file.read_exact(&mut index_buf)?;
             match BlockIndex::deserialize(&index_buf) {
-                Ok(idx) if !idx.entries.is_empty() => idx.entries[0].0,
+                Ok(idx) if !idx.entries.is_empty() => idx.entries[0].first_key,
                 _ => 0u64,
             }
         } else {
@@ -166,7 +178,7 @@ impl SSTable {
     }
 
     /// Share the block index entries with an iterator (cheap Arc clone).
-    pub fn shared_index_entries(&self) -> Arc<Vec<(Key, u64, u32)>> {
+    pub fn shared_index_entries(&self) -> Arc<Vec<BlockIndexEntry>> {
         self.index.shared_entries()
     }
 
@@ -252,7 +264,7 @@ impl SSTable {
             None => return Ok(None),
         };
 
-        let block_buf = self.read_block(block_entry.1, block_entry.2)?;
+        let block_buf = self.read_block(block_entry.offset, block_entry.size)?;
         Self::get_from_block_data(&block_buf, &key_bytes)
     }
 
@@ -422,7 +434,7 @@ impl SSTable {
             };
             
             // Read and search block (with CRC verification)
-            let block_buf = self.read_block(block_entry.1, block_entry.2)?;
+            let block_buf = self.read_block(block_entry.offset, block_entry.size)?;
 
             let block = DataBlock::deserialize(&block_buf)?;
             results[idx] = block.get(&key_bytes);
@@ -442,13 +454,18 @@ impl SSTable {
         // Find starting block
         let start_idx = self.index.find_block_index(&start_bytes);
         
-        // Scan blocks
+        // Scan blocks with zone map skip
         for i in start_idx..self.index.entries.len() {
-            let (_, offset, size) = &self.index.entries[i];
+            let entry = &self.index.entries[i];
 
-            let block_buf = self.read_block(*offset, *size)?;
+            // Zone map skip: block entirely before our range
+            if entry.last_key < start { continue; }
+            // Zone map skip: block entirely past our range
+            if entry.first_key >= end { break; }
+
+            let block_buf = self.read_block(entry.offset, entry.size)?;
             let block = DataBlock::deserialize(&block_buf)?;
-            
+
             for (k, v) in block.entries.iter() {
                 // Check if key is in range [start, end)
                 if k >= &start && k < &end {
@@ -473,7 +490,7 @@ impl SSTable {
 
         // Scan all blocks (collect offsets to avoid borrow conflict)
         let block_entries: Vec<_> = self.index.entries.iter()
-            .map(|(_k, o, s)| (*o, *s))
+            .map(|e| (e.offset, e.size))
             .collect();
 
         for (offset, size) in block_entries {
@@ -710,16 +727,21 @@ impl SSTableBuilder {
         let first_key = self.current_block.entries.first()
             .map(|(k, _)| *k)  // ✅ u64 copy is cheap, no clone()
             .ok_or_else(|| StorageError::InvalidData("Empty block".into()))?;
-        
+        let last_key = self.current_block.entries.last()
+            .map(|(k, _)| *k)
+            .ok_or_else(|| StorageError::InvalidData("Empty block".into()))?;
+
         // Serialize with compression
         let block_data = self.current_block.serialize_compressed(
             self.config.enable_compression,
             self.config.compression_algorithm,
         )?;
         let block_size = block_data.len() as u32;
-        
-        // Record in index (block_size includes CRC)
-        self.index.entries.push((first_key, self.offset, block_size + 4));
+
+        // Record in index with zone map (first_key + last_key for block skipping)
+        self.index.entries.push(BlockIndexEntry {
+            first_key, offset: self.offset, size: block_size + 4, last_key,
+        });
 
         // Write to file: block_data + CRC32
         self.writer.write_all(&block_data)?;
@@ -1006,20 +1028,20 @@ impl BlockIndex {
             entries: Vec::new(),
         }
     }
-    
-    fn find_block(&self, key_bytes: &[u8]) -> Option<&(Key, u64, u32)> {
+
+    fn find_block(&self, key_bytes: &[u8]) -> Option<&BlockIndexEntry> {
         if key_bytes.len() != 8 {
             return None;
         }
-        
+
         // Convert bytes to u64 for comparison
         let key = u64::from_be_bytes([
             key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
             key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
         ]);
-        
+
         // Binary search for the block that might contain this key
-        match self.entries.binary_search_by(|(k, _, _)| k.cmp(&key)) {
+        match self.entries.binary_search_by(|e| e.first_key.cmp(&key)) {
             Ok(idx) => Some(&self.entries[idx]),
             Err(idx) => {
                 if idx == 0 {
@@ -1030,86 +1052,146 @@ impl BlockIndex {
             }
         }
     }
-    
+
     fn find_block_index(&self, key_bytes: &[u8]) -> usize {
         if key_bytes.len() != 8 {
             return 0;
         }
-        
+
         let key = u64::from_be_bytes([
             key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
             key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
         ]);
-        
-        match self.entries.binary_search_by(|(k, _, _)| k.cmp(&key)) {
+
+        match self.entries.binary_search_by(|e| e.first_key.cmp(&key)) {
             Ok(idx) => idx,
             Err(idx) => if idx == 0 { 0 } else { idx - 1 },
         }
     }
-    
+
     fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        
+
         // Number of entries
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        
-        for (key, offset, size) in &self.entries {
-            // Serialize u64 key as BIG-ENDIAN (for ordering)
-            buf.extend_from_slice(&key.to_be_bytes());
-            buf.extend_from_slice(&offset.to_le_bytes());
-            buf.extend_from_slice(&size.to_le_bytes());
+
+        for entry in &self.entries {
+            // first_key: BIG-ENDIAN for ordering
+            buf.extend_from_slice(&entry.first_key.to_be_bytes());
+            buf.extend_from_slice(&entry.offset.to_le_bytes());
+            buf.extend_from_slice(&entry.size.to_le_bytes());
+            // last_key: zone map upper bound
+            buf.extend_from_slice(&entry.last_key.to_be_bytes());
         }
-        
+
         Ok(buf)
     }
-    
+
     fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 4 {
             return Err(StorageError::InvalidData("BlockIndex too small".into()));
         }
 
-        let mut offset = 0;
-
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        offset += 4;
+        let offset = 4;
 
-        // Bounds check: 4 bytes header + num_entries * 20 bytes per entry
-        let expected_size = 4 + num_entries * 20;
-        if data.len() < expected_size {
-            return Err(StorageError::InvalidData(
-                format!("BlockIndex truncated: expected {} bytes, got {}", expected_size, data.len())
-            ));
+        // Try new format first: 4 header + 28 bytes per entry (first_key + offset + size + last_key)
+        let new_size = 4 + num_entries * 28;
+        // Old format: 4 header + 20 bytes per entry (first_key + offset + size)
+        let old_size = 4 + num_entries * 20;
+
+        if data.len() >= new_size {
+            // New format with zone map (last_key per block)
+            Self::deserialize_v2(data, num_entries)
+        } else if data.len() >= old_size {
+            // Legacy format without last_key — reconstruct from block data
+            Self::deserialize_v1(data, num_entries)
+        } else {
+            Err(StorageError::InvalidData(
+                format!("BlockIndex truncated: expected {} (or {} legacy) bytes, got {}", new_size, old_size, data.len())
+            ))
         }
-        
+    }
+
+    /// Deserialize new format (28 bytes/entry: first_key + offset + size + last_key)
+    fn deserialize_v2(data: &[u8], num_entries: usize) -> Result<Self> {
+        let mut off = 4usize;
         let mut entries = Vec::with_capacity(num_entries);
-        
+
         for _ in 0..num_entries {
-            // Read u64 key (8 bytes, BIG-ENDIAN)
-            let key = u64::from_be_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            let first_key = u64::from_be_bytes([
+                data[off], data[off+1], data[off+2], data[off+3],
+                data[off+4], data[off+5], data[off+6], data[off+7],
             ]);
-            offset += 8;
-            
+            off += 8;
+
             let block_offset = u64::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                data[off], data[off+1], data[off+2], data[off+3],
+                data[off+4], data[off+5], data[off+6], data[off+7],
             ]);
-            offset += 8;
-            
+            off += 8;
+
             let block_size = u32::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3]
+                data[off], data[off+1], data[off+2], data[off+3]
             ]);
-            offset += 4;
-            
-            entries.push((key, block_offset, block_size));
+            off += 4;
+
+            let last_key = u64::from_be_bytes([
+                data[off], data[off+1], data[off+2], data[off+3],
+                data[off+4], data[off+5], data[off+6], data[off+7],
+            ]);
+            off += 8;
+
+            entries.push(BlockIndexEntry { first_key, offset: block_offset, size: block_size, last_key });
+        }
+
+        Ok(Self { entries })
+    }
+
+    /// Deserialize legacy format (20 bytes/entry: first_key + offset + size, no last_key)
+    fn deserialize_v1(data: &[u8], num_entries: usize) -> Result<Self> {
+        let mut off = 4usize;
+        let mut entries = Vec::with_capacity(num_entries);
+
+        for i in 0..num_entries {
+            let first_key = u64::from_be_bytes([
+                data[off], data[off+1], data[off+2], data[off+3],
+                data[off+4], data[off+5], data[off+6], data[off+7],
+            ]);
+            off += 8;
+
+            let block_offset = u64::from_le_bytes([
+                data[off], data[off+1], data[off+2], data[off+3],
+                data[off+4], data[off+5], data[off+6], data[off+7],
+            ]);
+            off += 8;
+
+            let block_size = u32::from_le_bytes([
+                data[off], data[off+1], data[off+2], data[off+3]
+            ]);
+            off += 4;
+
+            // Legacy: last_key is unknown — use first_key as approximation.
+            // For the last block, this is conservative (may read one extra block).
+            let last_key = if i + 1 < num_entries {
+                // Use next block's first_key - 1 as upper bound
+                let next_first = u64::from_be_bytes([
+                    data[off], data[off+1], data[off+2], data[off+3],
+                    data[off+4], data[off+5], data[off+6], data[off+7],
+                ]);
+                next_first.saturating_sub(1)
+            } else {
+                u64::MAX // Last block: assume it covers everything up to max
+            };
+
+            entries.push(BlockIndexEntry { first_key, offset: block_offset, size: block_size, last_key });
         }
 
         Ok(Self { entries })
     }
 
     /// Share entries via Arc — cheap clone for iterators.
-    fn shared_entries(&self) -> Arc<Vec<(Key, u64, u32)>> {
+    fn shared_entries(&self) -> Arc<Vec<BlockIndexEntry>> {
         Arc::new(self.entries.clone())
     }
 }
@@ -1234,12 +1316,12 @@ pub struct SSTableStats {
 }
 
 /// SSTable streaming iterator — reads blocks on-demand via mmap (zero syscall).
-/// Falls back to seek+read if mmap is unavailable.
+/// Uses zone map (per-block first_key/last_key) to skip irrelevant blocks.
 pub struct SSTableIterator {
     /// Shared mmap — zero-copy block reads, no syscall overhead
     mmap: Option<Arc<Mmap>>,
-    /// Shared block index — Arc avoids per-scan Vec clone
-    index_entries: Arc<Vec<(Key, u64, u32)>>,
+    /// Shared block index with zone map — Arc avoids per-scan Vec clone
+    index_entries: Arc<Vec<BlockIndexEntry>>,
     /// Fallback file handle (only used when mmap is None)
     file: Option<BufReader<File>>,
     /// File path (needed for fallback reads)
@@ -1286,11 +1368,35 @@ impl SSTableIterator {
     }
 
     fn load_next_block(&mut self) -> Result<bool> {
-        if self.current_block_idx >= self.index_entries.len() {
-            return Ok(false); // No more blocks
+        // Loop to skip blocks that fall outside the query range (zone map skip).
+        loop {
+            if self.current_block_idx >= self.index_entries.len() {
+                return Ok(false); // No more blocks
+            }
+
+            let entry = &self.index_entries[self.current_block_idx];
+
+            // Zone map skip: block's max key < query start → skip entire block
+            if let Some(start) = self.start_key {
+                if entry.last_key < start {
+                    self.current_block_idx += 1;
+                    continue; // Skip this block, try next
+                }
+            }
+            // Zone map skip: block's min key >= query end → no more relevant blocks
+            if let Some(end) = self.end_key {
+                if entry.first_key >= end {
+                    return Ok(false); // All subsequent blocks are past end_key
+                }
+            }
+
+            let offset = entry.offset;
+            let size = entry.size;
+            break; // This block may contain relevant entries — proceed to read
         }
 
-        let (_, offset, size) = self.index_entries[self.current_block_idx];
+        let offset = self.index_entries[self.current_block_idx].offset;
+        let size = self.index_entries[self.current_block_idx].size;
 
         if size < 4 {
             return Err(crate::StorageError::InvalidData("Block too small for CRC".into()));
