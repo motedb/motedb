@@ -2040,7 +2040,21 @@ impl QueryExecutor {
                 });
             }
 
-            // ── Full decode path (existing logic) ──
+            // 🚀 Parallel full scan: when rayon is available and we have a positional
+            // WHERE clause (CompiledWhere never errors), process rows in parallel chunks.
+            #[cfg(feature = "rayon")]
+            {
+                if compiled_where.is_some() {
+                    if let Some(result) = self.try_parallel_full_scan(
+                        table, &schema_clone, &select_cols, &columns,
+                        compiled_where.as_ref().unwrap(), stmt,
+                    ) {
+                        return Ok(result);
+                    }
+                }
+            }
+
+            // ── Full decode path (sequential fallback) ──
             let row_iter = self.db.scan_table_rows_streaming(table)?;
             let filtered_iter = row_iter.filter_map(move |result| {
                 match result {
@@ -3514,6 +3528,68 @@ impl QueryExecutor {
                 })
                 .collect()
         }
+    }
+
+    /// 🚀 Parallel full table scan using rayon `par_bridge`.
+    ///
+    /// Pulls rows from the sequential LSM iterator and processes them in parallel
+    /// (WHERE filter + projection), interleaving I/O and CPU naturally.
+    /// Falls back to `None` if the table is too small for parallelism to help.
+    #[cfg(feature = "rayon")]
+    fn try_parallel_full_scan(
+        &self,
+        table: &str,
+        schema: &Arc<TableSchema>,
+        select_cols: &[SelectColumn],
+        columns: &[String],
+        compiled_where: &CompiledWhere,
+        stmt: &SelectStmt,
+    ) -> Option<StreamingQueryResult> {
+        use rayon::prelude::*;
+
+        const MIN_PARALLEL_ROWS: usize = 100000; // Only activate for large tables (>100K)
+
+        let row_iter = match self.db.scan_table_rows_streaming(table) {
+            Ok(it) => it,
+            Err(_) => return None,
+        };
+
+        // Collect rows into a Vec first to get a size estimate.
+        // For very small tables we skip parallelism entirely.
+        let all_rows: Vec<(u64, Row)> = match row_iter.collect::<std::result::Result<Vec<_>, _>>() {
+            Ok(rows) => rows,
+            Err(_) => return None,
+        };
+
+        if all_rows.len() < MIN_PARALLEL_ROWS {
+            return None;
+        }
+
+        // Process rows in parallel with par_bridge.
+        // Each row: evaluate WHERE, project matching rows.
+        let schema_ref: &TableSchema = schema.as_ref();
+        let results: Vec<Vec<Value>> = all_rows
+            .into_par_iter()
+            .filter_map(|(_row_id, row)| {
+                if compiled_where.eval(&row).unwrap_or(false) {
+                    Some(Self::project_row_direct(
+                        &row, select_cols, columns, schema_ref,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Some(StreamingQueryResult::SelectStreaming {
+            columns: columns.to_vec(),
+            rows: Box::new(results.into_iter().map(Ok)),
+            order_by: stmt.order_by.clone(),
+            limit: stmt.limit,
+            offset: stmt.offset,
+            distinct: stmt.distinct,
+            max_result_rows: None,
+        })
     }
 
     /// Internal SELECT execution (takes &SelectStmt to allow reuse in subqueries)
