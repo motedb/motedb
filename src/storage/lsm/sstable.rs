@@ -1231,6 +1231,154 @@ impl LazyEntryCursor {
     }
 }
 
+/// Batch block cursor: pre-builds a row offset table from decompressed block
+/// bytes, enabling column-at-a-time extraction for fixed-width columns.
+///
+/// For a block of ~500 rows, building the offset table takes ~20μs (one pass).
+/// Batch extraction then reads all values for one fixed column in a tight loop
+/// (~3ns per value vs ~30ns for per-row Value construction).
+///
+/// Used as a fast path for queries with fixed-column WHERE clauses and
+/// fixed-column SELECT projections.
+struct BatchBlockCursor {
+    /// Decompressed block data (same format as LazyEntryCursor)
+    data: Vec<u8>,
+    /// Byte offset of each row's inline data start (RawRow bytes).
+    /// Indexed by row number [0..num_rows).
+    row_data_offsets: Vec<u32>,
+    /// Number of rows in the block.
+    num_rows: usize,
+}
+
+impl BatchBlockCursor {
+    /// Build a batch cursor from decompressed block bytes.
+    /// Pre-scans all entries to build the row offset table.
+    fn new(data: Vec<u8>) -> Result<Self> {
+        if data.len() < 4 {
+            return Err(StorageError::InvalidData("Block too small for header".into()));
+        }
+        let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let max_entries = (data.len() / 22).min(10000); // sanity cap
+        let num_entries = num_entries.min(max_entries);
+
+        let mut row_data_offsets = Vec::with_capacity(num_entries);
+        let mut pos: usize = 4; // skip num_entries header
+
+        for _ in 0..num_entries {
+            if pos + 22 > data.len() {
+                break; // truncated entry
+            }
+            // Skip key (8) + timestamp (8) + deleted (1) + value_type (1) = 18 bytes
+            let value_type = data[pos + 16 + 1]; // 17th byte = value_type
+            pos += 18;
+
+            match value_type {
+                0 => {
+                    // Inline: [data_len: u32 LE] [data: bytes]
+                    if pos + 4 > data.len() { break; }
+                    let vlen = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                    pos += 4;
+                    // Record the start of the inline data (RawRow bytes)
+                    row_data_offsets.push(pos as u32);
+                    pos += vlen;
+                }
+                1 => {
+                    // Blob ref: skip 16 bytes
+                    pos += 16;
+                    row_data_offsets.push(0); // placeholder for blob rows
+                }
+                _ => break,
+            }
+        }
+
+        let num_rows = row_data_offsets.len();
+        Ok(Self { data, row_data_offsets, num_rows })
+    }
+
+    /// Number of rows in the block.
+    #[inline]
+    fn len(&self) -> usize { self.num_rows }
+
+    /// Extract all row keys as a Vec<u64>.
+    /// Keys are at the start of each entry, 4 bytes after num_entries header.
+    fn extract_keys(&self) -> Vec<u64> {
+        let mut keys = Vec::with_capacity(self.num_rows);
+        let mut pos: usize = 4; // skip num_entries
+        for _ in 0..self.num_rows {
+            if pos + 8 > self.data.len() { break; }
+            let key = u64::from_be_bytes([
+                self.data[pos], self.data[pos+1], self.data[pos+2], self.data[pos+3],
+                self.data[pos+4], self.data[pos+5], self.data[pos+6], self.data[pos+7],
+            ]);
+            keys.push(key);
+            pos += 8;
+            // Skip timestamp (8) + deleted (1) + value_type (1) = 10 bytes
+            pos += 10;
+            let value_type = self.data[pos - 2]; // value_type is the 18th byte
+            match value_type {
+                0 => {
+                    let vlen = u32::from_le_bytes([
+                        self.data[pos], self.data[pos+1], self.data[pos+2], self.data[pos+3]
+                    ]) as usize;
+                    pos += 4 + vlen;
+                }
+                1 => { pos += 20; } // 4(len) + 16(blob ref)
+                _ => break,
+            }
+        }
+        keys
+    }
+
+    /// Get the raw Row bytes for a given row index.
+    #[inline]
+    fn row_bytes(&self, row_idx: usize) -> &[u8] {
+        if row_idx >= self.num_rows {
+            return &[];
+        }
+        let start = self.row_data_offsets[row_idx] as usize;
+        if start == 0 || start >= self.data.len() {
+            return &[];
+        }
+        // Find the end: either next row's data start or end of data
+        let end = if row_idx + 1 < self.num_rows {
+            let next_start = self.row_data_offsets[row_idx + 1] as usize;
+            if next_start > start && next_start <= self.data.len() {
+                next_start
+            } else {
+                self.data.len()
+            }
+        } else {
+            self.data.len()
+        };
+        &self.data[start..end.min(self.data.len())]
+    }
+
+    /// Batch-extract an i64 column. Returns Vec of (row_idx, value) pairs,
+    /// skipping NULLs. Caller can use row_idx to cross-reference with extract_keys().
+    fn extract_i64_column(&self, offsets: &crate::storage::row_format::FixedColumnOffsets, col_idx: usize) -> Vec<(usize, i64)> {
+        let mut result = Vec::with_capacity(self.num_rows);
+        for row_idx in 0..self.num_rows {
+            let raw = self.row_bytes(row_idx);
+            if let Some(val) = offsets.read_i64(raw, col_idx) {
+                result.push((row_idx, val));
+            }
+        }
+        result
+    }
+
+    /// Batch-extract an f64 column.
+    fn extract_f64_column(&self, offsets: &crate::storage::row_format::FixedColumnOffsets, col_idx: usize) -> Vec<(usize, f64)> {
+        let mut result = Vec::with_capacity(self.num_rows);
+        for row_idx in 0..self.num_rows {
+            let raw = self.row_bytes(row_idx);
+            if let Some(val) = offsets.read_f64(raw, col_idx) {
+                result.push((row_idx, val));
+            }
+        }
+        result
+    }
+}
+
 impl BlockIndex {
     fn new() -> Self {
         Self {

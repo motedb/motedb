@@ -881,6 +881,8 @@ struct TwoPhaseFilteredIterator {
     col_types: Vec<crate::types::ColumnType>,
     fixed_count: usize,
     needed: Vec<usize>,
+    // Pre-computed fixed column offsets — avoids per-row O(C) col_types scan
+    fixed_offsets: Option<crate::storage::row_format::FixedColumnOffsets>,
     // WHERE filter
     where_pos: Vec<usize>,
     compiled_where: Option<CompiledWhere>,
@@ -903,10 +905,18 @@ impl Iterator for TwoPhaseFilteredIterator {
                 None => return None,
             };
 
-            // Parse row header once
-            let ctx = match crate::storage::row_format::RowParseContext::parse(
-                &raw_bytes, &self.col_types, self.fixed_count,
-            ) {
+            // Parse row header once — use pre-computed offsets when available
+            // to skip per-row O(C) col_types scan (~30-50ns per row saved)
+            let parse_result = if let Some(ref offsets) = self.fixed_offsets {
+                crate::storage::row_format::RowParseContext::parse_with_offsets(
+                    &raw_bytes, &self.col_types, offsets,
+                )
+            } else {
+                crate::storage::row_format::RowParseContext::parse(
+                    &raw_bytes, &self.col_types, self.fixed_count,
+                )
+            };
+            let ctx = match parse_result {
                 Some(c) => c,
                 None => {
                     // Legacy bincode — fall back to full decode
@@ -2053,6 +2063,7 @@ impl QueryExecutor {
 
                 let col_types = schema_clone.col_types().to_vec();
                 let fixed_count = crate::storage::row_format::compute_fixed_count(&col_types);
+                let fixed_offsets = crate::storage::row_format::FixedColumnOffsets::compute(&col_types);
                 let raw_iter = self.db.scan_table_raw_streaming(table)?;
 
                 // Two-phase filtered iterator with reusable buffers —
@@ -2065,6 +2076,7 @@ impl QueryExecutor {
                     col_types,
                     fixed_count,
                     needed,
+                    fixed_offsets,
                     where_pos,
                     compiled_where,
                     where_pos_to_idx,

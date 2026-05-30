@@ -218,6 +218,57 @@ impl RowParseContext {
         Some(Self { null_bitmap, fixed_count, var_offsets, var_data_start, fixed_idx_map })
     }
 
+    /// Parse row header using pre-computed FixedColumnOffsets (avoids per-row O(C) scan).
+    /// This is the fast path for queries with a known schema — the fixed_idx_map
+    /// and fixed_count are pre-computed once per table scan.
+    pub fn parse_with_offsets(
+        data: &[u8],
+        col_types: &[ColumnType],
+        offsets: &FixedColumnOffsets,
+    ) -> Option<Self> {
+        if !is_rawrow(data) || data.len() < HEADER_SIZE {
+            return None;
+        }
+
+        let col_count = u16::from_le_bytes([data[2], data[3]]) as usize;
+        if col_count != col_types.len() {
+            return None;
+        }
+
+        let null_bitmap = u64::from_le_bytes([
+            data[4], data[5], data[6], data[7],
+            data[8], data[9], data[10], data[11],
+        ]);
+
+        let var_section_start = HEADER_SIZE + offsets.fixed_count * FIXED_COL_SIZE;
+        let mut var_offsets = [(0usize, 0usize); 64];
+        let var_data_start;
+        if var_section_start + 2 <= data.len() {
+            let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+            let var_header_start = var_section_start + 2;
+            var_data_start = var_header_start + var_count * 10;
+            for i in 0..var_count {
+                let off = var_header_start + i * 10;
+                if off + 10 > data.len() { break; }
+                let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+                if col_idx >= 64 { break; }
+                let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
+                let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+                var_offsets[col_idx] = (v_off, v_len);
+            }
+        } else {
+            var_data_start = data.len();
+        }
+
+        Some(Self {
+            null_bitmap,
+            fixed_count: offsets.fixed_count,
+            var_offsets,
+            var_data_start,
+            fixed_idx_map: offsets.fixed_idx_map,
+        })
+    }
+
     /// Decode a set of columns using the pre-parsed context.
     /// Much faster than calling get_column() N times — header parsed only once.
     /// Uses pre-computed fixed_idx_map for O(1) fixed column lookup.
@@ -347,6 +398,141 @@ fn is_rawrow(data: &[u8]) -> bool {
 
 fn is_fixed(col_type: &ColumnType) -> bool {
     matches!(col_type, ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp)
+}
+
+/// Pre-computed byte offsets for fixed-width columns in RawRow format.
+///
+/// Each fixed column occupies 8 bytes at a deterministic offset:
+///   offset = HEADER_SIZE(12) + (num_fixed_before) * FIXED_COL_SIZE(8)
+///
+/// Also pre-computes `fixed_idx_map` for O(1) col_idx → fixed_idx lookup,
+/// avoiding per-row O(C) col_types scan in RowParseContext::parse().
+///
+/// Computed once per schema and reused across the entire table scan.
+#[derive(Debug, Clone)]
+pub struct FixedColumnOffsets {
+    /// Map: schema column position → byte offset in RawRow data
+    /// Zero for non-fixed columns.
+    col_to_offset: [u16; 64],
+    /// Columns that are fixed-width
+    fixed_columns: Vec<usize>,
+    /// Pre-computed col_idx → fixed_idx mapping (identical to RowParseContext's)
+    /// Used to avoid per-row O(C) scan in RowParseContext::parse().
+    pub fixed_idx_map: [u8; 64],
+    /// Number of fixed-width columns
+    pub fixed_count: usize,
+}
+
+impl FixedColumnOffsets {
+    /// Compute fixed column byte offsets and index map from schema column types.
+    /// Returns None if the table has no fixed-width columns.
+    pub fn compute(col_types: &[ColumnType]) -> Option<Self> {
+        let num_cols = col_types.len().min(64);
+        let mut col_to_offset = [0u16; 64];
+        let mut fixed_idx_map = [0u8; 64];
+        let mut fixed_columns = Vec::with_capacity(num_cols);
+        let mut fixed_count: usize = 0;
+
+        for i in 0..num_cols {
+            if is_fixed(&col_types[i]) {
+                let offset = HEADER_SIZE + fixed_count * FIXED_COL_SIZE;
+                col_to_offset[i] = offset as u16;
+                fixed_idx_map[i] = fixed_count as u8;
+                fixed_columns.push(i);
+                fixed_count += 1;
+            }
+        }
+
+        if fixed_columns.is_empty() {
+            None
+        } else {
+            Some(Self { col_to_offset, fixed_columns, fixed_idx_map, fixed_count })
+        }
+    }
+
+    /// Get the byte offset into RawRow data for the given column position.
+    /// Returns None if the column is not a fixed-width type.
+    #[inline]
+    pub fn offset(&self, col_idx: usize) -> Option<usize> {
+        if col_idx >= 64 {
+            return None;
+        }
+        // All fixed columns have non-zero offset (min = HEADER_SIZE = 12).
+        // Non-fixed columns have offset = 0 in the array.
+        let off = self.col_to_offset[col_idx] as usize;
+        if off == 0 {
+            None
+        } else {
+            Some(off)
+        }
+    }
+
+    /// Extract an i64 value from a RawRow byte slice at a fixed column offset.
+    /// Returns None if the column is NULL (null_bitmap bit is set).
+    #[inline]
+    pub fn read_i64(&self, raw: &[u8], col_idx: usize) -> Option<i64> {
+        let off = self.offset(col_idx)?;
+        if off + 8 > raw.len() { return None; }
+        // Check null_bitmap
+        if raw.len() >= HEADER_SIZE {
+            let null_bitmap = u64::from_le_bytes([raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]]);
+            if (null_bitmap >> col_idx) & 1 == 1 {
+                return None; // NULL
+            }
+        }
+        Some(i64::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3], raw[off+4], raw[off+5], raw[off+6], raw[off+7]]))
+    }
+
+    /// Extract an f64 value from a RawRow byte slice at a fixed column offset.
+    #[inline]
+    pub fn read_f64(&self, raw: &[u8], col_idx: usize) -> Option<f64> {
+        let off = self.offset(col_idx)?;
+        if off + 8 > raw.len() { return None; }
+        if raw.len() >= HEADER_SIZE {
+            let null_bitmap = u64::from_le_bytes([raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]]);
+            if (null_bitmap >> col_idx) & 1 == 1 {
+                return None;
+            }
+        }
+        Some(f64::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3], raw[off+4], raw[off+5], raw[off+6], raw[off+7]]))
+    }
+
+    /// Read a fixed column value as a Value enum.
+    #[inline]
+    pub fn read_value(&self, raw: &[u8], col_idx: usize, col_type: &ColumnType) -> Value {
+        if raw.len() >= HEADER_SIZE {
+            let null_bitmap = u64::from_le_bytes([raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]]);
+            if (null_bitmap >> col_idx) & 1 == 1 {
+                return Value::Null;
+            }
+        }
+        let off = self.offset(col_idx).unwrap_or(0);
+        if off + 8 > raw.len() { return Value::Null; }
+        match col_type {
+            ColumnType::Integer => Value::Integer(i64::from_le_bytes([
+                raw[off], raw[off+1], raw[off+2], raw[off+3],
+                raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+            ])),
+            ColumnType::Float => Value::Float(f64::from_le_bytes([
+                raw[off], raw[off+1], raw[off+2], raw[off+3],
+                raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+            ])),
+            ColumnType::Boolean => Value::Bool(raw[off] != 0),
+            ColumnType::Timestamp => {
+                let micros = i64::from_le_bytes([
+                    raw[off], raw[off+1], raw[off+2], raw[off+3],
+                    raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+                ]);
+                Value::Timestamp(crate::types::Timestamp::from_micros(micros))
+            }
+            _ => Value::Null, // Not a fixed type
+        }
+    }
+
+    /// Number of fixed columns
+    pub fn fixed_count(&self) -> usize {
+        self.fixed_columns.len()
+    }
 }
 
 fn decode_raw(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
