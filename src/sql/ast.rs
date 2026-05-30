@@ -16,6 +16,9 @@ pub enum Statement {
     AlterTable(AlterTableStmt),
     ShowTables,
     DescribeTable(String),  // table name
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
 }
 
 /// SELECT statement

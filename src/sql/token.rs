@@ -71,6 +71,9 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "auto_increment" => TokenType::AutoIncrement,
     "timeseries" => TokenType::Timeseries,
     "ttl" => TokenType::Ttl,
+    "begin" => TokenType::Begin,
+    "commit" => TokenType::Commit,
+    "rollback" => TokenType::Rollback,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +129,9 @@ pub enum TokenType {
     AutoIncrement, // AUTO_INCREMENT
     Timeseries, // TIMESERIES
     Ttl,       // TTL
+    Begin,     // BEGIN
+    Commit,    // COMMIT
+    Rollback,  // ROLLBACK
     
     // Data types
     Integer,

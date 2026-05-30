@@ -976,6 +976,9 @@ pub struct QueryExecutor {
     optimizer: super::optimizer::QueryOptimizer,
     /// Store the last AUTO_INCREMENT value inserted (mirrors evaluator)
     last_insert_id: std::sync::atomic::AtomicI64,
+    /// Current transaction ID when inside BEGIN...COMMIT/ROLLBACK block.
+    /// None = auto-commit mode (each statement is its own transaction).
+    current_txn_id: parking_lot::Mutex<Option<u64>>,
 }
 
 impl QueryExecutor {
@@ -984,6 +987,7 @@ impl QueryExecutor {
             evaluator: ExprEvaluator::with_db(db.clone()),
             optimizer: super::optimizer::QueryOptimizer::new(db.clone()),
             last_insert_id: std::sync::atomic::AtomicI64::new(i64::MIN),
+            current_txn_id: parking_lot::Mutex::new(None),
             db,
         }
     }
@@ -1018,6 +1022,9 @@ impl QueryExecutor {
             Statement::AlterTable(a) => self.execute_alter_table(a),
             Statement::ShowTables => self.execute_show_tables(),
             Statement::DescribeTable(table_name) => self.execute_describe_table(table_name),
+            Statement::BeginTransaction => self.execute_begin_transaction(),
+            Statement::CommitTransaction => self.execute_commit_transaction(),
+            Statement::RollbackTransaction => self.execute_rollback_transaction(),
         }
     }
     
@@ -1122,6 +1129,39 @@ impl QueryExecutor {
                     },
                 }
             }
+            Statement::BeginTransaction => {
+                let txn_id = self.db.begin_transaction()?;
+                *self.current_txn_id.lock() = Some(txn_id);
+                StreamingQueryResult::Definition {
+                    message: format!("Transaction {} started", txn_id),
+                }
+            }
+            Statement::CommitTransaction => {
+                if let Some(txn_id) = *self.current_txn_id.lock() {
+                    self.db.commit_transaction(txn_id)?;
+                    *self.current_txn_id.lock() = None;
+                    StreamingQueryResult::Definition {
+                        message: format!("Transaction {} committed", txn_id),
+                    }
+                } else {
+                    StreamingQueryResult::Definition {
+                        message: "No active transaction".to_string(),
+                    }
+                }
+            }
+            Statement::RollbackTransaction => {
+                if let Some(txn_id) = *self.current_txn_id.lock() {
+                    self.db.rollback_transaction(txn_id)?;
+                    *self.current_txn_id.lock() = None;
+                    StreamingQueryResult::Definition {
+                        message: format!("Transaction {} rolled back", txn_id),
+                    }
+                } else {
+                    StreamingQueryResult::Definition {
+                        message: "No active transaction".to_string(),
+                    }
+                }
+            }
         };
         Ok(result.with_max_rows(max_rows))
     }
@@ -1167,12 +1207,17 @@ impl QueryExecutor {
         }
 
         // Handle SELECT without FROM clause (e.g., SELECT ROUND(3.7), SELECT TRIM('  hi  '))
+        // Extract from once to avoid repeated unwraps.
+        let from = match stmt.from.as_ref() {
+            Some(f) => f,
+            None => return self.materialize_as_streaming(stmt),
+        };
         if stmt.from.is_none() {
             return self.materialize_as_streaming(stmt);
         }
 
         // Handle JOIN/Subquery by falling back to materialization
-        match stmt.from.as_ref().unwrap() {
+        match from {
             TableRef::Join { .. } | TableRef::Subquery { .. } => {
                 return self.materialize_as_streaming(stmt);
             }
@@ -1220,7 +1265,7 @@ impl QueryExecutor {
 
         // 🆕 TimeSeries table routing: use columnar store with zone maps + bloom filters
         // when the table is TimeSeries type. Falls through to LSM for complex queries.
-        if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+        if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().ok_or_else(|| MoteDBError::InvalidArgument("FROM clause required".into()))? {
             if let Ok(schema) = self.db.get_table_schema(table_name) {
                 if schema.table_type == crate::types::TableType::TimeSeries {
                     if let Some(result) = self.try_columnar_select(stmt, &schema)? {
@@ -3639,12 +3684,13 @@ impl QueryExecutor {
             });
         }
         
-        // From here on, we know stmt.from is Some, so unwrap is safe
+        // From here on, we know stmt.from is Some. Extracted once below.
+        let from = stmt.from.as_ref().unwrap();
 
         // 🆕 Columnar SELECT for TimeSeries tables
         // Pattern: SELECT cols FROM ts_table WHERE ts BETWEEN a AND b
         // → Route to columnar store with time-range pruning + column projection
-        if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+        if let TableRef::Table { name: table_name, .. } = from {
             if let Ok(schema) = self.db.get_table_schema(table_name) {
                 if schema.table_type == crate::types::TableType::TimeSeries {
                     if let Some(result) = self.try_columnar_select(stmt, &schema)? {
@@ -3686,7 +3732,7 @@ impl QueryExecutor {
         // 🚀 FAST PATH 0: Vector search optimization (P0)
         // Pattern: SELECT * FROM table WHERE VECTOR_SEARCH(column, [...], k)
         if let Some(ref where_clause) = stmt.where_clause {
-            if let Some((table_name, col_name, query_vector, k)) = self.try_extract_vector_search(where_clause, stmt.from.as_ref().unwrap()) {
+            if let Some((table_name, col_name, query_vector, k)) = self.try_extract_vector_search(where_clause, from) {
                 // ⚡ Ultra-fast path: Use vector index directly
                 // Resolve index name via registry (supports custom index names)
                 let index_name = self.db.index_registry.find_by_column(
@@ -3730,7 +3776,7 @@ impl QueryExecutor {
         // Pattern: SELECT ... FROM table WHERE MATCH(col) AGAINST('query') [ORDER BY score] [LIMIT k]
         // → Use text index directly (50x faster than full table scan + per-row search_ranked)
         if let Some(ref where_clause) = stmt.where_clause {
-            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let TableRef::Table { name: table_name, .. } = from {
                 if let Some(result) = self.try_text_search_fast_path(stmt, where_clause, table_name)? {
                     return Ok(result);
                 }
@@ -3742,7 +3788,7 @@ impl QueryExecutor {
         //          SELECT ... FROM table WHERE ST_KNN(col, ...) [LIMIT k]
         // → Use spatial index directly (50x faster than full table scan + per-row spatial query)
         if let Some(ref where_clause) = stmt.where_clause {
-            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let TableRef::Table { name: table_name, .. } = from {
                 if let Some(result) = self.try_spatial_fast_path(stmt, where_clause, table_name)? {
                     return Ok(result);
                 }
@@ -3755,7 +3801,7 @@ impl QueryExecutor {
             // Check if WHERE clause can use index
             if let Some(ref where_clause) = stmt.where_clause {
                 if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
-                    if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                    if let TableRef::Table { name: table_name, .. } = from {
                         let index_name = format!("{}.{}", table_name, col_name);
                         if self.db.column_indexes.contains_key(&index_name) {
                             // ⚡ Ultra-fast path: Use index to get count
@@ -3776,7 +3822,7 @@ impl QueryExecutor {
                 }
             } else {
                 // 🚀 COUNT(*) without WHERE — O(1) from row counter
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     let count = if let Some(counter) = self.db.table_row_count.get(table_name) {
                         counter.load(std::sync::atomic::Ordering::Relaxed) as i64
                     } else {
@@ -3805,7 +3851,7 @@ impl QueryExecutor {
         if stmt.group_by.is_none() && !stmt.distinct && stmt.having.is_none()
             && stmt.order_by.is_none() && self.has_aggregates(&stmt.columns)
         {
-            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let TableRef::Table { name: table_name, .. } = from {
                 if let Ok(schema) = self.db.get_table_schema(table_name) {
                     if let Some(result) = self.try_streaming_aggregate(stmt, &schema, table_name)? {
                         return Ok(result);
@@ -3817,7 +3863,7 @@ impl QueryExecutor {
         // 🚀 FAST PATH 1b: Positional GROUP BY — skip HashMap conversion entirely.
         // Works directly on Vec<Value> rows for simple single-table GROUP BY / aggregate queries.
         if stmt.group_by.is_some() || self.has_aggregates(&stmt.columns) {
-            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let TableRef::Table { name: table_name, .. } = from {
                 if let Ok(schema) = self.db.get_table_schema(table_name) {
                     if let Some((column_names, projected_rows)) =
                         self.try_apply_group_by_positional(stmt, &schema, table_name)?
@@ -3834,7 +3880,7 @@ impl QueryExecutor {
         // 🚀 FAST PATH 1c: Positional ORDER BY / DISTINCT — skip HashMap conversion entirely.
         // Works directly on Vec<Value> rows for simple single-table ORDER BY / DISTINCT queries.
         if (stmt.order_by.is_some() || stmt.distinct) && stmt.group_by.is_none() {
-            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let TableRef::Table { name: table_name, .. } = from {
                 if let Ok(schema) = self.db.get_table_schema(table_name) {
                     if let Some(result) = self.try_positional_order_by_distinct(stmt, &schema, table_name)? {
                         return Ok(result);
@@ -3851,7 +3897,7 @@ impl QueryExecutor {
         if stmt.where_clause.is_some() && stmt.group_by.is_none()
             && stmt.order_by.is_none() && !stmt.distinct
         {
-            if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+            if let TableRef::Table { name: table_name, .. } = from {
                 if let Some(result) =  self.try_positional_where(stmt, table_name)? {
                     return Ok(result);
                 }
@@ -3867,7 +3913,7 @@ impl QueryExecutor {
 
         if is_simple_star {
             if let Some(ref where_clause) = stmt.where_clause {
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     // Try point query: WHERE col = value
                     if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
                         let index_name = format!("{}.{}", table_name, col_name);
@@ -3922,7 +3968,7 @@ impl QueryExecutor {
                 }
             } else {
                 // No WHERE — full scan fast path
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     return self.fast_star_scan_result(table_name, stmt.limit, stmt.offset);
                 }
             }
@@ -3937,7 +3983,7 @@ impl QueryExecutor {
         let (all_sql_rows, combined_schema) = if let Some(ref where_clause) = stmt.where_clause {
             // Try range query first (dual-bound: col > X AND col < Y)
             if let Some((col_name, lower_value, lower_op, upper_value, upper_op)) = self.try_extract_range_query(where_clause) {
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     let index_name = format!("{}.{}", table_name, col_name);
                     let index_exists = self.db.column_indexes.contains_key(&index_name);
                     
@@ -4081,16 +4127,16 @@ impl QueryExecutor {
                         } // row_ids non-empty or pipeline inactive
                     } else {
                         // No index, use table scan
-                        self.execute_from_with_limit(stmt.from.as_ref().unwrap(), storage_limit)?
+                        self.execute_from_with_limit(from, storage_limit)?
                     }
                 } else {
-                    self.execute_from_with_limit(stmt.from.as_ref().unwrap(), storage_limit)?
+                    self.execute_from_with_limit(from, storage_limit)?
                 }
             }
             // Try point query
             else if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
                 // Extract table name from FROM clause
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     // Try to use column index
                     let index_name = format!("{}.{}", table_name, col_name);
                     let index_exists = self.db.column_indexes.contains_key(&index_name);
@@ -4121,21 +4167,21 @@ impl QueryExecutor {
                             }
                             Ok(_) | Err(_) => {
                                 // Fallback: index empty + pipeline active, or query error
-                                self.execute_from(stmt.from.as_ref().unwrap())?
+                                self.execute_from(from)?
                             }
                         }
                     } else {
                         // No index, use table scan
-                        self.execute_from(stmt.from.as_ref().unwrap())?
+                        self.execute_from(from)?
                     }
                 } else {
                     // Not a simple table (e.g., subquery or join)
-                    self.execute_from(stmt.from.as_ref().unwrap())?
+                    self.execute_from(from)?
                 }
             }
             // 🚀 Try inequality query (col < value, col > value, etc.)
             else if let Some((col_name, op, value)) = self.try_extract_inequality(where_clause) {
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     let index_name = format!("{}.{}", table_name, col_name);
                     let index_exists = self.db.column_indexes.contains_key(&index_name);
                     
@@ -4176,24 +4222,24 @@ impl QueryExecutor {
                             }
                             Ok(_) | Err(_) => {
                                 // Fallback: index empty + pipeline active, or query error
-                                self.execute_from(stmt.from.as_ref().unwrap())?
+                                self.execute_from(from)?
                             }
                         }
                     } else {
                         // No index, use table scan
-                        self.execute_from(stmt.from.as_ref().unwrap())?
+                        self.execute_from(from)?
                     }
                 } else {
                     // Not a simple table
-                    self.execute_from(stmt.from.as_ref().unwrap())?
+                    self.execute_from(from)?
                 }
             } else {
                 // Not a simple point/range query
-                self.execute_from_with_limit(stmt.from.as_ref().unwrap(), storage_limit)?
+                self.execute_from_with_limit(from, storage_limit)?
             }
         } else {
             // No WHERE clause - use standard scan with limit
-            self.execute_from_with_limit(stmt.from.as_ref().unwrap(), storage_limit)?
+            self.execute_from_with_limit(from, storage_limit)?
         };
         
         // 🎯 Filter rows (WHERE clause) - Apply remaining conditions
@@ -4201,7 +4247,7 @@ impl QueryExecutor {
             // Check if we already used the index (in which case, no need to filter again)
             let used_index = if self.try_extract_range_query(where_clause).is_some() {
                 // Range query - check if we used index
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     if let Some((col_name, _, _, _, _)) = self.try_extract_range_query(where_clause) {
                         let index_name = format!("{}.{}", table_name, col_name);
                         self.db.column_indexes.contains_key(&index_name)
@@ -4213,7 +4259,7 @@ impl QueryExecutor {
                 }
             } else if let Some((col_name, _)) = self.try_extract_point_query(where_clause) {
                 // Point query - check if we used index
-                if let TableRef::Table { name: table_name, .. } = stmt.from.as_ref().unwrap() {
+                if let TableRef::Table { name: table_name, .. } = from {
                     let index_name = format!("{}.{}", table_name, col_name);
                     self.db.column_indexes.contains_key(&index_name)
                 } else {
@@ -7569,6 +7615,8 @@ impl QueryExecutor {
         let affected_rows = prepared_rows.len();
 
         // Track last_insert_id for AUTO_INCREMENT primary key
+        // If inside an explicit transaction, buffer INSERTs via coordinator write_set.
+        let txn_id: Option<u64> = *self.current_txn_id.lock();
         let mut last_row_id: Option<u64> = None;
 
         if has_vector_column && prepared_rows.len() > 1 {
@@ -7577,7 +7625,11 @@ impl QueryExecutor {
                 std::collections::HashMap::new();
 
             for row in &prepared_rows {
-                let row_id = self.db.insert_row_to_table(&stmt.table, row.clone())?;
+                let row_id = if let Some(tid) = txn_id {
+                    self.db.insert_row_with_txn(&stmt.table, tid, row.clone())?
+                } else {
+                    self.db.insert_row_to_table(&stmt.table, row.clone())?
+                };
                 last_row_id = Some(row_id);
 
                 for (idx, col_def) in schema.columns.iter().enumerate() {
@@ -7602,7 +7654,11 @@ impl QueryExecutor {
         } else {
             // Normal row-by-row insert path
             for row in prepared_rows {
-                let row_id = self.db.insert_row_to_table(&stmt.table, row)?;
+                let row_id = if let Some(tid) = txn_id {
+                    self.db.insert_row_with_txn(&stmt.table, tid, row)?
+                } else {
+                    self.db.insert_row_to_table(&stmt.table, row)?
+                };
                 last_row_id = Some(row_id);
             }
         }
@@ -8483,6 +8539,45 @@ impl QueryExecutor {
         Ok(QueryResult::Select { columns, rows })
     }
     
+
+    /// Execute BEGIN [TRANSACTION]
+    fn execute_begin_transaction(&self) -> Result<QueryResult> {
+        let txn_id = self.db.begin_transaction()?;
+        *self.current_txn_id.lock() = Some(txn_id);
+        Ok(QueryResult::Definition {
+            message: format!("Transaction {} started", txn_id),
+        })
+    }
+
+    /// Execute COMMIT [TRANSACTION]
+    fn execute_commit_transaction(&self) -> Result<QueryResult> {
+        if let Some(txn_id) = *self.current_txn_id.lock() {
+            self.db.commit_transaction(txn_id)?;
+            *self.current_txn_id.lock() = None;
+            Ok(QueryResult::Definition {
+                message: format!("Transaction {} committed", txn_id),
+            })
+        } else {
+            Ok(QueryResult::Definition {
+                message: "No active transaction".to_string(),
+            })
+        }
+    }
+
+    /// Execute ROLLBACK [TRANSACTION]
+    fn execute_rollback_transaction(&self) -> Result<QueryResult> {
+        if let Some(txn_id) = *self.current_txn_id.lock() {
+            self.db.rollback_transaction(txn_id)?;
+            *self.current_txn_id.lock() = None;
+            Ok(QueryResult::Definition {
+                message: format!("Transaction {} rolled back", txn_id),
+            })
+        } else {
+            Ok(QueryResult::Definition {
+                message: "No active transaction".to_string(),
+            })
+        }
+    }
     // Helper methods
     
     /// ✅ 优化辅助函数：高效构造 qualified name (table.column)
@@ -8956,8 +9051,8 @@ impl QueryExecutor {
             _ => return Ok(None),
         };
 
-        let table_name = match stmt.from.as_ref().unwrap() {
-            TableRef::Table { name, .. } => name.clone(),
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name.clone(),
             _ => return Ok(None),
         };
 
@@ -9323,8 +9418,8 @@ impl QueryExecutor {
         };
         
         // Get table name
-        let table_name = match stmt.from.as_ref().unwrap() {
-            TableRef::Table { name, .. } => name,
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name,
             _ => return Ok(None),
         };
         
@@ -9605,8 +9700,8 @@ impl QueryExecutor {
         };
         
         // Get table name
-        let table_name = match stmt.from.as_ref().unwrap() {
-            TableRef::Table { name, .. } => name,
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name,
             _ => return Ok(None),
         };
         
@@ -9744,8 +9839,8 @@ impl QueryExecutor {
         }
         
         // 获取表名
-        let table_name = match stmt.from.as_ref().unwrap() {
-            TableRef::Table { name, .. } => name.clone(),
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name.clone(),
             _ => return Ok(None),
         };
         

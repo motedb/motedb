@@ -33,9 +33,12 @@ impl Parser {
             TokenType::Create => self.parse_create()?,
             TokenType::Drop => self.parse_drop()?,
             TokenType::Alter => Statement::AlterTable(self.parse_alter_table()?),
+            TokenType::Begin => self.parse_begin()?,
+            TokenType::Commit => self.parse_commit()?,
+            TokenType::Rollback => self.parse_rollback()?,
             TokenType::Show => self.parse_show()?,
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
-            _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, or DESCRIBE")),
+            _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
         };
         
         // Optionally consume semicolon
@@ -771,6 +774,28 @@ impl Parser {
         }
     }
     
+    /// Parse BEGIN [TRANSACTION]
+    fn parse_begin(&mut self) -> Result<Statement> {
+        self.expect(TokenType::Begin)?;
+        // Optionally consume "TRANSACTION" keyword (not reserved, so it's an Identifier token)
+        if matches!(&self.current().token_type, TokenType::Identifier(ref s) if s.eq_ignore_ascii_case("transaction")) {
+            self.advance();
+        }
+        Ok(Statement::BeginTransaction)
+    }
+
+    /// Parse COMMIT TRANSACTION
+    fn parse_commit(&mut self) -> Result<Statement> {
+        self.expect(TokenType::Commit)?;
+        Ok(Statement::CommitTransaction)
+    }
+
+    /// Parse ROLLBACK TRANSACTION
+    fn parse_rollback(&mut self) -> Result<Statement> {
+        self.expect(TokenType::Rollback)?;
+        Ok(Statement::RollbackTransaction)
+    }
+
     /// Parse SHOW statement
     fn parse_show(&mut self) -> Result<Statement> {
         self.expect(TokenType::Show)?;

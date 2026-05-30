@@ -407,8 +407,8 @@ pub struct DBConfig {
     /// 🚀 P0: Query timeout (seconds)
     /// 
     /// Maximum time allowed for a single query to execute.
-    /// - None = No timeout (default, may cause long-running queries)
-    /// - Some(30) = 30 seconds timeout (recommended for concurrent workloads)
+    /// - Some(30) = 30 seconds timeout (default, prevents runaway queries)
+    /// - None = No timeout (use with caution, queries may run indefinitely)
     /// 
     /// When timeout is reached:
     /// - Query is aborted immediately
@@ -478,7 +478,7 @@ impl Default for DBConfig {
             column_index_buffer_size: 1024 * 1024,  // 1MB
             max_result_rows: None,  // No limit
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
-            query_timeout_secs: None,  // No timeout by default
+            query_timeout_secs: Some(30),  // 30-second timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
         }
