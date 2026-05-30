@@ -266,7 +266,7 @@ impl MoteDB {
                     let filtered: Vec<(RowId, Vec<Value>)> = rows.iter()
                         .filter_map(|(row_id, row)| {
                             row.get(col_pos).and_then(|v| match v {
-                                Value::Text(t) => Some((*row_id, vec![Value::text((**t).clone())])),
+                                Value::Text(t) => Some((*row_id, vec![Value::text(t.to_string())])),
                                 Value::TextDoc(t) => Some((*row_id, vec![Value::text(t.content().to_string())])),
                                 _ => None,
                             })

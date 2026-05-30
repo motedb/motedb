@@ -1067,7 +1067,7 @@ impl Parser {
                                 _ => return Err(self.error("MATCH() first argument must be a column name")),
                             };
                             let query = match &args[1] {
-                                Expr::Literal(Value::Text(s)) => (**s).clone(),
+                                Expr::Literal(Value::Text(s)) => s.to_string(),
                                 _ => return Err(self.error("MATCH() second argument must be a string")),
                             };
                             Ok(Expr::Match { column, query, phrase: false })

@@ -64,18 +64,19 @@ impl<'de> Deserialize<'de> for ArcVec {
     }
 }
 
-/// Arc-wrapped String for cheap cloning in Value::Text.
+/// Arc-wrapped str for cheap cloning in Value::Text.
+/// Uses `Arc<str>` (1 allocation) instead of `Arc<String>` (2 allocations).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct ArcString(pub Arc<String>);
+pub struct ArcString(pub Arc<str>);
 
 impl ArcString {
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.0
     }
 }
 
 impl std::ops::Deref for ArcString {
-    type Target = String;
+    type Target = str;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -83,14 +84,14 @@ impl std::ops::Deref for ArcString {
 
 impl Serialize for ArcString {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.as_str().serialize(serializer)
+        self.0.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for ArcString {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        Ok(ArcString(Arc::new(s)))
+        Ok(ArcString(Arc::from(s)))
     }
 }
 
@@ -108,25 +109,25 @@ impl PartialOrd for ArcString {
 
 impl From<String> for ArcString {
     fn from(s: String) -> Self {
-        ArcString(Arc::new(s))
+        ArcString(Arc::from(s))
     }
 }
 
 impl From<&str> for ArcString {
     fn from(s: &str) -> Self {
-        ArcString(Arc::new(s.to_string()))
+        ArcString(Arc::from(s))
     }
 }
 
 impl PartialEq<String> for ArcString {
     fn eq(&self, other: &String) -> bool {
-        &*self.0 == other
+        &*self.0 == other.as_str()
     }
 }
 
 impl PartialEq<&str> for ArcString {
     fn eq(&self, other: &&str) -> bool {
-        self.0.as_str() == *other
+        &*self.0 == *other
     }
 }
 
@@ -265,9 +266,14 @@ impl std::hash::Hash for Value {
 }
 
 impl Value {
-    /// Create a Text value (boxes the string to keep enum compact)
+    /// Create a Text value from a String (1 allocation via Arc<str>).
     pub fn text(s: String) -> Self {
-        Value::Text(ArcString(Arc::new(s)))
+        Value::Text(ArcString(Arc::from(s)))
+    }
+
+    /// Create a Text value from a &str (1 allocation via Arc<str>).
+    pub fn text_from(s: &str) -> Self {
+        Value::Text(ArcString(Arc::from(s)))
     }
 
     /// Create a Tensor value

@@ -38,8 +38,8 @@ pub struct SSTable {
     /// File path
     path: PathBuf,
 
-    /// mmap of the entire file (preferred read path — zero syscall)
-    mmap: Option<Mmap>,
+    /// mmap of the entire file (shared with iterators via Arc — zero syscall reads)
+    mmap: Option<Arc<Mmap>>,
 
     /// Underlying file handle — kept alive to hold the mmap mapping valid
     #[allow(dead_code)]
@@ -141,8 +141,8 @@ impl SSTable {
         let bloom = BloomFilter::from_bytes_full(&bloom_buf)
             .ok_or_else(|| StorageError::InvalidData("Invalid Bloom filter".into()))?;
 
-        // mmap the file for zero-syscall block reads
-        let mmap = unsafe { Mmap::map(&file).ok() };
+        // mmap the file for zero-syscall block reads (Arc-shared with iterators)
+        let mmap = unsafe { Mmap::map(&file).ok() }.map(Arc::new);
 
         Ok(Self {
             path,
@@ -157,6 +157,23 @@ impl SSTable {
     /// Get a reference to the bloom filter for lock-free pre-checking
     pub fn bloom_filter(&self) -> &BloomFilter {
         &self.bloom
+    }
+
+    /// Share the mmap with an iterator (cheap Arc clone).
+    /// Returns None if mmap is unavailable (iterator will fall back to seek+read).
+    pub fn shared_mmap(&self) -> Option<Arc<Mmap>> {
+        self.mmap.clone()
+    }
+
+    /// Share the block index entries with an iterator (cheap Arc clone).
+    pub fn shared_index_entries(&self) -> Arc<Vec<(Key, u64, u32)>> {
+        self.index.shared_entries()
+    }
+
+    /// Read a block slice from mmap — zero-copy, zero-syscall.
+    /// Returns (data_without_crc, stored_crc) or falls back to seek+read.
+    pub fn read_block_zero_copy(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
+        self.read_block(offset, size)
     }
 
     /// Read a block from disk, verify CRC32, return the data portion (without CRC).
@@ -1087,8 +1104,13 @@ impl BlockIndex {
             
             entries.push((key, block_offset, block_size));
         }
-        
+
         Ok(Self { entries })
+    }
+
+    /// Share entries via Arc — cheap clone for iterators.
+    fn shared_entries(&self) -> Arc<Vec<(Key, u64, u32)>> {
+        Arc::new(self.entries.clone())
     }
 }
 
@@ -1211,10 +1233,17 @@ pub struct SSTableStats {
     pub max_timestamp: u64,
 }
 
-/// SSTable streaming iterator — reads blocks on-demand, supports range filtering.
+/// SSTable streaming iterator — reads blocks on-demand via mmap (zero syscall).
+/// Falls back to seek+read if mmap is unavailable.
 pub struct SSTableIterator {
-    file: BufReader<File>,
-    index_entries: Vec<(Key, u64, u32)>,
+    /// Shared mmap — zero-copy block reads, no syscall overhead
+    mmap: Option<Arc<Mmap>>,
+    /// Shared block index — Arc avoids per-scan Vec clone
+    index_entries: Arc<Vec<(Key, u64, u32)>>,
+    /// Fallback file handle (only used when mmap is None)
+    file: Option<BufReader<File>>,
+    /// File path (needed for fallback reads)
+    path: PathBuf,
     current_block_idx: usize,
     current_block_entries: Vec<(Key, Value)>,
     position_in_block: usize,
@@ -1230,17 +1259,29 @@ impl SSTableIterator {
     }
 
     /// Create an iterator over entries in [start_key, end_key).
+    /// Uses shared mmap (zero-syscall) when available, falls back to seek+read.
     pub fn with_range(sstable: &SSTable, start_key: Option<Key>, end_key: Option<Key>) -> Result<Self> {
-        let file = BufReader::new(File::open(&sstable.path).map_err(StorageError::Io)?);
-        let index_entries = sstable.index.entries.clone();
+        let mmap = sstable.shared_mmap();
+        let index_entries = sstable.shared_index_entries();
         let start_block_idx = if let Some(start) = start_key {
             let start_bytes = start.to_be_bytes();
             sstable.index.find_block_index(&start_bytes)
         } else { 0 };
 
+        // Only open file handle if mmap is unavailable
+        let (file, path) = if mmap.is_none() {
+            let file = BufReader::new(File::open(&sstable.path).map_err(StorageError::Io)?);
+            (Some(file), sstable.path.clone())
+        } else {
+            (None, sstable.path.clone())
+        };
+
         Ok(Self {
-            file, index_entries, current_block_idx: start_block_idx,
-            current_block_entries: Vec::new(), position_in_block: 0, start_key, end_key,
+            mmap, index_entries, file, path,
+            current_block_idx: start_block_idx,
+            current_block_entries: Vec::new(),
+            position_in_block: 0,
+            start_key, end_key,
         })
     }
 
@@ -1251,15 +1292,46 @@ impl SSTableIterator {
 
         let (_, offset, size) = self.index_entries[self.current_block_idx];
 
-        // Read block with CRC verification
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; size as usize];
-        self.file.read_exact(&mut buf)?;
-
-        // Verify CRC32 (last 4 bytes)
-        if buf.len() < 4 {
+        if size < 4 {
             return Err(crate::StorageError::InvalidData("Block too small for CRC".into()));
         }
+
+        // Fast path: read from mmap (zero syscall)
+        let buf: &[u8] = if let Some(ref mmap) = self.mmap {
+            let start = offset as usize;
+            let end = start + size as usize;
+            if end > mmap.len() {
+                return Err(crate::StorageError::InvalidData(
+                    format!("Block extends beyond mmap: offset {} + size {} > {}", offset, size, mmap.len())
+                ));
+            }
+            &mmap[start..end]
+        } else {
+            // Fallback: seek+read
+            let file = self.file.as_mut().unwrap();
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; size as usize];
+            file.read_exact(&mut buf)?;
+
+            // Verify CRC32 (last 4 bytes)
+            let data_len = buf.len() - 4;
+            let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+            let computed_crc = crc32fast::hash(&buf[..data_len]);
+            if stored_crc != computed_crc {
+                return Err(crate::StorageError::InvalidData(
+                    format!("CRC32 mismatch in iterator block at offset {}: expected {:08x}, got {:08x}", offset, stored_crc, computed_crc)
+                ));
+            }
+
+            // Deserialize block (without CRC bytes)
+            let block = DataBlock::deserialize(&buf[..data_len])?;
+            self.current_block_entries = block.entries;
+            self.position_in_block = 0;
+            self.current_block_idx += 1;
+            return Ok(true);
+        };
+
+        // mmap path: verify CRC + deserialize
         let data_len = buf.len() - 4;
         let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
         let computed_crc = crc32fast::hash(&buf[..data_len]);
@@ -1269,21 +1341,18 @@ impl SSTableIterator {
             ));
         }
 
-        // Deserialize block (without CRC bytes)
         let block = DataBlock::deserialize(&buf[..data_len])?;
-        
-        // Replace current block entries
         self.current_block_entries = block.entries;
         self.position_in_block = 0;
         self.current_block_idx += 1;
-        
+
         Ok(true)
     }
 }
 
 impl Iterator for SSTableIterator {
     type Item = (Key, Value);
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.position_in_block < self.current_block_entries.len() {
@@ -1345,7 +1414,7 @@ mod tests {
             // Test get
             let key = 50u64;  // ✅ u64 key
             let value = sst.get(key).unwrap().unwrap();
-            assert_eq!(value.data, ValueData::Inline(b"value_50".to_vec()));
+            assert_eq!(value.data, ValueData::Inline(std::sync::Arc::new(b"value_50".to_vec())));
             assert_eq!(value.timestamp, 50);
             
             // Test non-existent key

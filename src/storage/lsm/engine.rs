@@ -105,13 +105,13 @@ impl SSTableCache {
 /// 
 /// ## Architecture (🔥 NEW: Multi-slot Immutables)
 /// - **Active MemTable**: Accepts writes (never blocks)
-/// - **Immutable Queue**: 4 slots for flushing (buffered async)
+/// - **Immutable Queue**: 2 slots for flushing (buffered async)
 /// - **Flush Thread**: Background thread that continuously flushes queue
 /// 
 /// ## Memory Control (🔥 Backpressure-enabled)
 /// - Max memory: (1 + max_immutable_slots) × memtable_size = 5 × 4MB = 20MB
 /// - When active is full: push to immutable queue, create new active
-/// - Backpressure: If queue is full (4 slots occupied), wait for flush
+/// - Backpressure: If queue is full (2 slots occupied), wait for flush
 /// - Benefit: Write throughput remains high even when disk is slow
 /// 
 /// ## Performance
@@ -133,7 +133,7 @@ pub struct LSMEngine {
     /// 🆕 现在使用 UnifiedMemTable（支持数据+向量）
     memtable: Arc<RwLock<UnifiedMemTable>>,
     
-    /// Immutable MemTable queue (FIFO, up to 4 slots)
+    /// Immutable MemTable queue (FIFO, up to 2 slots)
     /// 🔥 NEW: Changed from Option to VecDeque for multi-slot buffering
     immutable: Arc<RwLock<VecDeque<UnifiedMemTable>>>,
     
@@ -308,7 +308,7 @@ impl LSMEngine {
         let mut engine = Self {
             memtable: Arc::new(RwLock::new(memtable)),
             immutable: Arc::new(RwLock::new(VecDeque::new())),  // 🔥 Empty queue
-            max_immutable_slots: 4,  // 🔥 NEW: 4 slots = 16MB buffer
+            max_immutable_slots: 2,  // 2 slots = 8MB peak buffer (embedded-friendly)
             flush_lock: Arc::new(Mutex::new(())),
             flush_in_progress: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -650,8 +650,8 @@ impl LSMEngine {
     /// 
     /// ## Memory Control (🔥 NEW: Queue-based Backpressure)
     /// - Max memory: (1 + max_slots) × memtable_size = 5 × 4MB = 20MB
-    /// - If queue has space (< 4 slots): No blocking, instant rotation
-    /// - If queue is full (= 4 slots): **Block write until a slot frees**
+    /// - If queue has space (< 2 slots): No blocking, instant rotation
+    /// - If queue is full (= 2 slots): **Block write until a slot frees**
     /// - Benefit: Smooth writes even when disk fsync is slow
     /// 
     /// ## Performance
@@ -1940,7 +1940,7 @@ mod tests {
         
         // Get
         let value = engine.get(1u64).unwrap().unwrap();
-        assert_eq!(value.data, ValueData::Inline(b"value1".to_vec()));
+        assert_eq!(value.data, ValueData::Inline(std::sync::Arc::new(b"value1".to_vec())));
         
         // Delete
         engine.delete(1u64, 3).unwrap();
@@ -1984,7 +1984,7 @@ mod tests {
         }
         for i in 0..1000u64 {
             let val = engine.get(i).unwrap().expect("key should exist");
-            assert_eq!(val.data, ValueData::Inline(i.to_le_bytes().to_vec()));
+            assert_eq!(val.data, ValueData::Inline(std::sync::Arc::new(i.to_le_bytes().to_vec())));
         }
     }
 
@@ -2040,7 +2040,7 @@ mod tests {
         // Put with even higher timestamp revives
         engine.put(1, Value::new(b"revived".to_vec(), 300)).unwrap();
         let val = engine.get(1).unwrap().unwrap();
-        assert_eq!(val.data, ValueData::Inline(b"revived".to_vec()));
+        assert_eq!(val.data, ValueData::Inline(std::sync::Arc::new(b"revived".to_vec())));
     }
 
     #[test]

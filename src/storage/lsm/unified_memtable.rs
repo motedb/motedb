@@ -531,7 +531,7 @@ mod tests {
         let memtable = create_vector_memtable(128);
 
         let key = 1u64;
-        let data = ValueData::Inline(b"test_data".to_vec());
+        let data = ValueData::Inline(std::sync::Arc::new(b"test_data".to_vec()));
         let vector = vec![1.0f32; 128];
 
         memtable.put_with_vector(key, data, vector, 1).unwrap();
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(memtable.size(), 0);
 
         let key = 1u64;
-        let data = ValueData::Inline(b"test".to_vec());
+        let data = ValueData::Inline(std::sync::Arc::new(b"test".to_vec()));
         let vector = vec![1.0f32; 128];
 
         memtable.put_with_vector(key, data, vector, 1).unwrap();
@@ -594,7 +594,7 @@ mod tests {
         assert!(!memtable.should_flush());
 
         for i in 0..250 {
-            let data = ValueData::Inline(vec![0u8; 10]);
+            let data = ValueData::Inline(std::sync::Arc::new(vec![0u8; 10]));
             let vector = vec![1.0f32; 128];
             memtable.put_with_vector(i, data, vector, i).unwrap();
         }

@@ -307,6 +307,13 @@ impl Database {
     /// db.execute("CREATE INDEX users_email ON users(email)")?;
     /// db.execute("CREATE VECTOR INDEX docs_vec ON docs(embedding)")?;
     /// ```
+
+    /// Returns the configured max_result_rows limit, if any.
+    /// Use with `for_each()` or `materialize_with_limit()` for bounded queries.
+    pub fn max_result_rows(&self) -> Option<usize> {
+        self.inner.max_result_rows
+    }
+
     pub fn execute(&self, sql: &str) -> Result<StreamingQueryResult> {
         use crate::sql::{Lexer, Parser};
 

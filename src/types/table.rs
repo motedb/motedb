@@ -479,7 +479,7 @@ mod tests {
         // Valid row
         let row = vec![
             Value::Timestamp(Timestamp::from_micros(123)),
-            Value::Text(ArcString(Arc::new("test".to_string()))),
+            Value::Text(ArcString(Arc::from("test"))),
         ];
         assert!(schema.validate_row(&row).is_ok());
 

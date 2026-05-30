@@ -81,10 +81,6 @@ pub struct TextFTSIndex {
     /// Deleted (term_id, doc_id) pairs (for update operations)
     /// Tracks which terms have been removed from which documents
     deleted_term_docs: Arc<RwLock<HashSet<(TermId, DocId)>>>,
-
-    /// Set of all distinct doc_ids ever inserted — used to avoid
-    /// double-counting total_docs on re-insert/update operations.
-    known_docs: Arc<RwLock<HashSet<DocId>>>,
 }
 
 /// Metadata for text FTS index
@@ -96,7 +92,6 @@ struct TextFTSMetadata {
     enable_positions: bool,
     deleted_docs: Vec<DocId>,
     deleted_term_docs: Vec<(TermId, DocId)>,
-    known_docs: Vec<DocId>,
 }
 
 /// Document length map
@@ -203,16 +198,16 @@ impl TextFTSIndex {
         
         // Load statistics metadata
         let meta_path = storage_dir.join("index_meta.bin");
-        let (total_docs, total_tokens, avg_doc_length, deleted_docs_vec, deleted_term_docs_vec, known_docs_vec) = if meta_path.exists() {
+        let (total_docs, total_tokens, avg_doc_length, deleted_docs_vec, deleted_term_docs_vec) = if meta_path.exists() {
             Self::load_metadata(&meta_path)?
         } else {
-            (0, 0, 0.0, Vec::new(), Vec::new(), Vec::new())
+            (0, 0, 0.0, Vec::new(), Vec::new())
         };
-        
+
         // Convert deleted_docs from Vec to HashSet
         let deleted_docs: HashSet<DocId> = deleted_docs_vec.into_iter().collect();
         let deleted_term_docs: HashSet<(TermId, DocId)> = deleted_term_docs_vec.into_iter().collect();
-        
+
         Ok(Self {
             storage_dir,
             btree: Arc::new(RwLock::new(btree)),
@@ -229,7 +224,6 @@ impl TextFTSIndex {
             doc_length_cache: Arc::new(RwLock::new(None)),
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
-            known_docs: Arc::new(RwLock::new(known_docs_vec.into_iter().collect())),
         })
     }
     
@@ -311,18 +305,10 @@ impl TextFTSIndex {
         pending_doc_lens.extend(doc_lengths_batch);
         drop(pending_doc_lens);
 
-        // 3. Update statistics — count only truly new documents
-        let new_doc_count = {
-            let mut known = self.known_docs.write();
-            let mut count = 0u64;
-            for (doc_id, _) in docs {
-                if known.insert(*doc_id) {
-                    count += 1;
-                }
-            }
-            count
-        };
-        self.total_docs += new_doc_count;
+        // 3. Update statistics — each document in batch is a new document.
+        // No need to track known_docs: callers guarantee insert is for new rows,
+        // updates go through the update() API, not insert().
+        self.total_docs += docs.len() as u64;
         self.total_tokens += batch_token_count;
 
         if self.total_docs > 0 {
@@ -361,9 +347,6 @@ impl TextFTSIndex {
         if already_deleted {
             return Ok(());
         }
-
-        // Remove from known_docs so it counts as new if re-inserted
-        self.known_docs.write().remove(&doc_id);
 
         // Tokenize to get all terms for this doc
         let tokens = self.tokenizer.tokenize(text);
@@ -1157,7 +1140,6 @@ impl TextFTSIndex {
         
         let deleted_docs: Vec<DocId> = self.deleted_docs.read().iter().copied().collect();
         let deleted_term_docs: Vec<(TermId, DocId)> = self.deleted_term_docs.read().iter().copied().collect();
-        let known_docs: Vec<DocId> = self.known_docs.read().iter().copied().collect();
 
         let metadata = TextFTSMetadata {
             total_docs: self.total_docs,
@@ -1166,7 +1148,6 @@ impl TextFTSIndex {
             enable_positions: self.enable_positions,
             deleted_docs,
             deleted_term_docs,
-            known_docs,
         };
         
         let serialized = bincode::serialize(&metadata)
@@ -1184,13 +1165,13 @@ impl TextFTSIndex {
     
     /// Load metadata from disk
     #[allow(clippy::type_complexity)]
-    fn load_metadata(stats_path: &PathBuf) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>, Vec<DocId>)> {
+    fn load_metadata(stats_path: &PathBuf) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>)> {
         let mut file = File::open(stats_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
 
         if buffer.is_empty() {
-            return Ok((0, 0, 0.0, Vec::new(), Vec::new(), Vec::new()));
+            return Ok((0, 0, 0.0, Vec::new(), Vec::new()));
         }
 
         let metadata: TextFTSMetadata =
@@ -1203,7 +1184,6 @@ impl TextFTSIndex {
             metadata.avg_doc_length,
             metadata.deleted_docs,
             metadata.deleted_term_docs,
-            metadata.known_docs,
         ))
     }
     
@@ -1528,7 +1508,7 @@ impl IndexBuilder for TextFTSIndex {
             for value in row.iter() {
                 match value {
                     Value::Text(text) => {
-                        documents.push((*row_id, (**text).clone()));
+                        documents.push((*row_id, text.to_string()));
                         break; // 只取第一个文本列
                     }
                     Value::TextDoc(text) => {

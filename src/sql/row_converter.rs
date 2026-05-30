@@ -149,13 +149,13 @@ mod tests {
         
         let row = vec![
             Value::Integer(1),
-            Value::Text(ArcString(Arc::new("Alice".to_string()))),
+            Value::Text(ArcString(Arc::from("Alice"))),
         ];
 
         let sql_row = row_to_sql_row(&row, &schema).unwrap();
 
         assert_eq!(sql_row.get("id"), Some(&Value::Integer(1)));
-        assert_eq!(sql_row.get("name"), Some(&Value::Text(ArcString(Arc::new("Alice".to_string())))));
+        assert_eq!(sql_row.get("name"), Some(&Value::Text(ArcString(Arc::from("Alice")))));
     }
 
     #[test]
@@ -170,13 +170,13 @@ mod tests {
 
         let mut sql_row = SqlRow::new();
         sql_row.insert("id".to_string(), Value::Integer(1));
-        sql_row.insert("name".to_string(), Value::Text(ArcString(Arc::new("Alice".to_string()))));
+        sql_row.insert("name".to_string(), Value::Text(ArcString(Arc::from("Alice"))));
 
         let row = sql_row_to_row(&sql_row, &schema).unwrap();
 
         assert_eq!(row.len(), 2);
         assert_eq!(row[0], Value::Integer(1));
-        assert_eq!(row[1], Value::Text(ArcString(Arc::new("Alice".to_string()))));
+        assert_eq!(row[1], Value::Text(ArcString(Arc::from("Alice"))));
     }
 
     #[test]
@@ -192,7 +192,7 @@ mod tests {
         
         let original_row = vec![
             Value::Integer(42),
-            Value::Text(ArcString(Arc::new("Bob".to_string()))),
+            Value::Text(ArcString(Arc::from("Bob"))),
             Value::Integer(30),
         ];
         

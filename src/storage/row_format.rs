@@ -155,6 +155,120 @@ pub fn compute_fixed_count(col_types: &[ColumnType]) -> usize {
     col_types.iter().filter(|t| is_fixed(t)).count()
 }
 
+/// Pre-parsed row header for zero-copy two-phase column decode.
+/// Parse once per row, then decode different column sets without re-parsing the header.
+pub struct RowParseContext {
+    null_bitmap: u64,
+    fixed_count: usize,
+    var_offsets: [(usize, usize); 64],
+    var_data_start: usize,
+    /// Pre-computed mapping: col_idx -> fixed_idx (O(1) lookup instead of O(col_idx) scan)
+    fixed_idx_map: [u8; 64],
+}
+
+impl RowParseContext {
+    /// Parse the row header (one-time cost per row).
+    /// Returns None if the data is not in RawRow format (legacy bincode).
+    pub fn parse(data: &[u8], col_types: &[ColumnType], fixed_count: usize) -> Option<Self> {
+        if !is_rawrow(data) || data.len() < HEADER_SIZE {
+            return None;
+        }
+
+        let col_count = u16::from_le_bytes([data[2], data[3]]) as usize;
+        if col_count != col_types.len() {
+            return None;
+        }
+
+        let null_bitmap = u64::from_le_bytes([
+            data[4], data[5], data[6], data[7],
+            data[8], data[9], data[10], data[11],
+        ]);
+
+        // Pre-compute col_idx -> fixed_idx mapping (one pass, O(C) not O(C²))
+        let mut fixed_idx_map = [0u8; 64];
+        let mut next_fixed = 0u8;
+        for (i, ct) in col_types.iter().enumerate() {
+            if i >= 64 { break; }
+            if is_fixed(ct) {
+                fixed_idx_map[i] = next_fixed;
+                next_fixed += 1;
+            }
+        }
+
+        let var_section_start = HEADER_SIZE + fixed_count * FIXED_COL_SIZE;
+        let mut var_offsets = [(0usize, 0usize); 64];
+        let var_data_start;
+        if var_section_start + 2 <= data.len() {
+            let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+            let var_header_start = var_section_start + 2;
+            var_data_start = var_header_start + var_count * 10;
+            for i in 0..var_count {
+                let off = var_header_start + i * 10;
+                if off + 10 > data.len() { break; }
+                let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+                if col_idx >= 64 { break; }
+                let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
+                let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+                var_offsets[col_idx] = (v_off, v_len);
+            }
+        } else {
+            var_data_start = data.len();
+        }
+
+        Some(Self { null_bitmap, fixed_count, var_offsets, var_data_start, fixed_idx_map })
+    }
+
+    /// Decode a set of columns using the pre-parsed context.
+    /// Much faster than calling get_column() N times — header parsed only once.
+    /// Uses pre-computed fixed_idx_map for O(1) fixed column lookup.
+    #[inline]
+    pub fn decode_columns(
+        &self,
+        data: &[u8],
+        col_types: &[ColumnType],
+        positions: &[usize],
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        out.clear();
+
+        for &col_idx in positions {
+            if col_idx >= col_types.len() {
+                out.push(Value::Null);
+                continue;
+            }
+
+            // NULL check
+            if self.null_bitmap & (1u64 << col_idx) != 0 {
+                out.push(Value::Null);
+                continue;
+            }
+
+            let col_type = &col_types[col_idx];
+
+            if is_fixed(col_type) {
+                // Fixed column: O(1) lookup via pre-computed mapping
+                let fixed_idx = self.fixed_idx_map[col_idx] as usize;
+                let off = HEADER_SIZE + fixed_idx * FIXED_COL_SIZE;
+                if off + FIXED_COL_SIZE > data.len() {
+                    out.push(Value::Null);
+                } else {
+                    out.push(decode_fixed(&data[off..off + FIXED_COL_SIZE], col_type));
+                }
+            } else {
+                // Variable column: use pre-parsed var_offsets
+                let (v_off, v_len) = self.var_offsets[col_idx];
+                let abs_off = self.var_data_start + v_off;
+                if abs_off + v_len > data.len() {
+                    out.push(Value::Null);
+                } else {
+                    out.push(decode_var(&data[abs_off..abs_off + v_len], col_type)?);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Decode bytes into a Row without knowing the schema.
 /// Tries RawRow first (with generic type inference), falls back to bincode.
 pub fn decode_any(data: &[u8]) -> Result<Row> {
@@ -590,9 +704,9 @@ fn decode_raw_any(data: &[u8]) -> Result<Row> {
                                 continue;
                             }
                         }
-                        // Try as UTF-8 text
+                        // Try as UTF-8 text — Arc<str> from &str = 1 allocation (not 2)
                         if let Ok(s) = std::str::from_utf8(var_data) {
-                            row.push(Value::text(s.to_string()));
+                            row.push(Value::text_from(s));
                         } else {
                             // Fallback: bincode
                             match bincode::deserialize::<Value>(var_data) {
@@ -639,7 +753,7 @@ fn decode_var(bytes: &[u8], col_type: &ColumnType) -> Result<Value> {
         ColumnType::Text => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| StorageError::InvalidData("Invalid UTF-8 in Text column".into()))?;
-            Ok(Value::text(s.to_string()))
+            Ok(Value::text_from(s))
         }
         _ => {
             // Check for tagged bincode value (0xFF prefix)

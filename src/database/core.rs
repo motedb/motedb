@@ -113,6 +113,9 @@ pub struct MoteDB {
     /// 🚀 P0: Query timeout (seconds)
     pub(crate) query_timeout_secs: Option<u64>,
 
+    /// Maximum rows a single SELECT may return (prevents OOM).
+    pub(crate) max_result_rows: Option<usize>,
+
     /// PK lookup cache capacity per table (LRU eviction)
     pub(crate) pk_lookup_capacity: usize,
 
@@ -318,6 +321,7 @@ impl MoteDB {
             query_timeout_secs: config.query_timeout_secs,
             pk_lookup_capacity: config.pk_lookup_capacity,
             column_index_buffer_size: config.column_index_buffer_size,
+            max_result_rows: config.max_result_rows,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -511,6 +515,7 @@ impl MoteDB {
             query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
             pk_lookup_capacity: self.pk_lookup_capacity,
             column_index_buffer_size: self.column_index_buffer_size,
+            max_result_rows: self.max_result_rows,
             is_flushing: self.is_flushing.clone(),
             is_pipeline_active: self.is_pipeline_active.clone(),  // shared — clones see true when pipeline runs
             pending_index_batches: self.pending_index_batches.clone(),
@@ -885,6 +890,7 @@ impl MoteDB {
             query_timeout_secs: config.query_timeout_secs,
             pk_lookup_capacity: config.pk_lookup_capacity,
             column_index_buffer_size: config.column_index_buffer_size,
+            max_result_rows: config.max_result_rows,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

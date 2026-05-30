@@ -260,7 +260,7 @@ mod tests {
         // 相同 key 在不同数据源（模拟多版本）
         let source1: Vec<Result<(Key, Value)>> = vec![
             Ok((1, Value { 
-                data: ValueData::Inline(vec![1, 0, 0]),  // v3 (newest)
+                data: ValueData::Inline(std::sync::Arc::new(vec![1, 0, 0])),  // v3 (newest)
                 timestamp: 300,
                 deleted: false,
             })),
@@ -268,7 +268,7 @@ mod tests {
         
         let source2: Vec<Result<(Key, Value)>> = vec![
             Ok((1, Value { 
-                data: ValueData::Inline(vec![1, 0]),  // v2
+                data: ValueData::Inline(std::sync::Arc::new(vec![1, 0])),  // v2
                 timestamp: 200,
                 deleted: false,
             })),
@@ -276,7 +276,7 @@ mod tests {
         
         let source3: Vec<Result<(Key, Value)>> = vec![
             Ok((1, Value { 
-                data: ValueData::Inline(vec![1]),  // v1 (oldest)
+                data: ValueData::Inline(std::sync::Arc::new(vec![1])),  // v1 (oldest)
                 timestamp: 100,
                 deleted: false,
             })),
@@ -292,7 +292,7 @@ mod tests {
         let results: Vec<(Key, Vec<u8>)> = iter.map(|r| {
             let (k, v) = r.unwrap();
             match v.data {
-                ValueData::Inline(data) => (k, data),
+                ValueData::Inline(data) => (k, data.to_vec()),
                 _ => panic!("Expected inline data"),
             }
         }).collect();
@@ -309,7 +309,7 @@ mod tests {
         let source1: Vec<Result<(Key, Value)>> = vec![
             Ok((1, Value::new(vec![1], 100))),
             Ok((2, Value { 
-                data: ValueData::Inline(vec![]),
+                data: ValueData::Inline(std::sync::Arc::new(vec![])),
                 timestamp: 200,
                 deleted: true,  // tombstone
             })),

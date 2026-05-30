@@ -294,6 +294,9 @@ impl RowCache {
             cache.pop(&key);
         }
         self.size.store(cache.len(), Ordering::Relaxed);
+
+        // Also clean up access_patterns for this table
+        self.access_patterns.write().remove(table_name);
     }
 
     /// Clear entire cache
@@ -343,7 +346,7 @@ mod tests {
     fn test_row_cache_basic() {
         let cache = RowCache::new(100);
 
-        let row = vec![Value::Integer(1), Value::Text(ArcString(Arc::new("test".to_string())))];
+        let row = vec![Value::Integer(1), Value::Text(ArcString(Arc::from("test")))];
 
         assert!(cache.get("users", 1).is_none());
 

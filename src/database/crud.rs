@@ -909,6 +909,7 @@ impl MoteDB {
             lsm_iter,
             col_types: Some(col_types.to_vec()),
             fixed_count: crate::storage::row_format::compute_fixed_count(&col_types),
+            row_buf: Vec::with_capacity(col_types.len()),
         })
     }
 
@@ -1257,7 +1258,7 @@ impl MoteDB {
                     let mut texts: Vec<(RowId, String)> = Vec::with_capacity(rows.len());
                     for (row_id, row) in row_ids.iter().zip(rows.iter()) {
                         if let Some(crate::types::Value::Text(text)) = row.get(col_def.position) {
-                            texts.push((*row_id, (**text).clone()));
+                            texts.push((*row_id, text.to_string()));
                         }
                     }
                     
@@ -1695,6 +1696,8 @@ pub struct TableRowStreamingIterator {
     lsm_iter: crate::storage::lsm::MergingIterator,
     col_types: Option<Vec<crate::types::ColumnType>>,
     fixed_count: usize,
+    /// Reusable decode buffer — avoids allocating a new Vec<Value> per row.
+    row_buf: Vec<Value>,
 }
 
 impl Iterator for TableRowStreamingIterator {
@@ -1721,8 +1724,8 @@ impl Iterator for TableRowStreamingIterator {
                     };
 
                     let row: Row = if let Some(ref col_types) = self.col_types {
-                        match crate::storage::row_format::decode_fast(data, col_types, self.fixed_count) {
-                            Ok(row) => row,
+                        match crate::storage::row_format::decode_fast_into(data, col_types, self.fixed_count, &mut self.row_buf) {
+                            Ok(()) => std::mem::take(&mut self.row_buf),
                             Err(e) => return Some(Err(e)),
                         }
                     } else {
@@ -1770,7 +1773,9 @@ impl Iterator for TableRowPartialIterator {
                     data, &self.col_types, self.fixed_count, &self.col_positions, &mut self.out_buf,
                 ) {
                     Ok(_) => {
-                        let projected = self.out_buf.clone();
+                        // Take the buffer contents — avoids cloning values.
+                        // out_buf becomes empty Vec (preserving allocation for next row).
+                        let projected = std::mem::take(&mut self.out_buf);
                         Some(Ok((row_id, projected)))
                     }
                     Err(e) => Some(Err(e)),

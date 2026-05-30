@@ -20,7 +20,7 @@ pub use token::{Token, TokenType};
 pub use lexer::Lexer;
 pub use ast::{Statement, SelectStmt, InsertStmt, CreateTableStmt, Expr, BinaryOperator};
 pub use parser::Parser;
-pub use executor::{QueryExecutor, QueryResult, StreamingQueryResult};
+pub use executor::{ForEachResult, QueryExecutor, QueryResult, StreamingControl, StreamingQueryResult};
 pub use evaluator::ExprEvaluator;
 pub use row_converter::{row_to_sql_row, sql_row_to_row, rows_to_sql_rows};
 pub use optimizer::{QueryOptimizer, QueryPlan, ScanMethod, IndexStats};

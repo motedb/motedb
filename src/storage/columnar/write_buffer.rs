@@ -38,7 +38,7 @@ impl ColumnBuffer {
             (Self::Float(v), Value::Null) => v.push(None),
             (Self::Bool(v), Value::Bool(b)) => v.push(Some(b)),
             (Self::Bool(v), Value::Null) => v.push(None),
-            (Self::Text(v), Value::Text(s)) => v.push(Some((*s).clone())),
+            (Self::Text(v), Value::Text(s)) => v.push(Some(s.to_string())),
             (Self::Text(v), Value::Null) => v.push(None),
             (Self::Other(v), val) => v.push(val),
             // Type mismatch: push NULL to keep column alignment

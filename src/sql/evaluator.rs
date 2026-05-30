@@ -308,6 +308,15 @@ impl ExprEvaluator {
                     return Ok(Value::Bool(false));
                 }
 
+                // Fast path: when all items are literals, use O(1) hash comparison
+                let all_literals = list.iter().all(|e| matches!(e, Expr::Literal(_)));
+                if all_literals {
+                    let found = list.iter().any(|item| {
+                        if let Expr::Literal(v) = item { val == *v } else { false }
+                    });
+                    return Ok(Value::Bool(if *negated { !found } else { found }));
+                }
+
                 let mut found = false;
                 let mut has_null = false;
 

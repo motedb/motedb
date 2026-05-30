@@ -80,7 +80,7 @@ pub use error::{Result, StorageError, MoteDBError};
 pub use database::{MoteDB, QueryProfile, TransactionStats};
 pub use api::Database;  // 简化 API 包装
 pub use catalog::TableRegistry;
-pub use sql::{QueryResult, StreamingQueryResult};  // ✅ 移除 execute_sql，添加 StreamingQueryResult
+pub use sql::{ForEachResult, QueryResult, StreamingControl, StreamingQueryResult};
 
 // 🔌 导出分词器插件系统（方便用户直接使用）
 pub mod tokenizers {

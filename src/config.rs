@@ -391,6 +391,11 @@ pub struct DBConfig {
     /// - 262144 (256KB): memory-constrained environments
     pub column_index_buffer_size: usize,
 
+    /// Maximum rows a single SELECT may return. Prevents OOM on large tables.
+    /// None = no limit (backward compatible).
+    /// Recommended: edge 50000, desktop 500000.
+    pub max_result_rows: Option<usize>,
+
     /// 🚀 Phase 3+: Index update strategy
     /// 
     /// Controls when indexes are updated:
@@ -469,8 +474,9 @@ impl Default for DBConfig {
             num_partitions: 4,
             lsm_config: LSMConfig::default(),
             row_cache_size: None,  // Use default 10000
-            pk_lookup_capacity: 50_000,  // ~4MB per table
+            pk_lookup_capacity: 10_000,  // ~0.8MB per table (embedded-friendly)
             column_index_buffer_size: 1024 * 1024,  // 1MB
+            max_result_rows: None,  // No limit
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
             query_timeout_secs: None,  // No timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()),  // ✅ 默认启用自动 checkpoint
@@ -529,7 +535,8 @@ impl DBConfig {
                 ..Default::default()
             },
             row_cache_size: Some(500),
-            pk_lookup_capacity: 50_000,  // ~4MB per table, covers most edge datasets
+            max_result_rows: Some(50_000),
+            pk_lookup_capacity: 10_000,  // ~0.8MB per table for edge devices
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
@@ -562,7 +569,8 @@ impl DBConfig {
                 ..Default::default()
             },
             row_cache_size: Some(500),
-            pk_lookup_capacity: 50_000,
+            max_result_rows: Some(100_000),
+            pk_lookup_capacity: 10_000,  // ~0.8MB per table for robotics
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
                 min_interval_secs: 60,
