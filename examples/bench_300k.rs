@@ -11,13 +11,14 @@ fn get_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn setup_db(n: usize) -> (Database, TempDir) {
+fn setup_db(n: usize) -> (Database, TempDir, u128, u128) {
     let dir = TempDir::new().unwrap();
     let mut config = DBConfig::for_edge();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
     db.execute("CREATE TABLE sales (id INT PRIMARY KEY AUTO_INCREMENT, customer TEXT, amount FLOAT, region TEXT)").unwrap();
     let batch_size = 5000;
+    let t_insert = Instant::now();
     for batch_start in (0..n).step_by(batch_size) {
         let end = (batch_start + batch_size).min(n);
         let mut batch = String::with_capacity(batch_size * 60);
@@ -30,12 +31,15 @@ fn setup_db(n: usize) -> (Database, TempDir) {
         batch.truncate(batch.len() - 1);
         db.execute(&format!("INSERT INTO sales (customer, amount, region) VALUES {}", batch)).unwrap();
     }
+    let insert_ms = t_insert.elapsed().as_millis();
     // Create column indexes for benchmarked WHERE columns.
     // The optimizer uses these to generate PointQuery plans for
     // low-selectivity queries (estimated_rows < 5% of total).
+    let t_index = Instant::now();
     db.execute("CREATE INDEX idx_region ON sales (region) USING COLUMN").unwrap();
     db.execute("CREATE INDEX idx_customer ON sales (customer) USING COLUMN").unwrap();
-    (db, dir)
+    let index_ms = t_index.elapsed().as_millis();
+    (db, dir, insert_ms, index_ms)
 }
 
 fn bench<F: FnMut()>(_label: &str, mut f: F) -> u64 {
@@ -58,11 +62,12 @@ fn main() {
     println!("\n  MoteDB 300K Row Benchmark");
     println!("  {}", "=".repeat(70));
     
-    let t0 = Instant::now();
-    let (db, _dir) = setup_db(n);
-    let insert_ms = t0.elapsed().as_millis();
+    let (db, _dir, insert_ms, index_ms) = setup_db(n);
     let rss = get_rss_kb();
+    let total_ms = insert_ms + index_ms;
     println!("  Insert {} rows: {}ms ({} rows/sec)", n, insert_ms, (n as u64 * 1000) / (insert_ms as u64).max(1));
+    println!("  Create 2 indexes: {}ms", index_ms);
+    println!("  Total setup: {}ms", total_ms);
     println!("  RSS after insert: {} KB ({} B/row)", rss, rss * 1024 / n as u64);
     println!();
 

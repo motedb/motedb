@@ -7692,16 +7692,22 @@ impl QueryExecutor {
                     Err(e) => return Err(e),
                 }
             }
-        } else {
-            // Normal row-by-row insert path
+        } else if txn_id.is_some() {
+            // Transactional path: must use per-row insert with txn coordinator
             for row in prepared_rows {
-                let row_id = if let Some(tid) = txn_id {
-                    self.db.insert_row_with_txn(&stmt.table, tid, row)?
-                } else {
-                    self.db.insert_row_to_table(&stmt.table, row)?
-                };
+                let row_id = self.db.insert_row_with_txn(&stmt.table, txn_id.unwrap(), row)?;
                 last_row_id = Some(row_id);
             }
+        } else if prepared_rows.len() > 1 {
+            // 🚀 Batch path: single WAL fsync, batched LSM put, batched index updates
+            let ids = self.db.batch_insert_rows_to_table(&stmt.table, prepared_rows)?;
+            if let Some(&id) = ids.last() {
+                last_row_id = Some(id);
+            }
+        } else if let Some(row) = prepared_rows.into_iter().next() {
+            // Single-row path
+            let row_id = self.db.insert_row_to_table(&stmt.table, row)?;
+            last_row_id = Some(row_id);
         }
 
         // Update last_insert_id if table has AUTO_INCREMENT primary key
