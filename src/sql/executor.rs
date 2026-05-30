@@ -1310,21 +1310,17 @@ impl QueryExecutor {
         // For PointQuery/RangeQuery, the plan already has resolved values — use original stmt.
         // For FullScan, WHERE still contains Parameter nodes — substitute needed.
         //
-        // When post_filters is non-empty, the index plan only covers part of the WHERE
-        // clause (e.g., `col = 5` in `col = 5 AND status = 'active'`). The streaming
-        // point/range paths don't re-evaluate the full WHERE, so fall back to FullScan
-        // which applies the complete WHERE clause per row.
-        let has_post_filters = !plan.post_filters.is_empty();
+        // post_filters are applied AFTER index row fetch: the index narrows to a small
+        // candidate set (e.g., 10 rows), then post_filters further filter in-memory.
+        // This replaces the old behavior of falling back to full table scan when
+        // post_filters were present.
+        let post_filters = &plan.post_filters;
         match plan.scan_method {
-            super::optimizer::ScanMethod::PointQuery { ref table, ref column, ref value }
-                if !has_post_filters =>
-            {
-                self.execute_point_query_streaming(stmt, table, column, value)
+            super::optimizer::ScanMethod::PointQuery { ref table, ref column, ref value } => {
+                self.execute_point_query_streaming(stmt, table, column, value, post_filters)
             }
-            super::optimizer::ScanMethod::RangeQuery { ref table, ref column, ref start, start_inclusive, ref end, end_inclusive }
-                if !has_post_filters =>
-            {
-                self.execute_range_query_streaming(stmt, table, column, start, start_inclusive, end, end_inclusive)
+            super::optimizer::ScanMethod::RangeQuery { ref table, ref column, ref start, start_inclusive, ref end, end_inclusive } => {
+                self.execute_range_query_streaming(stmt, table, column, start, start_inclusive, end, end_inclusive, post_filters)
             }
             super::optimizer::ScanMethod::FullScan { .. } if has_params => {
                 // FullScan with params: need to substitute WHERE for correct evaluation
@@ -1341,8 +1337,8 @@ impl QueryExecutor {
             }
             super::optimizer::ScanMethod::IndexIntersection {
                 ref table, ref column1, ref value1, ref column2, ref value2,
-            } if !has_post_filters => {
-                self.execute_index_intersection_streaming(stmt, table, column1, value1, column2, value2)
+            } => {
+                self.execute_index_intersection_streaming(stmt, table, column1, value1, column2, value2, post_filters)
             }
             _ => {
                 // Fallback to materialized path (handles params via eval())
@@ -1444,6 +1440,7 @@ impl QueryExecutor {
         table: &str,
         column: &str,
         value: &Value,
+        post_filters: &[Expr],
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
@@ -1460,6 +1457,19 @@ impl QueryExecutor {
             return self.materialize_as_streaming(stmt);
         }
 
+        // Helper: apply post_filters to a single decoded row, project if it passes.
+        macro_rules! filter_and_project {
+            ($row:expr) => {{
+                if !post_filters.is_empty()
+                    && !Self::row_passes_post_filters(&$row, post_filters, &schema)
+                {
+                    None
+                } else {
+                    Some(Self::project_row_direct(&$row, &stmt.columns, &columns, &schema))
+                }
+            }};
+        }
+
         // 🚀 Fast path for non-AUTO_INCREMENT PK: use in-memory PK lookup
         // Bypasses disk-based column index (1.5ms → <5µs)
         let is_non_auto_pk = is_pk && !schema.is_primary_key_auto_increment();
@@ -1473,8 +1483,7 @@ impl QueryExecutor {
                 let row = self.db.get_table_row_with_schema(table, rid, &schema)?;
                 let result_rows: Vec<Result<Vec<Value>>> = match row {
                     Some(row) => {
-                        let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
-                        vec![Ok(projected)]
+                        filter_and_project!(row).map(|r| Ok(r)).into_iter().collect()
                     }
                     None => vec![],
                 };
@@ -1522,8 +1531,7 @@ impl QueryExecutor {
             let row = self.db.get_table_row_with_schema(table, row_id, &schema)?;
             let result_rows: Vec<Result<Vec<Value>>> = match row {
                 Some(row) => {
-                    let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
-                    vec![Ok(projected)]
+                    filter_and_project!(row).map(|r| Ok(r)).into_iter().collect()
                 }
                 None => vec![],
             };
@@ -1566,15 +1574,14 @@ impl QueryExecutor {
         let max_id = *sorted_ids.last().unwrap();
         let density = sorted_ids.len() as f64 / (max_id - min_id + 1) as f64;
 
-        let result_rows: Vec<Result<Vec<Value>>> = if density > 0.1 {
+        // Decode full rows (before projection — post_filters need full row data)
+        let decoded_rows: Vec<Vec<Value>> = if density > 0.1 {
             // Dense result set: single range scan (sequential I/O >> random I/O)
             let id_set: std::collections::HashSet<u64> =
                 sorted_ids.into_iter().map(|id| id as u64).collect();
             let start_key = self.db.make_composite_key(table, min_id);
             let end_key = self.db.make_composite_key(table, max_id + 1);
             let schema_c = schema.clone();
-            let sel_c = stmt.columns.clone();
-            let col_c = columns.clone();
 
             let lsm_rows = self.db.lsm_engine.scan_range(start_key, end_key)
                 .unwrap_or_default();
@@ -1588,9 +1595,7 @@ impl QueryExecutor {
                     crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
                     _ => return None,
                 };
-                decode_row(data, &schema_c)
-                    .ok()
-                    .map(|row| Ok(Self::project_row_direct(&row, &sel_c, &col_c, &schema_c)))
+                decode_row(data, &schema_c).ok()
             }).collect()
         } else {
             // Sparse result set: batch read via row cache + LSM range scan
@@ -1598,16 +1603,20 @@ impl QueryExecutor {
                 .map_err(|e| StorageError::Query(format!(
                     "Failed to fetch rows for table '{}': {}", table, e
                 )))?;
-            let sel = stmt.columns.clone();
-            let col = columns.clone();
-            let sch = schema.clone();
-            batch.into_iter().filter_map(move |(_, opt_arc)| {
-                opt_arc.map(|row_arc| {
-                    let result = Self::project_row_direct(&row_arc, &sel, &col, &sch);
-                    Ok(result)
+            batch.into_iter()
+                .filter_map(|(_, opt_arc)| opt_arc)
+                .map(|row_arc| {
+                    let row: Vec<Value> = (*row_arc).clone();
+                    row
                 })
-            }).collect()
+                .collect()
         };
+
+        // Apply post_filters on full decoded rows, then project survivors
+        let result_rows: Vec<Result<Vec<Value>>> = decoded_rows.into_iter()
+            .filter(|row| post_filters.is_empty() || Self::row_passes_post_filters(row, post_filters, &schema))
+            .map(|row| Ok(Self::project_row_direct(&row, &stmt.columns, &columns, &schema)))
+            .collect();
 
         Ok(StreamingQueryResult::SelectStreaming {
             columns,
@@ -1641,6 +1650,7 @@ impl QueryExecutor {
         start_inclusive: bool,
         end: &Value,
         end_inclusive: bool,
+        post_filters: &[Expr],
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
 
@@ -1664,19 +1674,19 @@ impl QueryExecutor {
                         let arc_rows = self.db.get_table_rows_batch_arc(table, &row_ids)?;
                         let skip_n = stmt.offset.unwrap_or(0);
                         let take_n = stmt.limit.unwrap_or(usize::MAX);
-                        let rows: Vec<Result<Vec<Value>>> = arc_rows.into_iter()
+                        let rows: Vec<Vec<Value>> = arc_rows.into_iter()
                             .filter_map(|(_, opt)| opt)
+                            .filter(|row| post_filters.is_empty() || Self::row_passes_post_filters(row, post_filters, &schema))
                             .skip(skip_n)
-                            .map(|arc| Ok(match Arc::try_unwrap(arc) {
+                            .take(take_n)
+                            .map(|arc| match Arc::try_unwrap(arc) {
                                 Ok(row) => row,
                                 Err(arc) => (*arc).clone(),
-                            }))
-                            .take(take_n)
+                            })
                             .collect();
-                        let collected: Result<Vec<_>> = rows.into_iter().collect();
                         return Ok(StreamingQueryResult::SelectReady {
                             columns: column_names,
-                            rows: collected?,
+                            rows,
                         });
                     }
                 }
@@ -1697,39 +1707,32 @@ impl QueryExecutor {
         // 🚀 批量读取行数据（通过 row_cache 减少锁竞争和 LSM 开销）
         let db = self.db.clone();
         let table_name = table.to_string();
-        let schema_clone = schema.clone();
-        let select_cols = stmt.columns.clone();
-        let columns_clone = columns.clone();
 
-        // 批量 get 迭代器
+        // Decode rows in batches (no projection yet — post_filters need full row)
         const BATCH_SIZE: usize = 1000;
         let total_rows = row_ids.len();
 
-        let rows_iter = (0..total_rows).step_by(BATCH_SIZE).flat_map(move |batch_start| {
+        let decoded_rows: Vec<Vec<Value>> = (0..total_rows).step_by(BATCH_SIZE).flat_map(|batch_start| {
             let batch_end = (batch_start + BATCH_SIZE).min(total_rows);
             let batch_row_ids = &row_ids[batch_start..batch_end];
 
-            let batch_results = match db.get_table_rows_batch(&table_name, batch_row_ids) {
-                Ok(results) => results,
-                Err(e) => {
-                    return vec![Err(e)];
-                }
-            };
-
-            let mut processed = Vec::with_capacity(batch_results.len());
-            for (_row_id, row_opt) in batch_results {
-                if let Some(row) = row_opt {
-                    let projected = Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
-                    processed.push(Ok(projected));
-                }
+            match db.get_table_rows_batch(&table_name, batch_row_ids) {
+                Ok(results) => results.into_iter()
+                    .filter_map(|(_, opt)| opt)
+                    .collect::<Vec<_>>(),
+                Err(_) => vec![],
             }
+        }).collect();
 
-            processed
-        });
+        // Apply post_filters on full decoded rows, then project survivors
+        let result_rows: Vec<Result<Vec<Value>>> = decoded_rows.into_iter()
+            .filter(|row| post_filters.is_empty() || Self::row_passes_post_filters(row, post_filters, &schema))
+            .map(|row| Ok(Self::project_row_direct(&row, &stmt.columns, &columns, &schema)))
+            .collect();
 
         Ok(StreamingQueryResult::SelectStreaming {
             columns,
-            rows: Box::new(rows_iter),
+            rows: Box::new(result_rows.into_iter()),
             order_by: stmt.order_by.clone(),
             limit: stmt.limit,
             offset: stmt.offset,
@@ -1840,6 +1843,7 @@ impl QueryExecutor {
         value1: &Value,
         column2: &str,
         value2: &Value,
+        post_filters: &[Expr],
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
@@ -1875,9 +1879,10 @@ impl QueryExecutor {
         // Batch fetch intersected rows
         let rows_result = self.db.get_table_rows_batch_arc(table, &intersected)?;
 
-        // Project each row
+        // Apply post_filters on full decoded rows, then project survivors
         let projected_rows: Vec<Vec<Value>> = rows_result.into_iter()
             .filter_map(|(_row_id, opt_row)| opt_row)
+            .filter(|row| post_filters.is_empty() || Self::row_passes_post_filters(row, post_filters, &schema))
             .map(|row| {
                 let row: Vec<Value> = (*row).clone();
                 Self::project_row_direct(&row, &stmt.columns, &columns, &schema)
@@ -2966,6 +2971,30 @@ impl QueryExecutor {
             columns: columns.to_vec(),
             rows,
         }))
+    }
+
+    /// Evaluate post_filters against a decoded row.
+    /// Uses CompiledWhere (fastest, pre-resolved positions) when possible,
+    /// falls back to eval_expr_on_row (positional, no HashMap) otherwise.
+    fn row_passes_post_filters(row: &[Value], filters: &[Expr], schema: &TableSchema) -> bool {
+        for filter in filters {
+            // Fast path: CompiledWhere (pre-resolved column positions, zero HashMap)
+            if let Some(cw) = Self::compile_where(filter, schema) {
+                match cw.eval(row) {
+                    Some(true) => continue,
+                    Some(false) | None => return false,
+                }
+            } else {
+                // Fallback: positional eval (no HashMap, uses schema column positions)
+                match Self::eval_expr_on_row(filter, row, schema) {
+                    Ok(Value::Bool(b)) if b => continue,
+                    Ok(Value::Integer(i)) if i != 0 => continue,
+                    Ok(Value::Float(f)) if f != 0.0 && !f.is_nan() => continue,
+                    _ => return false,
+                }
+            }
+        }
+        true
     }
 
     /// Compile a WHERE expression into a `CompiledWhere` with pre-resolved column positions.
