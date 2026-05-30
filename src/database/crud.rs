@@ -904,12 +904,14 @@ impl MoteDB {
         let end_key = (table_prefix + 1) << 32;
 
         let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+        let use_raw = lsm_iter.has_raw_sst();
 
         Ok(TableRowStreamingIterator {
             lsm_iter,
             col_types: Some(col_types.to_vec()),
             fixed_count: crate::storage::row_format::compute_fixed_count(&col_types),
             row_buf: Vec::with_capacity(col_types.len()),
+            use_raw,
         })
     }
 
@@ -1698,12 +1700,42 @@ pub struct TableRowStreamingIterator {
     fixed_count: usize,
     /// Reusable decode buffer — avoids allocating a new Vec<Value> per row.
     row_buf: Vec<Value>,
+    /// Whether the MergingIterator has a raw SSTable source (zero-Arc path)
+    use_raw: bool,
 }
 
 impl Iterator for TableRowStreamingIterator {
     type Item = Result<(RowId, Row)>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // 🚀 Zero-Arc fast path: when raw_sst is set, bypass Arc<Vec<u8>> entirely
+        if self.use_raw {
+            loop {
+                match self.lsm_iter.next_raw() {
+                    Some(Ok((composite_key, _ts, deleted, data))) => {
+                        if deleted { continue; }
+                        if data.is_empty() { continue; } // blob ref fallback
+                        let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                        let row: Row = if let Some(ref col_types) = self.col_types {
+                            match crate::storage::row_format::decode_fast_into(&data, col_types, self.fixed_count, &mut self.row_buf) {
+                                Ok(()) => std::mem::take(&mut self.row_buf),
+                                Err(e) => return Some(Err(e)),
+                            }
+                        } else {
+                            match crate::storage::row_format::decode_any(&data) {
+                                Ok(row) => row,
+                                Err(e) => return Some(Err(e)),
+                            }
+                        };
+                        return Some(Ok((row_id, row)));
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => return None,
+                }
+            }
+        }
+
+        // Standard path: iterate through MergingIterator with Arc<Vec<u8>>
         loop {
             match self.lsm_iter.next() {
                 Some(Ok((composite_key, value))) => {

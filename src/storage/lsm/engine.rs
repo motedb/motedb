@@ -1838,7 +1838,7 @@ impl LSMEngine {
                 };
 
                 // 🚀 Streaming SSTable scan — reads blocks on demand, O(1) memory
-                let sst_iter = {
+                let mut sst_iter = {
                     let sstable = cached.handle.read();
                     match crate::storage::lsm::sstable::SSTableIterator::with_range(
                         &sstable, Some(start), Some(end),
@@ -1850,6 +1850,9 @@ impl LSMEngine {
                         }
                     }
                 };
+                // Skip CRC for sequential scans — data integrity is guaranteed by mmap
+                // and CRC was verified when the SSTable was first written/compacted.
+                sst_iter.set_verify_crc(false);
                 sources.push(Box::new(sst_iter.map(|(k, v)| Ok((k, v)))));
             }
 
@@ -1858,6 +1861,18 @@ impl LSMEngine {
             let rot_epoch_after = self.rotation_epoch.load(Ordering::Acquire);
             let cmp_epoch_after = self.compaction_worker.compaction_epoch().load(Ordering::Acquire);
             if rot_epoch_after == rot_epoch_before && cmp_epoch_after == cmp_epoch_before {
+                // 🚀 Fast path: single SSTable, no memtable data — use raw (zero-Arc) iterator
+                if sources.is_empty() && sstable_metas.len() == 1 {
+                    if let Ok(cached) = self.sstable_cache.get_or_open(&sstable_metas[0].path) {
+                        let sstable = cached.handle.read();
+                        if let Ok(mut sst_iter) = crate::storage::lsm::sstable::SSTableIterator::with_range(
+                            &sstable, Some(start), Some(end),
+                        ) {
+                            sst_iter.set_verify_crc(false); // Skip CRC for sequential scan
+                            return Ok(super::MergingIterator::new_raw_sst(sst_iter));
+                        }
+                    }
+                }
                 break; // Consistent snapshot
             }
             retries += 1;

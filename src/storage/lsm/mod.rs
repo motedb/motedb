@@ -21,7 +21,7 @@ mod merging_iterator;  // 🚀 流式合并迭代器
 
 pub use memtable::MemTable;
 pub use unified_memtable::{UnifiedMemTable, UnifiedEntry, DataEntry};
-pub use sstable::{SSTable, SSTableBuilder, BlockIndex};
+pub use sstable::{SSTable, SSTableBuilder, SSTableIterator, BlockIndex};
 pub use compaction::{CompactionWorker, CompactionConfig, Level, SSTableMeta, CompactionStats};
 pub use engine::{LSMEngine, LSMBatchedIterator};  // 🚀 Export batched iterator
 pub use bloom::BloomFilter;

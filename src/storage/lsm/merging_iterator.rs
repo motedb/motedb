@@ -18,6 +18,7 @@ use super::{Key, Value};
 use crate::Result;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use super::sstable::SSTableIterator;
 
 // Type alias for KV iterator
 type KVIterator = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
@@ -87,6 +88,10 @@ pub struct MergingIterator {
 
     /// 🚀 Single-source fast path: skip heap entirely when only 1 source
     single_source: bool,
+
+    /// 🚀 Unboxed SSTable iterator for zero-Arc single-source scans.
+    /// Set when sources is empty and this is the sole data source.
+    raw_sst: Option<SSTableIterator>,
 }
 
 impl MergingIterator {
@@ -100,6 +105,7 @@ impl MergingIterator {
             finished: false,
             first_error: None,
             single_source: single,
+            raw_sst: None,
         };
 
         if !single {
@@ -107,6 +113,46 @@ impl MergingIterator {
         }
 
         iter
+    }
+
+    /// Create a merging iterator with a single unboxed SSTableIterator.
+    /// Enables zero-Arc next_raw() path for full sequential scans.
+    pub fn new_raw_sst(sst: SSTableIterator) -> Self {
+        Self {
+            heap: BinaryHeap::new(),
+            sources: Vec::new(),
+            last_key: None,
+            finished: false,
+            first_error: None,
+            single_source: true,
+            raw_sst: Some(sst),
+        }
+    }
+
+    /// Zero-Arc scan: returns (key, timestamp, deleted, value_bytes) without
+    /// creating Arc<Vec<u8>> per entry. Only works when raw_sst is set.
+    /// Falls back to normal next() for multi-source or non-SST iterators.
+    pub fn next_raw(&mut self) -> Option<Result<(Key, u64, bool, Vec<u8>)>> {
+        if let Some(ref mut sst) = self.raw_sst {
+            return sst.next_raw().map(|(key, ts, del, data)| Ok((key, ts, del, data)));
+        }
+        // Fallback: unwrap Value into raw components
+        match self.next() {
+            Some(Ok((key, value))) => {
+                let bytes = match &value.data {
+                    super::ValueData::Inline(arc_vec) => arc_vec.as_slice().to_vec(),
+                    super::ValueData::Blob(_) => Vec::new(),
+                };
+                Some(Ok((key, value.timestamp, value.deleted, bytes)))
+            }
+            Some(Err(e)) => Some(Err(e)),
+            None => None,
+        }
+    }
+
+    /// Returns true if this iterator has a raw SSTable source (zero-Arc path).
+    pub fn has_raw_sst(&self) -> bool {
+        self.raw_sst.is_some()
     }
 
     fn fill_heap(&mut self) {
