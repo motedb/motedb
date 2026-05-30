@@ -1022,6 +1022,215 @@ impl DataBlock {
     }
 }
 
+/// Decompress raw block bytes (compression flag byte + payload).
+/// Returns the uncompressed payload with the flag byte stripped.
+fn decompress_block(data: &[u8]) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Err(StorageError::InvalidData("Empty block data".into()));
+    }
+    let compression_flag = data[0];
+    let actual_data = &data[1..];
+    match compression_flag {
+        0 => Ok(actual_data.to_vec()),
+        1 => {
+            let mut decoder = snap::raw::Decoder::new();
+            decoder.decompress_vec(actual_data)
+                .map_err(|e| StorageError::Io(std::io::Error::other(
+                    format!("Snappy decompression failed: {}", e)
+                )))
+        }
+        2 => {
+            zstd::bulk::decompress(actual_data, 4 * 1024 * 1024)
+                .map_err(|e| StorageError::Io(std::io::Error::other(
+                    format!("Zstd decompression failed: {}", e)
+                )))
+        }
+        _ => Err(StorageError::InvalidData(
+            format!("Unknown compression flag: {}", compression_flag)
+        )),
+    }
+}
+
+/// Lazy entry cursor: holds decompressed block bytes and parses entries on-demand.
+/// Replaces eager `DataBlock::deserialize()` full materialization in SSTableIterator.
+///
+/// For filtered scans (e.g. WHERE clause with 5% selectivity), this avoids
+/// ~95% of Arc<Vec<u8>> allocations by skipping non-matching entries with
+/// zero-copy `skip_entry()`.
+struct LazyEntryCursor {
+    /// Decompressed block bytes: [num_entries: u32 LE] [entries...]
+    data: Vec<u8>,
+    /// Number of entries (parsed from first 4 bytes)
+    num_entries: u32,
+    /// Current byte position (starts at 4, after num_entries header)
+    pos: usize,
+    /// Number of entries consumed so far
+    entries_consumed: u32,
+}
+
+impl LazyEntryCursor {
+    /// Create a cursor from decompressed block bytes.
+    fn new(data: Vec<u8>) -> Result<Self> {
+        if data.len() < 4 {
+            return Err(StorageError::InvalidData("Block too small for header".into()));
+        }
+        let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        // Sanity cap against corrupted data (minimum ~22 bytes per entry)
+        let max_entries = (data.len() / 22) as u32;
+        let num_entries = num_entries.min(max_entries);
+        Ok(Self {
+            data,
+            num_entries,
+            pos: 4,
+            entries_consumed: 0,
+        })
+    }
+
+    /// Peek at the next entry's key without advancing the cursor.
+    /// Zero allocation — just reads 8 bytes from current position.
+    fn peek_key(&self) -> Option<Key> {
+        if self.entries_consumed >= self.num_entries { return None; }
+        if self.pos + 8 > self.data.len() { return None; }
+        let key = u64::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ]);
+        Some(key)
+    }
+
+    /// Skip the current entry without allocating any Arc<Vec<u8>>.
+    /// Only advances the byte position past this entry's framing.
+    fn skip_entry(&mut self) -> Result<()> {
+        if self.entries_consumed >= self.num_entries {
+            return Ok(());
+        }
+        let buf = &self.data;
+        let mut pos = self.pos;
+
+        // Skip key (8 bytes)
+        pos += 8;
+        // Skip timestamp (8 bytes)
+        if pos + 10 > buf.len() {
+            return Err(StorageError::InvalidData("Truncated entry in skip".into()));
+        }
+        pos += 8;
+        // Skip deleted (1 byte)
+        pos += 1;
+        // Read value_type (1 byte) to know how much to skip
+        let value_type = buf[pos];
+        pos += 1;
+
+        match value_type {
+            0 => {
+                // Inline: skip [data_len: u32] + [data: bytes]
+                if pos + 4 > buf.len() {
+                    return Err(StorageError::InvalidData("Truncated inline length in skip".into()));
+                }
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                pos += 4 + vlen;
+            }
+            1 => {
+                // Blob ref: skip 16 bytes
+                pos += 16;
+            }
+            _ => {
+                return Err(StorageError::InvalidData(
+                    format!("Unknown value type in skip: {}", value_type)
+                ));
+            }
+        }
+
+        self.pos = pos;
+        self.entries_consumed += 1;
+        Ok(())
+    }
+
+    /// Parse and return the next entry, advancing the cursor.
+    /// Only allocates `Arc<Vec<u8>>` for the returned entry.
+    fn next_entry(&mut self) -> Result<Option<(Key, Value)>> {
+        if self.entries_consumed >= self.num_entries {
+            return Ok(None);
+        }
+
+        let buf = &self.data;
+        let mut pos = self.pos;
+
+        // Key (8 bytes, big-endian)
+        if pos + 8 > buf.len() {
+            return Err(StorageError::InvalidData("Truncated key".into()));
+        }
+        let key = u64::from_be_bytes([
+            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+        ]);
+        pos += 8;
+
+        // Timestamp (8 bytes) + deleted (1 byte) + value_type (1 byte)
+        if pos + 10 > buf.len() {
+            return Err(StorageError::InvalidData("Truncated value metadata".into()));
+        }
+        let timestamp = u64::from_le_bytes([
+            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+        ]);
+        pos += 8;
+        let deleted = buf[pos] != 0;
+        pos += 1;
+        let value_type = buf[pos];
+        pos += 1;
+
+        let value_data = match value_type {
+            0 => {
+                // Inline: [data_len: u32 LE] [data: bytes]
+                if pos + 4 > buf.len() {
+                    return Err(StorageError::InvalidData("Truncated inline length".into()));
+                }
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                pos += 4;
+                if pos + vlen > buf.len() {
+                    return Err(StorageError::InvalidData(
+                        format!("Inline data exceeds block: need {} bytes at pos {}", vlen, pos)
+                    ));
+                }
+                let inline_data = buf[pos..pos+vlen].to_vec();
+                pos += vlen;
+                ValueData::Inline(std::sync::Arc::new(inline_data))
+            }
+            1 => {
+                // Blob ref: [file_id: u32] [offset: u64] [size: u32] = 16 bytes
+                if pos + 16 > buf.len() {
+                    return Err(StorageError::InvalidData("Truncated blob reference".into()));
+                }
+                let file_id = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                pos += 4;
+                let blob_offset = u64::from_le_bytes([
+                    buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+                    buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                ]);
+                pos += 8;
+                let size = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                pos += 4;
+                ValueData::Blob(BlobRef { file_id, offset: blob_offset, size })
+            }
+            _ => {
+                return Err(StorageError::InvalidData(
+                    format!("Unknown value type: {}", value_type)
+                ));
+            }
+        };
+
+        self.pos = pos;
+        self.entries_consumed += 1;
+        Ok(Some((key, Value { data: value_data, timestamp, deleted })))
+    }
+}
+
 impl BlockIndex {
     fn new() -> Self {
         Self {
@@ -1327,8 +1536,9 @@ pub struct SSTableIterator {
     /// File path (needed for fallback reads)
     path: PathBuf,
     current_block_idx: usize,
-    current_block_entries: Vec<(Key, Value)>,
-    position_in_block: usize,
+    /// Lazy cursor: parses entries on-demand from decompressed block bytes.
+    /// Replaces eager `Vec<(Key, Value)>` full materialization.
+    current_cursor: Option<LazyEntryCursor>,
     /// Skip entries with key < start_key (inclusive lower bound)
     start_key: Option<Key>,
     /// Stop when key >= end_key (exclusive upper bound)
@@ -1361,8 +1571,7 @@ impl SSTableIterator {
         Ok(Self {
             mmap, index_entries, file, path,
             current_block_idx: start_block_idx,
-            current_block_entries: Vec::new(),
-            position_in_block: 0,
+            current_cursor: None,
             start_key, end_key,
         })
     }
@@ -1390,8 +1599,6 @@ impl SSTableIterator {
                 }
             }
 
-            let offset = entry.offset;
-            let size = entry.size;
             break; // This block may contain relevant entries — proceed to read
         }
 
@@ -1402,8 +1609,9 @@ impl SSTableIterator {
             return Err(crate::StorageError::InvalidData("Block too small for CRC".into()));
         }
 
-        // Fast path: read from mmap (zero syscall)
-        let buf: &[u8] = if let Some(ref mmap) = self.mmap {
+        // Unified read path: get raw block bytes, verify CRC, decompress, create lazy cursor.
+        let block_bytes: Vec<u8> = if let Some(ref mmap) = self.mmap {
+            // Fast path: read from mmap (zero syscall)
             let start = offset as usize;
             let end = start + size as usize;
             if end > mmap.len() {
@@ -1411,7 +1619,19 @@ impl SSTableIterator {
                     format!("Block extends beyond mmap: offset {} + size {} > {}", offset, size, mmap.len())
                 ));
             }
-            &mmap[start..end]
+            // Verify CRC32 (last 4 bytes)
+            let data_len = size as usize - 4;
+            let stored_crc = u32::from_le_bytes([
+                mmap[start + data_len], mmap[start + data_len + 1],
+                mmap[start + data_len + 2], mmap[start + data_len + 3]
+            ]);
+            let computed_crc = crc32fast::hash(&mmap[start..start + data_len]);
+            if stored_crc != computed_crc {
+                return Err(crate::StorageError::InvalidData(
+                    format!("CRC32 mismatch in iterator block at offset {}: expected {:08x}, got {:08x}", offset, stored_crc, computed_crc)
+                ));
+            }
+            decompress_block(&mmap[start..start + data_len])?
         } else {
             // Fallback: seek+read
             let file = self.file.as_mut().unwrap();
@@ -1428,30 +1648,11 @@ impl SSTableIterator {
                     format!("CRC32 mismatch in iterator block at offset {}: expected {:08x}, got {:08x}", offset, stored_crc, computed_crc)
                 ));
             }
-
-            // Deserialize block (without CRC bytes)
-            let block = DataBlock::deserialize(&buf[..data_len])?;
-            self.current_block_entries = block.entries;
-            self.position_in_block = 0;
-            self.current_block_idx += 1;
-            return Ok(true);
+            decompress_block(&buf[..data_len])?
         };
 
-        // mmap path: verify CRC + deserialize
-        let data_len = buf.len() - 4;
-        let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
-        let computed_crc = crc32fast::hash(&buf[..data_len]);
-        if stored_crc != computed_crc {
-            return Err(crate::StorageError::InvalidData(
-                format!("CRC32 mismatch in iterator block at offset {}: expected {:08x}, got {:08x}", offset, stored_crc, computed_crc)
-            ));
-        }
-
-        let block = DataBlock::deserialize(&buf[..data_len])?;
-        self.current_block_entries = block.entries;
-        self.position_in_block = 0;
+        self.current_cursor = Some(LazyEntryCursor::new(block_bytes)?);
         self.current_block_idx += 1;
-
         Ok(true)
     }
 }
@@ -1461,22 +1662,39 @@ impl Iterator for SSTableIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.position_in_block < self.current_block_entries.len() {
-                let (key, value) = &self.current_block_entries[self.position_in_block];
-                // Range check: skip entries below start_key
-                if let Some(start) = self.start_key {
-                    if *key < start {
-                        self.position_in_block += 1;
-                        continue;
+            if let Some(ref mut cursor) = self.current_cursor {
+                // Peek at key for cheap range filtering (zero allocation)
+                if let Some(key) = cursor.peek_key() {
+                    // Range check: skip entries below start_key (zero-alloc skip)
+                    if let Some(start) = self.start_key {
+                        if key < start {
+                            if cursor.skip_entry().is_err() { return None; }
+                            continue;
+                        }
+                    }
+                    // Range check: stop at end_key (exclusive upper bound)
+                    if let Some(end) = self.end_key {
+                        if key >= end {
+                            self.current_cursor = None;
+                            return None;
+                        }
                     }
                 }
-                // Range check: stop at end_key (exclusive upper bound)
-                if let Some(end) = self.end_key {
-                    if *key >= end { return None; }
+
+                // Materialize the full entry (Arc allocation happens here, only for returned entries)
+                match cursor.next_entry() {
+                    Ok(Some((key, value))) => return Some((key, value)),
+                    Ok(None) => {
+                        self.current_cursor = None; // block exhausted, fall through to load next
+                    }
+                    Err(e) => {
+                        eprintln!("[MoteDB] SSTableIterator: failed to parse entry: {}", e);
+                        return None;
+                    }
                 }
-                self.position_in_block += 1;
-                return Some((*key, value.clone()));
             }
+
+            // Load next block
             match self.load_next_block() {
                 Ok(true) => continue,
                 Ok(false) => return None,
