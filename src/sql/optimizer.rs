@@ -184,8 +184,8 @@ pub struct QueryOptimizer {
 struct CostParameters {
     /// Cost of reading one row from disk (ms)
     disk_read_cost: f64,
-    /// Cost of reading one row from memory (ms)
-    memory_read_cost: f64,
+    /// Cost of LSM point read (ms) — memtable → immutable → bloom filter → binary search
+    lsm_point_read_cost: f64,
     /// Cost of index lookup (ms)
     index_lookup_cost: f64,
     /// Cost of evaluating one predicate (ms)
@@ -196,7 +196,7 @@ impl Default for CostParameters {
     fn default() -> Self {
         Self {
             disk_read_cost: 0.01,      // 10μs per disk read
-            memory_read_cost: 0.001,    // 1μs per memory read
+            lsm_point_read_cost: 0.03,    // ~30μs per LSM point read
             index_lookup_cost: 0.005,   // 5μs per index lookup
             predicate_eval_cost: 0.0001, // 0.1μs per predicate eval
         }
@@ -529,10 +529,23 @@ impl QueryOptimizer {
         // Get or estimate index statistics
         let stats = self.get_index_stats(&index_name)?;
         let estimated_rows = stats.estimate_point_query();
-        
+
+        // Selectivity guard: only use PointQuery when estimated rows < 5% of total.
+        // Above this, FullScan (single sequential pass) is cheaper than
+        // individual LSM point lookups for each matching row.
+        // Also respects a minimum threshold to avoid rejecting PointQuery for tiny tables.
+        const PQ_SEL_DENOM: usize = 20; // 1/20 = 5% threshold
+        const MIN_EST_FOR_FULLSCAN: usize = 10; // always accept PointQuery for <10 estimated rows
+        if stats.total_rows > 0
+            && estimated_rows >= stats.total_rows / PQ_SEL_DENOM
+            && estimated_rows >= MIN_EST_FOR_FULLSCAN
+        {
+            return Ok(());
+        }
+
         // Calculate cost: index lookup + row fetch
         let cost = self.cost_params.index_lookup_cost
-            + (estimated_rows as f64 * self.cost_params.memory_read_cost);
+            + (estimated_rows as f64 * self.cost_params.lsm_point_read_cost);
         
         plans.push(QueryPlan {
             scan_method: ScanMethod::PointQuery {
@@ -580,7 +593,7 @@ impl QueryOptimizer {
         
         // Calculate cost: index range scan + row fetch
         let cost = self.cost_params.index_lookup_cost * (estimated_rows as f64 * 0.1)
-            + (estimated_rows as f64 * self.cost_params.memory_read_cost);
+            + (estimated_rows as f64 * self.cost_params.lsm_point_read_cost);
         
         plans.push(QueryPlan {
             scan_method: ScanMethod::RangeQuery {
@@ -646,7 +659,7 @@ impl QueryOptimizer {
 
                 // Cost: two index lookups + intersection + row fetch
                 let cost = self.cost_params.index_lookup_cost * 2.0
-                    + (estimated_rows as f64 * self.cost_params.memory_read_cost);
+                    + (estimated_rows as f64 * self.cost_params.lsm_point_read_cost);
 
                 // Only use intersection if it's cheaper than a single index + full scan
                 // Heuristic: intersection estimated_rows < total_rows * 0.3
@@ -1059,7 +1072,7 @@ impl QueryOptimizer {
                 query_vector: query_vector.clone(),
                 k: limit,
             },
-            estimated_cost: self.cost_params.index_lookup_cost + (limit as f64 * self.cost_params.memory_read_cost),
+            estimated_cost: self.cost_params.index_lookup_cost + (limit as f64 * self.cost_params.lsm_point_read_cost),
             estimated_rows: limit,
             post_filters: vec![],
         }))
@@ -1116,7 +1129,7 @@ impl QueryOptimizer {
                             end, end_inclusive: end_incl,
                         },
                         estimated_cost: self.cost_params.index_lookup_cost * (range_rows as f64)
-                            + range_rows as f64 * self.cost_params.memory_read_cost,
+                            + range_rows as f64 * self.cost_params.lsm_point_read_cost,
                         estimated_rows: 1,
                         post_filters: vec![where_clause.clone()],
                     }));

@@ -30,6 +30,11 @@ fn setup_db(n: usize) -> (Database, TempDir) {
         batch.truncate(batch.len() - 1);
         db.execute(&format!("INSERT INTO sales (customer, amount, region) VALUES {}", batch)).unwrap();
     }
+    // Create column indexes for benchmarked WHERE columns.
+    // The optimizer uses these to generate PointQuery plans for
+    // low-selectivity queries (estimated_rows < 5% of total).
+    db.execute("CREATE INDEX idx_region ON sales (region) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_customer ON sales (customer) USING COLUMN").unwrap();
     (db, dir)
 }
 
