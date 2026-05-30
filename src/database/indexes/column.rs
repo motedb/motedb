@@ -39,6 +39,7 @@ impl MoteDB {
         if let Ok(schema) = self.table_registry.get_table(table_name) {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
+                let col_types = schema.col_types();
 
                 debug_log!("[create_column_index] Using scan_range...");
                 let start_time = std::time::Instant::now();
@@ -49,47 +50,61 @@ impl MoteDB {
                 let end_key = (table_id + 1) << 32;
 
                 let mut indexed_count = 0;
-                const BATCH_SIZE: usize = 500;
+                const BATCH_SIZE: usize = 2000;
 
                 match self.lsm_engine.scan_range(start_key, end_key) {
                     Ok(entries) => {
-                        for (batch_idx, chunk) in entries.chunks(BATCH_SIZE).enumerate() {
-                            for (composite_key, value) in chunk {
-                                // Skip deleted (tombstone) entries — they don't belong in the index
-                                if value.deleted {
-                                    continue;
+                        // Collect (Value, RowId) pairs in batches for batch_insert
+                        let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(BATCH_SIZE);
+
+                        for (composite_key, value) in &entries {
+                            if value.deleted {
+                                continue;
+                            }
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+
+                            // Zero-copy for Inline; resolve Blob refs
+                            let col_value = match &value.data {
+                                crate::storage::lsm::ValueData::Inline(bytes) => {
+                                    // Extract single column without full row decode
+                                    crate::storage::row_format::get_column(bytes, &col_types, col_position)
+                                        .unwrap_or(crate::types::Value::Null)
                                 }
-                                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-
-                                let data_bytes: Vec<u8> = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.to_vec(),
-                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
-                                        match self.lsm_engine.resolve_blob(blob_ref) {
-                                            Ok(data) => data,
-                                            Err(e) => {
-                                                debug_log!("[create_column_index] Failed to resolve blob for row {}: {}", row_id, e);
-                                                continue;
-                                            }
+                                crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                    match self.lsm_engine.resolve_blob(blob_ref) {
+                                        Ok(data) => {
+                                            crate::storage::row_format::get_column(&data, &col_types, col_position)
+                                                .unwrap_or(crate::types::Value::Null)
                                         }
-                                    }
-                                };
-
-                                if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
-                                    if let Some(value) = row.get(col_position) {
-                                        if let Err(e) = index_arc.insert(value, row_id) {
-                                            debug_log!("[create_column_index] Insert failed row_id={}: {}", row_id, e);
-                                        } else {
-                                            indexed_count += 1;
-                                        }
+                                        Err(_) => continue,
                                     }
                                 }
+                            };
+
+                            if !matches!(col_value, crate::types::Value::Null) {
+                                batch.push((col_value, row_id));
                             }
 
-                            if (batch_idx + 1) % 4 == 0 || (batch_idx + 1) * BATCH_SIZE >= entries.len() {
-                                if let Err(e) = index_arc.flush() {
-                                    debug_log!("[create_column_index] Flush failed: {}", e);
+                            if batch.len() >= BATCH_SIZE {
+                                indexed_count += batch.len();
+                                if let Err(_e) = index_arc.batch_insert(std::mem::take(&mut batch)) {
+                                    debug_log!("[create_column_index] batch_insert failed: {}", _e);
                                 }
+                                batch = Vec::with_capacity(BATCH_SIZE);
                             }
+                        }
+
+                        // Flush remaining batch
+                        if !batch.is_empty() {
+                            indexed_count += batch.len();
+                            if let Err(_e) = index_arc.batch_insert(batch) {
+                                debug_log!("[create_column_index] final batch_insert failed: {}", _e);
+                            }
+                        }
+
+                        // Final flush to disk
+                        if let Err(e) = index_arc.flush() {
+                            debug_log!("[create_column_index] Flush failed: {}", e);
                         }
                     }
                     Err(e) => {
@@ -103,7 +118,6 @@ impl MoteDB {
                 }
 
                 // Index is fully populated from LSM — clear the rebuild flag.
-                // The async pipeline will skip this index since it's already up-to-date.
                 index_arc.mark_rebuilt();
             }
         }
