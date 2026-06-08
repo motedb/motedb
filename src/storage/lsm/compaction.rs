@@ -494,8 +494,321 @@ impl CompactionWorker {
     pub fn needs_compaction(&self) -> Result<bool> {
         let levels = self.levels.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
+
         Ok(levels.iter().any(|level| level.needs_compaction()))
+    }
+
+    /// Convert all row-based SSTables to a single columnar SSTable.
+    ///
+    /// This is the bridge from row-based to columnar storage. It:
+    /// 1. Merges all SSTables (same as compact_full)
+    /// 2. Decodes each row's RawRow bytes into per-column values
+    /// 3. Writes a columnar SSTable with separate column segments
+    ///
+    /// After this, subsequent scans can use the columnar fast path.
+    pub fn compact_to_columnar(
+        &self,
+        col_types: &[crate::types::ColumnType],
+    ) -> Result<(super::columnar::ColumnarSSTable, Vec<PathBuf>)> {
+        use super::columnar::ColumnarSSTableBuilder;
+
+        self.flush_pending_deletions();
+
+        // Collect all SSTables
+        let all_sources = {
+            let levels = self.levels.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let mut all = Vec::new();
+            for level in levels.iter() {
+                all.extend(level.sstables.iter().cloned());
+            }
+            all
+        };
+
+        let mut merged_paths = HashSet::new();
+        let mut all_inputs = Vec::new();
+        for meta in &all_sources {
+            match SSTable::open(&meta.path) {
+                Ok(sstable) => {
+                    merged_paths.insert(meta.path.clone());
+                    all_inputs.push(sstable);
+                }
+                Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut iters: Vec<_> = all_inputs.into_iter()
+            .filter_map(|mut sst| sst.iter().ok())
+            .collect();
+
+        if iters.is_empty() {
+            return Err(StorageError::Index("No SSTables to compact".into()));
+        }
+
+        // Generate output path
+        let output_path = {
+            let mut stats = self.stats.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let output_id = stats.num_compactions;
+            stats.num_compactions += 1;
+            self.storage_dir.join(format!("col_{:06}.sst", output_id))
+        };
+
+        let mut builder = ColumnarSSTableBuilder::new(&output_path, col_types.to_vec());
+
+        // Multi-way merge then decode+add to columnar builder
+        use std::collections::BinaryHeap;
+        #[derive(Debug, Clone)]
+        struct MergeEntry {
+            key: u64,
+            value: super::Value,
+            iter_idx: usize,
+        }
+        impl Eq for MergeEntry {}
+        impl PartialEq for MergeEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.key == other.key && self.iter_idx == other.iter_idx
+            }
+        }
+        impl Ord for MergeEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.key.cmp(&self.key)
+                    .then_with(|| other.iter_idx.cmp(&self.iter_idx))
+            }
+        }
+        impl PartialOrd for MergeEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap = BinaryHeap::new();
+        for (idx, iter) in iters.iter_mut().enumerate() {
+            if let Some((key, value)) = iter.next() {
+                heap.push(MergeEntry { key, value, iter_idx: idx });
+            }
+        }
+
+        let mut last_key: Option<u64> = None;
+        let mut last_value: Option<super::Value> = None;
+        let mut count: usize = 0;
+
+        while let Some(entry) = heap.pop() {
+            if Some(entry.key) == last_key {
+                if let Some(ref mut last) = last_value {
+                    if entry.value.timestamp > last.timestamp {
+                        *last = entry.value;
+                    }
+                }
+            } else {
+                if let (Some(key), Some(value)) = (last_key, last_value.take()) {
+                    if !value.deleted {
+                        let data = match &value.data {
+                            super::ValueData::Inline(bytes) => bytes.as_slice(),
+                            _ => continue,
+                        };
+                        builder.add_row(key, value.timestamp, false, data)?;
+                        count += 1;
+                    }
+                }
+                last_key = Some(entry.key);
+                last_value = Some(entry.value);
+            }
+
+            if let Some((key, value)) = iters[entry.iter_idx].next() {
+                heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
+            }
+        }
+
+        // Final entry
+        if let (Some(key), Some(value)) = (last_key, last_value) {
+            if !value.deleted {
+                let data = match &value.data {
+                    super::ValueData::Inline(bytes) => bytes.as_slice(),
+                    _ => return Err(StorageError::InvalidData("Blob ref in compaction".into())),
+                };
+                builder.add_row(key, value.timestamp, false, data)?;
+                count += 1;
+            }
+        }
+
+        builder.finish()?;
+
+        debug_log!("[compact_to_columnar] Wrote {} rows to {:?}", count, output_path);
+
+        let col_sst = super::columnar::ColumnarSSTable::open(&output_path)?;
+        let paths: Vec<PathBuf> = merged_paths.into_iter().collect();
+        Ok((col_sst, paths))
+    }
+
+    /// Full compaction: merge ALL SSTables across all levels into a single
+    /// SSTable on the last level. Used by vacuum to produce a single data
+    /// source that enables the raw_sst zero-copy scan path.
+    pub fn compact_full(&self) -> Result<()> {
+        self.flush_pending_deletions();
+
+        // Collect all SSTables from all levels
+        let (all_sources, last_level) = {
+            let levels = self.levels.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let mut all = Vec::new();
+            for level in levels.iter() {
+                all.extend(level.sstables.iter().cloned());
+            }
+            (all, levels.len() - 1)
+        };
+
+        if all_sources.len() <= 1 {
+            return Ok(()); // Nothing to merge
+        }
+
+        // Open all input SSTables
+        let mut all_inputs = Vec::new();
+        let mut merged_paths = HashSet::new();
+        for meta in &all_sources {
+            match SSTable::open(&meta.path) {
+                Ok(sstable) => {
+                    merged_paths.insert(meta.path.clone());
+                    all_inputs.push(sstable);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if all_inputs.is_empty() {
+            return Ok(());
+        }
+
+        // Generate unique output path
+        let output_path = {
+            let mut stats = self.stats.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let output_id = stats.num_compactions;
+            stats.num_compactions += 1;
+            self.storage_dir.join(format!("l{}_{:06}.sst", last_level, output_id))
+        };
+
+        // Create iterators
+        let mut iters: Vec<_> = all_inputs.into_iter()
+            .filter_map(|mut sst| sst.iter().ok())
+            .collect();
+
+        if iters.is_empty() {
+            return Ok(());
+        }
+
+        let estimated_size = all_sources.iter().map(|s| s.num_entries).sum::<u64>() as usize;
+        let mut builder = SSTableBuilder::new(&output_path, self.config.lsm_config.clone(), estimated_size)?;
+
+        // Multi-way merge (same logic as merge_sstables)
+        use std::collections::BinaryHeap;
+
+        #[derive(Debug, Clone)]
+        struct MergeEntry {
+            key: u64,
+            value: super::Value,
+            iter_idx: usize,
+        }
+
+        impl Eq for MergeEntry {}
+        impl PartialEq for MergeEntry {
+            fn eq(&self, other: &Self) -> bool {
+                self.key == other.key && self.iter_idx == other.iter_idx
+            }
+        }
+
+        impl Ord for MergeEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.key.cmp(&self.key)
+                    .then_with(|| other.iter_idx.cmp(&self.iter_idx))
+            }
+        }
+
+        impl PartialOrd for MergeEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap = BinaryHeap::new();
+        for (idx, iter) in iters.iter_mut().enumerate() {
+            if let Some((key, value)) = iter.next() {
+                heap.push(MergeEntry { key, value, iter_idx: idx });
+            }
+        }
+
+        // Drop tombstones in full compaction (last level)
+        let mut last_key: Option<u64> = None;
+        let mut last_value: Option<super::Value> = None;
+
+        while let Some(entry) = heap.pop() {
+            if Some(entry.key) == last_key {
+                if let Some(ref mut last) = last_value {
+                    if entry.value.timestamp > last.timestamp {
+                        *last = entry.value;
+                    }
+                }
+            } else {
+                // Emit previous key if it's live (not deleted)
+                if let (Some(key), Some(value)) = (last_key, last_value.take()) {
+                    if !value.deleted {
+                        builder.add(key, value)?;
+                    }
+                }
+                last_key = Some(entry.key);
+                last_value = Some(entry.value);
+            }
+
+            if let Some((key, value)) = iters[entry.iter_idx].next() {
+                heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
+            }
+        }
+
+        // Write final key
+        if let (Some(key), Some(value)) = (last_key, last_value) {
+            if !value.deleted {
+                builder.add(key, value)?;
+            }
+        }
+
+        let output_meta = builder.finish()?;
+
+        // Update levels: remove all old SSTables, add new one
+        self.invalidate_snapshot();
+        let mut levels = self.levels.lock()
+            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+
+        // Defer deletion of all old SSTable files
+        let mut removed_paths: Vec<PathBuf> = Vec::new();
+        for level in levels.iter_mut() {
+            for meta in &level.sstables {
+                if merged_paths.contains(&meta.path) {
+                    self.defer_deletion(meta.path.clone());
+                    removed_paths.push(meta.path.clone());
+                }
+            }
+            level.sstables.clear();
+            level.total_size = 0;
+        }
+
+        // Place output on last level
+        levels[last_level].add_sstable(output_meta);
+
+        drop(levels);
+
+        // Update stats
+        {
+            let mut stats = self.stats.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            stats.bytes_written += 0; // approximate
+        }
+
+        self.invalidate_snapshot();
+        self.compaction_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.invoke_post_compaction(&removed_paths);
+
+        Ok(())
     }
     
     /// Get all SSTables across all levels (for query)
@@ -646,10 +959,9 @@ impl CompactionWorker {
         // Add output file
         levels[level_idx + 1].add_sstable(output_meta);
 
-        // Update stats
+        // Update stats (num_compactions already incremented at ID allocation time)
         let mut stats = self.stats.lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        stats.num_compactions += 1;
 
         let bytes_read: u64 = valid_sources.iter().map(|s| s.size).sum::<u64>()
             + valid_overlapping.iter().map(|s| s.size).sum::<u64>();
@@ -704,7 +1016,6 @@ impl CompactionWorker {
                     all_inputs.push(sstable);
                 }
                 Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                    debug_log!("SSTable disappeared during open (TOCTOU race): {:?}", meta.path);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -717,12 +1028,16 @@ impl CompactionWorker {
             ));
         }
 
-        // Generate output file path
-        let stats = self.stats.lock()
-            .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        let output_id = stats.num_compactions;
-        let output_path = self.storage_dir.join(format!("l{}_{:06}.sst", output_level, output_id));
-        drop(stats);
+        // Generate output file path — eagerly increment num_compactions so
+        // concurrent compaction rounds get unique output IDs.
+        let output_path = {
+            let mut stats = self.stats.lock()
+                .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
+            let output_id = stats.num_compactions;
+            stats.num_compactions += 1;  // Eager: reserve the ID now
+            let path = self.storage_dir.join(format!("l{}_{:06}.sst", output_level, output_id));
+            path
+        };
 
         // Streaming merge
         let mut iters: Vec<_> = all_inputs.into_iter()

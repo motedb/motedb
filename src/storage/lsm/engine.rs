@@ -158,8 +158,8 @@ pub struct LSMEngine {
     /// Configuration
     config: LSMConfig,
     
-    /// Next SSTable ID
-    next_sst_id: Arc<RwLock<u64>>,
+    /// Next SSTable ID (atomic increment, no lock contention)
+    next_sst_id: Arc<std::sync::atomic::AtomicU64>,
     
     /// Compaction worker
     compaction_worker: Arc<CompactionWorker>,
@@ -176,6 +176,14 @@ pub struct LSMEngine {
 
     /// 🚀 Edge optimization: Condvar for event-driven compaction (replaces 500ms polling)
     compaction_wakeup: Arc<(Mutex<bool>, Condvar)>,
+
+    /// Pause flag for background compaction — set during vacuum to prevent
+    /// the background thread from racing with synchronous compaction.
+    compaction_paused: Arc<AtomicBool>,
+
+    /// Pause flag for background flush — set during vacuum to prevent
+    /// new SSTables from appearing during compact_full.
+    flush_paused: Arc<AtomicBool>,
 
     /// 🚀 Unified Flush Callback
     /// Callback: &UnifiedMemTable -> Result<()>
@@ -315,7 +323,7 @@ impl LSMEngine {
             sstable_cache: Arc::new(SSTableCache::new(config.sstable_cache_size)),
             storage_dir,
             config: config.clone(),
-            next_sst_id: Arc::new(RwLock::new(max_existing_id + 1)),
+            next_sst_id: Arc::new(std::sync::atomic::AtomicU64::new(max_existing_id + 1)),
             compaction_worker: compaction_worker.clone(),
             blob_store,
             compaction_thread: None,
@@ -324,6 +332,8 @@ impl LSMEngine {
             rotation_epoch: Arc::new(AtomicU64::new(0)),
             flush_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             compaction_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
+            compaction_paused: Arc::new(AtomicBool::new(false)),
+            flush_paused: Arc::new(AtomicBool::new(false)),
             consecutive_flush_errors: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
 
@@ -339,7 +349,8 @@ impl LSMEngine {
         let compaction_worker_weak = Arc::downgrade(&engine.compaction_worker);
         let shutdown_weak = Arc::downgrade(&engine.shutdown);
         let compaction_wakeup = engine.compaction_wakeup.clone();
-        
+        let compaction_paused = engine.compaction_paused.clone();
+
         let compaction_thread = thread::spawn(move || {
             let mut _consecutive_no_work = 0;
 
@@ -352,6 +363,11 @@ impl LSMEngine {
                     let (lock, cvar) = &*compaction_wakeup;
                     let guard = lock.lock().unwrap();
                     let _ = cvar.wait_timeout(guard, Duration::from_secs(30));
+                }
+
+                // Skip compaction if paused (e.g. vacuum is running synchronous compaction)
+                if compaction_paused.load(Ordering::Acquire) {
+                    continue;
                 }
 
                 let compaction_worker = match compaction_worker_weak.upgrade() {
@@ -401,6 +417,7 @@ impl LSMEngine {
         let flush_wakeup = engine.flush_wakeup.clone(); // 🚀 Condvar for event-driven flush
         let compaction_wakeup_for_flush = engine.compaction_wakeup.clone(); // Notify compaction after SST build
         let consecutive_flush_errors = engine.consecutive_flush_errors.clone(); // Circuit breaker
+        let flush_paused = engine.flush_paused.clone();
 
         let flush_thread = thread::Builder::new()
             .name("lsm-flush".to_string())
@@ -427,6 +444,10 @@ impl LSMEngine {
                 };
 
                 let fip = flush_in_progress.load(Ordering::Acquire);
+                // Skip flush if paused (vacuum is running compact_full)
+                if flush_paused.load(Ordering::Acquire) {
+                    return false; // Will be woken when unpaused
+                }
                 if !fip {
                     let immutable = match immutable_weak.upgrade() {
                         Some(i) => i,
@@ -474,9 +495,7 @@ impl LSMEngine {
                                 };
 
                                 let sst_id = {
-                                    let mut next_id = next_sst_id.write();
-                                    let current = *next_id;
-                                    *next_id += 1;
+                                    let current = next_sst_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     Some(current)
                                 };
 
@@ -1152,7 +1171,57 @@ impl LSMEngine {
 
         Ok(())
     }
-    
+
+    /// 🚀 Bulk load: sort → SSTable directly. Skips memtable + WAL entirely.
+    /// For batch INSERTs, this is the fastest path — O(N log N) sort + sequential write.
+    pub fn bulk_load(&self, mut kvs: Vec<(Key, Value)>) -> Result<()> {
+        if kvs.is_empty() { return Ok(()); }
+
+        // Sort by key for SSTable (must be in ascending order)
+        kvs.sort_by_key(|(k, _)| *k);
+
+        // Generate SSTable ID and path
+        let sst_id = self.next_sst_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sst_path = self.storage_dir.join(format!("l0_{:06}.sst", sst_id));
+
+        let estimated = kvs.len();
+        let mut builder = SSTableBuilder::new(&sst_path, self.config.clone(), estimated)?;
+
+        for (key, value) in &kvs {
+            builder.add(*key, value.clone())?;
+        }
+
+        let meta = builder.finish()?;
+        self.compaction_worker.register_sstable(meta)?;
+
+        // Wake compaction thread (new SSTable at L0)
+        if let Ok(mut guard) = self.compaction_wakeup.0.lock() { *guard = true; }
+        self.compaction_wakeup.1.notify_all();
+
+        Ok(())
+    }
+
+    /// 🚀 Fast batch insert: uses Vec-based memtable append (O(1) per entry)
+    /// instead of BTreeMap insert (O(log N)). Ideal for bulk data loading.
+    pub fn batch_put_fast(&self, kvs: &[(Key, Value)]) -> Result<()> {
+        if kvs.is_empty() { return Ok(()); }
+        let processed: Vec<(Key, Value)> = kvs.iter().map(|(k, v)| {
+            let mut v = v.clone();
+            if let ValueData::Inline(ref data) = v.data {
+                if data.len() >= self.config.blob_threshold {
+                    if let Ok(blob_ref) = self.blob_store.put(data) {
+                        v.data = ValueData::Blob(blob_ref);
+                    }
+                }
+            }
+            (*k, v)
+        }).collect();
+
+        let memtable = self.memtable.read();
+        memtable.batch_put_fast(&processed)?;
+        Ok(())
+    }
+
     /// Delete a key
     pub fn delete(&self, key: Key, timestamp: u64) -> Result<()> {
         self.put(key, Value::tombstone(timestamp))
@@ -1341,6 +1410,36 @@ impl LSMEngine {
     /// 
     /// ✅ 统一入口：手动Flush和后台Flush都会触发此回调
     /// ✅ 高效：传入MemTable引用，避免数据拷贝
+    /// Pause the background compaction thread.
+    /// Used by vacuum to prevent the background thread from racing with
+    /// synchronous compaction after memtable flush.
+    pub fn pause_background_compaction(&self) {
+        self.compaction_paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume the background compaction thread after a pause.
+    /// Wakes the thread so it can pick up any pending work.
+    pub fn resume_background_compaction(&self) {
+        self.compaction_paused.store(false, Ordering::SeqCst);
+        let (lock, cvar) = &*self.compaction_wakeup;
+        if let Ok(mut guard) = lock.lock() { *guard = true; }
+        cvar.notify_all();
+    }
+
+    /// Pause the background flush thread.
+    /// Used by vacuum to prevent new SSTables from appearing during compact_full.
+    pub fn pause_background_flush(&self) {
+        self.flush_paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume the background flush thread after a pause.
+    pub fn resume_background_flush(&self) {
+        self.flush_paused.store(false, Ordering::SeqCst);
+        let (lock, cvar) = &*self.flush_wakeup;
+        if let Ok(mut guard) = lock.lock() { *guard = true; }
+        cvar.notify_all();
+    }
+
     /// Force compaction: run one compaction cycle (best-effort).
     /// Returns true if more compaction is needed.
     pub fn compact(&self) -> Result<bool> {
@@ -1351,6 +1450,21 @@ impl LSMEngine {
         Ok(needs)
     }
 
+    /// Full compaction: merge ALL SSTables into a single file on the last level.
+    /// Used by vacuum to produce one SSTable for optimal scan performance.
+    pub fn compact_full(&self) -> Result<()> {
+        self.compaction_worker.compact_full()
+    }
+
+    /// Compact all SSTables into a single columnar SSTable.
+    /// Returns the columnar SSTable and the paths of the source SSTables (for cleanup).
+    pub fn compact_to_columnar(
+        &self,
+        col_types: &[crate::types::ColumnType],
+    ) -> Result<(crate::storage::lsm::columnar::ColumnarSSTable, Vec<std::path::PathBuf>)> {
+        self.compaction_worker.compact_to_columnar(col_types)
+    }
+
     pub fn set_flush_callback<F>(&self, callback: F) -> Result<()>
     where
         F: Fn(&UnifiedMemTable) -> Result<()> + Send + Sync + 'static,
@@ -1359,7 +1473,12 @@ impl LSMEngine {
         *cb = Some(Arc::new(callback));
         Ok(())
     }
-    
+
+    /// Check if the background flush thread is currently writing a memtable to disk.
+    pub fn is_flush_in_progress(&self) -> bool {
+        self.flush_in_progress.load(Ordering::Acquire)
+    }
+
     // Internal helpers
     
     fn get_level_from_path(&self, path: &std::path::Path) -> usize {
@@ -1395,6 +1514,10 @@ impl LSMEngine {
             if immutable_lock.len() >= self.max_immutable_slots {
                 return Err(StorageError::Transaction("Immutable queue full".into()));
             }
+
+            // Merge batch_buffer into shards before rotation.
+            // Without this, Vec-based fast path data is lost during flush.
+            memtable_lock.merge_batch_buffer();
 
             let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
             let old_memtable = std::mem::replace(&mut *memtable_lock, new_memtable);
@@ -1433,6 +1556,9 @@ impl LSMEngine {
         // Now rotate (lock order: memtable → immutable, consistent with get/scan)
         let mut memtable_lock = self.memtable.write();
         let mut immutable_lock = self.immutable.write();
+
+        // Merge batch_buffer before rotation so Vec-based fast path data persists.
+        memtable_lock.merge_batch_buffer();
 
         let new_memtable = Self::create_memtable(&self.config, &memtable_lock);
 

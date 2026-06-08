@@ -27,6 +27,27 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+/// Zero-copy value reference: shared block data Arc + byte range into it.
+///
+/// Eliminates the per-row `to_vec()` copy (~49 bytes × N rows) that `next_raw()`
+/// previously performed. The block stays alive via `Arc<Vec<u8>>` as long as any
+/// entry from that block is still referenced.
+///
+/// During streaming scans, entries are consumed sequentially so only 1-2 blocks
+/// are alive at any time.
+#[derive(Clone)]
+pub struct ValueBytes {
+    pub(crate) block: Arc<Vec<u8>>,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+impl ValueBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.block[self.start..self.start + self.len]
+    }
+}
+
 /// Magic number for SSTable files (ASCII "LSMT")
 const SSTABLE_MAGIC: u32 = 0x4C534D54;
 
@@ -627,6 +648,10 @@ impl SSTableBuilder {
     pub fn new<P: AsRef<Path>>(path: P, config: LSMConfig, estimated_keys: usize) -> Result<Self> {
         let final_path = path.as_ref().to_path_buf();
         let tmp_path = final_path.with_extension("sst.tmp");
+        // Ensure parent directory exists
+        if let Some(parent) = tmp_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -728,7 +753,9 @@ impl SSTableBuilder {
 
         // Atomic rename: .sst.tmp → .sst
         let tmp_path = self.path.with_extension("sst.tmp");
-        std::fs::rename(&tmp_path, &self.path)?;
+        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+            return Err(crate::StorageError::Io(e));
+        }
 
         // Get file size
         let file_size = self.offset + footer_data.len() as u64;
@@ -1092,8 +1119,9 @@ fn decompress_block(data: &[u8]) -> Result<Vec<u8>> {
 struct LazyEntryCursor {
     /// Block bytes: either owned (decompressed) or borrowed (mmap slice via Box<[u8]>).
     /// We use `Vec<u8>` for both since borrowed mmap data is cloned into Vec only
-    /// for compressed blocks. For uncompressed blocks, we can avoid the clone.
-    data: Vec<u8>,
+    /// for compressed blocks. Stored as Arc so entries can share ownership
+    /// via cheap Arc::clone (no per-row memcpy needed).
+    data: Arc<Vec<u8>>,
     /// Number of entries (parsed from first 4 bytes)
     num_entries: u32,
     /// Current byte position (starts at 4, after num_entries header)
@@ -1103,8 +1131,8 @@ struct LazyEntryCursor {
 }
 
 impl LazyEntryCursor {
-    /// Create a cursor from decompressed (owned) block bytes.
-    fn new(data: Vec<u8>) -> Result<Self> {
+    /// Create a cursor from decompressed block bytes (Arc for zero-copy sharing).
+    fn new(data: Arc<Vec<u8>>) -> Result<Self> {
         if data.len() < 4 {
             return Err(StorageError::InvalidData("Block too small for header".into()));
         }
@@ -1343,6 +1371,79 @@ impl LazyEntryCursor {
         // We achieve this by taking &mut self, which prevents concurrent calls.
         let slice = &self.data[value_start..value_start + value_len];
         Ok(Some((key, timestamp, deleted, slice)))
+    }
+
+    /// Zero-copy entry extraction: returns shared block Arc + byte range.
+    /// The `Arc<Vec<u8>>` is a cheap clone of the block's data pointer (~2ns refcount bump).
+    /// No per-row memcpy — the block stays alive as long as any entry references it.
+    fn next_entry_arc(&mut self) -> Result<Option<(Key, u64, bool, Arc<Vec<u8>>, usize, usize)>> {
+        if self.entries_consumed >= self.num_entries {
+            return Ok(None);
+        }
+
+        let buf = &self.data;
+        let mut pos = self.pos;
+
+        // Key (8 bytes, big-endian)
+        if pos + 8 > buf.len() {
+            return Err(StorageError::InvalidData("Truncated key".into()));
+        }
+        let key = u64::from_be_bytes([
+            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+        ]);
+        pos += 8;
+
+        // Timestamp (8 bytes) + deleted (1 byte) + value_type (1 byte)
+        if pos + 10 > buf.len() {
+            return Err(StorageError::InvalidData("Truncated value metadata".into()));
+        }
+        let timestamp = u64::from_le_bytes([
+            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
+            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+        ]);
+        pos += 8;
+        let deleted = buf[pos] != 0;
+        pos += 1;
+        let value_type = buf[pos];
+        pos += 1;
+
+        let value_start = match value_type {
+            0 => {
+                // Inline: [data_len: u32 LE] [data: bytes]
+                if pos + 4 > buf.len() {
+                    return Err(StorageError::InvalidData("Truncated inline length".into()));
+                }
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                pos += 4;
+                if pos + vlen > buf.len() {
+                    return Err(StorageError::InvalidData(
+                        format!("Inline data exceeds block: need {} bytes at pos {}", vlen, pos)
+                    ));
+                }
+                let start = pos;
+                pos += vlen;
+                start
+            }
+            1 => {
+                // Blob ref — skip 16 bytes, return empty range
+                pos += 16;
+                pos // empty
+            }
+            _ => {
+                return Err(StorageError::InvalidData(
+                    format!("Unknown value type: {}", value_type)
+                ));
+            }
+        };
+
+        let value_len = pos - value_start;
+        self.pos = pos;
+        self.entries_consumed += 1;
+
+        // Clone the block Arc (~2ns refcount bump) — entries share the block's memory
+        let block = Arc::clone(&self.data);
+        Ok(Some((key, timestamp, deleted, block, value_start, value_len)))
     }
 }
 
@@ -1920,7 +2021,7 @@ impl SSTableIterator {
             decompress_block(&buf[..data_len])?
         };
 
-        self.current_cursor = Some(LazyEntryCursor::new(block_bytes)?);
+        self.current_cursor = Some(LazyEntryCursor::new(Arc::new(block_bytes))?);
         self.current_block_idx += 1;
         Ok(true)
     }
@@ -1930,11 +2031,10 @@ impl SSTableIterator {
         self.verify_crc = verify;
     }
 
-    /// Zero-Arc scan: returns (key, timestamp, deleted, value_bytes) without
-    /// creating an Arc<Vec<u8>> per entry. Uses next_entry_raw() internally
-    /// which returns a slice into the block buffer, then copies to a Vec.
-    /// This avoids the expensive Arc allocation (~30ns saved per row).
-    pub fn next_raw(&mut self) -> Option<(Key, u64, bool, Vec<u8>)> {
+    /// Zero-copy scan: returns (key, timestamp, deleted, value_bytes) where
+    /// value_bytes shares the decompressed block's Arc<Vec<u8>> (no per-row memcpy).
+    /// Uses next_entry_arc() internally — ~2ns Arc::clone instead of ~20ns to_vec().
+    pub fn next_raw(&mut self) -> Option<(Key, u64, bool, ValueBytes)> {
         loop {
             if let Some(ref mut cursor) = self.current_cursor {
                 if let Some(key) = cursor.peek_key() {
@@ -1952,11 +2052,9 @@ impl SSTableIterator {
                     }
                 }
 
-                match cursor.next_entry_raw() {
-                    Ok(Some((key, ts, deleted, data))) => {
-                        // Copy the value bytes (cheap memcpy, ~20ns for 65 bytes)
-                        // but skip Arc::new() (~30ns saved per row)
-                        return Some((key, ts, deleted, data.to_vec()));
+                match cursor.next_entry_arc() {
+                    Ok(Some((key, ts, deleted, block, start, len))) => {
+                        return Some((key, ts, deleted, ValueBytes { block, start, len }));
                     }
                     Ok(None) => {
                         self.current_cursor = None;

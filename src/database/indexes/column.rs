@@ -24,7 +24,10 @@ impl MoteDB {
         let index_path = indexes_dir.join(format!("column_{}.idx", index_name));
 
         let mut config = ColumnValueIndexConfig::default();
-        config.mem_buffer_size = self.column_index_buffer_size;
+        // During CREATE INDEX, use a larger buffer (32 MB) to reduce BTree flush
+        // frequency. With default 1 MB, 300K entries require ~21 flushes.
+        // With 32 MB, all entries fit in a single buffer → 1 flush.
+        config.mem_buffer_size = (self.column_index_buffer_size).max(32 * 1024 * 1024);
         let index = ColumnValueIndex::create(
             index_path,
             table_name.to_string(),
@@ -35,67 +38,131 @@ impl MoteDB {
         let index_arc = Arc::new(index);
         self.column_indexes.insert(index_name.to_string(), index_arc.clone());
 
-        // Populate from existing data using scan_range
+        // Populate from existing data
         if let Ok(schema) = self.table_registry.get_table(table_name) {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
                 let col_types = schema.col_types();
 
-                debug_log!("[create_column_index] Using scan_range...");
+                debug_log!("[create_column_index] Building index...");
                 let start_time = std::time::Instant::now();
 
+                let mut indexed_count = 0;
+                const SORT_BATCH: usize = 50000;
+
+                // 🚀 Fast path: use columnar SSTable data directly (O(1) per value)
+                if let Some(col_sst) = self.columnar_sstables.get(table_name) {
+                    let num_rows = col_sst.num_rows;
+                    let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(SORT_BATCH);
+
+                    if col_sst.column_tags[col_position].is_fixed() {
+                        if let Ok(seg) = col_sst.read_fixed_i64(col_position) {
+                            for i in 0..num_rows {
+                                if col_sst.row_map.is_deleted(i) { continue; }
+                                let row_id = (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                                let val = match &col_types[col_position] {
+                                    crate::types::ColumnType::Integer =>
+                                        seg.get_i64(i).map(crate::types::Value::Integer),
+                                    crate::types::ColumnType::Float =>
+                                        seg.get_f64(i).map(crate::types::Value::Float),
+                                    _ => None,
+                                }.unwrap_or(crate::types::Value::Null);
+                                if !matches!(val, crate::types::Value::Null) {
+                                    batch.push((val, row_id));
+                                    if batch.len() >= SORT_BATCH {
+                                        batch.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                        indexed_count += batch.len();
+                                        let _ = index_arc.batch_insert(std::mem::take(&mut batch));
+                                        batch = Vec::with_capacity(SORT_BATCH);
+                                    }
+                                }
+                            }
+                        }
+                    } else if let Ok(seg) = col_sst.read_text(col_position) {
+                        for i in 0..num_rows {
+                            if col_sst.row_map.is_deleted(i) { continue; }
+                            let row_id = (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                            if let Some(s) = seg.get_str(i) {
+                                let val = crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s)));
+                                batch.push((val, row_id));
+                                if batch.len() >= SORT_BATCH {
+                                    batch.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                    indexed_count += batch.len();
+                                    let _ = index_arc.batch_insert(std::mem::take(&mut batch));
+                                    batch = Vec::with_capacity(SORT_BATCH);
+                                }
+                            }
+                        }
+                    }
+
+                    // Flush remaining
+                    if !batch.is_empty() {
+                        batch.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        indexed_count += batch.len();
+                        let _ = index_arc.batch_insert(batch);
+                    }
+                    let _ = index_arc.flush();
+
+                    let elapsed = start_time.elapsed();
+                    debug_log!("[create_column_index] Columnar path: {} values in {:?}", indexed_count, elapsed);
+                } else {
+                // Fallback: scan LSM tree
                 let table_id = self.table_registry.get_table_id(table_name)
                     .unwrap_or(0) as u64;
                 let start_key = table_id << 32;
                 let end_key = (table_id + 1) << 32;
 
-                let mut indexed_count = 0;
-                const BATCH_SIZE: usize = 2000;
+                match self.lsm_engine.scan_range_streaming(start_key, end_key) {
+                    Ok(mut lsm_iter) => {
+                        let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(SORT_BATCH);
 
-                match self.lsm_engine.scan_range(start_key, end_key) {
-                    Ok(entries) => {
-                        // Collect (Value, RowId) pairs in batches for batch_insert
-                        let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(BATCH_SIZE);
+                        loop {
+                            match lsm_iter.next() {
+                                Some(Ok((composite_key, value))) => {
+                                    if value.deleted { continue; }
+                                    let row_id = (composite_key & 0xFFFFFFFF) as RowId;
 
-                        for (composite_key, value) in &entries {
-                            if value.deleted {
-                                continue;
-                            }
-                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-
-                            // Zero-copy for Inline; resolve Blob refs
-                            let col_value = match &value.data {
-                                crate::storage::lsm::ValueData::Inline(bytes) => {
-                                    // Extract single column without full row decode
-                                    crate::storage::row_format::get_column(bytes, &col_types, col_position)
-                                        .unwrap_or(crate::types::Value::Null)
-                                }
-                                crate::storage::lsm::ValueData::Blob(blob_ref) => {
-                                    match self.lsm_engine.resolve_blob(blob_ref) {
-                                        Ok(data) => {
-                                            crate::storage::row_format::get_column(&data, &col_types, col_position)
+                                    let col_value = match &value.data {
+                                        crate::storage::lsm::ValueData::Inline(bytes) => {
+                                            crate::storage::row_format::get_column(bytes, &col_types, col_position)
                                                 .unwrap_or(crate::types::Value::Null)
                                         }
-                                        Err(_) => continue,
+                                        crate::storage::lsm::ValueData::Blob(blob_ref) => {
+                                            match self.lsm_engine.resolve_blob(blob_ref) {
+                                                Ok(data) => {
+                                                    crate::storage::row_format::get_column(&data, &col_types, col_position)
+                                                        .unwrap_or(crate::types::Value::Null)
+                                                }
+                                                Err(_) => continue,
+                                            }
+                                        }
+                                    };
+
+                                    if !matches!(col_value, crate::types::Value::Null) {
+                                        batch.push((col_value, row_id));
+                                    }
+
+                                    if batch.len() >= SORT_BATCH {
+                                        // Sort by value before inserting — faster BTreeMap inserts
+                                        batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                        indexed_count += batch.len();
+                                        if let Err(_e) = index_arc.batch_insert(std::mem::take(&mut batch)) {
+                                            debug_log!("[create_column_index] batch_insert failed: {}", _e);
+                                        }
+                                        batch = Vec::with_capacity(SORT_BATCH);
                                     }
                                 }
-                            };
-
-                            if !matches!(col_value, crate::types::Value::Null) {
-                                batch.push((col_value, row_id));
-                            }
-
-                            if batch.len() >= BATCH_SIZE {
-                                indexed_count += batch.len();
-                                if let Err(_e) = index_arc.batch_insert(std::mem::take(&mut batch)) {
-                                    debug_log!("[create_column_index] batch_insert failed: {}", _e);
+                                Some(Err(_e)) => {
+                                    debug_log!("[create_column_index] scan error: {}", _e);
+                                    break;
                                 }
-                                batch = Vec::with_capacity(BATCH_SIZE);
+                                None => break,
                             }
                         }
 
-                        // Flush remaining batch
+                        // Sort and flush remaining batch
                         if !batch.is_empty() {
+                            batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                             indexed_count += batch.len();
                             if let Err(_e) = index_arc.batch_insert(batch) {
                                 debug_log!("[create_column_index] final batch_insert failed: {}", _e);
@@ -108,9 +175,10 @@ impl MoteDB {
                         }
                     }
                     Err(e) => {
-                        debug_log!("[create_column_index] scan_range failed: {}", e);
+                        debug_log!("[create_column_index] scan_range_streaming failed: {}", e);
                     }
                 }
+                } // end else (fallback LSM scan)
 
                 let _scan_time = start_time.elapsed();
                 if indexed_count > 0 {

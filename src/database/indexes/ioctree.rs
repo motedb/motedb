@@ -71,6 +71,31 @@ impl MoteDB {
         Err(StorageError::Index(format!("i-Octree index '{}' not found", index_name)))
     }
 
+    /// 🚀 Build i-Octree from columnar SSTable data.
+    /// Reads geometries directly from column segment — O(N), zero per-row decode.
+    pub fn build_ioctree_from_columnar(
+        &self,
+        index_name: &str,
+        table_name: &str,
+        col_position: usize,
+    ) -> Result<usize> {
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Ok(0),
+        };
+        let geoms = col_sst.read_spatial(col_position)?;
+        if geoms.is_empty() { return Ok(0); }
+
+        let index_ref = self.ioctree_indexes.get(index_name)
+            .ok_or_else(|| StorageError::Index(format!("i-Octree '{}' not found", index_name)))?;
+        let mut index = index_ref.value().write();
+        for (row_id, geom) in &geoms {
+            index.insert(*row_id, geom)?;
+        }
+        index.flush()?;
+        Ok(geoms.len())
+    }
+
     /// Flush all i-Octree indexes to disk
     pub fn flush_ioctree_indexes(&self) -> Result<()> {
         for entry in self.ioctree_indexes.iter() {

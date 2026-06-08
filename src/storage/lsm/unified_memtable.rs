@@ -93,6 +93,11 @@ pub struct UnifiedMemTable {
     /// 分片存储：16 个独立 BTreeMap，按 key & 0xF 路由
     shards: [RwLock<BTreeMap<Key, Arc<DataEntry>>>; SHARD_COUNT],
 
+    /// 🚀 Batch write buffer: Vec-based fast path for bulk INSERTs.
+    /// Entries are appended (O(1)) instead of inserted into BTreeMap (O(log N)).
+    /// Merged into shards on flush or when scanning.
+    batch_buffer: RwLock<Vec<(Key, Arc<DataEntry>)>>,
+
     /// 向量数据 (仅向量表创建，避免非向量表的 Option<Vec> 开销)
     vectors: Option<VectorMap>,
 
@@ -122,6 +127,7 @@ impl UnifiedMemTable {
     pub fn new(config: &LSMConfig) -> Self {
         Self {
             shards: core::array::from_fn(|_| RwLock::new(BTreeMap::new())),
+            batch_buffer: RwLock::new(Vec::new()),
             vectors: None,
             vector_graph: None,
             vector_dimension: None,
@@ -146,6 +152,7 @@ impl UnifiedMemTable {
 
         Self {
             shards: core::array::from_fn(|_| RwLock::new(BTreeMap::new())),
+            batch_buffer: RwLock::new(Vec::new()),
             vectors: Some(Arc::new(RwLock::new(BTreeMap::new()))),
             vector_graph: Some(Arc::new(vector_graph)),
             vector_dimension: Some(dimension),
@@ -215,6 +222,54 @@ impl UnifiedMemTable {
     }
 
     /// Batch insert (grouped by shard for minimal lock contention)
+    /// 🚀 Fast batch insert: append to Vec instead of BTreeMap.
+    /// O(1) amortized per entry instead of O(log N). Entries are merged
+    /// into sharded BTree Maps during scan/flush.
+    pub fn batch_put_fast(&self, kvs: &[(Key, Value)]) -> Result<()> {
+        if kvs.is_empty() { return Ok(()); }
+        let mut buffer = self.batch_buffer.write();
+        let mut total_size: usize = 0;
+        for (key, value) in kvs {
+            let entry = Arc::new(DataEntry {
+                data: value.data.clone(),
+                timestamp: value.timestamp,
+                deleted: value.deleted,
+            });
+            total_size += entry.memory_size();
+            buffer.push((*key, entry));
+        }
+        if total_size > 0 {
+            self.size.fetch_add(total_size, Ordering::Relaxed);
+        }
+        self.next_seq.fetch_add(kvs.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Merge batch buffer into sharded BTreeMaps. Called before scan or flush.
+    pub(crate) fn merge_batch_buffer(&self) {
+        let mut buffer = self.batch_buffer.write();
+        if buffer.is_empty() { return; }
+        let entries: Vec<(Key, Arc<DataEntry>)> = std::mem::take(&mut *buffer);
+        let count = entries.len();
+        drop(buffer);
+
+        debug_log!("[merge_batch_buffer] Merging {} entries into shards", count);
+
+        // Group by shard and insert
+        let mut groups: [Vec<(Key, Arc<DataEntry>)>; SHARD_COUNT] = core::array::from_fn(|_| Vec::new());
+        for (key, entry) in entries {
+            groups[Self::shard_index(key)].push((key, entry));
+        }
+        for (si, group) in groups.into_iter().enumerate() {
+            if !group.is_empty() {
+                let mut shard = self.shards[si].write();
+                for (key, entry) in group {
+                    shard.insert(key, entry);
+                }
+            }
+        }
+    }
+
     pub fn batch_put(&self, kvs: &[(Key, Value)]) -> Result<()> {
         if kvs.is_empty() {
             return Ok(());
@@ -330,6 +385,7 @@ impl UnifiedMemTable {
 
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.read().is_empty())
+            && self.batch_buffer.read().is_empty()
     }
 
     /// Vector search (in-memory graph) — per-key single shard lookup
@@ -405,6 +461,7 @@ impl UnifiedMemTable {
 
     /// Range scan — merge ranges from all shards
     pub fn scan(&self, start: Key, end: Key) -> Result<Vec<(Key, UnifiedEntry)>> {
+        self.merge_batch_buffer();
         let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
         for shard in &self.shards {
             let s = shard.read();
@@ -435,6 +492,7 @@ impl UnifiedMemTable {
     /// Memory usage is O(N * 24) instead of O(N * avg_data_size).
     /// Skips vector map lookup — use scan_arcs_with_vectors() if vectors needed.
     pub fn scan_arcs(&self, start: Key, end: Key) -> Vec<(Key, Arc<DataEntry>)> {
+        self.merge_batch_buffer();
         let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
         for shard in &self.shards {
             let s = shard.read();
@@ -461,6 +519,7 @@ impl UnifiedMemTable {
 
     /// Full table scan — merge from all shards
     pub fn scan_all(&self) -> Result<Vec<(Key, UnifiedEntry)>> {
+        self.merge_batch_buffer();
         let mut all: Vec<(Key, Arc<DataEntry>)> = Vec::new();
         for shard in &self.shards {
             let s = shard.read();

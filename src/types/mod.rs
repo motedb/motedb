@@ -169,6 +169,29 @@ pub enum Value {
     Null,
 }
 
+/// Precise integer-vs-float comparison that avoids precision loss for |i| > 2^53.
+///
+/// Strategy:
+/// - If the float has a fractional part, compare via f64 (safe: integer is exact in f64 range).
+/// - If the float is an exact integer, compare via i64 arithmetic (avoids f64 precision loss).
+fn int_float_cmp(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    // If f has a fractional part, the integer can be compared as f64
+    // because the fractional part differentiates them regardless.
+    let f_trunc = f.trunc();
+    if f != f_trunc {
+        return (i as f64).partial_cmp(&f);
+    }
+    // f is an exact integer. Convert to i64 and compare precisely.
+    // f.trunc() is guaranteed to be in i64 range because it came from a valid f64
+    // that equals an integer value (no overflow since f64 can represent up to 2^1023).
+    if f_trunc >= i64::MIN as f64 && f_trunc <= i64::MAX as f64 {
+        let f_as_i = f_trunc as i64;
+        return Some(i.cmp(&f_as_i));
+    }
+    // f is astronomically large/small — fall back to f64 comparison
+    (i as f64).partial_cmp(&f)
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -180,14 +203,14 @@ impl PartialOrd for Value {
             (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
-            (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-            (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Integer(a), Value::Float(b)) => int_float_cmp(*a, *b),
+            (Value::Float(a), Value::Integer(b)) => int_float_cmp(*b, *a).map(|o| o.reverse()),
             // Timestamp vs Integer: compare timestamp micros to integer value
             (Value::Timestamp(a), Value::Integer(b)) => a.as_micros().partial_cmp(b),
             (Value::Integer(a), Value::Timestamp(b)) => a.partial_cmp(&b.as_micros()),
             // Timestamp vs Float: compare timestamp micros to float value
-            (Value::Timestamp(a), Value::Float(b)) => (a.as_micros() as f64).partial_cmp(b),
-            (Value::Float(a), Value::Timestamp(b)) => a.partial_cmp(&(b.as_micros() as f64)),
+            (Value::Timestamp(a), Value::Float(b)) => int_float_cmp(a.as_micros(), *b),
+            (Value::Float(a), Value::Timestamp(b)) => int_float_cmp(b.as_micros(), *a).map(|o| o.reverse()),
             _ => None,
         }
     }
@@ -207,6 +230,18 @@ fn canonical_float_bits(f: f64) -> u64 {
     f.to_bits()
 }
 
+/// Precise integer-vs-float equality that avoids precision loss for |i| > 2^53.
+fn int_float_eq(i: i64, f: f64) -> bool {
+    let f_trunc = f.trunc();
+    if f != f_trunc {
+        return float_eq(i as f64, f);
+    }
+    if f_trunc >= i64::MIN as f64 && f_trunc <= i64::MAX as f64 {
+        return i == f_trunc as i64;
+    }
+    float_eq(i as f64, f)
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -216,8 +251,8 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
-            (Value::Integer(a), Value::Float(b)) => float_eq(*a as f64, *b),
-            (Value::Float(a), Value::Integer(b)) => float_eq(*a, *b as f64),
+            (Value::Integer(a), Value::Float(b)) => int_float_eq(*a, *b),
+            (Value::Float(a), Value::Integer(b)) => int_float_eq(*b, *a),
             (Value::Timestamp(a), Value::Integer(b)) => a.as_micros() == *b,
             (Value::Integer(a), Value::Timestamp(b)) => *a == b.as_micros(),
             (Value::Timestamp(a), Value::Float(b)) => float_eq(a.as_micros() as f64, *b),

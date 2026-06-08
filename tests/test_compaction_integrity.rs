@@ -39,7 +39,7 @@ fn get_row(db: &Database, id: i64) -> Option<Vec<Value>> {
 fn get_val(db: &Database, id: i64) -> String {
     let row = get_row(db, id).unwrap_or_else(|| panic!("Row {} should exist", id));
     match &row[1] {
-        Value::Text(s) => (**s).clone(),
+        Value::Text(s) => (**s).to_string(),
         other => panic!("Row {} col 1 expected Text, got {:?}", id, other),
     }
 }

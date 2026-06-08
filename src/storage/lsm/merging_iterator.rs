@@ -18,6 +18,7 @@ use super::{Key, Value};
 use crate::Result;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 use super::sstable::SSTableIterator;
 
 // Type alias for KV iterator
@@ -129,21 +130,35 @@ impl MergingIterator {
         }
     }
 
-    /// Zero-Arc scan: returns (key, timestamp, deleted, value_bytes) without
-    /// creating Arc<Vec<u8>> per entry. Only works when raw_sst is set.
-    /// Falls back to normal next() for multi-source or non-SST iterators.
-    pub fn next_raw(&mut self) -> Option<Result<(Key, u64, bool, Vec<u8>)>> {
+    /// Zero-copy scan: returns (key, timestamp, deleted, value_bytes) where
+    /// value_bytes shares the decompressed block's Arc<Vec<u8>> (no per-row memcpy).
+    /// Works for both single and multi-SSTable raw paths.
+    pub fn next_raw(&mut self) -> Option<Result<(Key, u64, bool, super::sstable::ValueBytes)>> {
+        // Single raw SSTable path
         if let Some(ref mut sst) = self.raw_sst {
-            return sst.next_raw().map(|(key, ts, del, data)| Ok((key, ts, del, data)));
+            return sst.next_raw().map(|(key, ts, del, vb)| Ok((key, ts, del, vb)));
         }
-        // Fallback: unwrap Value into raw components
+        // Multi raw SSTable path — fall through to normal path for now
+        // (multi-raw needs value_bytes caching, not yet implemented)
+        // Fallback: wrap the Inline Arc into ValueBytes (clone Arc, skip memcpy)
         match self.next() {
             Some(Ok((key, value))) => {
-                let bytes = match &value.data {
-                    super::ValueData::Inline(arc_vec) => arc_vec.as_slice().to_vec(),
-                    super::ValueData::Blob(_) => Vec::new(),
+                let vb = match &value.data {
+                    super::ValueData::Inline(arc_vec) => {
+                        let len = arc_vec.len();
+                        super::sstable::ValueBytes {
+                            block: Arc::clone(arc_vec),
+                            start: 0,
+                            len,
+                        }
+                    }
+                    super::ValueData::Blob(_) => super::sstable::ValueBytes {
+                        block: Arc::new(Vec::new()),
+                        start: 0,
+                        len: 0,
+                    },
                 };
-                Some(Ok((key, value.timestamp, value.deleted, bytes)))
+                Some(Ok((key, value.timestamp, value.deleted, vb)))
             }
             Some(Err(e)) => Some(Err(e)),
             None => None,

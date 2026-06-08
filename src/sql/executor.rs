@@ -7,6 +7,7 @@ use crate::error::{Result, MoteDBError};
 use crate::{StorageError};
 use crate::types::{Value, SqlRow, TableSchema, ColumnType, RowId, Row};
 use crate::storage::row_format;
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 fn decode_row(data: &[u8], schema: &TableSchema) -> crate::Result<Row> {
@@ -42,6 +43,13 @@ fn prefix_schema(schema: &TableSchema, prefix: &str) -> TableSchema {
     s
 }
 
+/// Column segment wrapper for zero-materialization results.
+#[derive(Clone)]
+pub enum ColumnarSeg {
+    Fixed(crate::storage::lsm::columnar::FixedSegment),
+    Text(crate::storage::lsm::columnar::TextSegment),
+}
+
 /// Query result
 #[derive(Debug)]
 pub enum QueryResult {
@@ -50,12 +58,12 @@ pub enum QueryResult {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
-    
+
     /// INSERT/UPDATE/DELETE result
     Modification {
         affected_rows: usize,
     },
-    
+
     /// CREATE/DROP result
     Definition {
         message: String,
@@ -69,7 +77,7 @@ impl QueryResult {
             _ => 0,
         }
     }
-    
+
     /// Get columns and rows from SELECT result
     /// Returns None if not a SELECT result
     pub fn select_rows(&self) -> Option<(&[String], &[Vec<Value>])> {
@@ -135,12 +143,27 @@ pub enum StreamingQueryResult {
         distinct: bool,
         /// Safety limit: max rows to collect during materialize(). Truncates gracefully.
         max_result_rows: Option<usize>,
+        /// Capacity hint for materialize() — avoids repeated Vec reallocations.
+        /// Populated from fast_row_count() when available.
+        size_hint: Option<usize>,
     },
 
     /// 🚀 Pre-materialized SELECT result (zero-overhead for fast PK paths)
     SelectReady {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
+    },
+
+    /// 🚀 Columnar result — typed arrays, zero per-row Vec<Value> allocation.
+    /// Converted to Vec<Vec<Value>> lazily in materialize().
+    SelectColumnar {
+        columns: Vec<String>,
+        /// Column segments (Fixed or Text), one per output column
+        segments: Vec<ColumnarSeg>,
+        /// Row indices to include (None = all rows)
+        row_indices: Option<Vec<usize>>,
+        num_rows: usize,
+        row_map: crate::storage::lsm::columnar::RowMap,
     },
 
     /// INSERT/UPDATE/DELETE result
@@ -176,9 +199,45 @@ impl StreamingQueryResult {
             Self::SelectReady { columns, rows } => {
                 Ok(QueryResult::Select { columns, rows })
             }
-            Self::SelectStreaming { columns, rows, order_by, limit, offset, distinct, max_result_rows } => {
+            Self::SelectColumnar { columns, segments, row_indices, num_rows, row_map } => {
+                // Convert columnar to row-based lazily — only when materialize() called
+                let ncols = segments.len();
+                let source: Vec<usize> = if let Some(ref idx) = row_indices {
+                    idx.iter().filter(|&&i| !row_map.is_deleted(i)).copied().collect()
+                } else {
+                    (0..num_rows).filter(|&i| !row_map.is_deleted(i)).collect()
+                };
+                let mut rows = Vec::with_capacity(source.len());
+                // String interning pool: reuse Arc<str> for repeated text values.
+                // For region="US"/"EU" (2 values, 300K rows), saves 299,998 Arc allocations.
+                let mut string_pool: std::collections::HashMap<&str, std::sync::Arc<str>> =
+                    std::collections::HashMap::with_capacity(256);
+                for &idx in &source {
+                    let mut row = Vec::with_capacity(ncols);
+                    for seg in &segments {
+                        match seg {
+                            ColumnarSeg::Fixed(f) => row.push(
+                                f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null)),
+                            ColumnarSeg::Text(t) => {
+                                let val = if let Some(s) = t.get_str(idx) {
+                                    let arc = string_pool.get(s).cloned().unwrap_or_else(|| {
+                                        let a: std::sync::Arc<str> = std::sync::Arc::from(s);
+                                        string_pool.insert(s, a.clone());
+                                        a
+                                    });
+                                    Value::Text(crate::types::ArcString(arc))
+                                } else { Value::Null };
+                                row.push(val);
+                            }
+                        }
+                    }
+                    rows.push(row);
+                }
+                Ok(QueryResult::Select { columns, rows })
+            }
+            Self::SelectStreaming { columns, rows, order_by, limit, offset, distinct, max_result_rows, size_hint: stream_hint } => {
                 // Step 1: Collect rows, truncating at max_result_rows
-                let estimated_size = size_hint.unwrap_or(1024);
+                let estimated_size = stream_hint.or(size_hint).unwrap_or(1024);
                 let mut materialized_rows = Vec::with_capacity(estimated_size);
 
                 for row_result in rows {
@@ -188,6 +247,14 @@ impl StreamingQueryResult {
                             break;
                         }
                     }
+                }
+
+                // After materializing a large result (> 100K rows), tell the
+                // allocator to return freed heap to the OS. On macOS, the default
+                // allocator retains freed memory indefinitely, causing RSS drift
+                // across repeated queries (~+159 MB over 10 full scans).
+                if materialized_rows.len() > 100_000 {
+                    crate::database::persistence::trim_allocator();
                 }
 
                 // Step 2: Apply ORDER BY
@@ -232,11 +299,27 @@ impl StreamingQueryResult {
         }
     }
 
+    /// Get row count without full materialization. O(1) for columnar/ready results.
+    pub fn row_count(&self) -> usize {
+        match self {
+            Self::SelectReady { rows, .. } => rows.len(),
+            Self::SelectColumnar { row_indices, num_rows, row_map, .. } => {
+                if let Some(ref idx) = row_indices {
+                    idx.iter().filter(|&&i| !row_map.is_deleted(i)).count()
+                } else {
+                    (0..*num_rows).filter(|&i| !row_map.is_deleted(i)).count()
+                }
+            }
+            _ => 0, // Streaming — not materialized yet
+        }
+    }
+
     /// 获取列名（仅 SELECT）
     pub fn columns(&self) -> Option<&[String]> {
         match self {
             Self::SelectStreaming { columns, .. } => Some(columns),
             Self::SelectReady { columns, .. } => Some(columns),
+            Self::SelectColumnar { columns, .. } => Some(columns),
             _ => None,
         }
     }
@@ -245,10 +328,11 @@ impl StreamingQueryResult {
     /// When the limit is reached, materialize() truncates gracefully instead of erroring.
     fn with_max_rows(self, max: Option<usize>) -> Self {
         match self {
-            Self::SelectStreaming { columns, rows, order_by, limit, offset, distinct, max_result_rows: _ } => {
+            Self::SelectStreaming { columns, rows, order_by, limit, offset, distinct, max_result_rows: _, size_hint } => {
                 Self::SelectStreaming {
                     columns, rows, order_by, limit, offset, distinct,
                     max_result_rows: max,
+                    size_hint,
                 }
             }
             other => other,
@@ -288,6 +372,33 @@ impl StreamingQueryResult {
                 let has_more = rows.len() > limit;
                 for row in rows.iter().take(limit) {
                     match callback(&columns, row)? {
+                        StreamingControl::Continue => count += 1,
+                        StreamingControl::Break => break,
+                    }
+                }
+                Ok(ForEachResult { rows_processed: count, has_more })
+            }
+            Self::SelectColumnar { columns, segments, row_indices, num_rows, row_map } => {
+                let limit = max_rows.unwrap_or(usize::MAX);
+                let mut count = 0;
+                let actual = row_indices.as_ref().map(|v| v.len()).unwrap_or(num_rows);
+                let has_more = actual > limit;
+                let n = actual.min(limit);
+                let indices: Vec<usize> = if let Some(ref idx) = row_indices {
+                    idx[..n].to_vec()
+                } else {
+                    (0..n).collect()
+                };
+                for &idx in &indices {
+                    if row_map.is_deleted(idx) { continue; }
+                    let mut row = Vec::with_capacity(segments.len());
+                    for seg in &segments {
+                        match seg {
+                            ColumnarSeg::Fixed(f) => row.push(f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null)),
+                            ColumnarSeg::Text(t) => row.push(t.get_str(idx).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))).unwrap_or(Value::Null)),
+                        }
+                    }
+                    match callback(&columns, &row)? {
                         StreamingControl::Continue => count += 1,
                         StreamingControl::Break => break,
                     }
@@ -980,6 +1091,31 @@ impl Iterator for TwoPhaseFilteredIterator {
     }
 }
 
+/// SortKey wraps Value with a total-ordering Ord impl that treats NULLs
+/// as less than all non-NULL values (consistent with SQLite).
+#[derive(Clone)]
+struct SortKey(Value);
+
+impl Eq for SortKey {}
+impl PartialEq for SortKey {
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+impl Ord for SortKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&self.0, &other.0) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+            (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        }
+    }
+}
+
 pub struct QueryExecutor {
     db: Arc<MoteDB>,
     evaluator: ExprEvaluator,
@@ -1200,6 +1336,7 @@ impl QueryExecutor {
                     offset: None,
                     distinct: false,
                     max_result_rows: None,
+                    size_hint: None,
                 })
             }
             _ => unreachable!(),
@@ -1211,8 +1348,25 @@ impl QueryExecutor {
     /// Takes &SelectStmt — no cloning of the AST at all.
     /// This is the primary entry point from the statement cache.
     fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
-        // Aggregate queries (COUNT, SUM, etc.) require materialization — fall back
+        // Aggregate queries (COUNT, SUM, etc.) — try fast paths
         if self.has_aggregates(&stmt.columns) {
+            // Fast path 0: columnar aggregate pushdown (no row materialization)
+            if let Some(result) = self.try_aggregate_columnar_fast(stmt)? {
+                return Ok(result);
+            }
+            // Fast path 1: column index (works for high-selectivity filters)
+            if let Some(result) = self.try_aggregate_via_column_index(stmt)? {
+                return Ok(result);
+            }
+            if let Some(result) = self.try_aggregate_partial_scan(stmt)? {
+                return Ok(result);
+            }
+            // Fast path 3: columnar GROUP BY pushdown
+            if stmt.group_by.is_some() {
+                if let Some(result) = self.try_group_by_columnar(stmt)? {
+                    return Ok(result);
+                }
+            }
             return self.materialize_as_streaming(stmt);
         }
 
@@ -1328,8 +1482,24 @@ impl QueryExecutor {
                 self.execute_full_scan_streaming(&resolved, plan.scan_method.table_name())
             }
             super::optimizer::ScanMethod::FullScan { ref table } => {
-                // ORDER BY / DISTINCT on full scan: use positional path via materialize
-                // which has the optimized positional ORDER BY / DISTINCT fast path
+                // 🚀 DISTINCT via column value index: SELECT DISTINCT col FROM table
+                // without WHERE — iterate index keys directly (O(unique) vs O(N) scan).
+                if stmt.distinct && stmt.where_clause.is_none() && stmt.order_by.is_none() {
+                    if let Some(result) = self.try_distinct_via_column_index(stmt, table)? {
+                        return Ok(result);
+                    }
+                }
+                // 🚀 Streaming Top-K: when ORDER BY + LIMIT (no OFFSET) on full scan,
+                // use a bounded heap instead of materializing all rows + sorting.
+                if stmt.order_by.is_some() && stmt.limit.is_some()
+                    && stmt.offset.is_none() && !stmt.distinct
+                {
+                    if let Some(result) = self.try_order_by_limit_topk(stmt, table)? {
+                        return Ok(result);
+                    }
+                }
+                // ORDER BY / DISTINCT on full scan without streaming Top-K:
+                // fall back to materialize which has the positional sort path.
                 if stmt.order_by.is_some() || stmt.distinct {
                     return self.materialize_as_streaming(stmt);
                 }
@@ -1480,7 +1650,7 @@ impl QueryExecutor {
             let row_id = self.resolve_pk_with_cache(table, &pk_key, column, value)?;
 
             if let Some(rid) = row_id {
-                let row = self.db.get_table_row_with_schema(table, rid, &schema)?;
+                let row = self.db.get_table_row_arc(table, rid, &schema)?;
                 let result_rows: Vec<Result<Vec<Value>>> = match row {
                     Some(row) => {
                         filter_and_project!(row).map(|r| Ok(r)).into_iter().collect()
@@ -1495,6 +1665,7 @@ impl QueryExecutor {
                     offset: stmt.offset,
                     distinct: stmt.distinct,
                     max_result_rows: None,
+                    size_hint: None,
                 });
             }
             // PK not found — return empty
@@ -1506,6 +1677,7 @@ impl QueryExecutor {
                 offset: stmt.offset,
                 distinct: stmt.distinct,
                 max_result_rows: None,
+                size_hint: None,
             });
         }
 
@@ -1524,11 +1696,12 @@ impl QueryExecutor {
                         offset: stmt.offset,
                         distinct: stmt.distinct,
                         max_result_rows: None,
+                        size_hint: None,
                     });
                 }
             };
 
-            let row = self.db.get_table_row_with_schema(table, row_id, &schema)?;
+            let row = self.db.get_table_row_arc(table, row_id, &schema)?;
             let result_rows: Vec<Result<Vec<Value>>> = match row {
                 Some(row) => {
                     filter_and_project!(row).map(|r| Ok(r)).into_iter().collect()
@@ -1544,6 +1717,7 @@ impl QueryExecutor {
                 offset: stmt.offset,
                 distinct: stmt.distinct,
                 max_result_rows: None,
+                size_hint: None,
             });
         }
 
@@ -1564,6 +1738,7 @@ impl QueryExecutor {
                 offset: stmt.offset,
                 distinct: stmt.distinct,
                 max_result_rows: None,
+                size_hint: None,
             });
         }
 
@@ -1626,9 +1801,10 @@ impl QueryExecutor {
             offset: stmt.offset,
             distinct: stmt.distinct,
             max_result_rows: None,
+            size_hint: None,
         })
     }
-    
+
     /// 🔥 范围查询流式扫描（智能路由：主键用 LSM scan，非主键用列索引）
     /// 
     /// ## 性能优化
@@ -1738,9 +1914,10 @@ impl QueryExecutor {
             offset: stmt.offset,
             distinct: stmt.distinct,
             max_result_rows: None,
+            size_hint: None,
         })
     }
-    
+
     /// 🚀 主键范围查询流式扫描（使用 LSM range scan）
     /// 
     /// ## 关键优化
@@ -1830,6 +2007,7 @@ impl QueryExecutor {
             offset: stmt.offset,
             distinct: stmt.distinct,
             max_result_rows: None,
+            size_hint: None,
         })
     }
 
@@ -1934,29 +2112,1185 @@ impl QueryExecutor {
         Ok(StreamingQueryResult::SelectReady { columns, rows })
     }
 
+    /// 🚀 Streaming Top-K via bounded heap with partial decode.
+    ///
+    /// Only extracts the sort column value from each row (not all columns),
+    /// then batch-fetches the K winning rows. For a 4-column table, this
+    /// decodes ~75% less data per row — only 1 column instead of 4.
+    ///
+    /// For fixed-width sort columns (Integer, Float, Bool, Timestamp), the
+    /// sort value is read directly from a known byte offset — no decode at all.
+    fn try_order_by_limit_topk(&self, stmt: &SelectStmt, table: &str) -> Result<Option<StreamingQueryResult>> {
+        let limit = match stmt.limit {
+            Some(l) => l as usize,
+            None => return Ok(None),
+        };
+        let order_by = match stmt.order_by.as_ref() {
+            Some(ob) if !ob.is_empty() => ob,
+            _ => return Ok(None),
+        };
+        // Only handle single-column ORDER BY for now (covers the common case)
+        if order_by.len() > 1 {
+            return Ok(None);
+        }
+        let schema = self.db.get_table_schema(table)?;
+        // Resolve ORDER BY column position
+        let (sort_col_idx, ascending) = {
+            let ob = &order_by[0];
+            let col_name = match &ob.expr {
+                Expr::Column(name) => name.as_str(),
+                _ => return Ok(None),
+            };
+            let pos = match schema.get_column_position(col_name) {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+            (pos, ob.asc)
+        };
+
+        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+
+        // 🚀 Columnar Top-K: read sort column segment, heap of (value, idx),
+        // then fetch only K winning rows. Much faster than row-based scan.
+        if self.db.columnar_sstables.contains_key(table) {
+            let k = limit.min(100_000);
+            if let Ok((indices, _vals)) = self.db.scan_columnar_sstable_topk(
+                table, sort_col_idx, k, ascending,
+            ) {
+                let col_types = schema.col_types();
+                if let Ok(rows) = self.db.scan_columnar_sstable_rows(table, &col_types, &indices) {
+                    return Ok(Some(StreamingQueryResult::SelectReady { columns: col_names, rows }));
+                }
+            }
+        }
+
+        let col_types = schema.col_types();
+        let limit_usize = limit.min(100_000); // sanity cap
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+
+        // Pre-compute sort column layout for direct read from raw bytes.
+        // For fixed columns: byte offset = HEADER_SIZE + fixed_idx * 8
+        // For var columns: we need to scan the var header, but that's still
+        //   cheaper than full row decode (only parse header, skip all other vars).
+        let is_fixed = matches!(&col_types[sort_col_idx],
+            crate::types::ColumnType::Integer | crate::types::ColumnType::Float
+            | crate::types::ColumnType::Boolean | crate::types::ColumnType::Timestamp);
+        let sort_col_type = col_types[sort_col_idx].clone();
+        let fixed_count = col_types.iter()
+            .filter(|t| matches!(t, crate::types::ColumnType::Integer | crate::types::ColumnType::Float
+                | crate::types::ColumnType::Boolean | crate::types::ColumnType::Timestamp))
+            .count();
+        let var_section_start = crate::storage::row_format::HEADER_SIZE + fixed_count * crate::storage::row_format::FIXED_COL_SIZE;
+
+        // Pre-compute fixed offset for the sort column (valid only if is_fixed)
+        let fixed_offset: usize = if is_fixed {
+            let fixed_idx: usize = col_types[..sort_col_idx].iter()
+                .filter(|t| matches!(t, crate::types::ColumnType::Integer | crate::types::ColumnType::Float
+                    | crate::types::ColumnType::Boolean | crate::types::ColumnType::Timestamp))
+                .count();
+            crate::storage::row_format::HEADER_SIZE + fixed_idx * crate::storage::row_format::FIXED_COL_SIZE
+        } else {
+            0
+        };
+
+        // Helper to extract sort column value from raw bytes
+        let extract_sort_val = |data: &[u8]| -> Option<Value> {
+            use crate::storage::row_format::{HEADER_SIZE, FIXED_COL_SIZE};
+            if data.len() < HEADER_SIZE { return None; }
+            // Null bitmap check
+            let null_bitmap = u64::from_le_bytes([
+                data[4], data[5], data[6], data[7],
+                data[8], data[9], data[10], data[11],
+            ]);
+            if null_bitmap & (1u64 << sort_col_idx) != 0 {
+                return Some(Value::Null);
+            }
+            if is_fixed {
+                let off = fixed_offset;
+                if off + FIXED_COL_SIZE > data.len() { return None; }
+                let arr: [u8; 8] = data[off..off + 8].try_into().ok()?;
+                match sort_col_type {
+                    crate::types::ColumnType::Integer => Some(Value::Integer(i64::from_le_bytes(arr))),
+                    crate::types::ColumnType::Float => Some(Value::Float(f64::from_le_bytes(arr))),
+                    crate::types::ColumnType::Boolean => Some(Value::Bool(data[off] != 0)),
+                    crate::types::ColumnType::Timestamp => {
+                        let ts = crate::types::Timestamp::from_micros(i64::from_le_bytes(arr));
+                        Some(Value::Timestamp(ts))
+                    }
+                    _ => None,
+                }
+            } else {
+                // Variable column: scan var headers to find this column's data
+                if var_section_start + 2 > data.len() { return None; }
+                let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+                let var_header_start = var_section_start + 2;
+                let var_data_start = var_header_start + var_count * 10;
+                for vi in 0..var_count {
+                    let hdr_off = var_header_start + vi * 10;
+                    if hdr_off + 10 > data.len() { break; }
+                    let entry_col = u16::from_le_bytes([data[hdr_off], data[hdr_off + 1]]) as usize;
+                    if entry_col == sort_col_idx {
+                        let v_off = u32::from_le_bytes([
+                            data[hdr_off+2], data[hdr_off+3], data[hdr_off+4], data[hdr_off+5]]) as usize;
+                        let v_len = u32::from_le_bytes([
+                            data[hdr_off+6], data[hdr_off+7], data[hdr_off+8], data[hdr_off+9]]) as usize;
+                        let abs_off = var_data_start + v_off;
+                        if abs_off + v_len > data.len() { return None; }
+                        let var_data = &data[abs_off..abs_off + v_len];
+                        return match &sort_col_type {
+                            crate::types::ColumnType::Text => {
+                                let s = std::str::from_utf8(var_data).ok()?;
+                                Some(Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                            }
+                            _ => crate::storage::row_format::SchemaDecodeContext::decode_var_generic(var_data).ok(),
+                        };
+                    }
+                }
+                None
+            }
+        };
+
+        // Get MergingIterator directly for zero-copy raw access.
+        let table_prefix = self.db.compute_table_prefix(table);
+        let start_key = table_prefix << 32;
+        let end_key = (table_prefix + 1) << 32;
+        let mut lsm_iter = self.db.lsm_engine.scan_range_streaming(start_key, end_key)?;
+        let has_raw = lsm_iter.has_raw_sst();
+
+        // Build Top-K heap: only store (sort_val, row_id), not full rows.
+        // After scan, batch-fetch just the K winning row_ids.
+        if ascending {
+            // ASC: max-heap (pop largest when >K, keeping K smallest)
+            let mut heap: BinaryHeap<(SortKey, RowId)> = BinaryHeap::with_capacity(limit_usize + 1);
+            if has_raw {
+                loop {
+                    match lsm_iter.next_raw() {
+                        Some(Ok((composite_key, _ts, deleted, vb))) => {
+                            if deleted || vb.len == 0 { continue; }
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                            if let Some(sv) = extract_sort_val(vb.as_slice()) {
+                                heap.push((SortKey(sv), row_id));
+                                if heap.len() > limit_usize { heap.pop(); }
+                            }
+                        }
+                        Some(Err(_)) => return Ok(None), // fallback on error
+                        None => break,
+                    }
+                }
+            } else {
+                loop {
+                    match lsm_iter.next() {
+                        Some(Ok((composite_key, value))) => {
+                            if value.deleted { continue; }
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                            let data = match &value.data {
+                                crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                                _ => continue,
+                            };
+                            if let Some(sv) = extract_sort_val(data) {
+                                heap.push((SortKey(sv), row_id));
+                                if heap.len() > limit_usize { heap.pop(); }
+                            }
+                        }
+                        Some(Err(_)) => return Ok(None),
+                        None => break,
+                    }
+                }
+            }
+            let mut top: Vec<(SortKey, RowId)> = heap.into_vec();
+            top.sort_by(|a, b| a.0.cmp(&b.0));
+            top.truncate(limit_usize);
+            let row_ids: Vec<RowId> = top.into_iter().map(|(_, rid)| rid).collect();
+            let rows = self.db.get_table_rows_batch_arc(table, &row_ids)?;
+            let rows: Vec<Row> = rows.into_iter()
+                .filter_map(|(_, opt)| opt.map(|a| match Arc::try_unwrap(a) {
+                    Ok(row) => row,
+                    Err(arc) => (*arc).clone(),
+                }))
+                .collect();
+            return Ok(Some(StreamingQueryResult::SelectReady { columns: col_names, rows }));
+        } else {
+            // DESC: min-heap via Reverse (pop smallest when >K, keeping K largest)
+            let mut heap: BinaryHeap<Reverse<(SortKey, RowId)>> = BinaryHeap::with_capacity(limit_usize + 1);
+            if has_raw {
+                loop {
+                    match lsm_iter.next_raw() {
+                        Some(Ok((composite_key, _ts, deleted, vb))) => {
+                            if deleted || vb.len == 0 { continue; }
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                            if let Some(sv) = extract_sort_val(vb.as_slice()) {
+                                heap.push(Reverse((SortKey(sv), row_id)));
+                                if heap.len() > limit_usize { heap.pop(); }
+                            }
+                        }
+                        Some(Err(_)) => return Ok(None),
+                        None => break,
+                    }
+                }
+            } else {
+                loop {
+                    match lsm_iter.next() {
+                        Some(Ok((composite_key, value))) => {
+                            if value.deleted { continue; }
+                            let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                            let data = match &value.data {
+                                crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                                _ => continue,
+                            };
+                            if let Some(sv) = extract_sort_val(data) {
+                                heap.push(Reverse((SortKey(sv), row_id)));
+                                if heap.len() > limit_usize { heap.pop(); }
+                            }
+                        }
+                        Some(Err(_)) => return Ok(None),
+                        None => break,
+                    }
+                }
+            }
+            let mut top: Vec<Reverse<(SortKey, RowId)>> = heap.into_vec();
+            top.sort_by(|a, b| b.0.cmp(&a.0)); // DESC: largest first
+            top.truncate(limit_usize);
+            let row_ids: Vec<RowId> = top.into_iter().map(|r| r.0.1).collect();
+            let rows = self.db.get_table_rows_batch_arc(table, &row_ids)?;
+            let rows: Vec<Row> = rows.into_iter()
+                .filter_map(|(_, opt)| opt.map(|a| match Arc::try_unwrap(a) {
+                    Ok(row) => row,
+                    Err(arc) => (*arc).clone(),
+                }))
+                .collect();
+            return Ok(Some(StreamingQueryResult::SelectReady { columns: col_names, rows }));
+        }
+    }
+
+    /// 🚀 Columnar aggregate pushdown: compute COUNT/SUM/MIN/MAX directly
+    /// from column segments without materializing any rows.
+    /// 🚀 Columnar GROUP BY pushdown: build HashMap directly from typed arrays.
+    /// Only reads the group-by column and aggregate columns — no per-row decode.
+    /// For GROUP BY customer: read TextSegment → HashMap<String, (count, sum)> → compute AVG.
+    fn try_group_by_columnar(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
+        let table = match &stmt.from {
+            Some(TableRef::Table { name, .. }) => name.as_str(), _ => return Ok(None),
+        };
+        if !self.db.columnar_sstables.contains_key(table) { return Ok(None); }
+        let schema = self.db.get_table_schema(table)?;
+        let col_sst = self.db.columnar_sstables.get(table).unwrap();
+        let num_rows = col_sst.num_rows;
+
+        // Parse GROUP BY columns (only single-column for now)
+        let group_cols = stmt.group_by.as_ref().unwrap();
+        if group_cols.len() != 1 { return Ok(None); }
+        let group_col_name = group_cols[0].as_str();
+        let group_pos = match schema.get_column_position(group_col_name) {
+            Some(p) => p, None => return Ok(None),
+        };
+
+        // Parse aggregate columns
+        struct AggCol { func: String, col_pos: usize }
+        let mut agg_cols: Vec<AggCol> = Vec::new();
+        let mut has_count_star = false;
+        for col_expr in &stmt.columns {
+            match col_expr {
+                SelectColumn::Star => { has_count_star = true; }
+                SelectColumn::Column(name) => { /* group-by column in output */ }
+                SelectColumn::Expr(expr, _) => {
+                    if let Expr::FunctionCall { name, args, .. } = expr {
+                        match name.to_uppercase().as_str() {
+                            "COUNT" => {
+                                if args.first().map_or(true, |a| matches!(a, Expr::Column(_))) {
+                                    has_count_star = true; // COUNT(col) → treat as count
+                                }
+                            }
+                            _ => {
+                                let col = match args.first() {
+                                    Some(Expr::Column(c)) => c.as_str(), _ => return Ok(None),
+                                };
+                                let pos = match schema.get_column_position(col) {
+                                    Some(p) => p, None => return Ok(None),
+                                };
+                                agg_cols.push(AggCol { func: name.to_uppercase(), col_pos: pos });
+                            }
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Build HashMap from typed arrays — use &str keys (zero-alloc) from mmap
+        use std::collections::HashMap;
+        let mut groups: HashMap<&str, (i64, f64)> = HashMap::with_capacity(num_rows / 10);
+
+        if col_sst.column_tags[group_pos].is_fixed() {
+            return Ok(None);
+        }
+        let group_seg = col_sst.read_text(group_pos)?;
+        let mut agg_segs: Vec<crate::storage::lsm::columnar::FixedSegment> = Vec::new();
+        for a in &agg_cols {
+            if col_sst.column_tags[a.col_pos].is_fixed() {
+                agg_segs.push(col_sst.read_fixed_i64(a.col_pos)?);
+            } else { return Ok(None); }
+        }
+
+        for i in 0..num_rows {
+            if col_sst.row_map.is_deleted(i) { continue; }
+            let key = match group_seg.get_str(i) {
+                Some(s) => s,
+                None => continue,
+            };
+            let entry = groups.entry(key).or_insert((0, 0.0));
+            entry.0 += 1;
+            for (j, a) in agg_cols.iter().enumerate() {
+                if a.func == "SUM" || a.func == "AVG" {
+                    if let Some(v) = agg_segs[j].get_f64(i) {
+                        entry.1 += v;
+                    }
+                }
+            }
+        }
+
+        // Build output rows
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+        for (key, (count, sum)) in groups {
+            let mut row = Vec::new();
+            // Group-by column value
+            row.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(key))));
+            if has_count_star { row.push(Value::Integer(count)); }
+            for a in &agg_cols {
+                match a.func.as_str() {
+                    "SUM" => row.push(Value::Float(sum)),
+                    "AVG" => row.push(Value::Float(if count > 0 { sum / count as f64 } else { 0.0 })),
+                    _ => row.push(Value::Null),
+                }
+            }
+            rows.push(row);
+        }
+
+        // Build column names
+        let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+            SelectColumn::Star => "COUNT(*)".to_string(),
+            SelectColumn::Column(name) => name.clone(),
+            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, alias) => alias.clone().unwrap_or_else(||
+                format!("{}({})", name.to_uppercase(), match args.first() { Some(Expr::Column(c)) => c.as_str(), _ => "?" })
+            ),
+            _ => "?".to_string(),
+        }).collect();
+
+        Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows }))
+    }
+
+    /// For WHERE region='US': read region segment → find matches → compute
+    /// SUM/MIN/MAX from amount segment. O(N) scan but no per-row allocation.
+    fn try_aggregate_columnar_fast(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
+        if stmt.group_by.is_some() { return Ok(None); }
+        let table = match &stmt.from {
+            Some(TableRef::Table { name, .. }) => name.as_str(), _ => return Ok(None),
+        };
+        if !self.db.columnar_sstables.contains_key(table) { return Ok(None); }
+        let schema = self.db.get_table_schema(table)?;
+        let col_types = schema.col_types();
+
+        // Parse WHERE: only simple col = literal
+        let (filter_col, filter_value) = match &stmt.where_clause {
+            Some(Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) => {
+                let col = match left.as_ref() { Expr::Column(n) => n.as_str(), _ => return Ok(None) };
+                let val = match right.as_ref() { Expr::Literal(v) => v.clone(), _ => return Ok(None) };
+                (col, val)
+            }
+            _ => return Ok(None),
+        };
+        let filter_pos = match schema.get_column_position(filter_col) {
+            Some(p) => p, None => return Ok(None),
+        };
+
+        let col_sst = self.db.columnar_sstables.get(table).unwrap();
+        let num_rows = col_sst.num_rows;
+
+        // Find matching rows from filter column segment
+        let mut match_indices: Vec<usize> = Vec::new();
+        if col_sst.column_tags[filter_pos].is_fixed() {
+            let seg = col_sst.read_fixed_i64(filter_pos)?;
+            for i in 0..num_rows {
+                if col_sst.row_map.is_deleted(i) { continue; }
+                let matches = match &filter_value {
+                    Value::Integer(iv) => seg.get_i64(i) == Some(*iv),
+                    Value::Float(fv) => (seg.get_f64(i).unwrap_or(f64::NAN) - fv).abs() < f64::EPSILON,
+                    _ => false,
+                };
+                if matches { match_indices.push(i); }
+            }
+        } else {
+            let seg = col_sst.read_text(filter_pos)?;
+            for i in 0..num_rows {
+                if col_sst.row_map.is_deleted(i) { continue; }
+                if let Value::Text(tv) = &filter_value {
+                    if seg.get_str(i) == Some(tv.as_str()) { match_indices.push(i); }
+                }
+            }
+        }
+
+        let count = match_indices.len() as i64;
+        let mut result = Vec::new();
+
+        for col_expr in &stmt.columns {
+            match col_expr {
+                SelectColumn::Star => {} // COUNT(*)
+                SelectColumn::Expr(expr, _) => {
+                    if let Expr::FunctionCall { name, args, .. } = expr {
+                        match name.to_uppercase().as_str() {
+                            "COUNT" => {} // already have count
+                            _ => {
+                                let agg_col = match args.first() {
+                                    Some(Expr::Column(c)) => c.as_str(), _ => return Ok(None),
+                                };
+                                let agg_pos = match schema.get_column_position(agg_col) {
+                                    Some(p) => p, None => return Ok(None),
+                                };
+                                let is_fixed = col_sst.column_tags[agg_pos].is_fixed();
+                                if is_fixed {
+                                    let seg = col_sst.read_fixed_i64(agg_pos)?;
+                                    let vals: Vec<f64> = match_indices.iter()
+                                        .filter_map(|&i| seg.get_f64(i)).collect();
+                                    match name.to_uppercase().as_str() {
+                                        "SUM" => result.push(Value::Float(vals.iter().sum())),
+                                        "MIN" => result.push(vals.iter().min_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).map(|&v| Value::Float(v)).unwrap_or(Value::Null)),
+                                        "MAX" => result.push(vals.iter().max_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).map(|&v| Value::Float(v)).unwrap_or(Value::Null)),
+                                        _ => return Ok(None),
+                                    }
+                                } else { return Ok(None); }
+                            }
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let has_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+        let mut final_row = Vec::new();
+        if has_star { final_row.push(Value::Integer(count)); }
+        final_row.extend(result);
+        let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+            SelectColumn::Star => "COUNT(*)".to_string(),
+            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, alias) => alias.clone().unwrap_or_else(|| format!("{}({})", name.to_uppercase(), match args.first() { Some(Expr::Column(c)) => c.as_str(), _ => "?" })),
+            _ => "?".to_string(),
+        }).collect();
+        Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![final_row] }))
+    }
+
+    /// 🚀 Aggregate WHERE col=value via column index.
+    /// For COUNT/SUM/MIN/MAX with a simple equality WHERE on an indexed column,
+    /// use the index to get matching row_ids → batch fetch → compute aggregates.
+    /// O(index_lookup) instead of O(N) full scan.
+    fn try_aggregate_via_column_index(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
+        // Must have WHERE clause with simple col = value
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        // Extract: col_name = literal_value
+        let (filter_col, filter_value) = match where_clause {
+            Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } => {
+                let col = match left.as_ref() {
+                    Expr::Column(name) => name.as_str(),
+                    _ => return Ok(None),
+                };
+                let val = match right.as_ref() {
+                    Expr::Literal(v) => v.clone(),
+                    _ => return Ok(None),
+                };
+                (col, val)
+            }
+            _ => return Ok(None),
+        };
+        // Must be a single table
+        let table = match &stmt.from {
+            Some(TableRef::Table { name, .. }) => name.as_str(),
+            _ => return Ok(None),
+        };
+        let schema = self.db.get_table_schema(table)?;
+
+        // Check for column value index on the filtered column
+        let index_name = format!("{}.{}", table, filter_col);
+        let index_ref = match self.db.column_indexes.get(&index_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let row_ids_arc = index_ref.value().get_arc(&filter_value)?;
+        if row_ids_arc.is_empty() {
+            return Ok(None);
+        }
+        // Only use index direct-fetch when selectivity is high (few matching rows).
+        // For low-selectivity filters (100K/300K), a full scan decodes faster
+        // than 100K individual row fetches.
+        if row_ids_arc.len() > 1000 {
+            return Ok(None);
+        }
+        drop(index_ref);
+
+        // Batch fetch matching rows
+        let batch = self.db.get_table_rows_batch_arc(table, &row_ids_arc)?;
+        let rows: Vec<&Row> = batch.iter()
+            .filter_map(|(_, opt)| opt.as_ref().map(|a| a.as_ref()))
+            .collect();
+
+        if rows.is_empty() {
+            let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+                SelectColumn::Expr(_, alias) => alias.clone().unwrap_or_else(|| "?".to_string()),
+                SelectColumn::Column(name) => name.clone(),
+                _ => "?".to_string(),
+            }).collect();
+            let row: Vec<Value> = cols.iter().map(|_| Value::Integer(0)).collect();
+            return Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![row] }));
+        }
+
+        // Compute aggregates from fetched rows
+        let count = rows.len() as i64;
+        let mut result_row = Vec::new();
+        for col_expr in &stmt.columns {
+            match col_expr {
+                SelectColumn::Star => {}
+                SelectColumn::Expr(expr, _alias) => {
+                    if let Expr::FunctionCall { name, args, .. } = expr {
+                        let agg_col = match args.first() {
+                            Some(Expr::Column(c)) => c.as_str(),
+                            _ => return Ok(None),
+                        };
+                        let agg_pos = match schema.get_column_position(agg_col) {
+                            Some(p) => p, None => return Ok(None),
+                        };
+                        match name.to_uppercase().as_str() {
+                            "COUNT" => {}
+                            "SUM" => {
+                                let sum: f64 = rows.iter()
+                                    .filter_map(|r| r.get(agg_pos))
+                                    .filter_map(|v| match v {
+                                        Value::Integer(i) => Some(*i as f64),
+                                        Value::Float(f) => Some(*f),
+                                        _ => None,
+                                    }).sum();
+                                result_row.push(Value::Float(sum));
+                            }
+                            "MIN" => {
+                                let min_val = rows.iter().filter_map(|r| r.get(agg_pos))
+                                    .min_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                    .cloned().unwrap_or(Value::Null);
+                                result_row.push(min_val);
+                            }
+                            "MAX" => {
+                                let max_val = rows.iter().filter_map(|r| r.get(agg_pos))
+                                    .max_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                    .cloned().unwrap_or(Value::Null);
+                                result_row.push(max_val);
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        let has_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+        let mut final_row = Vec::new();
+        if has_star { final_row.push(Value::Integer(count)); }
+        final_row.extend(result_row);
+        let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+            SelectColumn::Star => "COUNT(*)".to_string(),
+            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, alias) => {
+                alias.clone().unwrap_or_else(|| {
+                    let col = match args.first() {
+                        Some(Expr::Column(c)) => c.as_str(), _ => "?",
+                    };
+                    format!("{}({})", name.to_uppercase(), col)
+                })
+            }
+            _ => "?".to_string(),
+        }).collect();
+        Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![final_row] }))
+    }
+
+    /// 🚀 DISTINCT via column value index: for `SELECT DISTINCT col FROM table`
+    /// 🚀 Columnar aggregate execution: decode all rows into column arrays,
+    /// apply WHERE filter on the relevant column, then compute COUNT/SUM/MIN/MAX
+    /// directly from typed arrays. Much faster than row-based decode + aggregate.
+    fn try_aggregate_columnar(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
+        // Only handle simple single-table queries, no GROUP BY
+        if stmt.group_by.is_some() {
+            return Ok(None);
+        }
+        let table = match &stmt.from {
+            Some(TableRef::Table { name, .. }) => name.as_str(),
+            _ => return Ok(None),
+        };
+        let schema = self.db.get_table_schema(table)?;
+
+        // Parse WHERE clause: only simple col = literal for now
+        let filter: Option<(&str, &Value)> = match &stmt.where_clause {
+            Some(Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) => {
+                let col = match left.as_ref() {
+                    Expr::Column(n) => n.as_str(),
+                    _ => return Ok(None),
+                };
+                let val = match right.as_ref() {
+                    Expr::Literal(v) => v,
+                    _ => return Ok(None),
+                };
+                Some((col, val))
+            }
+            None => None, // No WHERE — aggregate all rows
+            _ => return Ok(None),
+        };
+
+        // Resolve filter column position
+        let filter_col_pos = if let Some((col_name, _)) = filter {
+            match schema.get_column_position(col_name) {
+                Some(p) => p,
+                None => return Ok(None),
+            }
+        } else {
+            0 // unused when no filter
+        };
+        let filter_value = filter.map(|(_, v)| v);
+
+        // Use columnar scan for efficient decode
+        let col_types = schema.col_types();
+        let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let colar = self.db.scan_table_columnar(table, &col_types, column_names)?;
+
+        // Find matching row indices if there's a filter
+        let match_indices: Vec<usize> = if let Some(fval) = filter_value {
+            let region_arr = &colar.data[filter_col_pos];
+            (0..colar.num_rows)
+                .filter(|&i| match region_arr {
+                    crate::storage::row_format::ColumnArray::Texts(v) => {
+                        i < v.len() && v[i].as_ref() == match fval {
+                            Value::Text(s) => s.0.as_ref(),
+                            _ => return false,
+                        }
+                    }
+                    crate::storage::row_format::ColumnArray::Integers(v) => {
+                        i < v.len() && match fval {
+                            Value::Integer(iv) => v[i] == *iv,
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                })
+                .collect()
+        } else {
+            (0..colar.num_rows).collect()
+        };
+
+        let count = match_indices.len() as i64;
+        let mut result_row = Vec::new();
+
+        // Compute aggregates from column arrays for matching indices
+        for col_expr in &stmt.columns {
+            match col_expr {
+                SelectColumn::Star => {} // COUNT(*) handled via count variable
+                SelectColumn::Expr(expr, _alias) => {
+                    if let Expr::FunctionCall { name, args, .. } = expr {
+                        let agg_col = match args.first() {
+                            Some(Expr::Column(c)) => c.as_str(),
+                            _ => return Ok(None),
+                        };
+                        let agg_pos = match schema.get_column_position(agg_col) {
+                            Some(p) => p, None => return Ok(None),
+                        };
+                        match name.to_uppercase().as_str() {
+                            "COUNT" => {} // handled via match_indices.len()
+                            "SUM" => {
+                                let sum = match &colar.data[agg_pos] {
+                                    crate::storage::row_format::ColumnArray::Floats(v) => {
+                                        match_indices.iter().map(|&i| v[i]).sum::<f64>()
+                                    }
+                                    crate::storage::row_format::ColumnArray::Integers(v) => {
+                                        match_indices.iter().map(|&i| v[i] as f64).sum::<f64>()
+                                    }
+                                    _ => return Ok(None),
+                                };
+                                result_row.push(Value::Float(sum));
+                            }
+                            "MIN" => {
+                                let min_val = match &colar.data[agg_pos] {
+                                    crate::storage::row_format::ColumnArray::Floats(v) => {
+                                        match_indices.iter()
+                                            .filter_map(|&i| if i < v.len() { Some(v[i]) } else { None })
+                                            .min_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                    }
+                                    crate::storage::row_format::ColumnArray::Integers(v) => {
+                                        match_indices.iter()
+                                            .filter_map(|&i| if i < v.len() { Some(v[i] as f64) } else { None })
+                                            .min_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                    }
+                                    _ => None,
+                                };
+                                result_row.push(min_val.map(Value::Float).unwrap_or(Value::Null));
+                            }
+                            "MAX" => {
+                                let max_val = match &colar.data[agg_pos] {
+                                    crate::storage::row_format::ColumnArray::Floats(v) => {
+                                        match_indices.iter()
+                                            .filter_map(|&i| if i < v.len() { Some(v[i]) } else { None })
+                                            .max_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                    }
+                                    crate::storage::row_format::ColumnArray::Integers(v) => {
+                                        match_indices.iter()
+                                            .filter_map(|&i| if i < v.len() { Some(v[i] as f64) } else { None })
+                                            .max_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                                    }
+                                    _ => None,
+                                };
+                                result_row.push(max_val.map(Value::Float).unwrap_or(Value::Null));
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Build final row
+        let has_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+        let mut final_row: Vec<Value> = Vec::new();
+        if has_star { final_row.push(Value::Integer(count)); }
+        final_row.extend(result_row);
+
+        let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+            SelectColumn::Star => "COUNT(*)".to_string(),
+            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, alias) => {
+                alias.clone().unwrap_or_else(|| {
+                    let col = match args.first() {
+                        Some(Expr::Column(c)) => c.as_str(), _ => "?",
+                    };
+                    format!("{}({})", name.to_uppercase(), col)
+                })
+            }
+            _ => "?".to_string(),
+        }).collect();
+
+        Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![final_row] }))
+    }
+
+    /// 🚀 Partial-decode aggregate: scan all rows but only extract filter + aggregate
+    /// columns from raw bytes. Much faster than full row decode for queries like
+    /// COUNT/SUM/MIN/MAX WHERE col = value (when index path is not used).
+    fn try_aggregate_partial_scan(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
+        let (filter_col, filter_value) = match &stmt.where_clause {
+            Some(Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) => {
+                let col = match left.as_ref() { Expr::Column(n) => n.as_str(), _ => return Ok(None) };
+                let val = match right.as_ref() { Expr::Literal(v) => v.clone(), _ => return Ok(None) };
+                (col, val)
+            }
+            _ => return Ok(None),
+        };
+        if stmt.group_by.is_some() { return Ok(None); }
+        let table = match &stmt.from {
+            Some(TableRef::Table { name, .. }) => name.as_str(), _ => return Ok(None),
+        };
+        let schema = self.db.get_table_schema(table)?;
+        let filter_pos = match schema.get_column_position(filter_col) {
+            Some(p) => p, None => return Ok(None),
+        };
+        let col_types = schema.col_types();
+
+        // Identify aggregate columns
+        let mut agg_cols: Vec<(String, usize)> = Vec::new();
+        let mut has_count_star = false;
+        for col_expr in &stmt.columns {
+            match col_expr {
+                SelectColumn::Star => { has_count_star = true; }
+                SelectColumn::Expr(expr, _) => {
+                    if let Expr::FunctionCall { name, args, .. } = expr {
+                        // COUNT(*) or COUNT with any non-column arg
+                        if name.eq_ignore_ascii_case("COUNT") && !matches!(args.first(), Some(Expr::Column(_))) {
+                            has_count_star = true;
+                        } else {
+                            let pos = match args.first() {
+                                Some(Expr::Column(c)) => match schema.get_column_position(c) {
+                                    Some(p) => p, None => return Ok(None),
+                                },
+                                _ => return Ok(None),
+                            };
+                            agg_cols.push((name.to_uppercase(), pos));
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Pre-compute offsets for column extraction
+        use crate::storage::row_format::{HEADER_SIZE, FIXED_COL_SIZE};
+        let fixed_count = col_types.iter().filter(|t| matches!(t,
+            crate::types::ColumnType::Integer | crate::types::ColumnType::Float
+            | crate::types::ColumnType::Boolean | crate::types::ColumnType::Timestamp)).count();
+        let var_section_start = HEADER_SIZE + fixed_count * FIXED_COL_SIZE;
+        let fixed_offset_of = |ci: usize| -> usize {
+            HEADER_SIZE + col_types[..ci].iter().filter(|t| matches!(t,
+                crate::types::ColumnType::Integer | crate::types::ColumnType::Float
+                | crate::types::ColumnType::Boolean | crate::types::ColumnType::Timestamp)).count() * FIXED_COL_SIZE
+        };
+
+        // Extract a column value from raw bytes
+        let extract_col = |data: &[u8], ci: usize| -> Option<Value> {
+            if data.len() < HEADER_SIZE { return None; }
+            let ct = &col_types[ci];
+            if matches!(ct, crate::types::ColumnType::Integer | crate::types::ColumnType::Float
+                | crate::types::ColumnType::Boolean | crate::types::ColumnType::Timestamp) {
+                let off = fixed_offset_of(ci);
+                if off + FIXED_COL_SIZE > data.len() { return None; }
+                match ct {
+                    crate::types::ColumnType::Integer => unsafe {
+                        Some(Value::Integer(i64::from_le(std::ptr::read_unaligned(
+                            data.as_ptr().add(off) as *const i64))))
+                    },
+                    crate::types::ColumnType::Float => unsafe {
+                        Some(Value::Float(f64::from_bits(u64::from_le(std::ptr::read_unaligned(
+                            data.as_ptr().add(off) as *const u64)))))
+                    },
+                    _ => None,
+                }
+            } else {
+                if var_section_start + 2 > data.len() { return None; }
+                let vc = u16::from_le_bytes([data[var_section_start], data[var_section_start+1]]) as usize;
+                let vh = var_section_start + 2;
+                let vd = vh + vc * 10;
+                for vi in 0..vc {
+                    let h = vh + vi * 10;
+                    if h + 10 > data.len() { break; }
+                    if u16::from_le_bytes([data[h], data[h+1]]) as usize == ci {
+                        let vo = u32::from_le_bytes([data[h+2],data[h+3],data[h+4],data[h+5]]) as usize;
+                        let vl = u32::from_le_bytes([data[h+6],data[h+7],data[h+8],data[h+9]]) as usize;
+                        let a = vd + vo;
+                        if a + vl > data.len() { return None; }
+                        let b = &data[a..a+vl];
+                        return match ct {
+                            crate::types::ColumnType::Text => {
+                                Some(Value::Text(crate::types::ArcString(std::sync::Arc::from(
+                                    std::str::from_utf8(b).ok()?))))
+                            }
+                            _ => crate::storage::row_format::SchemaDecodeContext::decode_var_generic(b).ok(),
+                        };
+                    }
+                }
+                None
+            }
+        };
+
+        // Scan with zero-copy raw access
+        let tp = self.db.compute_table_prefix(table);
+        let mut it = self.db.lsm_engine.scan_range_streaming(tp << 32, (tp + 1) << 32)?;
+        let raw = it.has_raw_sst();
+        let mut count: i64 = 0;
+        let mut sum: f64 = 0.0;
+        let mut min: Option<f64> = None;
+        let mut max: Option<f64> = None;
+
+        if raw {
+            loop {
+                match it.next_raw() {
+                    Some(Ok((_, _, del, vb))) => {
+                        if del || vb.len == 0 { continue; }
+                        let d = vb.as_slice();
+                        if let Some(fv) = extract_col(d, filter_pos) { if fv != filter_value { continue; } } else { continue; }
+                        count += 1;
+                        for (_, pos) in &agg_cols {
+                            if let Some(av) = extract_col(d, *pos) {
+                                let fv = match av { Value::Integer(i) => i as f64, Value::Float(f) => f, _ => continue };
+                                sum += fv; min = Some(min.map_or(fv, |m| m.min(fv))); max = Some(max.map_or(fv, |m| m.max(fv)));
+                            }
+                        }
+                    }
+                    Some(Err(_)) => break, None => break,
+                }
+            }
+        } else {
+            loop {
+                match it.next() {
+                    Some(Ok((_, v))) => {
+                        if v.deleted { continue; }
+                        let d = match &v.data { crate::storage::lsm::ValueData::Inline(b) => b.as_slice(), _ => continue };
+                        if let Some(fv) = extract_col(d, filter_pos) { if fv != filter_value { continue; } } else { continue; }
+                        count += 1;
+                        for (_, pos) in &agg_cols {
+                            if let Some(av) = extract_col(d, *pos) {
+                                let fv = match av { Value::Integer(i) => i as f64, Value::Float(f) => f, _ => continue };
+                                sum += fv; min = Some(min.map_or(fv, |m| m.min(fv))); max = Some(max.map_or(fv, |m| m.max(fv)));
+                            }
+                        }
+                    }
+                    Some(Err(_)) => break, None => break,
+                }
+            }
+        }
+
+        let mut r = Vec::new();
+        if has_count_star { r.push(Value::Integer(count)); }
+        for (f, _) in &agg_cols {
+            match f.as_str() { "SUM" => r.push(Value::Float(sum)), "MIN" => r.push(min.map(Value::Float).unwrap_or(Value::Null)), "MAX" => r.push(max.map(Value::Float).unwrap_or(Value::Null)), "COUNT" => r.push(Value::Integer(count)), _ => {} }
+        }
+        let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+            SelectColumn::Star => "COUNT(*)".to_string(),
+            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, alias) => alias.clone().unwrap_or_else(|| format!("{}({})", name.to_uppercase(), match args.first() { Some(Expr::Column(c)) => c.as_str(), _ => "?" })),
+            _ => "?".to_string(),
+        }).collect();
+        Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![r] }))
+    }
+
+    /// without WHERE, iterate the column index keys directly.
+    /// O(unique_values) instead of O(N) full scan.
+    fn try_distinct_via_column_index(&self, stmt: &SelectStmt, table: &str) -> Result<Option<StreamingQueryResult>> {
+        // Only handle single-column DISTINCT (SELECT DISTINCT col)
+        let col_name = match stmt.columns.len() {
+            1 => match &stmt.columns[0] {
+                SelectColumn::Column(name) => name.as_str(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let schema = self.db.get_table_schema(table)?;
+        let col_def = match schema.get_column(col_name) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let col_pos = col_def.position;
+
+        // 🚀 Columnar DISTINCT: read column segment, collect unique values directly.
+        // No BTree scan needed — just iterate the typed array with a HashSet.
+        if self.db.columnar_sstables.contains_key(table) {
+            let col_sst = self.db.columnar_sstables.get(table).unwrap();
+            if col_sst.column_tags[col_pos].is_fixed() {
+                let seg = col_sst.read_fixed_i64(col_pos).ok();
+                if let Some(seg) = seg {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut vals = Vec::new();
+                    for i in 0..col_sst.num_rows {
+                        if col_sst.row_map.is_deleted(i) { continue; }
+                        if let Some(v) = seg.get_f64(i) {
+                            let key = v.to_bits();
+                            if seen.insert(key) {
+                                vals.push(Value::Float(v));
+                            }
+                        }
+                    }
+                    return Ok(Some(StreamingQueryResult::SelectReady {
+                        columns: vec![col_name.to_string()],
+                        rows: vals.into_iter().map(|v| vec![v]).collect(),
+                    }));
+                }
+            } else {
+                let seg = col_sst.read_text(col_pos).ok();
+                if let Some(seg) = seg {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut vals = Vec::new();
+                    for i in 0..col_sst.num_rows {
+                        if col_sst.row_map.is_deleted(i) { continue; }
+                        if let Some(s) = seg.get_str(i) {
+                            if seen.insert(s) { // &str key, borrows from mmap (no alloc)
+                                vals.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(s))));
+                            }
+                        }
+                    }
+                    return Ok(Some(StreamingQueryResult::SelectReady {
+                        columns: vec![col_name.to_string()],
+                        rows: vals.into_iter().map(|v| vec![v]).collect(),
+                    }));
+                }
+            }
+        }
+
+        // Check for column value index
+        let index_name = format!("{}.{}", table, col_name);
+        let index_ref = match self.db.column_indexes.get(&index_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        let index = index_ref.value();
+
+        // Collect unique keys from the index (type-aware decoding).
+        // all_keys() reads from the mem_buffer. If empty (data was flushed to BTree),
+        // fall back to full scan path to avoid returning incorrect empty results.
+        let keys = index.all_keys(&col_def.col_type)?;
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let rows: Vec<Vec<Value>> = keys.into_iter().map(|val| vec![val]).collect();
+        Ok(Some(StreamingQueryResult::SelectReady {
+            columns: vec![col_name.to_string()],
+            rows,
+        }))
+    }
+
     /// 🔥 全表扫描流式（现有实现）
     fn execute_full_scan_streaming(&self, stmt: &SelectStmt, table: &str) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
 
-        // 🚀 Fast path for SELECT * with no WHERE/ORDER BY/DISTINCT/LIMIT/OFFSET:
-        // Skip project_row_direct entirely — decoded row IS the final result.
+        // Auto-finalize unflushed columnar write buffer before query
+        self.db.finalize_columnar_buffer(table);
+
+        // 🚀 Columnar SSTable fast path: when a columnar SSTable exists for this
+        // table, read directly from typed column arrays. Much faster than
+        // row-based decode — no per-row binary parsing, no VarEntry scanning.
         let is_simple_star = stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star)
             && stmt.where_clause.is_none() && stmt.order_by.is_none()
             && !stmt.distinct && stmt.limit.is_none() && stmt.offset.is_none();
-        if is_simple_star {
-            let row_iter = self.db.scan_table_rows_streaming(table)?;
+        if is_simple_star && self.db.columnar_sstables.contains_key(table) {
+            // 🚀 Zero-materialization: return column segments directly, no Vec<Value> per row.
+            let col_types = schema.col_types();
             let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            // Stream directly — no materialization, O(1) memory
-            let mapped = row_iter.map(|r| r.map(|(_row_id, row)| row));
-            return Ok(StreamingQueryResult::SelectStreaming {
+            if let Some(col_sst) = self.db.columnar_sstables.get(table) {
+                let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
+                let mut ok = true;
+                for ci in 0..col_types.len() {
+                    if col_sst.column_tags[ci].is_fixed() {
+                        match col_sst.read_fixed_i64(ci) {
+                            Ok(seg) => segments.push(ColumnarSeg::Fixed(seg)),
+                            Err(_) => { ok = false; break; }
+                        }
+                    } else {
+                        match col_sst.read_text(ci) {
+                            Ok(seg) => segments.push(ColumnarSeg::Text(seg)),
+                            Err(_) => { ok = false; break; }
+                        }
+                    }
+                }
+                if ok {
+                    return Ok(StreamingQueryResult::SelectColumnar {
+                        columns: column_names,
+                        segments,
+                        row_indices: None,
+                        num_rows: col_sst.num_rows,
+                        row_map: col_sst.row_map.clone(),
+                    });
+                }
+            }
+        }
+
+        // 🚀 Fast path for SELECT * with no WHERE/ORDER BY/DISTINCT/LIMIT/OFFSET:
+        // Skip project_row_direct entirely — decoded row IS the final result.
+        if is_simple_star {
+            // 🚀 Optimized batch path for SELECT * with no filters:
+            // Decode rows using zero-copy ValueBytes (Arc-shared block data).
+            // Rows are allocated on-demand (via push in the decode loop) rather
+            // than pre-allocated — avoids 300K empty Vecs and ~36 MB of wasted
+            // pre-allocation overhead.
+            let col_types = schema.col_types();
+            let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let size_hint = self.db.fast_row_count(table).map(|c| c as usize).unwrap_or(1024);
+            let col_count = col_types.len();
+
+            // Pre-allocate the outer Vec only (avoids log₂(N) reallocations during push).
+            // Individual row Vecs are created on first use in the decode loop below.
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(size_hint);
+
+            let mut decode_iter = self.db.scan_table_decode_streaming(table, col_types)?;
+            loop {
+                let mut row = Vec::with_capacity(col_count);
+                match decode_iter.decode_next_into(&mut row) {
+                    Some(Ok(_row_id)) => rows.push(row),
+                    Some(Err(e)) => return Err(e),
+                    None => break,
+                }
+            }
+
+            return Ok(StreamingQueryResult::SelectReady {
                 columns: column_names,
-                rows: Box::new(mapped),
-                order_by: None,
-                limit: None,
-                offset: None,
-                distinct: false,
-                max_result_rows: None,
+                rows,
             });
+        }
+
+        // 🚀 Columnar projection: SELECT specific columns, no WHERE/ORDER BY
+        if !is_simple_star && self.db.columnar_sstables.contains_key(table)
+            && stmt.where_clause.is_none() && stmt.order_by.is_none()
+            && !stmt.distinct && stmt.limit.is_none() && stmt.offset.is_none()
+        {
+            let col_types = schema.col_types();
+            let column_names: Vec<String> = self.build_select_columns(&stmt.columns, &schema)?;
+            let col_positions: Vec<usize> = stmt.columns.iter()
+                .filter_map(|c| match c {
+                    SelectColumn::Column(name) => schema.get_column_position(name),
+                    _ => None,
+                })
+                .collect();
+            if col_positions.len() == stmt.columns.len() {
+                match self.db.scan_columnar_sstable_projection(table, &col_types, &col_positions) {
+                    Ok(iter) => {
+                        let mut rows = Vec::with_capacity(iter.size_hint().0);
+                        for row in iter { rows.push(row); }
+                        return Ok(StreamingQueryResult::SelectReady { columns: column_names, rows });
+                    }
+                    Err(e) => { let _ = e; } // columnar projection not available, fall through
+                }
+            }
+        }
+
+        // 🚀 Columnar WHERE/LIKE filter: use columnar scan for filters
+        if self.db.columnar_sstables.contains_key(table)
+            && stmt.order_by.is_none() && !stmt.distinct
+            && stmt.limit.is_none() && stmt.offset.is_none()
+        {
+            let col_types = schema.col_types();
+            let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let mut handled = false;
+
+            // Equality: WHERE col = value
+            if let Some(Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) = &stmt.where_clause {
+                if let (Expr::Column(filter_col), Expr::Literal(filter_val)) = (left.as_ref(), right.as_ref()) {
+                    if let Some(filter_pos) = schema.get_column_position(filter_col) {
+                        if let Some(col_sst) = self.db.columnar_sstables.get(table) {
+                            if let Ok(iter) = self.db.scan_columnar_sstable_filtered(table, &col_types, filter_pos, filter_val) {
+                                // Extract match indices from the filtered iterator
+                                let indices: Vec<usize> = iter.match_filter.clone().unwrap_or_default();
+                                let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
+                                for ci in 0..col_types.len() {
+                                    if col_sst.column_tags[ci].is_fixed() {
+                                        if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg)); }
+                                    } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
+                                }
+                                return Ok(StreamingQueryResult::SelectColumnar {
+                                    columns: column_names, segments,
+                                    row_indices: Some(indices), num_rows: col_sst.num_rows,
+                                    row_map: col_sst.row_map.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Prefix LIKE: WHERE col LIKE 'prefix%'
+            if !handled {
+                if let Some(Expr::Like { expr, pattern, .. }) = &stmt.where_clause {
+                    if let Expr::Column(filter_col) = expr.as_ref() {
+                        if let Expr::Literal(Value::Text(pattern_val)) = pattern.as_ref() {
+                            let pat = pattern_val.as_str();
+                            if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                                let prefix = &pat[..pat.len()-1];
+                                if let Some(filter_pos) = schema.get_column_position(filter_col) {
+                                    if let Some(col_sst) = self.db.columnar_sstables.get(table) {
+                                        if let Ok(iter) = self.db.scan_columnar_sstable_prefix(table, &col_types, filter_pos, prefix) {
+                                            let indices: Vec<usize> = iter.match_filter.clone().unwrap_or_default();
+                                            let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
+                                            for ci in 0..col_types.len() {
+                                                if col_sst.column_tags[ci].is_fixed() {
+                                                    if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg)); }
+                                                } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
+                                            }
+                                            return Ok(StreamingQueryResult::SelectColumnar {
+                                                columns: column_names, segments,
+                                                row_indices: Some(indices), num_rows: col_sst.num_rows,
+                                                row_map: col_sst.row_map.clone(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
@@ -2099,6 +3433,7 @@ impl QueryExecutor {
                     offset: stmt.offset,
                     distinct: stmt.distinct,
                     max_result_rows: None,
+                    size_hint: None,
                 });
             }
 
@@ -2151,6 +3486,7 @@ impl QueryExecutor {
                 offset: stmt.offset,
                 distinct: stmt.distinct,
                 max_result_rows: None,
+                size_hint: None,
             });
         }
 
@@ -2207,6 +3543,7 @@ impl QueryExecutor {
             offset: stmt.offset,
             distinct: stmt.distinct,
             max_result_rows: None,
+            size_hint: None,
         })
     }
 
@@ -3675,6 +5012,7 @@ impl QueryExecutor {
             offset: stmt.offset,
             distinct: stmt.distinct,
             max_result_rows: None,
+            size_hint: None,
         })
     }
 
@@ -8268,14 +9606,17 @@ impl QueryExecutor {
                 // 1️⃣ Create empty text index
                 self.db.create_text_index(&index_name)?;
                 
-                // 2️⃣ ✅ P0 FIX: 批量流式回填（避免内存爆炸 + 锁风暴）
+                // 2️⃣ 🚀 Columnar fast path: bulk build from TextSegment
                 let column_pos = schema.get_column_position(&stmt.column)
                     .ok_or_else(|| MoteDBError::ColumnNotFound(stmt.column.clone()))?;
-                
                 let start_time = std::time::Instant::now();
                 let mut backfill_count = 0;
-                
-                // ✅ 使用批量流式扫描（每批10000行，避免内存爆炸）
+
+                if let Ok(count) = self.db.build_text_index_from_columnar(&index_name, &stmt.table, column_pos) {
+                    backfill_count = count;
+                    debug_log!("[CREATE TEXT INDEX] Columnar build: {} docs in {:?}", count, start_time.elapsed());
+                } else {
+                // ✅ Fallback: 批量流式扫描（每批10000行，避免内存爆炸）
                 let batch_iter = self.db.scan_table_rows_batched(&stmt.table, 10000)?;
                 
                 for batch_result in batch_iter {
@@ -8313,6 +9654,7 @@ impl QueryExecutor {
                 if backfill_count > 0 {
                     debug_log!("Built text index in {:?}, indexed {} rows", start_time.elapsed(), backfill_count);
                 }
+                } // end else (columnar build failed, used row-based fallback)
                 
                 // 3️⃣ Register metadata
                 let metadata = crate::database::index_metadata::IndexMetadata::new(
@@ -8348,24 +9690,25 @@ impl QueryExecutor {
                 // Create i-Octree index for 3D point cloud data
                 self.db.create_ioctree_index(&index_name)?;
 
-                // Backfill existing 3D point data
+                // 🚀 Backfill: try columnar fast path first
                 let column_pos = schema.get_column_position(&stmt.column)
                     .ok_or_else(|| MoteDBError::ColumnNotFound(stmt.column.clone()))?;
-
-                let iter = self.db.scan_table_rows_streaming(&stmt.table)?;
                 let mut backfill_count = 0;
 
+                if let Ok(count) = self.db.build_ioctree_from_columnar(&index_name, &stmt.table, column_pos) {
+                    backfill_count = count;
+                } else {
+                let iter = self.db.scan_table_rows_streaming(&stmt.table)?;
                 for result in iter {
                     let (row_id, row) = result?;
                     if let Some(Value::Spatial(geometry)) = row.get(column_pos) {
                         if geometry.is_3d() {
                             if let Err(e) = self.db.insert_ioctree_point(row_id, &index_name, geometry) {
                                 debug_log!("⚠️ Failed to backfill ioctree index for row {}: {}", row_id, e);
-                            } else {
-                                backfill_count += 1;
-                            }
+                            } else { backfill_count += 1; }
                         }
                     }
+                }
                 }
 
                 if backfill_count > 0 {

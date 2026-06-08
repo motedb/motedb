@@ -6,7 +6,7 @@
 //! - 50K entries ≈ 800KB (vs 4MB with String keys)
 
 use crate::types::RowId;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::num::NonZeroUsize;
 
 /// Compact PK key — avoids String heap allocation
@@ -58,13 +58,13 @@ impl PkKey {
 /// - 50K entries ≈ 2MB (default)
 /// - 10K entries ≈ 400KB (edge/embedded)
 pub struct PkLookupCache {
-    cache: Mutex<lru::LruCache<PkKey, RowId>>,
+    cache: RwLock<lru::LruCache<PkKey, RowId>>,
 }
 
 impl PkLookupCache {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache: Mutex::new(lru::LruCache::new(
+            cache: RwLock::new(lru::LruCache::new(
                 NonZeroUsize::new(capacity.max(1)).unwrap(),
             )),
         }
@@ -72,40 +72,40 @@ impl PkLookupCache {
 
     /// Insert a PK value → RowId mapping.
     pub fn insert(&self, key: PkKey, row_id: RowId) {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         cache.put(key, row_id);
     }
 
     /// Look up a PK value by hash key string (legacy compat).
     pub fn get(&self, key: &str) -> Option<RowId> {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write(); // LRU touch requires write
         let pk_key = PkKey::from_hash_key(key);
         cache.get(&pk_key).copied()
     }
 
     /// Look up by compact PkKey (zero-allocation).
     pub fn get_pk(&self, key: &PkKey) -> Option<RowId> {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write(); // LRU touch requires write
         cache.get(key).copied()
     }
 
     /// Remove a PK value (used during DELETE).
     pub fn remove(&self, key: &str) {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         let pk_key = PkKey::from_hash_key(key);
         cache.pop(&pk_key);
     }
 
     /// Remove by compact PkKey.
     pub fn remove_pk(&self, key: &PkKey) {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         cache.pop(key);
     }
 
     /// Atomically check-and-insert: returns `Err(row_id)` if key already exists,
     /// or `Ok(())` after inserting the new mapping.
     pub fn insert_if_absent(&self, key: PkKey, row_id: RowId) -> Result<(), RowId> {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         if let Some(&existing) = cache.get(&key) {
             return Err(existing);
         }

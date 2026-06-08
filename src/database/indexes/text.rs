@@ -80,22 +80,45 @@ impl MoteDB {
         Ok(())
     }
     
+    /// 🚀 Build text index from columnar SSTable data — O(N) scan of TextSegment.
+    /// Restores FTS capability after zero-encode INSERT (which skips per-row indexing).
+    pub fn build_text_index_from_columnar(
+        &self,
+        index_name: &str,
+        table_name: &str,
+        col_position: usize,
+    ) -> Result<usize> {
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Ok(0),
+        };
+        let text_seg = match col_sst.read_text(col_position) {
+            Ok(seg) => seg,
+            Err(_) => return Ok(0),
+        };
+
+        let mut batch: Vec<(RowId, String)> = Vec::with_capacity(10000);
+        let mut total = 0usize;
+        for i in 0..col_sst.num_rows {
+            if col_sst.row_map.is_deleted(i) { continue; }
+            if let Some(s) = text_seg.get_str(i) {
+                let row_id = (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                batch.push((row_id, s.to_string()));
+                if batch.len() >= 10000 {
+                    let refs: Vec<(RowId, &str)> = batch.iter().map(|(id, s)| (*id, s.as_str())).collect();
+                    total += self.batch_insert_texts(index_name, &refs)?;
+                    batch.clear();
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let refs: Vec<(RowId, &str)> = batch.iter().map(|(id, s)| (*id, s.as_str())).collect();
+            total += self.batch_insert_texts(index_name, &refs)?;
+        }
+        Ok(total)
+    }
+
     /// Batch insert texts for multiple rows (10-100x faster than individual inserts)
-    ///
-    /// # Performance Optimization
-    /// - Avoids repeated lock acquisition
-    /// - Builds all inverted lists at once
-    /// - Zero-copy: passes &str references instead of String copies
-    ///
-    /// # Example
-    /// ```ignore
-    /// let texts: Vec<(u64, &str)> = vec![
-    ///     (1, "The quick brown fox"),
-    ///     (2, "jumps over the lazy dog"),
-    ///     (3, "The lazy cat"),
-    /// ];
-    /// db.batch_insert_texts("description", &texts)?;
-    /// ```
     pub fn batch_insert_texts(&self, index_name: &str, texts: &[(RowId, &str)]) -> Result<usize> {
         if texts.is_empty() {
             return Ok(0);

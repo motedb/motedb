@@ -630,60 +630,115 @@ impl Database {
             return Ok(None);
         }
 
-        // Find "INSERT INTO <table> VALUES ("
+        // Find "INSERT INTO <table>"
         let rest = &trimmed[6..].trim_start();
         if !rest.as_bytes().get(0..4).map(|b| b.eq_ignore_ascii_case(b"INTO")).unwrap_or(false) {
             return Ok(None);
         }
-
         let after_into = rest[4..].trim_start();
 
-        // Extract table name
+        // Extract table name (skip optional column list)
         let (table_name, after_table) = match after_into.find(|c: char| c.is_whitespace() || c == '(') {
             Some(pos) => (&after_into[..pos], after_into[pos..].trim_start()),
             None => return Ok(None),
         };
         if table_name.is_empty() { return Ok(None); }
 
-        // Must be followed by "VALUES ("
-        if !after_table.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"VALUES")).unwrap_or(false) {
+        // Parse optional column list: INSERT INTO t (col1, col2) VALUES ...
+        let (col_names, after_cols) = if after_table.starts_with('(') {
+            match after_table.find(')') {
+                Some(p) => {
+                    let col_str = &after_table[1..p];
+                    let cols: Vec<String> = col_str.split(',').map(|s| s.trim().to_string()).collect();
+                    (Some(cols), after_table[p+1..].trim_start())
+                }
+                None => return Ok(None),
+            }
+        } else {
+            (None, after_table)
+        };
+
+        // Must be followed by "VALUES"
+        if !after_cols.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"VALUES")).unwrap_or(false) {
             return Ok(None);
         }
-        let after_values = after_table[6..].trim_start();
-        if !after_values.starts_with('(') { return Ok(None); }
+        let values_part = after_cols[6..].trim_start();
 
-        // Extract values between ( and )
-        let close_paren = match after_values.rfind(')') {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let values_str = &after_values[1..close_paren];
-
-        // Parse values: split by comma, handling quoted strings
-        let values = match Self::parse_literal_list(values_str) {
-            Some(v) => v,
-            None => return Ok(None), // fall back to full parser
-        };
-
-        // Resolve schema and build row
+        // Resolve schema
         let schema = match self.inner.table_registry.get_table(table_name) {
             Ok(s) => s,
-            Err(_) => return Ok(None), // let full parser handle the error
-        };
-
-        let columns: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-        if values.len() != columns.len() { return Ok(None); }
-
-        // Build Row directly (skip HashMap intermediary)
-        let row = match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
-            Ok(r) => r,
             Err(_) => return Ok(None),
         };
 
-        // Insert
-        let _row_id = self.inner.insert_row_to_table(table_name, row)?;
+        // Parse multiple value tuples: (a,b,c),(d,e,f),...
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut pos = 0usize;
+        let bytes = values_part.as_bytes();
 
-        Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
+        while pos < bytes.len() {
+            // Skip whitespace and commas
+            while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\n' || bytes[pos] == b'\t' || bytes[pos] == b',') {
+                pos += 1;
+            }
+            if pos >= bytes.len() { break; }
+            if bytes[pos] != b'(' { return Ok(None); }
+            pos += 1; // skip '('
+
+            // Find matching ')'
+            let mut depth = 1;
+            let start = pos;
+            while pos < bytes.len() && depth > 0 {
+                match bytes[pos] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b'\'' => {
+                        // Skip quoted string
+                        pos += 1;
+                        while pos < bytes.len() && bytes[pos] != b'\'' {
+                            if bytes[pos] == b'\\' { pos += 1; }
+                            pos += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                if depth > 0 { pos += 1; }
+            }
+            if depth != 0 { return Ok(None); }
+            let tuple_str = std::str::from_utf8(&bytes[start..pos]).unwrap_or("");
+            pos += 1; // skip ')'
+
+            // Parse values in this tuple
+            let values = match Self::parse_literal_list(tuple_str) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if values.is_empty() { continue; }
+
+            // Build row: map values to schema positions using column list or default order
+            let row = if let Some(ref cols) = col_names {
+                match crate::sql::row_converter::values_to_row_by_columns(&values, cols, &schema) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                }
+            };
+            rows.push(row);
+        }
+
+        if rows.is_empty() { return Ok(None); }
+
+        let affected = rows.len();
+        if rows.len() == 1 {
+            self.inner.insert_row_to_table(table_name, rows.into_iter().next().unwrap())?;
+        } else {
+            self.inner.batch_insert_rows_to_table(table_name, rows)?;
+        }
+
+        Ok(Some(StreamingQueryResult::Modification { affected_rows: affected }))
     }
 
     /// Find a keyword in haystack case-insensitively, requiring word boundaries.
@@ -732,6 +787,9 @@ impl Database {
         };
         if table_name.is_empty() { return Ok(None); }
 
+        // Auto-finalize columnar write buffer so queries see latest data
+        self.inner.finalize_columnar_buffer(table_name);
+
         // Check for "WHERE" keyword (word boundary)
         let where_pos = match Self::find_keyword_ci(after_table, "where") {
             Some(p) => p,
@@ -766,7 +824,34 @@ impl Database {
         let select_part = after_select[..from_pos].trim();
         let is_star = select_part == "*";
 
+        // Check for aggregates (COUNT, SUM, AVG, MIN, MAX) — fast path can't handle them.
+        // Must fall through to full SQL path for proper aggregation.
+        let has_aggregates = Self::contains_aggregate_function(select_part);
+        if has_aggregates {
+            return Ok(None);
+        }
+
         if !is_pk {
+            // 🚀 Columnar SSTable fast path: use columnar filtered scan instead of
+            // per-row batch fetch. Much faster for low-selectivity filters.
+            if self.inner.columnar_sstables.contains_key(table_name) {
+                let col_types = schema.col_types();
+                let filter_pos = schema.get_column_position(col_name);
+                if let Some(pos) = filter_pos {
+                    if let Ok(iter) = self.inner.scan_columnar_sstable_filtered(
+                        table_name, &col_types, pos, &value,
+                    ) {
+                        let column_names: Vec<String> = if is_star {
+                            schema.column_names()
+                        } else {
+                            select_part.split(',').map(|s| s.trim().to_string()).collect()
+                        };
+                        let rows: Vec<Vec<Value>> = iter.collect();
+                        return Ok(Some(StreamingQueryResult::SelectReady { columns: column_names, rows }));
+                    }
+                }
+            }
+
             // Column index fast path: bypass parser for indexed non-PK columns
             let index_name = format!("{}.{}", table_name, col_name);
             if let Some(index_ref) = self.inner.column_indexes.get(&index_name) {
@@ -922,6 +1007,33 @@ impl Database {
 
     /// Parse a single SQL literal (integer, float, string, or simple expr like col + lit).
     /// Returns None if the value isn't a literal (falls through to full parser).
+    /// Check if a SELECT column expression contains aggregate functions.
+    /// Returns true if any of COUNT, SUM, AVG, MIN, MAX are found (case-insensitive).
+    fn contains_aggregate_function(select_part: &str) -> bool {
+        let upper = select_part.to_uppercase();
+        for keyword in &["COUNT", "SUM", "AVG", "MIN", "MAX"] {
+            if upper.contains(keyword) {
+                // Verify it's a word, not part of a column name like "max_value"
+                // Simple check: preceded by non-alphanumeric or start-of-string
+                if let Some(pos) = upper.find(keyword) {
+                    let before_ok = pos == 0 || {
+                        let b = upper.as_bytes()[pos - 1];
+                        !b.is_ascii_alphanumeric() && b != b'_'
+                    };
+                    let after_pos = pos + keyword.len();
+                    let after_ok = after_pos >= upper.len() || {
+                        let b = upper.as_bytes()[after_pos];
+                        !b.is_ascii_alphanumeric() && b != b'_'
+                    };
+                    if before_ok && after_ok {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn parse_single_literal(s: &str) -> Option<Value> {
         let s = s.trim();
         if s.is_empty() { return None; }

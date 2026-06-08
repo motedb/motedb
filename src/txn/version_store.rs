@@ -173,14 +173,18 @@ impl VersionStore {
     
     /// Update a row (creates a new version).
     ///
-    /// Atomically marks the old version's `end_ts` and prepends the new version
-    /// under the same write lock, preventing lost-update races.
+    /// Optionally validates against a snapshot to detect write-write conflicts.
+    /// When `snapshot` is `Some`, checks that no concurrent transaction has
+    /// committed a new version since the snapshot was taken. Atomically marks
+    /// the old version's `end_ts` and prepends the new version under the same
+    /// write lock, preventing lost-update races.
     pub fn update_version(
         &self,
         row_id: RowId,
         new_data: Row,
         txn_id: TransactionId,
         timestamp: Timestamp,
+        snapshot: Option<&Snapshot>,
     ) -> Result<()> {
         let mut new_version = Box::new(RowVersion {
             data: new_data,
@@ -195,6 +199,21 @@ impl VersionStore {
         let chain_ref = self.versions.entry(row_id).or_insert_with(VersionChain::new);
         {
             let mut head = chain_ref.head.write();
+
+            // Snapshot-based conflict detection: if another transaction committed
+            // a new version after our snapshot, this is a write-write conflict.
+            if let Some(snap) = snapshot {
+                if let Some(ref version) = *head {
+                    if (version.begin_ts > snap.timestamp
+                        || snap.active_txns.contains(&version.txn_id))
+                        && version.txn_id != txn_id
+                    {
+                        return Err(StorageError::Transaction(
+                            format!("Write-write conflict on row {} in txn {}", row_id, txn_id)
+                        ));
+                    }
+                }
+            }
 
             // Mark old version as superseded
             if let Some(old_version) = head.as_ref() {
@@ -215,6 +234,7 @@ impl VersionStore {
     
     /// Delete a row (marks latest version as deleted).
     ///
+    /// Optionally validates against a snapshot to detect write-write conflicts.
     /// Atomically sets `end_ts` on the old head and prepends a tombstone
     /// under the same write lock, preventing lost-update races.
     pub fn delete_version(
@@ -222,6 +242,7 @@ impl VersionStore {
         row_id: RowId,
         txn_id: TransactionId,
         timestamp: Timestamp,
+        snapshot: Option<&Snapshot>,
     ) -> Result<()> {
         let chain = self.versions.get(&row_id)
             .ok_or_else(|| StorageError::InvalidData(format!("Row {} not found", row_id)))?;
@@ -238,6 +259,21 @@ impl VersionStore {
         // Atomically mark old head and prepend tombstone under one write lock
         {
             let mut head = chain.head.write();
+
+            // Snapshot-based conflict detection
+            if let Some(snap) = snapshot {
+                if let Some(ref version) = *head {
+                    if (version.begin_ts > snap.timestamp
+                        || snap.active_txns.contains(&version.txn_id))
+                        && version.txn_id != txn_id
+                    {
+                        return Err(StorageError::Transaction(
+                            format!("Write-write conflict on row {} in txn {}", row_id, txn_id)
+                        ));
+                    }
+                }
+            }
+
             if let Some(old_version) = head.as_ref() {
                 old_version.end_ts.store(timestamp, Ordering::Release);
             }
@@ -569,8 +605,8 @@ mod tests {
         store.insert_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(100))], 1, 10).unwrap();
         
         // T2: Update at ts=20
-        store.update_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(200))], 2, 20).unwrap();
-        
+        store.update_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(200))], 2, 20, None).unwrap();
+
         // Snapshot at ts=15 should see old value
         let snapshot_old = Snapshot {
             timestamp: 15,
@@ -619,8 +655,8 @@ mod tests {
         store.insert_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(100))], 1, 10).unwrap();
         
         // Delete
-        store.delete_version(row_id, 2, 20).unwrap();
-        
+        store.delete_version(row_id, 2, 20, None).unwrap();
+
         // Snapshot before delete should see data
         let snapshot_before = Snapshot {
             timestamp: 15,
@@ -660,8 +696,8 @@ mod tests {
         
         // Create multiple versions
         store.insert_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(100))], 1, 10).unwrap();
-        store.update_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(200))], 2, 20).unwrap();
-        store.update_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(300))], 3, 30).unwrap();
+        store.update_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(200))], 2, 20, None).unwrap();
+        store.update_version(row_id, vec![Value::Timestamp(Timestamp::from_micros(300))], 3, 30, None).unwrap();
         
         let stats_before = store.stats();
         assert_eq!(stats_before.total_versions, 3);
@@ -692,8 +728,8 @@ mod tests {
         store.insert_version(row_id, vec![Value::Integer(0)], 1, 10).unwrap();
 
         // Simulate two concurrent updates (sequential but testing the atomic prepend)
-        store.update_version(row_id, vec![Value::Integer(1)], 2, 20).unwrap();
-        store.update_version(row_id, vec![Value::Integer(2)], 3, 30).unwrap();
+        store.update_version(row_id, vec![Value::Integer(1)], 2, 20, None).unwrap();
+        store.update_version(row_id, vec![Value::Integer(2)], 3, 30, None).unwrap();
 
         // The latest snapshot should see the most recent version
         let result = store.get_visible_version(row_id, &snapshot, crate::txn::IsolationLevel::ReadCommitted).unwrap();
@@ -718,7 +754,7 @@ mod tests {
         store.insert_version(row_id, vec![Value::Integer(42)], 1, 10).unwrap();
 
         // Delete should succeed and create a tombstone
-        store.delete_version(row_id, 2, 20).unwrap();
+        store.delete_version(row_id, 2, 20, None).unwrap();
 
         // Snapshot before delete sees the data
         let before = Snapshot { timestamp: 15, active_txns: HashSet::new() };
@@ -733,5 +769,51 @@ mod tests {
             store.get_visible_version(row_id, &after, crate::txn::IsolationLevel::ReadCommitted).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn test_update_version_conflict_detection() {
+        // Verifies that update_version with a snapshot rejects write-write conflicts.
+        let store = VersionStore::new();
+        let row_id = 1;
+
+        // Insert initial version at ts=10 by txn 1
+        store.insert_version(row_id, vec![Value::Integer(0)], 1, 10).unwrap();
+
+        // Snapshot taken at ts=15 (before any concurrent update)
+        let snapshot = Snapshot { timestamp: 15, active_txns: HashSet::new() };
+
+        // Concurrent update by txn 2 at ts=20 (after our snapshot)
+        store.update_version(row_id, vec![Value::Integer(1)], 2, 20, None).unwrap();
+
+        // Now txn 3 tries to update with the old snapshot — should detect conflict
+        let result = store.update_version(row_id, vec![Value::Integer(2)], 3, 30, Some(&snapshot));
+        assert!(result.is_err(), "Should detect write-write conflict");
+
+        // Without snapshot, the update should succeed (no conflict check)
+        let result = store.update_version(row_id, vec![Value::Integer(3)], 4, 40, None);
+        assert!(result.is_ok(), "Update without snapshot should succeed");
+    }
+
+    #[test]
+    fn test_delete_version_conflict_detection() {
+        // Verifies that delete_version with a snapshot rejects write-write conflicts.
+        let store = VersionStore::new();
+        let row_id = 1;
+
+        store.insert_version(row_id, vec![Value::Integer(0)], 1, 10).unwrap();
+
+        let snapshot = Snapshot { timestamp: 15, active_txns: HashSet::new() };
+
+        // Concurrent update after snapshot
+        store.update_version(row_id, vec![Value::Integer(1)], 2, 20, None).unwrap();
+
+        // Delete with old snapshot should detect conflict
+        let result = store.delete_version(row_id, 3, 30, Some(&snapshot));
+        assert!(result.is_err(), "Should detect write-write conflict");
+
+        // Delete without snapshot should succeed
+        let result = store.delete_version(row_id, 3, 30, None);
+        assert!(result.is_ok(), "Delete without snapshot should succeed");
     }
 }

@@ -148,6 +148,42 @@ where
         Ok(false)
     }
 
+    /// Batch insert multiple key-value pairs with a single RwLock acquisition.
+    ///
+    /// Acquires the write lock once and inserts all entries, then checks buffer
+    /// fullness once at the end. This eliminates N individual lock acquisitions
+    /// for batch operations (e.g., 300K row batch insert → 1 lock instead of 300K).
+    ///
+    /// Returns Ok(true) if the buffer became full during the batch (caller should flush).
+    pub fn batch_insert(&self, entries: Vec<(K, V)>) -> Result<bool, String> {
+        if entries.is_empty() {
+            return Ok(false);
+        }
+
+        let entry_size = std::mem::size_of::<K>() + std::mem::size_of::<V>();
+        let mut full = false;
+
+        let mut active = self.active.write();
+        for (key, value) in entries {
+            active.data.insert(key, value);
+            active.size += entry_size;
+        }
+
+        // Check once after all inserts
+        if active.size >= self.size_limit {
+            let old_active = BufferState {
+                data: std::mem::take(&mut active.data),
+                size: active.size,
+            };
+            active.size = 0;
+            drop(active); // Release write lock before acquiring immutable write lock
+            self.immutable.write().push(Arc::new(old_active));
+            full = true;
+        }
+
+        Ok(full)
+    }
+
     /// Point query: get value for exact key
     ///
     /// # Concurrency

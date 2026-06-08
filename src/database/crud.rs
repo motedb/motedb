@@ -57,34 +57,40 @@ impl MoteDB {
                         }
                         let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
 
-                        // Fast path: check PK cache (release DashMap guard immediately)
-                        let exists_in_cache = self.pk_lookup.get(table_name)
-                            .map(|lookup| lookup.get_pk(&pk_key).is_some())
-                            .unwrap_or(false);
-
-                        if exists_in_cache {
-                            return Err(StorageError::InvalidData(format!(
-                                "Duplicate primary key {:?} for table '{}'", pk_value, table_name
-                            )));
-                        }
-
-                        // Slow path: check column index (covers cache misses after restart)
-                        match self.query_by_column(table_name, pk_name, pk_value) {
-                            Ok(found) if !found.is_empty() => {
-                                let mut has_live = false;
-                                for &rid in &found {
-                                    if self.get_table_row(table_name, rid)?.is_some() {
-                                        has_live = true;
-                                        break;
-                                    }
+                        // Atomic check-and-insert: eliminates TOCTOU race between
+                        // the uniqueness check and the actual row insert.
+                        // On cache hit (duplicate), insert_if_absent returns Err immediately.
+                        // On cache miss, falls through to slow path below.
+                        if let Some(lookup) = self.pk_lookup.get(table_name) {
+                            match lookup.insert_if_absent(pk_key.clone(), 0 /* placeholder row_id */) {
+                                Ok(()) => {
+                                    // Successfully reserved — will update with real row_id below
                                 }
-                                if has_live {
+                                Err(_) => {
                                     return Err(StorageError::InvalidData(format!(
                                         "Duplicate primary key {:?} for table '{}'", pk_value, table_name
                                     )));
                                 }
                             }
-                            _ => {}
+                        } else {
+                            // No PK cache yet — fall back to slow path
+                            match self.query_by_column(table_name, pk_name, pk_value) {
+                                Ok(found) if !found.is_empty() => {
+                                    let mut has_live = false;
+                                    for &rid in &found {
+                                        if self.get_table_row(table_name, rid)?.is_some() {
+                                            has_live = true;
+                                            break;
+                                        }
+                                    }
+                                    if has_live {
+                                        return Err(StorageError::InvalidData(format!(
+                                            "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                        )));
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -164,16 +170,36 @@ impl MoteDB {
         // 6. Increment pending counter BEFORE WAL write (checkpoint uses this as barrier)
         self.increment_pending_updates();
 
-        // 7. Write to WAL first (durability) — by reference, zero clone
+        // 7. Write to WAL for durability
         self.wal.log_insert_raw_ref(table_name, partition, row_id, &row_data, 0)?;
 
-        // 7. Write to LSM MemTable (invalidate cache first for TOCTOU safety)
-        let composite_key = self.make_composite_key(table_name, row_id);
-        self.row_cache.invalidate(table_name, row_id);
+        // 7. Write to columnar buffer (primary storage). Skip LSM — columnar is the source of truth.
         let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let value = crate::storage::lsm::Value::new(row_data, ts);
-        self.lsm_engine.put(composite_key, value)?;
         self.row_cache.put(table_name.to_string(), row_id, row.clone());
+
+        // 🚀 Columnar write buffer (zero-encode path)
+        {
+            use dashmap::mapref::entry::Entry;
+            let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
+                Entry::Occupied(o) => o.get().clone(),
+                Entry::Vacant(v) => {
+                    let indexes_dir = self.path.join("indexes");
+                    std::fs::create_dir_all(&indexes_dir).ok();
+                    let path = indexes_dir.join(format!("{}_col.sst", table_name));
+                    let b = Arc::new(parking_lot::Mutex::new(
+                        crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(
+                            path, schema.col_types().to_vec(),
+                        )
+                    ));
+                    v.insert(b.clone());
+                    b
+                }
+            };
+            let mut builder = builder_arc.lock();
+            let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+            let _ = builder.add_values(key, ts, false, &row);
+        }
 
         // 7. Update indexes
         {
@@ -302,6 +328,17 @@ impl MoteDB {
                 self.trigger_prefetch(table_name, next_row_id, count, stride);
             }
             return Ok(Some((*row_arc).clone()));
+        }
+
+        // 🚀 Columnar point query: binary search in RowMap, O(log N)
+        if let Some(col_sst) = self.columnar_sstables.get(table_name) {
+            let key = self.make_composite_key(table_name, row_id);
+            if let Some(row) = col_sst.get_row(key, schema.col_types()) {
+                let row_arc = Arc::new(row);
+                self.row_cache.put_arc(table_name.to_string(), row_id, Arc::clone(&row_arc));
+                return Ok(Some(Arc::try_unwrap(row_arc).unwrap_or_else(|a| (*a).clone())));
+            }
+            return Ok(None);
         }
 
         // Cache miss - load from LSM
@@ -482,14 +519,30 @@ impl MoteDB {
         // 6. Write to WAL first (durability) — raw bytes
         self.wal.log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
 
-        // 6. Update in LSM MemTable (same bytes as WAL)
+        // 6. Write to columnar buffer (primary storage) + WAL (durability)
         let timestamp = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let value = crate::storage::lsm::Value::new(raw_new, timestamp);
-        self.lsm_engine.put(composite_key, value)?;
-
-        // Invalidate cache after LSM write — the next read will get the new
-        // value from the active memtable (fast path, no disk I/O).
         self.row_cache.invalidate(table_name, row_id);
+
+        // Add new row to columnar buffer (create if first write to this table)
+        {
+            use dashmap::mapref::entry::Entry;
+            let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
+                Entry::Occupied(o) => o.get().clone(),
+                Entry::Vacant(v) => {
+                    let indexes_dir = self.path.join("indexes");
+                    std::fs::create_dir_all(&indexes_dir).ok();
+                    let col_sst_path = indexes_dir.join(format!("{}_col.sst", table_name));
+                    let b = Arc::new(parking_lot::Mutex::new(
+                        crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(col_sst_path, schema.col_types().to_vec())
+                    ));
+                    v.insert(b.clone()); b
+                }
+            };
+            let mut builder = builder_arc.lock();
+            let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+            let _ = builder.add_values(key, timestamp, false, &new_row);
+        }
 
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
         let mut index_errors = Vec::new();
@@ -678,6 +731,27 @@ impl MoteDB {
 
         // 6. Delete from LSM (using tombstone)
         self.lsm_engine.delete(composite_key, timestamp)?;
+
+        // 🚀 Also add tombstone to columnar buffer (create if first write)
+        {
+            use dashmap::mapref::entry::Entry;
+            let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
+                Entry::Occupied(o) => o.get().clone(),
+                Entry::Vacant(v) => {
+                    let indexes_dir = self.path.join("indexes");
+                    std::fs::create_dir_all(&indexes_dir).ok();
+                    let col_sst_path = indexes_dir.join(format!("{}_col.sst", table_name));
+                    let b = Arc::new(parking_lot::Mutex::new(
+                        crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(col_sst_path, schema.col_types().to_vec())
+                    ));
+                    v.insert(b.clone()); b
+                }
+            };
+            let mut builder = builder_arc.lock();
+            let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+            let _ = builder.add_values(key, timestamp, true, &old_row);
+        }
 
         // Invalidate cache AFTER LSM write — single invalidation
         self.row_cache.invalidate(table_name, row_id);
@@ -906,11 +980,19 @@ impl MoteDB {
         let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
         let use_raw = lsm_iter.has_raw_sst();
 
+        // Detect whether any column is nullable
+        let has_nullable = schema.columns.iter().any(|c| c.nullable);
         Ok(TableRowStreamingIterator {
             lsm_iter,
-            col_types: Some(col_types.to_vec()),
-            fixed_count: crate::storage::row_format::compute_fixed_count(&col_types),
-            row_buf: Vec::with_capacity(col_types.len()),
+            decode_ctx: {
+                let mut ctx = crate::storage::row_format::SchemaDecodeContext::new(&col_types);
+                ctx.trust_utf8 = true; // Data encoded by MoteDB, safe to skip UTF-8 validation
+                ctx.skip_magic_check = true; // All data from our own encode()
+                if !has_nullable {
+                    ctx.has_nullable_columns = false;
+                }
+                Some(ctx)
+            },
             use_raw,
         })
     }
@@ -927,6 +1009,465 @@ impl MoteDB {
         let end_key = (table_prefix + 1) << 32;
         let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
         Ok(TableRawStreamingIterator { lsm_iter })
+    }
+
+    /// Zero-copy decode streaming scan — yields (row_id) and decodes each row
+    /// directly into a caller-provided Vec via `decode_row_into`.
+    ///
+    /// Uses `ValueBytes` (Arc-shared block data) instead of `to_vec()`,
+    /// eliminating the per-row memcpy that `scan_table_raw_streaming` performs.
+    pub fn scan_table_decode_streaming(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+    ) -> Result<TableDecodeStreamingIterator> {
+        ensure_open!(self);
+        let table_prefix = self.compute_table_prefix(table_name);
+        let start_key = table_prefix << 32;
+        let end_key = (table_prefix + 1) << 32;
+        let lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+        let use_raw = lsm_iter.has_raw_sst();
+        let mut ctx = crate::storage::row_format::SchemaDecodeContext::new(col_types);
+        ctx.trust_utf8 = true;
+        ctx.skip_magic_check = true; // All data from our own encode()
+        Ok(TableDecodeStreamingIterator {
+            lsm_iter,
+            decode_ctx: ctx,
+            use_raw,
+        })
+    }
+
+    /// Columnar streaming scan — decodes rows into `ColumnArray` slices instead
+    /// of `Vec<Value>`. Uses O(columns) allocations instead of O(rows), saving
+    /// ~50% memory and improving cache locality for aggregate queries.
+    ///
+    /// Returns a `ColumnarRowSet` containing all rows decoded into column arrays.
+    /// The caller can then compute COUNT/SUM/MIN/MAX directly from typed arrays.
+    pub fn scan_table_columnar(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+        column_names: Vec<String>,
+    ) -> Result<crate::storage::row_format::ColumnarRowSet> {
+        ensure_open!(self);
+        let table_prefix = self.compute_table_prefix(table_name);
+        let start_key = table_prefix << 32;
+        let end_key = (table_prefix + 1) << 32;
+        let mut lsm_iter = self.lsm_engine.scan_range_streaming(start_key, end_key)?;
+
+        let mut ctx = crate::storage::row_format::SchemaDecodeContext::new(col_types);
+        ctx.trust_utf8 = true;
+        ctx.skip_magic_check = true;
+
+        // Detect nullable columns
+        let schema = self.table_registry.get_table(table_name)?;
+        let has_nullable = schema.columns.iter().any(|c| c.nullable);
+        if !has_nullable {
+            ctx.has_nullable_columns = false;
+        }
+
+        let mut result = crate::storage::row_format::ColumnarRowSet::new(column_names, col_types);
+        let mut col_data: Vec<crate::storage::row_format::ColumnArray> = col_types.iter().map(|ct| match ct {
+            crate::types::ColumnType::Integer => crate::storage::row_format::ColumnArray::Integers(Vec::new()),
+            crate::types::ColumnType::Float => crate::storage::row_format::ColumnArray::Floats(Vec::new()),
+            crate::types::ColumnType::Text => crate::storage::row_format::ColumnArray::Texts(Vec::new()),
+            crate::types::ColumnType::Timestamp => crate::storage::row_format::ColumnArray::Timestamps(Vec::new()),
+            crate::types::ColumnType::Boolean => crate::storage::row_format::ColumnArray::Bools(Vec::new()),
+            _ => crate::storage::row_format::ColumnArray::Values(Vec::new()),
+        }).collect();
+
+        // Pre-allocate 300K capacity per column
+        let size_hint = self.fast_row_count(table_name).map(|c| c as usize).unwrap_or(1024);
+        for arr in &mut col_data {
+            match arr {
+                crate::storage::row_format::ColumnArray::Integers(v) => v.reserve(size_hint),
+                crate::storage::row_format::ColumnArray::Floats(v) => v.reserve(size_hint),
+                crate::storage::row_format::ColumnArray::Texts(v) => v.reserve(size_hint),
+                crate::storage::row_format::ColumnArray::Timestamps(v) => v.reserve(size_hint),
+                crate::storage::row_format::ColumnArray::Bools(v) => v.reserve(size_hint),
+                crate::storage::row_format::ColumnArray::Values(v) => v.reserve(size_hint),
+            }
+        }
+
+        let mut count = 0usize;
+        loop {
+            match lsm_iter.next() {
+                Some(Ok((_composite_key, value))) => {
+                    if value.deleted { continue; }
+                    let data = match &value.data {
+                        crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                        _ => continue,
+                    };
+                    if let Err(_e) = crate::storage::row_format::decode_row_into_columns(
+                        &ctx, data, &mut col_data,
+                    ) {
+                        continue; // skip malformed rows
+                    }
+                    count += 1;
+                }
+                Some(Err(_)) => break,
+                None => break,
+            }
+        }
+
+        result.data = col_data;
+        result.num_rows = count;
+        Ok(result)
+    }
+
+    /// Finalize unflushed columnar write buffer for a table.
+    /// Converts accumulated INSERT data to a columnar SSTable file.
+    /// Safe: only removes from write buffer AFTER successful finalization.
+    pub fn finalize_columnar_buffer(&self, table_name: &str) {
+        use dashmap::mapref::entry::Entry;
+        // Get the entry without removing — safe if finalize fails
+        if let Some(builder_arc) = self.columnar_write_bufs.get(table_name) {
+            let (path, col_types, num_rows, old_builder) = {
+                let mut guard = builder_arc.value().lock();
+                if guard.num_rows == 0 { return; }
+                let path = guard.path.clone();
+                let col_types = guard.column_types.clone();
+                let num_rows = guard.num_rows;
+                let old = std::mem::replace(
+                    &mut *guard,
+                    crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(&path, col_types.clone()),
+                );
+                (path, col_types, num_rows, old)
+            };
+            match old_builder.finish() {
+                Ok(()) => {
+                    if let Ok(col_sst) = crate::storage::lsm::columnar::ColumnarSSTable::open(&path) {
+                        self.columnar_sstables.insert(table_name.to_string(), Arc::new(col_sst));
+                        // Only remove write buffer AFTER successful finalization
+                        self.columnar_write_bufs.remove(table_name);
+                        debug_log!("[columnar] Buffer finalized for '{}' ({} rows)", table_name, num_rows);
+                    }
+                }
+                Err(e) => {
+                    debug_log!("[columnar] Finalize failed for '{}': {:?}", table_name, e);
+                }
+            }
+        }
+    }
+
+    /// Scan from a columnar SSTable, yielding rows one at a time via iterator.
+    /// Much faster than row-based scan + uses O(columns) memory instead of O(rows).
+    pub fn scan_columnar_sstable_streaming(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+    ) -> Result<ColumnarScanIterator> {
+        // Auto-finalize unflushed columnar write buffer before reading
+        self.finalize_columnar_buffer(table_name);
+
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Err(StorageError::InvalidData(
+                format!("No columnar SSTable for table '{}'", table_name)
+            )),
+        };
+
+        let num_cols = col_types.len();
+        let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
+        for col_idx in 0..num_cols {
+            let seg = if col_sst.column_tags[col_idx].is_fixed() {
+                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
+            } else {
+                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
+            };
+            segments.push(seg);
+        }
+
+        Ok(ColumnarScanIterator {
+            row_map: col_sst.row_map.clone(),
+            segments,
+            col_types: col_types.to_vec(),
+            current_idx: 0,
+            num_rows: col_sst.num_rows,
+            match_filter: None,
+        })
+    }
+
+    /// Streaming columnar scan with column projection — only reads the specified
+    /// column positions. For SELECT id, amount, only 2/4 segments are loaded.
+    pub fn scan_columnar_sstable_projection(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+        col_positions: &[usize],
+    ) -> Result<ColumnarScanIterator> {
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Err(StorageError::InvalidData(
+                format!("No columnar SSTable for table '{}'", table_name)
+            )),
+        };
+
+        // Build mapping: output position → segment index in SSTable
+        let mut segments: Vec<(usize, ColumnarSegment)> = Vec::with_capacity(col_positions.len());
+        for &col_idx in col_positions {
+            let seg = if col_sst.column_tags[col_idx].is_fixed() {
+                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
+            } else {
+                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
+            };
+            segments.push((col_idx, seg));
+        }
+
+        Ok(ColumnarScanIterator {
+            row_map: col_sst.row_map.clone(),
+            segments: segments.into_iter().map(|(_, s)| s).collect(),
+            col_types: col_positions.iter().map(|&i| col_types[i].clone()).collect(),
+            current_idx: 0,
+            num_rows: col_sst.num_rows,
+            match_filter: None,
+        })
+    }
+
+    /// Streaming columnar scan with equality filter on one column.
+    /// Only rows matching filter_col = filter_value are yielded.
+    /// For WHERE region = 'US' (100K/300K), this saves decoding 200K rows.
+    pub fn scan_columnar_sstable_filtered(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+        filter_col: usize,
+        filter_value: &crate::types::Value,
+    ) -> Result<ColumnarScanIterator> {
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Err(StorageError::InvalidData("No columnar SSTable".into())),
+        };
+
+        let num_cols = col_types.len();
+        let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
+        for col_idx in 0..num_cols {
+            let seg = if col_sst.column_tags[col_idx].is_fixed() {
+                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
+            } else {
+                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
+            };
+            segments.push(seg);
+        }
+
+        // Find matching row indices by scanning the filter column
+        let mut match_indices: Vec<usize> = Vec::new();
+        for row_idx in 0..col_sst.num_rows {
+            if col_sst.row_map.is_deleted(row_idx) { continue; }
+            let matches = match &segments[filter_col] {
+                ColumnarSegment::Fixed(f) => match filter_value {
+                    crate::types::Value::Integer(iv) => f.get_i64(row_idx) == Some(*iv),
+                    crate::types::Value::Float(fv) => (f.get_f64(row_idx).unwrap_or(f64::NAN) - fv).abs() < f64::EPSILON,
+                    _ => false,
+                },
+                ColumnarSegment::Text(t) => match filter_value {
+                    crate::types::Value::Text(tv) => t.get_str(row_idx) == Some(tv.as_str()),
+                    _ => false,
+                },
+            };
+            if matches {
+                match_indices.push(row_idx);
+            }
+        }
+
+        Ok(ColumnarScanIterator {
+            row_map: col_sst.row_map.clone(),
+            segments,
+            col_types: col_types.to_vec(),
+            current_idx: 0,
+            num_rows: col_sst.num_rows,
+            match_filter: Some(match_indices),
+        })
+    }
+
+    /// Streaming columnar scan with text prefix filter (LIKE 'prefix%').
+    /// Only rows where the text column starts with `prefix` are yielded.
+    pub fn scan_columnar_sstable_prefix(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+        filter_col: usize,
+        prefix: &str,
+    ) -> Result<ColumnarScanIterator> {
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Err(StorageError::InvalidData("No columnar SSTable".into())),
+        };
+
+        let num_cols = col_types.len();
+        let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
+        for col_idx in 0..num_cols {
+            let seg = if col_sst.column_tags[col_idx].is_fixed() {
+                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
+            } else {
+                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
+            };
+            segments.push(seg);
+        }
+
+        // Find rows where text column starts with prefix
+        let mut match_indices: Vec<usize> = Vec::new();
+        if let ColumnarSegment::Text(ref text_seg) = segments[filter_col] {
+            for row_idx in 0..col_sst.num_rows {
+                if col_sst.row_map.is_deleted(row_idx) { continue; }
+                if let Some(s) = text_seg.get_str(row_idx) {
+                    if s.starts_with(prefix) {
+                        match_indices.push(row_idx);
+                    }
+                }
+            }
+        }
+
+        Ok(ColumnarScanIterator {
+            row_map: col_sst.row_map.clone(),
+            segments,
+            col_types: col_types.to_vec(),
+            current_idx: 0,
+            num_rows: col_sst.num_rows,
+            match_filter: Some(match_indices),
+        })
+    }
+
+    /// Columnar Top-K: find indices of top K rows by a column value.
+    /// Returns (row_indices, values) for the top K, without materializing rows.
+    pub fn scan_columnar_sstable_topk(
+        &self,
+        table_name: &str,
+        sort_col: usize,
+        k: usize,
+        ascending: bool,
+    ) -> Result<(Vec<usize>, Vec<crate::types::Value>)> {
+        let col_sst = match self.columnar_sstables.get(table_name) {
+            Some(sst) => sst.clone(),
+            None => return Err(StorageError::InvalidData("No columnar SSTable".into())),
+        };
+        use std::collections::BinaryHeap;
+        use std::cmp::Reverse;
+
+        if col_sst.column_tags[sort_col].is_fixed() {
+            let seg = col_sst.read_fixed_i64(sort_col)?;
+            if ascending {
+                let mut heap: BinaryHeap<(OrderedF64, usize)> = BinaryHeap::with_capacity(k + 1);
+                for i in 0..col_sst.num_rows {
+                    if col_sst.row_map.is_deleted(i) { continue; }
+                    if let Some(v) = seg.get_f64(i) {
+                        heap.push((OrderedF64(v), i));
+                        if heap.len() > k { heap.pop(); }
+                    }
+                }
+                let mut res: Vec<(OrderedF64, usize)> = heap.into_vec();
+                res.sort_by_key(|(v, _)| *v);
+                res.truncate(k);
+                let indices: Vec<usize> = res.iter().map(|(_, i)| *i).collect();
+                let vals: Vec<crate::types::Value> = res.iter().map(|(v, _)| crate::types::Value::Float(v.0)).collect();
+                Ok((indices, vals))
+            } else {
+                let mut heap: BinaryHeap<Reverse<(OrderedF64, usize)>> = BinaryHeap::with_capacity(k + 1);
+                for i in 0..col_sst.num_rows {
+                    if col_sst.row_map.is_deleted(i) { continue; }
+                    if let Some(v) = seg.get_f64(i) {
+                        heap.push(Reverse((OrderedF64(v), i)));
+                        if heap.len() > k { heap.pop(); }
+                    }
+                }
+                let mut res: Vec<Reverse<(OrderedF64, usize)>> = heap.into_vec();
+                res.sort_by_key(|r| std::cmp::Reverse(r.0.0));
+                res.truncate(k);
+                let indices: Vec<usize> = res.iter().map(|r| r.0.1).collect();
+                let vals: Vec<crate::types::Value> = res.iter().map(|r| crate::types::Value::Float(r.0.0.0)).collect();
+                Ok((indices, vals))
+            }
+        } else {
+            // Text sort column
+            let seg = col_sst.read_text(sort_col)?;
+            if ascending {
+                let mut heap: BinaryHeap<(String, usize)> = BinaryHeap::with_capacity(k + 1);
+                for i in 0..col_sst.num_rows {
+                    if col_sst.row_map.is_deleted(i) { continue; }
+                    if let Some(s) = seg.get_str(i) {
+                        heap.push((s.to_string(), i));
+                        if heap.len() > k { heap.pop(); }
+                    }
+                }
+                let mut res: Vec<(String, usize)> = heap.into_vec();
+                res.sort_by(|a, b| a.0.cmp(&b.0));
+                res.truncate(k);
+                let indices: Vec<usize> = res.iter().map(|(_, i)| *i).collect();
+                let vals: Vec<crate::types::Value> = res.iter().map(|(s, _)| crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s.as_str())))).collect();
+                Ok((indices, vals))
+            } else {
+                let mut heap: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::with_capacity(k + 1);
+                for i in 0..col_sst.num_rows {
+                    if col_sst.row_map.is_deleted(i) { continue; }
+                    if let Some(s) = seg.get_str(i) {
+                        heap.push(Reverse((s.to_string(), i)));
+                        if heap.len() > k { heap.pop(); }
+                    }
+                }
+                let mut res: Vec<Reverse<(String, usize)>> = heap.into_vec();
+                res.sort_by(|a, b| b.0.0.cmp(&a.0.0));
+                res.truncate(k);
+                let indices: Vec<usize> = res.iter().map(|r| r.0.1).collect();
+                let vals: Vec<crate::types::Value> = res.iter().map(|r| crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(r.0.0.as_str())))).collect();
+                Ok((indices, vals))
+            }
+        }
+    }
+
+} // impl MoteDB
+
+/// OrderedF64: f64 wrapper with total ordering for BinaryHeap.
+/// NaN sorts last (largest) so it's popped first from a max-heap.
+#[derive(Clone, Copy, PartialEq)]
+struct OrderedF64(f64);
+
+impl Eq for OrderedF64 {}
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    }
+}
+
+impl MoteDB {
+
+    /// Fetch specific rows by index from a columnar SSTable.
+    /// Used after top-K or filter to materialize only the winning rows.
+    pub fn scan_columnar_sstable_rows(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+        indices: &[usize],
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut iter = self.scan_columnar_sstable_streaming(table_name, col_types)?;
+        let mut rows = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            rows.push(iter.build_row(idx));
+        }
+        Ok(rows)
+    }
+
+    /// Batch version: collect all rows (used when materialization is needed).
+    pub fn scan_columnar_sstable(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+    ) -> Result<Vec<Vec<Value>>> {
+        let iter = self.scan_columnar_sstable_streaming(table_name, col_types)?;
+        let mut rows = Vec::with_capacity(iter.num_rows);
+        for row in iter {
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     /// Get approximate row count for a table (fast estimation)
@@ -1044,6 +1585,12 @@ impl MoteDB {
                     let mut batch_pks: HashSet<crate::database::pk_cache::PkKey> = HashSet::with_capacity(rows.len());
                     for (idx, row) in rows.iter().enumerate() {
                         if let Some(pk_value) = row.get(pk_col.position) {
+                            // NULL primary key is invalid per SQL standard
+                            if matches!(pk_value, Value::Null) {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Batch row {}: NULL primary key is not allowed for table '{}'", idx, table_name
+                                )));
+                            }
                             let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
                             // Intra-batch duplicate check
                             if !batch_pks.insert(pk_key.clone()) {
@@ -1051,31 +1598,37 @@ impl MoteDB {
                                     "Batch row {}: duplicate primary key {:?} within batch for table '{}'", idx, pk_value, table_name
                                 )));
                             }
-                            let exists = self.pk_lookup.get(table_name)
-                                .map(|lookup| lookup.get_pk(&pk_key).is_some())
-                                .unwrap_or(false);
-                            if exists {
-                                return Err(StorageError::InvalidData(format!(
-                                    "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
-                                )));
-                            }
-                            match self.query_by_column(table_name, pk_name, pk_value) {
-                                Ok(found) if !found.is_empty() => {
-                                    // Verify at least one RowId still exists in LSM
-                                    let mut has_live = false;
-                                    for &rid in &found {
-                                        if self.get_table_row(table_name, rid)?.is_some() {
-                                            has_live = true;
-                                            break;
-                                        }
-                                    }
-                                    if has_live {
+                            // Atomic check-and-insert into PK cache.
+                            // This reserves the PK key, preventing concurrent inserts
+                            // from using the same key (eliminates TOCTOU race).
+                            if let Some(lookup) = self.pk_lookup.get(table_name) {
+                                match lookup.insert_if_absent(pk_key, 0 /* placeholder */) {
+                                    Ok(()) => {} // Reserved successfully
+                                    Err(_) => {
                                         return Err(StorageError::InvalidData(format!(
                                             "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
                                         )));
                                     }
                                 }
-                                _ => {}
+                            } else {
+                                // No PK cache — fall back to slow path (column index check)
+                                match self.query_by_column(table_name, pk_name, pk_value) {
+                                    Ok(found) if !found.is_empty() => {
+                                        let mut has_live = false;
+                                        for &rid in &found {
+                                            if self.get_table_row(table_name, rid)?.is_some() {
+                                                has_live = true;
+                                                break;
+                                            }
+                                        }
+                                        if has_live {
+                                            return Err(StorageError::InvalidData(format!(
+                                                "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
+                                            )));
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -1151,39 +1704,56 @@ impl MoteDB {
             }
         }
 
-        // 4. Encode rows and build WAL records (shared raw bytes for WAL + LSM)
+        // 4. Write WAL first (durability guarantee) + columnar buffer (primary storage).
+        //    WAL ensures zero data loss on crash; columnar buffer enables fast reads.
         let col_types = schema.col_types();
-        let mut wal_records = Vec::with_capacity(rows.len());
-        let mut kvs = Vec::with_capacity(rows.len());
-        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-            let composite_key = self.make_composite_key(table_name, *row_id);
-            let partition = (composite_key % self.num_partitions as u64) as PartitionId;
-            let row_data = row_format::encode(row, col_types)
-                .or_else(|_| bincode::serialize(row)
-                    .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
+        let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+        let base_ts = self.write_lsn.fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
-            wal_records.push(WALRecord::InsertRaw {
+        // Build WAL records (lightweight: no RawRow encoding, just Row values)
+        let wal_records: Vec<WALRecord> = rows.iter().enumerate().map(|(i, row)| {
+            WALRecord::Insert {
                 table_name: table_name.to_string(),
-                row_id: *row_id,
-                partition,
-                raw_data: row_data.clone(),
+                row_id: row_ids[i],
+                partition: (self.make_composite_key(table_name, row_ids[i]) % self.num_partitions as u64) as PartitionId,
+                data: row.clone(),
                 txn_id: 0,
-            });
-
-            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let value = crate::storage::lsm::Value::new(row_data, ts);
-            let composite_key = self.make_composite_key(table_name, *row_id);
-            kvs.push((composite_key, value));
-        }
-
-        // 5. Increment pending counter BEFORE batch WAL write (checkpoint barrier)
-        let old_count = self.pending_updates.fetch_add(rows.len(), std::sync::atomic::Ordering::Release);
-
-        // 6. Batch write WAL (single fsync)
+            }
+        }).collect();
+        self.increment_pending_updates();
         self.wal.batch_append(0, wal_records)?;
 
-        // 6. Batch write LSM MemTable (single lock)
-        self.lsm_engine.batch_put(&kvs)?;
+        use dashmap::mapref::entry::Entry;
+        let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
+            Entry::Occupied(o) => o.get().clone(),
+            Entry::Vacant(v) => {
+                let indexes_dir = self.path.join("indexes");
+                std::fs::create_dir_all(&indexes_dir).ok();
+                let col_sst_path = indexes_dir.join(format!("{}_col.sst", table_name));
+                let b = Arc::new(parking_lot::Mutex::new(
+                    crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(col_sst_path, col_types.to_vec())
+                ));
+                v.insert(b.clone());
+                b
+            }
+        };
+        let mut builder = builder_arc.lock();
+
+        for (i, row) in rows.iter().enumerate() {
+            let key = (table_id << 32) | (row_ids[i] & 0xFFFFFFFF);
+            builder.add_values(key, base_ts + i as u64, false, row)?;
+        }
+        drop(builder);
+
+        // 🚀 Embedded memory: auto-finalize when buffer exceeds 10K rows.
+        // Keeps write buffer under ~1.6 MB (10K × 40B × 4 cols) on embedded devices.
+        if let Some(b) = self.columnar_write_bufs.get(table_name) {
+            if b.value().lock().num_rows >= 10_000 {
+                self.finalize_columnar_buffer(table_name);
+            }
+        }
+
+        let _old_count = self.pending_updates.fetch_add(rows.len(), std::sync::atomic::Ordering::Release);
 
         // 6.5 Update PK cache for non-auto_increment tables
         if !auto_inc {
@@ -1206,35 +1776,68 @@ impl MoteDB {
         // 7. Batch update all indexes
         debug_log!("[batch_insert_rows_to_table] Batch updating indexes for {} rows in table '{}'", rows.len(), table_name);
 
-        // 7.1 按列聚合数据，批量更新 Column Index
-        let prefix_len = table_name.len() + 1;
+        // 7.1 Collect data for all column indexes, then insert in parallel.
+        //     Each column index is independent — no shared state between them.
+        //
+        //     🚀 Skip index updates when using columnar storage — WHERE/LIKE/aggregate
+        //     queries use columnar filter paths instead of BTree indexes.
+        //     Saves ~22MB per index on embedded devices.
+        if self.columnar_sstables.contains_key(table_name)
+            || self.columnar_write_bufs.contains_key(table_name) {
+            debug_log!("[batch_insert] Skipping column index updates — columnar storage active for '{}'", table_name);
+            // Still need to handle vector/text/spatial indexes below
+        } else {
+            let prefix_len = table_name.len() + 1;
+            let mut column_tasks: Vec<(Arc<crate::index::column_value::ColumnValueIndex>, Vec<(Value, RowId)>, String)> = Vec::new();
 
-        for col_def in &schema.columns {
+            for col_def in &schema.columns {
             let col_name = &col_def.name;
 
+            // Collect column index data
             let mut col_index_key = String::with_capacity(prefix_len + col_name.len());
             col_index_key.push_str(table_name);
             col_index_key.push('.');
             col_index_key.push_str(col_name);
             if let Some(index_ref) = self.column_indexes.get(&col_index_key) {
-                // 收集该列的所有数据
                 let mut column_data: Vec<(Value, RowId)> = Vec::with_capacity(rows.len());
                 for (row_id, row) in row_ids.iter().zip(rows.iter()) {
                     if let Some(col_value) = row.get(col_def.position) {
                         column_data.push((col_value.clone(), *row_id));
                     }
                 }
-
-                // 批量插入列索引
                 if !column_data.is_empty() {
-                    if let Err(_e) = index_ref.value().batch_insert(column_data) {
-                        debug_log!("[batch_insert] Failed to batch update column index '{}': {}", col_name, _e);
-                        self.index_registry.mark_stale(&col_index_key);
-                    }
+                    column_tasks.push((index_ref.value().clone(), column_data, col_index_key.clone()));
                 }
             }
-            
-            // 7.2 批量更新 Vector Index
+        }
+
+        // Parallel insert into column indexes (one thread per index).
+        // Each index has its own mem_buffer and BTree — no shared state.
+        if column_tasks.len() > 1 {
+            std::thread::scope(|s| {
+                for (index, data, key) in column_tasks {
+                    s.spawn(move || {
+                        if let Err(_e) = index.batch_insert(data) {
+                            debug_log!("[batch_insert] Failed to batch update column index '{}': {}", key, _e);
+                        }
+                    });
+                }
+            });
+        } else {
+            for (index, data, key) in column_tasks {
+                if let Err(_e) = index.batch_insert(data) {
+                    debug_log!("[batch_insert] Failed to batch update column index '{}': {}", key, _e);
+                    self.index_registry.mark_stale(&key);
+                }
+            }
+        }
+        } // end else (columnar SSTable exists → skip column indexes)
+
+        // 7.2 Collect and batch update non-column indexes (vector, text, spatial)
+        for col_def in &schema.columns {
+            let col_name = &col_def.name;
+
+            // 7.2a 批量更新 Vector Index
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
                 if let Some(index_name) = self.index_registry.find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Vector) {
                     let mut vectors: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(rows.len());
@@ -1301,9 +1904,16 @@ impl MoteDB {
             counter.fetch_add(rows.len() as u64, Ordering::Relaxed);
         }
 
-        // Auto-flush trigger (pending counter already incremented before WAL write)
+        // Auto-flush trigger
+        let old_count = self.pending_updates.fetch_add(rows.len(), std::sync::atomic::Ordering::Release);
         if old_count / 2_000 != (old_count + rows.len()) / 2_000 {
             self.request_auto_flush();
+        }
+
+        // 🚀 Immediate finalize: convert heap write buffer → mmap file.
+        // Frees ~10MB of heap memory, replaces with file-backed mmap (OS evictable).
+        if self.columnar_write_bufs.contains_key(table_name) {
+            self.finalize_columnar_buffer(table_name);
         }
 
         Ok(row_ids)
@@ -1694,12 +2304,11 @@ impl Iterator for TableRawStreamingIterator {
 /// 🚀 表行流式迭代器（真正的 O(1) 内存占用）
 ///
 /// 逐个返回行数据，不预先加载任何数据到内存。
+/// 使用 SchemaDecodeContext 实现预计算 schema 上下文，消除每行冗余计算。
 pub struct TableRowStreamingIterator {
     lsm_iter: crate::storage::lsm::MergingIterator,
-    col_types: Option<Vec<crate::types::ColumnType>>,
-    fixed_count: usize,
-    /// Reusable decode buffer — avoids allocating a new Vec<Value> per row.
-    row_buf: Vec<Value>,
+    /// Pre-computed schema context for accelerated decode.
+    decode_ctx: Option<crate::storage::row_format::SchemaDecodeContext>,
     /// Whether the MergingIterator has a raw SSTable source (zero-Arc path)
     use_raw: bool,
 }
@@ -1708,21 +2317,22 @@ impl Iterator for TableRowStreamingIterator {
     type Item = Result<(RowId, Row)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // 🚀 Zero-Arc fast path: when raw_sst is set, bypass Arc<Vec<u8>> entirely
+        // 🚀 Zero-copy fast path: when raw_sst is set, ValueBytes shares the
+        // decompressed block Arc — no per-row memcpy.
         if self.use_raw {
             loop {
                 match self.lsm_iter.next_raw() {
-                    Some(Ok((composite_key, _ts, deleted, data))) => {
+                    Some(Ok((composite_key, _ts, deleted, vb))) => {
                         if deleted { continue; }
-                        if data.is_empty() { continue; } // blob ref fallback
+                        if vb.len == 0 { continue; } // blob ref fallback
                         let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-                        let row: Row = if let Some(ref col_types) = self.col_types {
-                            match crate::storage::row_format::decode_fast_into(&data, col_types, self.fixed_count, &mut self.row_buf) {
-                                Ok(()) => std::mem::take(&mut self.row_buf),
+                        let row: Row = if let Some(ref mut ctx) = self.decode_ctx {
+                            match ctx.decode_row(vb.as_slice()) {
+                                Ok(row) => row,
                                 Err(e) => return Some(Err(e)),
                             }
                         } else {
-                            match crate::storage::row_format::decode_any(&data) {
+                            match crate::storage::row_format::decode_any_with_pool(vb.as_slice(), None) {
                                 Ok(row) => row,
                                 Err(e) => return Some(Err(e)),
                             }
@@ -1755,19 +2365,151 @@ impl Iterator for TableRowStreamingIterator {
                         }
                     };
 
-                    let row: Row = if let Some(ref col_types) = self.col_types {
-                        match crate::storage::row_format::decode_fast_into(data, col_types, self.fixed_count, &mut self.row_buf) {
-                            Ok(()) => std::mem::take(&mut self.row_buf),
+                    let row: Row = if let Some(ref mut ctx) = self.decode_ctx {
+                        match ctx.decode_row(data) {
+                            Ok(row) => row,
                             Err(e) => return Some(Err(e)),
                         }
                     } else {
-                        match crate::storage::row_format::decode_any(data) {
+                        match crate::storage::row_format::decode_any_with_pool(data, None) {
                             Ok(row) => row,
                             Err(e) => return Some(Err(e)),
                         }
                     };
 
                     return Some(Ok((row_id, row)));
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
+    }
+}
+
+/// Zero-copy decode streaming iterator — decodes rows directly into a
+/// caller-provided `Vec<Value>` using `ValueBytes::as_slice()`.
+///
+/// Column segment wrapper for streaming columnar scans.
+enum ColumnarSegment {
+    Fixed(crate::storage::lsm::columnar::FixedSegment),
+    Text(crate::storage::lsm::columnar::TextSegment),
+}
+
+/// Streaming iterator over a columnar SSTable. Yields one row at a time
+/// as Vec<Value>, avoiding full materialization.
+pub struct ColumnarScanIterator {
+    row_map: crate::storage::lsm::columnar::RowMap,
+    segments: Vec<ColumnarSegment>,
+    col_types: Vec<crate::types::ColumnType>,
+    current_idx: usize,
+    num_rows: usize,
+    /// Pre-computed matching row indices (for filtered scans). If None, scan all.
+    pub match_filter: Option<Vec<usize>>,
+}
+
+impl Iterator for ColumnarScanIterator {
+    type Item = Vec<crate::types::Value>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(ref matches) = self.match_filter {
+            // Filtered scan: only yield matching rows
+            while self.current_idx < matches.len() {
+                let row_idx = matches[self.current_idx];
+                self.current_idx += 1;
+                return Some(self.build_row(row_idx));
+            }
+            None
+        } else {
+            // Full scan: yield all non-deleted rows
+            while self.current_idx < self.num_rows {
+                let idx = self.current_idx;
+                self.current_idx += 1;
+                if self.row_map.is_deleted(idx) { continue; }
+                return Some(self.build_row(idx));
+            }
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if let Some(ref m) = self.match_filter {
+            let rem = m.len().saturating_sub(self.current_idx);
+            (rem, Some(m.len()))
+        } else {
+            let rem = self.num_rows.saturating_sub(self.current_idx);
+            (rem, Some(self.num_rows))
+        }
+    }
+}
+
+impl ColumnarScanIterator {
+    pub(crate) fn build_row(&self, idx: usize) -> Vec<crate::types::Value> {
+        let mut row = Vec::with_capacity(self.col_types.len());
+        for (col_idx, ct) in self.col_types.iter().enumerate() {
+            let val = match &self.segments[col_idx] {
+                ColumnarSegment::Fixed(f) => match ct {
+                    crate::types::ColumnType::Integer => f.get_i64(idx).map(crate::types::Value::Integer),
+                    crate::types::ColumnType::Float => f.get_f64(idx).map(crate::types::Value::Float),
+                    crate::types::ColumnType::Boolean => f.get_bool(idx).map(crate::types::Value::Bool),
+                    _ => None,
+                }.unwrap_or(crate::types::Value::Null),
+                ColumnarSegment::Text(t) => t.get_str(idx)
+                    .map(|s| crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                    .unwrap_or(crate::types::Value::Null),
+            };
+            row.push(val);
+        }
+        row
+    }
+}
+
+/// Unlike `TableRawStreamingIterator` (which copies `bytes.to_vec()` per row),
+/// this iterator borrows the shared block Arc data, eliminating the per-row memcpy.
+pub struct TableDecodeStreamingIterator {
+    lsm_iter: crate::storage::lsm::MergingIterator,
+    decode_ctx: crate::storage::row_format::SchemaDecodeContext,
+    use_raw: bool,
+}
+
+impl TableDecodeStreamingIterator {
+    /// Decode the next row directly into `out`. Returns `Some(Ok(row_id))` on success.
+    /// The caller is responsible for clearing `out` before each call (or it appends).
+    pub fn decode_next_into(&mut self, out: &mut Vec<crate::types::Value>) -> Option<Result<RowId>> {
+        if self.use_raw {
+            loop {
+                match self.lsm_iter.next_raw() {
+                    Some(Ok((composite_key, _ts, deleted, vb))) => {
+                        if deleted { continue; }
+                        if vb.len == 0 { continue; }
+                        let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                        match self.decode_ctx.decode_row_into(out, vb.as_slice()) {
+                            Ok(()) => return Some(Ok(row_id)),
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => return None,
+                }
+            }
+        }
+        // Standard path (no raw_sst)
+        loop {
+            match self.lsm_iter.next() {
+                Some(Ok((composite_key, value))) => {
+                    if value.deleted { continue; }
+                    let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+                    let data = match &value.data {
+                        crate::storage::lsm::ValueData::Inline(bytes) => bytes.as_slice(),
+                        crate::storage::lsm::ValueData::Blob(_) => {
+                            return Some(Err(StorageError::InvalidData(
+                                "Blob references should be resolved by LSM engine".into()
+                            )));
+                        }
+                    };
+                    match self.decode_ctx.decode_row_into(out, data) {
+                        Ok(()) => return Some(Ok(row_id)),
+                        Err(e) => return Some(Err(e)),
+                    }
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 None => return None,

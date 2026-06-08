@@ -13,6 +13,7 @@
 mod memtable;
 mod unified_memtable;  // 🆕 Unified MemTable (数据 + 向量)
 mod sstable;
+pub(crate) mod columnar;           // 🆕 Columnar SSTable (column-oriented storage)
 mod compaction;
 mod engine;
 mod bloom;
@@ -22,6 +23,7 @@ mod merging_iterator;  // 🚀 流式合并迭代器
 pub use memtable::MemTable;
 pub use unified_memtable::{UnifiedMemTable, UnifiedEntry, DataEntry};
 pub use sstable::{SSTable, SSTableBuilder, SSTableIterator, BlockIndex};
+pub use columnar::{ColumnarSSTable, ColumnarSSTableBuilder, RowMap};
 pub use compaction::{CompactionWorker, CompactionConfig, Level, SSTableMeta, CompactionStats};
 pub use engine::{LSMEngine, LSMBatchedIterator};  // 🚀 Export batched iterator
 pub use bloom::BloomFilter;
@@ -101,6 +103,16 @@ impl Value {
     pub fn new(data: Vec<u8>, timestamp: u64) -> Self {
         Self {
             data: ValueData::Inline(std::sync::Arc::new(data)),
+            timestamp,
+            deleted: false,
+        }
+    }
+
+    /// Create from a shared Arc buffer (avoids re-wrapping for batch inserts
+    /// where data is already in an Arc).
+    pub fn new_from_arc(data: std::sync::Arc<Vec<u8>>, timestamp: u64) -> Self {
+        Self {
+            data: ValueData::Inline(data),
             timestamp,
             deleted: false,
         }
@@ -253,6 +265,12 @@ impl LSMConfig {
             sstable_cache_size: db_config.sstable_cache_size.unwrap_or(defaults.sstable_cache_size),
             sstable_cache_memory_limit_mb: db_config.sstable_cache_memory_limit_mb.or(defaults.sstable_cache_memory_limit_mb),
             block_size: db_config.block_size.unwrap_or(defaults.block_size),
+            enable_compression: db_config.enable_compression.unwrap_or(defaults.enable_compression),
+            compression_algorithm: db_config.compression_algorithm.map(|a| match a {
+                crate::config::CompressionAlgorithm::Zstd => CompressionAlgorithm::Zstd,
+                crate::config::CompressionAlgorithm::Snappy => CompressionAlgorithm::Snappy,
+                crate::config::CompressionAlgorithm::None => CompressionAlgorithm::None,
+            }).unwrap_or(defaults.compression_algorithm),
             tombstone_ttl_secs: db_config.tombstone_ttl_secs.unwrap_or(defaults.tombstone_ttl_secs),
             ..defaults
         }

@@ -475,7 +475,7 @@ impl Default for DBConfig {
             lsm_config: LSMConfig::default(),
             row_cache_size: None,  // Use default 10000
             pk_lookup_capacity: 10_000,  // ~0.8MB per table (embedded-friendly)
-            column_index_buffer_size: 1024 * 1024,  // 1MB
+            column_index_buffer_size: 8 * 1024 * 1024,  // 8MB — fewer BTree flushes
             max_result_rows: None,  // No limit
             index_update_strategy: IndexUpdateStrategy::default(),  // BatchOnly
             query_timeout_secs: Some(30),  // 30-second timeout by default
@@ -528,10 +528,11 @@ impl DBConfig {
             },
             num_partitions: 2,
             lsm_config: LSMConfig {
-                memtable_size_limit: 4 * 1024 * 1024, // 4MB
-                sstable_cache_size: Some(8),
+                memtable_size_limit: 1 * 1024 * 1024, // 1MB (embedded: columnar handles bulk writes)
+                sstable_cache_size: Some(4),           // fewer cached SSTables for embedded
                 sstable_cache_memory_limit_mb: Some(10), // 10MB max
                 block_size: Some(16 * 1024),             // 16KB blocks
+                enable_compression: Some(false),         // Skip decompression CPU cost
                 ..Default::default()
             },
             row_cache_size: Some(500),
@@ -539,6 +540,7 @@ impl DBConfig {
             pk_lookup_capacity: 10_000,  // ~0.8MB per table for edge devices
             auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
+            column_index_buffer_size: 8 * 1024 * 1024, // 8MB — fewer BTree flushes during batch insert
             columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
             ..Default::default()
         }
@@ -566,6 +568,7 @@ impl DBConfig {
                 sstable_cache_size: Some(16),
                 sstable_cache_memory_limit_mb: Some(20),
                 block_size: Some(32 * 1024),
+                enable_compression: Some(false),       // Skip decompression for sensor reads
                 ..Default::default()
             },
             row_cache_size: Some(500),
@@ -606,6 +609,15 @@ impl DBConfig {
     }
 }
 
+/// SSTable block compression algorithm
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CompressionAlgorithm {
+    #[default]
+    Zstd,
+    Snappy,
+    None,
+}
+
 /// LSM 树配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LSMConfig {
@@ -627,6 +639,12 @@ pub struct LSMConfig {
     /// SSTable block size in bytes (None = storage default 64KB)
     pub block_size: Option<usize>,
 
+    /// Enable SSTable block compression (None = storage default: true)
+    pub enable_compression: Option<bool>,
+
+    /// Compression algorithm for SSTable blocks (None = storage default: Zstd)
+    pub compression_algorithm: Option<CompressionAlgorithm>,
+
     /// Tombstone TTL in seconds: deleted entries older than this are physically
     /// dropped during compaction. 0 = drop all tombstones immediately.
     /// None = use internal default (86400 = 24h).
@@ -642,6 +660,8 @@ impl Default for LSMConfig {
             sstable_cache_size: None,
             sstable_cache_memory_limit_mb: None,
             block_size: None,
+            enable_compression: None,
+            compression_algorithm: None,
             tombstone_ttl_secs: None,
         }
     }

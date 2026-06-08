@@ -70,6 +70,15 @@ pub enum WALRecord {
         txn_id: TransactionId,
     },
 
+    /// Insert with Arc-shared raw bytes — avoids clone when LSM also uses Arc.
+    InsertRawArc {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        raw_data: std::sync::Arc<Vec<u8>>,
+        txn_id: TransactionId,
+    },
+
     /// Update operation
     Update {
         table_name: String,
@@ -157,6 +166,15 @@ impl WALRecord {
                 buf.extend_from_slice(&(*partition as u16).to_le_bytes());
                 buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(raw_data);
+            }
+            WALRecord::InsertRawArc { table_name, row_id, partition, raw_data, txn_id } => {
+                buf.push(TAG_INSERT_RAW);
+                buf.extend_from_slice(&txn_id.to_le_bytes());
+                encode_str(&mut buf, table_name);
+                buf.extend_from_slice(&row_id.to_le_bytes());
+                buf.extend_from_slice(&(*partition as u16).to_le_bytes());
+                buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
+                buf.extend_from_slice(raw_data.as_slice());
             }
             WALRecord::Insert { table_name, row_id, partition, data, txn_id } => {
                 buf.push(TAG_INSERT_RAW);
@@ -349,6 +367,7 @@ impl WALRecord {
         match self {
             WALRecord::Insert { table_name, .. }
             | WALRecord::InsertRaw { table_name, .. }
+            | WALRecord::InsertRawArc { table_name, .. }
             | WALRecord::Update { table_name, .. }
             | WALRecord::UpdateRaw { table_name, .. }
             | WALRecord::Delete { table_name, .. }
@@ -375,6 +394,7 @@ impl WALRecord {
         match self {
             WALRecord::Insert { txn_id, .. }
             | WALRecord::InsertRaw { txn_id, .. }
+            | WALRecord::InsertRawArc { txn_id, .. }
             | WALRecord::Update { txn_id, .. }
             | WALRecord::UpdateRaw { txn_id, .. }
             | WALRecord::Delete { txn_id, .. }
@@ -1358,9 +1378,9 @@ impl WALManager {
         }
     }
 
-    /// Push a record through group commit queue (fire-and-forget).
-    /// Returns immediately; background thread handles batching & fsync.
-    /// Call `check_flush_errors()` to detect background flush failures.
+    /// Push a record through group commit queue and wait for durability.
+    /// Blocks until the background thread has flushed and fsynced the record,
+    /// guaranteeing durability when the function returns Ok.
     fn group_commit_append(
         &self,
         partition: PartitionId,
@@ -1373,16 +1393,28 @@ impl WALManager {
             if let Some(e) = gc.state.last_error.lock().take() {
                 return Err(e);
             }
+            let done = Arc::new((PlMutex::new(None), PlCondvar::new()));
             {
                 let mut queue = gc.state.queue.lock();
                 queue.push(GroupCommitEntry {
                     partition,
                     record,
-                    done: Arc::new((PlMutex::new(None), PlCondvar::new())),
+                    done: Arc::clone(&done),
                 });
             }
             gc.state.wakeup.notify_all();
-            Ok(0)
+
+            // Wait for the background thread to fsync our record
+            {
+                let mut flag = done.0.lock();
+                while flag.is_none() {
+                    done.1.wait(&mut flag);
+                }
+                match flag.take().unwrap() {
+                    Ok(()) => Ok(0),
+                    Err(msg) => Err(StorageError::Transaction(msg)),
+                }
+            }
         } else {
             let entry = self.partitions.get(&partition)
                 .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;

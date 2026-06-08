@@ -6,9 +6,10 @@
 use crate::database::core::MoteDB;
 use crate::{Result, StorageError};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// Return freed heap memory to the OS after flush/checkpoint.
-fn trim_allocator() {
+pub(crate) fn trim_allocator() {
     #[cfg(target_os = "linux")]
     {
         extern "C" {
@@ -16,6 +17,15 @@ fn trim_allocator() {
         }
         unsafe {
             malloc_trim(0);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
         }
     }
 }
@@ -87,24 +97,90 @@ impl MoteDB {
         let _guard = self.checkpoint_mutex.lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
 
-        // 1. Flush all memtables to SSTables
+        // Pause background compaction during vacuum.
+        self.lsm_engine.pause_background_compaction();
+
+        // 1. Flush all memtables to SSTables (background flush thread handles this)
         self.lsm_engine.flush()?;
 
-        // 2. Run compaction on all levels (repeatedly until no more compaction needed)
-        for _ in 0..10 {
-            if !self.lsm_engine.compact()? {
+        // Now pause flush thread too — all memtables are drained,
+        // prevent new SSTables from appearing during compact_full.
+        self.lsm_engine.pause_background_flush();
+
+        // 2. Full compaction: merge ALL SSTables into a single file.
+        //    Run twice: the flush thread may have registered new SSTables
+        //    between flush() returning and pause taking effect.
+        for _ in 0..3 {
+            if let Err(e) = self.lsm_engine.compact_full() {
+                warn_log!("[VACUUM] Full compaction failed (non-fatal): {:?}", e);
                 break;
             }
         }
 
-        // 3. Flush all column/text/vector indexes
-        self.flush_all_indexes()?;
+        // Resume background threads
+        self.lsm_engine.resume_background_flush();
+        self.lsm_engine.resume_background_compaction();
 
-        // 4. Clean up version store
+        // 3a. Finalize columnar write buffers → columnar SSTables.
+        //     Accumulated INSERT data (zero-encode) is written to disk now.
+        for entry in self.columnar_write_bufs.iter() {
+            let table_name = entry.key().clone();
+            let mut builder_guard = entry.value().lock();
+            if builder_guard.num_rows > 0 {
+                // Take the builder out, finish it, put a new empty one back
+                let col_types = builder_guard.column_types.clone();
+                let path = builder_guard.path.clone();
+                let num_rows = builder_guard.num_rows;
+                // Create a new empty builder to swap in
+                let mut old_builder = std::mem::replace(
+                    &mut *builder_guard,
+                    crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(&path, col_types),
+                );
+                drop(builder_guard);
+                // Finish the old builder (writes to disk)
+                if let Err(e) = old_builder.finish() {
+                    warn_log!("[VACUUM] Failed to finalize columnar buffer for '{}': {:?}", table_name, e);
+                } else {
+                    let indexes_dir = self.path.join("indexes");
+                    let col_sst_path = indexes_dir.join(format!("{}_col.sst", &table_name));
+                    if let Ok(col_sst) = crate::storage::lsm::columnar::ColumnarSSTable::open(&col_sst_path) {
+                        self.columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
+                        debug_log!("[VACUUM] Columnar buffer finalized for '{}' ({} rows)", table_name, num_rows);
+                    }
+                }
+            }
+        }
+
+        // 3b. Columnar compaction: convert row-based SSTable → columnar for all tables.
+        //    Non-fatal — if it fails, row-based scan still works.
+        for table_name in self.table_registry.list_tables()? {
+            if let Ok(schema) = self.table_registry.get_table(&table_name) {
+                let col_types = schema.col_types();
+                match self.lsm_engine.compact_to_columnar(&col_types) {
+                    Ok((col_sst, _source_paths)) => {
+                        self.columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
+                        debug_log!("[VACUUM] Columnar SSTable created for table '{}'", table_name);
+                    }
+                    Err(e) => {
+                        debug_log!("[VACUUM] Columnar compaction skipped for '{}': {:?}", table_name, e);
+                    }
+                }
+            }
+        }
+
+        // 4. Flush all column/text/vector indexes (non-fatal — core flush+compact is done)
+        if let Err(e) = self.flush_all_indexes() {
+            warn_log!("[VACUUM] Index flush failed (non-fatal): {}", e);
+        }
+
+        // 5. Clean up version store
         let min_active_ts = self.txn_coordinator.get_min_active_timestamp();
         if let Err(e) = self.version_store.vacuum(min_active_ts) {
             warn_log!("[VACUUM] Version store vacuum failed: {}", e);
         }
+
+        // 6. Return freed memory to the OS (cross-platform)
+        trim_allocator();
 
         Ok(())
     }
@@ -117,6 +193,14 @@ impl MoteDB {
     }
 
     fn checkpoint_impl(&self, rebuild_indexes: bool) -> Result<()> {
+        // 🚀 Crash recovery: finalize columnar write buffers before checkpoint.
+        //    Converts in-memory INSERT data to durable columnar SSTable files.
+        //    On crash, at most one checkpoint interval of data is lost.
+        for entry in self.columnar_write_bufs.iter() {
+            let table_name = entry.key().clone();
+            self.finalize_columnar_buffer(&table_name);
+        }
+
         let pending_before = self.pending_updates.load(Ordering::Acquire);
         if pending_before == 0 {
             let wal_dir = self.path.join("wal");

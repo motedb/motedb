@@ -13,41 +13,72 @@
 
 use crate::types::{Value, RowId};
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Stack-allocated cache key: (type_tag, data_hash).
-/// Eliminates bincode serialization overhead.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct FastKey {
-    tag: u8,
-    data: u64,
+/// Cache key that avoids hash collisions for text values.
+///
+/// For numeric types, uses stack-allocated (tag, data) pairs.
+/// For text, stores the full `Arc<str>` to guarantee no false cache hits
+/// from hash collisions (two different strings hashing to the same u64).
+#[derive(Debug, Clone)]
+enum FastKey {
+    Integer(i64),
+    Float(u64),         // f64 bits
+    Bool(bool),
+    Text(Arc<str>),
+    Timestamp(u64),
+    Null,
+    Complex(u8),        // tag for vector/tensor/spatial/textdoc (not looked up)
 }
+
+impl Hash for FastKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            FastKey::Integer(i) => i.hash(state),
+            FastKey::Float(bits) => bits.hash(state),
+            FastKey::Bool(b) => b.hash(state),
+            FastKey::Text(s) => s.hash(state),
+            FastKey::Timestamp(ts) => ts.hash(state),
+            FastKey::Null | FastKey::Complex(_) => {}
+        }
+    }
+}
+
+impl PartialEq for FastKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FastKey::Integer(a), FastKey::Integer(b)) => a == b,
+            (FastKey::Float(a), FastKey::Float(b)) => a == b,
+            (FastKey::Bool(a), FastKey::Bool(b)) => a == b,
+            (FastKey::Text(a), FastKey::Text(b)) => a == b,  // full string comparison
+            (FastKey::Timestamp(a), FastKey::Timestamp(b)) => a == b,
+            (FastKey::Null, FastKey::Null) => true,
+            (FastKey::Complex(a), FastKey::Complex(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FastKey {}
 
 impl FastKey {
     fn from_value(value: &Value) -> Self {
         match value {
-            Value::Integer(i) => FastKey { tag: 1, data: *i as u64 },
-            Value::Float(f) => FastKey { tag: 2, data: f.to_bits() },
-            Value::Bool(b) => FastKey { tag: 3, data: if *b { 1 } else { 0 } },
-            Value::Text(s) => {
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                s.hash(&mut h);
-                FastKey { tag: 4, data: h.finish() }
-            }
-            Value::Timestamp(ts) => FastKey { tag: 5, data: ts.as_micros_u64() },
-            Value::Null => FastKey { tag: 6, data: 0 },
-            // Complex/boxed types: use distinct tags so they never collide with
-            // simple types or each other in the cache. data=0 is acceptable because
-            // ColumnValueIndex (the only consumer of this cache) does not handle
-            // these types — they use separate specialized indexes (DiskANN, IOctree).
-            Value::Vector(_)   => FastKey { tag: 7, data: 0 },
-            Value::Tensor(_)   => FastKey { tag: 8, data: 0 },
-            Value::Spatial(_)  => FastKey { tag: 9, data: 0 },
-            Value::TextDoc(_)  => FastKey { tag: 10, data: 0 },
+            Value::Integer(i) => FastKey::Integer(*i),
+            Value::Float(f) => FastKey::Float(f.to_bits()),
+            Value::Bool(b) => FastKey::Bool(*b),
+            Value::Text(s) => FastKey::Text(Arc::clone(&s.0)),  // unwrap ArcString -> Arc<str>
+            Value::Timestamp(ts) => FastKey::Timestamp(ts.as_micros_u64()),
+            Value::Null => FastKey::Null,
+            Value::Vector(_)   => FastKey::Complex(7),
+            Value::Tensor(_)   => FastKey::Complex(8),
+            Value::Spatial(_)  => FastKey::Complex(9),
+            Value::TextDoc(_)  => FastKey::Complex(10),
         }
     }
 }
@@ -59,7 +90,7 @@ impl FastKey {
 /// - Old: Clone entire Vec (avg 100 * 8 = 800 bytes)
 /// - New: Clone Arc pointer (8 bytes) - **99% memory saving**
 pub struct CachedIndex {
-    cache: Mutex<LruCache<FastKey, Arc<Vec<RowId>>>>,
+    cache: RwLock<LruCache<FastKey, Arc<Vec<RowId>>>>,
     hit_count: AtomicU64,
     miss_count: AtomicU64,
 }
@@ -70,7 +101,7 @@ impl CachedIndex {
         let capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
 
         Self {
-            cache: Mutex::new(LruCache::new(capacity)),
+            cache: RwLock::new(LruCache::new(capacity)),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
         }
@@ -79,7 +110,7 @@ impl CachedIndex {
     /// Get value from cache (returns Arc-wrapped value)
     pub fn get(&self, key: &Value) -> Option<Arc<Vec<RowId>>> {
         let fk = FastKey::from_value(key);
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write(); // LRU touch requires write
         if let Some(ids) = cache.get(&fk) {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
             return Some(Arc::clone(ids));
@@ -90,7 +121,7 @@ impl CachedIndex {
     /// Put value into cache (wraps in Arc automatically)
     pub fn put(&self, key: Value, ids: Vec<RowId>) {
         let fk = FastKey::from_value(&key);
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         cache.put(fk, Arc::new(ids));
     }
 
@@ -113,7 +144,7 @@ impl CachedIndex {
 
     /// Get cache statistics
     pub fn stats(&self) -> CacheStats {
-        let cache = self.cache.lock();
+        let cache = self.cache.read();
 
         CacheStats {
             capacity: cache.cap().get(),
@@ -126,7 +157,7 @@ impl CachedIndex {
 
     /// Clear cache
     pub fn clear(&self) {
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         cache.clear();
         self.hit_count.store(0, Ordering::Relaxed);
         self.miss_count.store(0, Ordering::Relaxed);
@@ -135,7 +166,7 @@ impl CachedIndex {
     /// Invalidate a key
     pub fn invalidate(&self, key: &Value) {
         let fk = FastKey::from_value(key);
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         cache.pop(&fk);
     }
 
@@ -143,7 +174,7 @@ impl CachedIndex {
     /// Safe to skip: stale cache entries are eventually evicted by LRU policy.
     pub fn try_invalidate(&self, key: &Value) {
         let fk = FastKey::from_value(key);
-        if let Some(mut cache) = self.cache.try_lock() {
+        if let Some(mut cache) = self.cache.try_write() {
             cache.pop(&fk);
         }
     }
@@ -153,7 +184,7 @@ impl CachedIndex {
         let _ = (start, end);
         // With hash-based keys, we can't efficiently filter ranges.
         // Clear the entire cache — safe and simple.
-        let mut cache = self.cache.lock();
+        let mut cache = self.cache.write();
         cache.clear();
     }
 
@@ -262,6 +293,20 @@ mod tests {
         cache.put(Value::text("hello".to_string()), vec![1, 2]);
         assert_eq!(*cache.get(&Value::text("hello".to_string())).unwrap(), vec![1, 2]);
         assert_eq!(cache.get(&Value::text("world".to_string())), None);
+    }
+
+    #[test]
+    fn test_cache_text_no_collision() {
+        // Regression test: two different text values must never share a cache entry,
+        // even if their hashes collide.
+        let cache = CachedIndex::new(100);
+
+        cache.put(Value::text("alpha".to_string()), vec![1]);
+        cache.put(Value::text("beta".to_string()), vec![2]);
+
+        assert_eq!(*cache.get(&Value::text("alpha".to_string())).unwrap(), vec![1]);
+        assert_eq!(*cache.get(&Value::text("beta".to_string())).unwrap(), vec![2]);
+        assert_eq!(cache.get(&Value::text("gamma".to_string())), None);
     }
 
     #[test]

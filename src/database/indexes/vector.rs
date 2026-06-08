@@ -72,16 +72,27 @@ impl MoteDB {
         if let Ok(schema) = self.table_registry.get_table(table_name) {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
-
-                debug_log!("[create_vector_index] 使用scan_range扫描LSM...");
                 let start_time = std::time::Instant::now();
+                let mut vectors_to_index = Vec::new();
 
+                // 🚀 Columnar fast path: read vectors directly from column segment
+                if let Some(col_sst) = self.columnar_sstables.get(table_name) {
+                    match col_sst.read_vectors(col_position) {
+                        Ok(vectors) => {
+                            vectors_to_index = vectors;
+                            debug_log!("[create_vector_index] Columnar path: {} vectors in {:?}",
+                                vectors_to_index.len(), start_time.elapsed());
+                        }
+                        Err(e) => { let _ = e; } // columnar read failed, fall through
+                    }
+                }
+
+                // Fallback: scan LSM tree
+                if vectors_to_index.is_empty() {
                 let table_id = self.table_registry.get_table_id(table_name)
                     .unwrap_or(0) as u64;
                 let start_key = table_id << 32;
                 let end_key = (table_id + 1) << 32;
-
-                let mut vectors_to_index = Vec::new();
                 match self.lsm_engine.scan_range(start_key, end_key) {
                     Ok(entries) => {
                         for (composite_key, value) in entries {
@@ -115,6 +126,7 @@ impl MoteDB {
                         debug_log!("[create_vector_index] scan_range失败: {}", e);
                     }
                 }
+                } // end fallback
 
                 let scan_time = start_time.elapsed();
 

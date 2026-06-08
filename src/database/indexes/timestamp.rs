@@ -49,6 +49,31 @@ impl MoteDB {
         let mut entries_to_index = Vec::new();
 
         for table_name in self.table_registry.list_tables()? {
+            // 🚀 Columnar fast path: read timestamps directly from FixedSegment
+            if let Some(col_sst) = self.columnar_sstables.get(&table_name) {
+                // Find first timestamp column
+                if let Ok(schema) = self.table_registry.get_table(&table_name) {
+                    for col_def in &schema.columns {
+                        if matches!(col_def.col_type, crate::types::ColumnType::Timestamp) {
+                            if let Ok(seg) = col_sst.read_fixed_i64(col_def.position) {
+                                for i in 0..col_sst.num_rows {
+                                    if col_sst.row_map.is_deleted(i) { continue; }
+                                    if let Some(ts_micros) = seg.get_i64(i) {
+                                        if ts_micros as u64 > max_indexed_ts {
+                                            let row_id = (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                                            entries_to_index.push((ts_micros as u64, row_id));
+                                        }
+                                    }
+                                }
+                            }
+                            break; // only first timestamp column
+                        }
+                    }
+                }
+                continue; // skip LSM scan for this table
+            }
+
+            // Fallback: LSM scan
             let prefix = self.compute_table_prefix(&table_name);
             let start_key = prefix << 32;
             let end_key = (prefix + 1) << 32;
@@ -63,9 +88,7 @@ impl MoteDB {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
-
                 let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-
                 let data_bytes: Vec<u8> = match &value.data {
                     crate::storage::lsm::ValueData::Inline(bytes) => bytes.to_vec(),
                     crate::storage::lsm::ValueData::Blob(blob_ref) => {
@@ -75,7 +98,6 @@ impl MoteDB {
                         }
                     }
                 };
-
                 if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
                     if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
                         let ts_micros = ts.as_micros_u64();

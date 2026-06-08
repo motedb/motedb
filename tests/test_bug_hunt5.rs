@@ -302,7 +302,7 @@ fn test_empty_string_not_null() {
     assert_eq!(r.len(), 1, "Row with empty string should exist");
     // Empty string should be Text, not Null
     match &r[0][1] {
-        Value::Text(s) => assert_eq!((**s).as_str(), "", "Should be empty string, got '{}'", s),
+        Value::Text(s) => assert_eq!(&**s, "", "Should be empty string, got '{}'", s),
         Value::Null => panic!("Empty string incorrectly stored as NULL"),
         other => panic!("Unexpected type: {:?}", other),
     }

@@ -328,15 +328,19 @@ impl ColumnValueIndex {
             }
         }
 
-        for (key, value) in &keys {
-            let full = self.mem_buffer.insert(key.clone(), ()).map_err(|e| {
-                StorageError::InvalidData(e)
-            })?;
-            if full {
-                if let Some(_guard) = self.drain_lock.try_lock() {
-                    self.drain_immutable_to_btree()?;
-                }
+        // Batch insert into mem_buffer — single RwLock acquisition for all keys
+        let buffer_entries: Vec<(IndexKey, ())> = keys.iter().map(|(k, _)| (k.clone(), ())).collect();
+        let full = self.mem_buffer.batch_insert(buffer_entries).map_err(|e| {
+            StorageError::InvalidData(e)
+        })?;
+        if full {
+            if let Some(_guard) = self.drain_lock.try_lock() {
+                self.drain_immutable_to_btree()?;
             }
+        }
+
+        // Invalidate cache entries (non-locking)
+        for (_, value) in &keys {
             self.lru_cache.invalidate(value);
         }
 
@@ -998,6 +1002,71 @@ impl ColumnValueIndex {
     pub fn entry_count(&self) -> usize {
         let btree = self.btree.read();
         btree.approximate_entry_count()
+    }
+
+    /// Return all unique key values in the index (from mem_buffer + BTree).
+    /// Used by SELECT DISTINCT fast path — O(unique_values) vs O(N) full scan.
+    pub fn all_keys(&self, col_type: &crate::types::ColumnType) -> Result<Vec<Value>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut keys = Vec::new();
+
+        // 1. Collect from mem_buffer (active + immutable)
+        for (idx_key, _) in self.mem_buffer.scan_all() {
+            if seen.insert(idx_key.value_bytes) {
+                keys.push(Self::bytes_to_value(&idx_key.value_bytes, col_type));
+            }
+        }
+
+        // 2. Collect from BTree (flushed data).
+        //    Always scan BTree in addition to mem_buffer — after a flush/compaction,
+        //    mem_buffer may be empty and all data lives in BTree.
+        {
+            let min_key = IndexKey { value_bytes: [0u8; VALUE_DATA_SIZE], row_id: 0 };
+            let max_key = IndexKey { value_bytes: [0xFFu8; VALUE_DATA_SIZE], row_id: u64::MAX };
+            let btree = self.btree.read();
+            if let Ok(entries) = btree.range(&min_key, &max_key) {
+                for (idx_key, _) in entries {
+                    if seen.insert(idx_key.value_bytes) {
+                        keys.push(Self::bytes_to_value(&idx_key.value_bytes, col_type));
+                    }
+                }
+            }
+        }
+
+        Ok(keys)
+    }
+
+    /// Decode a value_bytes (from IndexKey) back to a Value using the column type.
+    fn bytes_to_value(bytes: &[u8; VALUE_DATA_SIZE], col_type: &crate::types::ColumnType) -> Value {
+        match col_type {
+            crate::types::ColumnType::Integer => {
+                let i = i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
+                Value::Integer(i)
+            }
+            crate::types::ColumnType::Float => {
+                let sortable = u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
+                let bits = if sortable & (1u64 << 63) != 0 {
+                    !sortable // negative: flip all bits back
+                } else {
+                    sortable ^ (1u64 << 63) // positive: flip sign bit back
+                };
+                Value::Float(f64::from_bits(bits))
+            }
+            crate::types::ColumnType::Timestamp => {
+                let ts = i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
+                Value::Timestamp(crate::types::Timestamp::from_micros(ts))
+            }
+            crate::types::ColumnType::Boolean => {
+                Value::Bool(bytes[0] != 0)
+            }
+            crate::types::ColumnType::Text => {
+                // Text is stored raw, find the actual length (trim trailing zeros)
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(VALUE_DATA_SIZE);
+                let s = std::str::from_utf8(&bytes[..end]).unwrap_or("");
+                Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))
+            }
+            _ => Value::Null, // Unsupported types fall back to NULL
+        }
     }
 
     // Helper: Convert Value to fixed 12-byte key (zero-padded for short types)

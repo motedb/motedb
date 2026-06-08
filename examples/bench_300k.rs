@@ -1,4 +1,4 @@
-use motedb::{Database, DBConfig, QueryResult};
+use motedb::{Database, DBConfig};
 use tempfile::TempDir;
 use std::time::Instant;
 
@@ -51,10 +51,7 @@ fn bench<F: FnMut()>(_label: &str, mut f: F) -> u64 {
 }
 
 fn rows(db: &Database, sql: &str) -> usize {
-    match db.execute(sql).unwrap().materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows.len(),
-        other => other.affected_rows(),
-    }
+    db.execute(sql).unwrap().materialize().unwrap().row_count()
 }
 
 fn main() {

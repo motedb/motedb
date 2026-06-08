@@ -88,6 +88,15 @@ pub struct MoteDB {
     /// Columnar segment store for TimeSeries tables (Gorilla-compressed immutable segments)
     pub(crate) columnar_store: Arc<crate::storage::ColumnarStore>,
 
+    /// Columnar SSTable for this table (if compaction has produced one).
+    /// Stored per table: table_name → ColumnarSSTable
+    pub(crate) columnar_sstables: Arc<DashMap<String, Arc<crate::storage::lsm::columnar::ColumnarSSTable>>>,
+
+    /// Columnar write buffer — accumulates INSERT rows across batches.
+    /// Zero encoding overhead: Values pushed directly to per-column arrays.
+    /// Finalized during flush/vacuum to a columnar SSTable.
+    pub(crate) columnar_write_bufs: Arc<DashMap<String, Arc<parking_lot::Mutex<crate::storage::lsm::columnar::ColumnarSSTableBuilder>>>>,
+
     /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
     /// Bypasses disk-based column index for O(1) PK → row_id resolution.
     /// Only populated for non-AUTO_INCREMENT primary keys.
@@ -295,6 +304,47 @@ impl MoteDB {
         // Set WAL on columnar store for crash recovery
         columnar_store.set_wal(wal.clone());
 
+        // 🚀 Recover columnar SSTables from disk (zero-encode INSERTs skip WAL)
+        let columnar_sstables = Arc::new(DashMap::new());
+        let indexes_dir = db_path.join("indexes");
+        if indexes_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "sst") {
+                        if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                            if name.ends_with("_col") {
+                                let table_name = name.trim_end_matches("_col").to_string();
+                                if let Ok(col_sst) = crate::storage::lsm::columnar::ColumnarSSTable::open(&path) {
+                                    let rows = col_sst.num_rows;
+                                    columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
+                                    debug_log!("[Recovery] Loaded columnar SSTable for '{}' ({} rows)", table_name, rows);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 🚀 Ensure columnar SSTable exists for all tables.
+        //    After WAL recovery, LSM has data but columnar may not. Build it.
+        //    This guarantees all reads can use the columnar fast path.
+        for table_name in table_registry.list_tables()? {
+            if !columnar_sstables.contains_key(&table_name) {
+                if let Ok(schema) = table_registry.get_table(&table_name) {
+                    let col_types = schema.col_types();
+                    match lsm_engine.compact_to_columnar(&col_types) {
+                        Ok((col_sst, _paths)) => {
+                            columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
+                            debug_log!("[Recovery] Built columnar SSTable for '{}'", table_name);
+                        }
+                        Err(_) => { /* LSM may be empty — skip */ }
+                    }
+                }
+            }
+        }
+
         let mut db = Self {
             path: db_path,
             wal,
@@ -312,6 +362,8 @@ impl MoteDB {
             text_indexes: Arc::new(DashMap::new()),
             column_indexes: Arc::new(DashMap::new()),
             columnar_store,
+            columnar_sstables,
+            columnar_write_bufs: Arc::new(DashMap::new()),
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -506,6 +558,8 @@ impl MoteDB {
             text_indexes: self.text_indexes.clone(),
             column_indexes: self.column_indexes.clone(),
             columnar_store: self.columnar_store.clone(),
+            columnar_sstables: self.columnar_sstables.clone(),
+            columnar_write_bufs: self.columnar_write_bufs.clone(),
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
@@ -673,7 +727,24 @@ impl MoteDB {
             .saturating_add(1_000_000);
         let recovery_lsn = Arc::new(AtomicU64::new(init_lsn));
 
-        // Phase 2: Redo — replay only committed/auto-commit records
+        // Phase 2: Redo — replay into LSM + columnar buffers simultaneously.
+        // Columnar data is finalized below; LSM provides backward compat.
+        // Prepare columnar builders for all tables (pre-allocate before replay)
+        let col_builders: Arc<DashMap<String, Arc<parking_lot::Mutex<
+            crate::storage::lsm::columnar::ColumnarSSTableBuilder
+        >>>> = Arc::new(DashMap::new());
+        for table_name in table_registry.list_tables()? {
+            if let Ok(schema) = table_registry.get_table(&table_name) {
+                let indexes_dir = db_path.join("indexes");
+                std::fs::create_dir_all(&indexes_dir).ok();
+                let col_path = indexes_dir.join(format!("{}_col.sst", &table_name));
+                let builder = crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(
+                    col_path, schema.col_types().to_vec(),
+                );
+                col_builders.insert(table_name.clone(), Arc::new(parking_lot::Mutex::new(builder)));
+            }
+        }
+
         for records in recovered_records.values() {
             for record in records {
                 match record {
@@ -685,39 +756,56 @@ impl MoteDB {
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let value = crate::storage::lsm::Value::new(raw_data.clone(), ts);
                         lsm_engine.put(composite_key, value)?;
+                        // Also write to columnar buffer
+                        if let Some(builder_arc) = col_builders.get(table_name) {
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
+                                let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
+                                let _ = builder_arc.value().lock().add_values(key, ts, false, &row);
+                            }
+                        }
                         _recovered_count += 1;
                     }
                     WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
                         if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        let table_id = table_registry.get_table_id(table_name)
-                            .unwrap_or(0);
+                        let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let row_data = bincode::serialize(data)?;
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let value = crate::storage::lsm::Value::new(row_data, ts);
                         lsm_engine.put(composite_key, value)?;
+                        if let Some(builder_arc) = col_builders.get(table_name) {
+                            let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
+                            let _ = builder_arc.value().lock().add_values(key, ts, false, data);
+                        }
                         _recovered_count += 1;
                     }
                     WALRecord::UpdateRaw { table_name, row_id, raw_new, txn_id, .. } => {
                         if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        let table_id = table_registry.get_table_id(table_name)
-                            .unwrap_or(0);
+                        let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let value = crate::storage::lsm::Value::new(raw_new.clone(), ts);
                         lsm_engine.put(composite_key, value)?;
+                        if let Some(builder_arc) = col_builders.get(table_name) {
+                            if let Ok(row) = crate::storage::row_format::decode_any(raw_new) {
+                                let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
+                                let _ = builder_arc.value().lock().add_values(key, ts, false, &row);
+                            }
+                        }
                         _recovered_count += 1;
                     }
                     WALRecord::Update { table_name, row_id, new_data, txn_id, .. } => {
                         if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        let table_id = table_registry.get_table_id(table_name)
-                            .unwrap_or(0);
+                        let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
-
                         let row_data = bincode::serialize(new_data)?;
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let value = crate::storage::lsm::Value::new(row_data, ts);
                         lsm_engine.put(composite_key, value)?;
+                        if let Some(builder_arc) = col_builders.get(table_name) {
+                            let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
+                            let _ = builder_arc.value().lock().add_values(key, ts, false, new_data);
+                        }
                         _recovered_count += 1;
                     }
                     WALRecord::DeleteRaw { table_name, row_id, txn_id, .. } => {
@@ -881,6 +969,8 @@ impl MoteDB {
             text_indexes: Arc::new(Self::hashmap_to_dashmap(text_indexes)),
             column_indexes: Arc::new(Self::hashmap_to_dashmap(column_indexes)),
             columnar_store,
+            columnar_sstables: Arc::new(DashMap::new()),
+            columnar_write_bufs: Arc::new(DashMap::new()),
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
