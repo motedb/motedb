@@ -729,10 +729,8 @@ impl MoteDB {
         self.increment_pending_updates();
         self.wal.log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
 
-        // 6. Delete from LSM (using tombstone)
-        self.lsm_engine.delete(composite_key, timestamp)?;
-
-        // 🚀 Also add tombstone to columnar buffer (create if first write)
+        // 🚀 Columnar tombstone is the source of truth. LSM delete removed.
+        // Columnar tombstone below marks the row deleted in all reads.
         {
             use dashmap::mapref::entry::Entry;
             let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
