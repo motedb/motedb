@@ -107,6 +107,11 @@ impl ColSegmentStore {
         self.segments.read().len()
     }
 
+    /// Number of rows currently buffered in memory (not yet flushed to a segment).
+    pub fn buffered_row_count(&self) -> usize {
+        self.write_buf.lock().num_rows
+    }
+
     pub fn col_types(&self) -> &[ColumnType] {
         &self.col_types
     }

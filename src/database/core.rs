@@ -97,6 +97,12 @@ pub struct MoteDB {
     /// Finalized during flush/vacuum to a columnar SSTable.
     pub(crate) columnar_write_bufs: Arc<DashMap<String, Arc<parking_lot::Mutex<crate::storage::lsm::columnar::ColumnarSSTableBuilder>>>>,
 
+    /// 🆕 Multi-segment columnar store (append-only + compaction).
+    /// Replaces the single-SSTable full-rewrite path. Each table that opts in
+    /// gets a ColSegmentStore; writes append delta segments (O(1)), reads
+    /// multi-way merge. Coexists with the legacy fields during migration.
+    pub(crate) col_segment_stores: Arc<DashMap<String, Arc<crate::storage::col_segment::ColSegmentStore>>>,
+
     /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
     /// Bypasses disk-based column index for O(1) PK → row_id resolution.
     /// Only populated for non-AUTO_INCREMENT primary keys.
@@ -364,6 +370,7 @@ impl MoteDB {
             columnar_store,
             columnar_sstables,
             columnar_write_bufs: Arc::new(DashMap::new()),
+            col_segment_stores: Arc::new(DashMap::new()),
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
@@ -560,6 +567,7 @@ impl MoteDB {
             columnar_store: self.columnar_store.clone(),
             columnar_sstables: self.columnar_sstables.clone(),
             columnar_write_bufs: self.columnar_write_bufs.clone(),
+            col_segment_stores: self.col_segment_stores.clone(),
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
@@ -971,6 +979,7 @@ impl MoteDB {
             columnar_store,
             columnar_sstables: Arc::new(DashMap::new()),
             columnar_write_bufs: Arc::new(DashMap::new()),
+            col_segment_stores: Arc::new(DashMap::new()),
             pk_lookup: Arc::new(DashMap::new()),
             table_row_count: Arc::new(DashMap::new()),
             table_registry,
