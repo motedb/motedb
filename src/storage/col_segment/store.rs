@@ -126,9 +126,11 @@ impl ColSegmentStore {
         project_cols: &[usize],
         predicate: &dyn Fn(Option<&Value>) -> bool,
     ) -> Vec<(u64, Vec<Value>)> {
-        let mut result: Vec<(u64, Vec<Value>)> = Vec::new();
+        // Pre-estimate result size to avoid Vec reallocations (300K rows = ~18 reallocs otherwise).
+        let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
+        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows);
         let segs = self.segments_snapshot();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(total_rows);
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
@@ -148,6 +150,15 @@ impl ColSegmentStore {
             });
             let fcol_type = filter_col.and_then(|fc| self.col_types.get(fc));
 
+            // Pre-intern filter Text column into ArcString vec to avoid per-row
+            // String allocation in the predicate (WHERE/LIKE on text cols).
+            let fcol_text_interned: Vec<Option<Value>> = if let Some(ref t) = fcol_text {
+                (0..n).map(|i| {
+                    if t.is_null(i) { return None; }
+                    t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                }).collect()
+            } else { Vec::new() };
+
             // Pre-decode project columns (once per segment).
             let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols.iter().map(|&pc| {
                 if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
@@ -159,6 +170,21 @@ impl ColSegmentStore {
                     seg.sst.read_text(pc).ok()
                 } else { None }
             }).collect();
+
+            // Pre-intern Text column values into ArcString once per segment.
+            // Only for full scan (no filter) — filtered scans decode Text lazily
+            // on match to avoid interning non-matching rows.
+            let ptext_interned: Vec<Vec<Option<Value>>> = if filter_col.is_none() {
+                ptext.iter().map(|ts| {
+                    match ts {
+                        Some(t) => (0..n).map(|i| {
+                            if t.is_null(i) { return None; }
+                            t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                        }).collect(),
+                        None => Vec::new(),
+                    }
+                }).collect()
+            } else { Vec::new() };
 
             for &i in &order {
                 if seg.sst.row_map.is_deleted(i) { continue; }
@@ -174,6 +200,8 @@ impl ColSegmentStore {
                             Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
                             _ => None,
                         }
+                    } else if !fcol_text_interned.is_empty() {
+                        fcol_text_interned.get(i).cloned().flatten()
                     } else if let Some(ref t) = fcol_text {
                         t.get_str(i).map(|s| Value::Text(s.to_string().into()))
                     } else { None };
@@ -190,7 +218,13 @@ impl ColSegmentStore {
                             (Some(Some(f)), _, ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
                             (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
                             (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
-                            (_, Some(Some(t)), ColumnType::Text) => t.get_str(i).map(|s| Value::Text(s.to_string().into())),
+                            (_, Some(Some(t)), ColumnType::Text) => {
+                                if !ptext_interned.is_empty() {
+                                    ptext_interned.get(pi).and_then(|v| v.get(i)).cloned().flatten()
+                                } else {
+                                    t.get_str(i).map(|s| Value::Text(s.to_string().into()))
+                                }
+                            }
                             _ => Some(Value::Null),
                         }
                     } else { Some(Value::Null) };
