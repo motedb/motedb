@@ -1653,9 +1653,37 @@ impl QueryExecutor {
             }
         }
 
-        // S9: non-PK ColSegmentStore point queries fall back to full scan
-        // (the index→LSM fetch path below returns empty for segment-backed tables).
+        // S9: non-PK ColSegmentStore point queries. Try column index first
+        // (index → row_ids → cached get_table_row), else projected full scan.
         if !is_pk && self.db.has_col_segment_store(table) {
+            if let Some(index_name) = self.db.index_registry.find_by_column(
+                table, column,
+                crate::database::index_metadata::IndexType::Column
+            ) {
+                if let Some(index) = self.db.column_indexes.get(&index_name) {
+                    let row_ids = index.value()
+                        .get_arc(value)
+                        .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+                    if !row_ids.is_empty() {
+                        let mut result_rows = Vec::with_capacity(row_ids.len());
+                        for &rid in row_ids.iter() {
+                            if let Some(row) = self.db.get_table_row(table, rid)? {
+                                let mut sql_row = SqlRow::new();
+                                sql_row.insert("__row_id__".to_string(), Value::Integer(rid as i64));
+                                sql_row.insert("__table__".to_string(), Value::text(table.to_string()));
+                                for (ci, col) in schema.columns.iter().enumerate() {
+                                    let v = row.get(ci).cloned().unwrap_or(Value::Null);
+                                    sql_row.insert(format!("{}.{}", table, col.name), v);
+                                }
+                                result_rows.push((rid, sql_row));
+                            }
+                        }
+                        let (_, projected) = self.project_columns(&stmt.columns, &result_rows, &schema)?;
+                        return Ok(StreamingQueryResult::SelectReady { columns, rows: projected });
+                    }
+                    return Ok(StreamingQueryResult::SelectReady { columns, rows: vec![] });
+                }
+            }
             return self.execute_full_scan_streaming(stmt, table);
         }
 
@@ -3691,41 +3719,118 @@ impl QueryExecutor {
             _ => None,
         };
 
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        let mut skipped = 0usize;
+        // 🆕 Projected + filtered scan: decode only filter col + output cols,
+        // avoiding full-row Vec<Value> decode for non-matches (the dominant
+        // cost — was 68-197ms for 300K rows; pure column read is <2ms).
+        let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
+            .unwrap_or_else(|| (0..col_types.len()).collect());
 
-        for (_key, _ts, row) in store.scan() {
-            // WHERE filter.
-            if let Some(ref wc) = where_clause {
-                let m = if let Some((pos, ref set)) = in_hashset {
-                    // O(1) HashSet lookup for IN-list.
-                    row.get(pos).map(|v| set.contains(v)).unwrap_or(false)
-                } else {
-                    // General expr eval.
-                    match Self::eval_expr_on_row(wc, &row, schema) {
-                        Ok(Value::Bool(b)) => b,
-                        Ok(Value::Integer(i)) => i != 0,
-                        Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
-                        _ => false,
+        // Extract (filter_col, predicate) from WHERE, or fall back to general.
+        let result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
+            self.col_segment_projected_scan(store, wc, schema, &out_positions, offset, limit)?
+        } else {
+            // No WHERE: full scan, project all output cols.
+            let scanned = store.scan_projected_filtered(None, &out_positions, &|_| true);
+            scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect()
+        };
+
+        Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows })
+    }
+
+    /// Helper: projected scan with WHERE filter for ColSegmentStore tables.
+    /// Extracts the filter column + predicate from the WHERE clause, then uses
+    /// scan_projected_filtered to decode only the needed columns.
+    fn col_segment_projected_scan(
+        &self,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        wc: &crate::sql::ast::Expr,
+        schema: &TableSchema,
+        out_positions: &[usize],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<Value>>> {
+        use crate::sql::ast::{Expr, BinaryOperator};
+        let col_types = store.col_types();
+
+        // Determine filter column + predicate.
+        let (filter_col, pred_box): (Option<usize>, Box<dyn Fn(Option<&Value>) -> bool>) = match wc {
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(cn), Expr::Literal(v)) => {
+                        let pos = schema.get_column_position(cn).unwrap_or(0);
+                        let val = v.clone();
+                        (Some(pos), Box::new(move |fv: Option<&Value>| fv == Some(&val)))
                     }
-                };
-                if !m { continue; }
+                    _ => {
+                        // General: fallback to MergeCursor scan.
+                        return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit);
+                    }
+                }
             }
+            Expr::Like { expr, pattern, negated: false } => {
+                match (expr.as_ref(), pattern.as_ref()) {
+                    (Expr::Column(cn), Expr::Literal(Value::Text(s))) => {
+                        let pat = s.as_str();
+                        if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                            let prefix = pat[..pat.len()-1].to_string();
+                            let pos = schema.get_column_position(cn).unwrap_or(0);
+                            (Some(pos), Box::new(move |fv: Option<&Value>| {
+                                match fv { Some(Value::Text(s)) => s.as_str().starts_with(&prefix), _ => false }
+                            }))
+                        } else {
+                            return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit);
+                        }
+                    }
+                    _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+                }
+            }
+            Expr::In { expr, list, negated: false } if list.iter().all(|e| matches!(e, Expr::Literal(_))) => {
+                match expr.as_ref() {
+                    Expr::Column(cn) => {
+                        let pos = schema.get_column_position(cn).unwrap_or(0);
+                        let set: std::collections::HashSet<Value> = list.iter()
+                            .filter_map(|e| if let Expr::Literal(v) = e { Some(v.clone()) } else { None })
+                            .collect();
+                        (Some(pos), Box::new(move |fv: Option<&Value>| fv.map(|v| set.contains(v)).unwrap_or(false)))
+                    }
+                    _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+                }
+            }
+            _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+        };
 
-            if skipped < offset { skipped += 1; continue; }
+        let scanned = store.scan_projected_filtered(filter_col, out_positions, &*pred_box);
+        Ok(scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect())
+    }
 
-            // Project: use resolve_select_positions for simple columns, else full row.
-            let projected: Vec<Value> = match Self::resolve_select_positions(&stmt.columns, schema) {
-                Some(positions) => positions.iter()
-                    .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
-                    .collect(),
-                None => row.clone(),
+    /// Fallback: general WHERE eval via MergeCursor (handles complex expressions).
+    fn col_segment_general_scan(
+        &self,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        wc: &crate::sql::ast::Expr,
+        schema: &TableSchema,
+        out_positions: &[usize],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut rows = Vec::new();
+        let mut skipped = 0usize;
+        for (_key, _ts, row) in store.scan() {
+            let m = match Self::eval_expr_on_row(wc, &row, schema) {
+                Ok(Value::Bool(b)) => b,
+                Ok(Value::Integer(i)) => i != 0,
+                Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                _ => false,
             };
+            if !m { continue; }
+            if skipped < offset { skipped += 1; continue; }
+            let projected: Vec<Value> = out_positions.iter()
+                .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
+                .collect();
             rows.push(projected);
             if rows.len() >= limit { break; }
         }
-
-        Ok(StreamingQueryResult::SelectReady { columns, rows })
+        Ok(rows)
     }
 
     /// Extract schema positions for simple column references in SELECT.
