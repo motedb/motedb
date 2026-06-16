@@ -3629,17 +3629,44 @@ impl QueryExecutor {
         let limit = stmt.limit.unwrap_or(usize::MAX);
         let offset = stmt.offset.unwrap_or(0);
 
+        // IN (literal list) HashSet fast path: avoid O(rows × list_len) linear scan.
+        // For `WHERE col IN (v1, v2, ...)`, build a HashSet once and do O(1) lookup per row.
+        let in_hashset: Option<(usize /*col_pos*/, std::collections::HashSet<Value>)> = match &where_clause {
+            Some(crate::sql::ast::Expr::In { expr, list, negated: false })
+                if list.iter().all(|e| matches!(e, crate::sql::ast::Expr::Literal(_))) =>
+            {
+                match expr.as_ref() {
+                    crate::sql::ast::Expr::Column(col_name) => {
+                        schema.get_column_position(col_name).map(|pos| {
+                            let set: std::collections::HashSet<Value> = list.iter()
+                                .filter_map(|e| if let crate::sql::ast::Expr::Literal(v) = e { Some(v.clone()) } else { None })
+                                .collect();
+                            (pos, set)
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
         let mut rows: Vec<Vec<Value>> = Vec::new();
         let mut skipped = 0usize;
 
         for (_key, _ts, row) in store.scan() {
-            // WHERE filter via general expr eval (handles IN/= /LIKE/etc. uniformly).
+            // WHERE filter.
             if let Some(ref wc) = where_clause {
-                let m = match Self::eval_expr_on_row(wc, &row, schema) {
-                    Ok(Value::Bool(b)) => b,
-                    Ok(Value::Integer(i)) => i != 0,
-                    Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
-                    _ => false,
+                let m = if let Some((pos, ref set)) = in_hashset {
+                    // O(1) HashSet lookup for IN-list.
+                    row.get(pos).map(|v| set.contains(v)).unwrap_or(false)
+                } else {
+                    // General expr eval.
+                    match Self::eval_expr_on_row(wc, &row, schema) {
+                        Ok(Value::Bool(b)) => b,
+                        Ok(Value::Integer(i)) => i != 0,
+                        Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                        _ => false,
+                    }
                 };
                 if !m { continue; }
             }

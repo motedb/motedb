@@ -57,8 +57,14 @@ impl MoteDB {
                 if self.has_col_segment_store(table_name) {
                     let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
                     store.flush_buffer()?;
+                    // Compact to a single segment so CREATE INDEX reads one file
+                    // with no dedup overhead (matches the pre-regression baseline path).
+                    while store.needs_compaction() {
+                        let _ = store.compact_once();
+                    }
                     let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(SORT_BATCH);
                     let segs = store.segments_snapshot();
+                    // After compaction typically 1 segment; still handle N for safety.
                     use std::collections::HashSet;
                     let mut seen_keys: HashSet<u64> = HashSet::new();
                     for seg in segs.iter().rev() {
