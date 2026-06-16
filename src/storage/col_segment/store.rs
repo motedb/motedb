@@ -87,10 +87,12 @@ impl ColSegmentStore {
     }
 
     /// Point lookup: newest segment first, return first hit.
+    /// Uses per-segment column decode cache — first access decompresses each
+    /// column once, subsequent lookups (incl. other keys) reuse the cache.
     pub fn get(&self, key: u64) -> Option<Vec<Value>> {
         let segs = self.segments.read();
         for seg in segs.iter().rev() {
-            if let Some(row) = seg.sst.get_row(key, &self.col_types) {
+            if let Some(row) = seg.get_row_cached(key, &self.col_types) {
                 return Some(row);
             }
         }

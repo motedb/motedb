@@ -1624,23 +1624,40 @@ impl QueryExecutor {
         value: &Value,
         post_filters: &[Expr],
     ) -> Result<StreamingQueryResult> {
-        // S9: ColSegmentStore tables store data in segment files, not the LSM.
-        // The point-query path below fetches rows via lsm_engine.scan_range,
-        // which returns empty for these tables. Fall back to full scan (which
-        // reads ColSegmentStore correctly) until point-query learns to fetch
-        // from ColSegmentStore.
-        if self.db.has_col_segment_store(table) {
-            return self.execute_full_scan_streaming(stmt, table);
-        }
         let schema = self.db.get_table_schema(table)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
-        // 🚀 Fast path for AUTO_INCREMENT primary key: skip column index, use direct LSM get
-        let is_pk = schema.primary_key()
-            .map(|pk| pk == column)
-            .unwrap_or(false);
-
+        let is_pk = schema.primary_key().map(|pk| pk == column).unwrap_or(false);
         let is_auto_increment_pk = is_pk && schema.is_primary_key_auto_increment();
+
+        // S9: AUTO_INCREMENT PK on ColSegmentStore — cached point lookup.
+        // Uses get_row_cached (per-column decode cache), O(1) after first access.
+        if is_auto_increment_pk && self.db.has_col_segment_store(table) {
+            let row_id = match value {
+                Value::Integer(id) if *id >= 0 => *id as RowId,
+                _ => return Ok(StreamingQueryResult::SelectReady { columns, rows: vec![] }),
+            };
+            let composite_key = self.db.make_composite_key(table, row_id);
+            if let Some(store) = self.db.col_segment_stores.get(table) {
+                if let Some(row) = store.get(composite_key) {
+                    self.db.row_cache.put(table.to_string(), row_id, row.clone());
+                    let sql_row = row_to_sql_row(&row, &schema)?;
+                    let mut prefixed = SqlRow::new();
+                    prefixed.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                    prefixed.insert("__table__".to_string(), Value::text(table.to_string()));
+                    for (cn, v) in sql_row { prefixed.insert(format!("{}.{}", table, cn), v); }
+                    let (_, result_rows) = self.project_columns(&stmt.columns, &[(row_id, prefixed)], &schema)?;
+                    return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
+                }
+                return Ok(StreamingQueryResult::SelectReady { columns, rows: vec![] });
+            }
+        }
+
+        // S9: non-PK ColSegmentStore point queries fall back to full scan
+        // (the index→LSM fetch path below returns empty for segment-backed tables).
+        if !is_pk && self.db.has_col_segment_store(table) {
+            return self.execute_full_scan_streaming(stmt, table);
+        }
 
         // If SELECT expressions need the full evaluator, fall back to materialized path
         if Self::select_needs_materialized(stmt) {
