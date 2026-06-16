@@ -1859,10 +1859,13 @@ impl MoteDB {
                 })
                 .collect();
             store.append_rows(&store_rows)?;
-            // Flush periodically to bound the in-memory buffer (embedded: ~4K rows).
-            if store.buffered_row_count() >= 4000 {
+            // Flush periodically to bound the in-memory buffer. 20K rows keeps
+            // buffer ~3MB while limiting segment count (500K → ~25 segs vs 125).
+            if store.buffered_row_count() >= 20000 {
                 store.flush_buffer()?;
-                if store.needs_compaction() {
+                // Compact aggressively to keep segment count low (bounds the
+                // heap memory used by per-segment file_data reads).
+                while store.needs_compaction() {
                     let _ = store.compact_once();
                 }
             }
