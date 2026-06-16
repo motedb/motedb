@@ -107,6 +107,12 @@ impl ColSegmentStore {
         self.segments.read().len()
     }
 
+    /// Snapshot of active segments (oldest→newest). Callers iterate directly
+    /// for single-column reads (e.g. CREATE INDEX) without full-row decode.
+    pub fn segments_snapshot(&self) -> Vec<Arc<Segment>> {
+        self.segments.read().iter().cloned().collect()
+    }
+
     /// Number of rows currently buffered in memory (not yet flushed to a segment).
     pub fn buffered_row_count(&self) -> usize {
         self.write_buf.lock().num_rows

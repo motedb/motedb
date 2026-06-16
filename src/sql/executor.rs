@@ -3127,7 +3127,18 @@ impl QueryExecutor {
     fn execute_full_scan_streaming(&self, stmt: &SelectStmt, table: &str) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
 
-        // Auto-finalize unflushed columnar write buffer before query
+        // S7: when the table uses the multi-segment ColSegmentStore, data is
+        // queryable via multi-way merge — no finalize/merge needed. Just flush
+        // pending buffer (cheap delta). Eliminates read-triggered full-table merge.
+        if self.db.has_col_segment_store(table) {
+            let col_types = schema.col_types().to_vec();
+            if let Ok(store) = self.db.get_or_create_col_segment_store(table, col_types.clone()) {
+                let _ = store.flush_buffer();
+                return self.execute_full_scan_via_col_segment(stmt, table, &schema, &store);
+            }
+        }
+
+        // Legacy path: finalize write buffer (with merge) so SSTable has all data.
         self.db.finalize_columnar_buffer(table);
 
         // 🚀 Columnar SSTable fast path: when a columnar SSTable exists for this
@@ -3254,6 +3265,62 @@ impl QueryExecutor {
                                     row_indices: Some(indices), num_rows: col_sst.num_rows,
                                     row_map: col_sst.row_map.clone(),
                                 });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // IN (literal list): WHERE col IN (v1, v2, ...) — columnar scan with
+            // HashSet membership test. Avoids the LSM-backed partial-decode path
+            // which returns empty for columnar tables.
+            if !handled {
+                if let Some(Expr::In { expr, list, negated: false }) = &stmt.where_clause {
+                    if let Expr::Column(filter_col) = expr.as_ref() {
+                        if list.iter().all(|e| matches!(e, Expr::Literal(_))) {
+                            if let Some(filter_pos) = schema.get_column_position(filter_col) {
+                                if let Some(col_sst) = self.db.columnar_sstables.get(table) {
+                                    let set: std::collections::HashSet<Value> = list.iter()
+                                        .filter_map(|e| if let Expr::Literal(v) = e { Some(v.clone()) } else { None })
+                                        .collect();
+                                    // Decode the filter column once, find matching row indices.
+                                    let matches: Vec<usize> = if col_sst.column_tags[filter_pos].is_fixed() {
+                                        let seg = col_sst.read_fixed_i64(filter_pos).ok();
+                                        let mut m = Vec::new();
+                                        if let Some(ref seg) = seg {
+                                            for i in 0..col_sst.num_rows {
+                                                if col_sst.row_map.is_deleted(i) { continue; }
+                                                if let Some(v) = seg.get_i64(i) {
+                                                    if set.contains(&Value::Integer(v)) { m.push(i); }
+                                                }
+                                            }
+                                        }
+                                        m
+                                    } else {
+                                        let seg = col_sst.read_text(filter_pos).ok();
+                                        let mut m = Vec::new();
+                                        if let Some(ref seg) = seg {
+                                            for i in 0..col_sst.num_rows {
+                                                if col_sst.row_map.is_deleted(i) { continue; }
+                                                if let Some(s) = seg.get_str(i) {
+                                                    if set.contains(&Value::Text(s.to_string().into())) { m.push(i); }
+                                                }
+                                            }
+                                        }
+                                        m
+                                    };
+                                    let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
+                                    for ci in 0..col_types.len() {
+                                        if col_sst.column_tags[ci].is_fixed() {
+                                            if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg)); }
+                                        } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
+                                    }
+                                    return Ok(StreamingQueryResult::SelectColumnar {
+                                        columns: column_names, segments,
+                                        row_indices: Some(matches), num_rows: col_sst.num_rows,
+                                        row_map: col_sst.row_map.clone(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -3545,6 +3612,52 @@ impl QueryExecutor {
             max_result_rows: None,
             size_hint: None,
         })
+    }
+
+    /// S7: full-table scan via the multi-segment ColSegmentStore.
+    fn execute_full_scan_via_col_segment(
+        &self,
+        stmt: &SelectStmt,
+        table: &str,
+        schema: &TableSchema,
+        store: &crate::storage::col_segment::ColSegmentStore,
+    ) -> Result<StreamingQueryResult> {
+        let col_types = schema.col_types().to_vec();
+        let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
+        let where_clause = stmt.where_clause.clone();
+
+        let limit = stmt.limit.unwrap_or(usize::MAX);
+        let offset = stmt.offset.unwrap_or(0);
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut skipped = 0usize;
+
+        for (_key, _ts, row) in store.scan() {
+            // WHERE filter via general expr eval (handles IN/= /LIKE/etc. uniformly).
+            if let Some(ref wc) = where_clause {
+                let m = match Self::eval_expr_on_row(wc, &row, schema) {
+                    Ok(Value::Bool(b)) => b,
+                    Ok(Value::Integer(i)) => i != 0,
+                    Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                    _ => false,
+                };
+                if !m { continue; }
+            }
+
+            if skipped < offset { skipped += 1; continue; }
+
+            // Project: use resolve_select_positions for simple columns, else full row.
+            let projected: Vec<Value> = match Self::resolve_select_positions(&stmt.columns, schema) {
+                Some(positions) => positions.iter()
+                    .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
+                    .collect(),
+                None => row.clone(),
+            };
+            rows.push(projected);
+            if rows.len() >= limit { break; }
+        }
+
+        Ok(StreamingQueryResult::SelectReady { columns, rows })
     }
 
     /// Extract schema positions for simple column references in SELECT.
@@ -6694,46 +6807,119 @@ impl QueryExecutor {
             map
         };
 
-        // Scan and build HashSet directly
-        let raw_iter = self.db.scan_table_raw_streaming(table_name).ok()?;
-        let has_where = compiled_where.is_some();
-        let cap = if has_where { 1024 } else { 16384 };
-        let mut set = std::collections::HashSet::with_capacity(cap);
-        let mut where_buf = Vec::with_capacity(where_positions.len().max(1));
+        // Scan and build HashSet directly.
+        // IMPORTANT: columnar tables (USING COLUMN) store data in the columnar
+        // SSTable, NOT in the LSM row store. The legacy raw scan path below would
+        // return empty/obsolete data for columnar tables (bug: IN subquery on a
+        // columnar table silently matched 0 rows). So we branch on storage type.
+        let mut set = if self.db.is_columnar_table(table_name) {
+            self.build_in_hashset_from_columnar(
+                table_name, &col_types, inner_col_pos,
+                compiled_where.as_ref(), &where_positions, &where_pos_to_idx,
+            )?
+        } else {
+            let raw_iter = self.db.scan_table_raw_streaming(table_name).ok()?;
+            let has_where = compiled_where.is_some();
+            let cap = if has_where { 1024 } else { 16384 };
+            let mut set = std::collections::HashSet::with_capacity(cap);
+            let mut where_buf = Vec::with_capacity(where_positions.len().max(1));
 
-        for result in raw_iter {
-            let (_row_id, raw_bytes) = match result {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            // Phase 1: WHERE eval on partial decode
-            if let Some(ref cw) = compiled_where {
-                let ctx = match crate::storage::row_format::RowParseContext::parse(
-                    &raw_bytes, &col_types, fixed_count,
-                ) {
-                    Some(c) => c,
-                    None => continue,
+            for result in raw_iter {
+                let (_row_id, raw_bytes) = match result {
+                    Ok(r) => r,
+                    Err(_) => continue,
                 };
-                if ctx.decode_columns(&raw_bytes, &col_types, &where_positions, &mut where_buf).is_err() {
-                    continue;
-                }
-                if !cw.eval_at(&where_buf, &where_pos_to_idx).unwrap_or(false) {
-                    continue;
-                }
-            }
 
-            // Phase 2: Decode the SELECT column and insert into HashSet
-            let val = crate::storage::row_format::get_column(&raw_bytes, &col_types, inner_col_pos)
-                .unwrap_or(Value::Null);
-            set.insert(val);
-        }
+                // Phase 1: WHERE eval on partial decode
+                if let Some(ref cw) = compiled_where {
+                    let ctx = match crate::storage::row_format::RowParseContext::parse(
+                        &raw_bytes, &col_types, fixed_count,
+                    ) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    if ctx.decode_columns(&raw_bytes, &col_types, &where_positions, &mut where_buf).is_err() {
+                        continue;
+                    }
+                    if !cw.eval_at(&where_buf, &where_pos_to_idx).unwrap_or(false) {
+                        continue;
+                    }
+                }
+
+                // Phase 2: Decode the SELECT column and insert into HashSet
+                let val = crate::storage::row_format::get_column(&raw_bytes, &col_types, inner_col_pos)
+                    .unwrap_or(Value::Null);
+                set.insert(val);
+            }
+            set
+        };
 
         if set.is_empty() {
             // Empty set means outer IN should match nothing
             return Some(set);
         }
 
+        Some(set)
+    }
+
+    /// Columnar-backed implementation of the IN-subquery hashset build.
+    /// Finalizes any pending write buffer, then projects the inner SELECT
+    /// column plus WHERE-referenced columns out of the columnar SSTable and
+    /// filters positionally. Returns the set of matching inner-column values.
+    fn build_in_hashset_from_columnar(
+        &self,
+        table_name: &str,
+        col_types: &[crate::types::ColumnType],
+        inner_col_pos: usize,
+        compiled_where: Option<&CompiledWhere>,
+        where_positions: &[usize],
+        where_pos_to_idx: &[Option<usize>],
+    ) -> Option<std::collections::HashSet<Value>> {
+        // Ensure all buffered rows are in the SSTable before scanning.
+        self.db.finalize_columnar_buffer(table_name);
+
+        // Collect distinct column positions we need to materialize:
+        // the inner SELECT column + every column referenced by WHERE.
+        let mut needed: Vec<usize> = vec![inner_col_pos];
+        needed.extend_from_slice(where_positions);
+        needed.sort_unstable();
+        needed.dedup();
+
+        let mut iter = self.db
+            .scan_columnar_sstable_projection(table_name, col_types, &needed)
+            .ok()?;
+
+        // Map from schema column position → index within `needed` (and thus
+        // within the iterator's row, since projection preserves order).
+        let proj_idx_of = |col_pos: usize| -> Option<usize> {
+            needed.iter().position(|&c| c == col_pos)
+        };
+        let inner_proj = proj_idx_of(inner_col_pos)?;
+
+        let has_where = compiled_where.is_some();
+        let cap = if has_where { 1024 } else { 16384 };
+        let mut set = std::collections::HashSet::with_capacity(cap);
+        let mut where_buf: Vec<Value> = Vec::with_capacity(where_positions.len().max(1));
+
+        for row in iter.by_ref() {
+            if let Some(cw) = compiled_where {
+                where_buf.clear();
+                let mut ok = true;
+                for &schema_pos in where_positions {
+                    let pi = match proj_idx_of(schema_pos) {
+                        Some(p) => p,
+                        None => { ok = false; break; }
+                    };
+                    where_buf.push(row.get(pi).cloned().unwrap_or(Value::Null));
+                }
+                if !ok { continue; }
+                if !cw.eval_at(&where_buf, where_pos_to_idx).unwrap_or(false) {
+                    continue;
+                }
+            }
+            let val = row.get(inner_proj).cloned().unwrap_or(Value::Null);
+            set.insert(val);
+        }
         Some(set)
     }
 

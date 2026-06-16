@@ -50,8 +50,75 @@ impl MoteDB {
                 let mut indexed_count = 0;
                 const SORT_BATCH: usize = 50000;
 
-                // 🚀 Fast path: use columnar SSTable data directly (O(1) per value)
-                if let Some(col_sst) = self.columnar_sstables.get(table_name) {
+                // S8: multi-segment ColSegmentStore path. Flush pending buffer
+                // (cheap delta), then iterate each segment's target column directly
+                // — same O(1)-per-value access as the legacy single-SSTable fast
+                // path, extended to N segments with newest-version-wins dedup.
+                if self.has_col_segment_store(table_name) {
+                    let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
+                    store.flush_buffer()?;
+                    let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(SORT_BATCH);
+                    let segs = store.segments_snapshot();
+                    use std::collections::HashSet;
+                    let mut seen_keys: HashSet<u64> = HashSet::new();
+                    for seg in segs.iter().rev() {
+                        let n = seg.sst.num_rows;
+                        if seg.sst.column_tags[col_position].is_fixed() {
+                            if let Ok(fseg) = seg.sst.read_fixed_i64(col_position) {
+                                for i in 0..n {
+                                    if seg.sst.row_map.is_deleted(i) { continue; }
+                                    let key = seg.sst.row_map.key(i);
+                                    if !seen_keys.insert(key) { continue; }
+                                    let row_id = (key & 0xFFFFFFFF) as RowId;
+                                    let val = match &col_types[col_position] {
+                                        crate::types::ColumnType::Integer =>
+                                            fseg.get_i64(i).map(crate::types::Value::Integer),
+                                        crate::types::ColumnType::Float =>
+                                            fseg.get_f64(i).map(crate::types::Value::Float),
+                                        _ => None,
+                                    };
+                                    if let Some(v) = val {
+                                        batch.push((v, row_id));
+                                        if batch.len() >= SORT_BATCH {
+                                            batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                            indexed_count += batch.len();
+                                            let _ = index_arc.batch_insert(std::mem::take(&mut batch));
+                                            batch = Vec::with_capacity(SORT_BATCH);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Ok(tseg) = seg.sst.read_text(col_position) {
+                            for i in 0..n {
+                                if seg.sst.row_map.is_deleted(i) { continue; }
+                                let key = seg.sst.row_map.key(i);
+                                if !seen_keys.insert(key) { continue; }
+                                let row_id = (key & 0xFFFFFFFF) as RowId;
+                                if let Some(s) = tseg.get_str(i) {
+                                    batch.push((
+                                        crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s))),
+                                        row_id,
+                                    ));
+                                    if batch.len() >= SORT_BATCH {
+                                        batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                                        indexed_count += batch.len();
+                                        let _ = index_arc.batch_insert(std::mem::take(&mut batch));
+                                        batch = Vec::with_capacity(SORT_BATCH);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !batch.is_empty() {
+                        batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        indexed_count += batch.len();
+                        let _ = index_arc.batch_insert(batch);
+                    }
+                    let _ = index_arc.flush();
+                    let elapsed = start_time.elapsed();
+                    debug_log!("[create_column_index] ColSegment path: {} values in {:?}", indexed_count, elapsed);
+                } else if let Some(col_sst) = self.columnar_sstables.get(table_name) {
+                    // Legacy single-SSTable path.
                     let num_rows = col_sst.num_rows;
                     let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(SORT_BATCH);
 
