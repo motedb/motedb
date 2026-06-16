@@ -1844,10 +1844,14 @@ impl MoteDB {
                 })
                 .collect();
             store.append_rows(&store_rows)?;
-            // Flush periodically to bound the in-memory buffer (embedded: ~1K rows).
+            // Flush periodically to bound the in-memory buffer (embedded: ~4K rows).
             // Cheap: writes a delta segment, does NOT read old data.
-            if store.buffered_row_count() >= 1000 {
+            if store.buffered_row_count() >= 4000 {
                 store.flush_buffer()?;
+                // Compact when segments accumulate (bounds merge fan-out).
+                if store.needs_compaction() {
+                    let _ = store.compact_once();
+                }
             }
         }
 

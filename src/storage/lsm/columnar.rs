@@ -114,7 +114,7 @@ impl ColumnTypeTag {
     }
 
     #[allow(dead_code)]
-    fn to_column_type(&self) -> ColumnType {
+    pub(crate) fn to_column_type(&self) -> ColumnType {
         match self {
             Self::Integer => ColumnType::Integer,
             Self::Float => ColumnType::Float,
@@ -441,9 +441,11 @@ impl TextSegment {
 /// Column data is accessed via zero-copy slices into the mmap — no heap copies.
 pub struct ColumnarSSTable {
     pub path: PathBuf,
-    mmap: Arc<Mmap>,
+    file_data: Vec<u8>,
     #[allow(dead_code)]
-    file: File,
+    mmap: Option<Arc<Mmap>>,
+    #[allow(dead_code)]
+    file: Option<File>,
     #[allow(dead_code)]
     header: ColumnarHeader,
     column_index: Vec<ColumnIndexEntry>,
@@ -453,6 +455,7 @@ pub struct ColumnarSSTable {
 }
 
 impl ColumnarSSTable {
+
     /// Check if a file is a columnar SSTable by reading its magic.
     pub fn is_columnar<P: AsRef<Path>>(path: P) -> bool {
         let path = path.as_ref();
@@ -504,18 +507,18 @@ impl ColumnarSSTable {
             footer_buf[12], footer_buf[13], footer_buf[14], footer_buf[15],
         ]);
 
-        // mmap the file
-        let mmap = unsafe { Mmap::map(&file).ok() }.map(Arc::new);
+        // Read entire file into memory. (mmap was restored then reverted: the
+        // merge path in finalize_columnar_buffer produces files whose row_map
+        // offset/length can disagree with the on-disk layout, causing mmap
+        // index-out-of-bounds. The heap read is correct until that merge bug
+        // is fixed. Atomic temp+rename publish is kept for crash-safety.)
+        file.seek(SeekFrom::Start(0))?;
+        let mut file_data = vec![0u8; file_len as usize];
+        file.read_exact(&mut file_data)?;
+        let mmap: Option<Arc<Mmap>> = None;
 
         // Read header
-        let header_bytes = if let Some(ref m) = mmap {
-            &m[..HEADER_SIZE]
-        } else {
-            file.seek(SeekFrom::Start(0))?;
-            let mut h = [0u8; HEADER_SIZE];
-            file.read_exact(&mut h)?;
-            return Err(StorageError::InvalidData("mmap failed".into()));
-        };
+        let header_bytes = &file_data[..HEADER_SIZE];
         let header = ColumnarHeader::deserialize(header_bytes)?;
         let num_columns = header.num_columns as usize;
         let num_rows = header.num_rows as usize;
@@ -523,7 +526,7 @@ impl ColumnarSSTable {
         // Read column index
         let ci_size = num_columns * COLUMN_INDEX_ENTRY_SIZE;
         let ci_start = HEADER_SIZE;
-        let ci_data = &mmap.as_ref().unwrap()[ci_start..ci_start + ci_size];
+        let ci_data = &file_data[ci_start..ci_start + ci_size];
         let column_index: Vec<ColumnIndexEntry> = (0..num_columns)
             .map(|i| {
                 let off = i * COLUMN_INDEX_ENTRY_SIZE;
@@ -540,12 +543,17 @@ impl ColumnarSSTable {
             })
             .collect();
 
-        // Read row map from mmap (zero-copy)
-        let row_map = RowMap::from_mmap(
-            mmap.as_ref().unwrap().clone(),
-            row_map_offset as usize,
+        // Row map: copy from file_data
+        let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
+        let rm_data = file_data[row_map_offset as usize..row_map_offset as usize + rm_total].to_vec();
+        let row_map = RowMap {
             num_rows,
-        )?;
+            keys_offset: 0,
+            timestamps_offset: keys_size,
+            deleted_offset: keys_size + timestamps_size,
+            deleted_len,
+            data: SegData::Owned(rm_data),
+        };
 
         let column_tags: Vec<ColumnTypeTag> = header.column_tags[..num_columns]
             .iter()
@@ -554,8 +562,9 @@ impl ColumnarSSTable {
 
         Ok(Self {
             path,
-            mmap: mmap.unwrap(),
-            file,
+            file_data,
+            mmap: mmap,
+            file: None,
             header,
             column_index,
             row_map,
@@ -587,7 +596,7 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
-        let decompressed = Self::decompress_segment(&self.mmap[start..end]);
+        let decompressed = Self::decompress_segment(&self.file_data[start..end]);
         FixedSegment::from_bytes(&decompressed, self.num_rows, tag)
     }
 
@@ -599,7 +608,7 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
-        let decompressed = Self::decompress_segment(&self.mmap[start..end]);
+        let decompressed = Self::decompress_segment(&self.file_data[start..end]);
         TextSegment::from_bytes(&decompressed, self.num_rows)
     }
 
@@ -614,20 +623,20 @@ impl ColumnarSSTable {
         let mut result = Vec::new();
         let mut pos = seg_start + null_bytes;
         for i in 0..self.num_rows {
-            if (self.mmap[seg_start + i/8] >> (i%8)) & 1 != 0 {
+            if (self.file_data[seg_start + i/8] >> (i%8)) & 1 != 0 {
                 // Null — skip to next row (need to read len to skip bytes)
                 if pos + 2 <= seg_end {
-                    let len = u16::from_le_bytes([self.mmap[pos], self.mmap[pos+1]]) as usize;
+                    let len = u16::from_le_bytes([self.file_data[pos], self.file_data[pos+1]]) as usize;
                     pos += 2 + len;
                 }
                 continue;
             }
             if self.row_map.is_deleted(i) { continue; }
             if pos + 2 > seg_end { break; }
-            let len = u16::from_le_bytes([self.mmap[pos], self.mmap[pos+1]]) as usize;
+            let len = u16::from_le_bytes([self.file_data[pos], self.file_data[pos+1]]) as usize;
             pos += 2;
             if len == 0 || pos + len > seg_end { continue; }
-            if let Ok(geom) = bincode::deserialize::<crate::types::Geometry>(&self.mmap[pos..pos+len]) {
+            if let Ok(geom) = bincode::deserialize::<crate::types::Geometry>(&self.file_data[pos..pos+len]) {
                 let row_id = (self.row_map.key(i) & 0xFFFFFFFF) as RowId;
                 result.push((row_id, geom));
             }
@@ -669,7 +678,7 @@ impl ColumnarSSTable {
     pub fn read_vectors(&self, col_idx: usize) -> Result<Vec<(RowId, Vec<f32>)>> {
         let entry = &self.column_index[col_idx];
         let raw = Self::decompress_segment(
-            &self.mmap[entry.offset as usize..(entry.offset + entry.size) as usize]
+            &self.file_data[entry.offset as usize..(entry.offset + entry.size) as usize]
         );
         let data = raw.as_ref();
         let null_bytes = (self.num_rows + 7) / 8;
@@ -886,10 +895,28 @@ impl ColumnarSSTableBuilder {
         Ok(())
     }
 
-    /// Write the columnar SSTable to disk.
+    /// Write the columnar SSTable to disk (consumes the builder).
     pub fn finish(mut self) -> Result<()> {
+        self.finish_and_reset()
+    }
+
+    /// Look up the latest entry for a key in the write buffer.
+    /// Returns Some(true) if tombstoned, Some(false) if live, None if not found.
+    pub fn check_key(&self, key: u64) -> Option<bool> {
+        for i in (0..self.num_rows).rev() {
+            if self.keys[i] == key {
+                return Some(self.deleted[i]);
+            }
+        }
+        None
+    }
+
+    /// Write the columnar SSTable to disk WITHOUT consuming self.
+    /// On success: clears internal buffers (data is now on disk).
+    /// On failure: ALL data is preserved for retry.
+    pub fn finish_and_reset(&mut self) -> Result<()> {
         if self.finished { return Ok(()); }
-        self.finished = true;
+        if self.num_rows == 0 { return Ok(()); }
 
         let num_cols = self.column_tags.len();
         let num_rows = self.num_rows;
@@ -1050,12 +1077,40 @@ impl ColumnarSSTableBuilder {
         footer[16..20].copy_from_slice(&COLUMNAR_MAGIC.to_le_bytes());
         buf.extend_from_slice(&footer);
 
-        // Write atomically
-        let file = OpenOptions::new().write(true).create(true).truncate(true).open(&self.path)?;
+        // Atomic publish via temp-file + rename: write the full buffer to a
+        // sibling temp file, fsync it, then atomically rename onto the final
+        // path. This guarantees that any concurrent reader (mmap-based) either
+        // sees the previous complete file or the new complete file — never a
+        // half-written one (which was the root cause of the mmap index-out-of-
+        // bounds panics on repeated finalize). Rename also lets us drop the
+        // per-finalize fsync of the *live* file: durability is provided by the
+        // WAL checkpoint path, and the temp-file fsync is what makes rename
+        // crash-safe on POSIX.
+        let final_path = self.path.clone();
+        let dir = final_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let tmp_path = dir.join(format!(
+            ".{}.tmp",
+            final_path.file_name().and_then(|n| n.to_str()).unwrap_or("col.tmp")
+        ));
+        let file = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&buf)?;
         writer.flush()?;
+        // fsync the temp file so the rename is durable across crashes.
+        writer.get_ref().sync_all()?;
         drop(writer);
+        // Atomic publish. On POSIX, rename guarantees readers see the new file
+        // in its entirety once the syscall returns.
+        std::fs::rename(&tmp_path, &final_path)?;
+
+        // Success: clear internal state (data is now on disk)
+        // Reset finished to false so the builder can be reused for new data.
+        self.finished = false;
+        self.num_rows = 0;
+        self.keys.clear();
+        self.timestamps.clear();
+        self.deleted.clear();
+        self.column_buffers = vec![Vec::new(); num_cols];
 
         Ok(())
     }

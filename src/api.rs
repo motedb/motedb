@@ -787,7 +787,7 @@ impl Database {
         };
         if table_name.is_empty() { return Ok(None); }
 
-        // Auto-finalize columnar write buffer so queries see latest data
+        // Finalize write buffer (with merge) so columnar paths see all data
         self.inner.finalize_columnar_buffer(table_name);
 
         // Check for "WHERE" keyword (word boundary)
@@ -805,7 +805,19 @@ impl Database {
         let col_name = after_where[..eq_pos].trim();
         let val_str = after_where[eq_pos + 1..].trim();
 
-        // Parse the literal value
+        // Truncate trailing SQL keywords (ORDER BY, LIMIT, etc).
+        // For quoted strings ('...'), find the closing quote first to preserve spaces.
+        let val_str = if val_str.starts_with('\'') {
+            // Find matching closing quote
+            let after_open = &val_str[1..];
+            if let Some(end) = after_open.find('\'') {
+                &val_str[..end + 2] // include both quotes
+            } else {
+                val_str
+            }
+        } else {
+            val_str.split_whitespace().next().unwrap_or(val_str)
+        };
         let value = match Self::parse_single_literal(val_str) {
             Some(v) => v,
             None => return Ok(None),
@@ -853,7 +865,9 @@ impl Database {
             }
 
             // Column index fast path: bypass parser for indexed non-PK columns
-            let index_name = format!("{}.{}", table_name, col_name);
+            let index_name = self.inner.index_registry
+                .find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Column)
+                .unwrap_or_else(|| format!("{}.{}", table_name, col_name));
             if let Some(index_ref) = self.inner.column_indexes.get(&index_name) {
                 let row_ids_arc = index_ref.value().get_arc(&value)?;
 
