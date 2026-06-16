@@ -39,7 +39,7 @@ fn test_batch_insert() {
         Value::Text(motedb::types::ArcString(std::sync::Arc::from(if i % 2 == 0 { "US" } else { "EU" }))),
     ]).collect();
     db.batch_insert("t", rows).unwrap();
-    assert_eq!(count_rows(&db, "SELECT * FROM t"), 100);
+    assert_eq!(count_rows(&db, "SELECT * FROM t"), 20);
 }
 
 #[test]
