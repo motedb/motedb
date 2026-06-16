@@ -5241,6 +5241,31 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name)
                     && !self.has_only_count_aggregate(&stmt.columns)
                 {
+                    // Skip PK equality (WHERE pk = val) — the PK point-query path
+                    // uses get_table_row which already checks ColSegmentStore.
+                    let is_pk_eq = match &stmt.where_clause {
+                        Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, .. }) => {
+                            matches!(left.as_ref(), crate::sql::ast::Expr::Column(c) if c == "id")
+                        }
+                        _ => false,
+                    };
+                    if !is_pk_eq {
+                        let stream = self.execute_full_scan_streaming(stmt, table_name)?;
+                        return Ok(stream.materialize()?);
+                    }
+                }
+            }
+        }
+
+        // S9: ColSegmentStore tables — route queries with WHERE through the
+        // multi-segment full-scan path. The PointQuery/index fast paths below
+        // fetch rows via lsm_engine.scan_range, which returns empty for
+        // ColSegmentStore tables (data lives in segment files, not the LSM).
+        if stmt.where_clause.is_some() && stmt.group_by.is_none() {
+            if let TableRef::Table { name: table_name, .. } = from {
+                if self.db.has_col_segment_store(table_name)
+                    && !self.has_only_count_aggregate(&stmt.columns)
+                {
                     let stream = self.execute_full_scan_streaming(stmt, table_name)?;
                     return Ok(stream.materialize()?);
                 }
