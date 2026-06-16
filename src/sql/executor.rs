@@ -11156,8 +11156,27 @@ impl QueryExecutor {
                 }));
             }
 
-            // 🚀 Direct LSM get (skip column index completely!)
+            // 🚀 Direct get: ColSegmentStore first (new path), then LSM (legacy).
             let composite_key = self.db.make_composite_key(table_name, row_id);
+            if self.db.has_col_segment_store(table_name) {
+                if let Some(store) = self.db.col_segment_stores.get(table_name) {
+                    if let Some(row) = store.get(composite_key) {
+                        self.db.row_cache.put(table_name.to_string(), row_id, row.clone());
+                        let sql_row = row_to_sql_row(&row, &schema)?;
+                        let mut prefixed_row = SqlRow::new();
+                        prefixed_row.insert("__row_id__".to_string(), Value::Integer(row_id as i64));
+                        prefixed_row.insert("__table__".to_string(), Value::text(table_name.clone()));
+                        for (col_name, val) in sql_row {
+                            prefixed_row.insert(format!("{}.{}", table_name, col_name), val);
+                        }
+                        let (column_names, result_rows) = self.project_columns(&stmt.columns, &[(row_id, prefixed_row)], &schema)?;
+                        return Ok(Some(QueryResult::Select { columns: column_names, rows: result_rows }));
+                    }
+                    // Not found in store — return empty (key doesn't exist).
+                    let (column_names, _) = self.project_columns(&stmt.columns, &[], &schema)?;
+                    return Ok(Some(QueryResult::Select { columns: column_names, rows: vec![] }));
+                }
+            }
             match self.db.lsm_engine.get(composite_key)? {
                 Some(value_data) => {
                     // Check tombstone
