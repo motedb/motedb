@@ -5257,7 +5257,7 @@ impl QueryExecutor {
                     // uses get_table_row which already checks ColSegmentStore.
                     let is_pk_eq = match &stmt.where_clause {
                         Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, .. }) => {
-                            matches!(left.as_ref(), crate::sql::ast::Expr::Column(c) if c == "id")
+                            matches!(left.as_ref(), crate::sql::ast::Expr::Column(c) if c == "id" || c.ends_with(".id"))
                         }
                         _ => false,
                     };

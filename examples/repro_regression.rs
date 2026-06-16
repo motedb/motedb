@@ -59,7 +59,6 @@ fn main() {
     let r = db.execute("SELECT * FROM sales ORDER BY amount DESC LIMIT 10").unwrap();
     eprintln!("[repro] ORDER BY LIMIT: {} rows (expect 10)", r.materialize().unwrap().row_count());
 
-    // PK point query performance
     let t = std::time::Instant::now();
     let r = db.execute("SELECT * FROM sales WHERE id = 30000").unwrap();
     let pk_rows = r.materialize().unwrap().row_count();
