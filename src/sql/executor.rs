@@ -1612,6 +1612,14 @@ impl QueryExecutor {
         value: &Value,
         post_filters: &[Expr],
     ) -> Result<StreamingQueryResult> {
+        // S9: ColSegmentStore tables store data in segment files, not the LSM.
+        // The point-query path below fetches rows via lsm_engine.scan_range,
+        // which returns empty for these tables. Fall back to full scan (which
+        // reads ColSegmentStore correctly) until point-query learns to fetch
+        // from ColSegmentStore.
+        if self.db.has_col_segment_store(table) {
+            return self.execute_full_scan_streaming(stmt, table);
+        }
         let schema = self.db.get_table_schema(table)?;
         let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
@@ -1828,6 +1836,10 @@ impl QueryExecutor {
         end_inclusive: bool,
         post_filters: &[Expr],
     ) -> Result<StreamingQueryResult> {
+        // S9: ColSegmentStore tables — fall back to full scan (data not in LSM).
+        if self.db.has_col_segment_store(table) {
+            return self.execute_full_scan_streaming(stmt, table);
+        }
         let schema = self.db.get_table_schema(table)?;
 
         // If SELECT expressions need the full evaluator, fall back to materialized path
@@ -5216,6 +5228,21 @@ impl QueryExecutor {
                         return Ok(result);
                     }
                     // Fall through to LSM full scan for complex queries (JOINs, subqueries, etc.)
+                }
+            }
+        }
+
+        // S9: ColSegmentStore tables — route queries with WHERE through the
+        // multi-segment full-scan path. The PointQuery/index fast paths below
+        // fetch rows via lsm_engine.scan_range, which returns empty for
+        // ColSegmentStore tables (data lives in segment files, not the LSM).
+        if stmt.where_clause.is_some() && stmt.group_by.is_none() {
+            if let TableRef::Table { name: table_name, .. } = from {
+                if self.db.has_col_segment_store(table_name)
+                    && !self.has_only_count_aggregate(&stmt.columns)
+                {
+                    let stream = self.execute_full_scan_streaming(stmt, table_name)?;
+                    return Ok(stream.materialize()?);
                 }
             }
         }

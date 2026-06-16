@@ -787,6 +787,15 @@ impl Database {
         };
         if table_name.is_empty() { return Ok(None); }
 
+        // 🆕 S9: ColSegmentStore tables use multi-segment storage. The fast
+        // SELECT path below fetches rows via column index + get_table_row,
+        // which works, but routing through the optimizer/full-scan path is
+        // simpler and already correct for these tables. Bail out here so the
+        // query goes through execute_full_scan_streaming → ColSegmentStore.
+        if self.inner.has_col_segment_store(table_name) {
+            return Ok(None);
+        }
+
         // Finalize write buffer (with merge) so columnar paths see all data
         self.inner.finalize_columnar_buffer(table_name);
 

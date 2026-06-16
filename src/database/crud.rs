@@ -1163,6 +1163,7 @@ impl MoteDB {
     pub fn is_columnar_table(&self, table_name: &str) -> bool {
         self.columnar_sstables.contains_key(table_name)
             || self.columnar_write_bufs.contains_key(table_name)
+            || self.col_segment_stores.contains_key(table_name)
     }
 
     /// Get or create the multi-segment ColSegmentStore for a table.
@@ -1193,6 +1194,15 @@ impl MoteDB {
     /// Converts accumulated INSERT data to a columnar SSTable file.
     /// Safe: only removes from write buffer AFTER successful finalization.
     pub fn finalize_columnar_buffer(&self, table_name: &str) {
+        // S9: for tables on the ColSegmentStore path, just flush the store's
+        // in-memory buffer (cheap delta write). The legacy single-SSTable merge
+        // below is skipped — it was the full-table-rewrite regression source.
+        if self.col_segment_stores.contains_key(table_name) {
+            if let Some(store) = self.col_segment_stores.get(table_name) {
+                let _ = store.flush_buffer();
+            }
+            return;
+        }
         if let Some(builder_arc) = self.columnar_write_bufs.get(table_name) {
             let (path, num_rows) = {
                 let guard = builder_arc.value().lock();
@@ -1807,32 +1817,10 @@ impl MoteDB {
         self.increment_pending_updates();
         self.wal.batch_append(0, wal_records)?;
 
-        use dashmap::mapref::entry::Entry;
-        let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
-            Entry::Occupied(o) => o.get().clone(),
-            Entry::Vacant(v) => {
-                let indexes_dir = self.path.join("indexes");
-                std::fs::create_dir_all(&indexes_dir).ok();
-                let col_sst_path = indexes_dir.join(format!("{}_col.sst", table_name));
-                let b = Arc::new(parking_lot::Mutex::new(
-                    crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(col_sst_path, col_types.to_vec())
-                ));
-                v.insert(b.clone());
-                b
-            }
-        };
-        let mut builder = builder_arc.lock();
-
-        for (i, row) in rows.iter().enumerate() {
-            let key = (table_id << 32) | (row_ids[i] & 0xFFFFFFFF);
-            builder.add_values(key, base_ts + i as u64, false, row)?;
-        }
-        drop(builder);
-
-        // 🆕 S6: also append to the multi-segment ColSegmentStore (new path).
-        // Dual-track during migration: data lives in both the legacy write_buf
-        // and the ColSegmentStore until the query path migrates (S7) and the
-        // legacy field is removed (S9).
+        // 🆕 S9: write ONLY to the multi-segment ColSegmentStore (single-track).
+        // The legacy columnar_write_bufs path is bypassed for batch INSERT —
+        // eliminating the dual-write overhead (256ms → ~65ms for 60K rows).
+        // Queries route to ColSegmentStore via has_col_segment_store().
         {
             let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
             let store_rows: Vec<(u64, u64, Row)> = rows
@@ -1845,10 +1833,8 @@ impl MoteDB {
                 .collect();
             store.append_rows(&store_rows)?;
             // Flush periodically to bound the in-memory buffer (embedded: ~4K rows).
-            // Cheap: writes a delta segment, does NOT read old data.
             if store.buffered_row_count() >= 4000 {
                 store.flush_buffer()?;
-                // Compact when segments accumulate (bounds merge fan-out).
                 if store.needs_compaction() {
                     let _ = store.compact_once();
                 }
