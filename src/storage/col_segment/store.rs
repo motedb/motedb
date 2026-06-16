@@ -146,6 +146,25 @@ impl ColSegmentStore {
             }
             segs.iter().cloned().collect()
         };
+        self.merge_segments(old_segs)
+    }
+
+    /// Force-merge ALL segments into one, ignoring the count threshold.
+    /// Used by sync_col_segment_to_sstables so legacy aggregate paths see
+    /// the complete dataset in a single SSTable. No-op if < 2 segments.
+    pub fn force_compact_all(&self) -> Result<()> {
+        let old_segs: Vec<Arc<Segment>> = {
+            let segs = self.segments.read();
+            if segs.len() < 2 { return Ok(()); }
+            segs.iter().cloned().collect()
+        };
+        self.merge_segments(old_segs)
+    }
+
+    /// Shared merge logic: merge `old_segs` into one new segment, dedup keys
+    /// (newest version wins), drop tombstones, update manifest + GC old files.
+    fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
+        if old_segs.is_empty() { return Ok(()); }
         let old_ids: Vec<u64> = old_segs.iter().map(|s| s.id).collect();
 
         // Merge-read old segments, write a new segment (dedup + drop tombstones).

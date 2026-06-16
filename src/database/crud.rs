@@ -1201,8 +1201,15 @@ impl MoteDB {
             // Compact to a single segment so legacy aggregate paths (which read
             // one columnar_sstables entry) see ALL data. Bounded: compaction
             // only runs while segment count >= threshold (3).
-            while store.needs_compaction() {
-                let _ = store.compact_once();
+            let mut compactions = 0;
+            // Force compact to a SINGLE segment so legacy aggregate paths (which
+            // read one columnar_sstables entry) see ALL data. compact_once
+            // already merges all segments when count >= threshold; we lower the
+            // bar here to force at least one pass when there are 2+ segments.
+            while store.segment_count() >= 2 {
+                let _ = store.force_compact_all();
+                compactions += 1;
+                if compactions > 5 { break; } // safety
             }
             if let Some(sst) = store.latest_segment_sst() {
                 self.columnar_sstables.insert(table_name.to_string(), sst);

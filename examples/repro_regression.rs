@@ -49,5 +49,15 @@ fn main() {
     let r = db.execute("SELECT * FROM sales").unwrap();
     eprintln!("[repro] SELECT *: {} (expect {})", r.materialize().unwrap().row_count(), n);
 
+    // Aggregate correctness tests (critical for embedded analytics)
+    let r = db.execute("SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM sales WHERE region = 'US'").unwrap();
+    eprintln!("[repro] COUNT/SUM/MIN/MAX WHERE: {:?}", r.materialize().unwrap().row_count());
+
+    let r = db.execute("SELECT customer, COUNT(*), SUM(amount) FROM sales GROUP BY customer").unwrap();
+    eprintln!("[repro] GROUP BY customer: {} groups (expect ~{})", r.materialize().unwrap().row_count(), n / 10);
+
+    let r = db.execute("SELECT * FROM sales ORDER BY amount DESC LIMIT 10").unwrap();
+    eprintln!("[repro] ORDER BY LIMIT: {} rows (expect 10)", r.materialize().unwrap().row_count());
+
     println!("DONE");
 }
