@@ -1190,6 +1190,26 @@ impl MoteDB {
         self.col_segment_stores.contains_key(table_name)
     }
 
+    /// 🆕 S9: sync a ColSegmentStore table's latest single segment (after flush
+    /// + compaction) into the legacy `columnar_sstables` map. Legacy aggregate /
+    /// GROUP BY / scan paths read `columnar_sstables` directly; this shares the
+    /// same Arc<ColumnarSSTable> so they observe the data without cloning.
+    /// Idempotent: safe to call before any query that uses legacy columnar reads.
+    pub fn sync_col_segment_to_sstables(&self, table_name: &str) {
+        if let Some(store) = self.col_segment_stores.get(table_name) {
+            let _ = store.flush_buffer();
+            // Compact to a single segment so legacy aggregate paths (which read
+            // one columnar_sstables entry) see ALL data. Bounded: compaction
+            // only runs while segment count >= threshold (3).
+            while store.needs_compaction() {
+                let _ = store.compact_once();
+            }
+            if let Some(sst) = store.latest_segment_sst() {
+                self.columnar_sstables.insert(table_name.to_string(), sst);
+            }
+        }
+    }
+
     /// Finalize unflushed columnar write buffer for a table.
     /// Converts accumulated INSERT data to a columnar SSTable file.
     /// Safe: only removes from write buffer AFTER successful finalization.

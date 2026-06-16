@@ -1348,6 +1348,18 @@ impl QueryExecutor {
     /// Takes &SelectStmt — no cloning of the AST at all.
     /// This is the primary entry point from the statement cache.
     fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
+        // S9: For ColSegmentStore tables, sync the latest single segment into
+        // columnar_sstables so legacy aggregate/GROUP BY fast paths see data.
+        // Only needed for aggregate queries (plain WHERE/SELECT use the
+        // ColSegmentStore full-scan path directly).
+        if self.has_aggregates(&stmt.columns) || stmt.group_by.is_some() || stmt.order_by.is_some() {
+            if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
+                if self.db.has_col_segment_store(table_name) {
+                    self.db.sync_col_segment_to_sstables(table_name);
+                }
+            }
+        }
+
         // Aggregate queries (COUNT, SUM, etc.) — try fast paths
         if self.has_aggregates(&stmt.columns) {
             // Fast path 0: columnar aggregate pushdown (no row materialization)

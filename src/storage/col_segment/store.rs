@@ -113,6 +113,15 @@ impl ColSegmentStore {
         self.segments.read().iter().cloned().collect()
     }
 
+    /// After flush+compaction to a single segment, return that segment's SSTable
+    /// as a shared Arc. Legacy read paths (aggregate, GROUP BY) read
+    /// `columnar_sstables: DashMap<String, Arc<ColumnarSSTable>>`; this lets them
+    /// observe the same SSTable without cloning (Arc shared). Returns None if
+    /// the store has no segments.
+    pub fn latest_segment_sst(&self) -> Option<Arc<crate::storage::lsm::columnar::ColumnarSSTable>> {
+        self.segments.read().back().map(|seg| Arc::clone(&seg.sst))
+    }
+
     /// Number of rows currently buffered in memory (not yet flushed to a segment).
     pub fn buffered_row_count(&self) -> usize {
         self.write_buf.lock().num_rows
