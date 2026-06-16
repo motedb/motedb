@@ -9377,7 +9377,7 @@ impl QueryExecutor {
                     return self.execute_update_pk(&stmt, &schema, &target_value);
                 }
 
-                // 🚀 Column index fast path: use index to find matching rows
+                // Column index fast path: use index to find matching rows
                 if let Some(index_name) = self.db.index_registry.find_by_column(
                     &stmt.table, &col_name,
                     crate::database::index_metadata::IndexType::Column

@@ -330,8 +330,24 @@ impl MoteDB {
             return Ok(Some((*row_arc).clone()));
         }
 
-        // Check write buffer for tombstones / updates before consulting SSTable
+        // 🆕 S9: ColSegmentStore cached point lookup — FIRST after row_cache.
+        // Uses per-segment column decode cache (get_row_cached), so repeated
+        // lookups (e.g. UPDATE of 500 rows) are O(1) per row after the first
+        // column decompress. This must precede the columnar_sstables check
+        // below, which calls the uncached ColumnarSSTable::get_row (decompresses
+        // the whole column on every call — was 8.7ms/row, the UPDATE bottleneck).
         let composite_key = self.make_composite_key(table_name, row_id);
+        if let Some(store) = self.col_segment_stores.get(table_name) {
+            if let Some(row) = store.get(composite_key) {
+                let row_arc = Arc::new(row);
+                self.row_cache.put_arc(table_name.to_string(), row_id, Arc::clone(&row_arc));
+                return Ok(Some(Arc::try_unwrap(row_arc).unwrap_or_else(|a| (*a).clone())));
+            }
+            // Not in any segment — key doesn't exist (store is authoritative).
+            return Ok(None);
+        }
+
+        // Check write buffer for tombstones / updates before consulting SSTable
         if let Some(builder_arc) = self.columnar_write_bufs.get(table_name) {
             let guard = builder_arc.value().lock();
             if let Some(deleted) = guard.check_key(composite_key) {
