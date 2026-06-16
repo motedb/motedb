@@ -1664,7 +1664,9 @@ impl QueryExecutor {
                     let row_ids = index.value()
                         .get_arc(value)
                         .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-                    if !row_ids.is_empty() {
+                    // Selectivity heuristic: for high-cardinality matches (>1000 rows),
+                    // a projected full scan is faster than N get_table_row calls.
+                    if !row_ids.is_empty() && row_ids.len() <= 1000 {
                         let mut result_rows = Vec::with_capacity(row_ids.len());
                         for &rid in row_ids.iter() {
                             if let Some(row) = self.db.get_table_row(table, rid)? {
@@ -1681,7 +1683,10 @@ impl QueryExecutor {
                         let (_, projected) = self.project_columns(&stmt.columns, &result_rows, &schema)?;
                         return Ok(StreamingQueryResult::SelectReady { columns, rows: projected });
                     }
-                    return Ok(StreamingQueryResult::SelectReady { columns, rows: vec![] });
+                    if row_ids.is_empty() {
+                        return Ok(StreamingQueryResult::SelectReady { columns, rows: vec![] });
+                    }
+                    // >1000 matches: fall through to projected full scan.
                 }
             }
             return self.execute_full_scan_streaming(stmt, table);
