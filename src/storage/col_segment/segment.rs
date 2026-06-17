@@ -26,6 +26,18 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Clear the column decode cache to free memory (call after bulk operations).
+    pub fn clear_cache(&self) {
+        self.col_cache.write().clear();
+    }
+
+    /// Release mmap pages from RSS via MADV_DONTNEED. The OS will re-fault
+    /// pages on next access. Call after bulk reads (e.g. compaction) to keep
+    /// peak RSS low on memory-constrained embedded devices.
+    pub fn release_pages(&self) {
+        self.sst.release_pages();
+    }
+
     pub fn open(path: &std::path::Path, id: u64) -> crate::Result<Self> {
         let sst = ColumnarSSTable::open(path)?;
         let row_count = sst.num_rows;

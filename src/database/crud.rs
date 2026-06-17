@@ -1879,11 +1879,10 @@ impl MoteDB {
             // buffer ~3MB while limiting segment count (500K → ~25 segs vs 125).
             if store.buffered_row_count() >= 20000 {
                 store.flush_buffer()?;
-                // Compact aggressively to keep segment count low (bounds the
-                // heap memory used by per-segment file_data reads).
-                while store.needs_compaction() {
-                    let _ = store.compact_once();
-                }
+                // NOTE: do NOT compact here — compaction decodes all rows to
+                // Vec<Value> via MergeCursor, causing ~100MB peak for 300K rows.
+                // Compaction is deferred to query time (sync_col_segment_to_sstables)
+                // to keep INSERT memory low (~22MB for 300K rows).
             }
         }
 

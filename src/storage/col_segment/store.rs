@@ -78,7 +78,6 @@ impl ColSegmentStore {
         // finish() writes to builder.path; set it to the numbered path first.
         old_buf.path = path.clone();
         old_buf.finish()?;
-
         let seg = Arc::new(Segment::open(&path, id)?);
         // Record in manifest (fsync'd) BEFORE exposing in memory.
         self.manifest.lock().add_segment(id)?;
@@ -407,6 +406,14 @@ impl ColSegmentStore {
             segs.push_back(new_seg);
         }
 
+        // Clear column caches + release mmap pages to keep peak RSS low.
+        {
+            let segs = self.segments.read();
+            for seg in segs.iter() {
+                seg.clear_cache();
+                seg.release_pages();
+            }
+        }
         // GC: delete old files, record in manifest.
         for oid in &old_ids {
             let p = self.dir.join(format!("{:010}.sst", oid));

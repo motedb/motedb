@@ -1,90 +1,142 @@
-use motedb::Database;
+use motedb::{Database, DBConfig};
 use tempfile::TempDir;
+
+fn rss_kb() -> usize {
+    let pid = std::process::id();
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
 
 fn main() {
     let dir = TempDir::new().unwrap();
-    let db = Database::create(dir.path()).unwrap();
+    let mut config = DBConfig::for_edge();
+    config.max_result_rows = None;
+    let db = Database::create_with_config(dir.path(), config).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, customer TEXT, amount FLOAT, region TEXT)").unwrap();
+    eprintln!("[mem] after create: {} KB", rss_kb());
 
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)").unwrap().materialize().unwrap();
-
-    let baseline = get_rss_kb();
-    println!("=== Memory Stabilization Test (Insert-Flush Cycles) ===");
-    println!("MemTable: 4MB, pk_lookup: 50K entries, row_cache: 10K entries");
-    println!("Baseline: {:.1} MB\n", baseline as f64 / 1024.0);
-    println!("{:<8} | {:>8} | {:>10} | {:>12} | {:>12}", "Cycle", "Total", "RSS MB", "Delta MB", "Cycle Δ MB");
-    println!("{}", "─".repeat(70));
-
-    // 20K rows per cycle ≈ 4MB MemTable → triggers auto-flush
-    let rows_per_cycle = 20_000;
-    let total_cycles = 25;
-    let mut prev_rss = baseline;
-    let mut total_rows = 0i64;
-
-    for cycle in 1..=total_cycles {
-        let start = total_rows + 1;
-        let end = total_rows + rows_per_cycle as i64;
-        for i in start..=end {
-            db.execute(&format!(
-                "INSERT INTO t VALUES ({}, 'name_{}', {:.1})", i, i, i as f64 * 1.5
-            )).unwrap().materialize().unwrap();
+    let n = 300_000usize;
+    let bs = 5000;
+    for start in (0..n).step_by(bs) {
+        let end = (start + bs).min(n);
+        let mut batch = String::new();
+        for i in start..end {
+            let region = if i % 3 == 0 { "US" } else { "EU" };
+            if !batch.is_empty() { batch.push(','); }
+            batch.push_str(&format!("('cust_{}',{:.2},'{}')", i % 30000, (i as f64 * 1.7) % 1000.0, region));
         }
-        total_rows = end;
-
-        // Flush every cycle
-        db.flush().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let rss = get_rss_kb();
-        let delta = rss.saturating_sub(baseline);
-        let cycle_delta = rss.saturating_sub(prev_rss);
-
-        if cycle <= 5 || cycle % 5 == 0 {
-            println!("{:<8} | {:>6}K | {:>8.1} | {:>10.1} | {:>10.1}",
-                cycle, total_rows / 1000, rss as f64 / 1024.0,
-                delta as f64 / 1024.0, cycle_delta as f64 / 1024.0);
+        db.execute(&format!("INSERT INTO t (customer, amount, region) VALUES {}", batch)).unwrap();
+    }
+    eprintln!("[mem] after {} INSERT: {} KB", n, rss_kb());
+    db.flush().unwrap();
+    // Measure segment file sizes
+    let ms_dir = dir.path().join("columnar_ms").join("t");
+    let mut total = 0u64;
+    let mut count = 0;
+    if let Ok(entries) = std::fs::read_dir(&ms_dir) {
+        for e in entries.flatten() {
+            if let Ok(m) = std::fs::metadata(e.path()) {
+                total += m.len(); count += 1;
+            }
         }
-        prev_rss = rss;
     }
-
-    // Final: check if memory is stable
-    let rss_end = get_rss_kb();
-    let rss_mid = get_rss_kb(); // measure again to see if it's stable
-    println!("\n=== Final Check ===");
-    println!("Final RSS: {:.1} MB (variance: {} KB)", rss_end as f64 / 1024.0, (rss_end as i64 - rss_mid as i64).unsigned_abs());
-
-    // Test: do queries to warm up caches, then check RSS
-    println!("\n--- Query phase (100 PK lookups) ---");
-    for i in 1..=100 {
-        db.execute(&format!("SELECT * FROM t WHERE id = {}", i * 100)).unwrap().materialize().unwrap();
+    eprintln!("[seg] {} files, {} KB total on disk", count, total/1024);
+    eprintln!("[mem] after flush: {} KB", rss_kb());
+    // Measure segment file sizes
+    // Walk all subdirs to find segment files
+    fn walk_all(p: &std::path::Path, prefix: String) {
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                let path = e.path();
+                let name = format!("{}/{}", prefix, e.file_name().to_string_lossy());
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.is_file() && meta.len() > 0 {
+                        eprintln!("[file] {} = {}KB", name, meta.len()/1024);
+                    }
+                    if meta.is_dir() {
+                        walk_all(&path, name);
+                    }
+                }
+            }
+        }
     }
-    let rss_after_query = get_rss_kb();
-    println!("After queries: {:.1} MB (Δ = {} KB)", rss_after_query as f64 / 1024.0,
-        (rss_after_query as i64 - rss_end as i64).unsigned_abs());
-
-    println!("\n=== Verdict ===");
-    let rss_final = rss_after_query as f64 / 1024.0;
-    let rows_k = total_rows / 1000;
-    println!("Total: {}K rows, RSS: {:.1} MB, {:.1} B/row", rows_k, rss_final, rss_final * 1024.0 * 1024.0 / total_rows as f64);
-    println!("\nKey bounded structures:");
-    println!("  pk_lookup: 50K entries × ~80B = ~4MB (LRU, evicts on overflow)");
-    println!("  row_cache: 10K entries × ~1KB = ~10MB (LRU)");
-    println!("  sstable_cache: 128 entries × ~100KB = ~12.8MB (LRU)");
-    println!("  memtable: 4MB (flushes to SSTable on overflow)");
-    println!("  Total bounded: ~31MB + OS/allocator overhead");
-
-    drop(db);
+    walk_all(dir.path(), "db".to_string());
+    let dbp = dir.path().join("columnar_ms").join("t");
+    let mut total_seg = 0u64;
+    let mut seg_count = 0;
+    if let Ok(entries) = std::fs::read_dir(&dbp) {
+        for e in entries.flatten() {
+            if e.path().extension().map(|x| x == "sst").unwrap_or(false) {
+                total_seg += std::fs::metadata(e.path()).map(|m| m.len()).unwrap_or(0);
+                seg_count += 1;
+            }
+        }
+    }
+    eprintln!("[seg] {} files, {} MB total on disk", seg_count, total_seg/1048576);
+    let _ = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    eprintln!("[mem] after COUNT: {} KB", rss_kb());
+    let _ = db.execute("SELECT * FROM t").unwrap();
+    eprintln!("[mem] after SELECT *: {} KB", rss_kb());
+    // List directories BEFORE checkpoint (TempDir still alive)
+    for entry in std::fs::read_dir(dir.path()).ok().into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let meta = std::fs::metadata(entry.path()).ok();
+        if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+            let sz: u64 = std::fs::read_dir(entry.path()).ok()
+                .into_iter().flatten().flatten()
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
+                .map(|m| m.len()).sum();
+            eprintln!("[dir] {} = {}MB", name.to_string_lossy(), sz/1048576);
+        }
+    }
+    // Debug: walk the dir path
+    let dbp = dir.path();
+    eprintln!("[debug] db path = {:?}", dbp);
+    fn walk(p: &std::path::Path, depth: usize) {
+        if let Ok(entries) = std::fs::read_dir(p) {
+            for e in entries.flatten() {
+                let meta = std::fs::metadata(e.path());
+                let sz = meta.as_ref().ok().map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0);
+                if depth <= 2 {
+                    eprintln!("[walk] {}{} {}B", "  ".repeat(depth), e.file_name().to_string_lossy(), sz);
+                }
+                if meta.map(|m| m.is_dir()).unwrap_or(false) {
+                    walk(&e.path(), depth+1);
+                }
+            }
+        }
+    }
+    walk(&dbp, 0);
+    db.checkpoint().unwrap();
+    eprintln!("[mem] after checkpoint: {} KB", rss_kb());
+        // Measure disk usage of ColSegmentStore + LSM + WAL
+    let db_dir = dir.path();
+    // List actual directories
+    for entry in std::fs::read_dir(db_dir).ok().into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let meta = std::fs::metadata(entry.path()).ok();
+        if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+            let sz: u64 = std::fs::read_dir(entry.path()).ok()
+                .into_iter().flatten().flatten()
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
+                .map(|m| m.len()).sum();
+            eprintln!("[dir] {} = {}MB", name.to_string_lossy(), sz/1048576);
+        }
+    }
+    let col_seg_size = std::fs::read_dir(db_dir.join("columnar_ms")).ok()
+        .map(|entries| entries.filter_map(|e| std::fs::metadata(e.ok()?.path()).ok())
+            .map(|m| m.len()).sum::<u64>()).unwrap_or(0);
+    let lsm_size = std::fs::read_dir(db_dir.join("lsm")).ok()
+        .map(|e| e.filter_map(|x| std::fs::metadata(x.ok()?.path()).ok())
+            .map(|m| m.len()).sum::<u64>()).unwrap_or(0);
+    let wal_size = std::fs::read_dir(db_dir.join("wal")).ok()
+        .map(|e| e.filter_map(|x| std::fs::metadata(x.ok()?.path()).ok())
+            .map(|m| m.len()).sum::<u64>()).unwrap_or(0);
+    eprintln!("[disk] columnar_ms={}MB lsm={}MB wal={}MB", col_seg_size/1048576, lsm_size/1048576, wal_size/1048576);
+    println!("DONE");
 }
 
-fn get_rss_kb() -> usize {
-    let pid = std::process::id();
-    let output = std::process::Command::new("ps")
-        .args(["-o", "rss", "-p", &pid.to_string()])
-        .output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines().skip(1) {
-        if let Ok(rss) = line.trim().parse::<usize>() {
-            return rss;
-        }
-    }
-    0
-}
+// Appended: measure disk usage
