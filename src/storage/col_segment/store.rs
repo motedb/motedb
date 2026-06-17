@@ -398,6 +398,8 @@ impl ColSegmentStore {
     /// (newest version wins), drop tombstones, update manifest + GC old files.
     fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
         if old_segs.is_empty() { return Ok(()); }
+        let _ms_t = std::time::Instant::now();
+        let _ms_n = old_segs.iter().map(|s| s.sst.num_rows).sum::<usize>();
         let old_ids: Vec<u64> = old_segs.iter().map(|s| s.id).collect();
         let ncols = self.col_types.len();
 
@@ -482,6 +484,7 @@ impl ColSegmentStore {
                 }
             }
         }
+        eprintln!("[DBG-MERGE] {} rows in {}ms", _ms_n, _ms_t.elapsed().as_millis());
         builder.finish()?;
 
         let new_seg = Arc::new(Segment::open(&path, id)?);

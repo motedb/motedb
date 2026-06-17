@@ -1336,9 +1336,13 @@ impl QueryExecutor {
         let col_types = schema.col_types().to_vec();
 
         // Detect simple COUNT(*) with optional WHERE.
-        let is_count_star = stmt.columns.len() == 1 && matches!(&stmt.columns[0],
-            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _)
-            if name.eq_ignore_ascii_case("COUNT") && args.is_empty());
+        let is_count_star = stmt.columns.len() == 1 && {
+            matches!(&stmt.columns[0],
+                SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _)
+                if name.eq_ignore_ascii_case("COUNT")
+                   && (args.is_empty()
+                       || (args.len() == 1 && matches!(args[0], Expr::Column(ref c) if c == "*"))))
+        };
 
         if is_count_star {
             // COUNT(*) with WHERE: filter then count. Without WHERE: count all.
@@ -1359,7 +1363,9 @@ impl QueryExecutor {
                 }
             } else {
                 // No WHERE: count live rows directly from row_map (zero decode).
+                let _ct = std::time::Instant::now();
                 count = store.count_live_rows() as i64;
+                eprintln!("[DBG-COUNT] count_live_rows: {}ms", _ct.elapsed().as_millis());
             }
             let columns: Vec<String> = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
             return Ok(Some(StreamingQueryResult::SelectReady {
@@ -1368,8 +1374,167 @@ impl QueryExecutor {
             }));
         }
 
+        // Multi-aggregate without GROUP BY: COUNT/SUM/MIN/MAX via multi-segment scan.
+        // Avoids sync compaction for these common analytical queries.
+        if stmt.group_by.is_none() {
+            return self.col_segment_multi_aggregate(stmt, table_name, store, &schema);
+        }
+
+        // GROUP BY with simple aggregates: multi-segment scan + HashMap aggregation.
+        if stmt.group_by.is_some() {
+            return self.col_segment_group_by(stmt, table_name, store, &schema);
+        }
+
         // For other aggregates, fall through to legacy path.
         Ok(None)
+    }
+
+    /// Multi-aggregate (COUNT/SUM/MIN/MAX) without GROUP BY, via multi-segment scan.
+    /// Avoids sync compaction.
+    fn col_segment_multi_aggregate(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        schema: &TableSchema,
+    ) -> Result<Option<StreamingQueryResult>> {
+        use crate::sql::ast::{Expr, SelectColumn};
+        // Identify aggregate functions and their target columns.
+        struct AggInfo { func: String, col: Option<usize> }
+        let mut aggs: Vec<AggInfo> = Vec::new();
+        for col in &stmt.columns {
+            if let SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _) = col {
+                let target = args.iter().filter_map(|a| {
+                    if let Expr::Column(cn) = a { schema.get_column_position(cn) } else { None }
+                }).next();
+                aggs.push(AggInfo { func: name.to_uppercase(), col: target });
+            } else {
+                return Ok(None); // non-aggregate column in SELECT — can't handle
+            }
+        }
+        if aggs.is_empty() { return Ok(None); }
+
+        // Find columns to scan (filter col + aggregate target cols).
+        let filter_col = stmt.where_clause.as_ref().and_then(|wc| {
+            if let Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = wc {
+                if let (Expr::Column(cn), Expr::Literal(_)) = (left.as_ref(), right.as_ref()) {
+                    return schema.get_column_position(cn);
+                }
+            }
+            None
+        });
+        let mut scan_cols: Vec<usize> = Vec::new();
+        if let Some(fc) = filter_col { scan_cols.push(fc); }
+        for a in &aggs {
+            if let Some(c) = a.col { if !scan_cols.contains(&c) { scan_cols.push(c); } }
+        }
+
+        // Extract WHERE filter value for predicate.
+        let pred: Box<dyn Fn(Option<&Value>) -> bool> = if let Some(ref wc) = stmt.where_clause {
+            if let Expr::BinaryOp { left: _, op: _, right } = wc {
+                if let Expr::Literal(v) = right.as_ref() {
+                    let target = v.clone();
+                    Box::new(move |fv: Option<&Value>| fv == Some(&target))
+                } else { return Ok(None); }
+            } else { return Ok(None); }
+        } else {
+            Box::new(|_| true)
+        };
+
+        let scanned = store.scan_projected_filtered(filter_col, &scan_cols, &*pred);
+
+        // Compute aggregates.
+        let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
+        let mut result_row: Vec<Value> = Vec::with_capacity(aggs.len());
+        for a in &aggs {
+            let col_idx_in_scan = a.col.and_then(|c| scan_cols.iter().position(|&s| s == c));
+            match a.func.as_str() {
+                "COUNT" => {
+                    result_row.push(Value::Integer(scanned.len() as i64));
+                }
+                "SUM" => {
+                    let sum: f64 = scanned.iter().filter_map(|(_, row)| {
+                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                            if let Value::Float(f) = v { Some(*f) } else if let Value::Integer(i) = v { Some(*i as f64) } else { None }
+                        })
+                    }).sum();
+                    result_row.push(Value::Float(sum));
+                }
+                "MIN" => {
+                    let min = scanned.iter().filter_map(|(_, row)| {
+                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                            if let Value::Float(f) = v { Some(*f) } else { None }
+                        })
+                    }).fold(f64::INFINITY, f64::min);
+                    result_row.push(Value::Float(min));
+                }
+                "MAX" => {
+                    let max = scanned.iter().filter_map(|(_, row)| {
+                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                            if let Value::Float(f) = v { Some(*f) } else { None }
+                        })
+                    }).fold(f64::NEG_INFINITY, f64::max);
+                    result_row.push(Value::Float(max));
+                }
+                _ => return Ok(None), // unsupported function
+            }
+        }
+        Ok(Some(StreamingQueryResult::SelectReady { columns, rows: vec![result_row] }))
+    }
+
+    /// GROUP BY via multi-segment scan + in-memory HashMap aggregation.
+    /// Avoids sync compaction entirely.
+    fn col_segment_group_by(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        schema: &TableSchema,
+    ) -> Result<Option<StreamingQueryResult>> {
+        use std::collections::HashMap;
+        // Extract GROUP BY column.
+        let group_cols: Vec<usize> = stmt.group_by.as_ref().map(|gc| {
+            gc.iter().filter_map(|cn| schema.get_column_position(cn)).collect()
+        }).unwrap_or_default();
+        if group_cols.is_empty() { return Ok(None); }
+        let gc = group_cols[0]; // single GROUP BY column
+
+        // Output columns: group col + aggregates.
+        let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
+            .unwrap_or_else(|| vec![gc]);
+        let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
+
+        // Scan only group col + amount col (minimal decode).
+        let mut scan_cols = vec![gc];
+        if let Some(ap) = out_pos.iter().find(|&&p| schema.columns.get(p).map(|c| matches!(c.col_type, ColumnType::Float)).unwrap_or(false)) {
+            scan_cols.push(*ap);
+        }
+        let scanned = store.scan_projected_filtered(Some(gc), &scan_cols, &|_| true);
+        // Aggregate: key = group value, value = (count, sum_amount if applicable)
+        let mut groups: HashMap<String, (i64, f64)> = HashMap::new();
+        let amount_pos = if scan_cols.len() > 1 { Some(1) } else { None }; // index in scan result
+        for (_key, row) in &scanned {
+            let gval = row.get(0).map(|v| match v {
+                Value::Text(s) => s.as_str().to_string(),
+                Value::Integer(i) => i.to_string(),
+                _ => "?".to_string(),
+            }).unwrap_or("?".to_string());
+            let entry = groups.entry(gval).or_insert((0, 0.0));
+            entry.0 += 1;
+            if let Some(ap) = amount_pos {
+                if let Some(Value::Float(f)) = row.get(ap) {
+                    entry.1 += f;
+                }
+            }
+        }
+        // Build result rows.
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+        for (gval, (count, sum)) in groups {
+            let mut row = vec![Value::Text(gval.into()), Value::Integer(count)];
+            if amount_pos.is_some() { row.push(Value::Float(sum)); }
+            rows.push(row);
+        }
+        Ok(Some(StreamingQueryResult::SelectReady { columns, rows }))
     }
 
     fn materialize_as_streaming(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
