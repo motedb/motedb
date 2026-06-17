@@ -380,14 +380,88 @@ impl ColSegmentStore {
     fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
         if old_segs.is_empty() { return Ok(()); }
         let old_ids: Vec<u64> = old_segs.iter().map(|s| s.id).collect();
+        let ncols = self.col_types.len();
 
-        // Merge-read old segments, write a new segment (dedup + drop tombstones).
         let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{:010}.sst", id));
         let mut builder = ColumnarSSTableBuilder::new(&path, self.col_types.clone());
-        let merge = MergeCursor::new(&old_segs, &self.col_types);
-        for (key, ts, row) in merge {
-            builder.add_values(key, ts, false, &row)?;
+
+        // Check if ALL columns are fixed-width (integer/float/bool/timestamp).
+        // If so, use the fast column-direct path (no Vec<Value>).
+        let all_fixed = self.col_types.iter().all(|ct| matches!(ct,
+            ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp));
+
+        if all_fixed {
+            // Column-direct compaction: extract raw i64 bytes per row, no Value.
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for seg in old_segs.iter().rev() {
+                let n = seg.sst.num_rows;
+                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
+                    (0..ncols).map(|ci| {
+                        if ci < seg.sst.column_tags.len() && seg.sst.column_tags[ci].is_fixed() {
+                            seg.sst.read_fixed_i64(ci).ok()
+                        } else { None }
+                    }).collect();
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) { continue; }
+                    let ts = seg.sst.row_map.timestamp(i);
+                    let mut col_bytes: Vec<&[u8]> = Vec::with_capacity(ncols);
+                    let mut bufs: Vec<[u8; 8]> = Vec::with_capacity(ncols);
+                    for ci in 0..ncols {
+                        let v = fixed_cols.get(ci).and_then(|x| x.as_ref())
+                            .and_then(|f| f.get_i64(i)).unwrap_or(i64::MIN);
+                        bufs.push(v.to_le_bytes());
+                    }
+                    for b in &bufs { col_bytes.push(b); }
+                    builder.add_values_raw(key, ts, false, &col_bytes)?;
+                }
+            }
+        } else {
+            // Mixed columns (has Text): direct copy with temp buffers.
+            // Avoids MergeCursor's per-row Vec<Value> + SegmentCursor pre-decode.
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for seg in old_segs.iter().rev() {
+                let n = seg.sst.num_rows;
+                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
+                    (0..ncols).map(|ci| {
+                        if ci < seg.sst.column_tags.len() && seg.sst.column_tags[ci].is_fixed() {
+                            seg.sst.read_fixed_i64(ci).ok()
+                        } else { None }
+                    }).collect();
+                let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> =
+                    (0..ncols).map(|ci| {
+                        if ci < seg.sst.column_tags.len() && !seg.sst.column_tags[ci].is_fixed() {
+                            seg.sst.read_text(ci).ok()
+                        } else { None }
+                    }).collect();
+                // Per-row reusable byte buffers (avoid per-row allocation).
+                let mut row_bytes: Vec<Vec<u8>> = vec![Vec::new(); ncols];
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) { continue; }
+                    let ts = seg.sst.row_map.timestamp(i);
+                    // Phase 1: fill row_bytes (mutable, no outstanding borrows).
+                    for ci in 0..ncols {
+                        if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
+                            let v = f.get_i64(i).unwrap_or(i64::MIN);
+                            row_bytes[ci].clear();
+                            row_bytes[ci].extend_from_slice(&v.to_le_bytes());
+                        } else if let Some(ref t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
+                            let s = t.get_str(i).unwrap_or("");
+                            row_bytes[ci].clear();
+                            let len = s.len().min(65535) as u16;
+                            row_bytes[ci].extend_from_slice(&len.to_le_bytes());
+                            row_bytes[ci].extend_from_slice(&s.as_bytes()[..len as usize]);
+                        }
+                    }
+                    // Phase 2: collect immutable slices (row_bytes not modified here).
+                    let col_slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();
+                    builder.add_values_raw(key, ts, false, &col_slices)?;
+                }
+            }
         }
         builder.finish()?;
 
