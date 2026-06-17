@@ -3752,6 +3752,65 @@ impl QueryExecutor {
             }
         }
 
+        // WHERE col = val / LIKE 'prefix%' on text: SelectColumnar with row_indices.
+        if let Some(ref wc) = where_clause {
+            use crate::sql::ast::{Expr, BinaryOperator};
+            let tf: Option<(usize, Box<dyn Fn(&str) -> bool>)> = match wc {
+                Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                    match (left.as_ref(), right.as_ref()) {
+                        (Expr::Column(cn), Expr::Literal(Value::Text(s)))
+                            if schema.get_column_position(cn).map(|p| matches!(col_types.get(p), Some(ColumnType::Text))).unwrap_or(false) =>
+                        {
+                            let pos = schema.get_column_position(cn).unwrap();
+                            let target = s.to_string();
+                            Some((pos, Box::new(move |v: &str| v == target.as_str())))
+                        }
+                        _ => None,
+                    }
+                }
+                Expr::Like { expr, pattern, .. } => {
+                    match (expr.as_ref(), pattern.as_ref()) {
+                        (Expr::Column(cn), Expr::Literal(Value::Text(s)))
+                            if schema.get_column_position(cn).map(|p| matches!(col_types.get(p), Some(ColumnType::Text))).unwrap_or(false) =>
+                        {
+                            let pat = s.to_string();
+                            if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                                let pos = schema.get_column_position(cn).unwrap();
+                                let prefix = pat[..pat.len()-1].to_string();
+                                Some((pos, Box::new(move |v: &str| v.starts_with(&prefix))))
+                            } else { None }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((fc, pred)) = tf {
+                let _ = store.flush_buffer();
+                while store.needs_compaction() { let _ = store.compact_once(); }
+                let segs = store.segments_snapshot();
+                if let Some(last) = segs.last() {
+                    let sst = &last.sst;
+                    let n = sst.num_rows;
+                    let matching: Vec<usize> = if let Ok(tseg) = sst.read_text(fc) {
+                        (0..n).filter(|&i| !sst.row_map.is_deleted(i) && tseg.get_str(i).map(|s| pred(s)).unwrap_or(false)).collect()
+                    } else { Vec::new() };
+                    let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
+                    for &pc in &out_positions {
+                        if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f)); }
+                        } else if pc < sst.column_tags.len() {
+                            if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
+                        }
+                    }
+                    return Ok(StreamingQueryResult::SelectColumnar {
+                        columns, segments: col_segs, row_indices: Some(matching),
+                        num_rows: n, row_map: sst.row_map.clone(),
+                    });
+                }
+            }
+        }
+
         // Extract (filter_col, predicate) from WHERE, or fall back to general.
         let result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
             self.col_segment_projected_scan(store, wc, schema, &out_positions, offset, limit)?
