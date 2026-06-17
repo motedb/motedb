@@ -1225,9 +1225,16 @@ impl MoteDB {
             while store.segment_count() >= 2 {
                 let _ = store.force_compact_all();
                 compactions += 1;
-                if compactions > 5 { break; } // safety
+                if compactions > 5 { break; }
+            }
+            // Release mmap pages after compaction (MADV_DONTNEED) to keep peak
+            // RSS low. Pages re-fault on next read access.
+            for seg in store.segments_snapshot() {
+                seg.clear_cache();
+                seg.release_pages();
             }
             if let Some(sst) = store.latest_segment_sst() {
+                sst.release_pages();
                 self.columnar_sstables.insert(table_name.to_string(), sst);
             }
         }

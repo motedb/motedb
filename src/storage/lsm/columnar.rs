@@ -829,6 +829,27 @@ impl ColumnarSSTableBuilder {
         Ok(())
     }
 
+    /// Add a row from pre-encoded column bytes (no Value construction).
+    /// Each entry is the raw bytes for that column (already in the on-disk format:
+    /// i64/LE, f64/LE, bool byte, or u16-len + UTF8 for text). Avoids Vec<Value>
+    /// allocation during compaction — the dominant memory cost (was 100MB for 300K rows).
+    pub fn add_values_raw(
+        &mut self,
+        key: u64,
+        timestamp: u64,
+        deleted: bool,
+        col_raw: &[&[u8]],
+    ) -> Result<()> {
+        self.keys.push(key);
+        self.timestamps.push(timestamp);
+        self.deleted.push(deleted);
+        for (col_idx, bytes) in col_raw.iter().enumerate() {
+            self.column_buffers[col_idx].extend_from_slice(bytes);
+        }
+        self.num_rows += 1;
+        Ok(())
+    }
+
     pub fn add_row(
         &mut self,
         key: u64,
