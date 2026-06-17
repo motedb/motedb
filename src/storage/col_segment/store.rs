@@ -337,6 +337,22 @@ impl ColSegmentStore {
     }
 
     /// Number of rows currently buffered in memory (not yet flushed to a segment).
+    /// Count live (non-deleted, non-duplicated) rows across all segments.
+    /// O(total_rows) but zero Value decode — fast for COUNT(*).
+    pub fn count_live_rows(&self) -> usize {
+        let segs = self.segments.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut count = 0;
+        for seg in segs.iter().rev() {
+            for i in 0..seg.sst.num_rows {
+                if seg.sst.row_map.is_deleted(i) { continue; }
+                let key = seg.sst.row_map.key(i);
+                if seen.insert(key) { count += 1; }
+            }
+        }
+        count
+    }
+
     pub fn buffered_row_count(&self) -> usize {
         self.write_buf.lock().num_rows
     }

@@ -1884,7 +1884,7 @@ impl MoteDB {
             store.append_rows(&store_rows)?;
             // Flush periodically to bound the in-memory buffer. 20K rows keeps
             // buffer ~3MB while limiting segment count (500K → ~25 segs vs 125).
-            if store.buffered_row_count() >= 20000 {
+            if store.buffered_row_count() >= 50000 {
                 store.flush_buffer()?;
                 // NOTE: do NOT compact here — compaction decodes all rows to
                 // Vec<Value> via MergeCursor, causing ~100MB peak for 300K rows.
