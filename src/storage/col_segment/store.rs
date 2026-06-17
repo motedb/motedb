@@ -271,6 +271,9 @@ impl ColSegmentStore {
                     seg.sst.read_text(pc).ok()
                 } else { None }
             }).collect();
+            // Per-column dedup cache for output text values.
+            let mut text_dedup: Vec<std::collections::HashMap<&str, std::sync::Arc<str>>> =
+                ptext_cols.iter().map(|_| std::collections::HashMap::with_capacity(64)).collect();
 
             for &i in &order {
                 if seg.sst.row_map.is_deleted(i) { continue; }
@@ -293,7 +296,16 @@ impl ColSegmentStore {
                             (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
                             (_, Some(Some(t)), ColumnType::Text) => {
                                 if t.is_null(i) { Some(Value::Null) }
-                                else { t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))) }
+                                else { t.get_str(i).map(|s| {
+                                    // Dedup: reuse Arc for repeated text values.
+                                    let cache = &mut text_dedup[pi];
+                                    let arc = cache.get(s).cloned().unwrap_or_else(|| {
+                                        let a: std::sync::Arc<str> = std::sync::Arc::from(s);
+                                        cache.insert(s, std::sync::Arc::clone(&a));
+                                        a
+                                    });
+                                    Value::Text(crate::types::ArcString(arc))
+                                }) }
                             }
                             _ => Some(Value::Null),
                         }
