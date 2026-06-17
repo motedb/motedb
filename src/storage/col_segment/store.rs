@@ -172,19 +172,17 @@ impl ColSegmentStore {
             }).collect();
 
             // Pre-intern Text column values into ArcString once per segment.
-            // Only for full scan (no filter) — filtered scans decode Text lazily
-            // on match to avoid interning non-matching rows.
-            let ptext_interned: Vec<Vec<Option<Value>>> = if filter_col.is_none() {
-                ptext.iter().map(|ts| {
-                    match ts {
-                        Some(t) => (0..n).map(|i| {
-                            if t.is_null(i) { return None; }
-                            t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
-                        }).collect(),
-                        None => Vec::new(),
-                    }
-                }).collect()
-            } else { Vec::new() };
+            // Always intern output Text columns into ArcString. Matched rows clone
+            // the Arc (refcount, ~1ns) instead of to_string heap allocation.
+            let ptext_interned: Vec<Vec<Option<Value>>> = ptext.iter().map(|ts| {
+                match ts {
+                    Some(t) => (0..n).map(|i| {
+                        if t.is_null(i) { return None; }
+                        t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                    }).collect(),
+                    None => Vec::new(),
+                }
+            }).collect();
 
             for &i in &order {
                 if seg.sst.row_map.is_deleted(i) { continue; }
@@ -224,6 +222,78 @@ impl ColSegmentStore {
                                 } else {
                                     t.get_str(i).map(|s| Value::Text(s.to_string().into()))
                                 }
+                            }
+                            _ => Some(Value::Null),
+                        }
+                    } else { Some(Value::Null) };
+                    row.push(v.unwrap_or(Value::Null));
+                }
+                result.push((key, row));
+            }
+        }
+        result
+    }
+
+    /// High-performance scan with a Text (&str) predicate on the filter column.
+    /// Avoids constructing a Value for the filter column entirely — the predicate
+    /// receives the raw &str borrowed from the segment (zero allocation). Only
+    /// matched rows get their output columns decoded (and output Text cols use
+    /// pre-interned ArcString clones). This is the fast path for WHERE col = 'x'
+    /// and LIKE 'prefix%' on text columns.
+    pub fn scan_text_filtered(
+        &self,
+        filter_col: usize,
+        project_cols: &[usize],
+        str_predicate: &dyn Fn(Option<&str>) -> bool,
+    ) -> Vec<(u64, Vec<Value>)> {
+        let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
+        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(65536));
+        let segs = self.segments_snapshot();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(total_rows);
+
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by_key(|&i| seg.sst.row_map.key(i));
+
+            // Filter column: read text segment once, predicate gets &str directly.
+            let ftext = seg.sst.read_text(filter_col).ok();
+
+            // Output fixed columns pre-decoded.
+            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols.iter().map(|&pc| {
+                if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
+                    seg.sst.read_fixed_i64(pc).ok()
+                } else { None }
+            }).collect();
+            // Output text columns: pre-intern into ArcString for clone-on-match.
+            let ptext_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols.iter().map(|&pc| {
+                if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed() {
+                    seg.sst.read_text(pc).ok()
+                } else { None }
+            }).collect();
+
+            for &i in &order {
+                if seg.sst.row_map.is_deleted(i) { continue; }
+                let key = seg.sst.row_map.key(i);
+                if !seen.insert(key) { continue; }
+
+                // Filter: pass raw &str to predicate (zero Value allocation).
+                let fval = ftext.as_ref().and_then(|t| {
+                    if t.is_null(i) { None } else { t.get_str(i) }
+                });
+                if !str_predicate(fval) { continue; }
+
+                // Decode output columns for this matched row.
+                let mut row = Vec::with_capacity(project_cols.len());
+                for (pi, &pc) in project_cols.iter().enumerate() {
+                    let v = if pc < self.col_types.len() {
+                        match (&pfixed.get(pi), &ptext_cols.get(pi), &self.col_types[pc]) {
+                            (Some(Some(f)), _, ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
+                            (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
+                            (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
+                            (_, Some(Some(t)), ColumnType::Text) => {
+                                if t.is_null(i) { Some(Value::Null) }
+                                else { t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))) }
                             }
                             _ => Some(Value::Null),
                         }

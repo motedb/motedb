@@ -3804,6 +3804,51 @@ impl QueryExecutor {
             _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
         };
 
+        // Text-filter fast path: raw &str predicate (zero Value alloc for non-matches).
+        if let Some(fc) = filter_col {
+            if matches!(col_types.get(fc), Some(ColumnType::Text)) {
+                let str_pred: Box<dyn Fn(Option<&str>) -> bool> = match wc {
+                    Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                        match (left.as_ref(), right.as_ref()) {
+                            (Expr::Column(_), Expr::Literal(Value::Text(s))) => {
+                                let target = s.to_string();
+                                Box::new(move |sv: Option<&str>| sv == Some(target.as_str()))
+                            }
+                            _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+                        }
+                    }
+                    Expr::Like { expr, pattern, .. } => {
+                        match (expr.as_ref(), pattern.as_ref()) {
+                            (Expr::Column(_), Expr::Literal(Value::Text(s))) => {
+                                let pat = s.to_string();
+                                if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                                    let prefix = pat[..pat.len()-1].to_string();
+                                    Box::new(move |sv: Option<&str>| sv.map(|s| s.starts_with(&prefix)).unwrap_or(false))
+                                } else {
+                                    return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit);
+                                }
+                            }
+                            _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+                        }
+                    }
+                    Expr::In { expr, list, .. } if list.iter().all(|e| matches!(e, Expr::Literal(Value::Text(_)))) => {
+                        match expr.as_ref() {
+                            Expr::Column(_) => {
+                                let strset: std::collections::HashSet<String> = list.iter()
+                                    .filter_map(|e| if let Expr::Literal(Value::Text(s)) = e { Some(s.to_string()) } else { None })
+                                    .collect();
+                                Box::new(move |sv: Option<&str>| sv.map(|s| strset.contains(s)).unwrap_or(false))
+                            }
+                            _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+                        }
+                    }
+                    _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
+                };
+                let scanned = store.scan_text_filtered(fc, out_positions, &*str_pred);
+                return Ok(scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect());
+            }
+        }
+
         let scanned = store.scan_projected_filtered(filter_col, out_positions, &*pred_box);
         Ok(scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect())
     }
