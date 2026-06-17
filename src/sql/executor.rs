@@ -1529,35 +1529,13 @@ impl QueryExecutor {
             .unwrap_or_else(|| vec![gc]);
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
 
-        // Scan only group col + amount col (minimal decode).
-        let mut scan_cols = vec![gc];
-        if let Some(ap) = out_pos.iter().find(|&&p| schema.columns.get(p).map(|c| matches!(c.col_type, ColumnType::Float)).unwrap_or(false)) {
-            scan_cols.push(*ap);
-        }
-        let scanned = store.scan_projected_filtered(Some(gc), &scan_cols, &|_| true);
-        // Aggregate: key = group value, value = (count, sum_amount if applicable)
-        let mut groups: HashMap<String, (i64, f64)> = HashMap::new();
-        let amount_pos = if scan_cols.len() > 1 { Some(1) } else { None }; // index in scan result
-        for (_key, row) in &scanned {
-            let gval = row.get(0).map(|v| match v {
-                Value::Text(s) => s.as_str().to_string(),
-                Value::Integer(i) => i.to_string(),
-                _ => "?".to_string(),
-            }).unwrap_or("?".to_string());
-            let entry = groups.entry(gval).or_insert((0, 0.0));
-            entry.0 += 1;
-            if let Some(ap) = amount_pos {
-                if let Some(Value::Float(f)) = row.get(ap) {
-                    entry.1 += f;
-                }
-            }
-        }
+        // Direct group-by scan: iterate group column without Vec<Value> allocation.
+        let groups = store.group_by_count(gc);
+
         // Build result rows.
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-        for (gval, (count, sum)) in groups {
-            let mut row = vec![Value::Text(gval.into()), Value::Integer(count)];
-            if amount_pos.is_some() { row.push(Value::Float(sum)); }
-            rows.push(row);
+        for (gval, count) in groups {
+            rows.push(vec![Value::Text(gval.into()), Value::Integer(count)]);
         }
         Ok(Some(StreamingQueryResult::SelectReady { columns, rows }))
     }

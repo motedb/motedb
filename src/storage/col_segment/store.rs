@@ -356,6 +356,36 @@ impl ColSegmentStore {
         count
     }
 
+    /// Group-by scan: iterate the group column directly (TextSegment), returning
+    /// (group_value, count) pairs. Zero Vec<Value> allocation — uses &str from
+    /// the text segment directly. Optimized for GROUP BY col, COUNT(*).
+    pub fn group_by_count(&self, group_col: usize) -> std::collections::HashMap<String, i64> {
+        let mut groups: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let segs = self.segments_snapshot();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            if let Ok(tseg) = seg.sst.read_text(group_col) {
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) { continue; }
+                    let gval = tseg.get_str(i).unwrap_or("").to_string();
+                    *groups.entry(gval).or_insert(0) += 1;
+                }
+            } else if let Ok(fseg) = seg.sst.read_fixed_i64(group_col) {
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) { continue; }
+                    let gval = fseg.get_i64(i).unwrap_or(0).to_string();
+                    *groups.entry(gval).or_insert(0) += 1;
+                }
+            }
+        }
+        groups
+    }
+
     pub fn buffered_row_count(&self) -> usize {
         self.write_buf.lock().num_rows
     }
