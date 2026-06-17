@@ -1374,6 +1374,31 @@ impl QueryExecutor {
             }));
         }
 
+        // ORDER BY + LIMIT: scan + sort in memory (avoids sync compaction).
+        if stmt.order_by.is_some() && stmt.limit.is_some() {
+            let ob = stmt.order_by.as_ref().unwrap();
+            if let Some(obe) = ob.first() {
+                if let crate::sql::ast::Expr::Column(cn) = &obe.expr {
+                    let order_col = schema.get_column_position(cn).unwrap_or(0);
+                    let limit = stmt.limit.unwrap();
+                    let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, &schema)
+                        .unwrap_or_else(|| (0..col_types.len()).collect());
+                    let scanned = store.scan_projected_filtered(Some(order_col), &out_pos, &|_| true);
+                    let order_idx = out_pos.iter().position(|&p| p == order_col).unwrap_or(0);
+                    let mut sorted = scanned;
+                    sorted.sort_by(|a, b| {
+                    let av = a.1.get(order_idx).cloned().unwrap_or(Value::Null);
+                    let bv = b.1.get(order_idx).cloned().unwrap_or(Value::Null);
+                    bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                    let rows: Vec<Vec<Value>> = sorted.into_iter().take(limit)
+                        .map(|(_, row)| row).collect();
+                    let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+                    return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
+                }
+            }
+        }
+
         // Multi-aggregate without GROUP BY: COUNT/SUM/MIN/MAX via multi-segment scan.
         // Avoids sync compaction for these common analytical queries.
         if stmt.group_by.is_none() {
@@ -1573,6 +1598,11 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, vec![]) {
                         let _ = store.flush_buffer();
+                        // ORDER BY LIMIT (no aggregate): full scan + in-memory sort.
+                        if stmt.order_by.is_some() && !self.has_aggregates(&stmt.columns) {
+                            let schema = self.db.get_table_schema(table_name)?;
+                            return self.execute_full_scan_via_col_segment(stmt, table_name, &schema, &store);
+                        }
                     }
                 }
             }
@@ -3975,6 +4005,28 @@ impl QueryExecutor {
             scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect()
         };
 
+        // Apply ORDER BY + LIMIT on the result (in-memory sort for ColSegmentStore).
+        let mut result_rows = result_rows;
+        if let Some(ref ob) = stmt.order_by {
+            if let Some(first_ob) = ob.first() {
+                if let crate::sql::ast::Expr::Column(cn) = &first_ob.expr {
+                    if let Some(order_idx) = schema.get_column_position(cn)
+                        .and_then(|p| out_positions.iter().position(|&x| x == p))
+                    {
+                        let asc = first_ob.asc;
+                        result_rows.sort_by(|a, b| {
+                            let av = a.get(order_idx).cloned().unwrap_or(Value::Null);
+                            let bv = b.get(order_idx).cloned().unwrap_or(Value::Null);
+                            let cmp = bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal);
+                            if asc { cmp.reverse() } else { cmp }
+                        });
+                    }
+                }
+            }
+        }
+        let lim = stmt.limit.unwrap_or(usize::MAX);
+        if result_rows.len() > lim { result_rows.truncate(lim); }
+
         Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows })
     }
 
@@ -5656,7 +5708,7 @@ impl QueryExecutor {
         // multi-segment full-scan path. The PointQuery/index fast paths below
         // fetch rows via lsm_engine.scan_range, which returns empty for
         // ColSegmentStore tables (data lives in segment files, not the LSM).
-        if stmt.where_clause.is_some() && stmt.group_by.is_none() {
+        if (stmt.where_clause.is_some() || stmt.order_by.is_some()) && stmt.group_by.is_none() {
             if let TableRef::Table { name: table_name, .. } = from {
                 if self.db.has_col_segment_store(table_name)
                     && !self.has_only_count_aggregate(&stmt.columns)
