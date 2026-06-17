@@ -1349,9 +1349,9 @@ impl QueryExecutor {
                     Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } => {
                         if let (Expr::Column(cn), Expr::Literal(v)) = (left.as_ref(), right.as_ref()) {
                             let pos = schema.get_column_position(cn).unwrap_or(0);
-                            let out_pos: Vec<usize> = (0..col_types.len()).collect();
                             let target = v.clone();
-                            let scanned = store.scan_projected_filtered(Some(pos), &out_pos, &move |fv: Option<&Value>| fv == Some(&target));
+                            // Only scan filter column (empty output = no Value decode).
+                            let scanned = store.scan_projected_filtered(Some(pos), &[], &move |fv: Option<&Value>| fv == Some(&target));
                             count = scanned.len() as i64;
                         } else { return Ok(None); }
                     }

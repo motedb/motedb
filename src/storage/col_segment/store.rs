@@ -171,17 +171,20 @@ impl ColSegmentStore {
             }).collect();
 
             // Pre-intern Text column values into ArcString once per segment.
-            // Always intern output Text columns into ArcString. Matched rows clone
-            // the Arc (refcount, ~1ns) instead of to_string heap allocation.
-            let ptext_interned: Vec<Vec<Option<Value>>> = ptext.iter().map(|ts| {
-                match ts {
-                    Some(t) => (0..n).map(|i| {
-                        if t.is_null(i) { return None; }
-                        t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
-                    }).collect(),
-                    None => Vec::new(),
-                }
-            }).collect();
+            // Skip interning when project_cols is empty (COUNT-only: no output decode).
+            let ptext_interned: Vec<Vec<Option<Value>>> = if project_cols.is_empty() {
+                Vec::new()
+            } else {
+                ptext.iter().map(|ts| {
+                    match ts {
+                        Some(t) => (0..n).map(|i| {
+                            if t.is_null(i) { return None; }
+                            t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                        }).collect(),
+                        None => Vec::new(),
+                    }
+                }).collect()
+            };
 
             for &i in &order {
                 if seg.sst.row_map.is_deleted(i) { continue; }
