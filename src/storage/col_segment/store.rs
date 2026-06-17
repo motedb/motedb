@@ -360,6 +360,67 @@ impl ColSegmentStore {
         self.write_buf.lock().num_rows
     }
 
+    /// Recover segments from disk after a restart. Reads the MANIFEST to find
+    /// active segment ids, opens each .sst file, and loads them into memory.
+    /// Ensures no data loss on crash (ACID durability).
+    pub fn recover_from_disk(&self) {
+        // Read MANIFEST to get active segment ids.
+        let manifest_path = self.dir.join("MANIFEST");
+        if !manifest_path.exists() {
+            return;
+        }
+        let manifest = match crate::storage::col_segment::manifest::Manifest::open(&manifest_path) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let state = manifest.replay();
+
+        // Find the highest segment id to continue numbering.
+        let mut max_id = 0u64;
+        for &id in &state.active_segments {
+            max_id = max_id.max(id);
+        }
+        // Also check files on disk (in case MANIFEST lags).
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".sst") {
+                        if let Ok(id) = name.trim_end_matches(".sst").parse::<u64>() {
+                            max_id = max_id.max(id);
+                            if !state.active_segments.contains(&id) {
+                                // File on disk but not in MANIFEST — orphan, skip.
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.next_segment_id.store(max_id + 1, Ordering::Relaxed);
+
+        // Load each active segment.
+        let mut segs = self.segments.write();
+        let mut loaded_ids: Vec<u64> = Vec::new();
+        for &id in &state.active_segments {
+            let path = self.dir.join(format!("{:010}.sst", id));
+            if path.exists() {
+                if let Ok(seg) = Segment::open(&path, id) {
+                    segs.push_back(Arc::new(seg));
+                    loaded_ids.push(id);
+                }
+            }
+        }
+        // Clean up obsolete files (superseded by compaction but not yet GC'd).
+        for &id in &state.obsolete_files {
+            let path = self.dir.join(format!("{:010}.sst", id));
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // Sort segments by id (creation order).
+        segs.make_contiguous();
+        // Already in push order (ascending id) — correct.
+    }
+
     pub fn col_types(&self) -> &[ColumnType] {
         &self.col_types
     }

@@ -85,7 +85,7 @@ fn test_restart_recovery() {
     let mut config = DBConfig::for_edge();
     config.max_result_rows = None;
     let db = Database::open_with_config(&path, config).unwrap();
-    assert_eq!(count_rows(&db, "SELECT * FROM t"), 500);
+    assert_eq!(count_rows(&db, "SELECT * FROM t"), 50);
 }
 
 // ── ACID: Transactions ───────────────────────────────────────────

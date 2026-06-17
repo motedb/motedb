@@ -1005,6 +1005,30 @@ impl MoteDB {
             _is_clone: false,
         };
 
+        // Recover ColSegmentStore: scan columnar_ms/ for table dirs, replay
+        // MANIFEST, load segments. Ensures data survives restart (ACID).
+        let ms_dir = db.path.join("columnar_ms");
+        if ms_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&ms_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_dir() {
+                            let table_name = entry.file_name().to_string_lossy().to_string();
+                            if let Ok(schema) = db.table_registry.get_table(&table_name) {
+                                let col_types = schema.col_types().to_vec();
+                                if let Ok(store) = crate::storage::col_segment::ColSegmentStore::create(
+                                    &db.path, &table_name, col_types,
+                                ) {
+                                    store.recover_from_disk();
+                                    db.col_segment_stores.insert(table_name, store);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
         let (index_build_tx, index_builder_thread) =
             Self::start_index_builder_pipeline(db.clone_for_callback());

@@ -201,6 +201,17 @@ impl MoteDB {
             let _ = builder.add_values(key, ts, false, &row);
         }
 
+        // S9: also write to ColSegmentStore (so single-row INSERTs survive restart).
+        {
+            let store = self.get_or_create_col_segment_store(table_name, schema.col_types().to_vec())?;
+            let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+            store.append_rows(&[(key, ts, row.clone())])?;
+            if store.buffered_row_count() >= 20000 {
+                store.flush_buffer()?;
+            }
+        }
+
         // 7. Update indexes
         {
         let mut index_errors: Vec<String> = Vec::new();
