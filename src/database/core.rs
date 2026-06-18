@@ -1020,6 +1020,11 @@ impl MoteDB {
                                     &db.path, &table_name, col_types,
                                 ) {
                                     store.recover_from_disk();
+                                    // Pre-compact to single segment so queries
+                                    // use fast SelectColumnar path (zero-copy).
+                                    while store.segment_count() >= 2 {
+                                        let _ = store.force_compact_all();
+                                    }
                                     db.col_segment_stores.insert(table_name, store);
                                 }
                             }
