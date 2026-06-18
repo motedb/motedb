@@ -1190,6 +1190,11 @@ impl QueryExecutor {
     ///
     /// For SELECT: only clones the SelectStmt (cheap relative to full query).
     /// For other statements: clones only the specific variant needed.
+    /// Check if a transaction is active (for fast-path bypass).
+    pub fn is_in_transaction(&self) -> bool {
+        self.current_txn_id.lock().is_some()
+    }
+
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
         let result = match stmt {

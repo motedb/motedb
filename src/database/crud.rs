@@ -1032,8 +1032,10 @@ impl MoteDB {
         if self.col_segment_stores.contains_key(table_name) {
             if let Some(store) = self.col_segment_stores.get(table_name) {
                 let _ = store.flush_buffer();
-                while store.segment_count() >= 2 {
+                let mut _ci = 0;
+                while store.segment_count() >= 2 && _ci < 5 {
                     let _ = store.force_compact_all();
+                    _ci += 1;
                 }
                 if let Some(last) = store.segments_snapshot().last() {
                     let col_sst = &last.sst;
