@@ -170,9 +170,19 @@ impl MoteDB {
         // Atomic LSM write — all rows or none
         self.lsm_engine.batch_put(&kvs)?;
 
-        // Now that LSM is updated, populate caches
+        // Now that LSM is updated, populate caches + ColSegmentStore
         for (row_id, (table_name, row_data)) in &write_set {
             self.row_cache.put(table_name.to_string(), *row_id, row_data.clone());
+
+            // Write committed row to ColSegmentStore (so SELECT sees it).
+            if self.col_segment_stores.contains_key(table_name) {
+                if let Ok(store) = self.get_or_create_col_segment_store(table_name, vec![]) {
+                    let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                    let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                    let ts = self.write_lsn.load(std::sync::atomic::Ordering::Relaxed);
+                    store.append_rows(&[(key, ts, row_data.clone())])?;
+                }
+            }
 
             let tbl_schema = self.table_registry.get_table(table_name)?;
             if let Some(pk_name) = tbl_schema.primary_key() {
