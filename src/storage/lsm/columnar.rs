@@ -533,8 +533,6 @@ impl ColumnarSSTable {
             unsafe { MmapOptions::new().map(&file) }.ok()
                 .filter(|m| m.len() >= row_map_min_end)
                 .map(|m| {
-                    // MADV_RANDOM: don't prefetch pages we won't read — saves RSS
-                    // on embedded devices by keeping only accessed pages resident.
                     let _ = unsafe { libc::madvise(m.as_ptr() as *mut _, m.len(), libc::MADV_RANDOM) };
                     Arc::new(m)
                 })
@@ -627,6 +625,25 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
+        // Zero-copy path: if mmap available and data uncompressed (flag=0),
+        // construct SegData::Mmap directly (no to_vec heap allocation).
+        if let Some(ref mmap) = self.mmap {
+            if end > 0 && self.backing().get(start) == Some(&0u8) {
+                // flag=0: uncompressed. Skip flag byte, point into mmap.
+                let data_start = start + 1; // skip flag
+                let null_bytes = (self.num_rows + 7) / 8;
+                let elem_size = tag.fixed_size();
+                let data_size = self.num_rows * elem_size;
+                let _ = end; // data_start + 1 + null_bytes + data_size should == end
+                return Ok(FixedSegment {
+                    num_rows: self.num_rows,
+                    null_bitmap: SegData::Mmap { mmap: Arc::clone(mmap), offset: data_start },
+                    data: SegData::Mmap { mmap: Arc::clone(mmap), offset: data_start + null_bytes },
+                    elem_size, tag,
+                });
+            }
+        }
+        // Fallback: decompress + from_bytes (with to_vec).
         let decompressed = Self::decompress_segment(&self.backing()[start..end]);
         FixedSegment::from_bytes(&decompressed, self.num_rows, tag)
     }
@@ -639,6 +656,21 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
+        // Zero-copy path: mmap + uncompressed (flag=0).
+        if let Some(ref mmap) = self.mmap {
+            if end > 0 && self.backing().get(start) == Some(&0u8) {
+                let data_start = start + 1; // skip flag
+                let null_bytes = (self.num_rows + 7) / 8;
+                return Ok(TextSegment {
+                    num_rows: self.num_rows,
+                    null_bitmap: SegData::Mmap { mmap: Arc::clone(mmap), offset: data_start },
+                    offsets_data: SegData::Mmap { mmap: Arc::clone(mmap), offset: data_start + null_bytes },
+                    string_data: SegData::Mmap { mmap: Arc::clone(mmap), offset: data_start + null_bytes + self.num_rows * 4 },
+                    trust_utf8: true,
+                    offsets_start: 0,
+                });
+            }
+        }
         let decompressed = Self::decompress_segment(&self.backing()[start..end]);
         TextSegment::from_bytes(&decompressed, self.num_rows)
     }
