@@ -531,9 +531,9 @@ impl ColSegmentStore {
                         } else { None }
                     }).collect();
                 for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) { continue; }
                     let key = seg.sst.row_map.key(i);
                     if !seen.insert(key) { continue; }
+                    if seg.sst.row_map.is_deleted(i) { continue; }
                     let ts = seg.sst.row_map.timestamp(i);
                     let mut col_bytes: Vec<&[u8]> = Vec::with_capacity(ncols);
                     let mut bufs: Vec<[u8; 8]> = Vec::with_capacity(ncols);
@@ -567,9 +567,9 @@ impl ColSegmentStore {
                 // Per-row reusable byte buffers (avoid per-row allocation).
                 let mut row_bytes: Vec<Vec<u8>> = vec![Vec::new(); ncols];
                 for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) { continue; }
                     let key = seg.sst.row_map.key(i);
                     if !seen.insert(key) { continue; }
+                    if seg.sst.row_map.is_deleted(i) { continue; }
                     let ts = seg.sst.row_map.timestamp(i);
                     // Phase 1: fill row_bytes (mutable, no outstanding borrows).
                     for ci in 0..ncols {

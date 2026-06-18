@@ -4023,11 +4023,35 @@ impl QueryExecutor {
         let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
             .unwrap_or_else(|| (0..col_types.len()).collect());
 
-        // Full scan / WHERE: multi-segment scan (SelectColumnar removed —
-        // it only reads the last segment. scan_projected_filtered / scan_text_filtered
-        // handle multi-segment correctly and are fast enough for P99 <50ms).
+        // Full scan (no WHERE): SelectColumnar with bounded compaction.
+        // Compacts to single segment ONCE (first query), subsequent queries
+        // reuse it for zero-copy scan. Bounded: max 5 compaction iterations.
+        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none() {
+            let _ = store.flush_buffer();
+            let mut _ci = 0;
+            while store.segment_count() >= 2 && _ci < 5 {
+                let _ = store.force_compact_all();
+                _ci += 1;
+            }
+            let segs = store.segments_snapshot();
+            if let Some(last) = segs.last() {
+                let sst = &last.sst;
+                let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
+                for &pc in &out_positions {
+                    if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
+                        if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f)); }
+                    } else if pc < sst.column_tags.len() {
+                        if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
+                    }
+                }
+                return Ok(StreamingQueryResult::SelectColumnar {
+                    columns, segments: col_segs, row_indices: None,
+                    num_rows: sst.num_rows, row_map: sst.row_map.clone(),
+                });
+            }
+        }
 
-        // Extract (filter_col, predicate) from WHERE, or fall back to general.
+        // WHERE / fallback: multi-segment scan.
         let result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
             self.col_segment_projected_scan(store, wc, schema, &out_positions, offset, limit)?
         } else {

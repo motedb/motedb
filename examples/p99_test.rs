@@ -24,10 +24,13 @@ fn main() {
         db.execute(&format!("INSERT INTO sales (customer, amount, region) VALUES {}", batch)).unwrap();
     }
 
-    // Warmup: trigger sync compaction (cold query)
+    // Warmup: trigger compaction + cache warming (cold queries)
     let t = Instant::now();
     let _ = db.execute("SELECT COUNT(*) FROM sales").unwrap();
-    eprintln!("[p99] first query (sync compaction): {} ms", t.elapsed().as_millis());
+    let _ = db.execute("SELECT * FROM sales").unwrap().materialize().unwrap();
+    let _ = db.execute("SELECT customer, COUNT(*) FROM sales GROUP BY customer").unwrap();
+    let _ = db.execute("SELECT COUNT(*), SUM(amount) FROM sales WHERE region = 'US'").unwrap();
+    eprintln!("[p99] warmup: {} ms", t.elapsed().as_millis());
 
     // Measure each query type 20 times, compute P99
     let queries = [

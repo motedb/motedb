@@ -1945,14 +1945,20 @@ impl MoteDB {
             // buffer ~3MB while limiting segment count (500K → ~25 segs vs 125).
             if store.buffered_row_count() >= 50000 {
                 store.flush_buffer()?;
-                // NOTE: do NOT compact here — compaction decodes all rows to
-                // Vec<Value> via MergeCursor, causing ~100MB peak for 300K rows.
-                // Compaction is deferred to query time (sync_col_segment_to_sstables)
-                // to keep INSERT memory low (~22MB for 300K rows).
+                // Defer compaction to background (keeps INSERT memory <30MB).
+                // Compaction at query time (SelectColumnar) handles first-query latency.
             }
         }
 
-        // 🚀 Embedded memory: auto-finalize when buffer exceeds 10K rows.
+        // Release segment mmap pages after bulk INSERT to keep RSS low.
+        // Pages re-fault on next read access.
+        if let Some(store) = self.col_segment_stores.get(table_name) {
+            for seg in store.segments_snapshot() {
+                seg.clear_cache();
+                seg.release_pages();
+            }
+        }
+
         // Keeps write buffer under ~1.6 MB (10K × 40B × 4 cols) on embedded devices.
         let _old_count = self.pending_updates.fetch_add(rows.len(), std::sync::atomic::Ordering::Release);
 
