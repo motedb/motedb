@@ -60,6 +60,17 @@ impl ColSegmentStore {
         Ok(())
     }
 
+    /// Append a tombstone (deletion marker) for a key. The tombstone suppresses
+    /// the row in multi-segment scans (newest-version-wins with deleted=true).
+    pub fn append_tombstone(&self, key: u64, ts: u64) -> Result<()> {
+        let mut buf = self.write_buf.lock();
+        // Write placeholder values for each column (keeps column_buffers in sync
+        // with num_rows). The actual values are never read for deleted rows.
+        let placeholder: Vec<Value> = self.col_types.iter().map(|_| Value::Null).collect();
+        buf.add_values(key, ts, true, &placeholder)?;
+        Ok(())
+    }
+
     /// Flush the buffer to a new delta segment on disk. Does NOT read old segments.
     /// O(this batch). Writes the file (no fsync — durability via WAL/manifest).
     pub fn flush_buffer(&self) -> Result<()> {
@@ -343,9 +354,11 @@ impl ColSegmentStore {
     /// Count live (non-deleted, non-duplicated) rows across all segments.
     /// O(total_rows) but zero Value decode — fast for COUNT(*).
     pub fn count_live_rows(&self) -> usize {
+        // Count buffered (unflushed) rows first.
+        let buffered = self.write_buf.lock().num_rows;
         let segs = self.segments.read();
         let mut seen = std::collections::HashSet::new();
-        let mut count = 0;
+        let mut count = buffered;
         for seg in segs.iter().rev() {
             for i in 0..seg.sst.num_rows {
                 if seg.sst.row_map.is_deleted(i) { continue; }

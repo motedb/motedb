@@ -792,6 +792,20 @@ impl MoteDB {
             let _ = builder.add_values(key, timestamp, true, &old_row);
         }
 
+        // 🆕 S9: write tombstone to ColSegmentStore so multi-segment scans
+        // see the deletion (legacy columnar_write_bufs tombstone is not read
+        // by ColSegmentStore scan paths).
+        if self.col_segment_stores.contains_key(table_name) {
+            if let Some(store) = self.col_segment_stores.get(table_name) {
+                // Flush existing data first so tombstone segment ordering is correct.
+                store.flush_buffer()?;
+                let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                store.append_tombstone(key, timestamp)?;
+                store.flush_buffer()?; // flush tombstone too
+            }
+        }
+
         // Invalidate cache AFTER LSM write — single invalidation
         self.row_cache.invalidate(table_name, row_id);
 
@@ -1014,6 +1028,38 @@ impl MoteDB {
         // Columnar-backed scan: if the table's data lives in a columnar SSTable
         // (rather than the LSM), decode column arrays and synthesize rows.
         // Falling back to the LSM scan here would yield empty/stale results.
+        // 🆕 S9: ColSegmentStore tables — flush+compact to single segment first.
+        if self.col_segment_stores.contains_key(table_name) {
+            if let Some(store) = self.col_segment_stores.get(table_name) {
+                let _ = store.flush_buffer();
+                while store.segment_count() >= 2 {
+                    let _ = store.force_compact_all();
+                }
+                if let Some(last) = store.segments_snapshot().last() {
+                    let col_sst = &last.sst;
+                    let num_cols = col_types.len();
+                    let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
+                    for col_idx in 0..num_cols {
+                        let seg = if col_idx < col_sst.column_tags.len() && col_sst.column_tags[col_idx].is_fixed() {
+                            ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
+                        } else {
+                            ColumnarSegment::Text(col_sst.read_text(col_idx)?)
+                        };
+                        segments.push(seg);
+                    }
+                    let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    return Ok(TableRowStreamingIterator {
+                        inner: TableRowStreamingInner::Columnar {
+                            row_map: col_sst.row_map.clone(),
+                            segments,
+                            col_names,
+                            current_idx: 0,
+                            num_rows: col_sst.num_rows,
+                        },
+                    });
+                }
+            }
+        }
         if self.columnar_sstables.contains_key(table_name) {
             let col_sst = self.columnar_sstables.get(table_name).unwrap().clone();
             let num_cols = col_types.len();
@@ -1247,6 +1293,8 @@ impl MoteDB {
             if let Some(sst) = store.latest_segment_sst() {
                 sst.release_pages();
                 self.columnar_sstables.insert(table_name.to_string(), sst);
+            } else {
+                eprintln!("[DBG-SYNC2] NO segs! buffered={}", store.buffered_row_count());
             }
         }
     }

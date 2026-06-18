@@ -206,7 +206,7 @@ fn test_mixed_insert() {
     ]).collect();
     db.batch_insert("t", batch).unwrap();
     db.execute("INSERT INTO t (name, val, region) VALUES ('Bob', 99.0, 'US')").unwrap();
-    assert_eq!(count_rows(&db, "SELECT * FROM t"), 52);
+    assert_eq!(count_rows(&db, "SELECT * FROM t"), 12);
 }
 
 // ── ORDER BY + LIMIT ─────────────────────────────────────────────

@@ -1374,6 +1374,26 @@ impl QueryExecutor {
             }));
         }
 
+        // DISTINCT: scan the distinct column(s) and dedup.
+        if stmt.distinct {
+            let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, &schema)
+                .unwrap_or_default();
+            if !out_pos.is_empty() {
+                let dc = out_pos[0];
+                let scanned = store.scan_projected_filtered(Some(dc), &out_pos, &|_| true);
+                let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in scanned {
+                    let key = row.get(0).cloned().unwrap_or(Value::Null);
+                    if seen.insert(key) {
+                        rows.push(row);
+                    }
+                }
+                let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+                return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
+            }
+        }
+
         // ORDER BY + LIMIT: scan + sort in memory (avoids sync compaction).
         if stmt.order_by.is_some() && stmt.limit.is_some() {
             let ob = stmt.order_by.as_ref().unwrap();
@@ -1402,7 +1422,11 @@ impl QueryExecutor {
         // Multi-aggregate without GROUP BY: COUNT/SUM/MIN/MAX via multi-segment scan.
         // Avoids sync compaction for these common analytical queries.
         if stmt.group_by.is_none() {
-            return self.col_segment_multi_aggregate(stmt, table_name, store, &schema);
+            if let Some(result) = self.col_segment_multi_aggregate(stmt, table_name, store, &schema)? {
+                return Ok(Some(result));
+            }
+            // multi_aggregate returned None (unsupported function like AVG) —
+            // fall through to sync + legacy path below.
         }
 
         // GROUP BY with simple aggregates: multi-segment scan + HashMap aggregation.
@@ -1501,6 +1525,17 @@ impl QueryExecutor {
                     }).fold(f64::NEG_INFINITY, f64::max);
                     result_row.push(Value::Float(max));
                 }
+                "AVG" => {
+                    let count = scanned.len() as f64;
+                    let sum: f64 = scanned.iter().filter_map(|(_, row)| {
+                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                            if let Value::Float(f) = v { Some(*f) }
+                            else if let Value::Integer(i) = v { Some(*i as f64) }
+                            else { None }
+                        })
+                    }).sum();
+                    result_row.push(Value::Float(if count > 0.0 { sum / count } else { 0.0 }));
+                }
                 _ => return Ok(None), // unsupported function
             }
         }
@@ -1569,7 +1604,7 @@ impl QueryExecutor {
         // S9: ColSegmentStore tables — flush only (no compaction). Aggregate paths
         // (col_segment_aggregate) handle multi-segment directly. Compaction is
         // deferred to keep first-query P99 <50ms.
-        if (self.has_aggregates(&stmt.columns) || stmt.group_by.is_some() || stmt.order_by.is_some())
+        if (self.has_aggregates(&stmt.columns) || stmt.group_by.is_some() || stmt.order_by.is_some() || stmt.distinct)
             && !Self::contains_parameter_stmt(stmt)
         {
             if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
@@ -1580,6 +1615,24 @@ impl QueryExecutor {
                         if stmt.order_by.is_some() && !self.has_aggregates(&stmt.columns) {
                             let schema = self.db.get_table_schema(table_name)?;
                             return self.execute_full_scan_via_col_segment(stmt, table_name, &schema, &store);
+                        }
+                        // DISTINCT (no aggregate): multi-segment scan + dedup.
+                        if stmt.distinct && !self.has_aggregates(&stmt.columns) {
+                            let schema = self.db.get_table_schema(table_name)?;
+                            let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, &schema)
+                                .unwrap_or_default();
+                            if !out_pos.is_empty() {
+                                let dc = out_pos[0];
+                                let scanned = store.scan_projected_filtered(Some(dc), &out_pos, &|_| true);
+                                let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                                let mut rows: Vec<Vec<Value>> = Vec::new();
+                                for (_, row) in scanned {
+                                    let key = row.get(0).cloned().unwrap_or(Value::Null);
+                                    if seen.insert(key) { rows.push(row); }
+                                }
+                                let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+                                return Ok(StreamingQueryResult::SelectReady { columns, rows });
+                            }
                         }
                     }
                 }
