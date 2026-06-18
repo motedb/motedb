@@ -198,9 +198,11 @@ impl ColSegmentStore {
             };
 
             for &i in &order {
-                if seg.sst.row_map.is_deleted(i) { continue; }
                 let key = seg.sst.row_map.key(i);
+                // Mark key as seen BEFORE checking deleted, so tombstones suppress
+                // older versions of the same key in earlier segments.
                 if !seen.insert(key) { continue; }
+                if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Decode filter value only (cheap: single column lookup).
                 let fval: Option<Value> = if let Some(fc) = filter_col {
@@ -289,9 +291,11 @@ impl ColSegmentStore {
                 ptext_cols.iter().map(|_| std::collections::HashMap::with_capacity(64)).collect();
 
             for &i in &order {
-                if seg.sst.row_map.is_deleted(i) { continue; }
                 let key = seg.sst.row_map.key(i);
+                // Mark key as seen BEFORE checking deleted, so tombstones suppress
+                // older versions of the same key in earlier segments.
                 if !seen.insert(key) { continue; }
+                if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Filter: pass raw &str to predicate (zero Value allocation).
                 let fval = ftext.as_ref().and_then(|t| {
@@ -361,9 +365,10 @@ impl ColSegmentStore {
         let mut count = buffered;
         for seg in segs.iter().rev() {
             for i in 0..seg.sst.num_rows {
-                if seg.sst.row_map.is_deleted(i) { continue; }
                 let key = seg.sst.row_map.key(i);
-                if seen.insert(key) { count += 1; }
+                if !seen.insert(key) { continue; }
+                if seg.sst.row_map.is_deleted(i) { continue; }
+                count += 1;
             }
         }
         count
@@ -380,17 +385,17 @@ impl ColSegmentStore {
             let n = seg.sst.num_rows;
             if let Ok(tseg) = seg.sst.read_text(group_col) {
                 for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) { continue; }
-                    let key = seg.sst.row_map.key(i);
-                    if !seen.insert(key) { continue; }
-                    let gval = tseg.get_str(i).unwrap_or("").to_string();
+                let key = seg.sst.row_map.key(i);
+                if !seen.insert(key) { continue; }
+                if seg.sst.row_map.is_deleted(i) { continue; }
+                let gval = tseg.get_str(i).unwrap_or("").to_string();
                     *groups.entry(gval).or_insert(0) += 1;
                 }
             } else if let Ok(fseg) = seg.sst.read_fixed_i64(group_col) {
                 for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) { continue; }
                     let key = seg.sst.row_map.key(i);
                     if !seen.insert(key) { continue; }
+                    if seg.sst.row_map.is_deleted(i) { continue; }
                     let gval = fseg.get_i64(i).unwrap_or(0).to_string();
                     *groups.entry(gval).or_insert(0) += 1;
                 }
