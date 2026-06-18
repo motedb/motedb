@@ -1078,7 +1078,8 @@ impl ColumnarSSTableBuilder {
         let mut column_entries = Vec::with_capacity(num_cols);
         let mut current_offset = segments_start as u64;
         for seg in &segments {
-            // Try Snappy compression — only use if it saves space
+            // Try Snappy compression — only use if it saves space.
+            // Compression reduces file size → less file_data heap memory on read.
             let compressed = snap::raw::Encoder::new()
                 .compress_vec(seg)
                 .unwrap_or_else(|_| seg.clone());

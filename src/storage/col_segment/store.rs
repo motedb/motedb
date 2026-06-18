@@ -181,21 +181,9 @@ impl ColSegmentStore {
                 } else { None }
             }).collect();
 
-            // Pre-intern Text column values into ArcString once per segment.
-            // Skip interning when project_cols is empty (COUNT-only: no output decode).
-            let ptext_interned: Vec<Vec<Option<Value>>> = if project_cols.is_empty() {
-                Vec::new()
-            } else {
-                ptext.iter().map(|ts| {
-                    match ts {
-                        Some(t) => (0..n).map(|i| {
-                            if t.is_null(i) { return None; }
-                            t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
-                        }).collect(),
-                        None => Vec::new(),
-                    }
-                }).collect()
-            };
+            // Lazy text decode: do NOT pre-intern all rows (saves 300K ArcString
+            // allocations = ~20MB). Decode only matched rows on demand below.
+            let ptext_interned: Vec<Vec<Option<Value>>> = Vec::new();
 
             for &i in &order {
                 let key = seg.sst.row_map.key(i);
