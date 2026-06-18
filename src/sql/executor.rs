@@ -1463,6 +1463,48 @@ impl QueryExecutor {
         }
         if aggs.is_empty() { return Ok(None); }
 
+        // 🚀 Fast path: COUNT + SUM/MIN/MAX WHERE text_col = 'val' — direct column
+        // scan without Vec<Value> construction. Avoids 100K allocations + 30MB memory.
+        if let Some(ref wc) = stmt.where_clause {
+            if let Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = wc {
+                if let (Expr::Column(cn), Expr::Literal(Value::Text(s))) = (left.as_ref(), right.as_ref()) {
+                    if let Some(fc) = schema.get_column_position(cn) {
+                        if matches!(schema.col_types().get(fc), Some(ColumnType::Text)) {
+                            // Find SUM/MIN/MAX target column.
+                            let agg_target = aggs.iter().filter_map(|a| a.col).next();
+                            let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
+                            if let Some(ac) = agg_target {
+                                let has_count = aggs.iter().any(|a| a.func == "COUNT");
+                                let has_sum = aggs.iter().any(|a| a.func == "SUM");
+                                let has_min = aggs.iter().any(|a| a.func == "MIN");
+                                let has_max = aggs.iter().any(|a| a.func == "MAX");
+                                if has_count && (has_sum || has_min || has_max) && aggs.len() <= 4 {
+                                    let (count, min, max) = store.count_min_max_text_filter(fc, s.as_str(), ac);
+                                    let sum = if has_sum {
+                                        // count_sum includes sum; re-scan for sum if needed
+                                        let (c, s) = store.count_sum_text_filter(fc, s.as_str(), ac);
+                                        s
+                                    } else { 0.0 };
+                                    let mut row: Vec<Value> = Vec::new();
+                                    for a in &aggs {
+                                        match a.func.as_str() {
+                                            "COUNT" => row.push(Value::Integer(count)),
+                                            "SUM" => row.push(Value::Float(sum)),
+                                            "MIN" => row.push(Value::Float(min)),
+                                            "MAX" => row.push(Value::Float(max)),
+                                            "AVG" => row.push(Value::Float(if count > 0 { sum / count as f64 } else { 0.0 })),
+                                            _ => row.push(Value::Null),
+                                        }
+                                    }
+                                    return Ok(Some(StreamingQueryResult::SelectReady { columns, rows: vec![row] }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Find columns to scan (filter col + aggregate target cols).
         let filter_col = stmt.where_clause.as_ref().and_then(|wc| {
             if let Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = wc {

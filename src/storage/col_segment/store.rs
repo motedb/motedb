@@ -375,6 +375,66 @@ impl ColSegmentStore {
     }
 
     /// Group-by scan: iterate the group column directly (TextSegment), returning
+    /// Count + Sum with a text filter: iterate filter col (TextSegment) + sum col
+    /// (FixedSegment) directly. Returns (count, sum). Zero Vec<Value> allocation.
+    /// Optimized for SELECT COUNT(*), SUM(col) WHERE text_col = 'val'.
+    pub fn count_sum_text_filter(&self, filter_col: usize, filter_val: &str, sum_col: usize) -> (i64, f64) {
+        let segs = self.segments_snapshot();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut count = 0i64;
+        let mut sum = 0.0f64;
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            let ftext = seg.sst.read_text(filter_col).ok();
+            let fsum = seg.sst.read_fixed_i64(sum_col).ok();
+            if let Some(tseg) = ftext.as_ref() {
+                for i in 0..n {
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) { continue; }
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if tseg.get_str(i) == Some(filter_val) {
+                        count += 1;
+                        if let Some(ref f) = fsum {
+                            if let Some(v) = f.get_f64(i) { sum += v; }
+                            else if let Some(v) = f.get_i64(i) { sum += v as f64; }
+                        }
+                    }
+                }
+            }
+        }
+        (count, sum)
+    }
+
+    /// Count + Min + Max with a text filter. Returns (count, min, max).
+    pub fn count_min_max_text_filter(&self, filter_col: usize, filter_val: &str, agg_col: usize) -> (i64, f64, f64) {
+        let segs = self.segments_snapshot();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut count = 0i64;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            let ftext = seg.sst.read_text(filter_col).ok();
+            let fagg = seg.sst.read_fixed_i64(agg_col).ok();
+            if let Some(tseg) = ftext.as_ref() {
+                for i in 0..n {
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) { continue; }
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if tseg.get_str(i) == Some(filter_val) {
+                        count += 1;
+                        if let Some(ref f) = fagg {
+                            let v = f.get_f64(i).unwrap_or_else(|| f.get_i64(i).map(|i| i as f64).unwrap_or(0.0));
+                            min = min.min(v);
+                            max = max.max(v);
+                        }
+                    }
+                }
+            }
+        }
+        (count, min.max(f64::NEG_INFINITY), max.min(f64::INFINITY))
+    }
+
     /// (group_value, count) pairs. Zero Vec<Value> allocation — uses &str from
     /// the text segment directly. Optimized for GROUP BY col, COUNT(*).
     pub fn group_by_count(&self, group_col: usize) -> std::collections::HashMap<String, i64> {
