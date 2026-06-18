@@ -4070,12 +4070,34 @@ impl QueryExecutor {
         let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
             .unwrap_or_else(|| (0..col_types.len()).collect());
 
-        // Full scan (no WHERE): multi-segment scan (no compaction — avoids
-        // deadlock with transaction path and keeps memory bounded).
-        // SelectColumnar (zero-copy) requires compaction which can interact
-        // badly with write_buf locks in transaction scenarios.
+        // Full scan (no WHERE): SelectColumnar with bounded compaction.
+        // Compacts to single segment (first query ~32ms), then zero-copy scan.
         if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none() {
             let _ = store.flush_buffer();
+            let mut _ci = 0;
+            while store.segment_count() >= 2 && _ci < 3 {
+                if store.force_compact_all().is_err() { break; }
+                _ci += 1;
+            }
+            if store.segment_count() <= 1 {
+                let segs = store.segments_snapshot();
+                if let Some(last) = segs.last() {
+                    let sst = &last.sst;
+                    let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
+                    for &pc in &out_positions {
+                        if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f)); }
+                        } else if pc < sst.column_tags.len() {
+                            if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
+                        }
+                    }
+                    return Ok(StreamingQueryResult::SelectColumnar {
+                        columns, segments: col_segs, row_indices: None,
+                        num_rows: sst.num_rows, row_map: sst.row_map.clone(),
+                    });
+                }
+            }
+            // Fallback: multi-segment scan if compaction failed.
             let scanned = store.scan_projected_filtered(None, &out_positions, &|_| true);
             let result_rows: Vec<Vec<Value>> = scanned.into_iter()
                 .skip(offset).take(limit).map(|(_, row)| row).collect();
