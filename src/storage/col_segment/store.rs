@@ -136,11 +136,18 @@ impl ColSegmentStore {
         project_cols: &[usize],
         predicate: &dyn Fn(Option<&Value>) -> bool,
     ) -> Vec<(u64, Vec<Value>)> {
-        // Pre-estimate result size to avoid Vec reallocations (300K rows = ~18 reallocs otherwise).
+        // Pre-estimate result size to avoid Vec reallocations.
         let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
-        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows);
+        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(65536));
         let segs = self.segments_snapshot();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(total_rows);
+        // Skip HashSet dedup when single segment (no overlap possible).
+        // Saves ~15MB for 300K rows.
+        let single_seg = segs.len() <= 1;
+        let mut seen: std::collections::HashSet<u64> = if single_seg {
+            std::collections::HashSet::new() // empty, unused
+        } else {
+            std::collections::HashSet::with_capacity(total_rows)
+        };
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
@@ -189,7 +196,7 @@ impl ColSegmentStore {
                 let key = seg.sst.row_map.key(i);
                 // Mark key as seen BEFORE checking deleted, so tombstones suppress
                 // older versions of the same key in earlier segments.
-                if !seen.insert(key) { continue; }
+                if !single_seg && !seen.insert(key) { continue; }
                 if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Decode filter value only (cheap: single column lookup).
@@ -252,7 +259,12 @@ impl ColSegmentStore {
         let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
         let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(65536));
         let segs = self.segments_snapshot();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(total_rows);
+        let single_seg = segs.len() <= 1;
+        let mut seen: std::collections::HashSet<u64> = if single_seg {
+            std::collections::HashSet::new()
+        } else {
+            std::collections::HashSet::with_capacity(total_rows)
+        };
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
@@ -282,7 +294,7 @@ impl ColSegmentStore {
                 let key = seg.sst.row_map.key(i);
                 // Mark key as seen BEFORE checking deleted, so tombstones suppress
                 // older versions of the same key in earlier segments.
-                if !seen.insert(key) { continue; }
+                if !single_seg && !seen.insert(key) { continue; }
                 if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Filter: pass raw &str to predicate (zero Value allocation).
@@ -333,6 +345,16 @@ impl ColSegmentStore {
         self.segments.read().iter().cloned().collect()
     }
 
+    /// Release mmap pages + clear col caches to reduce RSS after queries.
+    /// Call after batch queries to keep memory low.
+    pub fn release_query_memory(&self) {
+        let segs = self.segments.read();
+        for seg in segs.iter() {
+            seg.clear_cache();
+            seg.release_pages();
+        }
+    }
+
     /// After flush+compaction to a single segment, return that segment's SSTable
     /// as a shared Arc. Legacy read paths (aggregate, GROUP BY) read
     /// `columnar_sstables: DashMap<String, Arc<ColumnarSSTable>>`; this lets them
@@ -351,10 +373,11 @@ impl ColSegmentStore {
         let segs = self.segments.read();
         let mut seen = std::collections::HashSet::new();
         let mut count = buffered;
+        let single_seg = segs.len() <= 1;
         for seg in segs.iter().rev() {
             for i in 0..seg.sst.num_rows {
                 let key = seg.sst.row_map.key(i);
-                if !seen.insert(key) { continue; }
+                if !single_seg && !seen.insert(key) { continue; }
                 if seg.sst.row_map.is_deleted(i) { continue; }
                 count += 1;
             }
@@ -368,6 +391,7 @@ impl ColSegmentStore {
     /// Optimized for SELECT COUNT(*), SUM(col) WHERE text_col = 'val'.
     pub fn count_sum_text_filter(&self, filter_col: usize, filter_val: &str, sum_col: usize) -> (i64, f64) {
         let segs = self.segments_snapshot();
+        let single_seg = segs.len() <= 1;
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut count = 0i64;
         let mut sum = 0.0f64;
@@ -396,6 +420,7 @@ impl ColSegmentStore {
     /// Count + Min + Max with a text filter. Returns (count, min, max).
     pub fn count_min_max_text_filter(&self, filter_col: usize, filter_val: &str, agg_col: usize) -> (i64, f64, f64) {
         let segs = self.segments_snapshot();
+        let single_seg = segs.len() <= 1;
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut count = 0i64;
         let mut min = f64::INFINITY;
@@ -428,13 +453,14 @@ impl ColSegmentStore {
     pub fn group_by_count(&self, group_col: usize) -> std::collections::HashMap<String, i64> {
         let mut groups: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         let segs = self.segments_snapshot();
+        let single_seg = segs.len() <= 1;
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
             if let Ok(tseg) = seg.sst.read_text(group_col) {
                 for i in 0..n {
                 let key = seg.sst.row_map.key(i);
-                if !seen.insert(key) { continue; }
+                if !single_seg && !seen.insert(key) { continue; }
                 if seg.sst.row_map.is_deleted(i) { continue; }
                 let gval = tseg.get_str(i).unwrap_or("").to_string();
                     *groups.entry(gval).or_insert(0) += 1;
@@ -569,6 +595,7 @@ impl ColSegmentStore {
 
         if all_fixed {
             // Column-direct compaction: extract raw i64 bytes per row, no Value.
+            let single_seg = old_segs.len() <= 1;
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
