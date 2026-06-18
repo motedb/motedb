@@ -1276,14 +1276,14 @@ impl QueryExecutor {
                 }
             }
             Statement::BeginTransaction => {
-                let txn_id = self.db.begin_transaction()?;
+                        let txn_id = self.db.begin_transaction()?;
                 *self.current_txn_id.lock() = Some(txn_id);
                 StreamingQueryResult::Definition {
                     message: format!("Transaction {} started", txn_id),
                 }
             }
             Statement::CommitTransaction => {
-                if let Some(txn_id) = *self.current_txn_id.lock() {
+                        if let Some(txn_id) = *self.current_txn_id.lock() {
                     self.db.commit_transaction(txn_id)?;
                     *self.current_txn_id.lock() = None;
                     StreamingQueryResult::Definition {
@@ -10775,6 +10775,7 @@ impl QueryExecutor {
 
     /// Execute COMMIT [TRANSACTION]
     fn execute_commit_transaction(&self) -> Result<QueryResult> {
+        eprintln!("[TXN] COMMIT called");
         if let Some(txn_id) = *self.current_txn_id.lock() {
             self.db.commit_transaction(txn_id)?;
             *self.current_txn_id.lock() = None;
