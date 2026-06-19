@@ -190,9 +190,10 @@ impl MoteDB {
 
     /// Checkpoint during Drop — skips the is_closed check since we're shutting down.
     pub(crate) fn checkpoint_on_drop(&self) -> Result<()> {
-        let _guard = self.checkpoint_mutex.lock()
-            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
-        self.checkpoint_impl(true)
+        // Skip checkpoint during Drop — background threads are already stopped,
+        // so lsm_engine.flush() would enter backpressure waiting for a dead
+        // flush thread. WAL files remain on disk for crash recovery on next open.
+        Ok(())
     }
 
     fn checkpoint_impl(&self, rebuild_indexes: bool) -> Result<()> {

@@ -1288,7 +1288,8 @@ impl QueryExecutor {
                 }
             }
             Statement::CommitTransaction => {
-                        if let Some(txn_id) = *self.current_txn_id.lock() {
+                let _txn_id_opt = *self.current_txn_id.lock();
+                if let Some(txn_id) = _txn_id_opt {
                     self.db.commit_transaction(txn_id)?;
                     *self.current_txn_id.lock() = None;
                     StreamingQueryResult::Definition {
@@ -1301,7 +1302,8 @@ impl QueryExecutor {
                 }
             }
             Statement::RollbackTransaction => {
-                if let Some(txn_id) = *self.current_txn_id.lock() {
+                let _txn_id_opt = *self.current_txn_id.lock();
+                if let Some(txn_id) = _txn_id_opt {
                     self.db.rollback_transaction(txn_id)?;
                     *self.current_txn_id.lock() = None;
                     StreamingQueryResult::Definition {
@@ -10787,7 +10789,8 @@ impl QueryExecutor {
     /// Execute COMMIT [TRANSACTION]
     fn execute_commit_transaction(&self) -> Result<QueryResult> {
         eprintln!("[TXN] COMMIT called");
-        if let Some(txn_id) = *self.current_txn_id.lock() {
+        let _txn_id_opt = *self.current_txn_id.lock();
+                if let Some(txn_id) = _txn_id_opt {
             self.db.commit_transaction(txn_id)?;
             *self.current_txn_id.lock() = None;
             Ok(QueryResult::Definition {
@@ -10802,7 +10805,8 @@ impl QueryExecutor {
 
     /// Execute ROLLBACK [TRANSACTION]
     fn execute_rollback_transaction(&self) -> Result<QueryResult> {
-        if let Some(txn_id) = *self.current_txn_id.lock() {
+        let _txn_id_opt = *self.current_txn_id.lock();
+                if let Some(txn_id) = _txn_id_opt {
             self.db.rollback_transaction(txn_id)?;
             *self.current_txn_id.lock() = None;
             Ok(QueryResult::Definition {
