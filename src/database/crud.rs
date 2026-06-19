@@ -566,6 +566,16 @@ impl MoteDB {
 
         // Add new row to columnar buffer (create if first write to this table)
         {
+            // Also write to ColSegmentStore for query visibility (new append path).
+            let store_clone = self.col_segment_stores.get(table_name).map(|s| s.clone());
+            if let Some(store) = store_clone {
+                let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+                let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                let _ = store.append_rows(&[(key, timestamp, new_row.clone())]);
+                // Flush so the updated row is in a segment (queries only read segments).
+                let _ = store.flush_buffer();
+            }
+
             use dashmap::mapref::entry::Entry;
             let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
                 Entry::Occupied(o) => o.get().clone(),
