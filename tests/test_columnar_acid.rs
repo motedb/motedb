@@ -92,12 +92,22 @@ fn test_restart_recovery() {
 
 #[test]
 fn test_transaction_commit() {
-    let (_dir, db) = create_db();
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, val FLOAT, region TEXT)").unwrap();
     db.execute("INSERT INTO t (name, val, region) VALUES ('Alice', 1.0, 'US')").unwrap();
     db.execute("BEGIN").unwrap();
     db.execute("INSERT INTO t (name, val, region) VALUES ('Bob', 2.0, 'EU')").unwrap();
     db.execute("COMMIT").unwrap();
-    assert_eq!(count_rows(&db, "SELECT * FROM t"), 2);
+    eprintln!("COMMIT done, before SELECT");
+    let count = count_rows(&db, "SELECT * FROM t");
+    eprintln!("count: {}", count);
+    assert_eq!(count, 2);
+    eprintln!("test passed, dropping db");
+    drop(db);
+    eprintln!("db dropped");
+    drop(dir);
+    eprintln!("dir dropped");
 }
 
 #[test]

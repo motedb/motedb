@@ -317,9 +317,15 @@ impl Database {
     pub fn execute(&self, sql: &str) -> Result<StreamingQueryResult> {
         use crate::sql::{Lexer, Parser};
 
+        // In transaction mode, skip fast INSERT paths so rows go through
+        // insert_row_with_txn (buffered in write_set until COMMIT).
+        let in_txn = self.query_executor.is_in_transaction();
+
         // 🚀 Fast path: simple INSERT INTO <table> VALUES (...)
-        if let Some(result) = self.try_fast_insert(sql)? {
-            return Ok(result);
+        if !in_txn {
+            if let Some(result) = self.try_fast_insert(sql)? {
+                return Ok(result);
+            }
         }
 
         // 🚀 Fast path: UPDATE table SET col = val WHERE pk = value
