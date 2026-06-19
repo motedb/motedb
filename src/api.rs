@@ -499,7 +499,6 @@ impl Database {
         };
 
         let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
-        if !is_pk { return Ok(None); }
 
         let is_star = select_cols.map_or(false, |cols| cols.len() == 1 && matches!(cols[0], SelectColumn::Star));
 
@@ -1228,7 +1227,6 @@ impl Database {
             Err(_) => return Ok(None),
         };
         let is_pk = schema.primary_key().map(|pk| pk == where_col).unwrap_or(false);
-        if !is_pk { return Ok(None); }
 
         // Parse SET assignments: col1=v1, col2=v2 (store raw value strings)
         let mut set_items: Vec<(String, String)> = Vec::new();
@@ -1355,7 +1353,6 @@ impl Database {
             Err(_) => return Ok(None),
         };
         let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
-        if !is_pk { return Ok(None); }
 
         // Resolve PK → row_id
         let row_id = if schema.is_primary_key_auto_increment() {
