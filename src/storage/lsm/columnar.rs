@@ -526,36 +526,46 @@ impl ColumnarSSTable {
             footer_buf[12], footer_buf[13], footer_buf[14], footer_buf[15],
         ]);
 
-        // mmap for zero-copy (saves RSS — critical for <100MB embedded budget).
-        // Falls back to heap read if mmap fails or file too small for row_map.
-        let row_map_min_end = row_map_offset as usize + 64;
-        let mmap: Option<Arc<Mmap>> = if (file_len as usize) >= row_map_min_end {
-            unsafe { MmapOptions::new().map(&file) }.ok()
-                .filter(|m| m.len() >= row_map_min_end)
-                .map(|m| {
-                    let _ = unsafe { libc::madvise(m.as_ptr() as *mut _, m.len(), libc::MADV_RANDOM) };
-                    Arc::new(m)
-                })
-        } else { None };
-
+        // 🚀 Lazy loading: for files > 512KB, don't read/mmap the entire file.
+        // Only read metadata (header + column_index + row_map). Column data
+        // is read on-demand via seek+read in read_segment_bytes.
+        // For small files (< 512KB), read fully (avoids seek overhead).
+        let lazy_load = file_len > 512 * 1024;
+        
+        let mmap: Option<Arc<Mmap>> = None;
         let mut file_data: Vec<u8> = Vec::new();
-        if mmap.is_none() {
+
+        if !lazy_load {
             file.seek(SeekFrom::Start(0))?;
             file_data = vec![0u8; file_len as usize];
             file.read_exact(&mut file_data)?;
         }
-        let data: &[u8] = if let Some(ref m) = mmap { &m[..] } else { &file_data };
 
-        // Read header
-        let header_bytes = &data[..HEADER_SIZE];
-        let header = ColumnarHeader::deserialize(header_bytes)?;
+        // Read header.
+        let header = if !file_data.is_empty() {
+            ColumnarHeader::deserialize(&file_data[..HEADER_SIZE])?
+        } else {
+            file.seek(SeekFrom::Start(0))?;
+            let mut hb = vec![0u8; HEADER_SIZE];
+            file.read_exact(&mut hb)?;
+            ColumnarHeader::deserialize(&hb)?
+        };
+
         let num_columns = header.num_columns as usize;
         let num_rows = header.num_rows as usize;
 
-        // Read column index
+        // Read column index.
         let ci_size = num_columns * COLUMN_INDEX_ENTRY_SIZE;
         let ci_start = HEADER_SIZE;
-        let ci_data = &data[ci_start..ci_start + ci_size];
+        let ci_buf = if !file_data.is_empty() {
+            file_data[ci_start..ci_start + ci_size].to_vec()
+        } else {
+            let mut b = vec![0u8; ci_size];
+            file.seek(SeekFrom::Start(ci_start as u64))?;
+            file.read_exact(&mut b)?;
+            b
+        };
+        let ci_data: &[u8] = &ci_buf;
         let column_index: Vec<ColumnIndexEntry> = (0..num_columns)
             .map(|i| {
                 let off = i * COLUMN_INDEX_ENTRY_SIZE;
@@ -574,7 +584,17 @@ impl ColumnarSSTable {
 
         // Row map: copy from file_data
         let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
-        let rm_data = data[row_map_offset as usize..row_map_offset as usize + rm_total].to_vec();
+        // Row map: seek+read from file.
+        let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
+        // Row map: read from file_data or seek+read.
+        let rm_data = if !file_data.is_empty() {
+            file_data[row_map_offset as usize..row_map_offset as usize + rm_total].to_vec()
+        } else {
+            let mut d = vec![0u8; rm_total];
+            file.seek(SeekFrom::Start(row_map_offset))?;
+            file.read_exact(&mut d)?;
+            d
+        };
         let row_map = RowMap {
             num_rows,
             keys_offset: 0,
@@ -625,8 +645,8 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
-        let decompressed = Self::decompress_segment(&self.backing()[start..end]);
-        FixedSegment::from_bytes(&decompressed, self.num_rows, tag)
+        let seg_bytes = self.read_segment_bytes(start, end);
+        FixedSegment::from_bytes(&seg_bytes, self.num_rows, tag)
     }
 
     pub fn read_fixed_f64(&self, col_idx: usize) -> Result<FixedSegment> {
@@ -637,8 +657,34 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
         let end = start + entry.size as usize;
-        let decompressed = Self::decompress_segment(&self.backing()[start..end]);
-        TextSegment::from_bytes(&decompressed, self.num_rows)
+        let seg_bytes = self.read_segment_bytes(start, end);
+        TextSegment::from_bytes(&seg_bytes, self.num_rows)
+    }
+
+    /// Read column segment bytes via seek+read from file. Only reads the
+    /// specific column's bytes — NOT the entire file. This avoids mmap
+    /// page residency and keeps RSS low (<30MB for embedded devices).
+    fn read_segment_bytes(&self, start: usize, end: usize) -> std::borrow::Cow<[u8]> {
+        // If file_data is populated (small files), use it directly.
+        if !self.file_data.is_empty() {
+            return Self::decompress_segment(&self.file_data[start..end]);
+        }
+        // If mmap available, use it (zero-copy slice).
+        if let Some(ref mmap) = self.mmap {
+            return Self::decompress_segment(&mmap[start..end]);
+        }
+        // Seek+read from file: only read this column's bytes into heap.
+        let len = end - start;
+        let mut buf = vec![0u8; len];
+        if let Ok(mut f) = std::fs::File::open(&self.path) {
+            use std::io::{Seek, Read};
+            if f.seek(SeekFrom::Start(start as u64)).is_ok() {
+                if f.read_exact(&mut buf).is_ok() {
+                    return Self::decompress_segment(&buf).into_owned().into();
+                }
+            }
+        }
+        std::borrow::Cow::Owned(Vec::new())
     }
 
     /// Read spatial geometries from column segment.

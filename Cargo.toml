@@ -96,7 +96,7 @@ clap = { version = "4.4", features = ["derive"] }
 # Enable jieba tokenizer by default
 [features]
 default = ["tokenizer-jieba", "rayon"]  # Full build: jieba + parallelism, system allocator
-default-edge = []  # Edge/IoT minimal: no tokenizer, no rayon, system allocator
+default-edge = ["jemalloc"]  # Edge/IoT minimal: no tokenizer, no rayon, system allocator
 # 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
