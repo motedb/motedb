@@ -1047,18 +1047,9 @@ impl Parser {
                             return Err(self.error("POINT() requires exactly 2 arguments (x, y)"));
                         }
 
-                        // Evaluate arguments to get numeric values
-                        let x = match &args[0] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("POINT() arguments must be numeric literals")),
-                        };
-
-                        let y = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("POINT() arguments must be numeric literals")),
-                        };
+                        // Evaluate arguments to get numeric values (supports negatives)
+                        let x = self.eval_num(&args[0]).map_err(|_| self.error("POINT() arguments must be numeric literals"))?;
+                        let y = self.eval_num(&args[1]).map_err(|_| self.error("POINT() arguments must be numeric literals"))?;
 
                         use crate::types::{Geometry, Point3D};
                         Ok(Expr::Literal(Value::spatial(Geometry::Point3D(Point3D::new(x, y, 0.0)))))
@@ -1220,17 +1211,8 @@ impl Parser {
                             _ => return Err(self.error("ST_DISTANCE() first argument must be a column name")),
                         };
                         
-                        let x = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_DISTANCE() x must be a number")),
-                        };
-                        
-                        let y = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_DISTANCE() y must be a number")),
-                        };
+                        let x = self.eval_num(&args[1]).map_err(|_| self.error("ST_DISTANCE() x must be a number"))?;
+                        let y = self.eval_num(&args[2]).map_err(|_| self.error("ST_DISTANCE() y must be a number"))?;
                         
                         Ok(Expr::StDistance3D { column, x, y, z: 0.0 })
                     } else if name.to_uppercase() == "ST_KNN" {
@@ -1533,6 +1515,22 @@ impl Parser {
         Ok(list)
     }
     
+    fn eval_num(&self, expr: &Expr) -> std::result::Result<f64, ()> {
+        match expr {
+            Expr::Literal(Value::Float(f)) => Ok(*f),
+            Expr::Literal(Value::Integer(i)) => Ok(*i as f64),
+            Expr::UnaryOp { op, expr, .. } => {
+                let v = self.eval_num(expr)?;
+                match op {
+                    UnaryOperator::Minus => Ok(-v),
+                    UnaryOperator::Plus => Ok(v),
+                    _ => Err(()),
+                }
+            }
+            _ => Err(()),
+        }
+    }
+
     fn parse_usize(&mut self) -> Result<usize> {
         if let TokenType::Number(n) = self.current().token_type {
             if n < 0.0 || n.fract() != 0.0 {

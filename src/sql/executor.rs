@@ -1372,7 +1372,6 @@ impl QueryExecutor {
                 // No WHERE: count live rows directly from row_map (zero decode).
                 let _ct = std::time::Instant::now();
                 count = store.count_live_rows() as i64;
-                eprintln!("[DBG-COUNT] count_live_rows: {}ms", _ct.elapsed().as_millis());
             }
             let columns: Vec<String> = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
             return Ok(Some(StreamingQueryResult::SelectReady {
