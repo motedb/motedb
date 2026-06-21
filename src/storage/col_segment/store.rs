@@ -276,21 +276,19 @@ impl ColSegmentStore {
             // Filter column: read text segment once, predicate gets &str directly.
             let ftext = seg.sst.read_text(filter_col).ok();
 
-            // Output fixed columns pre-decoded.
+            // Pre-read output columns (same segment, one-time cost per column).
+            // This is O(cols) not O(rows) — much faster than per-row lazy decode.
             let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols.iter().map(|&pc| {
                 if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
                     seg.sst.read_fixed_i64(pc).ok()
                 } else { None }
             }).collect();
-            // Output text columns: pre-intern into ArcString for clone-on-match.
             let ptext_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed() {
+                if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed()
+                    && !matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Spatial) {
                     seg.sst.read_text(pc).ok()
                 } else { None }
             }).collect();
-            // Per-column dedup cache for output text values.
-            let mut text_dedup: Vec<std::collections::HashMap<&str, std::sync::Arc<str>>> =
-                ptext_cols.iter().map(|_| std::collections::HashMap::with_capacity(64)).collect();
 
             for &i in &order {
                 let key = seg.sst.row_map.key(i);
@@ -305,30 +303,23 @@ impl ColSegmentStore {
                 });
                 if !str_predicate(fval) { continue; }
 
-                // Decode output columns for this matched row.
+                // Decode output columns from pre-read segments (O(1) per row).
                 let mut row = Vec::with_capacity(project_cols.len());
                 for (pi, &pc) in project_cols.iter().enumerate() {
                     let v = if pc < self.col_types.len() {
-                        match (&pfixed.get(pi), &ptext_cols.get(pi), &self.col_types[pc]) {
-                            (Some(Some(f)), _, ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
-                            (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
-                            (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
-                            (_, Some(Some(t)), ColumnType::Text) => {
-                                if t.is_null(i) { Some(Value::Null) }
-                                else { t.get_str(i).map(|s| {
-                                    // Dedup: reuse Arc for repeated text values.
-                                    let cache = &mut text_dedup[pi];
-                                    let arc = cache.get(s).cloned().unwrap_or_else(|| {
-                                        let a: std::sync::Arc<str> = std::sync::Arc::from(s);
-                                        cache.insert(s, std::sync::Arc::clone(&a));
-                                        a
-                                    });
-                                    Value::Text(crate::types::ArcString(arc))
-                                }) }
+                        if matches!(self.col_types[pc], ColumnType::Spatial | ColumnType::Tensor(_)) {
+                            Some(Value::Null)
+                        } else if let Some(Some(ref f)) = pfixed.get(pi) {
+                            match self.col_types[pc] {
+                                ColumnType::Integer => f.get_i64(i).map(Value::Integer),
+                                ColumnType::Float => f.get_f64(i).map(Value::Float),
+                                ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
+                                _ => None,
                             }
-                            _ => Some(Value::Null),
-                        }
-                    } else { Some(Value::Null) };
+                        } else if let Some(Some(ref t)) = ptext_cols.get(pi) {
+                            t.get_str(i).map(|s| Value::Text(s.to_string().into()))
+                        } else { None }
+                    } else { None };
                     row.push(v.unwrap_or(Value::Null));
                 }
                 result.push((key, row));

@@ -207,7 +207,7 @@ impl MoteDB {
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
             let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
             store.append_rows(&[(key, ts, row.clone())])?;
-            if store.buffered_row_count() >= 20000 {
+            if store.buffered_row_count() >= 100000 {
                 store.flush_buffer()?;
             }
         }
@@ -1954,7 +1954,7 @@ impl MoteDB {
             store.append_rows(&store_rows)?;
             // Flush periodically to bound the in-memory buffer. 20K rows keeps
             // buffer ~3MB while limiting segment count (500K → ~25 segs vs 125).
-            if store.buffered_row_count() >= 50000 {
+            if store.buffered_row_count() >= 100000 {
                 store.flush_buffer()?;
                 // Defer compaction to background (keeps INSERT memory <30MB).
                 // Compaction at query time (SelectColumnar) handles first-query latency.
