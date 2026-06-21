@@ -530,7 +530,7 @@ impl ColumnarSSTable {
         // Only read metadata (header + column_index + row_map). Column data
         // is read on-demand via seek+read in read_segment_bytes.
         // For small files (< 512KB), read fully (avoids seek overhead).
-        let lazy_load = file_len > 2 * 1024 * 1024;
+        let lazy_load = file_len > 256 * 1024;
         
         let mmap: Option<Arc<Mmap>> = None;
         let mut file_data: Vec<u8> = Vec::new();

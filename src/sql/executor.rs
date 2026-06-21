@@ -1698,7 +1698,19 @@ impl QueryExecutor {
                             return Ok(result);
                         }
                         // col_segment_aggregate returned None (complex aggregate).
-                        // Sync (compact) so legacy aggregate paths see data.
+                        // Try multi_aggregate and group_by directly (no sync needed).
+                        let schema = self.db.get_table_schema(table_name)?;
+                        if stmt.group_by.is_some() {
+                            if let Some(result) = self.col_segment_group_by(stmt, table_name, &store, &schema)? {
+                                return Ok(result);
+                            }
+                        }
+                        if stmt.group_by.is_none() {
+                            if let Some(result) = self.col_segment_multi_aggregate(stmt, table_name, &store, &schema)? {
+                                return Ok(result);
+                            }
+                        }
+                        // Last resort: sync + legacy path.
                         self.db.sync_col_segment_to_sstables(table_name);
                     }
                 }
@@ -4105,11 +4117,44 @@ impl QueryExecutor {
             return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
         }
 
+        // Full scan (no WHERE): SelectColumnar with bounded compaction for zero-copy.
+        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none() {
+            let _ = store.flush_buffer();
+            let mut _ci = 0;
+            while store.segment_count() >= 2 && _ci < 3 {
+                if store.force_compact_all().is_err() { break; }
+                _ci += 1;
+            }
+            if store.segment_count() <= 1 {
+                let segs = store.segments_snapshot();
+                if let Some(last) = segs.last() {
+                    let sst = &last.sst;
+                    let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
+                    for &pc in &out_positions {
+                        if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f)); }
+                        } else if pc < sst.column_tags.len() {
+                            if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
+                        }
+                    }
+                    return Ok(StreamingQueryResult::SelectColumnar {
+                        columns, segments: col_segs, row_indices: None,
+                        num_rows: sst.num_rows, row_map: sst.row_map.clone(),
+                    });
+                }
+            }
+            // Fallback: multi-segment scan.
+            let scanned = store.scan_projected_filtered(None, &out_positions, &|_| true);
+            let result_rows: Vec<Vec<Value>> = scanned.into_iter()
+                .skip(offset).take(limit).map(|(_, row)| row).collect();
+            return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
+        }
+
         // WHERE / fallback: multi-segment scan.
         let result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
             self.col_segment_projected_scan(store, wc, schema, &out_positions, offset, limit)?
         } else {
-            // No WHERE: full scan, project all output cols.
+            // No WHERE but has GROUP BY / ORDER BY: full scan, project all output cols.
             let scanned = store.scan_projected_filtered(None, &out_positions, &|_| true);
             scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect()
         };
