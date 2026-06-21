@@ -530,7 +530,7 @@ impl ColumnarSSTable {
         // Only read metadata (header + column_index + row_map). Column data
         // is read on-demand via seek+read in read_segment_bytes.
         // For small files (< 512KB), read fully (avoids seek overhead).
-        let lazy_load = file_len > 512 * 1024;
+        let lazy_load = file_len > 2 * 1024 * 1024;
         
         let mmap: Option<Arc<Mmap>> = None;
         let mut file_data: Vec<u8> = Vec::new();
@@ -970,19 +970,23 @@ impl ColumnarSSTableBuilder {
                     buf.extend_from_slice(&bytes);
                 }
                 ColumnTypeTag::Spatial => {
-                    let geometry = match value {
-                        Value::Spatial(g) => (**g).clone(),
-                        Value::Null => {
-                            buf.extend_from_slice(&[0u8; 2]);
-                            continue;
+                    // Encode as WKT-like text string to match TextSegment format.
+                    let wkt = match value {
+                        Value::Spatial(g) => {
+                            use crate::types::Geometry;
+                            match **g {
+                                Geometry::Point3D(ref p) => format!("POINT({},{},{})", p.x, p.y, p.z),
+                                
+                                _ => String::new(),
+                            }
                         }
-                        _ => { buf.extend_from_slice(&[0u8; 2]); continue; }
+                        Value::Null => String::new(),
+                        _ => String::new(),
                     };
-                    let bytes = bincode::serialize(&geometry).unwrap_or_default();
-                    // Store: [len: u16 LE] [bincode bytes]
+                    let bytes = wkt.as_bytes();
                     let len = bytes.len().min(65535) as u16;
                     buf.extend_from_slice(&len.to_le_bytes());
-                    buf.extend_from_slice(&bytes);
+                    buf.extend_from_slice(bytes);
                 }
             }
         }

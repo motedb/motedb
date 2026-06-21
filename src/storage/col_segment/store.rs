@@ -226,6 +226,8 @@ impl ColSegmentStore {
                             (Some(Some(f)), _, ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
                             (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
                             (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
+                            (_, _, ColumnType::Spatial) => Some(Value::Null),
+                            (_, _, ColumnType::Tensor(_)) => Some(Value::Null),
                             (_, Some(Some(t)), ColumnType::Text) => {
                                 if !ptext_interned.is_empty() {
                                     ptext_interned.get(pi).and_then(|v| v.get(i)).cloned().flatten()
