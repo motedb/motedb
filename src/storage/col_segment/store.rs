@@ -192,16 +192,27 @@ impl ColSegmentStore {
         // Skip HashSet dedup when single segment (no overlap possible).
         // Saves ~15MB for 300K rows.
         let single_seg = segs.len() <= 1;
-        let mut seen: std::collections::HashSet<u64> = if single_seg {
-            std::collections::HashSet::new() // empty, unused
-        } else {
-            std::collections::HashSet::with_capacity(total_rows)
-        };
+        // 🔑 Always dedup by key (newest-version-wins). An UPDATE appends a newer
+        // version of a row with the SAME composite key; without dedup, scans
+        // return both old and new versions (duplicate rows). Segments are iterated
+        // newest→oldest (`.rev()`), and within a segment rows are iterated
+        // newest→oldest below, so the first-seen version of a key is the newest.
+        let mut seen: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(total_rows.max(64));
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            // Sort by key ascending, then by row index DESCENDING. The descending
+            // row-index tiebreak means that among multiple versions of the same
+            // key (UPDATE appends a newer row with a larger index), the newest
+            // version sorts FIRST. So a forward scan + seen-insert dedup keeps
+            // the newest version of each key (newest-version-wins).
             let mut order: Vec<usize> = (0..n).collect();
-            order.sort_by_key(|&i| seg.sst.row_map.key(i));
+            order.sort_by(|&a, &b| {
+                let ka = seg.sst.row_map.key(a);
+                let kb = seg.sst.row_map.key(b);
+                ka.cmp(&kb).then(b.cmp(&a)) // key asc, row index desc
+            });
 
             // Pre-decode filter column (once per segment).
             let fcol_fixed = filter_col.and_then(|fc| {
@@ -243,9 +254,11 @@ impl ColSegmentStore {
 
             for &i in &order {
                 let key = seg.sst.row_map.key(i);
-                // Mark key as seen BEFORE checking deleted, so tombstones suppress
-                // older versions of the same key in earlier segments.
-                if !single_seg && !seen.insert(key) { continue; }
+                // Newest-version-wins dedup: skip if a newer version of this key
+                // was already emitted (from a newer segment, or a newer row within
+                // this segment). Mark seen BEFORE the deleted check so a tombstone
+                // in a newer version suppresses older live rows.
+                if !seen.insert(key) { continue; }
                 if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Decode filter value only (cheap: single column lookup).

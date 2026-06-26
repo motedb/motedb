@@ -582,6 +582,14 @@ impl MoteDB {
             // S9: append the updated row to ColSegmentStore so queries see it.
             // Queries read exclusively from ColSegmentStore segments; writing
             // only to columnar_write_bufs (legacy builder) makes UPDATE invisible.
+            //
+            // 🔑 UPDATE = same key, newer version. The old version (in an older
+            // segment or the buffer) shares the SAME composite key. Reads use
+            // newest-version-wins: a forward scan/merge keeps the first-seen
+            // (newest segment) version for a key and skips older duplicates.
+            // So appending the new row is sufficient — no explicit tombstone
+            // needed (a tombstone here would itself occupy the dedup slot and
+            // wrongly suppress the new row during merge).
             {
                 let store = self.get_or_create_col_segment_store(table_name, schema.col_types().to_vec())?;
                 let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;

@@ -1179,15 +1179,138 @@ impl ColumnarSSTableBuilder {
         latest.into_iter().collect()
     }
 
-    /// Write the columnar SSTable to disk WITHOUT consuming self.
-    /// On success: clears internal buffers (data is now on disk).
-    /// On failure: ALL data is preserved for retry.
+    /// Compact the in-memory buffer so each composite key appears at most once,
+    /// keeping the NEWEST version (last appended = highest timestamp). Also drops
+    /// any key whose newest version is a tombstone (deleted). Rows are in append
+    /// order (old→new), so the last occurrence of a key wins. After this, the
+    /// SSTable written by finish_and_reset() has unique keys, so find_key()
+    /// binary search and single-segment scans return the correct (newest) value.
+    ///
+    /// This fixes the durability bug where an UPDATE (same key, newer value)
+    /// followed by a flush+restart returned the OLD value: without dedup the
+    /// segment held both versions and find_key picked the wrong one.
+    fn dedup_keys_newest_wins(&mut self) {
+        // 1. For each key, find the index of its last (newest) occurrence.
+        let mut last_idx: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(self.num_rows);
+        for (i, &k) in self.keys.iter().enumerate() {
+            last_idx.insert(k, i);
+        }
+        // 2. Build the keep-list in original order: a row is kept iff it is the
+        //    newest version of its key. We DO NOT drop tombstones here — a
+        //    tombstone's newest version must be preserved so read paths
+        //    (is_deleted checks, newest-version-wins scans) see the deletion.
+        //    Dropping them would resurrect deleted rows. Only duplicates of the
+        //    SAME key (older versions) are removed.
+        let keep: Vec<usize> = (0..self.num_rows)
+            .filter(|&i| last_idx.get(&self.keys[i]) == Some(&i))
+            .collect();
+        if keep.len() == self.num_rows {
+            return; // no dupes, nothing to do
+        }
+        // 3. Decode each kept row into Vec<Value>, then reset buffers and re-add.
+        //    We re-add via add_values to reuse the existing layout logic for every
+        //    column type (fixed + text). Buffer is small (in-memory), so this is
+        //    cheap relative to the SSTable write.
+        let col_types = self.column_types.clone();
+        let mut kept_rows: Vec<(u64, u64, Vec<Value>)> = Vec::with_capacity(keep.len());
+        for &i in &keep {
+            let mut row = Vec::with_capacity(col_types.len());
+            for (ci, tag) in self.column_tags.iter().enumerate() {
+                let v = match tag {
+                    ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                        let buf = &self.column_buffers[ci];
+                        let off = i * 8;
+                        if off + 8 > buf.len() { row.push(Value::Null); continue; }
+                        let val = i64::from_le_bytes([
+                            buf[off], buf[off+1], buf[off+2], buf[off+3],
+                            buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+                        ]);
+                        if val == i64::MIN {
+                            row.push(Value::Null);
+                        } else if matches!(tag, ColumnTypeTag::Timestamp) {
+                            row.push(Value::Timestamp(crate::types::Timestamp::from_micros(val)));
+                        } else {
+                            row.push(Value::Integer(val));
+                        }
+                    }
+                    ColumnTypeTag::Float => {
+                        let buf = &self.column_buffers[ci];
+                        let off = i * 8;
+                        if off + 8 > buf.len() { row.push(Value::Null); continue; }
+                        let bits = u64::from_le_bytes([
+                            buf[off], buf[off+1], buf[off+2], buf[off+3],
+                            buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+                        ]);
+                        let f = f64::from_bits(bits);
+                        if f.is_nan() { row.push(Value::Null); }
+                        else { row.push(Value::Float(f)); }
+                    }
+                    ColumnTypeTag::Bool => {
+                        let buf = &self.column_buffers[ci];
+                        row.push(Value::Bool(buf.get(i).copied().unwrap_or(0) != 0));
+                    }
+                    ColumnTypeTag::Text => {
+                        // Text layout: each row = [u16 len][bytes], concatenated.
+                        let s = self.extract_text_row(ci, i);
+                        row.push(Value::text(s));
+                    }
+                    _ => row.push(Value::Null),
+                };
+            }
+            kept_rows.push((self.keys[i], self.timestamps[i], row));
+        }
+        // 4. Reset buffers and re-add the deduplicated rows.
+        self.keys.clear();
+        self.timestamps.clear();
+        self.deleted.clear();
+        for b in self.column_buffers.iter_mut() { b.clear(); }
+        self.num_rows = 0;
+        for (key, ts, row) in kept_rows {
+            // Re-add uses the same encoding. add_values pushes key/ts/deleted.
+            let _ = self.add_values(key, ts, false, &row);
+        }
+    }
+
+    /// Extract the text value for row `i` in text column `ci`. Text rows are
+    /// laid out as concatenated [u16 len][len bytes] entries.
+    fn extract_text_row(&self, ci: usize, target_row: usize) -> String {
+        let buf = &self.column_buffers[ci];
+        let mut pos = 0usize;
+        let mut row = 0usize;
+        while pos + 2 <= buf.len() {
+            let len = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+            pos += 2;
+            if row == target_row {
+                if pos + len <= buf.len() {
+                    return String::from_utf8_lossy(&buf[pos..pos + len]).into_owned();
+                }
+                return String::new();
+            }
+            pos += len;
+            row += 1;
+        }
+        String::new()
+    }
+
     pub fn finish_and_reset(&mut self) -> Result<()> {
         if self.finished { return Ok(()); }
         if self.num_rows == 0 { return Ok(()); }
 
-        let num_cols = self.column_tags.len();
+        // 🔑 Dedup same-key rows BEFORE writing (newest-version-wins). An UPDATE
+        // appends a newer row with the SAME composite key; if both versions are
+        // written to the SSTable, find_key() binary search returns an arbitrary
+        // one (often the older), so reads after a flush/restart see stale data.
+        // Keep only the LAST occurrence of each key (rows are in append order =
+        // old→new, so last is newest). Tombstones count as a version too — if a
+        // key's newest version is a tombstone, the key is dropped entirely here
+        // (no live row), which is correct for a flushed segment.
+        if self.num_rows > 1 {
+            self.dedup_keys_newest_wins();
+        }
         let num_rows = self.num_rows;
+        if num_rows == 0 { return Ok(()); }
+        let num_cols = self.column_tags.len();
 
         // Build column segments with null bitmaps
         let mut segments: Vec<Vec<u8>> = Vec::with_capacity(num_cols);

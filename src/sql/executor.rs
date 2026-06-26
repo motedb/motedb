@@ -46,7 +46,12 @@ fn prefix_schema(schema: &TableSchema, prefix: &str) -> TableSchema {
 /// Column segment wrapper for zero-materialization results.
 #[derive(Clone)]
 pub enum ColumnarSeg {
-    Fixed(crate::storage::lsm::columnar::FixedSegment),
+    /// Fixed-width numeric column. `is_integer` distinguishes Integer (decode
+    /// as i64) from Float/Boolean (decode as f64/bool). The FixedSegment blob
+    /// stores raw 8-byte values without a type tag, so the caller must tell the
+    /// decoder how to interpret them — otherwise Integer columns are read back
+    /// as Float (e.g. age=30 → Float(from_bits(30))).
+    Fixed(crate::storage::lsm::columnar::FixedSegment, bool),
     Text(crate::storage::lsm::columnar::TextSegment),
 }
 
@@ -205,7 +210,30 @@ impl StreamingQueryResult {
                 let source: Vec<usize> = if let Some(ref idx) = row_indices {
                     idx.iter().filter(|&&i| !row_map.is_deleted(i)).copied().collect()
                 } else {
-                    (0..num_rows).filter(|&i| !row_map.is_deleted(i)).collect()
+                    // Newest-version-wins dedup: when a single segment holds
+                    // multiple versions of the same key (e.g. after an UPDATE
+                    // appends a newer row without merging), keep only the last
+                    // (newest) version per key. Rows are in append order
+                    // (old→new), so the last occurrence of a key is newest.
+                    let live: Vec<usize> = (0..num_rows)
+                        .filter(|&i| !row_map.is_deleted(i))
+                        .collect();
+                    let mut latest_for_key: std::collections::HashMap<u64, usize> =
+                        std::collections::HashMap::with_capacity(live.len());
+                    for &i in &live {
+                        latest_for_key.insert(row_map.key(i), i);
+                    }
+                    // Preserve original order, but only keep the newest version
+                    // of each key.
+                    let mut seen: std::collections::HashSet<u64> =
+                        std::collections::HashSet::with_capacity(latest_for_key.len());
+                    live.into_iter()
+                        .filter(|&i| {
+                            // Keep this row if it's the newest version of its key.
+                            latest_for_key.get(&row_map.key(i)) == Some(&i)
+                                && seen.insert(row_map.key(i))
+                        })
+                        .collect()
                 };
                 let mut rows = Vec::with_capacity(source.len());
                 // String interning pool: reuse Arc<str> for repeated text values.
@@ -216,8 +244,16 @@ impl StreamingQueryResult {
                     let mut row = Vec::with_capacity(ncols);
                     for seg in &segments {
                         match seg {
-                            ColumnarSeg::Fixed(f) => row.push(
-                                f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null)),
+                            ColumnarSeg::Fixed(f, is_integer) => {
+                                // Decode according to the stored type tag, not the
+                                // raw bits. Integer columns store i64; reading them
+                                // as f64 reinterprets the bits (age=30 → tiny Float).
+                                if *is_integer {
+                                    row.push(f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null));
+                                } else {
+                                    row.push(f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null));
+                                }
+                            }
                             ColumnarSeg::Text(t) => {
                                 let val = if let Some(s) = t.get_str(idx) {
                                     let arc = string_pool.get(s).cloned().unwrap_or_else(|| {
@@ -387,14 +423,34 @@ impl StreamingQueryResult {
                 let indices: Vec<usize> = if let Some(ref idx) = row_indices {
                     idx[..n].to_vec()
                 } else {
-                    (0..n).collect()
+                    // Newest-version-wins dedup (see materialize SelectColumnar note).
+                    let live: Vec<usize> = (0..n).filter(|&i| !row_map.is_deleted(i)).collect();
+                    let mut latest_for_key: std::collections::HashMap<u64, usize> =
+                        std::collections::HashMap::with_capacity(live.len());
+                    for &i in &live {
+                        latest_for_key.insert(row_map.key(i), i);
+                    }
+                    let mut seen: std::collections::HashSet<u64> =
+                        std::collections::HashSet::with_capacity(latest_for_key.len());
+                    live.into_iter()
+                        .filter(|&i| {
+                            latest_for_key.get(&row_map.key(i)) == Some(&i)
+                                && seen.insert(row_map.key(i))
+                        })
+                        .collect()
                 };
                 for &idx in &indices {
                     if row_map.is_deleted(idx) { continue; }
                     let mut row = Vec::with_capacity(segments.len());
                     for seg in &segments {
                         match seg {
-                            ColumnarSeg::Fixed(f) => row.push(f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null)),
+                            ColumnarSeg::Fixed(f, is_integer) => {
+                                if *is_integer {
+                                    row.push(f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null));
+                                } else {
+                                    row.push(f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null));
+                                }
+                            }
                             ColumnarSeg::Text(t) => row.push(t.get_str(idx).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))).unwrap_or(Value::Null)),
                         }
                     }
@@ -3418,7 +3474,7 @@ impl QueryExecutor {
                 for ci in 0..col_types.len() {
                     if col_sst.column_tags[ci].is_fixed() {
                         match col_sst.read_fixed_i64(ci) {
-                            Ok(seg) => segments.push(ColumnarSeg::Fixed(seg)),
+                            Ok(seg) => segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))),
                             Err(_) => { ok = false; break; }
                         }
                     } else {
@@ -3518,7 +3574,7 @@ impl QueryExecutor {
                                 let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
                                 for ci in 0..col_types.len() {
                                     if col_sst.column_tags[ci].is_fixed() {
-                                        if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg)); }
+                                        if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))); }
                                     } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
                                 }
                                 return Ok(StreamingQueryResult::SelectColumnar {
@@ -3573,7 +3629,7 @@ impl QueryExecutor {
                                     let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
                                     for ci in 0..col_types.len() {
                                         if col_sst.column_tags[ci].is_fixed() {
-                                            if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg)); }
+                                            if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))); }
                                         } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
                                     }
                                     return Ok(StreamingQueryResult::SelectColumnar {
@@ -3603,7 +3659,7 @@ impl QueryExecutor {
                                             let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
                                             for ci in 0..col_types.len() {
                                                 if col_sst.column_tags[ci].is_fixed() {
-                                                    if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg)); }
+                                                    if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))); }
                                                 } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
                                             }
                                             return Ok(StreamingQueryResult::SelectColumnar {
@@ -3933,7 +3989,7 @@ impl QueryExecutor {
                     let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
                     for &pc in &out_positions {
                         if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
-                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f)); }
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f, matches!(schema.col_types().get(pc), Some(ColumnType::Integer)))); }
                         } else if pc < sst.column_tags.len() {
                             if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
                         }
@@ -3966,7 +4022,7 @@ impl QueryExecutor {
                     let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
                     for &pc in &out_positions {
                         if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
-                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f)); }
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f, matches!(schema.col_types().get(pc), Some(ColumnType::Integer)))); }
                         } else if pc < sst.column_tags.len() {
                             if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
                         }
@@ -5692,11 +5748,15 @@ impl QueryExecutor {
             }
         }
 
-        // S9: ColSegmentStore tables — route queries with WHERE through the
-        // multi-segment full-scan path. The PointQuery/index fast paths below
-        // fetch rows via lsm_engine.scan_range, which returns empty for
-        // ColSegmentStore tables (data lives in segment files, not the LSM).
-        if (stmt.where_clause.is_some() || stmt.order_by.is_some()) && stmt.group_by.is_none() {
+        // S9: ColSegmentStore tables — route ALL non-aggregate queries (with or
+        // without WHERE) through the multi-segment full-scan path. The
+        // PointQuery/index fast paths below fetch rows via lsm_engine.scan_range,
+        // which returns empty for ColSegmentStore tables (data lives in segment
+        // files, not the LSM). Previously this only routed queries with a WHERE
+        // or ORDER BY clause, so a plain `SELECT *` (no WHERE) fell through to
+        // the LSM path and returned 0 rows — a correctness bug for ColSegmentStore
+        // tables.
+        if stmt.group_by.is_none() && !self.has_aggregates(&stmt.columns) {
             if let TableRef::Table { name: table_name, .. } = from {
                 if self.db.has_col_segment_store(table_name)
                     && !self.has_only_count_aggregate(&stmt.columns)
