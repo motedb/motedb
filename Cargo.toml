@@ -1,6 +1,6 @@
 [package]
 name = "motedb"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
 license = "MIT"
@@ -41,9 +41,6 @@ lru = "0.12"
 
 # Roaring Bitmap for text index posting lists (used by: text_types)
 roaring = "0.10"
-
-# Fast hash algorithm (used throughout: HashMaps, Sets)
-ahash = "0.8"
 
 # Serialization (used by: all indexes, storage, catalog, txn, SQL)
 serde = { version = "1.0", features = ["derive"] }
@@ -95,15 +92,17 @@ clap = { version = "4.4", features = ["derive"] }
 
 # Enable jieba tokenizer by default
 [features]
-default = ["tokenizer-jieba", "rayon"]  # Full build: jieba + parallelism, system allocator
-default-edge = ["jemalloc"]  # Edge/IoT minimal: no tokenizer, no rayon, system allocator
+# Full build: jieba + parallelism + jemalloc (memory-efficient allocator with OS purge)
+default = ["tokenizer-jieba", "rayon", "jemalloc"]
+default-edge = ["jemalloc"]  # Edge/IoT minimal: no tokenizer, no rayon, jemalloc allocator
 # 可选分词器插件
 tokenizer-jieba = ["jieba-rs"]  # 中文分词（Jieba）
 tokenizer-all = ["tokenizer-jieba"]  # 启用所有分词器
 # 内存分析（用于性能调优）
 mem-profiling = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 # 🧠 jemalloc allocator (background thread returns freed memory to OS)
-jemalloc = ["tikv-jemallocator"]
+# jemalloc-ctl: enables explicit mallctl purge after bulk ops (CREATE INDEX)
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
 # ⚡ 数据并行化（可选，减少二进制大小 ~200KB）
 rayon = ["dep:rayon"]  # 启用 Rayon 并行处理
 

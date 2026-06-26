@@ -66,6 +66,15 @@ impl MoteDB {
             debug_log!("[Flush] Columnar flush failed: {:?}", e);
         }
 
+        // 🔥 Flush ColSegmentStore write buffers — without this, all buffered
+        // INSERT/UPDATE/DELETE data is lost on restart. This was the root cause
+        // of the "data disappears after reopen" bug found by durability tests.
+        for entry in self.col_segment_stores.iter() {
+            if let Err(e) = entry.flush_buffer() {
+                debug_log!("[Flush] ColSegmentStore flush failed for {}: {:?}", entry.key(), e);
+            }
+        }
+
         self.pending_updates.store(0, Ordering::Relaxed);
         trim_allocator();
 

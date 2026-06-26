@@ -22,6 +22,31 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+/// Explicitly purge jemalloc's dirty pages back to the OS.
+/// Call after bulk operations (CREATE INDEX, compaction) that create
+/// large transient allocations, to keep RSS low on edge devices.
+/// No-op when jemalloc is not enabled.
+pub fn purge_memory_to_os() {
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    {
+        // Advance epoch to refresh arena stats, then purge each arena.
+        // "arena.<i>.purge" forces all dirty/muzzy pages back to the OS.
+        use tikv_jemalloc_ctl::{epoch, arenas};
+        let _ = epoch::advance();
+        if let Ok(n) = arenas::narenas::read() {
+            for i in 0..n {
+                let name = format!("arena.{}.purge\0", i);
+                // write(name) triggers immediate purge of arena i.
+                let _ = unsafe { tikv_jemalloc_ctl::raw::write(name.as_bytes(), ()) };
+            }
+        }
+    }
+    #[cfg(not(all(feature = "jemalloc", not(target_env = "msvc"))))]
+    {
+        // System allocator: no manual purge available.
+    }
+}
+
 /// Debug-only logging macro
 /// Only prints in debug builds, silenced in release builds
 #[macro_export]

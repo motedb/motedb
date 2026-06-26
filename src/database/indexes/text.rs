@@ -88,6 +88,11 @@ impl MoteDB {
         table_name: &str,
         col_position: usize,
     ) -> Result<usize> {
+        // 🚀 ColSegmentStore path (the active storage engine).
+        if self.has_col_segment_store(table_name) {
+            return self.build_text_index_from_col_segment(index_name, table_name, col_position);
+        }
+        // Legacy columnar_sstables path.
         let col_sst = match self.columnar_sstables.get(table_name) {
             Some(sst) => sst.clone(),
             None => return Ok(0),
@@ -109,6 +114,54 @@ impl MoteDB {
                     total += self.batch_insert_texts(index_name, &refs)?;
                     batch.clear();
                 }
+            }
+        }
+        if !batch.is_empty() {
+            let refs: Vec<(RowId, &str)> = batch.iter().map(|(id, s)| (*id, s.as_str())).collect();
+            total += self.batch_insert_texts(index_name, &refs)?;
+        }
+        Ok(total)
+    }
+
+    /// 🚀 Build text index from ColSegmentStore (the active storage engine).
+    /// Reads TextSegment from each segment and batch-inserts into the FTS index.
+    pub fn build_text_index_from_col_segment(
+        &self,
+        index_name: &str,
+        table_name: &str,
+        col_position: usize,
+    ) -> Result<usize> {
+        let store = match self.col_segment_stores.get(table_name) {
+            Some(s) => s.clone(),
+            None => return Ok(0),
+        };
+        let _ = store.flush_buffer();
+
+        let segs = store.segments_snapshot();
+        let mut batch: Vec<(RowId, String)> = Vec::with_capacity(10000);
+        let mut total = 0usize;
+
+        for seg in segs.iter() {
+            let n = seg.sst.num_rows;
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+            match seg.sst.read_text(col_position) {
+                Ok(tseg) => {
+                    let has_nulls = tseg.has_any_null();
+                    for i in 0..n {
+                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                        let s = if has_nulls { tseg.get_str(i) } else { Some(tseg.get_str_fast(i)) };
+                        if let Some(s) = s {
+                            let row_id = (seg.sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                            batch.push((row_id, s.to_string()));
+                            if batch.len() >= 10000 {
+                                let refs: Vec<(RowId, &str)> = batch.iter().map(|(id, s)| (*id, s.as_str())).collect();
+                                total += self.batch_insert_texts(index_name, &refs)?;
+                                batch.clear();
+                            }
+                        }
+                    }
+                }
+                Err(_) => continue,
             }
         }
         if !batch.is_empty() {

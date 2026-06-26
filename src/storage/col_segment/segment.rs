@@ -58,7 +58,7 @@ impl Segment {
         key: u64,
         col_types: &[crate::types::ColumnType],
     ) -> Option<Vec<crate::types::Value>> {
-        use crate::types::{ColumnType, Value};
+        use crate::types::Value;
 
         // Binary search in RowMap for the row index.
         let idx = self.sst.row_map.find_key(key)?;

@@ -1040,6 +1040,7 @@ pub fn compute_fixed_count(col_types: &[ColumnType]) -> usize {
 /// Parse once per row, then decode different column sets without re-parsing the header.
 pub struct RowParseContext {
     null_bitmap: u64,
+    #[allow(dead_code)]
     fixed_count: usize,
     var_offsets: [(usize, usize); 64],
     var_data_start: usize,

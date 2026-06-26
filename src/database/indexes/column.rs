@@ -56,71 +56,71 @@ impl MoteDB {
                 // path, extended to N segments with newest-version-wins dedup.
                 if self.has_col_segment_store(table_name) {
                     let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
-                    store.flush_buffer()?;
-                    // Compact to a single segment so CREATE INDEX reads one file
-                    // with no dedup overhead (matches the pre-regression baseline path).
-                    while store.needs_compaction() {
-                        let _ = store.compact_once();
+                    // Only flush if there are buffered rows. Avoid triggering compaction.
+                    if store.buffered_row_count() > 0 {
+                        store.flush_buffer()?;
                     }
-                    let mut batch: Vec<(crate::types::Value, RowId)> = Vec::with_capacity(SORT_BATCH);
+                    // 🚀 Collect ALL entries as raw [u8;64] bytes.
                     let segs = store.segments_snapshot();
-                    // After compaction typically 1 segment; still handle N for safety.
+                    let single_seg = segs.len() == 1;
+                    let mut raw_entries: Vec<([u8; 64], RowId)> = Vec::new();
                     use std::collections::HashSet;
-                    let mut seen_keys: HashSet<u64> = HashSet::new();
+                    let mut seen_keys: Option<HashSet<u64>> = if single_seg { None } else { Some(HashSet::new()) };
                     for seg in segs.iter().rev() {
                         let n = seg.sst.num_rows;
+                        let has_deletions = seg.sst.row_map.has_any_deleted();
                         if seg.sst.column_tags[col_position].is_fixed() {
                             if let Ok(fseg) = seg.sst.read_fixed_i64(col_position) {
+                                raw_entries.reserve(n);
                                 for i in 0..n {
-                                    if seg.sst.row_map.is_deleted(i) { continue; }
+                                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
                                     let key = seg.sst.row_map.key(i);
-                                    if !seen_keys.insert(key) { continue; }
+                                    if let Some(ref mut s) = seen_keys { if !s.insert(key) { continue; } }
                                     let row_id = (key & 0xFFFFFFFF) as RowId;
-                                    let val = match &col_types[col_position] {
+                                    let mut buf = [0u8; 64];
+                                    let ok = match &col_types[col_position] {
                                         crate::types::ColumnType::Integer =>
-                                            fseg.get_i64(i).map(crate::types::Value::Integer),
+                                            fseg.get_i64(i).map(|v| { buf[..8].copy_from_slice(&v.to_be_bytes()); }).is_some(),
                                         crate::types::ColumnType::Float =>
-                                            fseg.get_f64(i).map(crate::types::Value::Float),
-                                        _ => None,
+                                            fseg.get_f64(i).map(|v| {
+                                                let bits = v.to_bits();
+                                                let sortable = if bits & (1u64<<63) != 0 { !bits } else { bits ^ (1u64<<63) };
+                                                buf[..8].copy_from_slice(&sortable.to_be_bytes());
+                                            }).is_some(),
+                                        _ => false,
                                     };
-                                    if let Some(v) = val {
-                                        batch.push((v, row_id));
-                                        if batch.len() >= SORT_BATCH {
-                                            batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                                            indexed_count += batch.len();
-                                            let _ = index_arc.batch_insert(std::mem::take(&mut batch));
-                                            batch = Vec::with_capacity(SORT_BATCH);
-                                        }
-                                    }
+                                    if ok { raw_entries.push((buf, row_id)); }
                                 }
                             }
                         } else if let Ok(tseg) = seg.sst.read_text(col_position) {
-                            for i in 0..n {
-                                if seg.sst.row_map.is_deleted(i) { continue; }
-                                let key = seg.sst.row_map.key(i);
-                                if !seen_keys.insert(key) { continue; }
-                                let row_id = (key & 0xFFFFFFFF) as RowId;
-                                if let Some(s) = tseg.get_str(i) {
-                                    batch.push((
-                                        crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s))),
-                                        row_id,
-                                    ));
-                                    if batch.len() >= SORT_BATCH {
-                                        batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                                        indexed_count += batch.len();
-                                        let _ = index_arc.batch_insert(std::mem::take(&mut batch));
-                                        batch = Vec::with_capacity(SORT_BATCH);
-                                    }
+                            let n = seg.sst.num_rows;
+                            raw_entries.reserve(n);
+                            if has_deletions || !single_seg {
+                                // Slow path: need deletion checks and/or dedup.
+                                let extracted = tseg.bulk_extract_raw_keys();
+                                for (buf, row_idx) in extracted {
+                                    if has_deletions && seg.sst.row_map.is_deleted(row_idx) { continue; }
+                                    let key = seg.sst.row_map.key(row_idx);
+                                    if let Some(ref mut s) = seen_keys { if !s.insert(key) { continue; } }
+                                    let row_id = (key & 0xFFFFFFFF) as RowId;
+                                    raw_entries.push((buf, row_id));
+                                }
+                            } else {
+                                // Fast path: single segment, no deletions.
+                                let extracted = tseg.extract_all_raw_keys_unchecked();
+                                for (buf, row_idx) in extracted {
+                                    let key = seg.sst.row_map.key(row_idx);
+                                    let row_id = (key & 0xFFFFFFFF) as RowId;
+                                    raw_entries.push((buf, row_id));
                                 }
                             }
                         }
                     }
-                    if !batch.is_empty() {
-                        batch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                        indexed_count += batch.len();
-                        let _ = index_arc.batch_insert(batch);
-                    }
-                    let _ = index_arc.flush();
+
+                    indexed_count = raw_entries.len();
+                    // Single bulk_insert_raw call — triggers bulk_load (fastest).
+                    // bulk_load writes all pages + syncs superblock. No flush needed.
+                    let _ = index_arc.bulk_insert_raw(raw_entries);
                     let elapsed = start_time.elapsed();
                     debug_log!("[create_column_index] ColSegment path: {} values in {:?}", indexed_count, elapsed);
                 } else if let Some(col_sst) = self.columnar_sstables.get(table_name) {

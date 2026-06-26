@@ -168,18 +168,33 @@ impl Default for BM25Config {
 //=============================================================================
 
 /// Posting list for a term (memory-optimized)
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PostingList {
     /// Document IDs (Roaring Bitmap for 90%+ compression)
     doc_ids: RoaringBitmap,
-    
+
     /// Document frequencies (parallel array to doc_ids for memory efficiency)
     /// doc_freqs[i] is the frequency of term in doc_ids[i]
     /// ✅ This saves ~50% memory vs HashMap<DocId, u16>
     doc_freqs: Vec<u16>,
-    
+
     /// Positions in documents (for phrase queries, disabled by default)
     positions: Option<HashMap<DocId, Vec<Position>>>,
+
+    /// 🚀 Cached decoded pairs: (doc_id, tf) sorted by doc_id.
+    /// Built lazily on first search, then reused. NOT included in Clone.
+    cached_pairs: parking_lot::Mutex<Option<Vec<(u32, u16)>>>,
+}
+
+impl Clone for PostingList {
+    fn clone(&self) -> Self {
+        Self {
+            doc_ids: self.doc_ids.clone(),
+            doc_freqs: self.doc_freqs.clone(),
+            positions: self.positions.clone(),
+            cached_pairs: parking_lot::Mutex::new(None),
+        }
+    }
 }
 
 // Manual Serialize/Deserialize for PostingList
@@ -219,6 +234,7 @@ impl<'de> Deserialize<'de> for PostingList {
             doc_ids,
             doc_freqs: helper.doc_freqs,
             positions: helper.positions,
+            cached_pairs: parking_lot::Mutex::new(None),
         })
     }
 }
@@ -235,6 +251,7 @@ impl PostingList {
             doc_ids: RoaringBitmap::new(),
             doc_freqs: Vec::new(),
             positions: Some(HashMap::new()),
+            cached_pairs: parking_lot::Mutex::new(None),
         }
     }
     
@@ -247,6 +264,7 @@ impl PostingList {
             doc_ids: RoaringBitmap::new(),
             doc_freqs: Vec::new(),
             positions: if disable_positions { None } else { Some(HashMap::new()) },
+            cached_pairs: parking_lot::Mutex::new(None),
         }
     }
     
@@ -331,11 +349,14 @@ impl PostingList {
             doc_ids,
             doc_freqs,
             positions: None,  // Positions not stored in compact format
+            cached_pairs: parking_lot::Mutex::new(None),
         })
     }
     
     /// Add a document occurrence (optimized for sequential inserts)
     pub fn add(&mut self, doc_id: DocId, position: Option<Position>) {
+        // Invalidate cached pairs on mutation.
+        *self.cached_pairs.lock() = None;
         let is_new = !self.doc_ids.contains(doc_id as u32);
         self.doc_ids.insert(doc_id as u32);
 
@@ -474,6 +495,18 @@ impl PostingList {
             // doc_freqs out of sync: default tf=1
             self.doc_ids.iter().map(|id| (id, 1)).collect()
         }
+    }
+
+    /// 🚀 Cached iteration: builds (doc_id, tf) pairs once, then returns
+    /// a reference slice on subsequent calls (zero-copy). The caller must
+    /// not hold the lock across mutation operations.
+    pub fn iter_doc_tf_cached_ref(&self) -> Vec<(u32, u16)> {
+        let mut guard = self.cached_pairs.lock();
+        if guard.is_none() {
+            *guard = Some(self.iter_doc_tf());
+        }
+        // Return clone — fast since pairs are small (6 bytes each).
+        guard.as_ref().unwrap().clone()
     }
     
     pub fn get_positions(&self, doc_id: DocId) -> Option<&[Position]> {

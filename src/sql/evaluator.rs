@@ -476,13 +476,11 @@ impl ExprEvaluator {
             BinaryOperator::Lt => {
                 // 🐛 DEBUG: Print comparison for debugging
                 let result = left < right;
-                // eprintln!("DEBUG Lt: {:?} < {:?} = {}", left, right, result);
                 Ok(Value::Bool(result))
             }
             BinaryOperator::Gt => {
                 // 🐛 DEBUG: Print comparison for debugging  
                 let result = left > right;
-                // eprintln!("DEBUG Gt: {:?} > {:?} = {}", left, right, result);
                 Ok(Value::Bool(result))
             }
             BinaryOperator::Le => Ok(Value::Bool(left <= right)),

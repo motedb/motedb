@@ -514,8 +514,6 @@ impl StreamingQueryResult {
         F: FnMut(&[String], &Vec<Value>) -> Result<StreamingControl>,
     {
         use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-
         // We keep limit+offset rows in the heap (need offset extra for skipping)
         let k = limit.saturating_add(offset);
 
@@ -757,6 +755,7 @@ struct AggregateInfo {
 ///
 /// For simple comparisons (Eq, Lt, etc.), evaluation is a single Vec index
 /// + direct Value comparison — no recursion, no string ops, no HashMap.
+#[allow(dead_code)]
 enum CompiledWhere {
     Eq(usize, Value),                    // col[pos] == value
     Ne(usize, Value),                    // col[pos] != value
@@ -1599,7 +1598,6 @@ impl QueryExecutor {
         store: &crate::storage::col_segment::ColSegmentStore,
         schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
-        use std::collections::HashMap;
         // Extract GROUP BY column.
         let group_cols: Vec<usize> = stmt.group_by.as_ref().map(|gc| {
             gc.iter().filter_map(|cn| schema.get_column_position(cn)).collect()
@@ -3133,170 +3131,6 @@ impl QueryExecutor {
             }
             _ => "?".to_string(),
         }).collect();
-        Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![final_row] }))
-    }
-
-    /// 🚀 DISTINCT via column value index: for `SELECT DISTINCT col FROM table`
-    /// 🚀 Columnar aggregate execution: decode all rows into column arrays,
-    /// apply WHERE filter on the relevant column, then compute COUNT/SUM/MIN/MAX
-    /// directly from typed arrays. Much faster than row-based decode + aggregate.
-    fn try_aggregate_columnar(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
-        // Only handle simple single-table queries, no GROUP BY
-        if stmt.group_by.is_some() {
-            return Ok(None);
-        }
-        let table = match &stmt.from {
-            Some(TableRef::Table { name, .. }) => name.as_str(),
-            _ => return Ok(None),
-        };
-        let schema = self.db.get_table_schema(table)?;
-
-        // Parse WHERE clause: only simple col = literal for now
-        let filter: Option<(&str, &Value)> = match &stmt.where_clause {
-            Some(Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) => {
-                let col = match left.as_ref() {
-                    Expr::Column(n) => n.as_str(),
-                    _ => return Ok(None),
-                };
-                let val = match right.as_ref() {
-                    Expr::Literal(v) => v,
-                    _ => return Ok(None),
-                };
-                Some((col, val))
-            }
-            None => None, // No WHERE — aggregate all rows
-            _ => return Ok(None),
-        };
-
-        // Resolve filter column position
-        let filter_col_pos = if let Some((col_name, _)) = filter {
-            match schema.get_column_position(col_name) {
-                Some(p) => p,
-                None => return Ok(None),
-            }
-        } else {
-            0 // unused when no filter
-        };
-        let filter_value = filter.map(|(_, v)| v);
-
-        // Use columnar scan for efficient decode
-        let col_types = schema.col_types();
-        let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let colar = self.db.scan_table_columnar(table, &col_types, column_names)?;
-
-        // Find matching row indices if there's a filter
-        let match_indices: Vec<usize> = if let Some(fval) = filter_value {
-            let region_arr = &colar.data[filter_col_pos];
-            (0..colar.num_rows)
-                .filter(|&i| match region_arr {
-                    crate::storage::row_format::ColumnArray::Texts(v) => {
-                        i < v.len() && v[i].as_ref() == match fval {
-                            Value::Text(s) => s.0.as_ref(),
-                            _ => return false,
-                        }
-                    }
-                    crate::storage::row_format::ColumnArray::Integers(v) => {
-                        i < v.len() && match fval {
-                            Value::Integer(iv) => v[i] == *iv,
-                            _ => false,
-                        }
-                    }
-                    _ => false,
-                })
-                .collect()
-        } else {
-            (0..colar.num_rows).collect()
-        };
-
-        let count = match_indices.len() as i64;
-        let mut result_row = Vec::new();
-
-        // Compute aggregates from column arrays for matching indices
-        for col_expr in &stmt.columns {
-            match col_expr {
-                SelectColumn::Star => {} // COUNT(*) handled via count variable
-                SelectColumn::Expr(expr, _alias) => {
-                    if let Expr::FunctionCall { name, args, .. } = expr {
-                        let agg_col = match args.first() {
-                            Some(Expr::Column(c)) => c.as_str(),
-                            _ => return Ok(None),
-                        };
-                        let agg_pos = match schema.get_column_position(agg_col) {
-                            Some(p) => p, None => return Ok(None),
-                        };
-                        match name.to_uppercase().as_str() {
-                            "COUNT" => {} // handled via match_indices.len()
-                            "SUM" => {
-                                let sum = match &colar.data[agg_pos] {
-                                    crate::storage::row_format::ColumnArray::Floats(v) => {
-                                        match_indices.iter().map(|&i| v[i]).sum::<f64>()
-                                    }
-                                    crate::storage::row_format::ColumnArray::Integers(v) => {
-                                        match_indices.iter().map(|&i| v[i] as f64).sum::<f64>()
-                                    }
-                                    _ => return Ok(None),
-                                };
-                                result_row.push(Value::Float(sum));
-                            }
-                            "MIN" => {
-                                let min_val = match &colar.data[agg_pos] {
-                                    crate::storage::row_format::ColumnArray::Floats(v) => {
-                                        match_indices.iter()
-                                            .filter_map(|&i| if i < v.len() { Some(v[i]) } else { None })
-                                            .min_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                                    }
-                                    crate::storage::row_format::ColumnArray::Integers(v) => {
-                                        match_indices.iter()
-                                            .filter_map(|&i| if i < v.len() { Some(v[i] as f64) } else { None })
-                                            .min_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                                    }
-                                    _ => None,
-                                };
-                                result_row.push(min_val.map(Value::Float).unwrap_or(Value::Null));
-                            }
-                            "MAX" => {
-                                let max_val = match &colar.data[agg_pos] {
-                                    crate::storage::row_format::ColumnArray::Floats(v) => {
-                                        match_indices.iter()
-                                            .filter_map(|&i| if i < v.len() { Some(v[i]) } else { None })
-                                            .max_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                                    }
-                                    crate::storage::row_format::ColumnArray::Integers(v) => {
-                                        match_indices.iter()
-                                            .filter_map(|&i| if i < v.len() { Some(v[i] as f64) } else { None })
-                                            .max_by(|a,b| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                                    }
-                                    _ => None,
-                                };
-                                result_row.push(max_val.map(Value::Float).unwrap_or(Value::Null));
-                            }
-                            _ => return Ok(None),
-                        }
-                    }
-                }
-                _ => return Ok(None),
-            }
-        }
-
-        // Build final row
-        let has_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
-        let mut final_row: Vec<Value> = Vec::new();
-        if has_star { final_row.push(Value::Integer(count)); }
-        final_row.extend(result_row);
-
-        let cols: Vec<String> = stmt.columns.iter().map(|c| match c {
-            SelectColumn::Star => "COUNT(*)".to_string(),
-            SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, alias) => {
-                alias.clone().unwrap_or_else(|| {
-                    let col = match args.first() {
-                        Some(Expr::Column(c)) => c.as_str(), _ => "?",
-                    };
-                    format!("{}({})", name.to_uppercase(), col)
-                })
-            }
-            _ => "?".to_string(),
-        }).collect();
-
         Ok(Some(StreamingQueryResult::SelectReady { columns: cols, rows: vec![final_row] }))
     }
 

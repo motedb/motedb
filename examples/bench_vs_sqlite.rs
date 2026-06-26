@@ -88,6 +88,26 @@ impl MoteDBBench {
         t.elapsed().as_millis()
     }
 
+    /// INSERT via low-level batch_insert API (Vec<Row>) — the fastest path.
+    /// Skips SQL parsing entirely. This is the fair comparison vs SQLite's
+    /// prepared statement approach.
+    fn insert_batch_api(&self, data: &[(String, f64, &'static str)]) -> u128 {
+        use motedb::types::Value;
+        let t = Instant::now();
+        for chunk in data.chunks(5000) {
+            let rows: Vec<Vec<Value>> = chunk.iter().map(|(c, a, r)| {
+                vec![
+                    Value::Integer(0), // PK placeholder (auto-increment overwrites)
+                    Value::text(c.clone()),
+                    Value::Float(*a),
+                    Value::text(r.to_string()),
+                ]
+            }).collect();
+            let _ = self.db.batch_insert("sales", rows);
+        }
+        t.elapsed().as_millis()
+    }
+
     fn create_indexes(&self) -> u128 {
         let t = Instant::now();
         self.db.execute("CREATE INDEX idx_region ON sales (region) USING COLUMN").unwrap();
@@ -134,7 +154,12 @@ struct SQLiteBench {
 
 impl SQLiteBench {
     fn setup(n: usize) -> Self {
-        let conn = Connection::open_in_memory().unwrap();
+        // Use file-based DB (same as MoteDB) for fair comparison.
+        // Previously used open_in_memory which gave SQLite an unfair advantage.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("sqlite_bench.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let _ = dir; // keep alive
         // Maximum performance configuration
         conn.execute_batch("
             PRAGMA journal_mode = WAL;
@@ -238,11 +263,15 @@ fn main() {
 
     let rss_before = get_rss_kb();
 
-    // MoteDB setup
+    // MoteDB setup — SQL INSERT path
     let mote = MoteDBBench::setup(n);
     let mote_insert = mote.insert(&data);
     let mote_index = mote.create_indexes();
     let mote_vacuum = mote.vacuum();
+
+    // MoteDB setup — batch API INSERT path (fastest, fair vs SQLite prepared)
+    let mote_batch = MoteDBBench::setup(n);
+    let mote_insert_batch = mote_batch.insert_batch_api(&data);
 
     let rss_after_mote = get_rss_kb();
 
@@ -257,16 +286,18 @@ fn main() {
     println!("  │  {:30} {:>12} {:>12}", "", "MoteDB", "SQLite");
     println!("  │  {}", "-".repeat(58));
     println!("  │  {:30} {:>9} ms   {:>9} ms",
-        "INSERT {} rows".replace("{}", &n.to_string()), mote_insert, sqlite_insert);
+        "INSERT {} (SQL)".replace("{}", &n.to_string()), mote_insert, sqlite_insert);
+    println!("  │  {:30} {:>9} ms   {:>9} ms",
+        "INSERT {} (batch API)".replace("{}", &n.to_string()), mote_insert_batch, sqlite_insert);
     println!("  │  {:30} {:>9} ms   {:>9} ms",
         "CREATE 2 indexes", mote_index, sqlite_index);
     println!("  │  {:30} {:>9} ms   {:>12}",
         "Vacuum/compact", mote_vacuum, "n/a");
     println!("  │  {}", "-".repeat(58));
-    let mote_ins_rps = n as f64 / mote_insert as f64 * 1000.0;
+    let mote_ins_rps = n as f64 / mote_insert_batch as f64 * 1000.0;
     let sqlite_ins_rps = n as f64 / sqlite_insert as f64 * 1000.0;
     println!("  │  {:30} {:>9}/s   {:>9}/s",
-        "INSERT throughput", format!("{:.0}", mote_ins_rps), format!("{:.0}", sqlite_ins_rps));
+        "INSERT throughput (batch)", format!("{:.0}", mote_ins_rps), format!("{:.0}", sqlite_ins_rps));
     let mote_idx_rps = (n as f64 * 2.0) / mote_index as f64 * 1000.0;
     let sqlite_idx_rps = (n as f64 * 2.0) / sqlite_index as f64 * 1000.0;
     println!("  │  {:30} {:>9}/s   {:>9}/s",

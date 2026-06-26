@@ -1564,13 +1564,157 @@ impl<K: BTreeKey> GenericBTree<K> {
                 continue;
             }
             let content_len = u16::from_le_bytes([buf[13], buf[14]]) as usize;
-            if content_len < HEADER_SIZE || content_len > PAGE_SIZE {
+            if content_len < HEADER_SIZE || content_len > 65536 {
                 // Not a valid B+Tree page — must be an overflow page
                 overflow_ids.insert(page_id as u64);
             }
         }
 
         *self.overflow_page_ids.write() = overflow_ids;
+    }
+
+    /// Get the next page ID (for checking if tree is empty).
+    pub fn next_page_id(&self) -> u64 {
+        *self.next_page_id.read()
+    }
+
+    /// 🚀 Bulk-load sorted entries into a fresh B+Tree. O(N/B) sequential writes.
+    /// Uses Page::serialize (same format as write_page) + sync_superblock
+    /// (same format as normal path) — fully compatible with read_page.
+    pub fn bulk_load(&mut self, mut entries: Vec<K>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        entries.dedup();
+
+        // 🔑 Leaf page capacity MUST respect PAGE_SIZE: read_page_arc() rejects
+        // pages with content_len > PAGE_SIZE. The previous 16384 constant built
+        // ~16KB leaf pages which failed validation on read (>4096), corrupting
+        // the index for any dataset spanning 2+ leaf pages (300+ entries). Use
+        // PAGE_SIZE consistently for both leaf and internal page sizing.
+        let max_keys = ((PAGE_SIZE - HEADER_SIZE) / (self.key_size + 4 + 4)).max(self.max_keys);
+        let n = entries.len();
+        let key_size = self.key_size;
+
+        let max_internal_keys = ((PAGE_SIZE - HEADER_SIZE) / (key_size + 8)).max(4);
+        // Page format for empty-value leaf: 16-byte header + num_keys*key_size + num_keys*4 (value offsets, all 0).
+        // Pre-calculate total leaf content size for reserve.
+        let num_leaf_pages = (n + max_keys - 1) / max_keys;
+        let leaf_content_per_page = HEADER_SIZE + max_keys * key_size + max_keys * 4 + max_keys * 4;
+        let total_est = num_leaf_pages * leaf_content_per_page + 8192;
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut write_buf: Vec<u8> = Vec::with_capacity(total_est);
+        let mut offsets = self.page_offsets.write();
+        let mut file_pos: u64 = SUPERBLOCK_RESERVE;
+        let mut next_pid: u64 = 1;
+
+        // Inline serializer for leaf pages with empty values — writes directly
+        // to write_buf, avoiding Page struct + Vec allocation per page.
+        // Format: [is_leaf:1][num_keys:4][next_leaf:8][content_len:2][reserved:1]
+        //         [keys: num_keys * key_size][value_offsets: num_keys * 4 (all 0)]
+        let mut leaf_info: Vec<(u64, K)> = Vec::new();
+        let t1 = std::time::Instant::now();
+        let mut chunk_start = 0;
+        while chunk_start < n {
+            let chunk_end = (chunk_start + max_keys).min(n);
+            let num_keys = chunk_end - chunk_start;
+
+            // Serialize leaf page directly into write_buf.
+            // Value format: [offsets: num_keys*4][data: num_keys * 4 (length=0 u32 each)]
+            let content_size = HEADER_SIZE + num_keys * key_size + num_keys * 4 + num_keys * 4;
+            let start = write_buf.len();
+
+            // Header
+            write_buf.push(1u8); // is_leaf
+            write_buf.extend_from_slice(&(num_keys as u32).to_le_bytes());
+            let next_leaf = if chunk_end >= n { INVALID_PAGE_ID } else { next_pid + 1 };
+            write_buf.extend_from_slice(&next_leaf.to_le_bytes());
+            write_buf.extend_from_slice(&(content_size as u16).to_le_bytes());
+            write_buf.push(0u8); // reserved
+
+            // Keys
+            for i in chunk_start..chunk_end {
+                let kb = entries[i].serialize();
+                write_buf.extend_from_slice(&kb);
+            }
+            // Value offsets: each value has offset = prev_offset + 4 (for the
+            // length prefix u32). Empty values have 0 bytes data but still
+            // consume 4 bytes (the length=0 u32).
+            let mut val_off: u32 = 0;
+            for _ in chunk_start..chunk_end {
+                write_buf.extend_from_slice(&val_off.to_le_bytes());
+                val_off += 4; // 4 bytes for the length u32 (data is 0 bytes)
+            }
+            // Value data: each empty value is just a length=0 u32.
+            for _ in chunk_start..chunk_end {
+                write_buf.extend_from_slice(&0u32.to_le_bytes()); // length = 0
+            }
+
+            // Record offset
+            let pid = next_pid as usize;
+            if pid >= offsets.len() { offsets.resize(pid + 1, 0); }
+            offsets[pid] = file_pos;
+            file_pos += (write_buf.len() - start) as u64;
+
+            // Save first key for internal page construction.
+            leaf_info.push((next_pid, entries[chunk_start].clone()));
+            next_pid += 1;
+            chunk_start = chunk_end;
+        }
+
+        // Phase 2: Build internal pages bottom-up (using Page::serialize).
+        // Internal pages have a different layout than leaf pages: keys + child_ids
+        // (8 bytes each) instead of keys + value_offsets + value_data.
+        // Calculate max internal keys: (PAGE_SIZE - HEADER_SIZE) / (key_size + 8)
+        let max_internal_keys = ((PAGE_SIZE - HEADER_SIZE) / (key_size + 8)).max(4);
+        let mut current_level = leaf_info;
+        while current_level.len() > 1 {
+            let mut next_level: Vec<(u64, K)> = Vec::new();
+            let mut idx = 0;
+            while idx < current_level.len() {
+                let group_end = (idx + max_internal_keys + 1).min(current_level.len());
+                let children: Vec<u64> = current_level[idx..group_end].iter().map(|(pid, _)| *pid).collect();
+                let sep_keys: Vec<K> = current_level[idx+1..group_end].iter().map(|(_, k)| k.clone()).collect();
+                let first_key = current_level[idx].1.clone();
+
+                let mut page = Page::new_internal(next_pid, max_internal_keys);
+                page.keys = sep_keys;
+                page.children = children;
+                page.num_keys = page.keys.len();
+
+                let buf = page.serialize(self.key_size)?;
+                let pid = page.page_id as usize;
+                if pid >= offsets.len() { offsets.resize(pid + 1, 0); }
+                offsets[pid] = file_pos;
+                file_pos += buf.len() as u64;
+                write_buf.extend_from_slice(&buf);
+
+                next_level.push((next_pid, first_key));
+                next_pid += 1;
+                idx = group_end;
+            }
+            current_level = next_level;
+        }
+
+        let root_id = current_level[0].0;
+        drop(offsets);
+
+        {
+            let mut file = self.storage_file.write();
+            file.seek(SeekFrom::Start(SUPERBLOCK_RESERVE))?;
+            file.write_all(&write_buf)?;
+            file.sync_all()?;
+        }
+
+        *self.root_page_id.write() = root_id;
+        *self.next_page_id.write() = next_pid;
+        self.page_cache.write().clear();
+
+        // Write superblock using the SAME format as normal path.
+        self.sync_superblock()?;
+
+        Ok(())
     }
 
     /// Flush all dirty pages to disk (cache-granularity, requires cache_size >= num_pages)
@@ -1635,7 +1779,7 @@ impl<K: BTreeKey> GenericBTree<K> {
                 let mut header_buf = [0u8; HEADER_SIZE];
                 file.read_exact_at(&mut header_buf, file_offset)?;
                 let content_len = u16::from_le_bytes([header_buf[13], header_buf[14]]) as usize;
-                if content_len < HEADER_SIZE || content_len > PAGE_SIZE {
+                if content_len < HEADER_SIZE || content_len > 65536 {
                     return Err(StorageError::Corruption("bad content_len".into()));
                 }
                 let mut buf = vec![0u8; content_len];
