@@ -1213,7 +1213,9 @@ impl ColumnarSSTableBuilder {
         //    column type (fixed + text). Buffer is small (in-memory), so this is
         //    cheap relative to the SSTable write.
         let col_types = self.column_types.clone();
-        let mut kept_rows: Vec<(u64, u64, Vec<Value>)> = Vec::with_capacity(keep.len());
+        // (key, timestamp, deleted, row) — preserve the deleted flag so a
+        // tombstone's newest version stays a tombstone after rebuild.
+        let mut kept_rows: Vec<(u64, u64, bool, Vec<Value>)> = Vec::with_capacity(keep.len());
         for &i in &keep {
             let mut row = Vec::with_capacity(col_types.len());
             for (ci, tag) in self.column_tags.iter().enumerate() {
@@ -1258,7 +1260,7 @@ impl ColumnarSSTableBuilder {
                     _ => row.push(Value::Null),
                 };
             }
-            kept_rows.push((self.keys[i], self.timestamps[i], row));
+            kept_rows.push((self.keys[i], self.timestamps[i], self.deleted[i], row));
         }
         // 4. Reset buffers and re-add the deduplicated rows.
         self.keys.clear();
@@ -1266,9 +1268,11 @@ impl ColumnarSSTableBuilder {
         self.deleted.clear();
         for b in self.column_buffers.iter_mut() { b.clear(); }
         self.num_rows = 0;
-        for (key, ts, row) in kept_rows {
-            // Re-add uses the same encoding. add_values pushes key/ts/deleted.
-            let _ = self.add_values(key, ts, false, &row);
+        for (key, ts, deleted, row) in kept_rows {
+            // Re-add using the SAME encoding + the preserved deleted flag. A
+            // tombstone's newest version must be re-added with deleted=true so
+            // read paths (is_deleted, newest-version-wins) still see the deletion.
+            let _ = self.add_values(key, ts, deleted, &row);
         }
     }
 
