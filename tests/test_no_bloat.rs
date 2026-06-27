@@ -277,7 +277,6 @@ fn test_table_drop_frees_memory() {
 }
 
 #[test]
-#[ignore = "Known bug: DELETE not reflected in count after compaction"]
 fn test_count_live_rows_after_deletes() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");

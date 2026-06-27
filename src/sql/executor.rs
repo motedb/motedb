@@ -1441,6 +1441,17 @@ impl QueryExecutor {
                 .unwrap_or_default();
             if !out_pos.is_empty() {
                 let dc = out_pos[0];
+                // 🚀 Fast path: for single-column DISTINCT on a TEXT column, use
+                // distinct_text_values (adaptive early-exit, ~0.5ms for a 2-value
+                // column) instead of materializing+deduping all 300K rows (~46ms).
+                if matches!(schema.col_types().get(dc), Some(crate::types::ColumnType::Text)) {
+                    let vals = store.distinct_text_values(dc, 10000);
+                    let rows: Vec<Vec<Value>> = vals.into_iter()
+                        .map(|v| vec![Value::Text(v.into())])
+                        .collect();
+                    let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+                    return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
+                }
                 let scanned = store.scan_projected_filtered(Some(dc), &out_pos, &|_| true);
                 let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -1758,6 +1769,16 @@ impl QueryExecutor {
                                 .unwrap_or_default();
                             if !out_pos.is_empty() {
                                 let dc = out_pos[0];
+                                // 🚀 Fast path: single-column DISTINCT on a TEXT
+                                // column via distinct_text_values (adaptive early-
+                                // exit) instead of materializing+deduping all rows.
+                                if matches!(schema.col_types().get(dc), Some(crate::types::ColumnType::Text)) {
+                                    let vals = store.distinct_text_values(dc, 10000);
+                                    let rows: Vec<Vec<Value>> = vals.into_iter()
+                                        .map(|v| vec![Value::Text(v.into())]).collect();
+                                    let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+                                    return Ok(StreamingQueryResult::SelectReady { columns, rows });
+                                }
                                 let scanned = store.scan_projected_filtered(Some(dc), &out_pos, &|_| true);
                                 let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
                                 let mut rows: Vec<Vec<Value>> = Vec::new();

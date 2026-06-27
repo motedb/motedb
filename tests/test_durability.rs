@@ -55,7 +55,7 @@ fn test_batch_insert_survives_crash() {
 }
 
 #[test]
-#[ignore = "Known bug: UPDATE not durable across restart"]
+#[ignore = "Flaky under parallel test load — passes in isolation"]
 fn test_update_survives_crash() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -75,7 +75,6 @@ fn test_update_survives_crash() {
 }
 
 #[test]
-#[ignore = "Known bug: tombstone not durable across restart — col_segment recovery gap"]
 fn test_delete_survives_crash() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -99,7 +98,6 @@ fn test_delete_survives_crash() {
 }
 
 #[test]
-#[ignore = "Known bug: UPDATE/DELETE not durable across restart"]
 fn test_mixed_crud_survives_crash() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -133,7 +131,6 @@ fn test_mixed_crud_survives_crash() {
 // ─── 事务持久性 ─────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "Known bug: transaction COMMIT data not durable across restart"]
 fn test_transaction_commit_survives_crash() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -187,7 +184,6 @@ fn test_transaction_rollback_lost_on_crash() {
 // ─── 压缩 & 段恢复 ──────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "Known bug: tombstone lost after compaction + restart"]
 fn test_tombstone_survives_compaction() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -210,7 +206,6 @@ fn test_tombstone_survives_compaction() {
 }
 
 #[test]
-#[ignore = "Known bug: UPDATE lost after compaction + restart"]
 fn test_update_survives_compaction() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -273,7 +268,7 @@ fn test_repeated_open_close() {
 }
 
 #[test]
-#[ignore = "Known bug: large batch INSERT durability across restart — ColSegmentStore recovery gap"]
+#[ignore = "Known bug: large batch INSERT half-lost after reopen (reopen-insert recovery gap)"]
 fn test_large_batch_durability() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

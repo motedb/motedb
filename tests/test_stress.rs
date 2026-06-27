@@ -23,7 +23,6 @@ fn test_10k_insert_consistency() {
 }
 
 #[test]
-#[ignore = "Known bug: rapid DELETE+INSERT creates segment bloat"]
 fn test_rapid_insert_delete_cycle() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -41,7 +40,6 @@ fn test_rapid_insert_delete_cycle() {
 }
 
 #[test]
-#[ignore = "Known bug: rapid UPDATE creates duplicate rows"]
 fn test_rapid_update_same_row() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");

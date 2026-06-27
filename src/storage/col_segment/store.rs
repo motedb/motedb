@@ -189,30 +189,28 @@ impl ColSegmentStore {
         let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
         let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(65536));
         let segs = self.segments_snapshot();
-        // Skip HashSet dedup when single segment (no overlap possible).
-        // Saves ~15MB for 300K rows.
         let single_seg = segs.len() <= 1;
-        // 🔑 Always dedup by key (newest-version-wins). An UPDATE appends a newer
-        // version of a row with the SAME composite key; without dedup, scans
-        // return both old and new versions (duplicate rows). Segments are iterated
-        // newest→oldest (`.rev()`), and within a segment rows are iterated
-        // newest→oldest below, so the first-seen version of a key is the newest.
-        let mut seen: std::collections::HashSet<u64> =
-            std::collections::HashSet::with_capacity(total_rows.max(64));
-
+        // 🔑 Newest-version-wins dedup. An UPDATE appends a newer row with the
+        // SAME composite key; without dedup, scans return both versions. We
+        // iterate segments newest→oldest (.rev()) and, within a segment, rows
+        // newest→oldest (descending index), so the FIRST version of a key seen
+        // is the newest — a plain HashSet suffices (no per-scan O(N log N) sort,
+        // which caused a ~6x regression on DISTINCT/ORDER BY/LIKE/IN).
+        //
+        // For single-segment tables with no UPDATE history, keys are already
+        // unique, so we skip dedup entirely (need_dedup=false) — zero overhead.
+        let need_dedup = !single_seg || self.may_have_duplicate_keys();
+        let mut seen: std::collections::HashSet<u64> = if need_dedup {
+            std::collections::HashSet::with_capacity(total_rows)
+        } else {
+            std::collections::HashSet::new()
+        };
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
-            // Sort by key ascending, then by row index DESCENDING. The descending
-            // row-index tiebreak means that among multiple versions of the same
-            // key (UPDATE appends a newer row with a larger index), the newest
-            // version sorts FIRST. So a forward scan + seen-insert dedup keeps
-            // the newest version of each key (newest-version-wins).
-            let mut order: Vec<usize> = (0..n).collect();
-            order.sort_by(|&a, &b| {
-                let ka = seg.sst.row_map.key(a);
-                let kb = seg.sst.row_map.key(b);
-                ka.cmp(&kb).then(b.cmp(&a)) // key asc, row index desc
-            });
+            // Descending index order within a segment: rows are appended old→new,
+            // so iterating n→0 visits the newest (largest index) version of a key
+            // first. Combined with `seen`, this keeps the newest version.
+            let order: Vec<usize> = if need_dedup { (0..n).rev().collect() } else { (0..n).collect() };
 
             // Pre-decode filter column (once per segment).
             let fcol_fixed = filter_col.and_then(|fc| {
@@ -255,10 +253,9 @@ impl ColSegmentStore {
             for &i in &order {
                 let key = seg.sst.row_map.key(i);
                 // Newest-version-wins dedup: skip if a newer version of this key
-                // was already emitted (from a newer segment, or a newer row within
-                // this segment). Mark seen BEFORE the deleted check so a tombstone
-                // in a newer version suppresses older live rows.
-                if !seen.insert(key) { continue; }
+                // was already emitted. Mark seen BEFORE the deleted check so a
+                // tombstone in a newer version suppresses older live rows.
+                if need_dedup && !seen.insert(key) { continue; }
                 if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Decode filter value only (cheap: single column lookup).
@@ -763,6 +760,21 @@ impl ColSegmentStore {
     /// Number of rows currently buffered in memory (not yet flushed to a segment).
     /// Count live (non-deleted, non-duplicated) rows across all segments.
     /// O(total_rows) but zero Value decode — fast for COUNT(*).
+    /// Heuristic: does a single (compacted) segment possibly hold multiple
+    /// versions of the same key? flush_buffer() runs dedup_keys_newest_wins, so
+    /// a freshly-flushed single segment has unique keys. Duplicate keys can
+    /// appear only when an UPDATE was buffered and NOT yet flushed/compacted.
+    /// Returns false for the common case (no pending UPDATEs), letting the scan
+    /// path skip dedup entirely (the v0.5.0 performance fix).
+    fn may_have_duplicate_keys(&self) -> bool {
+        // The write buffer can hold a newer version of an already-segmented key.
+        // But by the time we scan, ensure_query_visibility() has flushed it, and
+        // flush runs dedup. So a single segment is deduped. Conservatively check
+        // the buffer depth: if there's substantial unflushed data, it may overlap.
+        let buf_n = self.write_buf.lock().num_rows;
+        buf_n > 0 && self.segments.read().len() >= 1
+    }
+
     pub fn count_live_rows(&self) -> usize {
         // Newest-version-wins across buffer + segments. Build a map of
         // key → is_tombstone, where buffered entries override segment entries.
