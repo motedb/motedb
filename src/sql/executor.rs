@@ -1616,28 +1616,72 @@ impl QueryExecutor {
                     result_row.push(Value::Integer(scanned.len() as i64));
                 }
                 "SUM" => {
-                    let sum: f64 = scanned.iter().filter_map(|(_, row)| {
-                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
-                            if let Value::Float(f) = v { Some(*f) } else if let Value::Integer(i) = v { Some(*i as f64) } else { None }
-                        })
-                    }).sum();
-                    result_row.push(Value::Float(sum));
+                    // Return Integer for all-integer columns (consistency), else Float.
+                    let ints: Option<i64> = {
+                        let vs: Vec<i64> = scanned.iter().filter_map(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                                if let Value::Integer(i) = v { Some(*i) } else { None }
+                            }).filter(|&v| v != i64::MIN)
+                        }).collect();
+                        if vs.iter().all(|_| true) && !vs.is_empty()
+                            && scanned.iter().all(|(_, row)| {
+                                col_idx_in_scan.and_then(|ci| row.get(ci))
+                                    .map(|v| matches!(v, Value::Integer(_)) || v == &Value::Null)
+                                    .unwrap_or(true)
+                            }) {
+                            Some(vs.iter().sum())
+                        } else { None }
+                    };
+                    if let Some(i_sum) = ints {
+                        result_row.push(Value::Integer(i_sum));
+                    } else {
+                        let sum: f64 = scanned.iter().filter_map(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                                if let Value::Float(f) = v { Some(*f) } else if let Value::Integer(i) = v { Some(*i as f64) } else { None }
+                            })
+                        }).sum();
+                        result_row.push(Value::Float(sum));
+                    }
                 }
                 "MIN" => {
-                    let min = scanned.iter().filter_map(|(_, row)| {
+                    // 🔑 Handle Integer columns too (was Float-only, so Integer
+                    // MIN returned the INFINITY fold seed). Decode by value type.
+                    let ints: Vec<i64> = scanned.iter().filter_map(|(_, row)| {
+                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                            if let Value::Integer(i) = v { Some(*i) } else { None }
+                        }).filter(|&v| v != i64::MIN) // MIN = NULL sentinel
+                    }).collect();
+                    let floats: Vec<f64> = scanned.iter().filter_map(|(_, row)| {
                         col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
                             if let Value::Float(f) = v { Some(*f) } else { None }
                         })
-                    }).fold(f64::INFINITY, f64::min);
-                    result_row.push(Value::Float(min));
+                    }).filter(|v| !v.is_nan()).collect();
+                    if !ints.is_empty() {
+                        result_row.push(Value::Integer(*ints.iter().min().unwrap()));
+                    } else if !floats.is_empty() {
+                        result_row.push(Value::Float(floats.iter().cloned().fold(f64::INFINITY, f64::min)));
+                    } else {
+                        result_row.push(Value::Null);
+                    }
                 }
                 "MAX" => {
-                    let max = scanned.iter().filter_map(|(_, row)| {
+                    let ints: Vec<i64> = scanned.iter().filter_map(|(_, row)| {
+                        col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                            if let Value::Integer(i) = v { Some(*i) } else { None }
+                        }).filter(|&v| v != i64::MIN)
+                    }).collect();
+                    let floats: Vec<f64> = scanned.iter().filter_map(|(_, row)| {
                         col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
                             if let Value::Float(f) = v { Some(*f) } else { None }
                         })
-                    }).fold(f64::NEG_INFINITY, f64::max);
-                    result_row.push(Value::Float(max));
+                    }).filter(|v| !v.is_nan()).collect();
+                    if !ints.is_empty() {
+                        result_row.push(Value::Integer(*ints.iter().max().unwrap()));
+                    } else if !floats.is_empty() {
+                        result_row.push(Value::Float(floats.iter().cloned().fold(f64::NEG_INFINITY, f64::max)));
+                    } else {
+                        result_row.push(Value::Null);
+                    }
                 }
                 "AVG" => {
                     let count = scanned.len() as f64;
@@ -3119,13 +3163,37 @@ impl QueryExecutor {
                                 let is_fixed = col_sst.column_tags[agg_pos].is_fixed();
                                 if is_fixed {
                                     let seg = col_sst.read_fixed_i64(agg_pos)?;
-                                    let vals: Vec<f64> = match_indices.iter()
-                                        .filter_map(|&i| seg.get_f64(i)).collect();
-                                    match name.to_uppercase().as_str() {
-                                        "SUM" => result.push(Value::Float(vals.iter().sum())),
-                                        "MIN" => result.push(vals.iter().min_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).map(|&v| Value::Float(v)).unwrap_or(Value::Null)),
-                                        "MAX" => result.push(vals.iter().max_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).map(|&v| Value::Float(v)).unwrap_or(Value::Null)),
-                                        _ => return Ok(None),
+                                    // 🔑 Decode by column type, NOT always f64. Integer
+                                    // columns store i64; reading them as f64 reinterprets
+                                    // the bits (Integer(5) → f64::from_bits(5) ≈ 0),
+                                    // corrupting SUM/MIN/MAX (the v0.5.0 MIN=inf bug).
+                                    let is_int = matches!(schema.col_types().get(agg_pos),
+                                        Some(crate::types::ColumnType::Integer)
+                                        | Some(crate::types::ColumnType::Boolean));
+                                    if is_int {
+                                        let vals: Vec<i64> = match_indices.iter()
+                                            .filter_map(|&i| seg.get_i64(i))
+                                            .filter(|&v| v != i64::MIN) // MIN is the NULL sentinel
+                                            .collect();
+                                        match name.to_uppercase().as_str() {
+                                            "SUM" => result.push(Value::Integer(vals.iter().sum())),
+                                            "MIN" => result.push(vals.iter().min().copied().map(Value::Integer).unwrap_or(Value::Null)),
+                                            "MAX" => result.push(vals.iter().max().copied().map(Value::Integer).unwrap_or(Value::Null)),
+                                            _ => return Ok(None),
+                                        }
+                                    } else {
+                                        let vals: Vec<f64> = match_indices.iter()
+                                            .filter_map(|&i| seg.get_f64(i))
+                                            .filter(|v| !v.is_nan()) // NaN = NULL
+                                            .collect();
+                                        let pick = |cmp: std::cmp::Ordering| cmp;
+                                        let _ = pick;
+                                        match name.to_uppercase().as_str() {
+                                            "SUM" => result.push(Value::Float(vals.iter().sum())),
+                                            "MIN" => result.push(vals.iter().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).copied().map(Value::Float).unwrap_or(Value::Null)),
+                                            "MAX" => result.push(vals.iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).copied().map(Value::Float).unwrap_or(Value::Null)),
+                                            _ => return Ok(None),
+                                        }
                                     }
                                 } else { return Ok(None); }
                             }
