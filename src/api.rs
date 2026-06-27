@@ -272,6 +272,12 @@ impl Database {
         // lock is held until the MoteDB is dropped — which may be much later
         // if the caller keeps the handle alive after close().
         self.inner.release_lock();
+        // Stop WAL background threads + final sync_flush. Without this the old
+        // flush thread keeps owning the WAL partition file handles, and a
+        // reopen deadlocks on the partition mutex / file lock. (WALManager is
+        // held via Arc, so its Drop — which does this — never runs while close
+        // leaves the handle alive.)
+        self.inner.wal.shutdown();
         result
     }
 

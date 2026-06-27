@@ -1799,6 +1799,36 @@ impl WALManager {
 
         Ok(result)
     }
+
+    /// Explicitly stop background threads (group-commit + periodic flush) and
+    /// do a final sync_flush on all partitions. Called by MoteDB::close() so a
+    /// subsequent open() on the same directory can acquire the WAL partition
+    /// files without contention from a still-running old flush thread.
+    ///
+    /// Without this, the WAL threads keep running until the WALManager is
+    /// dropped — but MoteDB holds it via Arc, so close() never dropped it,
+    /// leaving the old thread owning the partition file handles. A reopen then
+    /// deadlocked on the partition mutex / file lock.
+    ///
+    /// Idempotent: safe to call multiple times (sets stop flags; threads exit
+    /// their loops on the next wake).
+    pub fn shutdown(&self) {
+        eprintln!("[WAL] shutdown: gc={} flush={}", self.group_commit.is_some(), self.flush_thread.is_some());
+        // Stop group commit thread (wake it so it checks should_stop).
+        if let Some(gc) = self.group_commit.as_ref() {
+            gc.should_stop.store(true, Ordering::Relaxed);
+            gc.state.wakeup.notify_all();
+        }
+        // Stop periodic flush thread.
+        if let Some(ft) = self.flush_thread.as_ref() {
+            ft.should_stop.store(true, Ordering::Relaxed);
+        }
+        // Final sync on all partitions (flush buffered writes to disk).
+        for entry in self.partitions.iter() {
+            let mut wal = entry.value().lock();
+            let _ = wal.sync_flush();
+        }
+    }
 }
 
 impl Drop for WALManager {

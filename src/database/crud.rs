@@ -116,6 +116,13 @@ impl MoteDB {
                 table_name, e
             )))?;
 
+        // 3. Validate row (before allocating AUTO_INCREMENT to avoid ID waste)
+        schema.validate_row(&row)
+            .map_err(|e| StorageError::InvalidData(format!(
+                "Row validation failed for table '{}': {}",
+                table_name, e
+            )))?;
+
         let row_id = if schema.is_primary_key_auto_increment() {
             // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
             // 🚀 Optimized: DashMap — first insert per table acquires shard lock, then lock-free
