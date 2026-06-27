@@ -161,8 +161,9 @@ fn test_boolean_storage() {
 // DDL lifecycle
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// KNOWN BUG: DROP TABLE doesn't fully clear the ColSegmentStore — recreating
-/// a same-named table can see stale rows from the dropped one. Tracked.
+/// DROP TABLE clears all data; recreating a same-named table starts empty.
+/// Was returning 2 rows (stale data from dropped table) — fixed by removing
+/// the ColSegmentStore + deleting segment/manifest files on DROP TABLE.
 #[test]
 fn test_create_drop_recreate_same_table() {
     let (_dir, db) = make_db();
@@ -171,12 +172,9 @@ fn test_create_drop_recreate_same_table() {
     db.execute("DROP TABLE t").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'reborn')").unwrap();
-    // Bug: returns 2 (stale row from dropped table lingers). Verified behavior.
-    let n = count(&db, "t");
-    assert!(n >= 1, "at least the new row must be present");
-    let rows = select_rows(&db, "SELECT v FROM t WHERE id = 1");
-    let has_reborn = rows.iter().any(|r| r.get(0) == Some(&Value::text("reborn".to_string())));
-    assert!(has_reborn, "new row 'reborn' must be findable");
+    assert_eq!(count(&db, "t"), 1, "dropped table data must not linger");
+    let rows = select_rows(&db, "SELECT v FROM t");
+    assert_eq!(rows[0][0], Value::text("reborn".to_string()));
 }
 
 #[test]

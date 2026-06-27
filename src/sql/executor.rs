@@ -10765,6 +10765,19 @@ impl QueryExecutor {
             debug_log!("[DROP TABLE] Warning: LSM range delete failed: {}", e);
         }
 
+        // 8. Drop the ColSegmentStore (columnar source of truth) and its on-disk
+        // segment files. Without this, recreating a same-named table sees stale
+        // rows from the dropped one (test_create_drop_recreate returned 2 rows).
+        // Also clear the columnar_write_bufs entry and the synced columnar_sstables
+        // alias so reads don't fall back to the dropped data.
+        if let Some(entry) = self.db.col_segment_stores.get(table_name) {
+            // Best-effort: delete on-disk segment files + manifest.
+            let _ = entry.value().drop_all();
+        }
+        self.db.col_segment_stores.remove(table_name);
+        self.db.columnar_write_bufs.remove(table_name);
+        self.db.columnar_sstables.remove(table_name);
+
         let _ = schema; // used above for validation
 
         Ok(QueryResult::Definition {

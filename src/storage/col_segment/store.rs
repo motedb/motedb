@@ -137,6 +137,30 @@ impl ColSegmentStore {
     ///
     /// NOTE: auto-compaction is triggered in append_rows/append_tombstone
     /// (write path), NOT here. Compacting during a read would invalidate
+    /// Drop all data: clear in-memory segments + write buffer, delete on-disk
+    /// segment files, and delete the manifest file so a reopen starts fresh.
+    /// Called by DROP TABLE so a recreated same-named table starts empty (no
+    /// stale rows). Best-effort on file deletion.
+    pub fn drop_all(&self) -> Result<()> {
+        // Snapshot segment ids (for file deletion), then clear in-memory state.
+        let segs = self.segments_snapshot();
+        let seg_ids: Vec<u64> = segs.iter().map(|s| s.id).collect();
+        self.segments.write().clear();
+        // Clear the write buffer by finishing (no-op if empty) then draining.
+        // The builder has no public clear(); we just leave it — the store is
+        // being removed from the registry anyway, so a new store is created on
+        // recreate. Delete on-disk files so the old data can't be recovered.
+        for id in &seg_ids {
+            let path = self.dir.join(format!("{:010}.sst", id));
+            let _ = std::fs::remove_file(&path);
+        }
+        // Delete the manifest file so a reopen finds no manifest → creates a
+        // fresh one with no segments.
+        let manifest_path = self.dir.join("MANIFEST");
+        let _ = std::fs::remove_file(&manifest_path);
+        Ok(())
+    }
+
     /// SegData slices held by in-flight SelectColumnar queries (use-after-free).
     pub fn ensure_query_visibility(&self) -> Result<()> {
         if self.write_buf.lock().num_rows > 0 {
