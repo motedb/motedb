@@ -1647,6 +1647,24 @@ impl QueryExecutor {
 
     /// GROUP BY via multi-segment scan + in-memory HashMap aggregation.
     /// Avoids sync compaction entirely.
+    /// Parse each select column into its aggregate spec (None = plain column,
+    /// Some = aggregate like COUNT/SUM/MIN/MAX/AVG). Used by col_segment_group_by
+    /// to decide whether the COUNT-only fast path is safe.
+    fn parse_select_aggregates(
+        &self,
+        columns: &[crate::sql::ast::SelectColumn],
+        schema: &TableSchema,
+    ) -> Vec<Option<AggregateInfo>> {
+        columns.iter().map(|sc| {
+            match sc {
+                crate::sql::ast::SelectColumn::Expr(expr, _) => {
+                    self.try_parse_aggregate(expr, schema)
+                }
+                _ => None, // Star / Column / ColumnWithAlias — not an aggregate
+            }
+        }).collect()
+    }
+
     fn col_segment_group_by(
         &self,
         stmt: &SelectStmt,
@@ -1660,6 +1678,21 @@ impl QueryExecutor {
         }).unwrap_or_default();
         if group_cols.is_empty() { return Ok(None); }
         let gc = group_cols[0]; // single GROUP BY column
+
+        // 🔑 Only the pure `SELECT g, COUNT(*) ... GROUP BY g` shape can use the
+        // store.group_by_count fast path. If the query asks for SUM/MIN/MAX/AVG,
+        // or mixes aggregates, group_by_count would silently return COUNT for
+        // every aggregate (the v0.5.0 GROUP BY SUM bug). Detect the aggregate
+        // shape; if it isn't exactly [group_col, COUNT(*)], fall back to the
+        // general materialize path which evaluates each aggregate correctly.
+        let agg_specs = self.parse_select_aggregates(&stmt.columns, schema);
+        let is_pure_count = agg_specs.iter().all(|a| matches!(a, Some(ai) if ai.func == "COUNT"))
+            && agg_specs.iter().any(|a| matches!(a, Some(ai) if ai.func == "COUNT"));
+        if !is_pure_count {
+            // Has SUM/MIN/MAX/AVG, or a mix, or no aggregate at all (plain
+            // GROUP BY + projected columns). Let the general path handle it.
+            return Ok(None);
+        }
 
         // Output columns: group col + aggregates.
         let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
@@ -2898,18 +2931,49 @@ impl QueryExecutor {
             }
         }
 
-        // Build HashMap from typed arrays — use &str keys (zero-alloc) from mmap
+        // Build HashMap from typed arrays — use &str keys (zero-alloc) from mmap.
+        // Accumulator: (count, int_sum, float_sum, has_float). Integer columns
+        // accumulate into int_sum; Float columns into float_sum. Reading an
+        // Integer column via get_f64() reinterprets its i64 bits as f64 (e.g.
+        // Integer(10) → f64::from_bits(10) ≈ 0), which silently corrupts SUM.
+        // Decode according to the column's declared type.
         use std::collections::HashMap;
-        let mut groups: HashMap<&str, (i64, f64)> = HashMap::with_capacity(num_rows / 10);
+        let col_types = schema.col_types();
+        struct GroupAcc { count: i64, int_sum: i64, float_sum: f64, has_float: bool }
+        impl GroupAcc {
+            fn new() -> Self { Self { count: 0, int_sum: 0, float_sum: 0.0, has_float: false } }
+            fn add(&mut self, val: f64, is_int: bool) {
+                if is_int {
+                    self.int_sum = self.int_sum.wrapping_add(val as i64);
+                } else {
+                    if !self.has_float { self.has_float = true; self.float_sum = self.int_sum as f64; }
+                    self.float_sum += val;
+                }
+            }
+            fn sum(&self) -> Value {
+                if self.has_float { Value::Float(self.float_sum) } else { Value::Integer(self.int_sum) }
+            }
+            fn avg(&self) -> Value {
+                if self.count == 0 { return Value::Null; }
+                let s = if self.has_float { self.float_sum } else { self.int_sum as f64 };
+                Value::Float(s / self.count as f64)
+            }
+        }
+        let mut groups: HashMap<&str, (GroupAcc, Vec<f64>)> = HashMap::with_capacity(num_rows / 10);
 
         if col_sst.column_tags[group_pos].is_fixed() {
             return Ok(None);
         }
         let group_seg = col_sst.read_text(group_pos)?;
         let mut agg_segs: Vec<crate::storage::lsm::columnar::FixedSegment> = Vec::new();
+        // For each agg column, whether it's an Integer (use get_i64) or Float.
+        let mut agg_is_int: Vec<bool> = Vec::with_capacity(agg_cols.len());
         for a in &agg_cols {
             if col_sst.column_tags[a.col_pos].is_fixed() {
                 agg_segs.push(col_sst.read_fixed_i64(a.col_pos)?);
+                agg_is_int.push(matches!(col_types.get(a.col_pos),
+                    Some(crate::types::ColumnType::Integer)
+                    | Some(crate::types::ColumnType::Boolean)));
             } else { return Ok(None); }
         }
 
@@ -2919,28 +2983,32 @@ impl QueryExecutor {
                 Some(s) => s,
                 None => continue,
             };
-            let entry = groups.entry(key).or_insert((0, 0.0));
-            entry.0 += 1;
+            let entry = groups.entry(key).or_insert_with(|| (GroupAcc::new(), Vec::new()));
+            entry.0.count += 1;
             for (j, a) in agg_cols.iter().enumerate() {
                 if a.func == "SUM" || a.func == "AVG" {
-                    if let Some(v) = agg_segs[j].get_f64(i) {
-                        entry.1 += v;
-                    }
+                    let is_int = agg_is_int[j];
+                    let v = if is_int {
+                        agg_segs[j].get_i64(i).map(|x| x as f64)
+                    } else {
+                        agg_segs[j].get_f64(i)
+                    };
+                    if let Some(v) = v { entry.0.add(v, is_int); }
                 }
             }
         }
 
         // Build output rows
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-        for (key, (count, sum)) in groups {
+        for (key, (acc, _)) in groups {
             let mut row = Vec::new();
             // Group-by column value
             row.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(key))));
-            if has_count_star { row.push(Value::Integer(count)); }
+            if has_count_star { row.push(Value::Integer(acc.count)); }
             for a in &agg_cols {
                 match a.func.as_str() {
-                    "SUM" => row.push(Value::Float(sum)),
-                    "AVG" => row.push(Value::Float(if count > 0 { sum / count as f64 } else { 0.0 })),
+                    "SUM" => row.push(acc.sum()),
+                    "AVG" => row.push(acc.avg()),
                     _ => row.push(Value::Null),
                 }
             }

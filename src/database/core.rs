@@ -175,8 +175,11 @@ pub struct MoteDB {
     auto_flush_thread: Option<AutoFlushThread>,
 
     /// File lock to prevent concurrent database opens on the same directory.
-    /// Holds an exclusive flock on `.lock` file. Released on Drop.
-    _lock_file: Option<std::fs::File>,
+    /// Holds an exclusive flock on `.lock` file. Released on Drop OR explicitly
+    /// via release_lock() so that close() allows a subsequent open() on the
+    /// same directory (the test/multi-handle scenario). Wrapped in a Mutex
+    /// because close() runs on a &self MoteDB.
+    _lock_file: std::sync::Mutex<Option<std::fs::File>>,
 
     /// True for clone_for_callback() instances — skip Drop checkpoint.
     _is_clone: bool,
@@ -392,7 +395,7 @@ impl MoteDB {
             index_build_tx: None,
             index_builder_thread: None,
             auto_flush_thread: None,
-            _lock_file: Some(lock_file),
+            _lock_file: std::sync::Mutex::new(Some(lock_file)),
             _is_clone: false,
         };
 
@@ -587,7 +590,7 @@ impl MoteDB {
             index_build_tx: None,  // Don't clone sender (only owned by original)
             index_builder_thread: None,  // Don't clone thread (only owned by original)
             auto_flush_thread: None,    // Don't clone thread (only owned by original)
-            _lock_file: None,  // Don't clone lock (only owned by original)
+            _lock_file: std::sync::Mutex::new(None),  // Don't clone lock (only owned by original)
             _is_clone: true,   // Skip Drop checkpoint for clones
         }
     }
@@ -1001,7 +1004,7 @@ impl MoteDB {
             index_build_tx: None,
             index_builder_thread: None,
             auto_flush_thread: None,
-            _lock_file: Some(lock_file),
+            _lock_file: std::sync::Mutex::new(Some(lock_file)),
             _is_clone: false,
         };
 
@@ -1711,6 +1714,17 @@ impl MoteDB {
         }
 
         Ok(max_id)
+    }
+
+    /// Explicitly release the exclusive flock. Called by close() so a
+    /// subsequent open() on the same directory succeeds (otherwise the lock
+    /// is only freed when the MoteDB is dropped, which may be much later if
+    /// the caller keeps the handle alive).
+    pub fn release_lock(&self) {
+        if let Ok(mut guard) = self._lock_file.lock() {
+            // Dropping the Option's File releases the OS flock.
+            guard.take();
+        }
     }
 
     /// Acquire an exclusive file lock on the database directory.

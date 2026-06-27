@@ -267,6 +267,11 @@ impl Database {
 
         let result = self.inner.checkpoint_full();
         self.inner.is_closed.store(true, std::sync::atomic::Ordering::Release);
+        // Release the exclusive flock so a subsequent open() on the same
+        // directory (or another process) can acquire it. Without this, the
+        // lock is held until the MoteDB is dropped — which may be much later
+        // if the caller keeps the handle alive after close().
+        self.inner.release_lock();
         result
     }
 
