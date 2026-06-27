@@ -79,9 +79,15 @@ impl Manifest {
         })
     }
 
-    /// Open an existing manifest for appending.
+    /// Open an existing manifest for appending. Seeks to end so that append()
+    /// writes after the existing records (NOT at offset 0, which would
+    /// overwrite the MAGIC header — the v0.5.0 WAL-recovery-gap bug).
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        // Position the write cursor at end-of-file so append() extends the log
+        // instead of clobbering the header.
+        use std::io::Seek;
+        let _ = file.seek(std::io::SeekFrom::End(0));
         Ok(Self {
             path: path.to_path_buf(),
             writer: BufWriter::new(file),
