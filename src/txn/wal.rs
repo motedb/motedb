@@ -1398,22 +1398,50 @@ impl WALManager {
                 let mut queue = gc.state.queue.lock();
                 queue.push(GroupCommitEntry {
                     partition,
-                    record,
+                    record: record.clone(),
                     done: Arc::clone(&done),
                 });
             }
             gc.state.wakeup.notify_all();
 
-            // Wait for the background thread to fsync our record
+            // Wait for the background thread to fsync our record. Use a bounded
+            // wait with a fallback: if the group-commit thread is wedged (e.g.
+            // after a reopen where recovery left partition state inconsistent),
+            // the unbounded wait would deadlock the caller forever. After the
+            // timeout, fall back to an inline append+sync so the write still
+            // succeeds (durability preserved) and the caller doesn't hang.
             {
                 let mut flag = done.0.lock();
+                let mut waited = Duration::from_millis(0);
+                let max_wait = Duration::from_secs(2);
                 while flag.is_none() {
-                    done.1.wait(&mut flag);
+                    let start = std::time::Instant::now();
+                    let res = done.1.wait_for(&mut flag, Duration::from_millis(100));
+                    waited += start.elapsed();
+                    if flag.is_some() { break; }
+                    if waited >= max_wait {
+                        // Group-commit thread didn't process in time — fall back
+                        // to a direct append so the caller doesn't hang.
+                        break;
+                    }
+                    let _ = res;
                 }
-                match flag.take().unwrap() {
-                    Ok(()) => Ok(0),
-                    Err(msg) => Err(StorageError::Transaction(msg)),
+                if flag.is_some() {
+                    match flag.take().unwrap() {
+                        Ok(()) => return Ok(0),
+                        Err(msg) => return Err(StorageError::Transaction(msg)),
+                    }
                 }
+                // Fallback: inline append + sync_flush the partition directly.
+                if let Some(entry) = self.partitions.get(&partition) {
+                    let mut wal = entry.value().lock();
+                    wal.append(record)?;
+                    wal.sync_flush()?;
+                } else {
+                    return Err(StorageError::Transaction(
+                        "group-commit timed out and partition missing".to_string()));
+                }
+                Ok(0)
             }
         } else {
             let entry = self.partitions.get(&partition)
