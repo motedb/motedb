@@ -361,7 +361,6 @@ fn test_concurrent_writes_durability() {
 }
 
 #[test]
-#[ignore = "WAL recovery gap: NULL values cause column-count mismatch on reopen"]
 fn test_null_value_durability() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

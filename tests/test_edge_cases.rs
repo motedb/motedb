@@ -41,7 +41,6 @@ fn test_null_values() {
 }
 
 #[test]
-#[ignore = "Empty string literal handling: needs proper escaping"]
 fn test_empty_string() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
@@ -148,7 +147,6 @@ fn test_update_nonexistent_row() {
 }
 
 #[test]
-#[ignore = "DROP+reCREATE: stale col_segment_store persists"]
 fn test_table_create_drop_recreate() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");

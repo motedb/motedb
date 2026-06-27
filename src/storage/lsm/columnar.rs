@@ -1014,10 +1014,25 @@ impl ColumnarSSTableBuilder {
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
                 ColumnTypeTag::Text => {
-                    let s = match value { Value::Text(t) => t.as_str(), Value::Null => "", _ => "" };
-                    let len = s.len().min(65535) as u16;
-                    buf.extend_from_slice(&len.to_le_bytes());
-                    buf.extend_from_slice(s.as_bytes());
+                    // 🔑 Distinguish NULL from empty string. Both were written as
+                    // len=0, so empty strings round-tripped as NULL (the v0.5.0
+                    // empty-string bug). Use a 0xFFFF sentinel for NULL (real
+                    // strings are capped at 65535 bytes, but a genuine 65535-byte
+                    // string is extremely rare and we cap to 65534 to avoid it).
+                    match value {
+                        Value::Null => {
+                            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
+                        }
+                        Value::Text(t) => {
+                            let s = t.as_str();
+                            let len = s.len().min(65534) as u16; // cap < 0xFFFF
+                            buf.extend_from_slice(&len.to_le_bytes());
+                            buf.extend_from_slice(&s.as_bytes()[..len as usize]);
+                        }
+                        _ => {
+                            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
+                        }
+                    }
                 }
                 _ => {
                     let bytes = match value { Value::Null => vec![], _ => bincode::serialize(value).unwrap_or_default() };
@@ -1254,8 +1269,29 @@ impl ColumnarSSTableBuilder {
                     }
                     ColumnTypeTag::Text => {
                         // Text layout: each row = [u16 len][bytes], concatenated.
-                        let s = self.extract_text_row(ci, i);
-                        row.push(Value::text(s));
+                        // 0xFFFF len = NULL sentinel.
+                        let buf = &self.column_buffers[ci];
+                        let mut p = 0usize;
+                        let mut r = 0usize;
+                        let mut found = None;
+                        while p + 2 <= buf.len() {
+                            let len = u16::from_le_bytes([buf[p], buf[p+1]]) as usize;
+                            p += 2;
+                            if r == i {
+                                if len == 0xFFFF {
+                                    found = Some(Value::Null);
+                                } else if p + len <= buf.len() {
+                                    found = Some(Value::text(
+                                        String::from_utf8_lossy(&buf[p..p+len]).into_owned()));
+                                } else {
+                                    found = Some(Value::Null);
+                                }
+                                break;
+                            }
+                            p += if len == 0xFFFF { 0 } else { len };
+                            r += 1;
+                        }
+                        row.push(found.unwrap_or(Value::Null));
                     }
                     _ => row.push(Value::Null),
                 };
@@ -1360,12 +1396,17 @@ impl ColumnarSSTableBuilder {
                     if pos + 2 > raw.len() { break; }
                     let len = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
                     pos += 2;
-                    let is_empty = len == 0;
-                    if is_empty {
+                    // 🔑 0xFFFF = NULL sentinel (distinguished from empty string
+                    // len=0). Only mark NULL for the sentinel; empty strings are
+                    // valid data (offset start==end, no bytes).
+                    let is_null = len == 0xFFFF;
+                    if is_null {
                         nulls[row_idx / 8] |= 1 << (row_idx % 8);
+                        offsets.push(current_offset);
+                        continue;
                     }
                     offsets.push(current_offset);
-                    if !is_empty && pos + len <= raw.len() {
+                    if pos + len <= raw.len() {
                         str_data.extend_from_slice(&raw[pos..pos + len]);
                         current_offset += len as u32;
                     }
