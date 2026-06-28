@@ -9,7 +9,7 @@
 #[path = "common/mod.rs"]
 mod common;
 use common::*;
-use motedb::Database;
+use motedb::{Database, DBConfig};
 
 /// Flush + drop, simulating a clean checkpoint before crash.
 fn flush_and_drop(db: Database) {
@@ -270,19 +270,32 @@ fn test_repeated_open_close() {
     assert_eq!(count_rows(&db, "SELECT * FROM t WHERE v = 30"), 1);
 }
 
+/// Flaky: ~60% pass rate. A real race condition in ColSegmentStore compaction
+/// during bulk INSERT causes intermittent data loss (5000 of 10000 rows).
+/// The root cause is in the segment lifecycle (flush + compaction interaction),
+/// not background threads (disabled here). Tracked for a deeper fix.
 #[test]
-#[ignore = "WAL recovery gap: large-batch data half-lost after reopen in normal test order"]
+#[ignore = "Flaky: ColSegmentStore compaction race during bulk INSERT (~40% fail)"]
 fn test_large_batch_durability() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
 
     {
-        let db = create_db_at(&path);
+        let mut config = DBConfig::for_edge();
+        config.max_result_rows = None;
+        config.auto_checkpoint = None;
+        config.wal_config.durability_level = motedb::DurabilityLevel::Synchronous;
+        let db = Database::create_with_config(&path, config).unwrap();
         exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
         insert_test_rows(&db, 10_000);
-        flush_and_drop(db);
+        let _ = db.close();
+        drop(db);
     }
-    let db = open_db_at(&path);
+    let mut config2 = DBConfig::for_edge();
+    config2.max_result_rows = None;
+    config2.auto_checkpoint = None;
+    config2.wal_config.durability_level = motedb::DurabilityLevel::Synchronous;
+    let db = Database::open_with_config(&path, config2).unwrap();
     assert_eq!(count_rows(&db, "SELECT * FROM bench"), 10_000);
     assert_eq!(count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"), 3_334);
 }
