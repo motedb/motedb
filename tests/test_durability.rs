@@ -270,12 +270,7 @@ fn test_repeated_open_close() {
     assert_eq!(count_rows(&db, "SELECT * FROM t WHERE v = 30"), 1);
 }
 
-/// Flaky: ~60% pass rate. A real race condition in ColSegmentStore compaction
-/// during bulk INSERT causes intermittent data loss (5000 of 10000 rows).
-/// The root cause is in the segment lifecycle (flush + compaction interaction),
-/// not background threads (disabled here). Tracked for a deeper fix.
 #[test]
-#[ignore = "Flaky: ColSegmentStore compaction race during bulk INSERT (~40% fail)"]
 fn test_large_batch_durability() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

@@ -22,6 +22,11 @@ pub struct ColSegmentStore {
     segments: RwLock<VecDeque<Arc<Segment>>>,
     /// In-memory write buffer. Flushed as a delta segment (does not read old data).
     write_buf: Mutex<ColumnarSSTableBuilder>,
+    /// Write lock serializing flush_buffer + merge_segments. Without this, a
+    /// concurrent flush (triggered by ensure_query_visibility during a query)
+    /// can create a segment that force_compact_all then misses or clobbers
+    /// (the v0.5.0 large_batch_durability race — 5000 of 10000 rows lost).
+    flush_merge_lock: parking_lot::Mutex<()>,
     next_segment_id: AtomicU64,
     manifest: Mutex<Manifest>,
     col_types: Vec<ColumnType>,
@@ -53,6 +58,7 @@ impl ColSegmentStore {
             dir,
             segments: RwLock::new(VecDeque::new()),
             write_buf: Mutex::new(write_buf),
+            flush_merge_lock: parking_lot::Mutex::new(()),
             next_segment_id: AtomicU64::new(1),
             manifest: Mutex::new(manifest),
             col_types,
@@ -105,6 +111,10 @@ impl ColSegmentStore {
     /// Flush the buffer to a new delta segment on disk. Does NOT read old segments.
     /// O(this batch). Writes the file (no fsync — durability via WAL/manifest).
     pub fn flush_buffer(&self) -> Result<()> {
+        // Serialize with merge_segments: if a merge is in progress, wait.
+        // Without this, flush can create a segment that the merge then
+        // clobbers (the large_batch_durability race).
+        let _guard = self.flush_merge_lock.lock();
         // Take buffer contents out, replace with a fresh builder, release the lock fast.
         let buf_path = self.dir.join(".writebuf.tmp");
         let mut old_buf = {
@@ -1404,6 +1414,10 @@ impl ColSegmentStore {
     /// (newest version wins), drop tombstones, update manifest + GC old files.
     fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
         if old_segs.is_empty() { return Ok(()); }
+        // Serialize with flush_buffer: wait for any in-progress flush to
+        // complete before merging, and hold the lock so no new flush can
+        // create a segment that this merge would miss.
+        let _guard = self.flush_merge_lock.lock();
         let old_ids: Vec<u64> = old_segs.iter().map(|s| s.id).collect();
         let ncols = self.col_types.len();
 

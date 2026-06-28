@@ -265,6 +265,18 @@ impl Database {
             warn_log!("[close] Background threads did not stop within timeout");
         }
 
+        // 🚀 Flush ColSegmentStore buffers BEFORE checkpoint. Without this,
+        // in-memory INSERT data (the write buffer) is lost on close — the
+        // large_batch_durability bug (10000 rows → 5000 after reopen). The
+        // second batch was in the buffer, never flushed, dropped on close.
+        for entry in self.inner.col_segment_stores.iter() {
+            let _ = entry.value().flush_buffer();
+            // Compact to a single segment so the reopen sees all data in one place.
+            while entry.value().segment_count() >= 2 {
+                if entry.value().force_compact_all().is_err() { break; }
+            }
+        }
+
         let result = self.inner.checkpoint_full();
         self.inner.is_closed.store(true, std::sync::atomic::Ordering::Release);
         // Release the exclusive flock so a subsequent open() on the same
