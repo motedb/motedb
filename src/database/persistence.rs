@@ -43,7 +43,16 @@ impl MoteDB {
             return Ok(());
         }
 
+        // Serialize with checkpoint_impl: the auto-checkpoint background thread
+        // runs checkpoint_full concurrently, which calls sync_col_segment_to_
+        // sstables → force_compact_all. If flush_impl's ColSegmentStore
+        // flush_buffer runs concurrently with that compaction, segments can be
+        // lost (the v0.5.0 large_batch data-loss bug — 10000 rows → 5000).
+        let _ckpt_guard = self.checkpoint_mutex.lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()));
+
         let result = self.flush_impl();
+        drop(_ckpt_guard);
         self.is_flushing.store(false, Ordering::Release);
         result
     }

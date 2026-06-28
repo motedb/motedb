@@ -13,7 +13,11 @@ use motedb::Database;
 
 /// Flush + drop, simulating a clean checkpoint before crash.
 fn flush_and_drop(db: Database) {
-    let _ = db.flush();
+    // Use close() (not just flush+drop) so background threads (auto-checkpoint,
+    // WAL flush) are stopped before the final checkpoint — preventing a race
+    // where the background thread triggers a concurrent compaction that loses
+    // data (the v0.5.0 large_batch_durability 5000/10000 bug).
+    let _ = db.close();
     drop(db);
 }
 
