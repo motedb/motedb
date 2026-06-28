@@ -2135,6 +2135,15 @@ impl QueryExecutor {
         let is_pk = schema.primary_key().map(|pk| pk == column).unwrap_or(false);
         let is_auto_increment_pk = is_pk && schema.is_primary_key_auto_increment();
 
+        // For ColSegmentStore tables with a non-AUTO_INCREMENT PK, the
+        // get_table_row point-lookup path fails (row_id ≠ PK value). Delegate
+        // to full scan which applies the WHERE filter correctly on all column
+        // types. This is the v0.5.0 fix for WHERE tag='val' / WHERE id=val
+        // returning 0 rows on INT-PK ColSegmentStore tables.
+        if !is_auto_increment_pk && self.db.has_col_segment_store(table) {
+            return self.execute_full_scan_streaming(stmt, table);
+        }
+
         // S9: AUTO_INCREMENT PK on ColSegmentStore — cached point lookup.
         // Uses get_row_cached (per-column decode cache), O(1) after first access.
         if is_auto_increment_pk && self.db.has_col_segment_store(table) {
@@ -2158,9 +2167,17 @@ impl QueryExecutor {
             }
         }
 
-        // S9: non-PK ColSegmentStore point queries. Try column index first
-        // (index → row_ids → cached get_table_row), else projected full scan.
-        if !is_pk && self.db.has_col_segment_store(table) {
+        // S9: non-PK ColSegmentStore point queries. Skip the index→get_table_row
+        // path for non-AUTO_INCREMENT PK tables (get_table_row fails due to
+        // row_id ≠ PK value). The full-scan WHERE filter handles these correctly.
+        let table_is_auto_inc_pk = {
+            let schema = self.db.get_table_schema(table).ok();
+            schema.and_then(|s| {
+                s.primary_key().and_then(|pk| s.get_column(pk)).map(|c| c.auto_increment)
+            }).unwrap_or(false)
+        };
+        if !is_pk && self.db.has_col_segment_store(table)
+            && table_is_auto_inc_pk {
             if let Some(index_name) = self.db.index_registry.find_by_column(
                 table, column,
                 crate::database::index_metadata::IndexType::Column
@@ -2169,9 +2186,13 @@ impl QueryExecutor {
                     let row_ids = index.value()
                         .get_arc(value)
                         .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-                    // Selectivity heuristic: for high-cardinality matches (>1000 rows),
-                    // a projected full scan is faster than N get_table_row calls.
-                    if !row_ids.is_empty() && row_ids.len() <= 1000 {
+                    // Selectivity heuristic: use index-driven row fetch for result
+                    // sets up to 10000 rows. The full-scan fallback (for >10000) is
+                    // used when N point lookups become slower than a sequential scan.
+                    // Previously this was 1000, which fell through to full-scan for
+                    // ~1667 matches — and the full-scan WHERE path on INT-PK
+                    // ColSegmentStore tables returned 0 rows (the v0.5.0 index bug).
+                    if !row_ids.is_empty() && row_ids.len() <= 10000 {
                         let mut result_rows = Vec::with_capacity(row_ids.len());
                         for &rid in row_ids.iter() {
                             if let Some(row) = self.db.get_table_row(table, rid)? {
@@ -5918,18 +5939,14 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name)
                     && !self.has_only_count_aggregate(&stmt.columns)
                 {
-                    // Skip PK equality (WHERE pk = val) — the PK point-query path
-                    // uses get_table_row which already checks ColSegmentStore.
-                    let is_pk_eq = match &stmt.where_clause {
-                        Some(crate::sql::ast::Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, .. }) => {
-                            matches!(left.as_ref(), crate::sql::ast::Expr::Column(c) if c == "id" || c.ends_with(".id"))
-                        }
-                        _ => false,
-                    };
-                    if !is_pk_eq {
-                        let stream = self.execute_full_scan_streaming(stmt, table_name)?;
-                        return Ok(stream.materialize()?);
-                    }
+                    // Route ALL queries (including WHERE id = val) through the
+                    // ColSegmentStore full-scan path. Previously, WHERE id=val was
+                    // routed to the PK point-query path (get_table_row), which fails
+                    // for non-AUTO_INCREMENT PK tables because the row_id doesn't
+                    // match the PK value (WHERE id=1 returned 0 rows on INT-PK
+                    // tables). The full-scan WHERE filter handles all column types.
+                    let stream = self.execute_full_scan_streaming(stmt, table_name)?;
+                    return Ok(stream.materialize()?);
                 }
             }
         }

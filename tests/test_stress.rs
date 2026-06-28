@@ -107,7 +107,6 @@ fn test_mixed_read_write_stability() {
 }
 
 #[test]
-#[ignore = "CREATE INDEX after bulk insert: tag distribution issue"]
 fn test_index_after_bulk_insert() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
