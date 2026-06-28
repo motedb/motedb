@@ -1035,6 +1035,19 @@ impl MoteDB {
                     }
                 }
             }
+            // 🔑 Recover next_row_id from ColSegmentStore segments so that
+            // post-reopen INSERTs don't reuse a row_id from a previous session.
+            // Without this, the non-AUTO_INCREMENT row_id counter resets to 0/1
+            // after reopen, causing key collisions and data loss (the 3-cycle
+            // count=2 bug — cycle 3 reused row_id 1 instead of allocating 2).
+            let max_seg_row_id = db.col_segment_stores.iter()
+                .map(|e| e.value().max_row_id())
+                .max()
+                .unwrap_or(0);
+            let current = db.next_row_id.load(std::sync::atomic::Ordering::Relaxed);
+            if max_seg_row_id + 1 > current {
+                db.next_row_id.store(max_seg_row_id + 1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)

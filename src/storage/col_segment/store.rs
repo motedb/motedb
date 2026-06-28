@@ -1383,6 +1383,23 @@ impl ColSegmentStore {
         self.merge_segments(old_segs)
     }
 
+    /// Return the maximum row_id (key & 0xFFFFFFFF) across all segments + buffer.
+    /// Used on reopen to initialize next_row_id so new INSERTs don't reuse a
+    /// row_id from a previous session (which would collide with existing data).
+    pub fn max_row_id(&self) -> u64 {
+        let mut max = 0u64;
+        for (key, _) in self.write_buf.lock().latest_entries() {
+            max = max.max(key & 0xFFFFFFFF);
+        }
+        for seg in self.segments.read().iter() {
+            for i in 0..seg.sst.num_rows {
+                let key = seg.sst.row_map.key(i);
+                max = max.max(key & 0xFFFFFFFF);
+            }
+        }
+        max
+    }
+
     /// Shared merge logic: merge `old_segs` into one new segment, dedup keys
     /// (newest version wins), drop tombstones, update manifest + GC old files.
     fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {

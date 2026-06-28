@@ -233,7 +233,6 @@ fn test_update_survives_compaction() {
 }
 
 #[test]
-#[ignore = "Known bug: col_segment recovery on reopen"]
 fn test_repeated_open_close() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
