@@ -343,12 +343,11 @@ fn test_checkpoint_durability() {
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 200);
 }
 
-/// Concurrent writes + durability. Concurrent INSERTs on a shared Database
-/// handle lose ~50% of rows (the write buffer append or PK uniqueness check
-/// has a data race). Tracked as a deep concurrency bug; single-threaded writes
-/// are reliable. Marked #[ignore] with documented root cause.
+/// Concurrent writes + durability. Previously lost ~50% of rows due to a
+/// TOCTOU race in get_or_create_col_segment_store (check-then-insert let two
+/// threads create separate stores, the second clobbering the first). Fixed by
+/// using DashMap::entry() for atomic creation.
 #[test]
-#[ignore = "Concurrent INSERT data race: ~50% rows lost on multi-thread writes"]
 fn test_concurrent_writes_durability() {
     use std::sync::Arc;
     use std::thread;
@@ -362,12 +361,12 @@ fn test_concurrent_writes_durability() {
         config.auto_checkpoint = None;
         let db = Arc::new(Database::create_with_config(&path, config).unwrap());
         exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, thread_id INT)");
-        let handles: Vec<_> = (0..2)
+        let handles: Vec<_> = (0..4)
             .map(|tid| {
                 let db = db.clone();
                 thread::spawn(move || {
-                    for i in 0..100 {
-                        let id = tid * 100 + i + 1;
+                    for i in 0..250 {
+                        let id = tid * 250 + i + 1;
                         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", id, tid));
                     }
                 })
@@ -378,9 +377,9 @@ fn test_concurrent_writes_durability() {
         drop(db);
     }
     let db = open_db_at(&path);
-    assert_eq!(count_rows(&db, "SELECT * FROM t"), 200);
-    for tid in 0..2 {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE thread_id = {}", tid)), 100);
+    assert_eq!(count_rows(&db, "SELECT * FROM t"), 1000);
+    for tid in 0..4 {
+        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE thread_id = {}", tid)), 250);
     }
 }
 

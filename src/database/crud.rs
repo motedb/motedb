@@ -1299,15 +1299,22 @@ impl MoteDB {
         table_name: &str,
         col_types: Vec<crate::types::ColumnType>,
     ) -> Result<Arc<crate::storage::col_segment::ColSegmentStore>> {
-        if let Some(s) = self.col_segment_stores.get(table_name) {
-            return Ok(s.clone());
+        // 🔑 Atomic entry-based creation (fixes concurrent INSERT data loss).
+        // The old check-then-insert had a TOCTOU race: two threads could both
+        // see None, both create a store, and the second insert clobbered the
+        // first — losing ~50% of rows (the v0.5.0 concurrent_writes bug).
+        // DashMap::entry() is atomic: only one thread creates the store.
+        use dashmap::mapref::entry::Entry;
+        match self.col_segment_stores.entry(table_name.to_string()) {
+            Entry::Occupied(o) => Ok(o.get().clone()),
+            Entry::Vacant(v) => {
+                let store = crate::storage::col_segment::ColSegmentStore::create(
+                    &self.path, table_name, col_types,
+                )?;
+                v.insert(store.clone());
+                Ok(store)
+            }
         }
-        let store = crate::storage::col_segment::ColSegmentStore::create(
-            &self.path, table_name, col_types,
-        )?;
-        self.col_segment_stores
-            .insert(table_name.to_string(), store.clone());
-        Ok(store)
     }
 
     /// Whether this table has an active ColSegmentStore (new multi-segment path).
