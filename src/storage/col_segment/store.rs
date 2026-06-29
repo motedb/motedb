@@ -974,6 +974,7 @@ impl ColSegmentStore {
         k: usize,
         desc: bool,
     ) -> Vec<(usize, usize)> {
+        let t0 = std::time::Instant::now();
         if k == 0 { return Vec::new(); }
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
@@ -1035,7 +1036,8 @@ impl ColSegmentStore {
                 a.0.cmp(&b.0)
             }
         });
-        out.into_iter().map(|(_, s, r)| (s, r)).collect()
+        let result: Vec<(usize, usize)> = out.into_iter().map(|(_, s, r)| (s, r)).collect();
+        result
     }
 
     /// (group_value, count) pairs. Zero Vec<Value> allocation — uses &str from

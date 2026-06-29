@@ -4218,6 +4218,71 @@ impl QueryExecutor {
             return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
         }
 
+        // 🚀 ORDER BY + LIMIT fast path: if ORDER BY is on a single numeric
+        // column with a small LIMIT and no WHERE, use top_k_row_indices to
+        // scan only the sort column (bounded heap), then fetch only K rows.
+        // This avoids materializing + sorting all 300K rows (49ms → ~2ms).
+        if where_clause.is_none() {
+            if let Some(ref ob) = stmt.order_by {
+                if let Some(first_ob) = ob.first() {
+                    if let crate::sql::ast::Expr::Column(cn) = &first_ob.expr {
+                        let lim = stmt.limit.unwrap_or(usize::MAX);
+                        if lim > 0 && lim <= 10000 {
+                            if let Some(order_col) = schema.get_column_position(cn) {
+                                let is_numeric = matches!(schema.col_types().get(order_col),
+                                    Some(crate::types::ColumnType::Integer)
+                                    | Some(crate::types::ColumnType::Float)
+                                    | Some(crate::types::ColumnType::Boolean));
+                                if is_numeric {
+                                    let top_indices = store.top_k_row_indices(order_col, lim, !first_ob.asc);
+                                    let segs = store.segments_snapshot();
+                                    let col_types = store.col_types();
+                                    // Cache decoded columns per segment to avoid re-reading.
+                                    use crate::storage::lsm::columnar::{FixedSegment, TextSegment};
+                                    enum Col { Text(TextSegment), Fixed(FixedSegment), None }
+                                    let mut col_cache: std::collections::HashMap<(usize, usize), Col> =
+                                        std::collections::HashMap::new();
+                                    let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(top_indices.len());
+                                    for (seg_idx, local_row) in top_indices {
+                                        let seg = match segs.get(seg_idx) { Some(s) => s, None => continue };
+                                        let mut row = Vec::with_capacity(out_positions.len());
+                                        for &pc in &out_positions {
+                                            let col = col_cache.entry((seg_idx, pc)).or_insert_with(|| {
+                                                if matches!(col_types.get(pc), Some(crate::types::ColumnType::Text)) {
+                                                    match seg.sst.read_text(pc) {
+                                                        Ok(t) => Col::Text(t), Err(_) => Col::None,
+                                                    }
+                                                } else {
+                                                    match seg.sst.read_fixed_i64(pc) {
+                                                        Ok(f) => Col::Fixed(f), Err(_) => Col::None,
+                                                    }
+                                                }
+                                            });
+                                            let v = match col {
+                                                Col::Text(t) => t.get_str(local_row).map(|s| Value::Text(s.into())).unwrap_or(Value::Null),
+                                                Col::Fixed(f) => {
+                                                    match col_types.get(pc) {
+                                                        Some(crate::types::ColumnType::Float) =>
+                                                            f.get_i64(local_row).map(|i| Value::Float(i as f64)).unwrap_or(Value::Null),
+                                                        _ => f.get_i64(local_row).map(Value::Integer).unwrap_or(Value::Null),
+                                                    }
+                                                }
+                                                Col::None => Value::Null,
+                                            };
+                                            row.push(v);
+                                        }
+                                        result_rows.push(row);
+                                    }
+                                    return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
+                                }
+                            } else {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // WHERE / fallback: multi-segment scan.
         let result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
             self.col_segment_projected_scan(store, wc, schema, &out_positions, offset, limit)?
