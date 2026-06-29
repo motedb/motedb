@@ -414,6 +414,64 @@ impl ColSegmentStore {
         filter_col: usize,
         prefix: &[u8],
         limit: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        // Returns (segment_idx, local_row_idx) pairs for rows whose text column
+        // starts with the given prefix. Multi-segment safe (dedup by key).
+        let segs = self.segments_snapshot();
+        let single_seg = segs.len() <= 1;
+        let cap = if limit == usize::MAX { 65536 } else { limit };
+        let mut indices: Vec<(usize, usize)> = Vec::with_capacity(cap.min(65536));
+        let mut seen: std::collections::HashSet<u64> = if single_seg {
+            std::collections::HashSet::new()
+        } else {
+            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
+        };
+        let plen = prefix.len();
+        for (sidx, seg) in segs.iter().enumerate() {
+            let n = seg.sst.num_rows;
+            let ftext = match seg.sst.read_text(filter_col) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let has_nulls = ftext.has_any_null();
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+            if !has_nulls && !has_deletions {
+                for i in 0..n {
+                    if !single_seg {
+                        let key = seg.sst.row_map.key(i);
+                        if !seen.insert(key) { continue; }
+                    }
+                    let s = ftext.get_str_fast(i);
+                    if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
+                        indices.push((sidx, i));
+                        if indices.len() >= limit { return Some(indices); }
+                    }
+                }
+            } else {
+                for i in 0..n {
+                    if !single_seg {
+                        let key = seg.sst.row_map.key(i);
+                        if !seen.insert(key) { continue; }
+                    }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                    if let Some(s) = ftext.get_str(i) {
+                        if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
+                            indices.push((sidx, i));
+                            if indices.len() >= limit { return Some(indices); }
+                        }
+                    }
+                }
+            }
+        }
+        Some(indices)
+    }
+
+    /// Legacy single-segment variant — kept for backward compat.
+    pub fn scan_row_indices_prefix_single(
+        &self,
+        filter_col: usize,
+        prefix: &[u8],
+        limit: usize,
     ) -> Option<Vec<usize>> {
         let segs = self.segments_snapshot();
         if segs.len() != 1 { return None; }

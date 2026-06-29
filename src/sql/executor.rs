@@ -4379,6 +4379,52 @@ impl QueryExecutor {
             _ => return self.col_segment_general_scan(store, wc, schema, out_positions, offset, limit),
         };
 
+        // 🚀 LIKE prefix fast path: byte-compare scan (no closure dispatch,
+        // no per-row Value allocation for non-matches).
+        if let Expr::Like { expr, pattern, negated: false } = wc {
+            if let (Expr::Column(cn), Expr::Literal(Value::Text(s))) = (expr.as_ref(), pattern.as_ref()) {
+                let pat = s.as_str();
+                if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                    let prefix = pat[..pat.len()-1].to_string();
+                    if let Some(fc) = schema.get_column_position(cn) {
+                        if matches!(col_types.get(fc), Some(ColumnType::Text)) {
+                            if let Some(indices) = store.scan_row_indices_prefix(fc, prefix.as_bytes(), offset + limit) {
+                                let segs = store.segments_snapshot();
+                                use crate::storage::lsm::columnar::{FixedSegment, TextSegment};
+                                enum Col { Text(TextSegment), Fixed(FixedSegment), None }
+                                let mut col_cache: std::collections::HashMap<(usize, usize), Col> = std::collections::HashMap::new();
+                                let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
+                                for (seg_idx, local_row) in indices.iter().skip(offset).take(limit) {
+                                    let seg = match segs.get(*seg_idx) { Some(s) => s, None => continue };
+                                    let mut row = Vec::with_capacity(out_positions.len());
+                                    for &pc in out_positions {
+                                        let col = col_cache.entry((*seg_idx, pc)).or_insert_with(|| {
+                                            if matches!(col_types.get(pc), Some(ColumnType::Text)) {
+                                                match seg.sst.read_text(pc) { Ok(t) => Col::Text(t), Err(_) => Col::None }
+                                            } else {
+                                                match seg.sst.read_fixed_i64(pc) { Ok(f) => Col::Fixed(f), Err(_) => Col::None }
+                                            }
+                                        });
+                                        let v = match col {
+                                            Col::Text(t) => t.get_str(*local_row).map(|s| Value::Text(s.into())).unwrap_or(Value::Null),
+                                            Col::Fixed(f) => match col_types.get(pc) {
+                                                Some(ColumnType::Float) => f.get_i64(*local_row).map(|i| Value::Float(i as f64)).unwrap_or(Value::Null),
+                                                _ => f.get_i64(*local_row).map(Value::Integer).unwrap_or(Value::Null),
+                                            },
+                                            Col::None => Value::Null,
+                                        };
+                                        row.push(v);
+                                    }
+                                    result.push(row);
+                                }
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Text-filter fast path: raw &str predicate (zero Value alloc for non-matches).
         if let Some(fc) = filter_col {
             if matches!(col_types.get(fc), Some(ColumnType::Text)) {
