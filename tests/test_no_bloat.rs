@@ -100,7 +100,6 @@ fn test_compaction_preserves_data() {
 }
 
 #[test]
-#[ignore = "Known bug: DELETE tombstone dedup issue"]
 fn test_compaction_drops_tombstones() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -123,7 +122,6 @@ fn test_compaction_drops_tombstones() {
 }
 
 #[test]
-#[ignore = "Known bug: UPDATE creates duplicate rows instead of updating"]
 fn test_compaction_dedup_updates() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");

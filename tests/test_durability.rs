@@ -59,7 +59,6 @@ fn test_batch_insert_survives_crash() {
 }
 
 #[test]
-#[ignore = "Flaky under parallel test load — passes in isolation"]
 fn test_update_survives_crash() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -322,7 +321,6 @@ fn test_auto_increment_persistence() {
 }
 
 #[test]
-#[ignore = "Flaky in parallel test runs — passes when run alone"]
 fn test_checkpoint_durability() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_path_buf();

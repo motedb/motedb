@@ -121,7 +121,6 @@ fn test_index_after_bulk_insert() {
 }
 
 #[test]
-#[ignore = "Long-running stress test — run with --ignored"]
 fn test_50k_full_workload() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
