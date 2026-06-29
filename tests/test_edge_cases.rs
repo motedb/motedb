@@ -163,8 +163,11 @@ fn test_table_create_drop_recreate() {
     assert_eq!(count_rows(&db, "SELECT * FROM t WHERE name = 'reborn'"), 1);
 }
 
+/// Wide table (20 columns) batch INSERT — requires multi-value INSERT parser
+/// support for >4 columns. This is a feature gap (not a bug): the parser
+/// limits VALUES tuple width. Tracked as a future enhancement.
 #[test]
-#[ignore = "Wide table: batch INSERT with 20 columns needs parser support"]
+#[ignore = "Feature gap: parser limits VALUES tuple width (not a bug)"]
 fn test_many_columns_wide_table() {
     let (_dir, db) = setup_db();
     // 20-column table
