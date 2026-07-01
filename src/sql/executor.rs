@@ -9785,60 +9785,79 @@ impl QueryExecutor {
             cols
         };
 
-        // Iterate rows: for ColSegmentStore tables use the row-based iterator
-        // (columnar-aware); otherwise use the raw-byte scan + partial decode.
-        // Both branches yield fully-decoded rows for grouping/aggregation.
-        let mut col_seg_iter = if is_col_segment { Some(_row_iter) } else { None };
+        // Iterate rows: for ColSegmentStore tables use the vectorized projected
+        // scan (only decodes needed_cols). For each row we read ONLY the group
+        // key + aggregate values via proj_map — no full-row clone. This avoids
+        // the full-schema Vec<Value> decode + clone that made the fallback
+        // GROUP BY ~10x slower than the single-column fast path.
+        let proj_map: std::collections::HashMap<usize, usize> = needed_cols.iter()
+            .enumerate().map(|(i, &sp)| (sp, i)).collect();
+        let col_seg_rows: Option<Vec<Vec<Value>>> = if is_col_segment {
+            let store = self.db.get_or_create_col_segment_store(table_name, col_types.to_vec()).ok();
+            if let Some(store) = store {
+                let _ = store.flush_buffer();
+                let mut scanned = store.scan_projected_filtered(None, &needed_cols, &|_| true);
+                if has_where {
+                    let clause = where_clause.as_ref().unwrap();
+                    let ncol = schema.columns.len();
+                    scanned.retain(|(_, prow)| {
+                        let mut full = vec![Value::Null; ncol];
+                        for (i, &sp) in needed_cols.iter().enumerate() {
+                            if sp < ncol { if let Some(v) = prow.get(i) { full[sp] = v.clone(); } }
+                        }
+                        matches!(Self::eval_expr_on_row(clause, &full, schema), Ok(Value::Bool(true)))
+                    });
+                }
+                Some(scanned.into_iter().map(|(_, r)| r).collect())
+            } else { None }
+        } else { None };
+
         let mut raw_iter = raw_iter;
 
-        // Each iteration produces a fully decoded Row (with WHERE applied).
-        // We inline the raw path here to keep the grouping logic uniform.
-        loop {
-            let decoded_row: Row = if let Some(ref mut iter) = col_seg_iter {
-                // Columnar: iterator already yields decoded Vec<Value> rows.
-                match iter.next() {
-                    Some(Ok((_row_id, row))) => {
-                        if let Some(ref clause) = where_clause {
-                            match Self::eval_expr_on_row(clause, &row, schema) {
-                                Ok(Value::Bool(true)) => row,
-                                Ok(_) => continue,
-                                Err(_) => return Ok(None),
-                            }
-                        } else {
-                            row
-                        }
-                    }
-                    Some(Err(e)) => return Err(e),
-                    None => break,
-                }
-            } else {
-                let (_row_id, raw_bytes) = match raw_iter.as_mut().unwrap().next() {
-                    Some(Ok(r)) => r,
-                    Some(Err(e)) => return Err(e),
-                    None => break,
+        // Collect all rows into a single Vec first (avoids borrow-lifetime issues
+        // between the col-seg projected rows and the LSM raw-byte decode).
+        let all_rows: Vec<Vec<Value>> = if let Some(rows) = col_seg_rows {
+            rows
+        } else {
+            let mut out = Vec::new();
+            while let Some(item) = raw_iter.as_mut().unwrap().next() {
+                let (_row_id, raw_bytes) = match item {
+                    Ok(r) => r,
+                    Err(e) => return Err(e),
                 };
-                if let Some(ref clause) = where_clause {
-                    let full_row = match crate::storage::row_format::decode_fast(&raw_bytes, col_types, fixed_count) {
+                let row = if let Some(ref clause) = where_clause {
+                    let fr = match crate::storage::row_format::decode_fast(&raw_bytes, col_types, fixed_count) {
                         Ok(r) => r,
                         Err(_) => return Ok(None),
                     };
-                    match Self::eval_expr_on_row(clause, &full_row, schema) {
-                        Ok(Value::Bool(true)) => full_row,
+                    match Self::eval_expr_on_row(clause, &fr, schema) {
+                        Ok(Value::Bool(true)) => fr,
                         Ok(_) => continue,
                         Err(_) => return Ok(None),
                     }
                 } else {
-                    // No WHERE: decode only the needed columns for this row.
                     (0..col_types.len()).map(|pos| {
                         crate::storage::row_format::get_column(&raw_bytes, col_types, pos)
                             .unwrap_or(Value::Null)
                     }).collect()
+                };
+                out.push(row);
+            }
+            out
+        };
+
+        for cur_row in &all_rows {
+            let read_val = |schema_pos: usize| -> Value {
+                if let Some(&pi) = proj_map.get(&schema_pos) {
+                    cur_row.get(pi).cloned().unwrap_or(Value::Null)
+                } else {
+                    cur_row.get(schema_pos).cloned().unwrap_or(Value::Null)
                 }
             };
 
-            // Build group key from the fully decoded row.
+            // Build group key from the row (via proj_map for col-seg).
             let group_key: Vec<Value> = group_col_positions.iter()
-                .map(|&pos| decoded_row.get(pos).cloned().unwrap_or(Value::Null))
+                .map(|&pos| read_val(pos))
                 .collect();
 
             // Find or create group
@@ -9851,7 +9870,7 @@ impl QueryExecutor {
             for (agg_idx, &select_idx) in agg_indices.iter().enumerate() {
                 if let Some(ref agg) = select_col_info[select_idx].2 {
                     if let Some(pos) = agg.col_pos {
-                        let val = decoded_row.get(pos).cloned().unwrap_or(Value::Null);
+                        let val = read_val(pos);
                         entry.1[agg_idx].update(&val, &agg.func);
                     } else {
                         // COUNT(*) or COUNT(1)
