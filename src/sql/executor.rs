@@ -4457,11 +4457,12 @@ impl QueryExecutor {
 
         // Apply ORDER BY on the full result (in-memory sort for ColSegmentStore).
         // Supports multi-key ORDER BY with per-key ASC/DESC.
+        // 🚀 Schwartzian transform: pre-compute each row's sort keys ONCE (was:
+        // rebuilt full-schema Vec per comparison → 2 allocations × N·log(N)
+        // comparisons = the 23ms bottleneck on 2K rows). Now O(N) key compute +
+        // O(N log N) comparisons with zero per-comparison allocation.
         if let Some(ref ob) = stmt.order_by {
                 if !ob.is_empty() {
-                    // Build a sort plan over the full-schema row: for each ORDER BY
-                    // key, either a raw column position (cheap) or an expression to
-                    // evaluate (e.g. ORDER BY a + b). NULLs sort first in ASC.
                     let ncol = schema.columns.len();
                     enum SortKey { Col(usize), Expr(Expr) }
                     let sort_plan: Vec<(SortKey, bool)> = ob.iter().map(|oe| {
@@ -4474,36 +4475,28 @@ impl QueryExecutor {
                             None => (SortKey::Expr(oe.expr.clone()), oe.asc),
                         }
                     }).collect();
-                    let key_val = |row: &[Value], sk: &SortKey| -> Value {
-                        match sk {
-                            SortKey::Col(p) => row.get(*p).cloned().unwrap_or(Value::Null),
-                            SortKey::Expr(e) => Self::eval_expr_on_row(e, row, schema).unwrap_or(Value::Null),
+                    // Pre-compute sort keys per row (once each), then sort by keys.
+                    let keyed: Vec<(Vec<Value>, Vec<Value>)> = result_rows.into_iter().map(|row| {
+                        let mut full = vec![Value::Null; ncol];
+                        for (i, &sp) in scan_positions.iter().enumerate() {
+                            if sp < ncol { if let Some(v) = row.get(i) { full[sp] = v.clone(); } }
                         }
-                    };
-                    result_rows.sort_by(|a, b| {
-                        // Reconstruct full-schema rows from scan_positions for expression eval.
-                        let fa: Vec<Value> = {
-                            let mut f = vec![Value::Null; ncol];
-                            for (i, &sp) in scan_positions.iter().enumerate() {
-                                if sp < ncol { if let Some(v) = a.get(i) { f[sp] = v.clone(); } }
-                            }
-                            f
-                        };
-                        let fb: Vec<Value> = {
-                            let mut f = vec![Value::Null; ncol];
-                            for (i, &sp) in scan_positions.iter().enumerate() {
-                                if sp < ncol { if let Some(v) = b.get(i) { f[sp] = v.clone(); } }
-                            }
-                            f
-                        };
-                        for (sk, asc) in &sort_plan {
-                            let av = key_val(&fa, sk);
-                            let bv = key_val(&fb, sk);
+                        let keys: Vec<Value> = sort_plan.iter().map(|(sk, _)| match sk {
+                            SortKey::Col(p) => full.get(*p).cloned().unwrap_or(Value::Null),
+                            SortKey::Expr(e) => Self::eval_expr_on_row(e, &full, schema).unwrap_or(Value::Null),
+                        }).collect();
+                        (keys, row)
+                    }).collect();
+                    let mut keyed = keyed;
+                    keyed.sort_by(|(ka, _), (kb, _)| {
+                        for (i, (_, asc)) in sort_plan.iter().enumerate() {
+                            let av = &ka[i];
+                            let bv = &kb[i];
                             let cmp = match (matches!(av, Value::Null), matches!(bv, Value::Null)) {
                                 (true, true) => std::cmp::Ordering::Equal,
                                 (true, false) => std::cmp::Ordering::Less,
                                 (false, true) => std::cmp::Ordering::Greater,
-                                _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+                                _ => av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal),
                             };
                             if cmp != std::cmp::Ordering::Equal {
                                 return if *asc { cmp } else { cmp.reverse() };
@@ -4511,6 +4504,7 @@ impl QueryExecutor {
                         }
                         std::cmp::Ordering::Equal
                     });
+                    result_rows = keyed.into_iter().map(|(_, r)| r).collect();
                 }
         }
         // Evaluate computed SELECT expressions and build the final output rows.
