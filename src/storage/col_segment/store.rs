@@ -337,7 +337,7 @@ impl ColSegmentStore {
                     } else if !fcol_text_interned.is_empty() {
                         fcol_text_interned.get(i).cloned().flatten()
                     } else if let Some(ref t) = fcol_text {
-                        t.get_str(i).map(|s| Value::Text(s.to_string().into()))
+                        t.get_str(i).map(|s| Value::Text(s.into()))
                     } else { None };
                     v
                 } else { None };
@@ -365,7 +365,9 @@ impl ColSegmentStore {
                                 if !ptext_interned.is_empty() {
                                     ptext_interned.get(pi).and_then(|v| v.get(i)).cloned().flatten()
                                 } else {
-                                    t.get_str(i).map(|s| Value::Text(s.to_string().into()))
+                                    // Arc::from(&str) directly (one alloc), avoiding
+                                    // the intermediate String alloc from to_string().
+                                    t.get_str(i).map(|s| Value::Text(s.into()))
                                 }
                             }
                             _ => Some(Value::Null),
@@ -637,7 +639,7 @@ impl ColSegmentStore {
                                     _ => None,
                                 }
                             } else if let Some(Some(ref t)) = ptext_cols.get(pi) {
-                                t.get_str(i).map(|s| Value::Text(s.to_string().into()))
+                                t.get_str(i).map(|s| Value::Text(s.into()))
                             } else { None }
                         } else { None };
                         row.push(v.unwrap_or(Value::Null));

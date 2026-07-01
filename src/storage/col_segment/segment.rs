@@ -106,7 +106,7 @@ fn decode_cached_value(cached: &CachedCol, idx: usize, ct: &crate::types::Column
         (CachedCol::Fixed(f), ColumnType::Timestamp) => f.get_i64(idx)
             .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))).unwrap_or(Value::Null),
         (CachedCol::Text(t), ColumnType::Text) => t.get_str(idx)
-            .map(|s| Value::Text(s.to_string().into())).unwrap_or(Value::Null),
+            .map(|s| Value::Text(s.into())).unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }

@@ -2690,7 +2690,7 @@ impl Iterator for TableRowStreamingIterator {
                                 }.unwrap_or(crate::types::Value::Null)
                             }
                             ColumnarSegment::Text(t) => t.get_str(idx)
-                                .map(|s| crate::types::Value::Text(s.to_string().into()))
+                                .map(|s| crate::types::Value::Text(s.into()))
                                 .unwrap_or(crate::types::Value::Null),
                             ColumnarSegment::Vector(cols) => cols.get(idx)
                                 .cloned()

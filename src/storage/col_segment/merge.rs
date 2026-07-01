@@ -144,7 +144,7 @@ impl SegmentCursor {
                     }
                     _ => None,
                 },
-                Some(ColData::Text(t)) => t.get_str(i).map(|s| Value::Text(s.to_string().into())),
+                Some(ColData::Text(t)) => t.get_str(i).map(|s| Value::Text(s.into())),
                 Some(ColData::Vector(cols)) => cols.get(i).cloned().flatten()
                     .map(|v| Value::Vector(crate::types::ArcVec(Arc::new(v)))),
                 Some(ColData::Spatial(cols)) => cols.get(i).cloned().flatten()
