@@ -22,13 +22,31 @@ type RowPredicate = Option<Box<dyn Fn(&SqlRow) -> bool + Send + Sync>>;
 
 /// Prefix all column names in rows with `table.prefix` and add metadata fields.
 fn prefix_rows(rows: &mut [(u64, SqlRow)], table: &str, prefix: &str) {
+    // Pre-compute prefixed key names from the first row (avoids format!() per
+    // row — was: N rows × M cols format!() calls + N HashMap rebuilds).
+    if rows.is_empty() { return; }
+    let row_id_key = "__row_id__".to_string();
+    let table_key = "__table__".to_string();
+    let table_val = Value::text(table.to_string());
+
+    // Collect original column names from the first row.
+    let orig_keys: Vec<String> = rows[0].1.keys()
+        .filter(|k| !k.starts_with('_'))
+        .cloned()
+        .collect();
+    let prefixed_keys: Vec<String> = orig_keys.iter()
+        .map(|k| format!("{}.{}", prefix, k))
+        .collect();
+
     for (row_id, sql_row) in rows.iter_mut() {
-        let mut new = SqlRow::new();
-        new.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-        new.insert("__table__".to_string(), Value::text(table.to_string()));
-        let old = std::mem::take(sql_row);
-        for (col_name, val) in old {
-            new.insert(format!("{}.{}", prefix, col_name), val);
+        let mut new = SqlRow::with_capacity(orig_keys.len() + 2);
+        new.insert(row_id_key.clone(), Value::Integer(*row_id as i64));
+        new.insert(table_key.clone(), table_val.clone());
+        // Move values to prefixed keys (reuse pre-computed key strings).
+        for (orig, prefixed) in orig_keys.iter().zip(prefixed_keys.iter()) {
+            if let Some(val) = sql_row.remove(orig) {
+                new.insert(prefixed.clone(), val);
+            }
         }
         *sql_row = new;
     }
@@ -8001,8 +8019,10 @@ impl QueryExecutor {
     /// Combine two SqlRows (for JOIN operations)
     /// ✅ 优化：使用 with_capacity 预分配，减少 reallocation
     fn combine_rows(&self, left: &SqlRow, right: &SqlRow) -> SqlRow {
+        // Merge two SqlRows into one. The left row's entries are cloned, the
+        // right row's entries are also cloned (both sides may match multiple
+        // partners in the join). Capacity pre-allocated to avoid rehashing.
         let mut combined = SqlRow::with_capacity(left.len() + right.len());
-        // 直接 extend，HashMap 的 clone 仍然必要（因为我们需要保留原始行）
         combined.extend(left.iter().map(|(k, v)| (k.clone(), v.clone())));
         combined.extend(right.iter().map(|(k, v)| (k.clone(), v.clone())));
         combined

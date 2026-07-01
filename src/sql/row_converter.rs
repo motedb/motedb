@@ -4,13 +4,11 @@ use crate::error::Result;
 
 /// Convert storage Row (Vec<Value>) to SQL SqlRow (HashMap<String, Value>)
 pub fn row_to_sql_row(row: &Row, schema: &TableSchema) -> Result<SqlRow> {
-    let mut sql_row = SqlRow::new();
-    
+    let mut sql_row = SqlRow::with_capacity(schema.columns.len());
     for (i, col_def) in schema.columns.iter().enumerate() {
         let value = row.get(i).cloned().unwrap_or(Value::Null);
         sql_row.insert(col_def.name.clone(), value);
     }
-    
     Ok(sql_row)
 }
 
@@ -52,9 +50,16 @@ pub fn sql_row_to_row(sql_row: &SqlRow, schema: &TableSchema) -> Result<Row> {
 
 /// Convert a batch of storage rows to SQL rows
 pub fn rows_to_sql_rows(rows: Vec<(u64, Row)>, schema: &TableSchema) -> Result<Vec<(u64, SqlRow)>> {
+    // Pre-extract column names (avoid cloning String per row per column).
+    let col_names: Vec<&String> = schema.columns.iter().map(|c| &c.name).collect();
     rows.into_iter()
         .map(|(row_id, row)| {
-            row_to_sql_row(&row, schema).map(|sql_row| (row_id, sql_row))
+            let mut sql_row = SqlRow::with_capacity(col_names.len());
+            for (i, name) in col_names.iter().enumerate() {
+                let value = row.get(i).cloned().unwrap_or(Value::Null);
+                sql_row.insert((*name).clone(), value);
+            }
+            Ok((row_id, sql_row))
         })
         .collect()
 }
