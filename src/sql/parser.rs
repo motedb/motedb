@@ -931,11 +931,23 @@ impl Parser {
             TokenType::Number(n) => {
                 let n = *n;
                 self.advance();
-                // Integer if no fraction and within i64 range (beware f64 precision loss)
-                if n.fract() == 0.0 && n > i64::MIN as f64 - 1.0 && n < i64::MAX as f64 + 1.0 {
-                    let v = n as i64;
-                    if (v as f64 - n).abs() < 0.5 {
-                        return Ok(Expr::Literal(Value::Integer(v)));
+                // Integer if no fraction and within i64 range (beware f64 precision loss).
+                // f64 cannot exactly represent i64::MAX/MIN, so clamp the f64
+                // boundaries 9223372036854775808.0 (=2^63, the value i64::MAX
+                // rounds to) to i64::MAX, and -9223372036854775808.0 to i64::MIN,
+                // so the extreme values round-trip as Integer instead of Float.
+                if n.fract() == 0.0 {
+                    if n == 9223372036854775808.0 {
+                        return Ok(Expr::Literal(Value::Integer(i64::MAX)));
+                    }
+                    if n == -9223372036854775808.0 {
+                        return Ok(Expr::Literal(Value::Integer(i64::MIN)));
+                    }
+                    if n > i64::MIN as f64 && n < 9223372036854775808.0 {
+                        let v = n as i64;
+                        if (v as f64 - n).abs() < 0.5 {
+                            return Ok(Expr::Literal(Value::Integer(v)));
+                        }
                     }
                 }
                 Ok(Expr::Literal(Value::Float(n)))
@@ -1199,7 +1211,10 @@ impl Parser {
                             _ => return Err(self.error("ST_WITHIN() max_y must be a number")),
                         };
                         
-                        Ok(Expr::StWithin3D { column, min_x, min_y, min_z: 0.0, max_x, max_y, max_z: 0.0 })
+                        // 2D ST_WITHIN: the z range is unbounded (±∞) so it does
+                        // not filter out any point based on z. Using z∈[0,0] would
+                        // wrongly exclude points whose stored z ≠ 0.
+                        Ok(Expr::StWithin3D { column, min_x, min_y, min_z: f64::NEG_INFINITY, max_x, max_y, max_z: f64::INFINITY })
                     } else if name.to_uppercase() == "ST_DISTANCE" {
                         // ST_DISTANCE(point_column, x, y)
                         if args.len() != 3 {

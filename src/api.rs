@@ -744,11 +744,23 @@ impl Database {
 
             // Build row: map values to schema positions using column list or default order
             let row = if let Some(ref cols) = col_names {
+                if values.len() != cols.len() {
+                    return Err(crate::error::MoteDBError::InvalidArgument(
+                        format!("Column count mismatch: expected {}, got {}", cols.len(), values.len())
+                    ));
+                }
                 match crate::sql::row_converter::values_to_row_by_columns(&values, cols, &schema) {
                     Ok(r) => r,
                     Err(_) => return Ok(None),
                 }
             } else {
+                // Without an explicit column list, the value count must match the
+                // table's column count exactly (else fall back for error reporting).
+                if values.len() != schema.columns.len() {
+                    return Err(crate::error::MoteDBError::InvalidArgument(
+                        format!("Column count mismatch: expected {}, got {}", schema.columns.len(), values.len())
+                    ));
+                }
                 match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
                     Ok(r) => r,
                     Err(_) => return Ok(None),
@@ -1249,7 +1261,13 @@ impl Database {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        let _is_pk = schema.primary_key().map(|pk| pk == where_col).unwrap_or(false);
+        let is_pk = schema.primary_key().map(|pk| pk == where_col).unwrap_or(false);
+        // This fast path only accelerates `WHERE pk = value`. For non-PK WHERE
+        // columns query_by_column would error (no index) — bail to the general
+        // UPDATE path, which scans + filters positionally.
+        if !is_pk {
+            return Ok(None);
+        }
 
         // Parse SET assignments: col1=v1, col2=v2 (store raw value strings)
         let mut set_items: Vec<(String, String)> = Vec::new();
@@ -1375,7 +1393,13 @@ impl Database {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        let _is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
+        let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
+        // This fast path only accelerates `WHERE pk = value`. For non-PK WHERE
+        // columns query_by_column would error (no index) — bail to the general
+        // DELETE path, which scans + filters positionally.
+        if !is_pk {
+            return Ok(None);
+        }
 
         // Resolve PK → row_id
         let row_id = if schema.is_primary_key_auto_increment() {

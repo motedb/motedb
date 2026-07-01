@@ -46,12 +46,13 @@ fn prefix_schema(schema: &TableSchema, prefix: &str) -> TableSchema {
 /// Column segment wrapper for zero-materialization results.
 #[derive(Clone)]
 pub enum ColumnarSeg {
-    /// Fixed-width numeric column. `is_integer` distinguishes Integer (decode
-    /// as i64) from Float/Boolean (decode as f64/bool). The FixedSegment blob
-    /// stores raw 8-byte values without a type tag, so the caller must tell the
-    /// decoder how to interpret them — otherwise Integer columns are read back
-    /// as Float (e.g. age=30 → Float(from_bits(30))).
-    Fixed(crate::storage::lsm::columnar::FixedSegment, bool),
+    /// Fixed-width numeric column. The carried `ColumnType` tells the decoder
+    /// how to interpret the raw bytes: Integer→get_i64, Float→get_f64,
+    /// Boolean→get_bool. The FixedSegment blob stores raw bytes without a type
+    /// tag, so the caller must tell the decoder how to interpret them —
+    /// otherwise Integer columns are read back as Float (e.g. age=30 →
+    /// Float(from_bits(30))) or Boolean bits are misread as a number.
+    Fixed(crate::storage::lsm::columnar::FixedSegment, crate::types::ColumnType),
     Text(crate::storage::lsm::columnar::TextSegment),
 }
 
@@ -244,15 +245,17 @@ impl StreamingQueryResult {
                     let mut row = Vec::with_capacity(ncols);
                     for seg in &segments {
                         match seg {
-                            ColumnarSeg::Fixed(f, is_integer) => {
-                                // Decode according to the stored type tag, not the
-                                // raw bits. Integer columns store i64; reading them
-                                // as f64 reinterprets the bits (age=30 → tiny Float).
-                                if *is_integer {
-                                    row.push(f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null));
-                                } else {
-                                    row.push(f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null));
-                                }
+                            ColumnarSeg::Fixed(f, ct) => {
+                                // Decode according to the column's declared type.
+                                row.push(match ct {
+                                    crate::types::ColumnType::Integer =>
+                                        f.get_i64(idx).map(Value::Integer),
+                                    crate::types::ColumnType::Float =>
+                                        f.get_f64(idx).map(Value::Float),
+                                    crate::types::ColumnType::Boolean =>
+                                        f.get_bool(idx).map(Value::Bool),
+                                    _ => f.get_i64(idx).map(Value::Integer),
+                                }.unwrap_or(Value::Null));
                             }
                             ColumnarSeg::Text(t) => {
                                 let val = if let Some(s) = t.get_str(idx) {
@@ -444,12 +447,16 @@ impl StreamingQueryResult {
                     let mut row = Vec::with_capacity(segments.len());
                     for seg in &segments {
                         match seg {
-                            ColumnarSeg::Fixed(f, is_integer) => {
-                                if *is_integer {
-                                    row.push(f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null));
-                                } else {
-                                    row.push(f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null));
-                                }
+                            ColumnarSeg::Fixed(f, ct) => {
+                                row.push(match ct {
+                                    crate::types::ColumnType::Integer =>
+                                        f.get_i64(idx).map(Value::Integer),
+                                    crate::types::ColumnType::Float =>
+                                        f.get_f64(idx).map(Value::Float),
+                                    crate::types::ColumnType::Boolean =>
+                                        f.get_bool(idx).map(Value::Bool),
+                                    _ => f.get_i64(idx).map(Value::Integer),
+                                }.unwrap_or(Value::Null));
                             }
                             ColumnarSeg::Text(t) => row.push(t.get_str(idx).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))).unwrap_or(Value::Null)),
                         }
@@ -1520,6 +1527,19 @@ impl QueryExecutor {
         schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
         use crate::sql::ast::{Expr, SelectColumn};
+        // COUNT(DISTINCT col) and other DISTINCT aggregates are not supported
+        // here (this path counts without dedup). Fall back to the materialized
+        // path which dedups via HashSet (compute_aggregate_positional).
+        let has_distinct = stmt.columns.iter().any(|c| {
+            matches!(c, SelectColumn::Expr(Expr::FunctionCall { distinct: true, .. }, _))
+        });
+        if has_distinct {
+            return Ok(None);
+        }
+        // Ensure buffered rows are durable — scan_projected_filtered only reads
+        // persisted segments. (Subquery resolution calls execute_select_internal
+        // directly, bypassing the streaming entry's flush.)
+        let _ = store.flush_buffer();
         // Identify aggregate functions and their target columns.
         struct AggInfo { func: String, col: Option<usize> }
         let mut aggs: Vec<AggInfo> = Vec::new();
@@ -1613,34 +1633,41 @@ impl QueryExecutor {
             let col_idx_in_scan = a.col.and_then(|c| scan_cols.iter().position(|&s| s == c));
             match a.func.as_str() {
                 "COUNT" => {
-                    result_row.push(Value::Integer(scanned.len() as i64));
+                    // COUNT(*) counts all rows; COUNT(col) skips NULLs.
+                    let n = match a.col {
+                        None => scanned.len(), // COUNT(*)
+                        Some(_) => scanned.iter().filter(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci))
+                                .map(|v| !matches!(v, Value::Null))
+                                .unwrap_or(false)
+                        }).count(),
+                    };
+                    result_row.push(Value::Integer(n as i64));
                 }
                 "SUM" => {
-                    // Return Integer for all-integer columns (consistency), else Float.
-                    let ints: Option<i64> = {
-                        let vs: Vec<i64> = scanned.iter().filter_map(|(_, row)| {
-                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
-                                if let Value::Integer(i) = v { Some(*i) } else { None }
-                            }).filter(|&v| v != i64::MIN)
-                        }).collect();
-                        if vs.iter().all(|_| true) && !vs.is_empty()
-                            && scanned.iter().all(|(_, row)| {
-                                col_idx_in_scan.and_then(|ci| row.get(ci))
-                                    .map(|v| matches!(v, Value::Integer(_)) || v == &Value::Null)
-                                    .unwrap_or(true)
-                            }) {
-                            Some(vs.iter().sum())
-                        } else { None }
-                    };
-                    if let Some(i_sum) = ints {
-                        result_row.push(Value::Integer(i_sum));
+                    // SUM ignores NULLs; SUM over zero non-NULL values is NULL.
+                    let non_null: Vec<&Value> = scanned.iter()
+                        .filter_map(|(_, row)| col_idx_in_scan.and_then(|ci| row.get(ci)))
+                        .filter(|v| !matches!(v, Value::Null))
+                        .collect();
+                    if non_null.is_empty() {
+                        result_row.push(Value::Null);
                     } else {
-                        let sum: f64 = scanned.iter().filter_map(|(_, row)| {
-                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
-                                if let Value::Float(f) = v { Some(*f) } else if let Value::Integer(i) = v { Some(*i as f64) } else { None }
-                            })
-                        }).sum();
-                        result_row.push(Value::Float(sum));
+                        // Return Integer for all-integer columns (consistency), else Float.
+                        let all_int = non_null.iter().all(|v| matches!(v, Value::Integer(_)));
+                        if all_int {
+                            let s: i64 = non_null.iter().filter_map(|v| {
+                                if let Value::Integer(i) = v { Some(*i) } else { None }
+                            }).filter(|&v| v != i64::MIN).sum();
+                            result_row.push(Value::Integer(s));
+                        } else {
+                            let s: f64 = non_null.iter().filter_map(|v| {
+                                if let Value::Float(f) = v { Some(*f) }
+                                else if let Value::Integer(i) = v { Some(*i as f64) }
+                                else { None }
+                            }).sum();
+                            result_row.push(Value::Float(s));
+                        }
                     }
                 }
                 "MIN" => {
@@ -1684,15 +1711,20 @@ impl QueryExecutor {
                     }
                 }
                 "AVG" => {
-                    let count = scanned.len() as f64;
-                    let sum: f64 = scanned.iter().filter_map(|(_, row)| {
+                    // AVG ignores NULLs; AVG over zero non-NULL values is NULL.
+                    let nums: Vec<f64> = scanned.iter().filter_map(|(_, row)| {
                         col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
                             if let Value::Float(f) = v { Some(*f) }
                             else if let Value::Integer(i) = v { Some(*i as f64) }
                             else { None }
                         })
-                    }).sum();
-                    result_row.push(Value::Float(if count > 0.0 { sum / count } else { 0.0 }));
+                    }).collect();
+                    if nums.is_empty() {
+                        result_row.push(Value::Null);
+                    } else {
+                        let sum: f64 = nums.iter().sum();
+                        result_row.push(Value::Float(sum / nums.len() as f64));
+                    }
                 }
                 _ => return Ok(None), // unsupported function
             }
@@ -1748,6 +1780,13 @@ impl QueryExecutor {
             // GROUP BY + projected columns). Let the general path handle it.
             return Ok(None);
         }
+        // Multi-column GROUP BY (GROUP BY a, b) and HAVING are not supported by
+        // this fast path (it groups on a single column and emits no HAVING
+        // filtering). Fall back to try_apply_group_by_positional / apply_group_by,
+        // which handle composite keys and HAVING correctly.
+        if group_cols.len() > 1 || stmt.having.is_some() {
+            return Ok(None);
+        }
 
         // Output columns: group col + aggregates.
         let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
@@ -1791,6 +1830,73 @@ impl QueryExecutor {
     /// Takes &SelectStmt — no cloning of the AST at all.
     /// This is the primary entry point from the statement cache.
     fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
+        // 🚀 Pre-resolve scalar/IN subqueries in WHERE clause BEFORE any routing.
+        // This converts `WHERE col > (SELECT ...)` / `WHERE col IN (SELECT ...)`
+        // into literal forms early, so every downstream path (columnar scan,
+        // ORDER BY, DISTINCT, optimizer) sees resolvable WHERE predicates.
+        let resolved_subq_stmt;
+        let stmt: &SelectStmt = if let Some(ref where_clause) = stmt.where_clause {
+            if Self::expr_contains_subquery(where_clause) {
+                resolved_subq_stmt = self.resolve_subqueries_stmt(stmt)?;
+                &resolved_subq_stmt
+            } else {
+                stmt
+            }
+        } else {
+            stmt
+        };
+
+        // Validate bare SELECT column references against the table schema.
+        // A column that doesn't exist is a query error (not a silent value
+        // from another column). Applies before any fast-path routing so all
+        // paths benefit. (Also checked in execute_select_internal for the
+        // subquery/non-streaming route.)
+        if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
+            if let Ok(schema) = self.db.get_table_schema(table_name) {
+                for col in &stmt.columns {
+                    if let SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) = col {
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        if schema.get_column_position(bare).is_none() {
+                            return Err(MoteDBError::ColumnNotFound(
+                                format!("'{}' in table '{}'", bare, table_name)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 🚀 Fast path: Text search (MATCH AGAINST), spatial (ST_WITHIN/ST_KNN),
+        // and ORDER BY ST_DISTANCE must go through execute_select_internal which
+        // has the index pushdown paths. Check this BEFORE the ColSegmentStore S9
+        // routing, otherwise these WHERE clauses hit the columnar scan which
+        // cannot evaluate spatial/text expressions (returns 0 rows).
+        if let Some(ref where_clause) = stmt.where_clause {
+            if Self::expr_needs_materialized_path(where_clause) {
+                return self.materialize_as_streaming(stmt);
+            }
+        }
+        if let Some(ref order_by) = stmt.order_by {
+            if order_by.iter().any(|ob| Self::expr_is_or_aliases_st_distance(&ob.expr, &stmt.columns)) {
+                if let Some(QueryResult::Select { columns, rows }) = self.try_optimize_spatial_order_by(stmt)? {
+                    return Ok(StreamingQueryResult::SelectReady { columns, rows });
+                }
+                return self.materialize_as_streaming(stmt);
+            }
+            // Vector distance ORDER BY (col <-> [...] LIMIT k) needs the vector
+            // index pushdown path (FAST PATH -1) — route to execute_select_internal
+            // instead of the columnar scan, which can't evaluate `<->` ordering.
+            if let Some(plan) = self.try_optimize_vector_order_by(stmt)? {
+                let qr = self.execute_vector_order_by_plan(stmt, &plan);
+                match qr {
+                    Ok(QueryResult::Select { columns, rows }) => {
+                        return Ok(StreamingQueryResult::SelectReady { columns, rows });
+                    }
+                    _ => return self.materialize_as_streaming(stmt),
+                }
+            }
+        }
+
         // S9: ColSegmentStore tables — flush only (no compaction). Aggregate paths
         // (col_segment_aggregate) handle multi-segment directly. Compaction is
         // deferred to keep first-query P99 <50ms.
@@ -1905,44 +2011,9 @@ impl QueryExecutor {
             _ => {}
         }
 
-        // 🚀 Pre-resolve scalar subqueries in WHERE clause.
-        // This converts `WHERE col > (SELECT AVG(col) FROM t)` into
-        // `WHERE col > Literal(avg_value)` early, allowing the optimizer to
-        // extract range/point query plans and the streaming path to evaluate
-        // the expression per-row without falling back to materialization.
-        let resolved_subq_stmt;
-        let stmt: &SelectStmt = if let Some(ref where_clause) = stmt.where_clause {
-            if Self::expr_contains_subquery(where_clause) {
-                resolved_subq_stmt = self.resolve_subqueries_stmt(stmt)?;
-                &resolved_subq_stmt
-            } else {
-                stmt
-            }
-        } else {
-            stmt
-        };
-
-        // 🔥 核心改进：使用查询优化器生成执行计划
-        // 🚀 Fast path: Text search and spatial queries must go through execute_select_internal
-        // which has the optimized index pushdown paths. The streaming path only handles
-        // FullScan which would be O(N) for these queries.
-        if let Some(ref where_clause) = stmt.where_clause {
-            if Self::expr_needs_materialized_path(where_clause) {
-                return self.materialize_as_streaming(stmt);
-            }
-        }
-
-        // 🚀 Fast path: ORDER BY ST_DISTANCE uses spatial KNN index
-        if let Some(ref order_by) = stmt.order_by {
-            if order_by.iter().any(|ob| Self::expr_is_or_aliases_st_distance(&ob.expr, &stmt.columns)) {
-                // Try KNN spatial optimization first
-                if let Some(QueryResult::Select { columns, rows }) = self.try_optimize_spatial_order_by(stmt)? {
-                    return Ok(StreamingQueryResult::SelectReady { columns, rows });
-                }
-                // Fall back to full scan if KNN index not available
-                return self.materialize_as_streaming(stmt);
-            }
-        }
+        // (WHERE subqueries were pre-resolved at the top of this function.)
+        // (Spatial/text/ST_DISTANCE ORDER BY materialized-path routing is done
+        //  above, before the ColSegmentStore S9 block.)
 
         // 🆕 TimeSeries table routing: use columnar store with zone maps + bloom filters
         // when the table is TimeSeries type. Falls through to LSM for complex queries.
@@ -2078,15 +2149,24 @@ impl QueryExecutor {
         })
     }
 
-    /// Check if an expression contains MATCH, ST_WITHIN, or ST_KNN that needs
-    /// the materialized execution path with index pushdown fast paths.
+    /// Check if an expression contains MATCH, ST_WITHIN, ST_KNN, ST_RADIUS,
+    /// or spatial scalar functions (WITHIN_RADIUS/ST_DISTANCE) that the
+    /// columnar scan cannot evaluate (it doesn't decode GEOMETRY columns) and
+    /// must run through the materialized execution path.
     fn expr_needs_materialized_path(expr: &Expr) -> bool {
         match expr {
             Expr::Match { .. }
             | Expr::StWithin3D { .. } | Expr::StKnn3D { .. } | Expr::StRadius3D { .. } => true,
+            Expr::FunctionCall { name, args, .. } => {
+                matches!(name.to_lowercase().as_str(),
+                    "within_radius" | "st_distance" | "st_distance_3d")
+                || args.iter().any(|a| Self::expr_needs_materialized_path(a))
+            }
             Expr::BinaryOp { left, right, .. } => {
                 Self::expr_needs_materialized_path(left) || Self::expr_needs_materialized_path(right)
             }
+            Expr::UnaryOp { expr, .. } => Self::expr_needs_materialized_path(expr),
+            Expr::IsNull { expr, .. } => Self::expr_needs_materialized_path(expr),
             _ => false,
         }
     }
@@ -2976,6 +3056,11 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(table)?;
         let col_sst = self.db.columnar_sstables.get(table).unwrap();
         let num_rows = col_sst.num_rows;
+        // HAVING and DISTINCT aggregates are not applied by this pushdown path —
+        // fall back to the materialized GROUP BY path which evaluates them.
+        // ORDER BY over the grouped result is also not applied here (the
+        // pushdown emits groups in scan/hash order, not sorted).
+        if stmt.having.is_some() || stmt.order_by.is_some() { return Ok(None); }
 
         // Parse GROUP BY columns (only single-column for now)
         let group_cols = stmt.group_by.as_ref().unwrap();
@@ -3652,7 +3737,7 @@ impl QueryExecutor {
                 for ci in 0..col_types.len() {
                     if col_sst.column_tags[ci].is_fixed() {
                         match col_sst.read_fixed_i64(ci) {
-                            Ok(seg) => segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))),
+                            Ok(seg) => segments.push(ColumnarSeg::Fixed(seg, col_types.get(ci).cloned().unwrap_or(ColumnType::Integer))),
                             Err(_) => { ok = false; break; }
                         }
                     } else {
@@ -3752,7 +3837,7 @@ impl QueryExecutor {
                                 let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
                                 for ci in 0..col_types.len() {
                                     if col_sst.column_tags[ci].is_fixed() {
-                                        if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))); }
+                                        if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, col_types.get(ci).cloned().unwrap_or(ColumnType::Integer))); }
                                     } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
                                 }
                                 return Ok(StreamingQueryResult::SelectColumnar {
@@ -3807,7 +3892,7 @@ impl QueryExecutor {
                                     let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
                                     for ci in 0..col_types.len() {
                                         if col_sst.column_tags[ci].is_fixed() {
-                                            if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))); }
+                                            if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, col_types.get(ci).cloned().unwrap_or(ColumnType::Integer))); }
                                         } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
                                     }
                                     return Ok(StreamingQueryResult::SelectColumnar {
@@ -3837,7 +3922,7 @@ impl QueryExecutor {
                                             let mut segments: Vec<ColumnarSeg> = Vec::with_capacity(col_types.len());
                                             for ci in 0..col_types.len() {
                                                 if col_sst.column_tags[ci].is_fixed() {
-                                                    if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, matches!(col_types.get(ci), Some(ColumnType::Integer)))); }
+                                                    if let Ok(seg) = col_sst.read_fixed_i64(ci) { segments.push(ColumnarSeg::Fixed(seg, col_types.get(ci).cloned().unwrap_or(ColumnType::Integer))); }
                                                 } else if let Ok(seg) = col_sst.read_text(ci) { segments.push(ColumnarSeg::Text(seg)); }
                                             }
                                             return Ok(StreamingQueryResult::SelectColumnar {
@@ -4150,10 +4235,25 @@ impl QueryExecutor {
         // cost — was 68-197ms for 300K rows; pure column read is <2ms).
         let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
             .unwrap_or_else(|| (0..col_types.len()).collect());
+        // Computed SELECT expressions (a+b, CONCAT(...), -v, …) cannot be served
+        // by the zero-copy SelectColumnar path (raw columns only); they're
+        // evaluated later in the projected-scan fallback via eval_expr_on_row.
+        let has_computed_sel = Self::select_has_computed_expression(&stmt.columns);
 
         // Full scan (no WHERE): SelectColumnar with bounded compaction.
         // Compacts to single segment (first query ~32ms), then zero-copy scan.
-        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none() {
+        // Skip this zero-copy path when LIMIT/OFFSET/DISTINCT is set —
+        // SelectColumnar does not carry those, so they'd be silently dropped.
+        // Also skip for computed expressions (see note above).
+        // Also skip when the table has Vector/Spatial columns: SelectColumnar's
+        // ColumnarSeg only decodes Fixed/Text, and would read those columns via
+        // read_text (garbage/panic). The projected-scan fallback decodes them
+        // correctly via build_column_segment.
+        let has_vector_or_spatial = col_types.iter().any(|ct| matches!(ct,
+            ColumnType::Tensor(_) | ColumnType::Spatial));
+        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none()
+            && stmt.limit.is_none() && stmt.offset.is_none() && !stmt.distinct
+            && !has_computed_sel && !has_vector_or_spatial {
             let _ = store.flush_buffer();
             let mut _ci = 0;
             while store.segment_count() >= 2 && _ci < 3 {
@@ -4167,7 +4267,7 @@ impl QueryExecutor {
                     let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
                     for &pc in &out_positions {
                         if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
-                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f, matches!(schema.col_types().get(pc), Some(ColumnType::Integer)))); }
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f, schema.col_types().get(pc).cloned().unwrap_or(ColumnType::Integer))); }
                         } else if pc < sst.column_tags.len() {
                             if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
                         }
@@ -4186,7 +4286,10 @@ impl QueryExecutor {
         }
 
         // Full scan (no WHERE): SelectColumnar with bounded compaction for zero-copy.
-        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none() {
+        // (See LIMIT/OFFSET/DISTINCT/computed-expr guard note on the path above.)
+        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none()
+            && stmt.limit.is_none() && stmt.offset.is_none() && !stmt.distinct
+            && !has_computed_sel && !has_vector_or_spatial {
             let _ = store.flush_buffer();
             let mut _ci = 0;
             while store.segment_count() >= 2 && _ci < 3 {
@@ -4200,7 +4303,7 @@ impl QueryExecutor {
                     let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
                     for &pc in &out_positions {
                         if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
-                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f, matches!(schema.col_types().get(pc), Some(ColumnType::Integer)))); }
+                            if let Ok(f) = sst.read_fixed_i64(pc) { col_segs.push(ColumnarSeg::Fixed(f, schema.col_types().get(pc).cloned().unwrap_or(ColumnType::Integer))); }
                         } else if pc < sst.column_tags.len() {
                             if let Ok(t) = sst.read_text(pc) { col_segs.push(ColumnarSeg::Text(t)); }
                         }
@@ -4222,7 +4325,10 @@ impl QueryExecutor {
         // column with a small LIMIT and no WHERE, use top_k_row_indices to
         // scan only the sort column (bounded heap), then fetch only K rows.
         // This avoids materializing + sorting all 300K rows (49ms → ~2ms).
-        if where_clause.is_none() {
+        // Note: OFFSET is only supported here when there's a single ORDER BY
+        // key (multi-key or OFFSET-bearing queries fall through to the full
+        // scan + sort path below).
+        if where_clause.is_none() && offset == 0 && stmt.order_by.as_ref().map_or(true, |o| o.len() <= 1) {
             if let Some(ref ob) = stmt.order_by {
                 if let Some(first_ob) = ob.first() {
                     if let crate::sql::ast::Expr::Column(cn) = &first_ob.expr {
@@ -4234,7 +4340,9 @@ impl QueryExecutor {
                                     | Some(crate::types::ColumnType::Float)
                                     | Some(crate::types::ColumnType::Boolean));
                                 if is_numeric {
-                                    let top_indices = store.top_k_row_indices(order_col, lim, !first_ob.asc);
+                                    let is_float = matches!(schema.col_types().get(order_col),
+                                        Some(crate::types::ColumnType::Float));
+                                    let top_indices = store.top_k_row_indices_typed(order_col, lim, !first_ob.asc, is_float);
                                     let segs = store.segments_snapshot();
                                     let col_types = store.col_types();
                                     // Cache decoded columns per segment to avoid re-reading.
@@ -4262,8 +4370,17 @@ impl QueryExecutor {
                                                 Col::Text(t) => t.get_str(local_row).map(|s| Value::Text(s.into())).unwrap_or(Value::Null),
                                                 Col::Fixed(f) => {
                                                     match col_types.get(pc) {
+                                                        // Float is stored in the same fixed 8-byte slot as
+                                                        // i64, so reading it as i64 and casting to f64 gives
+                                                        // garbage. Re-read the raw bytes as f64 instead.
                                                         Some(crate::types::ColumnType::Float) =>
-                                                            f.get_i64(local_row).map(|i| Value::Float(i as f64)).unwrap_or(Value::Null),
+                                                            f.get_i64(local_row)
+                                                                .map(|bits| {
+                                                                    // Preserve exact bit pattern: i64 → u64 is a
+                                                                    // lossless reinterpret (two's complement).
+                                                                    Value::Float(f64::from_bits(bits as u64))
+                                                                })
+                                                                .unwrap_or(Value::Null),
                                                         _ => f.get_i64(local_row).map(Value::Integer).unwrap_or(Value::Null),
                                                     }
                                                 }
@@ -4284,31 +4401,190 @@ impl QueryExecutor {
         }
 
         // WHERE / fallback: multi-segment scan.
-        let result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
-            self.col_segment_projected_scan(store, wc, schema, &out_positions, offset, limit)?
-        } else {
-            // No WHERE but has GROUP BY / ORDER BY: full scan, project all output cols.
-            let scanned = store.scan_projected_filtered(None, &out_positions, &|_| true);
-            scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect()
-        };
-
-        // Apply ORDER BY + LIMIT on the result (in-memory sort for ColSegmentStore).
-        let mut result_rows = result_rows;
-        if let Some(ref ob) = stmt.order_by {
-            if let Some(first_ob) = ob.first() {
-                if let crate::sql::ast::Expr::Column(cn) = &first_ob.expr {
-                    if let Some(order_idx) = schema.get_column_position(cn)
-                        .and_then(|p| out_positions.iter().position(|&x| x == p))
-                    {
-                        let asc = first_ob.asc;
-                        result_rows.sort_by(|a, b| {
-                            let av = a.get(order_idx).cloned().unwrap_or(Value::Null);
-                            let bv = b.get(order_idx).cloned().unwrap_or(Value::Null);
-                            let cmp = bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal);
-                            if asc { cmp.reverse() } else { cmp }
-                        });
+        // NOTE: do not apply OFFSET/LIMIT here for the no-WHERE path — that
+        // must happen AFTER ORDER BY (OFFSET is defined over the sorted result).
+        //
+        // ORDER BY may reference columns that aren't in the SELECT list. To sort
+        // correctly we must scan those columns too, then strip them afterward.
+        // Build an augmented projection = out_positions ∪ order-by positions.
+        let ob_schema_positions: Vec<usize> = stmt.order_by.as_ref()
+            .map(|ob| {
+                // Collect schema columns referenced by each ORDER BY key, including
+                // columns nested inside expressions (e.g. ORDER BY a + b).
+                let mut acc: Vec<usize> = Vec::new();
+                for oe in ob {
+                    for p in Self::expr_referenced_columns(&oe.expr, schema) {
+                        if !acc.contains(&p) { acc.push(p); }
                     }
                 }
+                acc
+            })
+            .unwrap_or_default();
+        let mut scan_positions = out_positions.clone();
+        for &p in &ob_schema_positions {
+            if !scan_positions.contains(&p) {
+                scan_positions.push(p);
+            }
+        }
+        // Computed SELECT expressions may reference columns not in out_positions
+        // (e.g. SELECT ABS(age) — out_positions is "all columns" fallback, but
+        // be explicit so the scan reads every column the expressions need).
+        let has_computed_sel = Self::select_has_computed_expression(&stmt.columns);
+        if has_computed_sel {
+            for col in &stmt.columns {
+                if let SelectColumn::Expr(expr, _) = col {
+                    for p in Self::expr_referenced_columns(expr, schema) {
+                        if !scan_positions.contains(&p) {
+                            scan_positions.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        // Map from output-row index → schema column position, for final projection.
+        let keep_indices: Vec<usize> = out_positions.iter()
+            .map(|&p| scan_positions.iter().position(|&x| x == p).unwrap())
+            .collect();
+
+        let mut result_rows: Vec<Vec<Value>> = if let Some(ref wc) = where_clause {
+            self.col_segment_projected_scan(store, wc, schema, &scan_positions, 0, usize::MAX)?
+        } else {
+            // No WHERE but has GROUP BY / ORDER BY / DISTINCT: full scan, project
+            // all output cols + any order-by-only cols.
+            let scanned = store.scan_projected_filtered(None, &scan_positions, &|_| true);
+            scanned.into_iter().map(|(_, row)| row).collect()
+        };
+
+        // Apply ORDER BY on the full result (in-memory sort for ColSegmentStore).
+        // Supports multi-key ORDER BY with per-key ASC/DESC.
+        if let Some(ref ob) = stmt.order_by {
+                if !ob.is_empty() {
+                    // Build a sort plan over the full-schema row: for each ORDER BY
+                    // key, either a raw column position (cheap) or an expression to
+                    // evaluate (e.g. ORDER BY a + b). NULLs sort first in ASC.
+                    let ncol = schema.columns.len();
+                    enum SortKey { Col(usize), Expr(Expr) }
+                    let sort_plan: Vec<(SortKey, bool)> = ob.iter().map(|oe| {
+                        let bare_col = if let crate::sql::ast::Expr::Column(cn) = &oe.expr {
+                            let b = cn.rsplit('.').next().unwrap_or(cn);
+                            schema.get_column_position(b)
+                        } else { None };
+                        match bare_col {
+                            Some(p) => (SortKey::Col(p), oe.asc),
+                            None => (SortKey::Expr(oe.expr.clone()), oe.asc),
+                        }
+                    }).collect();
+                    let key_val = |row: &[Value], sk: &SortKey| -> Value {
+                        match sk {
+                            SortKey::Col(p) => row.get(*p).cloned().unwrap_or(Value::Null),
+                            SortKey::Expr(e) => Self::eval_expr_on_row(e, row, schema).unwrap_or(Value::Null),
+                        }
+                    };
+                    result_rows.sort_by(|a, b| {
+                        // Reconstruct full-schema rows from scan_positions for expression eval.
+                        let fa: Vec<Value> = {
+                            let mut f = vec![Value::Null; ncol];
+                            for (i, &sp) in scan_positions.iter().enumerate() {
+                                if sp < ncol { if let Some(v) = a.get(i) { f[sp] = v.clone(); } }
+                            }
+                            f
+                        };
+                        let fb: Vec<Value> = {
+                            let mut f = vec![Value::Null; ncol];
+                            for (i, &sp) in scan_positions.iter().enumerate() {
+                                if sp < ncol { if let Some(v) = b.get(i) { f[sp] = v.clone(); } }
+                            }
+                            f
+                        };
+                        for (sk, asc) in &sort_plan {
+                            let av = key_val(&fa, sk);
+                            let bv = key_val(&fb, sk);
+                            let cmp = match (matches!(av, Value::Null), matches!(bv, Value::Null)) {
+                                (true, true) => std::cmp::Ordering::Equal,
+                                (true, false) => std::cmp::Ordering::Less,
+                                (false, true) => std::cmp::Ordering::Greater,
+                                _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+                            };
+                            if cmp != std::cmp::Ordering::Equal {
+                                return if *asc { cmp } else { cmp.reverse() };
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+        }
+        // Evaluate computed SELECT expressions and build the final output rows.
+        // Each scanned row carries column values at `scan_positions`. Build a
+        // full-schema positional row (Vec<Value> of schema length) so
+        // eval_expr_on_row can resolve Expr::Column by position, then evaluate
+        // each SELECT column: Column→raw value, computed Expr→eval_expr_on_row.
+        if has_computed_sel {
+            let ncol = schema.columns.len();
+            // Pre-compute, per SELECT column, how to produce its output value:
+            //  - Some(pos): copy scan row's value at that schema position.
+            //  - None + an Expr: evaluate the expression against the full row.
+            // (Star/ColumnWithAlias map to Column semantics here.)
+            enum OutCol { CopySchema(usize), Expr(Expr) }
+            let out_plan: Vec<OutCol> = stmt.columns.iter().map(|c| match c {
+                SelectColumn::Star => OutCol::CopySchema(0), // rare; expanded below
+                SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    OutCol::CopySchema(schema.get_column_position(bare).unwrap_or(0))
+                }
+                SelectColumn::Expr(expr, _) => {
+                    if let Expr::Column(name) = expr {
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        OutCol::CopySchema(schema.get_column_position(bare).unwrap_or(0))
+                    } else if let Expr::Literal(v) = expr {
+                        OutCol::Expr(Expr::Literal(v.clone()))
+                    } else {
+                        OutCol::Expr(expr.clone())
+                    }
+                }
+            }).collect();
+            let star_expanded = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+
+            for row in &mut result_rows {
+                // Build full-schema positional row from scan_positions.
+                let mut full: Vec<Value> = vec![Value::Null; ncol];
+                for (i, &sp) in scan_positions.iter().enumerate() {
+                    if sp < ncol {
+                        if let Some(v) = row.get(i) { full[sp] = v.clone(); }
+                    }
+                }
+                let new_row: Vec<Value> = if star_expanded {
+                    // SELECT * : emit all schema columns in order.
+                    full.clone()
+                } else {
+                    out_plan.iter().map(|oc| match oc {
+                        OutCol::CopySchema(p) => full.get(*p).cloned().unwrap_or(Value::Null),
+                        OutCol::Expr(e) => Self::eval_expr_on_row(e, &full, schema).unwrap_or(Value::Null),
+                    }).collect()
+                };
+                *row = new_row;
+            }
+        } else if keep_indices.len() < scan_positions.len() {
+            // Project down to the requested output columns (strip order-by-only cols).
+            for row in &mut result_rows {
+                let projected: Vec<Value> = keep_indices.iter().map(|&i| row[i].clone()).collect();
+                *row = projected;
+            }
+        }
+        // Apply DISTINCT over the output projection (before OFFSET/LIMIT).
+        if stmt.distinct {
+            let mut seen: std::collections::HashSet<Vec<Value>> =
+                std::collections::HashSet::with_capacity(result_rows.len());
+            result_rows.retain(|row| {
+                let key: Vec<Value> = row.clone();
+                seen.insert(key)
+            });
+        }
+        // Apply OFFSET then LIMIT over the sorted result.
+        if offset > 0 {
+            if offset >= result_rows.len() {
+                result_rows.clear();
+            } else {
+                result_rows.drain(..offset);
             }
         }
         let lim = stmt.limit.unwrap_or(usize::MAX);
@@ -4484,6 +4760,9 @@ impl QueryExecutor {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<Vec<Value>>> {
+        // Ensure buffered rows are durable before scanning — store.scan() only
+        // reads persisted segments, so unflushed inserts would be invisible.
+        let _ = store.flush_buffer();
         let mut rows = Vec::new();
         let mut skipped = 0usize;
         for (_key, _ts, row) in store.scan() {
@@ -4787,6 +5066,88 @@ impl QueryExecutor {
                     }
                 }
                 Ok(Value::Null)
+            }
+            "ifnull" | "nvl" => {
+                // IFNULL(value, default) — return default if value is NULL.
+                if args.len() != 2 { return Ok(Value::Null); }
+                let val = Self::eval_expr_on_row(&args[0], row, schema)?;
+                if matches!(val, Value::Null) {
+                    Self::eval_expr_on_row(&args[1], row, schema)
+                } else {
+                    Ok(val)
+                }
+            }
+            "nullif" => {
+                // NULLIF(a, b) — NULL if a == b, else a.
+                if args.len() != 2 { return Ok(Value::Null); }
+                let a = Self::eval_expr_on_row(&args[0], row, schema)?;
+                let b = Self::eval_expr_on_row(&args[1], row, schema)?;
+                if a == b { Ok(Value::Null) } else { Ok(a) }
+            }
+            "substr" | "substring" => {
+                // SUBSTR(text, start [, length]) — SQL 1-indexed.
+                if args.len() < 2 || args.len() > 3 { return Ok(Value::text(String::new())); }
+                let text = match Self::eval_expr_on_row(&args[0], row, schema)? {
+                    Value::Text(s) => s,
+                    _ => return Ok(Value::text(String::new())),
+                };
+                let start = match Self::eval_expr_on_row(&args[1], row, schema)? {
+                    Value::Integer(i) if i >= 0 => (i.max(1) as usize).saturating_sub(1),
+                    Value::Integer(i) if i < 0 => text.chars().count().saturating_sub((-i) as usize),
+                    _ => return Ok(Value::text(String::new())),
+                };
+                let result = if args.len() == 3 {
+                    let length = match Self::eval_expr_on_row(&args[2], row, schema)? {
+                        Value::Integer(i) => i.max(0) as usize,
+                        _ => return Ok(Value::text(String::new())),
+                    };
+                    text.chars().skip(start).take(length).collect()
+                } else {
+                    text.chars().skip(start).collect()
+                };
+                Ok(Value::text(result))
+            }
+            "replace" => {
+                // REPLACE(text, from, to).
+                if args.len() != 3 { return Ok(Value::Null); }
+                let text = match Self::eval_expr_on_row(&args[0], row, schema)? { Value::Text(s) => s, _ => return Ok(Value::Null) };
+                let from = match Self::eval_expr_on_row(&args[1], row, schema)? { Value::Text(s) => s, _ => return Ok(Value::Null) };
+                let to = match Self::eval_expr_on_row(&args[2], row, schema)? { Value::Text(s) => s, _ => return Ok(Value::Null) };
+                Ok(Value::text(text.replace(from.as_str(), to.as_str())))
+            }
+            "sign" => {
+                if args.is_empty() { return Ok(Value::Null); }
+                match Self::eval_expr_on_row(&args[0], row, schema)? {
+                    Value::Integer(i) => Ok(Value::Integer(i.signum())),
+                    Value::Float(f) => Ok(Value::Integer(if f > 0.0 { 1 } else if f < 0.0 { -1 } else { 0 })),
+                    _ => Ok(Value::Null),
+                }
+            }
+            "power" | "pow" => {
+                if args.len() != 2 { return Ok(Value::Null); }
+                let base = match Self::eval_expr_on_row(&args[0], row, schema)? {
+                    Value::Integer(i) => i as f64, Value::Float(f) => f, _ => return Ok(Value::Null),
+                };
+                let exp = match Self::eval_expr_on_row(&args[1], row, schema)? {
+                    Value::Integer(i) => i as f64, Value::Float(f) => f, _ => return Ok(Value::Null),
+                };
+                Ok(Value::Float(base.powf(exp)))
+            }
+            "mod" => {
+                if args.len() != 2 { return Ok(Value::Null); }
+                let a = Self::eval_expr_on_row(&args[0], row, schema)?;
+                let b = Self::eval_expr_on_row(&args[1], row, schema)?;
+                match (&a, &b) {
+                    (Value::Integer(x), Value::Integer(y)) => {
+                        if *y == 0 { return Ok(Value::Null); }
+                        Ok(match x.checked_rem(*y) { Some(n) => Value::Integer(n), None => Value::Integer(0) })
+                    }
+                    (Value::Float(x), Value::Float(y)) => {
+                        if *y == 0.0 { return Ok(Value::Null); }
+                        Ok(Value::Float(x % y))
+                    }
+                    _ => Ok(Value::Null),
+                }
             }
             "if" => {
                 if args.len() >= 3 {
@@ -5986,6 +6347,24 @@ impl QueryExecutor {
             stmt
         };
 
+        // Validate SELECT column references against the table schema (when a
+        // single table is named). A bare column that doesn't exist in the
+        // table is a query error, not a silent NULL/value from another column.
+        if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
+            if let Ok(schema) = self.db.get_table_schema(table_name) {
+                for col in &stmt.columns {
+                    if let SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) = col {
+                        let bare = name.rsplit('.').next().unwrap_or(name);
+                        if schema.get_column_position(bare).is_none() {
+                            return Err(MoteDBError::ColumnNotFound(
+                                format!("'{}' in table '{}'", bare, table_name)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // 🆕 FAST PATH -4: SELECT without FROM clause (e.g., SELECT LAST_INSERT_ID())
         // → Evaluate expressions directly without table scan
         if stmt.from.is_none() {
@@ -6049,6 +6428,10 @@ impl QueryExecutor {
             if let TableRef::Table { name: table_name, .. } = from {
                 if self.db.has_col_segment_store(table_name)
                     && !self.has_only_count_aggregate(&stmt.columns)
+                    // Don't route spatial/text/vector queries to the columnar
+                    // scan — they need the index pushdown paths below
+                    // (FAST PATH 0a/0b/-1/-1b).
+                    && stmt.where_clause.as_ref().map_or(true, |w| !Self::expr_needs_materialized_path(w))
                 {
                     // Route ALL queries (including WHERE id = val) through the
                     // ColSegmentStore full-scan path. Previously, WHERE id=val was
@@ -6066,7 +6449,10 @@ impl QueryExecutor {
         // multi-segment full-scan path. The PointQuery/index fast paths below
         // fetch rows via lsm_engine.scan_range, which returns empty for
         // ColSegmentStore tables (data lives in segment files, not the LSM).
-        if stmt.where_clause.is_some() && stmt.group_by.is_none() {
+        // Skip spatial/text/vector WHERE — they need the index pushdown paths.
+        if stmt.where_clause.as_ref().map_or(false, |w| !Self::expr_needs_materialized_path(w))
+            && stmt.where_clause.is_some() && stmt.group_by.is_none()
+        {
             if let TableRef::Table { name: table_name, .. } = from {
                 if self.db.has_col_segment_store(table_name)
                     && !self.has_only_count_aggregate(&stmt.columns)
@@ -7812,7 +8198,7 @@ impl QueryExecutor {
             Expr::Subquery(subquery) => {
                 // Execute subquery
                 let result = self.execute_select_internal(subquery)?;
-                
+
                 match result {
                     QueryResult::Select { rows, .. } => {
                         // Scalar subquery: return single value
@@ -8648,7 +9034,50 @@ impl QueryExecutor {
             }
         })
     }
-    
+
+    /// Check if the SELECT list contains any *computed* expression — i.e. an
+    /// `Expr` that is not a bare column reference or literal. The columnar scan
+    /// fast paths only project raw columns/literals; computed expressions
+    /// (`a + b`, `CONCAT(...)`, `IF(...)`, `-v`, scalar subqueries, …) must go
+    /// through the materialized path where `eval_expr_on_row` evaluates them.
+    /// `Star` and `Column`/`ColumnWithAlias` are NOT computed.
+    fn select_has_computed_expression(columns: &[SelectColumn]) -> bool {
+        columns.iter().any(|col| match col {
+            SelectColumn::Star | SelectColumn::Column(_) | SelectColumn::ColumnWithAlias(_, _) => false,
+            SelectColumn::Expr(expr, _) => !matches!(expr, Expr::Column(_) | Expr::Literal(_)),
+        })
+    }
+
+    /// Recursively collect schema column positions referenced by an expression.
+    /// Used to ensure a columnar scan reads all columns a SELECT expression needs
+    /// before evaluating it.
+    fn expr_referenced_columns(expr: &Expr, schema: &TableSchema) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut add = |name: &str, out: &mut Vec<usize>| {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            if let Some(p) = schema.get_column_position(bare) {
+                if !out.contains(&p) { out.push(p); }
+            }
+        };
+        match expr {
+            Expr::Column(name) => add(name, &mut out),
+            Expr::BinaryOp { left, right, .. } => {
+                for p in Self::expr_referenced_columns(left, schema) { if !out.contains(&p) { out.push(p); } }
+                for p in Self::expr_referenced_columns(right, schema) { if !out.contains(&p) { out.push(p); } }
+            }
+            Expr::UnaryOp { expr, .. } => {
+                for p in Self::expr_referenced_columns(expr, schema) { if !out.contains(&p) { out.push(p); } }
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    for p in Self::expr_referenced_columns(a, schema) { if !out.contains(&p) { out.push(p); } }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
     /// Check if an expression is an aggregate function
     fn is_aggregate_expr(&self, expr: &Expr) -> bool {
         match expr {
@@ -8720,6 +9149,12 @@ impl QueryExecutor {
         schema: &TableSchema,
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
+        // This path scans via raw bytes (LSM), which is empty for ColSegmentStore
+        // tables (data lives in segment files). Bail so the caller falls through
+        // to try_apply_group_by_positional, which scans columnar segments.
+        if self.db.has_col_segment_store(table_name) {
+            return Ok(None);
+        }
         // Parse all SELECT columns into aggregate descriptors
         let mut agg_specs: Vec<(String, AggregateInfo)> = Vec::new();
         for col_spec in &stmt.columns {
@@ -9228,8 +9663,18 @@ impl QueryExecutor {
     ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
         use std::collections::HashMap;
 
+        // ColSegmentStore tables cannot be read via the raw-byte LSM scan (data
+        // lives in segment files). Use the row-based streaming iterator that
+        // correctly decodes columnar segments. The raw path is an optimization
+        // for LSM-backed tables only.
+        let is_col_segment = self.db.has_col_segment_store(table_name);
+
         // Use raw byte scan — avoid full row decode, only decode needed columns
-        let raw_iter = self.db.scan_table_raw_streaming(table_name)?;
+        let raw_iter = if is_col_segment {
+            None
+        } else {
+            Some(self.db.scan_table_raw_streaming(table_name)?)
+        };
         let col_types = schema.col_types();
         let fixed_count = crate::storage::row_format::compute_fixed_count(col_types);
 
@@ -9346,43 +9791,60 @@ impl QueryExecutor {
             cols
         };
 
-        for result in raw_iter {
-            let (_row_id, raw_bytes) = match result {
-                Ok(r) => r,
-                Err(e) => return Err(e),
-            };
+        // Iterate rows: for ColSegmentStore tables use the row-based iterator
+        // (columnar-aware); otherwise use the raw-byte scan + partial decode.
+        // Both branches yield fully-decoded rows for grouping/aggregation.
+        let mut col_seg_iter = if is_col_segment { Some(_row_iter) } else { None };
+        let mut raw_iter = raw_iter;
 
-            // WHERE filter — full decode when needed
-            // Keep decoded row to reuse for group key + aggregate extraction,
-            // avoiding a redundant partial decode from raw bytes.
-            let decoded_row: Option<Row> = if let Some(ref clause) = where_clause {
-                let full_row = match crate::storage::row_format::decode_fast(&raw_bytes, col_types, fixed_count) {
-                    Ok(r) => r,
-                    Err(_) => return Ok(None),
-                };
-                match Self::eval_expr_on_row(clause, &full_row, schema) {
-                    Ok(Value::Bool(true)) => Some(full_row),
-                    Ok(_) => continue,
-                    Err(_) => return Ok(None),
+        // Each iteration produces a fully decoded Row (with WHERE applied).
+        // We inline the raw path here to keep the grouping logic uniform.
+        loop {
+            let decoded_row: Row = if let Some(ref mut iter) = col_seg_iter {
+                // Columnar: iterator already yields decoded Vec<Value> rows.
+                match iter.next() {
+                    Some(Ok((_row_id, row))) => {
+                        if let Some(ref clause) = where_clause {
+                            match Self::eval_expr_on_row(clause, &row, schema) {
+                                Ok(Value::Bool(true)) => row,
+                                Ok(_) => continue,
+                                Err(_) => return Ok(None),
+                            }
+                        } else {
+                            row
+                        }
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => break,
                 }
             } else {
-                None
-            };
-
-            // Column value extractor: reuse decoded row if available,
-            // otherwise partial-decode from raw bytes (saves full decode cost).
-            let get_col = |pos: usize| -> Value {
-                if let Some(ref row) = decoded_row {
-                    row.get(pos).cloned().unwrap_or(Value::Null)
+                let (_row_id, raw_bytes) = match raw_iter.as_mut().unwrap().next() {
+                    Some(Ok(r)) => r,
+                    Some(Err(e)) => return Err(e),
+                    None => break,
+                };
+                if let Some(ref clause) = where_clause {
+                    let full_row = match crate::storage::row_format::decode_fast(&raw_bytes, col_types, fixed_count) {
+                        Ok(r) => r,
+                        Err(_) => return Ok(None),
+                    };
+                    match Self::eval_expr_on_row(clause, &full_row, schema) {
+                        Ok(Value::Bool(true)) => full_row,
+                        Ok(_) => continue,
+                        Err(_) => return Ok(None),
+                    }
                 } else {
-                    crate::storage::row_format::get_column(&raw_bytes, col_types, pos)
-                        .unwrap_or(Value::Null)
+                    // No WHERE: decode only the needed columns for this row.
+                    (0..col_types.len()).map(|pos| {
+                        crate::storage::row_format::get_column(&raw_bytes, col_types, pos)
+                            .unwrap_or(Value::Null)
+                    }).collect()
                 }
             };
 
-            // Build group key using decoded or partial-decoded values
+            // Build group key from the fully decoded row.
             let group_key: Vec<Value> = group_col_positions.iter()
-                .map(|&pos| get_col(pos))
+                .map(|&pos| decoded_row.get(pos).cloned().unwrap_or(Value::Null))
                 .collect();
 
             // Find or create group
@@ -9391,11 +9853,11 @@ impl QueryExecutor {
                 (group_key, accums)
             });
 
-            // Update each aggregate accumulator using partial decode
+            // Update each aggregate accumulator using the decoded row.
             for (agg_idx, &select_idx) in agg_indices.iter().enumerate() {
                 if let Some(ref agg) = select_col_info[select_idx].2 {
                     if let Some(pos) = agg.col_pos {
-                        let val = get_col(pos);
+                        let val = decoded_row.get(pos).cloned().unwrap_or(Value::Null);
                         entry.1[agg_idx].update(&val, &agg.func);
                     } else {
                         // COUNT(*) or COUNT(1)
@@ -10545,7 +11007,17 @@ impl QueryExecutor {
             }
             col_def
         }).collect();
-        
+
+        // Guard: the columnar SSTable format reserves a fixed-width header slot
+        // per column (MAX_COLUMNS). Reject early with a clean error instead of
+        // panicking at flush time when the header overflows.
+        if columns.len() > crate::storage::lsm::columnar::MAX_COLUMNS {
+            return Err(crate::error::StorageError::InvalidData(format!(
+                "table '{}' has {} columns, but the maximum is {}",
+                stmt.table, columns.len(), crate::storage::lsm::columnar::MAX_COLUMNS
+            )).into());
+        }
+
         // 🆕 STEP 1: Find primary key columns
         let primary_key_cols: Vec<&super::ast::ColumnDef> = stmt.columns.iter()
             .filter(|col| col.primary_key)

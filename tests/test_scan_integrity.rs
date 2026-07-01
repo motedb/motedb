@@ -1,4 +1,4 @@
-use motedb::{Database, DBConfig, StreamingQueryResult};
+use motedb::{Database, DBConfig};
 use tempfile::TempDir;
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
@@ -41,8 +41,12 @@ fn test_where_count_accuracy() {
     let mut manual_pending = 0i64;
     let mut manual_completed = 0i64;
     let mut manual_total = 0i64;
-    if let StreamingQueryResult::SelectStreaming { mut rows, .. } = result {
-        while let Some(Ok(row)) = rows.next() {
+    // The DB may return any of SelectStreaming / SelectReady / SelectColumnar
+    // for a full scan depending on the storage path. Materialize uniformly so
+    // the manual count is correct regardless of the result variant.
+    let materialized = result.materialize().unwrap();
+    if let motedb::sql::QueryResult::Select { rows, .. } = materialized {
+        for row in &rows {
             manual_total += 1;
             if let motedb::types::Value::Text(s) = &row[1] {
                 if s.as_str() == "pending" { manual_pending += 1; }

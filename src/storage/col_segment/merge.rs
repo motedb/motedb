@@ -19,7 +19,11 @@ use std::sync::Arc;
 enum ColData {
     Fixed(FixedSegment),
     Text(TextSegment),
-    /// Fallback for Vector/Spatial — decoded per-row via get_row (rare path).
+    /// Pre-decoded Vector column: one Vec<f32> per row index (None = NULL).
+    Vector(Vec<Option<Vec<f32>>>),
+    /// Pre-decoded Spatial column: one Geometry per row index (None = NULL).
+    Spatial(Vec<Option<crate::types::Geometry>>),
+    /// Fallback for unsupported column types.
     Opaque,
 }
 
@@ -66,6 +70,29 @@ impl SegmentCursor {
                     Ok(seg_data) => ColData::Text(seg_data),
                     Err(_) => ColData::Opaque,
                 }
+            } else if ci < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector) {
+                // Map read_vectors (row_id, vec) pairs to per-row-index options.
+                let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
+                let mut per = vec![None; n];
+                let mut di = 0usize;
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                    while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                    if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                }
+                ColData::Vector(per)
+            } else if ci < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial) {
+                let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
+                let mut per = vec![None; n];
+                let mut di = 0usize;
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                    while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                    if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                }
+                ColData::Spatial(per)
             } else {
                 ColData::Opaque
             };
@@ -118,6 +145,10 @@ impl SegmentCursor {
                     _ => None,
                 },
                 Some(ColData::Text(t)) => t.get_str(i).map(|s| Value::Text(s.to_string().into())),
+                Some(ColData::Vector(cols)) => cols.get(i).cloned().flatten()
+                    .map(|v| Value::Vector(crate::types::ArcVec(Arc::new(v)))),
+                Some(ColData::Spatial(cols)) => cols.get(i).cloned().flatten()
+                    .map(|g| Value::Spatial(std::boxed::Box::new(g))),
                 _ => None,
             }
             .unwrap_or(Value::Null);

@@ -82,10 +82,13 @@ use memmap2::Mmap;
 // ── Constants ─────────────────────────────────────────────────────
 
 const COLUMNAR_MAGIC: u32 = 0x434D5442; // "BTMC"
-const COLUMNAR_VERSION: u32 = 1;
-const HEADER_SIZE: usize = 32;
+const COLUMNAR_VERSION: u32 = 2; // v2: MAX_COLUMNS 16 → 128, header grew to 144 bytes
+const HEADER_SIZE: usize = 144; // 14 (fixed prefix) + 128 (column_tags) + 2 (reserved)
 const FOOTER_SIZE: usize = 20;
-const MAX_COLUMNS: usize = 16;
+/// Maximum number of columns supported by the columnar SSTable format.
+/// The on-disk header reserves a fixed-width slot per column, so this is a
+/// hard format limit. CREATE TABLE rejects tables exceeding it.
+pub const MAX_COLUMNS: usize = 128;
 
 /// Column type tags for the columnar format (compact u8 representation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +158,8 @@ impl ColumnarHeader {
         buf[4..8].copy_from_slice(&COLUMNAR_VERSION.to_le_bytes());
         buf[8..12].copy_from_slice(&self.num_rows.to_le_bytes());
         buf[12..14].copy_from_slice(&self.num_columns.to_le_bytes());
-        buf[14..30].copy_from_slice(&self.column_tags);
-        // bytes 30-31: reserved
+        buf[14..14 + MAX_COLUMNS].copy_from_slice(&self.column_tags);
+        // bytes 142-143: reserved
         buf
     }
 
@@ -179,7 +182,7 @@ impl ColumnarHeader {
         let num_rows = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         let num_columns = u16::from_le_bytes([data[12], data[13]]);
         let mut column_tags = [0u8; MAX_COLUMNS];
-        column_tags.copy_from_slice(&data[14..30]);
+        column_tags.copy_from_slice(&data[14..14 + MAX_COLUMNS]);
         Ok(Self { num_rows, num_columns, column_tags })
     }
 }
@@ -849,25 +852,29 @@ impl ColumnarSSTable {
         let entry = &self.column_index[col_idx];
         let seg_start = entry.offset as usize;
         let seg_end = seg_start + entry.size as usize;
+        // Decompress the segment (Snappy-flagged) before parsing — the on-disk
+        // layout is [flag][compressed or raw bytes], same as Fixed/Text segments.
+        let seg_bytes = self.read_segment_bytes(seg_start, seg_end);
+        let data = seg_bytes.as_ref();
         let null_bytes = (self.num_rows + 7) / 8;
-        if seg_start + null_bytes > seg_end { return Ok(Vec::new()); }
+        if null_bytes + 2 > data.len() { return Ok(Vec::new()); }
         let mut result = Vec::new();
-        let mut pos = seg_start + null_bytes;
+        let mut pos = null_bytes;
         for i in 0..self.num_rows {
-            if (self.backing()[seg_start + i/8] >> (i%8)) & 1 != 0 {
-                // Null — skip to next row (need to read len to skip bytes)
-                if pos + 2 <= seg_end {
-                    let len = u16::from_le_bytes([self.backing()[pos], self.backing()[pos+1]]) as usize;
+            if (data[i/8] >> (i%8)) & 1 != 0 {
+                // Null — skip to next row (read len to skip its bytes).
+                if pos + 2 <= data.len() {
+                    let len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
                     pos += 2 + len;
                 }
                 continue;
             }
             if self.row_map.is_deleted(i) { continue; }
-            if pos + 2 > seg_end { break; }
-            let len = u16::from_le_bytes([self.backing()[pos], self.backing()[pos+1]]) as usize;
+            if pos + 2 > data.len() { break; }
+            let len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
             pos += 2;
-            if len == 0 || pos + len > seg_end { continue; }
-            if let Ok(geom) = bincode::deserialize::<crate::types::Geometry>(&self.backing()[pos..pos+len]) {
+            if len == 0 || pos + len > data.len() { continue; }
+            if let Ok(geom) = bincode::deserialize::<crate::types::Geometry>(&data[pos..pos+len]) {
                 let row_id = (self.row_map.key(i) & 0xFFFFFFFF) as RowId;
                 result.push((row_id, geom));
             }
@@ -954,6 +961,11 @@ pub struct ColumnarSSTableBuilder {
     deleted: Vec<bool>,
     // Buffered column data (one Vec per column)
     column_buffers: Vec<Vec<u8>>,
+    // Explicit per-column NULL flags. Tracked at encode time so the NULL
+    // bitmap is authoritative — no value sentinel is needed (previously
+    // i64::MIN was the Integer NULL sentinel, which collided with the real
+    // value i64::MIN, and f64::NAN collided with stored NaN).
+    null_flags: Vec<Vec<bool>>,
     finished: bool,
 }
 
@@ -973,6 +985,7 @@ impl ColumnarSSTableBuilder {
             timestamps: Vec::new(),
             deleted: Vec::new(),
             column_buffers: vec![Vec::new(); num_cols],
+            null_flags: vec![Vec::new(); num_cols],
             finished: false,
         }
     }
@@ -996,6 +1009,8 @@ impl ColumnarSSTableBuilder {
 
         for (col_idx, value) in row.iter().enumerate() {
             let buf = &mut self.column_buffers[col_idx];
+            // Track explicit NULL flag (authoritative; no value sentinel needed).
+            self.null_flags[col_idx].push(matches!(value, Value::Null));
             match &self.column_tags[col_idx] {
                 ColumnTypeTag::Integer => {
                     let i = match value { Value::Integer(v) => *v, Value::Null => i64::MIN, _ => 0 };
@@ -1006,8 +1021,10 @@ impl ColumnarSSTableBuilder {
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
                 ColumnTypeTag::Bool => {
-                    let b = match value { Value::Bool(v) => *v, _ => false };
-                    buf.push(if b { 1 } else { 0 });
+                    // 1-byte storage: 0=false, 1=true, 2=NULL sentinel.
+                    // (Value::Null must be distinguishable from Bool(false).)
+                    let b = match value { Value::Bool(v) => if *v { 1 } else { 0 }, _ => 2 };
+                    buf.push(b);
                 }
                 ColumnTypeTag::Timestamp => {
                     let ts = match value { Value::Timestamp(t) => t.as_micros(), Value::Null => i64::MIN, _ => 0 };
@@ -1034,9 +1051,36 @@ impl ColumnarSSTableBuilder {
                         }
                     }
                 }
-                _ => {
-                    let bytes = match value { Value::Null => vec![], _ => bincode::serialize(value).unwrap_or_default() };
-                    buf.extend_from_slice(&bytes);
+                ColumnTypeTag::Vector => {
+                    // Vector column: [dim:u16][f32×dim] per row (matches
+                    // read_vectors: [null_bitmap][dim:u16][f32×dim per row]).
+                    // NULL writes dim=0 so the row decodes as null/empty.
+                    match value {
+                        Value::Vector(v) => {
+                            let floats: &[f32] = &v.0;
+                            buf.extend_from_slice(&(floats.len() as u16).to_le_bytes());
+                            for f in floats { buf.extend_from_slice(&f.to_le_bytes()); }
+                        }
+                        Value::Tensor(t) => {
+                            let floats = t.to_f32();
+                            buf.extend_from_slice(&(floats.len() as u16).to_le_bytes());
+                            for f in &floats { buf.extend_from_slice(&f.to_le_bytes()); }
+                        }
+                        _ => buf.extend_from_slice(&0u16.to_le_bytes()),
+                    }
+                }
+                ColumnTypeTag::Spatial => {
+                    // Spatial column: [len:u16][bincode(Geometry)] per row
+                    // (matches read_spatial). NULL writes len=0.
+                    match value {
+                        Value::Spatial(g) => {
+                            let bytes = bincode::serialize(&**g).unwrap_or_default();
+                            let len = bytes.len().min(65535) as u16;
+                            buf.extend_from_slice(&len.to_le_bytes());
+                            buf.extend_from_slice(&bytes[..len as usize]);
+                        }
+                        _ => buf.extend_from_slice(&0u16.to_le_bytes()),
+                    }
                 }
             }
         }
@@ -1059,6 +1103,21 @@ impl ColumnarSSTableBuilder {
         self.timestamps.push(timestamp);
         self.deleted.push(deleted);
         for (col_idx, bytes) in col_raw.iter().enumerate() {
+            // Infer the NULL flag from the column's encoded bytes so the
+            // authoritative null_bitmap stays correct for raw-merge paths
+            // (which bypass add_values' per-Value NULL tracking).
+            let is_null = match self.column_tags.get(col_idx) {
+                Some(crate::storage::lsm::columnar::ColumnTypeTag::Vector) => {
+                    // dim:u16 == 0 ⇒ NULL
+                    bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == 0
+                }
+                Some(crate::storage::lsm::columnar::ColumnTypeTag::Spatial) => {
+                    // len:u16 == 0 ⇒ NULL
+                    bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == 0
+                }
+                _ => false,
+            };
+            self.null_flags[col_idx].push(is_null);
             self.column_buffers[col_idx].extend_from_slice(bytes);
         }
         self.num_rows += 1;
@@ -1084,6 +1143,8 @@ impl ColumnarSSTableBuilder {
 
         for (col_idx, value) in row.iter().enumerate() {
             let buf = &mut self.column_buffers[col_idx];
+            // Track explicit NULL flag (authoritative; no value sentinel needed).
+            self.null_flags[col_idx].push(matches!(value, Value::Null));
             match &self.column_tags[col_idx] {
                 ColumnTypeTag::Integer => {
                     let i = match value {
@@ -1103,10 +1164,10 @@ impl ColumnarSSTableBuilder {
                 }
                 ColumnTypeTag::Bool => {
                     let b = match value {
-                        Value::Bool(v) => *v,
-                        _ => false,
+                        Value::Bool(v) => if *v { 1 } else { 0 },
+                        _ => 2, // NULL sentinel
                     };
-                    buf.push(if b { 1 } else { 0 });
+                    buf.push(b);
                 }
                 ColumnTypeTag::Timestamp => {
                     let ts = match value {
@@ -1239,13 +1300,17 @@ impl ColumnarSSTableBuilder {
                         let buf = &self.column_buffers[ci];
                         let off = i * 8;
                         if off + 8 > buf.len() { row.push(Value::Null); continue; }
+                        // Use the authoritative NULL flag (not a value sentinel),
+                        // so the real value i64::MIN round-trips correctly.
+                        if self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true) {
+                            row.push(Value::Null);
+                            continue;
+                        }
                         let val = i64::from_le_bytes([
                             buf[off], buf[off+1], buf[off+2], buf[off+3],
                             buf[off+4], buf[off+5], buf[off+6], buf[off+7],
                         ]);
-                        if val == i64::MIN {
-                            row.push(Value::Null);
-                        } else if matches!(tag, ColumnTypeTag::Timestamp) {
+                        if matches!(tag, ColumnTypeTag::Timestamp) {
                             row.push(Value::Timestamp(crate::types::Timestamp::from_micros(val)));
                         } else {
                             row.push(Value::Integer(val));
@@ -1255,16 +1320,25 @@ impl ColumnarSSTableBuilder {
                         let buf = &self.column_buffers[ci];
                         let off = i * 8;
                         if off + 8 > buf.len() { row.push(Value::Null); continue; }
+                        // Authoritative NULL flag (not the NaN sentinel), so a
+                        // stored NaN round-trips as Float(NaN) rather than Null.
+                        if self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true) {
+                            row.push(Value::Null);
+                            continue;
+                        }
                         let bits = u64::from_le_bytes([
                             buf[off], buf[off+1], buf[off+2], buf[off+3],
                             buf[off+4], buf[off+5], buf[off+6], buf[off+7],
                         ]);
-                        let f = f64::from_bits(bits);
-                        if f.is_nan() { row.push(Value::Null); }
-                        else { row.push(Value::Float(f)); }
+                        row.push(Value::Float(f64::from_bits(bits)));
                     }
                     ColumnTypeTag::Bool => {
                         let buf = &self.column_buffers[ci];
+                        // Authoritative NULL flag; Bool has no value sentinel.
+                        if self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true) {
+                            row.push(Value::Null);
+                            continue;
+                        }
                         row.push(Value::Bool(buf.get(i).copied().unwrap_or(0) != 0));
                     }
                     ColumnTypeTag::Text => {
@@ -1293,7 +1367,60 @@ impl ColumnarSSTableBuilder {
                         }
                         row.push(found.unwrap_or(Value::Null));
                     }
-                    _ => row.push(Value::Null),
+                    ColumnTypeTag::Vector => {
+                        // Vector layout: [dim:u16][f32×dim] per row, concatenated.
+                        let buf = &self.column_buffers[ci];
+                        let mut p = 0usize;
+                        let mut r = 0usize;
+                        let mut found = None;
+                        while p + 2 <= buf.len() {
+                            let dim = u16::from_le_bytes([buf[p], buf[p+1]]) as usize;
+                            p += 2;
+                            if r == i {
+                                if dim == 0 {
+                                    found = Some(Value::Null);
+                                } else if p + dim * 4 <= buf.len() {
+                                    let mut v = Vec::with_capacity(dim);
+                                    for j in 0..dim {
+                                        let off = p + j * 4;
+                                        v.push(f32::from_le_bytes([buf[off],buf[off+1],buf[off+2],buf[off+3]]));
+                                    }
+                                    found = Some(Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v))));
+                                } else {
+                                    found = Some(Value::Null);
+                                }
+                                break;
+                            }
+                            p += dim * 4;
+                            r += 1;
+                        }
+                        row.push(found.unwrap_or(Value::Null));
+                    }
+                    ColumnTypeTag::Spatial => {
+                        // Spatial layout: [len:u16][bincode(Geometry)] per row.
+                        let buf = &self.column_buffers[ci];
+                        let mut p = 0usize;
+                        let mut r = 0usize;
+                        let mut found = None;
+                        while p + 2 <= buf.len() {
+                            let len = u16::from_le_bytes([buf[p], buf[p+1]]) as usize;
+                            p += 2;
+                            if r == i {
+                                if len == 0 || p + len > buf.len() {
+                                    found = Some(Value::Null);
+                                } else {
+                                    match bincode::deserialize::<crate::types::Geometry>(&buf[p..p+len]) {
+                                        Ok(g) => found = Some(Value::Spatial(std::boxed::Box::new(g))),
+                                        Err(_) => found = Some(Value::Null),
+                                    }
+                                }
+                                break;
+                            }
+                            p += len;
+                            r += 1;
+                        }
+                        row.push(found.unwrap_or(Value::Null));
+                    }
                 };
             }
             kept_rows.push((self.keys[i], self.timestamps[i], self.deleted[i], row));
@@ -1303,6 +1430,7 @@ impl ColumnarSSTableBuilder {
         self.timestamps.clear();
         self.deleted.clear();
         for b in self.column_buffers.iter_mut() { b.clear(); }
+        for f in self.null_flags.iter_mut() { f.clear(); }
         self.num_rows = 0;
         for (key, ts, deleted, row) in kept_rows {
             // Re-add using the SAME encoding + the preserved deleted flag. A
@@ -1364,20 +1492,13 @@ impl ColumnarSSTableBuilder {
                 // Fixed segment: [null_bitmap] [data]
                 let mut nulls = vec![0u8; null_bytes];
                 let elem_size = tag.fixed_size();
-                // Check for null sentinels
+                // NULL bitmap is authoritative (tracked at encode time). This
+                // avoids the i64::MIN / f64::NAN value-sentinel collision, so
+                // those exact values can be stored without being mistaken for NULL.
+                let _ = elem_size;
+                let null_flags = &self.null_flags[col_idx];
                 for row_idx in 0..num_rows {
-                    let off = row_idx * elem_size;
-                    let is_null = match tag {
-                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
-                            raw[off..off+8] == i64::MIN.to_le_bytes()[..]
-                        }
-                        ColumnTypeTag::Float => {
-                            raw[off..off+8] == f64::NAN.to_le_bytes()[..]
-                        }
-                        ColumnTypeTag::Bool => false,
-                        _ => false,
-                    };
-                    if is_null {
+                    if row_idx < null_flags.len() && null_flags[row_idx] {
                         nulls[row_idx / 8] |= 1 << (row_idx % 8);
                     }
                 }
@@ -1419,8 +1540,54 @@ impl ColumnarSSTableBuilder {
                     seg.extend_from_slice(&off.to_le_bytes());
                 }
                 seg.extend_from_slice(&str_data);
+            } else if matches!(tag, ColumnTypeTag::Vector) {
+                // Vector segment: [null_bitmap][dim:u16][f32×dim per row].
+                // The raw buffer holds [dim:u16][f32×dim] per row (from
+                // add_values). Re-pack to a uniform dim so read_vectors can
+                // use a fixed stride. Missing/NULL rows get zero-filled.
+                let mut nulls = vec![0u8; null_bytes];
+                // First pass: determine the column's dimension (max over rows).
+                let mut col_dim: usize = 0;
+                let mut row_dims: Vec<usize> = Vec::with_capacity(num_rows);
+                {
+                    let mut pos = 0usize;
+                    for row_idx in 0..num_rows {
+                        if pos + 2 > raw.len() { row_dims.push(0); continue; }
+                        let d = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
+                        if d == 0 {
+                            nulls[row_idx / 8] |= 1 << (row_idx % 8);
+                            row_dims.push(0);
+                        } else {
+                            if d > col_dim { col_dim = d; }
+                            row_dims.push(d);
+                        }
+                        pos += 2 + d * 4;
+                    }
+                }
+                seg.extend_from_slice(&nulls);
+                seg.extend_from_slice(&(col_dim as u16).to_le_bytes());
+                // Second pass: emit col_dim f32 per row (pad shorter/missing).
+                let mut pos = 0usize;
+                for row_idx in 0..num_rows {
+                    let d = row_dims[row_idx];
+                    let mut vals = vec![0f32; col_dim];
+                    if d > 0 && pos + 2 <= raw.len() {
+                        // raw[pos..pos+2] is dim (already read); data follows.
+                        let base = pos + 2;
+                        for j in 0..d.min(col_dim) {
+                            let off = base + j * 4;
+                            if off + 4 <= raw.len() {
+                                vals[j] = f32::from_le_bytes([raw[off],raw[off+1],raw[off+2],raw[off+3]]);
+                            }
+                        }
+                    }
+                    for v in &vals { seg.extend_from_slice(&v.to_le_bytes()); }
+                    pos += 2 + d * 4;
+                }
             } else {
-                // Vector/Spatial: store raw bytes as-is
+                // Spatial (and any other variable column): [null_bitmap]
+                // then [len:u16][bytes] per row. The raw buffer already holds
+                // [len:u16][bytes] per row from add_values; copy as-is.
                 let mut nulls = vec![0u8; null_bytes];
                 seg.extend_from_slice(&nulls);
                 seg.extend_from_slice(raw);

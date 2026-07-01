@@ -1092,12 +1092,7 @@ impl MoteDB {
                     let num_cols = col_types.len();
                     let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
                     for col_idx in 0..num_cols {
-                        let seg = if col_idx < col_sst.column_tags.len() && col_sst.column_tags[col_idx].is_fixed() {
-                            ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-                        } else {
-                            ColumnarSegment::Text(col_sst.read_text(col_idx)?)
-                        };
-                        segments.push(seg);
+                        segments.push(build_column_segment(&*col_sst, col_idx, col_sst.num_rows)?);
                     }
                     let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                     return Ok(TableRowStreamingIterator {
@@ -1105,6 +1100,7 @@ impl MoteDB {
                             row_map: col_sst.row_map.clone(),
                             segments,
                             col_names,
+                            col_types: col_types.to_vec(),
                             current_idx: 0,
                             num_rows: col_sst.num_rows,
                         },
@@ -1117,12 +1113,7 @@ impl MoteDB {
             let num_cols = col_types.len();
             let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
             for col_idx in 0..num_cols {
-                let seg = if col_sst.column_tags[col_idx].is_fixed() {
-                    ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-                } else {
-                    ColumnarSegment::Text(col_sst.read_text(col_idx)?)
-                };
-                segments.push(seg);
+                segments.push(build_column_segment(&col_sst, col_idx, col_sst.num_rows)?);
             }
             let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
             return Ok(TableRowStreamingIterator {
@@ -1130,6 +1121,7 @@ impl MoteDB {
                     row_map: col_sst.row_map.clone(),
                     segments,
                     col_names,
+                    col_types: col_types.to_vec(),
                     current_idx: 0,
                     num_rows: col_sst.num_rows,
                 },
@@ -1431,12 +1423,7 @@ impl MoteDB {
         let num_cols = col_types.len();
         let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
         for col_idx in 0..num_cols {
-            let seg = if col_sst.column_tags[col_idx].is_fixed() {
-                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-            } else {
-                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
-            };
-            segments.push(seg);
+            segments.push(build_column_segment(&*col_sst, col_idx, col_sst.num_rows)?);
         }
 
         Ok(ColumnarScanIterator {
@@ -1503,12 +1490,7 @@ impl MoteDB {
         let num_cols = col_types.len();
         let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
         for col_idx in 0..num_cols {
-            let seg = if col_sst.column_tags[col_idx].is_fixed() {
-                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-            } else {
-                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
-            };
-            segments.push(seg);
+            segments.push(build_column_segment(&*col_sst, col_idx, col_sst.num_rows)?);
         }
 
         // Find matching row indices by scanning the filter column
@@ -1525,6 +1507,9 @@ impl MoteDB {
                     crate::types::Value::Text(tv) => t.get_str(row_idx) == Some(tv.as_str()),
                     _ => false,
                 },
+                // Vector/Spatial columns aren't supported as filter columns
+                // here; the caller routes such queries through a different path.
+                ColumnarSegment::Vector(_) | ColumnarSegment::Spatial(_) => false,
             };
             if matches {
                 match_indices.push(row_idx);
@@ -1558,12 +1543,7 @@ impl MoteDB {
         let num_cols = col_types.len();
         let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
         for col_idx in 0..num_cols {
-            let seg = if col_sst.column_tags[col_idx].is_fixed() {
-                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-            } else {
-                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
-            };
-            segments.push(seg);
+            segments.push(build_column_segment(&*col_sst, col_idx, col_sst.num_rows)?);
         }
 
         // Find rows where text column starts with prefix
@@ -2667,10 +2647,14 @@ enum TableRowStreamingInner {
     },
     /// Columnar SSTable backed scan. For tables whose data lives in the
     /// columnar SSTable (not the LSM), we decode column arrays into rows.
+    /// `col_types` drives the decode: Integer→get_i64, Float→get_f64,
+    /// Boolean→get_bool. Without it every fixed-width column was decoded as
+    /// Integer, reinterpreting Float/Boolean bits as i64 (garbage values).
     Columnar {
         row_map: crate::storage::lsm::columnar::RowMap,
         segments: Vec<ColumnarSegment>,
         col_names: Vec<String>,
+        col_types: Vec<crate::types::ColumnType>,
         current_idx: usize,
         num_rows: usize,
     },
@@ -2684,7 +2668,7 @@ impl Iterator for TableRowStreamingIterator {
             TableRowStreamingInner::Lsm { lsm_iter, decode_ctx, use_raw } => {
                 lsm_next(lsm_iter, decode_ctx, *use_raw)
             }
-            TableRowStreamingInner::Columnar { row_map, segments, col_names, current_idx, num_rows } => {
+            TableRowStreamingInner::Columnar { row_map, segments, col_names, col_types, current_idx, num_rows } => {
                 while *current_idx < *num_rows {
                     let idx = *current_idx;
                     *current_idx += 1;
@@ -2692,18 +2676,33 @@ impl Iterator for TableRowStreamingIterator {
                     let key = row_map.key(idx);
                     let row_id = (key & 0xFFFFFFFF) as RowId;
                     let mut row: Row = Vec::with_capacity(col_names.len());
-                    for seg in segments.iter() {
+                    for (ci, seg) in segments.iter().enumerate() {
+                        // Decode by the column's declared type so Float/Boolean
+                        // are not reinterpreted as Integer bit patterns.
                         let v = match seg {
-                            ColumnarSegment::Fixed(f) => f.get_i64(idx)
-                                .map(|i| {
-                                    // Preserve original column type tag if possible;
-                                    // FixedSegment stores i64. Float columns were
-                                    // stored as their f64 bit pattern.
-                                    crate::types::Value::Integer(i)
-                                })
-                                .unwrap_or(crate::types::Value::Null),
+                            ColumnarSegment::Fixed(f) => {
+                                match col_types.get(ci) {
+                                    Some(crate::types::ColumnType::Float) =>
+                                        f.get_f64(idx).map(crate::types::Value::Float),
+                                    Some(crate::types::ColumnType::Boolean) =>
+                                        f.get_bool(idx).map(crate::types::Value::Bool),
+                                    _ => f.get_i64(idx).map(crate::types::Value::Integer),
+                                }.unwrap_or(crate::types::Value::Null)
+                            }
                             ColumnarSegment::Text(t) => t.get_str(idx)
                                 .map(|s| crate::types::Value::Text(s.to_string().into()))
+                                .unwrap_or(crate::types::Value::Null),
+                            ColumnarSegment::Vector(cols) => cols.get(idx)
+                                .cloned()
+                                .flatten()
+                                .map(|f32s| crate::types::Value::Vector(
+                                    crate::types::ArcVec(std::sync::Arc::new(f32s)))
+                                )
+                                .unwrap_or(crate::types::Value::Null),
+                            ColumnarSegment::Spatial(cols) => cols.get(idx)
+                                .cloned()
+                                .flatten()
+                                .map(|g| crate::types::Value::Spatial(std::boxed::Box::new(g)))
                                 .unwrap_or(crate::types::Value::Null),
                         };
                         row.push(v);
@@ -2786,6 +2785,61 @@ fn lsm_next(
 enum ColumnarSegment {
     Fixed(crate::storage::lsm::columnar::FixedSegment),
     Text(crate::storage::lsm::columnar::TextSegment),
+    /// Pre-decoded Vector column: one Vec<f32> per row (None = NULL).
+    Vector(Vec<Option<Vec<f32>>>),
+    /// Pre-decoded Spatial column: one Geometry per row (None = NULL).
+    Spatial(Vec<Option<crate::types::Geometry>>),
+}
+
+/// Build a ColumnarSegment from an SSTable column, dispatching on the stored
+/// column tag. Vector/Spatial columns are pre-decoded into per-row option vecs
+/// (since they have no zero-copy FixedSegment/TextSegment readers used by the
+/// row iterators); the rest use zero-copy Fixed/Text segments.
+fn build_column_segment(
+    col_sst: &crate::storage::lsm::columnar::ColumnarSSTable,
+    col_idx: usize,
+    num_rows: usize,
+) -> Result<ColumnarSegment> {
+    use crate::storage::lsm::columnar::ColumnTypeTag;
+    let tag = col_sst.column_tags.get(col_idx);
+    match tag {
+        Some(ColumnTypeTag::Vector) => {
+            // read_vectors returns (row_id, vec) pairs in row order (i=0..n);
+            // map each to its original row index by re-iterating in lockstep.
+            let decoded = col_sst.read_vectors(col_idx)?;
+            let mut per_row: Vec<Option<Vec<f32>>> = vec![None; num_rows];
+            let mut di = 0usize;
+            for i in 0..num_rows {
+                if col_sst.row_map.is_deleted(i) { continue; }
+                // read_vectors skips nulls too; its k-th output corresponds to
+                // the k-th non-null, non-deleted row. Match by row_id.
+                let expected_key = col_sst.row_map.key(i) & 0xFFFFFFFF;
+                while di < decoded.len() && decoded[di].0 != expected_key { di += 1; }
+                if di < decoded.len() {
+                    per_row[i] = Some(decoded[di].1.clone());
+                    di += 1;
+                }
+            }
+            Ok(ColumnarSegment::Vector(per_row))
+        }
+        Some(ColumnTypeTag::Spatial) => {
+            let decoded = col_sst.read_spatial(col_idx)?;
+            let mut per_row: Vec<Option<crate::types::Geometry>> = vec![None; num_rows];
+            let mut di = 0usize;
+            for i in 0..num_rows {
+                if col_sst.row_map.is_deleted(i) { continue; }
+                let expected_key = col_sst.row_map.key(i) & 0xFFFFFFFF;
+                while di < decoded.len() && decoded[di].0 != expected_key { di += 1; }
+                if di < decoded.len() {
+                    per_row[i] = Some(decoded[di].1.clone());
+                    di += 1;
+                }
+            }
+            Ok(ColumnarSegment::Spatial(per_row))
+        }
+        Some(t) if t.is_fixed() => Ok(ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)),
+        _ => Ok(ColumnarSegment::Text(col_sst.read_text(col_idx)?)),
+    }
 }
 
 /// Streaming iterator over a columnar SSTable. Yields one row at a time
@@ -2848,6 +2902,12 @@ impl ColumnarScanIterator {
                 }.unwrap_or(crate::types::Value::Null),
                 ColumnarSegment::Text(t) => t.get_str(idx)
                     .map(|s| crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                    .unwrap_or(crate::types::Value::Null),
+                ColumnarSegment::Vector(cols) => cols.get(idx).cloned().flatten()
+                    .map(|v| crate::types::Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v))))
+                    .unwrap_or(crate::types::Value::Null),
+                ColumnarSegment::Spatial(cols) => cols.get(idx).cloned().flatten()
+                    .map(|g| crate::types::Value::Spatial(std::boxed::Box::new(g)))
                     .unwrap_or(crate::types::Value::Null),
             };
             row.push(val);

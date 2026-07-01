@@ -279,6 +279,39 @@ impl ColSegmentStore {
                     seg.sst.read_text(pc).ok()
                 } else { None }
             }).collect();
+            // Pre-decode Vector/Spatial columns (read_vectors/read_spatial return
+            // (row_id, value) pairs; map them to per-row-index option vecs).
+            let n_seg = seg.sst.num_rows;
+            let pvector: Vec<Vec<Option<Vec<f32>>>> = project_cols.iter().map(|&pc| {
+                if pc < seg.sst.column_tags.len()
+                    && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Vector) {
+                    let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
+                    let mut per = vec![None; n_seg];
+                    let mut di = 0usize;
+                    for i in 0..n_seg {
+                        if seg.sst.row_map.is_deleted(i) { continue; }
+                        let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                        while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                        if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                    }
+                    per
+                } else { Vec::new() }
+            }).collect();
+            let pspatial: Vec<Vec<Option<crate::types::Geometry>>> = project_cols.iter().map(|&pc| {
+                if pc < seg.sst.column_tags.len()
+                    && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Spatial) {
+                    let decoded = seg.sst.read_spatial(pc).unwrap_or_default();
+                    let mut per = vec![None; n_seg];
+                    let mut di = 0usize;
+                    for i in 0..n_seg {
+                        if seg.sst.row_map.is_deleted(i) { continue; }
+                        let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                        while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                        if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                    }
+                    per
+                } else { Vec::new() }
+            }).collect();
 
             // Lazy text decode: do NOT pre-intern all rows (saves 300K ArcString
             // allocations = ~20MB). Decode only matched rows on demand below.
@@ -319,8 +352,15 @@ impl ColSegmentStore {
                             (Some(Some(f)), _, ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
                             (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
                             (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
-                            (_, _, ColumnType::Spatial) => Some(Value::Null),
-                            (_, _, ColumnType::Tensor(_)) => Some(Value::Null),
+                            (_, _, ColumnType::Spatial) => {
+                                // Pre-decoded spatial geometry (or NULL).
+                                pspatial.get(pi).and_then(|p| p.get(i)).cloned().flatten()
+                                    .map(|g| Value::Spatial(std::boxed::Box::new(g)))
+                            }
+                            (_, _, ColumnType::Tensor(_)) => {
+                                pvector.get(pi).and_then(|p| p.get(i)).cloned().flatten()
+                                    .map(|v| Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v))))
+                            }
                             (_, Some(Some(t)), ColumnType::Text) => {
                                 if !ptext_interned.is_empty() {
                                     ptext_interned.get(pi).and_then(|v| v.get(i)).cloned().flatten()
@@ -1032,7 +1072,20 @@ impl ColSegmentStore {
         k: usize,
         desc: bool,
     ) -> Vec<(usize, usize)> {
-        let t0 = std::time::Instant::now();
+        // Delegates to the type-aware variant, assuming an Integer column.
+        // Callers that know the column is Float should use top_k_row_indices_typed.
+        self.top_k_row_indices_typed(order_col, k, desc, false)
+    }
+
+    /// Type-aware top-K. `is_float` selects the correct decoder so Float columns
+    /// are not misread as Integer (their 8-byte fixed slot decodes as garbage i64).
+    pub fn top_k_row_indices_typed(
+        &self,
+        order_col: usize,
+        k: usize,
+        desc: bool,
+        is_float: bool,
+    ) -> Vec<(usize, usize)> {
         if k == 0 { return Vec::new(); }
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
@@ -1059,7 +1112,22 @@ impl ColSegmentStore {
         for (sidx, seg) in segs.iter().enumerate() {
             let n = seg.sst.num_rows;
             let has_deletions = seg.sst.row_map.has_any_deleted();
-            if let Ok(fseg) = seg.sst.read_fixed_i64(order_col) {
+            // Read via the decoder matching the column's stored type. Reading a
+            // Float column as i64 reinterprets the bits → garbage sort keys.
+            if is_float {
+                if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
+                    for i in 0..n {
+                        let key = seg.sst.row_map.key(i);
+                        if let Some(ref mut s) = dedup {
+                            if !s.insert(key) { continue; }
+                        }
+                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                        let v = fseg.get_f64(i).unwrap_or(f64::NAN);
+                        let ord_key = if desc { u64::MAX - to_ord(v) } else { to_ord(v) };
+                        push_capped(&mut heap, ord_key, sidx, i);
+                    }
+                }
+            } else if let Ok(fseg) = seg.sst.read_fixed_i64(order_col) {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = dedup {
@@ -1071,29 +1139,17 @@ impl ColSegmentStore {
                     let ord_key = if desc { u64::MAX - to_ord(v) } else { to_ord(v) };
                     push_capped(&mut heap, ord_key, sidx, i);
                 }
-            } else if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    if let Some(ref mut s) = dedup {
-                        if !s.insert(key) { continue; }
-                    }
-                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
-                    let v = fseg.get_f64(i).unwrap_or(f64::NAN);
-                    let ord_key = if desc { u64::MAX - to_ord(v) } else { to_ord(v) };
-                    push_capped(&mut heap, ord_key, sidx, i);
-                }
             }
         }
         let _ = single_seg;
         // Extract and sort the K results in the requested order.
+        // ord_key is encoded so that ascending ord_key always yields the
+        // requested order:
+        //   ASC : ord_key == to_ord(v)        → ascending ord_key = ascending value
+        //   DESC: ord_key == u64::MAX - to_ord(v)
+        //                                    → ascending ord_key = descending value
         let mut out: Vec<(u64, usize, usize)> = heap.into_vec();
-        out.sort_by(|a, b| {
-            if desc {
-                b.0.cmp(&a.0)
-            } else {
-                a.0.cmp(&b.0)
-            }
-        });
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         let result: Vec<(usize, usize)> = out.into_iter().map(|(_, s, r)| (s, r)).collect();
         result
     }
@@ -1487,8 +1543,12 @@ impl ColSegmentStore {
 
         // Check if ALL columns are fixed-width (integer/float/bool/timestamp).
         // If so, use the fast column-direct path (no Vec<Value>).
+        // all_fixed = every column is 8-byte fixed (Integer/Float/Timestamp).
+        // Boolean is fixed-width but only 1 byte, so it must go through the
+        // mixed path (which reads via the type-correct accessor); including it
+        // here would write 8 bytes per Boolean row and corrupt the segment.
         let all_fixed = self.col_types.iter().all(|ct| matches!(ct,
-            ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp));
+            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp));
 
         if all_fixed {
             // Column-direct compaction: extract raw i64 bytes per row, no Value.
@@ -1530,9 +1590,14 @@ impl ColSegmentStore {
                 builder.add_values_raw(key, ts, false, &col_bytes)?;
             }
         } else {
-            // Mixed columns (has Text): direct copy with temp buffers.
-            // Avoids MergeCursor's per-row Vec<Value> + SegmentCursor pre-decode.
+            // Mixed columns (has Text and/or Vector/Spatial): direct copy with
+            // temp buffers. Avoids MergeCursor's per-row Vec<Value> + SegmentCursor
+            // pre-decode.
             // 🔑 CRITICAL: collect ALL rows, sort by key, THEN add (see note above).
+            // 🔑 Vector/Spatial columns must be decoded+re-encoded here (they have
+            // no zero-copy segment readers); otherwise a multi-segment merge would
+            // silently DROP those columns (each row's buffer stayed empty).
+            use crate::storage::lsm::columnar::ColumnTypeTag;
             let single_seg = old_segs.len() <= 1;
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
             let mut collected: Vec<(u64, u64, Vec<Vec<u8>>)> = Vec::new();
@@ -1546,16 +1611,44 @@ impl ColSegmentStore {
                     }).collect();
                 let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> =
                     (0..ncols).map(|ci| {
-                        // Only read as text if the column tag is actually Text.
-                        // Spatial/Tensor columns have special binary encoding —
-                        // reading them as text produces corrupted data that
-                        // causes slice out-of-bounds panics on subsequent reads.
                         if ci < seg.sst.column_tags.len()
                             && matches!(seg.sst.column_tags[ci],
                                 crate::storage::lsm::columnar::ColumnTypeTag::Text) {
                             seg.sst.read_text(ci).ok()
                         } else { None }
                     }).collect();
+                // Pre-decode Vector columns into per-idx option vecs.
+                let vec_cols: Vec<Vec<Option<Vec<f32>>>> = (0..ncols).map(|ci| {
+                    if ci < seg.sst.column_tags.len()
+                        && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector) {
+                        let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
+                        let mut per_row = vec![None; n];
+                        let mut di = 0usize;
+                        for i in 0..n {
+                            if seg.sst.row_map.is_deleted(i) { continue; }
+                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                            if di < decoded.len() { per_row[i] = Some(decoded[di].1.clone()); di += 1; }
+                        }
+                        per_row
+                    } else { Vec::new() }
+                }).collect();
+                // Pre-decode Spatial columns into per-idx option vecs.
+                let spatial_cols: Vec<Vec<Option<crate::types::Geometry>>> = (0..ncols).map(|ci| {
+                    if ci < seg.sst.column_tags.len()
+                        && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial) {
+                        let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
+                        let mut per_row = vec![None; n];
+                        let mut di = 0usize;
+                        for i in 0..n {
+                            if seg.sst.row_map.is_deleted(i) { continue; }
+                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                            if di < decoded.len() { per_row[i] = Some(decoded[di].1.clone()); di += 1; }
+                        }
+                        per_row
+                    } else { Vec::new() }
+                }).collect();
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if !seen.insert(key) { continue; }
@@ -1564,7 +1657,15 @@ impl ColSegmentStore {
                     let mut row_bytes: Vec<Vec<u8>> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
                         let mut buf = Vec::new();
-                        if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
+                        let tag = seg.sst.column_tags.get(ci).copied();
+                        if matches!(tag, Some(crate::storage::lsm::columnar::ColumnTypeTag::Bool)) {
+                            // Boolean: 1-byte fixed. Read via get_bool, write 1 byte.
+                            if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
+                                buf.push(if f.get_bool(i).unwrap_or(false) { 1u8 } else { 0u8 });
+                            } else {
+                                buf.push(0u8);
+                            }
+                        } else if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
                             let v = f.get_i64(i).unwrap_or(i64::MIN);
                             buf.extend_from_slice(&v.to_le_bytes());
                         } else if let Some(ref t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
@@ -1572,6 +1673,24 @@ impl ColSegmentStore {
                             let len = s.len().min(65535) as u16;
                             buf.extend_from_slice(&len.to_le_bytes());
                             buf.extend_from_slice(&s.as_bytes()[..len as usize]);
+                        } else if ci < vec_cols.len() && !vec_cols[ci].is_empty() {
+                            // Vector: re-encode [dim:u16][f32×dim] (NULL → dim=0).
+                            if let Some(ref v) = vec_cols[ci][i] {
+                                buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+                                for x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+                            } else {
+                                buf.extend_from_slice(&0u16.to_le_bytes());
+                            }
+                        } else if ci < spatial_cols.len() && !spatial_cols[ci].is_empty() {
+                            // Spatial: re-encode [len:u16][bincode(Geometry)] (NULL → len=0).
+                            if let Some(ref g) = spatial_cols[ci][i] {
+                                let bytes = bincode::serialize(g).unwrap_or_default();
+                                let len = bytes.len().min(65535) as u16;
+                                buf.extend_from_slice(&len.to_le_bytes());
+                                buf.extend_from_slice(&bytes[..len as usize]);
+                            } else {
+                                buf.extend_from_slice(&0u16.to_le_bytes());
+                            }
                         }
                         row_bytes.push(buf);
                     }

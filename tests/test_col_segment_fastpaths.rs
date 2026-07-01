@@ -100,6 +100,110 @@ fn test_top_k_k_zero() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Type-aware top-K: Float columns must be sorted by their true f64 value, not
+// by the i64 bit-pattern of the float's representation. DESC must return the
+// largest value first; ASC the smallest first. Order must be exact (not
+// re-sorted by the test) so this catches both the bit-reinterpret bug and the
+// ASC/DESC direction bug.
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn fetch_floats(store: &ColSegmentStore, col: usize, idxs: &[(usize, usize)]) -> Vec<f64> {
+    let segs = store.segments_snapshot();
+    idxs.iter()
+        .filter_map(|(s, r)| {
+            let seg = segs.get(*s)?;
+            seg.sst.read_fixed_f64(col).ok().and_then(|f| f.get_f64(*r))
+        })
+        .collect()
+}
+
+#[test]
+fn test_top_k_typed_float_desc_order() {
+    let (_dir, store) = make_store(vec![ColumnType::Integer, ColumnType::Float]);
+    let rows: Vec<_> = vec![
+        row(1, 1, vec![Value::Integer(1), Value::Float(10.0)]),
+        row(2, 1, vec![Value::Integer(2), Value::Float(50.0)]),
+        row(3, 1, vec![Value::Integer(3), Value::Float(30.0)]),
+        row(4, 1, vec![Value::Integer(4), Value::Float(90.0)]),
+        row(5, 1, vec![Value::Integer(5), Value::Float(20.0)]),
+    ];
+    store.append_rows(&rows).unwrap();
+    store.flush_buffer().unwrap();
+
+    let top = store.top_k_row_indices_typed(1, 3, true, true);
+    let scores = fetch_floats(&store, 1, &top);
+    // DESC, no re-sort: largest first → 90.0, 50.0, 30.0
+    assert_eq!(scores, vec![90.0, 50.0, 30.0], "DESC Float top-3 must be largest-first");
+}
+
+#[test]
+fn test_top_k_typed_float_asc_order() {
+    let (_dir, store) = make_store(vec![ColumnType::Integer, ColumnType::Float]);
+    let rows: Vec<_> = vec![
+        row(1, 1, vec![Value::Integer(1), Value::Float(10.0)]),
+        row(2, 1, vec![Value::Integer(2), Value::Float(50.0)]),
+        row(3, 1, vec![Value::Integer(3), Value::Float(5.0)]),
+        row(4, 1, vec![Value::Integer(4), Value::Float(30.0)]),
+    ];
+    store.append_rows(&rows).unwrap();
+    store.flush_buffer().unwrap();
+
+    let top = store.top_k_row_indices_typed(1, 3, false, true);
+    let scores = fetch_floats(&store, 1, &top);
+    // ASC, no re-sort: smallest first → 5.0, 10.0, 30.0
+    assert_eq!(scores, vec![5.0, 10.0, 30.0], "ASC Float top-3 must be smallest-first");
+}
+
+#[test]
+fn test_top_k_typed_integer_desc_order() {
+    let (_dir, store) = make_store(vec![ColumnType::Integer, ColumnType::Integer]);
+    let rows: Vec<_> = vec![
+        row(1, 1, vec![Value::Integer(1), Value::Integer(10)]),
+        row(2, 1, vec![Value::Integer(2), Value::Integer(50)]),
+        row(3, 1, vec![Value::Integer(3), Value::Integer(30)]),
+        row(4, 1, vec![Value::Integer(4), Value::Integer(90)]),
+    ];
+    store.append_rows(&rows).unwrap();
+    store.flush_buffer().unwrap();
+
+    let top = store.top_k_row_indices_typed(1, 3, true, false);
+    let segs = store.segments_snapshot();
+    let vals: Vec<i64> = top.iter()
+        .filter_map(|(s, r)| {
+            let seg = segs.get(*s)?;
+            seg.sst.read_fixed_i64(1).ok().and_then(|f| f.get_i64(*r))
+        })
+        .collect();
+    // DESC: largest first → 90, 50, 30
+    assert_eq!(vals, vec![90, 50, 30], "DESC Integer top-3 must be largest-first");
+}
+
+#[test]
+fn test_top_k_typed_float_with_negatives_and_zero() {
+    // Negative floats and zero exercise the IEEE total-order encoding path.
+    let (_dir, store) = make_store(vec![ColumnType::Integer, ColumnType::Float]);
+    let rows: Vec<_> = vec![
+        row(1, 1, vec![Value::Integer(1), Value::Float(-5.0)]),
+        row(2, 1, vec![Value::Integer(2), Value::Float(0.0)]),
+        row(3, 1, vec![Value::Integer(3), Value::Float(-20.0)]),
+        row(4, 1, vec![Value::Integer(4), Value::Float(7.5)]),
+        row(5, 1, vec![Value::Integer(5), Value::Float(-1.25)]),
+    ];
+    store.append_rows(&rows).unwrap();
+    store.flush_buffer().unwrap();
+
+    // ASC: -20.0, -5.0, -1.25, 0.0, 7.5
+    let top = store.top_k_row_indices_typed(1, 5, false, true);
+    let scores = fetch_floats(&store, 1, &top);
+    assert_eq!(scores, vec![-20.0, -5.0, -1.25, 0.0, 7.5], "ASC with negatives");
+
+    // DESC: 7.5, 0.0, -1.25, -5.0, -20.0
+    let top = store.top_k_row_indices_typed(1, 5, true, true);
+    let scores = fetch_floats(&store, 1, &top);
+    assert_eq!(scores, vec![7.5, 0.0, -1.25, -5.0, -20.0], "DESC with negatives");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // distinct_text_values
 // ═══════════════════════════════════════════════════════════════════════════
 
