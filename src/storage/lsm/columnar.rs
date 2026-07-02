@@ -915,10 +915,12 @@ impl ColumnarSSTable {
     /// Format: [flag: u8] [null_bitmap] [dim: u16 LE] [f32×dim per row]
     pub fn read_vectors(&self, col_idx: usize) -> Result<Vec<(RowId, Vec<f32>)>> {
         let entry = &self.column_index[col_idx];
-        let raw = Self::decompress_segment(
-            &self.backing()[entry.offset as usize..(entry.offset + entry.size) as usize]
-        );
-        let data = raw.as_ref();
+        // Use read_segment_bytes (handles file_data / mmap / seek+read fallbacks
+        // and returns empty on failure) rather than slicing self.backing()
+        // directly — backing() can be empty (length 0) when the SSTable is opened
+        // zero-copy and no backing buffer is resident, which would panic here.
+        let seg_bytes = self.read_segment_bytes(entry.offset as usize, (entry.offset + entry.size) as usize);
+        let data = seg_bytes.as_ref();
         let null_bytes = (self.num_rows + 7) / 8;
         if null_bytes + 2 > data.len() { return Ok(Vec::new()); }
         let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes+1]]) as usize;
