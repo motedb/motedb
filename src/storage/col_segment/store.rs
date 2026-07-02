@@ -352,7 +352,7 @@ impl ColSegmentStore {
                 if seg.sst.row_map.is_deleted(i) { continue; }
 
                 // Decode filter value only (cheap: single column lookup).
-                let fval: Option<Value> = if let Some(fc) = filter_col {
+                let fval: Option<Value> = if filter_col.is_some() {
                     let v = if let Some(ref f) = fcol_fixed {
                         match fcol_type {
                             Some(ColumnType::Integer) => f.get_i64(i).map(Value::Integer),

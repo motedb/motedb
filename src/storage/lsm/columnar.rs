@@ -633,10 +633,6 @@ impl ColumnarSSTable {
         }
     }
 
-    fn backing(&self) -> &[u8] {
-        if let Some(ref m) = self.mmap { &m[..] } else { &self.file_data }
-    }
-
     /// Check if a file is a columnar SSTable by reading its magic.
     pub fn is_columnar<P: AsRef<Path>>(path: P) -> bool {
         let path = path.as_ref();
@@ -783,7 +779,7 @@ impl ColumnarSSTable {
 
     /// Read a fixed column as an i64 array (zero-copy from mmap).
     /// Decompress segment data if needed. Format: [flag: u8] [data].
-    fn decompress_segment(data: &[u8]) -> std::borrow::Cow<[u8]> {
+    fn decompress_segment(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         if data.is_empty() { return std::borrow::Cow::Borrowed(data); }
         match data[0] {
             1 => { // Snappy compressed
@@ -823,7 +819,7 @@ impl ColumnarSSTable {
     /// Read column segment bytes via seek+read from file. Only reads the
     /// specific column's bytes — NOT the entire file. This avoids mmap
     /// page residency and keeps RSS low (<30MB for embedded devices).
-    fn read_segment_bytes(&self, start: usize, end: usize) -> std::borrow::Cow<[u8]> {
+    fn read_segment_bytes(&self, start: usize, end: usize) -> std::borrow::Cow<'_, [u8]> {
         // If file_data is populated (small files), use it directly.
         if !self.file_data.is_empty() {
             return Self::decompress_segment(&self.file_data[start..end]);
@@ -1297,7 +1293,7 @@ impl ColumnarSSTableBuilder {
         for &i in &keep {
             let mut row = Vec::with_capacity(col_types.len());
             for (ci, tag) in self.column_tags.iter().enumerate() {
-                let v = match tag {
+                match tag {
                     ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
                         let buf = &self.column_buffers[ci];
                         let off = i * 8;
@@ -1442,27 +1438,6 @@ impl ColumnarSSTableBuilder {
         }
     }
 
-    /// Extract the text value for row `i` in text column `ci`. Text rows are
-    /// laid out as concatenated [u16 len][len bytes] entries.
-    fn extract_text_row(&self, ci: usize, target_row: usize) -> String {
-        let buf = &self.column_buffers[ci];
-        let mut pos = 0usize;
-        let mut row = 0usize;
-        while pos + 2 <= buf.len() {
-            let len = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
-            pos += 2;
-            if row == target_row {
-                if pos + len <= buf.len() {
-                    return String::from_utf8_lossy(&buf[pos..pos + len]).into_owned();
-                }
-                return String::new();
-            }
-            pos += len;
-            row += 1;
-        }
-        String::new()
-    }
-
     pub fn finish_and_reset(&mut self) -> Result<()> {
         if self.finished { return Ok(()); }
         if self.num_rows == 0 { return Ok(()); }
@@ -1590,7 +1565,7 @@ impl ColumnarSSTableBuilder {
                 // Spatial (and any other variable column): [null_bitmap]
                 // then [len:u16][bytes] per row. The raw buffer already holds
                 // [len:u16][bytes] per row from add_values; copy as-is.
-                let mut nulls = vec![0u8; null_bytes];
+                let nulls = vec![0u8; null_bytes];
                 seg.extend_from_slice(&nulls);
                 seg.extend_from_slice(raw);
             }

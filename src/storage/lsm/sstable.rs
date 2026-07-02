@@ -1500,7 +1500,6 @@ impl BlockIndex {
         }
 
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let offset = 4;
 
         // Try new format first: 4 header + 28 bytes per entry (first_key + offset + size + last_key)
         let new_size = 4 + num_entries * 28;

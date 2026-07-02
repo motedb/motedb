@@ -147,7 +147,7 @@ impl MoteDB {
                 let path = builder_guard.path.clone();
                 let num_rows = builder_guard.num_rows;
                 // Create a new empty builder to swap in
-                let mut old_builder = std::mem::replace(
+                let old_builder = std::mem::replace(
                     &mut *builder_guard,
                     crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(&path, col_types),
                 );

@@ -379,7 +379,6 @@ impl MoteDB {
 
         // 🚀 Columnar point query: binary search in RowMap, O(log N)
         if let Some(col_sst) = self.columnar_sstables.get(table_name) {
-            let key = composite_key;
             let key = self.make_composite_key(table_name, row_id);
             if let Some(row) = col_sst.get_row(key, schema.col_types()) {
                 let row_arc = Arc::new(row);
@@ -1689,7 +1688,7 @@ impl MoteDB {
         col_types: &[crate::types::ColumnType],
         indices: &[usize],
     ) -> Result<Vec<Vec<Value>>> {
-        let mut iter = self.scan_columnar_sstable_streaming(table_name, col_types)?;
+        let iter = self.scan_columnar_sstable_streaming(table_name, col_types)?;
         let mut rows = Vec::with_capacity(indices.len());
         for &idx in indices {
             rows.push(iter.build_row(idx));

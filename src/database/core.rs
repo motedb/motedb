@@ -1785,7 +1785,7 @@ impl MoteDB {
     /// within `timeout`, it is detached (the Weak references it holds will
     /// naturally become invalid, causing it to exit on its next iteration).
     fn join_with_timeout(
-        name: &'static str,
+        _name: &'static str,
         handle: std::thread::JoinHandle<()>,
         _timeout: std::time::Duration,
     ) {

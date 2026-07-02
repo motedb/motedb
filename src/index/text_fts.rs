@@ -911,7 +911,7 @@ impl TextFTSIndex {
             let pairs = posting.iter_doc_tf_cached_ref();
             let deleted_empty = deleted.is_empty();
             let deleted_td_empty = deleted_term_docs.is_empty();
-            let mut entries: Vec<(u32, u16)> = if deleted_empty && deleted_td_empty {
+            let entries: Vec<(u32, u16)> = if deleted_empty && deleted_td_empty {
                 // No deletions at all — skip all checks (100x faster).
                 pairs.into_iter().filter(|&(_, tf)| tf > 0).collect()
             } else {

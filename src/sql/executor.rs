@@ -1694,7 +1694,7 @@ impl QueryExecutor {
     fn col_segment_multi_aggregate(
         &self,
         stmt: &SelectStmt,
-        table_name: &str,
+        _table_name: &str,
         store: &crate::storage::col_segment::ColSegmentStore,
         schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
@@ -1746,7 +1746,7 @@ impl QueryExecutor {
                                     let (count, min, max) = store.count_min_max_text_filter(fc, s.as_str(), ac);
                                     let sum = if has_sum {
                                         // count_sum includes sum; re-scan for sum if needed
-                                        let (c, s) = store.count_sum_text_filter(fc, s.as_str(), ac);
+                                        let (_, s) = store.count_sum_text_filter(fc, s.as_str(), ac);
                                         s
                                     } else { 0.0 };
                                     let mut row: Vec<Value> = Vec::new();
@@ -1789,7 +1789,7 @@ impl QueryExecutor {
             if comparisons.is_empty() {
                 (None, Vec::new())
             } else {
-                let (fc, op, target) = comparisons[0].clone();
+                let (fc, _, _) = comparisons[0].clone();
                 (Some(fc), comparisons[1..].to_vec())
             };
 
@@ -1967,7 +1967,7 @@ impl QueryExecutor {
     fn col_segment_group_by(
         &self,
         stmt: &SelectStmt,
-        table_name: &str,
+        _table_name: &str,
         store: &crate::storage::col_segment::ColSegmentStore,
         schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
@@ -2001,7 +2001,7 @@ impl QueryExecutor {
         }
 
         // Output columns: group col + aggregates.
-        let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
+        let _out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
             .unwrap_or_else(|| vec![gc]);
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
 
@@ -3314,7 +3314,7 @@ impl QueryExecutor {
         for col_expr in &stmt.columns {
             match col_expr {
                 SelectColumn::Star => { has_count_star = true; }
-                SelectColumn::Column(name) => { /* group-by column in output */ }
+                SelectColumn::Column(_name) => { /* group-by column in output */ }
                 SelectColumn::Expr(expr, _) => {
                     if let Expr::FunctionCall { name, args, .. } = expr {
                         match name.to_uppercase().as_str() {
@@ -3445,7 +3445,7 @@ impl QueryExecutor {
         };
         if !self.db.columnar_sstables.contains_key(table) { return Ok(None); }
         let schema = self.db.get_table_schema(table)?;
-        let col_types = schema.col_types();
+        let _col_types = schema.col_types();
 
         // Parse WHERE: only simple col = literal
         let (filter_col, filter_value) = match &stmt.where_clause {
@@ -4061,7 +4061,7 @@ impl QueryExecutor {
         {
             let col_types = schema.col_types();
             let column_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            let mut handled = false;
+            let handled = false;
 
             // Equality: WHERE col = value
             if let Some(Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right }) = &stmt.where_clause {
@@ -5976,7 +5976,7 @@ impl QueryExecutor {
                     }
                 }
             }
-            Expr::In { expr, list, negated } => {
+            Expr::In { expr, list, negated: _ } => {
                 if let Expr::Column(col_name) = expr.as_ref() {
                     let pos = schema.get_column_position(
                         if col_name.contains('.') { col_name.rsplit('.').next().unwrap_or(col_name) } else { col_name }
@@ -8095,7 +8095,7 @@ impl QueryExecutor {
                     // Small integers (within f64 exact range) use Numeric for cross-type
                     // matching with Float columns. Large integers use Integer to preserve
                     // full 64-bit precision.
-                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    const EXACT_MAX: i64 = 1i64 << 53; // 2^53, max exact i64 in f64
                     if *i >= -EXACT_MAX && *i <= EXACT_MAX {
                         Some(HashKey::Numeric((*i as f64).to_bits()))
                     } else {
@@ -8233,7 +8233,7 @@ impl QueryExecutor {
                     // Small integers (within f64 exact range) use Numeric for cross-type
                     // matching with Float columns. Large integers use Integer to preserve
                     // full 64-bit precision.
-                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    const EXACT_MAX: i64 = 1i64 << 53; // 2^53, max exact i64 in f64
                     if *i >= -EXACT_MAX && *i <= EXACT_MAX {
                         Some(HashKey::Numeric((*i as f64).to_bits()))
                     } else {
@@ -8353,7 +8353,7 @@ impl QueryExecutor {
                     // Small integers (within f64 exact range) use Numeric for cross-type
                     // matching with Float columns. Large integers use Integer to preserve
                     // full 64-bit precision.
-                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    const EXACT_MAX: i64 = 1i64 << 53; // 2^53, max exact i64 in f64
                     if *i >= -EXACT_MAX && *i <= EXACT_MAX {
                         Some(HashKey::Numeric((*i as f64).to_bits()))
                     } else {
@@ -8488,7 +8488,7 @@ impl QueryExecutor {
                     // Small integers (within f64 exact range) use Numeric for cross-type
                     // matching with Float columns. Large integers use Integer to preserve
                     // full 64-bit precision.
-                    const EXACT_MAX: i64 = (1i64 << 53); // 2^53, max exact i64 in f64
+                    const EXACT_MAX: i64 = 1i64 << 53; // 2^53, max exact i64 in f64
                     if *i >= -EXACT_MAX && *i <= EXACT_MAX {
                         Some(HashKey::Numeric((*i as f64).to_bits()))
                     } else {
@@ -8572,7 +8572,7 @@ impl QueryExecutor {
     fn stream_in_subquery_to_hashset(
         &self,
         subquery_stmt: &SelectStmt,
-        outer_col_name: &str,
+        _outer_col_name: &str,
     ) -> Option<std::collections::HashSet<Value>> {
         use crate::sql::ast::TableRef;
 
@@ -8630,7 +8630,7 @@ impl QueryExecutor {
         // SSTable, NOT in the LSM row store. The legacy raw scan path below would
         // return empty/obsolete data for columnar tables (bug: IN subquery on a
         // columnar table silently matched 0 rows). So we branch on storage type.
-        let mut set = if self.db.is_columnar_table(table_name) {
+        let set = if self.db.is_columnar_table(table_name) {
             self.build_in_hashset_from_columnar(
                 table_name, &col_types, inner_col_pos,
                 compiled_where.as_ref(), &where_positions, &where_pos_to_idx,
@@ -9601,7 +9601,7 @@ impl QueryExecutor {
     /// before evaluating it.
     fn expr_referenced_columns(expr: &Expr, schema: &TableSchema) -> Vec<usize> {
         let mut out = Vec::new();
-        let mut add = |name: &str, out: &mut Vec<usize>| {
+        let add = |name: &str, out: &mut Vec<usize>| {
             let bare = name.rsplit('.').next().unwrap_or(name);
             if let Some(p) = schema.get_column_position(bare) {
                 if !out.contains(&p) { out.push(p); }
@@ -10306,7 +10306,6 @@ impl QueryExecutor {
         // For each group, store: (group_key_values, Vec<AggAccumulator>)
         // AggAccumulator per aggregate column in select_col_info
         let num_aggs = select_col_info.iter().filter(|(_, _, a)| a.is_some()).count();
-        let num_group_cols = group_col_positions.len();
 
         // Identify which select columns are aggregates (index into select_col_info)
         let agg_indices: Vec<usize> = select_col_info.iter()
@@ -11722,7 +11721,6 @@ impl QueryExecutor {
                 let mut backfill_count = 0;
 
                 if let Ok(count) = self.db.build_text_index_from_columnar(&index_name, &stmt.table, column_pos) {
-                    backfill_count = count;
                     debug_log!("[CREATE TEXT INDEX] Columnar build: {} docs in {:?}", count, start_time.elapsed());
                 } else {
                 // ✅ Fallback: 批量流式扫描（每批10000行，避免内存爆炸）

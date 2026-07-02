@@ -1596,7 +1596,6 @@ impl<K: BTreeKey> GenericBTree<K> {
         let n = entries.len();
         let key_size = self.key_size;
 
-        let max_internal_keys = ((PAGE_SIZE - HEADER_SIZE) / (key_size + 8)).max(4);
         // Page format for empty-value leaf: 16-byte header + num_keys*key_size + num_keys*4 (value offsets, all 0).
         // Pre-calculate total leaf content size for reserve.
         let num_leaf_pages = (n + max_keys - 1) / max_keys;
@@ -1614,7 +1613,6 @@ impl<K: BTreeKey> GenericBTree<K> {
         // Format: [is_leaf:1][num_keys:4][next_leaf:8][content_len:2][reserved:1]
         //         [keys: num_keys * key_size][value_offsets: num_keys * 4 (all 0)]
         let mut leaf_info: Vec<(u64, K)> = Vec::new();
-        let t1 = std::time::Instant::now();
         let mut chunk_start = 0;
         while chunk_start < n {
             let chunk_end = (chunk_start + max_keys).min(n);
