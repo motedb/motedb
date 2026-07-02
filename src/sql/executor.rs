@@ -61,6 +61,29 @@ fn prefix_schema(schema: &TableSchema, prefix: &str) -> TableSchema {
     s
 }
 
+/// Apply a comparison operator to an optional field value (None = NULL) and a
+/// target. NULLs never match. Used for post-filtering scanned rows by AND'd
+/// predicates that weren't pushed into the single-column scan predicate.
+fn apply_op_value(
+    op: &crate::sql::ast::BinaryOperator,
+    fv: Option<&Value>,
+    target: &Value,
+) -> bool {
+    use crate::sql::ast::BinaryOperator;
+    let v = match fv { Some(v) => v, None => return false };
+    match op {
+        BinaryOperator::Eq => v == target,
+        BinaryOperator::Ne => v != target,
+        BinaryOperator::Lt => v.partial_cmp(target) == Some(Ordering::Less),
+        BinaryOperator::Gt => v.partial_cmp(target) == Some(Ordering::Greater),
+        BinaryOperator::Le => matches!(v.partial_cmp(target),
+            Some(Ordering::Less | Ordering::Equal)),
+        BinaryOperator::Ge => matches!(v.partial_cmp(target),
+            Some(Ordering::Greater | Ordering::Equal)),
+        _ => false,
+    }
+}
+
 /// Column segment wrapper for zero-materialization results.
 #[derive(Clone)]
 pub enum ColumnarSeg {
@@ -1433,20 +1456,20 @@ impl QueryExecutor {
 
         if is_count_star {
             // COUNT(*) with WHERE: filter then count. Without WHERE: count all.
-            let filter_col_pos: Option<usize>;
             let count;
             if let Some(ref wc) = stmt.where_clause {
-                match wc {
-                    Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } => {
-                        if let (Expr::Column(cn), Expr::Literal(v)) = (left.as_ref(), right.as_ref()) {
-                            let pos = schema.get_column_position(cn).unwrap_or(0);
-                            let target = v.clone();
-                            // Only scan filter column (empty output = no Value decode).
-                            let scanned = store.scan_projected_filtered(Some(pos), &[], &move |fv: Option<&Value>| fv == Some(&target));
-                            count = scanned.len() as i64;
-                        } else { return Ok(None); }
-                    }
-                    _ => return Ok(None),
+                // Handle any simple comparison (col OP literal). Previously only
+                // `=` was supported; `>`, `>=`, `<`, `<=`, `!=` fell through to
+                // col_segment_multi_aggregate which discarded the operator and
+                // silently returned 0 rows.
+                if let Some((pos, op, target)) = Self::parse_simple_comparison_where(wc, &schema) {
+                    let pred = Self::build_comparison_predicate(op, target);
+                    // Only scan filter column (empty output = no Value decode).
+                    let scanned = store.scan_projected_filtered(Some(pos), &[], &*pred);
+                    count = scanned.len() as i64;
+                } else {
+                    // Compound AND/OR or unsupported shape — fall back.
+                    return Ok(None);
                 }
             } else {
                 // No WHERE: count live rows directly from row_map (zero decode).
@@ -1535,6 +1558,137 @@ impl QueryExecutor {
         Ok(None)
     }
 
+    /// Parse a simple comparison WHERE clause of the form `col OP literal`
+    /// into `(column_position, operator, literal_value)`.
+    ///
+    /// Supports all six comparison operators (=, !=, <, >, <=, >=). Returns
+    /// None for compound expressions (AND/OR), non-comparison operators, or
+    /// shapes where the left side isn't a column / right side isn't a literal.
+    /// Callers fall back to the materialized path in those cases.
+    ///
+    /// This exists because two COUNT/aggregate fast paths previously only
+    /// matched `=` (or worse, matched every BinaryOp but discarded the operator
+    /// and always compared with equality — silently turning `id > 49000` into
+    /// `id == 49000` and returning 0 rows).
+    fn parse_simple_comparison_where(
+        wc: &crate::sql::ast::Expr,
+        schema: &TableSchema,
+    ) -> Option<(usize, crate::sql::ast::BinaryOperator, Value)> {
+        use crate::sql::ast::{BinaryOperator, Expr};
+        let (left, op, right) = match wc {
+            Expr::BinaryOp { left, op, right } => (left, op, right),
+            _ => return None,
+        };
+        // Only comparison operators (skip logical/arith operators).
+        match op {
+            BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt
+            | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge => {}
+            _ => return None,
+        }
+        let pos = match (left.as_ref(), right.as_ref()) {
+            // col OP literal  (normal form)
+            (Expr::Column(cn), Expr::Literal(v)) => {
+                (schema.get_column_position(cn)?, v.clone())
+            }
+            // literal OP col  (swapped operand form, e.g. 49000 < id)
+            (Expr::Literal(v), Expr::Column(cn)) => {
+                let p = schema.get_column_position(cn)?;
+                // Flip the operator to match the swapped operands.
+                let flipped = match op {
+                    BinaryOperator::Eq => BinaryOperator::Eq,
+                    BinaryOperator::Ne => BinaryOperator::Ne,
+                    BinaryOperator::Lt => BinaryOperator::Gt,
+                    BinaryOperator::Gt => BinaryOperator::Lt,
+                    BinaryOperator::Le => BinaryOperator::Ge,
+                    BinaryOperator::Ge => BinaryOperator::Le,
+                    _ => return None,
+                };
+                return Some((p, flipped, v.clone()));
+            }
+            _ => return None,
+        };
+        Some((pos.0, op.clone(), pos.1))
+    }
+
+    /// Parse a WHERE clause into a flat list of (col_pos, op, target)
+    /// comparisons. Handles:
+    ///   - a single comparison:  `col OP lit`
+    ///   - AND of comparisons:   `c1 OP1 lit1 AND c2 OP2 lit2 [AND ...]`
+    ///
+    /// Returns None (→ fall back to materialized path) for OR, nested logic,
+    /// or any leaf that isn't a simple comparison. Only top-level AND chains
+    /// are flattened; parentheses-free.
+    fn parse_where_comparisons(
+        wc: &crate::sql::ast::Expr,
+        schema: &TableSchema,
+    ) -> Option<Vec<(usize, crate::sql::ast::BinaryOperator, Value)>> {
+        use crate::sql::ast::{BinaryOperator, Expr};
+        match wc {
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                let mut out = Vec::new();
+                // Recursively flatten left + right (handles N-term AND chains).
+                out.extend(Self::parse_where_comparisons(left, schema)?);
+                out.extend(Self::parse_where_comparisons(right, schema)?);
+                Some(out)
+            }
+            _ => {
+                // Leaf: must be a single comparison.
+                let one = Self::parse_simple_comparison_where(wc, schema)?;
+                Some(vec![one])
+            }
+        }
+    }
+
+    /// Build a row predicate closure from a comparison operator + target value.
+    /// The closure receives `Option<&Value>` (the filter column's value, None =
+    /// NULL) and applies the operator, treating NULLs as non-matching.
+    fn build_comparison_predicate(
+        op: crate::sql::ast::BinaryOperator,
+        target: Value,
+    ) -> Box<dyn Fn(Option<&Value>) -> bool> {
+        use crate::sql::ast::BinaryOperator;
+        match op {
+            BinaryOperator::Eq => {
+                Box::new(move |fv: Option<&Value>| fv == Some(&target))
+            }
+            BinaryOperator::Ne => {
+                // NULL != target is NULL (not true), so NULLs don't match.
+                Box::new(move |fv: Option<&Value>| match fv {
+                    Some(v) => v != &target,
+                    None => false,
+                })
+            }
+            BinaryOperator::Lt => {
+                Box::new(move |fv: Option<&Value>| match fv {
+                    Some(v) => v.partial_cmp(&target) == Some(std::cmp::Ordering::Less),
+                    None => false,
+                })
+            }
+            BinaryOperator::Gt => {
+                Box::new(move |fv: Option<&Value>| match fv {
+                    Some(v) => v.partial_cmp(&target) == Some(std::cmp::Ordering::Greater),
+                    None => false,
+                })
+            }
+            BinaryOperator::Le => {
+                Box::new(move |fv: Option<&Value>| match fv {
+                    Some(v) => matches!(v.partial_cmp(&target),
+                        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+                    None => false,
+                })
+            }
+            BinaryOperator::Ge => {
+                Box::new(move |fv: Option<&Value>| match fv {
+                    Some(v) => matches!(v.partial_cmp(&target),
+                        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+                    None => false,
+                })
+            }
+            // Any other operator: never match (defensive — shouldn't happen).
+            _ => Box::new(|_| false),
+        }
+    }
+
     /// Multi-aggregate (COUNT/SUM/MIN/MAX) without GROUP BY, via multi-segment scan.
     /// Avoids sync compaction.
     fn col_segment_multi_aggregate(
@@ -1615,34 +1769,74 @@ impl QueryExecutor {
             }
         }
 
-        // Find columns to scan (filter col + aggregate target cols).
-        let filter_col = stmt.where_clause.as_ref().and_then(|wc| {
-            if let Expr::BinaryOp { left, op: crate::sql::ast::BinaryOperator::Eq, right } = wc {
-                if let (Expr::Column(cn), Expr::Literal(_)) = (left.as_ref(), right.as_ref()) {
-                    return schema.get_column_position(cn);
-                }
-            }
-            None
-        });
+        // Parse WHERE into a list of (col_pos, op, target) comparisons.
+        // Supports either a single comparison or an AND of comparisons
+        // (2-term AND is the common `cat = 3 AND amount > 150` shape).
+        // Any other shape (OR, nested, etc.) falls back to the materialized
+        // path rather than risk a silent miscount.
+        let comparisons: Vec<(usize, crate::sql::ast::BinaryOperator, Value)> =
+            match stmt.where_clause.as_ref() {
+                None => Vec::new(),
+                Some(wc) => match Self::parse_where_comparisons(wc, schema) {
+                    Some(cs) => cs,
+                    None => return Ok(None), // unsupported shape — fall back
+                },
+            };
+
+        // Choose the scan filter column (first comparison) and the remaining
+        // comparisons to apply as a post-filter on the projected rows.
+        let (filter_col, post_comparisons): (Option<usize>, Vec<(usize, crate::sql::ast::BinaryOperator, Value)>) =
+            if comparisons.is_empty() {
+                (None, Vec::new())
+            } else {
+                let (fc, op, target) = comparisons[0].clone();
+                (Some(fc), comparisons[1..].to_vec())
+            };
+
         let mut scan_cols: Vec<usize> = Vec::new();
         if let Some(fc) = filter_col { scan_cols.push(fc); }
+        // Post-filter columns must be projected so we can evaluate them.
+        for (pc, _, _) in &post_comparisons {
+            if !scan_cols.contains(pc) { scan_cols.push(*pc); }
+        }
         for a in &aggs {
             if let Some(c) = a.col { if !scan_cols.contains(&c) { scan_cols.push(c); } }
         }
 
-        // Extract WHERE filter value for predicate.
-        let pred: Box<dyn Fn(Option<&Value>) -> bool> = if let Some(ref wc) = stmt.where_clause {
-            if let Expr::BinaryOp { left: _, op: _, right } = wc {
-                if let Expr::Literal(v) = right.as_ref() {
-                    let target = v.clone();
-                    Box::new(move |fv: Option<&Value>| fv == Some(&target))
-                } else { return Ok(None); }
-            } else { return Ok(None); }
-        } else {
-            Box::new(|_| true)
+        // Build the scan predicate from the primary comparison. Honors the
+        // actual operator (previously this discarded `op` and always compared
+        // with equality, silently turning `id > 49000` into `id == 49000`).
+        let pred: Box<dyn Fn(Option<&Value>) -> bool> = match filter_col {
+            Some(_) => {
+                let (_, op, target) = (comparisons[0].0, comparisons[0].1.clone(), comparisons[0].2.clone());
+                Self::build_comparison_predicate(op, target)
+            }
+            None => Box::new(|_| true),
         };
 
-        let scanned = store.scan_projected_filtered(filter_col, &scan_cols, &*pred);
+        let scanned_raw = store.scan_projected_filtered(filter_col, &scan_cols, &*pred);
+
+        // Apply post-filter comparisons (AND of remaining predicates) on the
+        // projected rows. Each post-comparison's column is looked up by its
+        // position in scan_cols.
+        let scanned: Vec<(u64, Vec<Value>)> = if post_comparisons.is_empty() {
+            scanned_raw
+        } else {
+            // Pre-compute (scan_col_index, op, target) for each post-comparison.
+            let post_resolved: Vec<(usize, crate::sql::ast::BinaryOperator, Value)> = post_comparisons
+                .into_iter()
+                .map(|(pc, op, target)| {
+                    let idx = scan_cols.iter().position(|&s| s == pc).unwrap_or(0);
+                    (idx, op, target)
+                })
+                .collect();
+            scanned_raw.into_iter().filter(|(_, row)| {
+                post_resolved.iter().all(|(idx, op, target)| {
+                    let fv = row.get(*idx);
+                    apply_op_value(op, fv, target)
+                })
+            }).collect()
+        };
 
         // Compute aggregates.
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
