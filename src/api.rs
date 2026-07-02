@@ -416,19 +416,27 @@ impl Database {
             if let Some(cached) = read_cache.peek(sql) {
                 // 🚀 Fast path: use pre-computed PK metadata
                 if let Some(ref meta) = cached.fast_pk {
-                    let result = self.execute_fast_pk_with_meta(meta, &params)?;
-                    return Ok(result);
+                    if let Some(result) = self.execute_fast_pk_with_meta(meta, &params)? {
+                        return Ok(result);
+                    }
+                    // PK cache miss (e.g. after recovery) — fall through to full path.
+                    (Arc::clone(&cached.stmt), false)
+                } else {
+                    (Arc::clone(&cached.stmt), false)
                 }
-                (Arc::clone(&cached.stmt), false)
             } else {
                 drop(read_cache);
                 let mut cache = self.stmt_cache.write();
                 if let Some(cached) = cache.get(sql) {
                     if let Some(ref meta) = cached.fast_pk {
-                        let result = self.execute_fast_pk_with_meta(meta, &params)?;
-                        return Ok(result);
+                        if let Some(result) = self.execute_fast_pk_with_meta(meta, &params)? {
+                            return Ok(result);
+                        }
+                        // PK cache miss — fall through to full path.
+                        (Arc::clone(&cached.stmt), false)
+                    } else {
+                        (Arc::clone(&cached.stmt), false)
                     }
-                    (Arc::clone(&cached.stmt), false)
                 } else {
                     let mut lexer = Lexer::new(sql);
                     let tokens = lexer.tokenize()?;
@@ -445,15 +453,17 @@ impl Database {
         if cached_fast_pk {
             if let Some(meta) = Self::detect_fast_pk_pattern(&statement, &self.inner)? {
                 // Execute using the metadata we just computed (no extra lock)
-                let result = self.execute_fast_pk_with_meta(&meta, &params)?;
-                // Cache for future calls (write lock only, no read-back)
-                {
-                    let mut cache = self.stmt_cache.write();
-                    if let Some(cached) = cache.get_mut(sql) {
-                        cached.fast_pk = Some(meta);
+                if let Some(result) = self.execute_fast_pk_with_meta(&meta, &params)? {
+                    // Cache for future calls (write lock only, no read-back)
+                    {
+                        let mut cache = self.stmt_cache.write();
+                        if let Some(cached) = cache.get_mut(sql) {
+                            cached.fast_pk = Some(meta);
+                        }
                     }
+                    return Ok(result);
                 }
-                return Ok(result);
+                // PK cache miss — fall through to full path without caching meta.
             }
         }
 
@@ -572,7 +582,7 @@ impl Database {
         &self,
         meta: &FastPkMeta,
         params: &[Value],
-    ) -> Result<StreamingQueryResult> {
+    ) -> Result<Option<StreamingQueryResult>> {
         let pk_value = match params.get(meta.param_idx - 1) {
             Some(v) => v,
             None => return Err(crate::error::MoteDBError::InvalidArgument(format!(
@@ -580,11 +590,17 @@ impl Database {
             ))),
         };
 
-        // Resolve PK → row_id
+        // Resolve PK → row_id.
+        // For AUTO_INCREMENT PKs the value IS the row_id, so we can always
+        // resolve. For non-AUTO_INCREMENT PKs we depend on the pk_lookup cache,
+        // which is lazily populated and may be empty after recovery (open) — a
+        // cache miss does NOT mean the row doesn't exist. In that case return
+        // None so the caller falls back to the full executor path (which scans
+        // the columnar store) instead of returning a wrong-typed/empty result.
         let row_id = if meta.is_auto_increment {
             match pk_value {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
-                _ => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
+                _ => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
             }
         } else {
             let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
@@ -592,7 +608,7 @@ impl Database {
                 .and_then(|lookup| lookup.get_pk(&pk_key))
             {
                 Some(rid) => rid,
-                None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
+                None => return Ok(None), // PK cache miss — fall back to full path
             }
         };
 
@@ -600,15 +616,15 @@ impl Database {
             "delete" => {
                 let row = match self.inner.get_table_row(&meta.table_name, row_id)? {
                     Some(r) => r,
-                    None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
+                    None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
                 };
                 self.inner.delete_row_from_table(&meta.table_name, row_id, row)?;
-                Ok(StreamingQueryResult::Modification { affected_rows: 1 })
+                Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
             }
             "update" => {
                 let old_row_arc = match self.inner.get_table_row_arc(&meta.table_name, row_id, &meta.schema)? {
                     Some(r) => r,
-                    None => return Ok(StreamingQueryResult::Modification { affected_rows: 0 }),
+                    None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
                 };
                 let mut new_row = (*old_row_arc).clone();
                 for &(col_pos, param_idx) in &meta.set_param_positions {
@@ -621,7 +637,7 @@ impl Database {
                 }
                 // Pass &Arc<Row> as &Row — avoids cloning old_row
                 self.inner.update_row_with_schema_ref(&meta.table_name, row_id, &*old_row_arc, new_row, &meta.schema)?;
-                Ok(StreamingQueryResult::Modification { affected_rows: 1 })
+                Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
             }
             _ => {
                 // SELECT
@@ -638,10 +654,10 @@ impl Database {
                     }
                     None => vec![],
                 };
-                Ok(StreamingQueryResult::SelectReady {
+                Ok(Some(StreamingQueryResult::SelectReady {
                     columns: (*meta.column_names).clone(),
                     rows: result_vec,
-                })
+                }))
             }
         }
     }
