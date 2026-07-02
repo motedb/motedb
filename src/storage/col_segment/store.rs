@@ -219,10 +219,31 @@ impl ColSegmentStore {
         project_cols: &[usize],
         predicate: &dyn Fn(Option<&Value>) -> bool,
     ) -> Vec<(u64, Vec<Value>)> {
-        // Pre-estimate result size to avoid Vec reallocations.
+        self.scan_projected_filtered_limit(filter_col, project_cols, predicate, usize::MAX)
+    }
+
+    /// Same as scan_projected_filtered, but stops scanning after `max_results`
+    /// matching rows have been collected. This enables LIMIT early-termination:
+    /// SELECT cols FROM t LIMIT 50 only decodes 50 rows instead of all N.
+    ///
+    /// When max_results is very small (e.g. 1 for PK point queries), project
+    /// columns are decoded lazily — only for matching rows, not pre-decoded for
+    /// the entire segment. This is critical for PK point queries on large tables.
+    pub fn scan_projected_filtered_limit(
+        &self,
+        filter_col: Option<usize>,
+        project_cols: &[usize],
+        predicate: &dyn Fn(Option<&Value>) -> bool,
+        max_results: usize,
+    ) -> Vec<(u64, Vec<Value>)> {
         let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
-        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(65536));
+        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(max_results).min(65536));
+        if max_results == 0 { return result; }
         let segs = self.segments_snapshot();
+
+        // For small result sets (≤8 rows expected), use lazy projection:
+        // only decode output columns for matching rows, not the whole segment.
+        let lazy_project = max_results <= 8;
         let single_seg = segs.len() <= 1;
         // 🔑 Newest-version-wins dedup. An UPDATE appends a newer row with the
         // SAME composite key; without dedup, scans return both versions. We
@@ -268,53 +289,58 @@ impl ColSegmentStore {
                 }).collect()
             } else { Vec::new() };
 
-            // Pre-decode project columns (once per segment).
-            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
-                    seg.sst.read_fixed_i64(pc).ok()
-                } else { None }
-            }).collect();
-            let ptext: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed() {
-                    seg.sst.read_text(pc).ok()
-                } else { None }
-            }).collect();
-            // Pre-decode Vector/Spatial columns (read_vectors/read_spatial return
-            // (row_id, value) pairs; map them to per-row-index option vecs).
+            // Pre-decode project columns (once per segment) — unless lazy mode
+            // (small result set): then we decode only for matched rows below.
+            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = if !lazy_project {
+                project_cols.iter().map(|&pc| {
+                    if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
+                        seg.sst.read_fixed_i64(pc).ok()
+                    } else { None }
+                }).collect()
+            } else { Vec::new() };
+            let ptext: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = if !lazy_project {
+                project_cols.iter().map(|&pc| {
+                    if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed() {
+                        seg.sst.read_text(pc).ok()
+                    } else { None }
+                }).collect()
+            } else { Vec::new() };
             let n_seg = seg.sst.num_rows;
-            let pvector: Vec<Vec<Option<Vec<f32>>>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len()
-                    && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Vector) {
-                    let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
-                    let mut per = vec![None; n_seg];
-                    let mut di = 0usize;
-                    for i in 0..n_seg {
-                        if seg.sst.row_map.is_deleted(i) { continue; }
-                        let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                        while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                        if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
-                    }
-                    per
-                } else { Vec::new() }
-            }).collect();
-            let pspatial: Vec<Vec<Option<crate::types::Geometry>>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len()
-                    && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Spatial) {
-                    let decoded = seg.sst.read_spatial(pc).unwrap_or_default();
-                    let mut per = vec![None; n_seg];
-                    let mut di = 0usize;
-                    for i in 0..n_seg {
-                        if seg.sst.row_map.is_deleted(i) { continue; }
-                        let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                        while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                        if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
-                    }
-                    per
-                } else { Vec::new() }
-            }).collect();
+            let pvector: Vec<Vec<Option<Vec<f32>>>> = if !lazy_project {
+                project_cols.iter().map(|&pc| {
+                    if pc < seg.sst.column_tags.len()
+                        && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Vector) {
+                        let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
+                        let mut per = vec![None; n_seg];
+                        let mut di = 0usize;
+                        for i in 0..n_seg {
+                            if seg.sst.row_map.is_deleted(i) { continue; }
+                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                            if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                        }
+                        per
+                    } else { Vec::new() }
+                }).collect()
+            } else { Vec::new() };
+            let pspatial: Vec<Vec<Option<crate::types::Geometry>>> = if !lazy_project {
+                project_cols.iter().map(|&pc| {
+                    if pc < seg.sst.column_tags.len()
+                        && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Spatial) {
+                        let decoded = seg.sst.read_spatial(pc).unwrap_or_default();
+                        let mut per = vec![None; n_seg];
+                        let mut di = 0usize;
+                        for i in 0..n_seg {
+                            if seg.sst.row_map.is_deleted(i) { continue; }
+                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
+                            if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                        }
+                        per
+                    } else { Vec::new() }
+                }).collect()
+            } else { Vec::new() };
 
-            // Lazy text decode: do NOT pre-intern all rows (saves 300K ArcString
-            // allocations = ~20MB). Decode only matched rows on demand below.
             let ptext_interned: Vec<Vec<Option<Value>>> = Vec::new();
 
             for &i in &order {
@@ -346,6 +372,27 @@ impl ColSegmentStore {
 
                 // Decode output columns for matching row only.
                 let mut row = Vec::with_capacity(project_cols.len());
+                if lazy_project {
+                    // Lazy mode: decode each column on-demand for this single row.
+                    for &pc in project_cols.iter() {
+                        let v = if pc < self.col_types.len() && pc < seg.sst.column_tags.len() {
+                            if seg.sst.column_tags[pc].is_fixed() {
+                                match self.col_types[pc] {
+                                    ColumnType::Integer => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_i64(i)).map(Value::Integer),
+                                    ColumnType::Float => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_f64(i)).map(Value::Float),
+                                    ColumnType::Boolean => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_bool(i)).map(Value::Bool),
+                                    _ => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_i64(i)).map(Value::Integer),
+                                }
+                            } else {
+                                match seg.sst.read_text(pc).ok().and_then(|t| t.get_str(i).map(|s| s.to_string())) {
+                                    Some(s) => Some(Value::Text(s.into())),
+                                    None => Some(Value::Null),
+                                }
+                            }
+                        } else { Some(Value::Null) };
+                        row.push(v.unwrap_or(Value::Null));
+                    }
+                } else {
                 for (pi, &pc) in project_cols.iter().enumerate() {
                     let v = if pc < self.col_types.len() {
                         match (&pfixed.get(pi), &ptext.get(pi), &self.col_types[pc]) {
@@ -353,7 +400,6 @@ impl ColSegmentStore {
                             (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
                             (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
                             (_, _, ColumnType::Spatial) => {
-                                // Pre-decoded spatial geometry (or NULL).
                                 pspatial.get(pi).and_then(|p| p.get(i)).cloned().flatten()
                                     .map(|g| Value::Spatial(std::boxed::Box::new(g)))
                             }
@@ -365,8 +411,6 @@ impl ColSegmentStore {
                                 if !ptext_interned.is_empty() {
                                     ptext_interned.get(pi).and_then(|v| v.get(i)).cloned().flatten()
                                 } else {
-                                    // Arc::from(&str) directly (one alloc), avoiding
-                                    // the intermediate String alloc from to_string().
                                     t.get_str(i).map(|s| Value::Text(s.into()))
                                 }
                             }
@@ -375,7 +419,10 @@ impl ColSegmentStore {
                     } else { Some(Value::Null) };
                     row.push(v.unwrap_or(Value::Null));
                 }
+                } // end else (non-lazy)
                 result.push((key, row));
+                // 🚀 LIMIT early-termination: stop scanning once we have enough rows.
+                if result.len() >= max_results { return result; }
             }
         }
         result
@@ -910,21 +957,26 @@ impl ColSegmentStore {
     }
 
     pub fn count_live_rows(&self) -> usize {
-        // Newest-version-wins across buffer + segments. Build a map of
-        // key → is_tombstone, where buffered entries override segment entries.
-        // A key is live iff its newest version is not a tombstone.
+        // Fast path: single segment, no buffer, no deletions → just return num_rows.
+        // This covers the common case (fresh insert, no UPDATE/DELETE history).
+        let buf = self.write_buf.lock();
+        let buf_count = buf.num_rows;
+        let segs = self.segments.read();
+        if segs.len() == 1 && buf_count == 0 {
+            let seg = &segs[0];
+            if !seg.sst.row_map.has_any_deleted() {
+                return seg.sst.num_rows;
+            }
+        }
+        drop(buf);
+
+        // Slow path: multi-segment or has UPDATE/DELETE history.
+        // Newest-version-wins across buffer + segments.
         let mut liveness: std::collections::HashMap<u64, bool> = {
             let buf = self.write_buf.lock();
             buf.latest_entries().into_iter().collect()
         };
-        let segs = self.segments.read();
-        let single_seg = segs.len() <= 1;
-        let _ = single_seg;
-        // Newest-version-wins: iterate segments newest→oldest, and within each
-        // segment iterate rows newest→oldest (rows are appended old→new, so the
-        // last row is the newest version). Record each key's first-seen (newest)
-        // liveness. This correctly handles a tombstone that lands after its live
-        // row in the same segment (tombstone appended last = newest = wins).
+        // Newest-version-wins: iterate segments newest→oldest.
         for seg in segs.iter().rev() {
             for i in (0..seg.sst.num_rows).rev() {
                 let key = seg.sst.row_map.key(i);

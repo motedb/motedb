@@ -2234,11 +2234,36 @@ impl QueryExecutor {
         let is_auto_increment_pk = is_pk && schema.is_primary_key_auto_increment();
 
         // For ColSegmentStore tables with a non-AUTO_INCREMENT PK, the
-        // get_table_row point-lookup path fails (row_id ≠ PK value). Delegate
-        // to full scan which applies the WHERE filter correctly on all column
-        // types. This is the v0.5.0 fix for WHERE tag='val' / WHERE id=val
-        // returning 0 rows on INT-PK ColSegmentStore tables.
+        // get_table_row point-lookup path fails (row_id ≠ PK value).
+        // 🚀 PK fast-scan: scan only the PK column to find the matching row,
+        // then fetch output columns for that single row. Avoids flush_buffer
+        // + full multi-column scan for a 1-row result.
         if !is_auto_increment_pk && self.db.has_col_segment_store(table) {
+            // 🚀 Try column index first (O(log N) B-tree lookup, created at
+            // CREATE TABLE time for non-AUTO_INCREMENT PKs). Falls back to
+            // PK-column scan if index isn't built yet (async pipeline).
+            let index_name = format!("{}.{}", table, column);
+            if let Some(index) = self.db.column_indexes.get(&index_name) {
+                let row_ids = index.value().get_arc(value).unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+                if !row_ids.is_empty() {
+                    let batch = self.db.get_table_rows_batch(table, &row_ids)?;
+                    let mut result_rows: Vec<Vec<Value>> = Vec::new();
+                    for (_, row_opt) in batch {
+                        if let Some(row) = row_opt {
+                            let projected = Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
+                            result_rows.push(projected);
+                        }
+                    }
+                    if !result_rows.is_empty() {
+                        return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
+                    }
+                    // Index found row_ids but rows not loadable (ColSegmentStore
+                    // async delay) → fall through to scan.
+                }
+                // Key not in index → might be stale (async builder hasn't caught
+                // up yet). Fall through to scan rather than returning empty.
+            }
+            // Index not available yet (async builder) → fall back to scan.
             return self.execute_full_scan_streaming(stmt, table);
         }
 
@@ -4269,6 +4294,22 @@ impl QueryExecutor {
         // correctly via build_column_segment.
         let has_vector_or_spatial = col_types.iter().any(|ct| matches!(ct,
             ColumnType::Tensor(_) | ColumnType::Spatial));
+
+        // 🚀 LIMIT early-termination fast path: SELECT cols FROM t [LIMIT N]
+        // When there's no WHERE/ORDER BY/GROUP BY/DISTINCT, we can scan only
+        // the first (offset + limit) rows instead of all N rows. This converts
+        // a 5000-row scan into a 50-row scan for LIMIT 50 (100x faster).
+        if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none()
+            && !stmt.distinct && !has_computed_sel && !has_vector_or_spatial
+            && (stmt.limit.is_some() || stmt.offset.is_some())
+        {
+            let take_n = offset + limit.min(100_000); // cap to avoid unbounded allocation
+            let scanned = store.scan_projected_filtered_limit(None, &out_positions, &|_| true, take_n);
+            let result_rows: Vec<Vec<Value>> = scanned.into_iter()
+                .skip(offset).map(|(_, row)| row).collect();
+            return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
+        }
+
         if where_clause.is_none() && stmt.group_by.is_none() && stmt.order_by.is_none()
             && stmt.limit.is_none() && stmt.offset.is_none() && !stmt.distinct
             && !has_computed_sel && !has_vector_or_spatial {
@@ -4620,13 +4661,17 @@ impl QueryExecutor {
         use crate::sql::ast::{Expr, BinaryOperator};
         let col_types = store.col_types();
 
-        // Determine filter column + predicate.
+        let mut early_stop_at: usize = usize::MAX;
         let (filter_col, pred_box): (Option<usize>, Box<dyn Fn(Option<&Value>) -> bool>) = match wc {
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                 match (left.as_ref(), right.as_ref()) {
                     (Expr::Column(cn), Expr::Literal(v)) => {
                         let pos = schema.get_column_position(cn).unwrap_or(0);
                         let val = v.clone();
+                        // If filtering on PK, at most 1 row matches → early-stop.
+                        if schema.primary_key() == Some(cn.as_str()) {
+                            early_stop_at = 1;
+                        }
                         (Some(pos), Box::new(move |fv: Option<&Value>| fv == Some(&val)))
                     }
                     _ => {
@@ -4758,7 +4803,11 @@ impl QueryExecutor {
             }
         }
 
-        let scanned = store.scan_projected_filtered(filter_col, out_positions, &*pred_box);
+        // 🚀 Use scan_projected_filtered_limit so WHERE col = val with a LIMIT
+        // stops scanning after enough matches. For PK equality (early_stop_at=1),
+        // this converts a 5000-row scan into a 1-row scan.
+        let take_n = offset.saturating_add(limit).min(early_stop_at);
+        let scanned = store.scan_projected_filtered_limit(filter_col, out_positions, &*pred_box, take_n);
         Ok(scanned.into_iter().skip(offset).take(limit).map(|(_, row)| row).collect())
     }
 
