@@ -1613,7 +1613,7 @@ impl ColSegmentStore {
             // row_map, breaking point lookups (get/where id=...) after compaction.
             let single_seg = old_segs.len() <= 1;
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut collected: Vec<(u64, u64, Vec<[u8; 8]>)> = Vec::new();
+            let mut collected: Vec<(u64, u64, Vec<[u8; 8]>, Vec<bool>)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
                 let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
@@ -1628,20 +1628,22 @@ impl ColSegmentStore {
                     if seg.sst.row_map.is_deleted(i) { continue; }
                     let ts = seg.sst.row_map.timestamp(i);
                     let mut col_vals: Vec<[u8; 8]> = Vec::with_capacity(ncols);
+                    let mut col_nulls: Vec<bool> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
-                        let v = fixed_cols.get(ci).and_then(|x| x.as_ref())
-                            .and_then(|f| f.get_i64(i)).unwrap_or(i64::MIN);
-                        col_vals.push(v.to_le_bytes());
+                        match fixed_cols.get(ci).and_then(|x| x.as_ref()).and_then(|f| f.get_i64(i)) {
+                            Some(v) => { col_vals.push(v.to_le_bytes()); col_nulls.push(false); }
+                            None => { col_vals.push(0i64.to_le_bytes()); col_nulls.push(true); }
+                        }
                     }
-                    collected.push((key, ts, col_vals));
+                    collected.push((key, ts, col_vals, col_nulls));
                 }
             }
             // Single-segment data is already sorted (sequential insert); skip the
             // sort for that case to avoid the O(N log N) overhead.
-            if !single_seg { collected.sort_unstable_by_key(|(k, _, _)| *k); }
-            for (key, ts, col_vals) in collected {
+            if !single_seg { collected.sort_unstable_by_key(|(k, _, _, _)| *k); }
+            for (key, ts, col_vals, col_nulls) in collected {
                 let col_bytes: Vec<&[u8]> = col_vals.iter().map(|b| b.as_slice()).collect();
-                builder.add_values_raw(key, ts, false, &col_bytes)?;
+                builder.add_values_raw_with_nulls(key, ts, false, &col_bytes, &col_nulls)?;
             }
         } else {
             // Mixed columns (has Text and/or Vector/Spatial): direct copy with
@@ -1654,7 +1656,7 @@ impl ColSegmentStore {
             use crate::storage::lsm::columnar::ColumnTypeTag;
             let single_seg = old_segs.len() <= 1;
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut collected: Vec<(u64, u64, Vec<Vec<u8>>)> = Vec::new();
+            let mut collected: Vec<(u64, u64, Vec<Vec<u8>>, Vec<bool>)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
                 let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
@@ -1709,31 +1711,40 @@ impl ColSegmentStore {
                     if seg.sst.row_map.is_deleted(i) { continue; }
                     let ts = seg.sst.row_map.timestamp(i);
                     let mut row_bytes: Vec<Vec<u8>> = Vec::with_capacity(ncols);
+                    let mut row_nulls: Vec<bool> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
                         let mut buf = Vec::new();
                         let tag = seg.sst.column_tags.get(ci).copied();
                         if matches!(tag, Some(crate::storage::lsm::columnar::ColumnTypeTag::Bool)) {
                             // Boolean: 1-byte fixed. Read via get_bool, write 1 byte.
-                            if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
-                                buf.push(if f.get_bool(i).unwrap_or(false) { 1u8 } else { 0u8 });
-                            } else {
-                                buf.push(0u8);
+                            match fixed_cols.get(ci).and_then(|x| x.as_ref()).and_then(|f| f.get_bool(i)) {
+                                Some(b) => { buf.push(if b { 1u8 } else { 0u8 }); row_nulls.push(false); }
+                                None => { buf.push(0u8); row_nulls.push(true); }
                             }
                         } else if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
-                            let v = f.get_i64(i).unwrap_or(i64::MIN);
-                            buf.extend_from_slice(&v.to_le_bytes());
+                            match f.get_i64(i) {
+                                Some(v) => { buf.extend_from_slice(&v.to_le_bytes()); row_nulls.push(false); }
+                                None => { buf.extend_from_slice(&0i64.to_le_bytes()); row_nulls.push(true); }
+                            }
                         } else if let Some(ref t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
-                            let s = t.get_str(i).unwrap_or("");
-                            let len = s.len().min(65535) as u16;
-                            buf.extend_from_slice(&len.to_le_bytes());
-                            buf.extend_from_slice(&s.as_bytes()[..len as usize]);
+                            match t.get_str(i) {
+                                Some(s) => {
+                                    let len = s.len().min(65535) as u16;
+                                    buf.extend_from_slice(&len.to_le_bytes());
+                                    buf.extend_from_slice(&s.as_bytes()[..len as usize]);
+                                    row_nulls.push(false);
+                                }
+                                None => { buf.extend_from_slice(&0u16.to_le_bytes()); row_nulls.push(true); }
+                            }
                         } else if ci < vec_cols.len() && !vec_cols[ci].is_empty() {
                             // Vector: re-encode [dim:u16][f32×dim] (NULL → dim=0).
                             if let Some(ref v) = vec_cols[ci][i] {
                                 buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
                                 for x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+                                row_nulls.push(false);
                             } else {
                                 buf.extend_from_slice(&0u16.to_le_bytes());
+                                row_nulls.push(true);
                             }
                         } else if ci < spatial_cols.len() && !spatial_cols[ci].is_empty() {
                             // Spatial: re-encode [len:u16][bincode(Geometry)] (NULL → len=0).
@@ -1742,19 +1753,23 @@ impl ColSegmentStore {
                                 let len = bytes.len().min(65535) as u16;
                                 buf.extend_from_slice(&len.to_le_bytes());
                                 buf.extend_from_slice(&bytes[..len as usize]);
+                                row_nulls.push(false);
                             } else {
                                 buf.extend_from_slice(&0u16.to_le_bytes());
+                                row_nulls.push(true);
                             }
+                        } else {
+                            row_nulls.push(false);
                         }
                         row_bytes.push(buf);
                     }
-                    collected.push((key, ts, row_bytes));
+                    collected.push((key, ts, row_bytes, row_nulls));
                 }
             }
-            if !single_seg { collected.sort_unstable_by_key(|(k, _, _)| *k); }
-            for (key, ts, row_bytes) in collected {
+            if !single_seg { collected.sort_unstable_by_key(|(k, _, _, _)| *k); }
+            for (key, ts, row_bytes, row_nulls) in collected {
                 let col_slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();
-                builder.add_values_raw(key, ts, false, &col_slices)?;
+                builder.add_values_raw_with_nulls(key, ts, false, &col_slices, &row_nulls)?;
             }
         }
         builder.finish()?;

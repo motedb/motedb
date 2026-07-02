@@ -8,7 +8,7 @@
 //!   cargo test --test test_compaction_integrity -- --test-threads=1
 //!   cargo test --test test_compaction_integrity --profile release-test -- --test-threads=1
 
-use motedb::{Database, DBConfig, StreamingQueryResult};
+use motedb::{Database, DBConfig};
 use motedb::types::Value;
 use tempfile::TempDir;
 
@@ -19,12 +19,14 @@ fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
 }
 
 fn count_rows(db: &Database) -> usize {
-    let mut count = 0;
-    let mut result = db.execute("SELECT id FROM t").unwrap();
-    if let StreamingQueryResult::SelectStreaming { ref mut rows, .. } = result {
-        while let Some(Ok(_)) = rows.next() { count += 1; }
+    // Use materialize() so all StreamingQueryResult variants are handled
+    // (SelectStreaming / SelectReady / SelectColumnar). The previous manual
+    // iteration only matched SelectStreaming, silently returning 0 for tables
+    // served by the columnar store (SelectColumnar/SelectReady).
+    match exec(db, "SELECT id FROM t") {
+        motedb::sql::QueryResult::Select { rows, .. } => rows.len(),
+        _ => 0,
     }
-    count
 }
 
 fn get_row(db: &Database, id: i64) -> Option<Vec<Value>> {
@@ -62,12 +64,25 @@ fn lsm_dir_for(dir: &TempDir) -> std::path::PathBuf {
     dir.path().with_extension("mote").join("lsm")
 }
 
+/// Count segment files in the columnar multi-segment store (the source of
+/// truth since v0.3.0). Data lives in `<db>.mote/columnar_ms/<table>/*.sst`,
+/// NOT in the legacy `lsm/` dir.
 fn count_sst_files(dir: &TempDir) -> usize {
-    let lsm = lsm_dir_for(dir);
-    std::fs::read_dir(&lsm).unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
-        .count()
+    let ms = dir.path().with_extension("mote").join("columnar_ms");
+    let mut count = 0;
+    if let Ok(rd) = std::fs::read_dir(&ms) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Ok(rd2) = std::fs::read_dir(&p) {
+                    count += rd2.flatten()
+                        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
+                        .count();
+                }
+            }
+        }
+    }
+    count
 }
 
 // ── Category 1: Compaction Data Integrity ─────────────────────────────
@@ -503,9 +518,11 @@ fn test_update_then_scan_preserves_all() {
         let mut final_count = 0u64;
         let mut completed_count = 0u64;
         let mut pending_count = 0u64;
-        let mut result = db.execute("SELECT id, status FROM t").unwrap();
-        if let StreamingQueryResult::SelectStreaming { ref mut rows, .. } = result {
-            while let Some(Ok(row)) = rows.next() {
+        // materialize() handles all StreamingQueryResult variants (the columnar
+        // store returns SelectColumnar/SelectReady, not SelectStreaming).
+        let result = db.execute("SELECT id, status FROM t").unwrap().materialize().unwrap();
+        if let motedb::sql::QueryResult::Select { rows, .. } = result {
+            for row in &rows {
                 match &row[1] {
                     Value::Text(s) if s.as_str() == "final" => final_count += 1,
                     Value::Text(s) if s.as_str() == "completed" => completed_count += 1,
@@ -526,41 +543,43 @@ fn test_update_then_scan_preserves_all() {
     assert!(ok, "Status distribution did not settle after 8 attempts");
 }
 
-// ── Category 4: Deferred Deletion ─────────────────────────────────────
+// ── Category 4: Segment file lifecycle ─────────────────────────────────
+// Since v0.3.0 the columnar multi-segment store is the source of truth.
+// Compaction (merge_segments) merges old segments into one and GCs the old
+// files immediately (no deferred deletion — the single-writer manifest makes
+// that safe). These tests verify that data survives across compaction cycles
+// and the segment file count stays bounded.
 
 #[test]
 fn test_deferred_deletion_keeps_files_alive() {
     let (dir, db) = make_db();
     create_table(&db);
 
-    // Batch 1: creates SSTable A
+    // Batch 1: creates segment A
     for i in 1..=500i64 {
         exec(&db, &format!("INSERT INTO t VALUES ({}, 'a', 0.0)", i));
     }
     db.flush().unwrap();
+    assert!(count_sst_files(&dir) >= 1, "Batch 1: expected >= 1 segment file");
 
-    // Batch 2: creates SSTable B → triggers compaction (2 SSTables >= threshold)
+    // Batch 2: creates segment B → may trigger compaction (A+B merge)
     for i in 501..=1000i64 {
         exec(&db, &format!("INSERT INTO t VALUES ({}, 'b', 0.0)", i));
     }
     db.flush().unwrap();
-
-    // Wait for compaction to merge A+B into C
     wait_for_compaction();
 
-    // Source files A and B should still exist (deferred deletion)
-    let file_count = count_sst_files(&dir);
-    assert!(file_count >= 2, "Deferred deletion: expected >= 2 sst files, got {}", file_count);
+    // Data must survive regardless of compaction/GC.
+    assert_eq!(count_rows(&db), 1000, "All 1000 rows present after batch 2");
 
-    // Batch 3: creates SSTable D → triggers next compaction cycle
-    // which will flush_pending_deletions() from the previous cycle
+    // Batch 3: creates segment C → another compaction cycle
     for i in 1001..=1500i64 {
         exec(&db, &format!("INSERT INTO t VALUES ({}, 'c', 0.0)", i));
     }
     db.flush().unwrap();
     wait_for_compaction();
 
-    assert_eq!(count_rows(&db), 1500, "All 1500 rows should be present");
+    assert_eq!(count_rows(&db), 1500, "All 1500 rows should be present after compaction cycles");
 }
 
 #[test]
@@ -596,12 +615,12 @@ fn test_orphan_cleanup_on_open() {
 }
 
 fn count_rows_via(db: &Database, sql: &str) -> usize {
-    let mut count = 0;
-    let mut result = db.execute(sql).unwrap();
-    if let StreamingQueryResult::SelectStreaming { ref mut rows, .. } = result {
-        while let Some(Ok(_)) = rows.next() { count += 1; }
+    // Use materialize() — see count_rows() for why (SelectStreaming-only match
+    // silently returned 0 for columnar-served tables).
+    match exec(db, sql) {
+        motedb::sql::QueryResult::Select { rows, .. } => rows.len(),
+        _ => 0,
     }
-    count
 }
 
 // ── Category 5: Restart Recovery ──────────────────────────────────────

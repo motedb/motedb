@@ -1122,6 +1122,45 @@ impl ColumnarSSTableBuilder {
         Ok(())
     }
 
+    /// Like add_values_raw, but accepts explicit per-cell NULL flags.
+    ///
+    /// The plain add_values_raw can only infer NULL for Vector/Spatial columns
+    /// (from dim/len==0); Fixed and Text columns have no in-band NULL marker, so
+    /// NULLs written via the raw path were stored as their sentinel bytes
+    /// (i64::MIN / empty string) with is_null=false — corrupting NULLs across a
+    /// merge. This variant takes the authoritative null flag per column from the
+    /// source segment's FixedSegment/TextSegment::is_null(), preserving NULLs.
+    pub fn add_values_raw_with_nulls(
+        &mut self,
+        key: u64,
+        timestamp: u64,
+        deleted: bool,
+        col_raw: &[&[u8]],
+        col_nulls: &[bool],
+    ) -> Result<()> {
+        self.keys.push(key);
+        self.timestamps.push(timestamp);
+        self.deleted.push(deleted);
+        for (col_idx, bytes) in col_raw.iter().enumerate() {
+            // Explicit NULL flag wins; fall back to byte-inference for any
+            // column type the caller didn't cover (defensive).
+            let inferred = match self.column_tags.get(col_idx) {
+                Some(crate::storage::lsm::columnar::ColumnTypeTag::Vector) => {
+                    bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == 0
+                }
+                Some(crate::storage::lsm::columnar::ColumnTypeTag::Spatial) => {
+                    bytes.len() >= 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == 0
+                }
+                _ => false,
+            };
+            let is_null = col_nulls.get(col_idx).copied().unwrap_or(inferred);
+            self.null_flags[col_idx].push(is_null);
+            self.column_buffers[col_idx].extend_from_slice(bytes);
+        }
+        self.num_rows += 1;
+        Ok(())
+    }
+
     pub fn add_row(
         &mut self,
         key: u64,
@@ -1483,24 +1522,30 @@ impl ColumnarSSTableBuilder {
                 seg.extend_from_slice(raw);
             } else if matches!(tag, ColumnTypeTag::Text) {
                 // Text segment: [null_bitmap] [offsets] [string_data]
-                // Raw buffer format: [(len: u16 LE, bytes)] repeated
+                // Raw buffer format: [(len: u16 LE, bytes)] repeated.
+                // Use the authoritative null_flags (tracked at add_values time)
+                // rather than the 0xFFFF in-band sentinel, so NULLs are preserved
+                // regardless of how the raw bytes were encoded (dedup re-add,
+                // raw merge, etc.).
                 let mut nulls = vec![0u8; null_bytes];
                 let mut offsets = Vec::with_capacity((num_rows + 1) * 4);
                 let mut str_data = Vec::new();
                 let mut current_offset = 0u32;
+                let null_flags = &self.null_flags[col_idx];
 
                 let mut pos = 0usize;
                 for row_idx in 0..num_rows {
                     if pos + 2 > raw.len() { break; }
                     let len = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
                     pos += 2;
-                    // 🔑 0xFFFF = NULL sentinel (distinguished from empty string
-                    // len=0). Only mark NULL for the sentinel; empty strings are
-                    // valid data (offset start==end, no bytes).
-                    let is_null = len == 0xFFFF;
+                    let is_null = null_flags.get(row_idx).copied().unwrap_or(false)
+                        || len == 0xFFFF; // also catch legacy sentinel bytes
                     if is_null {
                         nulls[row_idx / 8] |= 1 << (row_idx % 8);
                         offsets.push(current_offset);
+                        // NULL rows have no string data; skip their bytes (len
+                        // is 0xFFFF sentinel or 0 for an empty-but-flagged NULL).
+                        if len != 0xFFFF { pos += len; }
                         continue;
                     }
                     offsets.push(current_offset);
@@ -1749,14 +1794,6 @@ mod tests {
         let col_sst = ColumnarSSTable::open(&path).unwrap();
         assert_eq!(col_sst.num_rows, 4);
         assert_eq!(col_sst.column_tags.len(), 4);
-
-        // DEBUG: check offsets
-        eprintln!("File size: {}", std::fs::metadata(&path).unwrap().len());
-        for (i, entry) in col_sst.column_index.iter().enumerate() {
-            eprintln!("  col {}: offset={}, size={}", i, entry.offset, entry.size);
-        }
-        eprintln!("RowMap num_rows={}, data_offset={}", col_sst.row_map.num_rows,
-            match &col_sst.row_map.data { crate::storage::lsm::columnar::SegData::Mmap { offset, .. } => *offset, _ => 0 });
 
         // Check row map
         assert_eq!(col_sst.row_map.key(0), 1);
