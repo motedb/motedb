@@ -182,12 +182,28 @@ impl ColSegmentStore {
     /// Point lookup: newest segment first, return first hit.
     /// Uses per-segment column decode cache — first access decompresses each
     /// column once, subsequent lookups (incl. other keys) reuse the cache.
+    ///
+    /// 🔑 Tombstone-aware: if a segment contains the key but it's deleted
+    /// (tombstone), we STOP searching — the deletion suppresses older live
+    /// versions in older segments. Previously `get_row_cached` returned None
+    /// for a tombstoned key, indistinguishable from "key not in segment", so
+    /// `get` fell through to an older segment holding the live row and
+    /// returned stale data after a DELETE.
     pub fn get(&self, key: u64) -> Option<Vec<Value>> {
         let segs = self.segments.read();
         for seg in segs.iter().rev() {
-            if let Some(row) = seg.get_row_cached(key, &self.col_types) {
-                return Some(row);
+            // Check if this segment contains the key at all.
+            if let Some(idx) = seg.sst.row_map.find_key(key) {
+                // Key is in this segment. If deleted, it's a tombstone — the
+                // newest version of this key is a deletion, so return None
+                // regardless of older segments.
+                if seg.sst.row_map.is_deleted(idx) {
+                    return None;
+                }
+                // Live row: decode and return.
+                return seg.get_row_cached(key, &self.col_types);
             }
+            // Key not in this segment — continue to older segments.
         }
         None
     }

@@ -4150,7 +4150,7 @@ impl QueryExecutor {
                     if let Expr::Column(filter_col) = expr.as_ref() {
                         if let Expr::Literal(Value::Text(pattern_val)) = pattern.as_ref() {
                             let pat = pattern_val.as_str();
-                            if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                            if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') && !pat[..pat.len()-1].contains('_') {
                                 let prefix = &pat[..pat.len()-1];
                                 if let Some(filter_pos) = schema.get_column_position(filter_col) {
                                     if let Some(col_sst) = self.db.columnar_sstables.get(table) {
@@ -4756,10 +4756,24 @@ impl QueryExecutor {
                     let ncol = schema.columns.len();
                     enum SortKey { Col(usize), Expr(Expr) }
                     let sort_plan: Vec<(SortKey, bool)> = ob.iter().map(|oe| {
-                        let bare_col = if let crate::sql::ast::Expr::Column(cn) = &oe.expr {
-                            let b = cn.rsplit('.').next().unwrap_or(cn);
-                            schema.get_column_position(b)
-                        } else { None };
+                        let bare_col = match &oe.expr {
+                            crate::sql::ast::Expr::Column(cn) => {
+                                let b = cn.rsplit('.').next().unwrap_or(cn);
+                                schema.get_column_position(b)
+                            }
+                            // ORDER BY column position (1-based, references
+                            // SELECT output columns). Resolve to schema position
+                            // via the select positions map.
+                            crate::sql::ast::Expr::Literal(Value::Integer(n)) => {
+                                let pos_1based = *n as usize;
+                                if pos_1based == 0 || pos_1based > out_positions.len() {
+                                    None
+                                } else {
+                                    Some(out_positions[pos_1based - 1])
+                                }
+                            }
+                            _ => None,
+                        };
                         match bare_col {
                             Some(p) => (SortKey::Col(p), oe.asc),
                             None => (SortKey::Expr(oe.expr.clone()), oe.asc),
@@ -4915,7 +4929,7 @@ impl QueryExecutor {
                 match (expr.as_ref(), pattern.as_ref()) {
                     (Expr::Column(cn), Expr::Literal(Value::Text(s))) => {
                         let pat = s.as_str();
-                        if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                        if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') && !pat[..pat.len()-1].contains('_') {
                             let prefix = pat[..pat.len()-1].to_string();
                             let pos = schema.get_column_position(cn).unwrap_or(0);
                             (Some(pos), Box::new(move |fv: Option<&Value>| {
@@ -4948,7 +4962,7 @@ impl QueryExecutor {
         if let Expr::Like { expr, pattern, negated: false } = wc {
             if let (Expr::Column(cn), Expr::Literal(Value::Text(s))) = (expr.as_ref(), pattern.as_ref()) {
                 let pat = s.as_str();
-                if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') && !pat[..pat.len()-1].contains('_') {
                     let prefix = pat[..pat.len()-1].to_string();
                     if let Some(fc) = schema.get_column_position(cn) {
                         if matches!(col_types.get(fc), Some(ColumnType::Text)) {
@@ -5006,7 +5020,7 @@ impl QueryExecutor {
                         match (expr.as_ref(), pattern.as_ref()) {
                             (Expr::Column(_), Expr::Literal(Value::Text(s))) => {
                                 let pat = s.to_string();
-                                if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') {
+                                if pat.ends_with('%') && !pat[..pat.len()-1].contains('%') && !pat[..pat.len()-1].contains('_') {
                                     let prefix = pat[..pat.len()-1].to_string();
                                     Box::new(move |sv: Option<&str>| sv.map(|s| s.starts_with(&prefix)).unwrap_or(false))
                                 } else {
@@ -7848,14 +7862,28 @@ impl QueryExecutor {
 
         // Build hash table on the smaller side (right) keyed by join column value.
         use std::collections::HashMap;
-        // Hash key: use a simple u64 representation for numeric columns,
-        // or string for Text columns.
+        // Hash key: numeric values share a Numeric variant so that Integer
+        // and Float values that are numerically equal match in joins.
+        // Small integers (within f64 exact range) are converted to f64 bits
+        // to match Float columns; large integers preserve full 64-bit range.
         #[derive(Hash, PartialEq, Eq)]
-        enum JoinKey { Int(i64), Float(u64), Text(String), Bool(bool) }
+        enum JoinKey {
+            Numeric(u64),  // f64::to_bits() for Float and small Integer (< 2^53)
+            Integer(u64),  // i64 wrapped to u64 for large Integer, preserves full range
+            Text(String),
+            Bool(bool),
+        }
         fn to_key(v: &Value) -> Option<JoinKey> {
             match v {
-                Value::Integer(i) => Some(JoinKey::Int(*i)),
-                Value::Float(f) => Some(JoinKey::Float(f.to_bits())),
+                Value::Integer(i) => {
+                    const EXACT_MAX: i64 = 1i64 << 53; // 2^53, max exact i64 in f64
+                    if *i >= -EXACT_MAX && *i <= EXACT_MAX {
+                        Some(JoinKey::Numeric((*i as f64).to_bits()))
+                    } else {
+                        Some(JoinKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
+                Value::Float(f) => Some(JoinKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(JoinKey::Text(s.to_string())),
                 Value::Bool(b) => Some(JoinKey::Bool(*b)),
                 _ => None,
@@ -9592,7 +9620,12 @@ impl QueryExecutor {
     fn select_has_computed_expression(columns: &[SelectColumn]) -> bool {
         columns.iter().any(|col| match col {
             SelectColumn::Star | SelectColumn::Column(_) | SelectColumn::ColumnWithAlias(_, _) => false,
-            SelectColumn::Expr(expr, _) => !matches!(expr, Expr::Column(_) | Expr::Literal(_)),
+            // Any Expr that isn't a bare Column requires eval_expr_on_row —
+            // including literals (SELECT NULL, id) and function calls. These
+            // can't be served by the zero-copy SelectColumnar path (raw columns
+            // only), so they must route to the projected-scan fallback which
+            // evaluates expressions per row.
+            SelectColumn::Expr(expr, _) => !matches!(expr, Expr::Column(_)),
         })
     }
 
@@ -11802,9 +11835,13 @@ impl QueryExecutor {
                     .ok_or_else(|| MoteDBError::ColumnNotFound(stmt.column.clone()))?;
                 let mut backfill_count = 0;
 
-                if let Ok(count) = self.db.build_ioctree_from_columnar(&index_name, &stmt.table, column_pos) {
-                    backfill_count = count;
-                } else {
+                // Columnar fast path returns Ok(0) for ColSegmentStore-backed tables
+                // (not in legacy columnar_sstables); in that case fall back to row scan.
+                match self.db.build_ioctree_from_columnar(&index_name, &stmt.table, column_pos) {
+                    Ok(count) if count > 0 => {
+                        backfill_count = count;
+                    }
+                    _ => {
                 let iter = self.db.scan_table_rows_streaming(&stmt.table)?;
                 for result in iter {
                     let (row_id, row) = result?;
@@ -11816,6 +11853,7 @@ impl QueryExecutor {
                         }
                     }
                 }
+                    }
                 }
 
                 if backfill_count > 0 {

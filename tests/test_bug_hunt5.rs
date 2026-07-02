@@ -642,9 +642,12 @@ fn test_fast_update_add_overflow() {
     assert!(result.is_ok(), "UPDATE with overflow should not panic");
     let r = rows(&db, "SELECT val FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    // The value should be something large (either float or wrapped integer)
+    // The value should be something large (either float or wrapped integer).
+    // Note: i64::MAX as f64 rounds to exactly 2^63, so the overflow-promoted
+    // value equals i64::MAX as f64. Compare with >= (not >) — at this magnitude
+    // f64's ULP is 2048, so subtracting 200 is a no-op and would never pass.
     match &r[0][0] {
-        Value::Float(f) => assert!(*f > i64::MAX as f64 - 200.0, "should be large float"),
+        Value::Float(f) => assert!(*f >= i64::MAX as f64, "should be large float, got {}", f),
         Value::Integer(_) => { /* wrapped or checked result */ }
         _ => panic!("Expected numeric"),
     }
