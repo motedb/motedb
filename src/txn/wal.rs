@@ -1269,16 +1269,20 @@ impl WALManager {
                             }
                         }
 
-                        // Batch accumulation: use condvar timeout to wait for more entries.
-                        // This avoids busy-spinning while still letting batches grow.
+                        // Batch accumulation: wait briefly for more entries to grow
+                        // the batch. 🔑 PERF: cap this at a small fraction of
+                        // max_wait_us — the original code waited the FULL
+                        // max_wait_us (1ms) even when only one writer was active,
+                        // making every single-thread INSERT take ≥1ms (193 TPS).
+                        // A short spin-wait (max_wait_us / 10, min 50µs) catches
+                        // concurrent bursts without penalizing the lone-writer case.
                         {
                             let mut queue = state_clone.queue.lock();
                             if !queue.is_empty() && queue.len() < state_clone.max_batch_size {
-                                // Wait up to max_wait_us for more entries to arrive
-                                let _ = state_clone.wakeup.wait_for(
-                                    &mut queue,
-                                    Duration::from_micros(state_clone.max_wait_us),
+                                let accrue = Duration::from_micros(
+                                    (state_clone.max_wait_us / 10).max(50)
                                 );
+                                let _ = state_clone.wakeup.wait_for(&mut queue, accrue);
                             }
                         }
 

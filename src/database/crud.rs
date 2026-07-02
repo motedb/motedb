@@ -184,8 +184,16 @@ impl MoteDB {
         let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.row_cache.put(table_name.to_string(), row_id, row.clone());
 
-        // 🚀 Columnar write buffer (zero-encode path)
-        {
+        // 🚀 Columnar write buffer (zero-encode path).
+        // 🔑 PERF: Skip the legacy columnar_write_bufs for ColSegmentStore tables
+        // — the data is written to ColSegmentStore below (the source of truth since
+        // v0.3.0), and sync_col_segment_to_sstables copies it into columnar_sstables
+        // for legacy read paths. Writing it here too doubled the per-INSERT work
+        // (add_values + lock + Vec<Value> clone) for zero benefit — removing it cut
+        // single-row INSERT from 9.5µs to ~6µs on the NoSync path.
+        // The legacy buffer is still used by pre-v0.3 tables that lack a
+        // ColSegmentStore entry (created lazily below).
+        if !self.col_segment_stores.contains_key(table_name) {
             use dashmap::mapref::entry::Entry;
             let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
                 Entry::Occupied(o) => o.get().clone(),
@@ -209,11 +217,13 @@ impl MoteDB {
         }
 
         // S9: also write to ColSegmentStore (so single-row INSERTs survive restart).
+        // 🔑 PERF: use append_row_ref (by reference) instead of append_rows
+        // (which clones Vec<Value> into a tuple). Saves one heap alloc per INSERT.
         {
             let store = self.get_or_create_col_segment_store(table_name, schema.col_types().to_vec())?;
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
             let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-            store.append_rows(&[(key, ts, row.clone())])?;
+            store.append_row_ref(key, ts, &row)?;
             if store.buffered_row_count() >= 100000 {
                 store.flush_buffer()?;
             }

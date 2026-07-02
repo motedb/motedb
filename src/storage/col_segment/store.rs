@@ -94,6 +94,19 @@ impl ColSegmentStore {
         Ok(())
     }
 
+    /// Append a single row by reference — avoids the Vec<Value> clone that
+    /// append_rows requires (it takes &[(.., Vec<Value>)]). This is the hot
+    /// path for single-row INSERT (saves one heap allocation per INSERT).
+    pub fn append_row_ref(&self, key: u64, ts: u64, row: &[Value]) -> Result<()> {
+        self.groupby_cache.write().clear();
+        self.in_hash_cache.write().clear();
+        let mut buf = self.write_buf.lock();
+        buf.add_values(key, ts, false, row)?;
+        drop(buf);
+        // Auto-compaction disabled — can deadlock with merge_segments.
+        Ok(())
+    }
+
     /// Append a tombstone (deletion marker) for a key. The tombstone suppresses
     /// the row in multi-segment scans (newest-version-wins with deleted=true).
     /// 🔥 Stability: auto-compacts when segments exceed threshold.
@@ -983,10 +996,17 @@ impl ColSegmentStore {
             if !seg.sst.row_map.has_any_deleted() {
                 return seg.sst.num_rows;
             }
+            // Single segment with deletions: count non-deleted rows directly
+            // (O(n) scan of the row_map, no HashMap allocation).
+            let mut count = 0usize;
+            for i in 0..seg.sst.num_rows {
+                if !seg.sst.row_map.is_deleted(i) { count += 1; }
+            }
+            return count;
         }
         drop(buf);
 
-        // Slow path: multi-segment or has UPDATE/DELETE history.
+        // Slow path: multi-segment with UPDATE/DELETE history.
         // Newest-version-wins across buffer + segments.
         let mut liveness: std::collections::HashMap<u64, bool> = {
             let buf = self.write_buf.lock();
