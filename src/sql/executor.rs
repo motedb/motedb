@@ -4273,6 +4273,43 @@ impl QueryExecutor {
             _ => None,
         };
 
+        // 🚀 IN-subquery PK index fast path: WHERE pk_col IN (v1, v2, ...)
+        // When the filter column is the PK and a column index exists, do K
+        // index lookups (O(K log N)) instead of scanning all N rows.
+        // This is the semi-join optimization: the IN list (from a resolved
+        // subquery) drives index lookups rather than a full table scan.
+        if let Some((col_pos, ref set)) = in_hashset {
+            let pk_name = schema.primary_key();
+            let is_pk_col = pk_name.as_ref()
+                .and_then(|pk| schema.get_column_position(pk))
+                .map(|pk_pos| pk_pos == col_pos)
+                .unwrap_or(false);
+            if is_pk_col && set.len() <= 1000 {
+                let index_name = format!("{}.{}", table, schema.columns[col_pos].name);
+                if let Some(index) = self.db.column_indexes.get(&index_name) {
+                    let idx = index.value();
+                    let mut all_row_ids: Vec<RowId> = Vec::new();
+                    for v in set {
+                        if let Ok(ids) = idx.get(v) {
+                            all_row_ids.extend(ids);
+                        }
+                    }
+                    if !all_row_ids.is_empty() {
+                        let batch = self.db.get_table_rows_batch(table, &all_row_ids)?;
+                        let result_rows: Vec<Vec<Value>> = batch.into_iter()
+                            .filter_map(|(_, row_opt)| row_opt)
+                            .map(|row| {
+                                Self::project_row_direct(&row, &stmt.columns, &columns, schema)
+                            })
+                            .collect();
+                        return Ok(StreamingQueryResult::SelectReady { columns, rows: result_rows });
+                    }
+                    // No matches in index → empty result.
+                    return Ok(StreamingQueryResult::SelectReady { columns, rows: vec![] });
+                }
+            }
+        }
+
         // 🆕 Projected + filtered scan: decode only filter col + output cols,
         // avoiding full-row Vec<Value> decode for non-matches (the dominant
         // cost — was 68-197ms for 300K rows; pure column read is <2ms).
