@@ -189,8 +189,10 @@ fn test_integer_overflow_add() {
             let r = row(&db, "SELECT a FROM t WHERE id = 1");
             match &r[0] {
                 Value::Float(f) => {
-                    // Overflow-to-f64 is acceptable: > i64::MAX
-                    assert!(*f > i64::MAX as f64, "Float result {} should be > i64::MAX", f);
+                    // Overflow-to-f64 is acceptable. i64::MAX + 1 as f64 equals
+                    // i64::MAX as f64 (both round to 2^63 — f64 ULP at this
+                    // magnitude is 2048), so compare with >= not >.
+                    assert!(*f >= i64::MAX as f64, "Float result {} should be >= i64::MAX as f64", f);
                 }
                 Value::Integer(i) => {
                     // Should NOT wrap to negative or be a small value
