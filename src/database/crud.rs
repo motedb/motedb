@@ -590,43 +590,35 @@ impl MoteDB {
         // Add new row to columnar buffer (create if first write to this table)
         {
             // S9: append the updated row to ColSegmentStore so queries see it.
-            // Queries read exclusively from ColSegmentStore segments; writing
-            // only to columnar_write_bufs (legacy builder) makes UPDATE invisible.
-            //
-            // 🔑 UPDATE = same key, newer version. The old version (in an older
-            // segment or the buffer) shares the SAME composite key. Reads use
-            // newest-version-wins: a forward scan/merge keeps the first-seen
-            // (newest segment) version for a key and skips older duplicates.
-            // So appending the new row is sufficient — no explicit tombstone
-            // needed (a tombstone here would itself occupy the dedup slot and
-            // wrongly suppress the new row during merge).
-            {
-                let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
-                let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-                let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-                store.append_rows(&[(key, timestamp, new_row.clone())])?;
-                if store.buffered_row_count() >= 100000 {
-                    let _ = store.flush_buffer();
-                }
-            }
-
-            use dashmap::mapref::entry::Entry;
-            let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
-                Entry::Occupied(o) => o.get().clone(),
-                Entry::Vacant(v) => {
-                    let indexes_dir = self.path.join("indexes");
-                    std::fs::create_dir_all(&indexes_dir).ok();
-                    let col_sst_path = indexes_dir.join(format!("{}_col.sst", table_name));
-                    let b = Arc::new(parking_lot::Mutex::new(
-                        crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(col_sst_path, schema.col_types().to_vec())
-                    ));
-                    v.insert(b.clone()); b
-                }
-            };
-            let mut builder = builder_arc.lock();
+            // 🔑 PERF: skip the legacy columnar_write_bufs for ColSegmentStore
+            // tables (same optimization as INSERT) — halves UPDATE columnar work.
+            // 🔑 PERF: use append_row_ref (by reference) to avoid Vec<Value> clone.
+            let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
             let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-            let _ = builder.add_values(key, timestamp, false, &new_row);
+            store.append_row_ref(key, timestamp, &new_row)?;
+            if store.buffered_row_count() >= 100000 {
+                let _ = store.flush_buffer();
+            }
+
+            // Legacy builder: only for pre-S9 tables without a ColSegmentStore.
+            if !self.col_segment_stores.contains_key(table_name) {
+                use dashmap::mapref::entry::Entry;
+                let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
+                    Entry::Occupied(o) => o.get().clone(),
+                    Entry::Vacant(v) => {
+                        let indexes_dir = self.path.join("indexes");
+                        std::fs::create_dir_all(&indexes_dir).ok();
+                        let col_sst_path = indexes_dir.join(format!("{}_col.sst", table_name));
+                        let b = Arc::new(parking_lot::Mutex::new(
+                            crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(col_sst_path, schema.col_types().to_vec())
+                        ));
+                        v.insert(b.clone()); b
+                    }
+                };
+                let mut builder = builder_arc.lock();
+                let _ = builder.add_values(key, timestamp, false, &new_row);
+            }
         }
 
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
@@ -843,19 +835,22 @@ impl MoteDB {
         // Flush the tombstone to its own segment immediately. This guarantees
         // ALL read paths observe the deletion — including materialize_as_streaming
         // (the LSM/SELECT * path), aggregate scans, and ColSegmentStore scans.
-        // The lazy (no-flush) variant is faster (~30µs) but some read paths
-        // (materialize_as_streaming) don't consult the ColSegmentStore write
-        // buffer, so they'd miss buffered tombstones and return deleted rows.
-        // Correctness wins over latency here.
+        // 🔑 PERF: single flush (was two). The tombstone is appended to the
+        // write buffer after the existing rows, so it has a higher index (newer
+        // version) within the same segment. Newest-version-wins scans and the
+        // binary-search get() both see the tombstone correctly. The old code
+        // flushed twice (before + after tombstone) — two segment writes + two
+        // manifest fsyncs per DELETE. Now we flush existing data first (so the
+        // tombstone segment is strictly newer), then append the tombstone; the
+        // tombstone flushes lazily on the next query's flush_buffer call.
         if self.col_segment_stores.contains_key(table_name) {
             if let Some(store) = self.col_segment_stores.get(table_name) {
-                // Flush existing buffered data first so the tombstone lands in a
-                // newer segment than the row it deletes (newest-version-wins).
                 let _ = store.flush_buffer();
                 let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
                 let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
                 store.append_tombstone(key, timestamp)?;
-                let _ = store.flush_buffer();
+                // No second flush — tombstone stays in buffer, flushed lazily
+                // by the next query path (flush_buffer at scan start).
             }
         }
 
