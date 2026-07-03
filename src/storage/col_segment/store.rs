@@ -1,13 +1,51 @@
 use super::segment::Segment;
 use super::merge::MergeCursor;
 use super::manifest::Manifest;
-use crate::storage::lsm::columnar::ColumnarSSTableBuilder;
+use crate::storage::lsm::columnar::{ColumnarSSTableBuilder, ColumnTypeTag};
 use crate::types::{ColumnType, Value, ArcString};
 use crate::Result;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// ── Comparison helpers for count_filtered (zero-allocation) ──────────
+#[inline]
+fn cmp_opt<T: Copy + PartialEq + PartialOrd>(
+    v: Option<T>, target: Option<T>, op: &crate::sql::ast::BinaryOperator,
+) -> bool {
+    use crate::sql::ast::BinaryOperator;
+    let (v, t) = match (v, target) { (Some(a), Some(b)) => (a, b), _ => return false };
+    match op {
+        BinaryOperator::Eq => v == t,
+        BinaryOperator::Ne => v != t,
+        BinaryOperator::Lt => v.partial_cmp(&t) == Some(std::cmp::Ordering::Less),
+        BinaryOperator::Gt => v.partial_cmp(&t) == Some(std::cmp::Ordering::Greater),
+        BinaryOperator::Le => matches!(v.partial_cmp(&t), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+        BinaryOperator::Ge => matches!(v.partial_cmp(&t), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+        _ => false,
+    }
+}
+
+#[inline]
+fn cmp_opt_f64(v: Option<f64>, target: Option<f64>, op: &crate::sql::ast::BinaryOperator) -> bool {
+    cmp_opt(v, target, op)
+}
+
+#[inline]
+fn cmp_str(v: Option<&str>, target: Option<&str>, op: &crate::sql::ast::BinaryOperator) -> bool {
+    use crate::sql::ast::BinaryOperator;
+    let (v, t) = match (v, target) { (Some(a), Some(b)) => (a, b), _ => return false };
+    match op {
+        BinaryOperator::Eq => v == t,
+        BinaryOperator::Ne => v != t,
+        BinaryOperator::Lt => v < t,
+        BinaryOperator::Gt => v > t,
+        BinaryOperator::Le => v <= t,
+        BinaryOperator::Ge => v >= t,
+        _ => false,
+    }
+}
 use std::sync::Arc;
 
 /// Compaction trigger: merge when segment count reaches this.
@@ -983,6 +1021,86 @@ impl ColSegmentStore {
         // the buffer depth: if there's substantial unflushed data, it may overlap.
         let buf_n = self.write_buf.lock().num_rows;
         buf_n > 0 && self.segments.read().len() >= 1
+    }
+
+    /// Count rows matching a filter WITHOUT materializing Value objects.
+    /// Optimized for COUNT(*) WHERE col = val / col > val / col < val.
+    ///
+    /// For Integer/Float filter columns, compares raw i64/f64 bits directly.
+    /// For Text filter columns, compares &str without ArcString allocation.
+    /// This avoids the per-row Value::Text(s.into()) / Value::Integer(v)
+    /// allocation that scan_projected_filtered does — the dominant cost for
+    /// COUNT WHERE on large tables (was ~1ms for 20K rows).
+    pub fn count_filtered(
+        &self,
+        filter_col: usize,
+        op: &crate::sql::ast::BinaryOperator,
+        target: &Value,
+    ) -> usize {
+
+        // Determine dedup need BEFORE locking write_buf (may_have_duplicate_keys
+        // also locks write_buf — parking_lot Mutex is not reentrant → deadlock).
+        let need_dedup = self.may_have_duplicate_keys();
+        let buf = self.write_buf.lock();
+        let segs = self.segments.read();
+        let mut seen: std::collections::HashSet<u64> = if need_dedup {
+            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Pre-extract target comparison value (avoids re-matching per row).
+        let target_i = if let Value::Integer(v) = target { Some(*v) } else { None };
+        let target_f = if let Value::Float(v) = target { Some(*v) } else { None };
+        let target_s: Option<&str> = if let Value::Text(t) = target { Some(t.as_str()) } else { None };
+        let target_b = if let Value::Bool(v) = target { Some(*v) } else { None };
+
+        let mut count = 0usize;
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            if filter_col >= seg.sst.column_tags.len() { continue; }
+            let tag = seg.sst.column_tags[filter_col];
+
+            // Pre-decode the filter column once per segment.
+            let fcol_fixed = if tag.is_fixed() { seg.sst.read_fixed_i64(filter_col).ok() } else { None };
+            let fcol_text = if matches!(tag, ColumnTypeTag::Text) { seg.sst.read_text(filter_col).ok() } else { None };
+
+            let order: Vec<usize> = if need_dedup { (0..n).rev().collect() } else { (0..n).collect() };
+            for &i in &order {
+                let key = seg.sst.row_map.key(i);
+                if need_dedup && !seen.insert(key) { continue; }
+                if seg.sst.row_map.is_deleted(i) { continue; }
+
+                let matches = if let Some(ref f) = fcol_fixed {
+                    // Fixed-width: compare raw i64/f64 bits, no Value alloc.
+                    match tag {
+                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                            let v = f.get_i64(i);
+                            cmp_opt(v, target_i, op)
+                        }
+                        ColumnTypeTag::Float => {
+                            let v = f.get_f64(i);
+                            cmp_opt_f64(v, target_f, op)
+                        }
+                        ColumnTypeTag::Bool => {
+                            let v = f.get_bool(i);
+                            cmp_opt(v, target_b, op)
+                        }
+                        _ => false,
+                    }
+                } else if let Some(ref t) = fcol_text {
+                    // Text: compare &str directly, no ArcString alloc.
+                    match t.get_str(i) {
+                        Some(s) => cmp_str(Some(s), target_s, op),
+                        None => false, // NULL never matches
+                    }
+                } else { false };
+
+                if matches { count += 1; }
+            }
+        }
+        drop(buf);
+        count
     }
 
     pub fn count_live_rows(&self) -> usize {

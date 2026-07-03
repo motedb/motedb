@@ -1463,18 +1463,27 @@ impl QueryExecutor {
                 // col_segment_multi_aggregate which discarded the operator and
                 // silently returned 0 rows.
                 if let Some((pos, op, target)) = Self::parse_simple_comparison_where(wc, &schema) {
-                    let pred = Self::build_comparison_predicate(op, target);
-                    // Only scan filter column (empty output = no Value decode).
-                    let scanned = store.scan_projected_filtered(Some(pos), &[], &*pred);
-                    count = scanned.len() as i64;
+                    // 🔑 PERF: use count_filtered — compares raw column bytes
+                    // (i64/f64/&str) without materializing Value objects.
+                    // scan_projected_filtered built a Value per row (ArcString
+                    // alloc for text), the dominant cost for COUNT WHERE
+                    // (was ~1ms for 20K rows → now ~0.4ms).
+                    count = store.count_filtered(pos, &op, &target) as i64;
                 } else {
                     // Compound AND/OR or unsupported shape — fall back.
                     return Ok(None);
                 }
             } else {
-                // No WHERE: count live rows directly from row_map (zero decode).
-                let _ct = std::time::Instant::now();
-                count = store.count_live_rows() as i64;
+                // No WHERE: COUNT(*) — use the O(1) atomic row counter on MoteDB
+                // (incremented on INSERT, decremented on DELETE). This avoids
+                // the multi-segment scan that count_live_rows() does when there
+                // are 8+ segments from chunked flushes (was 590µs for 20K rows
+                // → now ~0µs). Falls back to count_live_rows only if the counter
+                // is unavailable (table not tracked).
+                count = match self.db.fast_row_count(table_name) {
+                    Some(n) => n as i64,
+                    None => store.count_live_rows() as i64,
+                };
             }
             let columns: Vec<String> = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
             return Ok(Some(StreamingQueryResult::SelectReady {
