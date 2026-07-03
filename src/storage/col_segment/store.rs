@@ -9,6 +9,20 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Result of a single-pass aggregate scan (SUM/AVG/MIN/MAX/COUNT).
+/// Computed without per-row Value allocation.
+#[derive(Default, Clone)]
+pub struct AggregateResult {
+    pub count: i64,
+    pub int_sum: i64,
+    pub float_sum: f64,
+    pub has_float: bool,
+    pub min_int: i64,
+    pub max_int: i64,
+    pub min_float: f64,
+    pub max_float: f64,
+}
+
 // ── Comparison helpers for count_filtered (zero-allocation) ──────────
 #[inline]
 fn cmp_opt<T: Copy + PartialEq + PartialOrd>(
@@ -1101,6 +1115,102 @@ impl ColSegmentStore {
         }
         drop(buf);
         count
+    }
+
+    /// Single-pass aggregate over a filtered column — computes COUNT/SUM/AVG/
+    /// MIN/MAX in one scan without materializing Value objects per row.
+    /// Returns (count, int_sum, float_sum, has_float, min_int, max_int,
+    /// min_float, max_float). The caller picks the relevant fields per aggregate.
+    ///
+    /// 🔑 PERF: scan_projected_filtered materialized a Vec<Value> per row then
+    /// did multi-pass collect()+sum(). This folds directly over raw i64/f64
+    /// column bytes — zero per-row allocation, single pass.
+    pub fn aggregate_filtered(
+        &self,
+        filter_col: Option<usize>,
+        agg_col: usize,
+        op: &crate::sql::ast::BinaryOperator,
+        target: &Value,
+    ) -> AggregateResult {
+        let need_dedup = self.may_have_duplicate_keys();
+        let segs = self.segments_snapshot();
+        let mut seen: std::collections::HashSet<u64> = if need_dedup {
+            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
+        } else {
+            std::collections::HashSet::new()
+        };
+        // Pre-extract filter target for comparison.
+        let target_i = if let Value::Integer(v) = target { Some(*v) } else { None };
+        let target_f = if let Value::Float(v) = target { Some(*v) } else { None };
+        let target_s: Option<&str> = if let Value::Text(t) = target { Some(t.as_str()) } else { None };
+        let no_filter = filter_col.is_none();
+        let fc = filter_col.unwrap_or(0);
+
+        let mut result = AggregateResult::default();
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            if agg_col >= seg.sst.column_tags.len() { continue; }
+            // Pre-decode filter + aggregate columns once per segment.
+            let fcol_fixed = if !no_filter && fc < seg.sst.column_tags.len() && seg.sst.column_tags[fc].is_fixed() {
+                seg.sst.read_fixed_i64(fc).ok()
+            } else { None };
+            let fcol_text = if !no_filter && fc < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[fc], ColumnTypeTag::Text) {
+                seg.sst.read_text(fc).ok()
+            } else { None };
+            let agg_fixed = if seg.sst.column_tags[agg_col].is_fixed() {
+                seg.sst.read_fixed_i64(agg_col).ok()
+            } else { None };
+            let agg_is_float = matches!(self.col_types.get(agg_col), Some(ColumnType::Float));
+
+            let order: Vec<usize> = if need_dedup { (0..n).rev().collect() } else { (0..n).collect() };
+            for &i in &order {
+                let key = seg.sst.row_map.key(i);
+                if need_dedup && !seen.insert(key) { continue; }
+                if seg.sst.row_map.is_deleted(i) { continue; }
+
+                // Apply filter predicate (zero-alloc, same as count_filtered).
+                let passes = if no_filter {
+                    true
+                } else if let Some(ref f) = fcol_fixed {
+                    match seg.sst.column_tags[fc] {
+                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => cmp_opt(f.get_i64(i), target_i, op),
+                        ColumnTypeTag::Float => cmp_opt_f64(f.get_f64(i), target_f, op),
+                        ColumnTypeTag::Bool => {
+                            let tb = target_i.map(|i| i != 0);
+                            cmp_opt(f.get_bool(i), tb, op)
+                        }
+                        _ => false,
+                    }
+                } else if let Some(ref t) = fcol_text {
+                    cmp_str(t.get_str(i), target_s, op)
+                } else { false };
+
+                if !passes { continue; }
+
+                // Fold aggregate value directly (no Value construction).
+                // 🔑 COUNT(col)/SUM/AVG/MIN/MAX all skip NULLs — only count
+                // when the value is present (get_i64/get_f64 return None for NULL).
+                if let Some(ref af) = agg_fixed {
+                    if agg_is_float {
+                        if let Some(v) = af.get_f64(i) {
+                            result.count += 1;
+                            result.float_sum += v;
+                            result.has_float = true;
+                            if result.count == 1 { result.min_float = v; result.max_float = v; }
+                            else { result.min_float = result.min_float.min(v); result.max_float = result.max_float.max(v); }
+                        }
+                    } else {
+                        if let Some(v) = af.get_i64(i) {
+                            result.count += 1;
+                            result.int_sum = result.int_sum.wrapping_add(v);
+                            if result.count == 1 { result.min_int = v; result.max_int = v; }
+                            else { result.min_int = result.min_int.min(v); result.max_int = result.max_int.max(v); }
+                        }
+                    }
+                }
+            }
+        }
+        result
     }
 
     pub fn count_live_rows(&self) -> usize {

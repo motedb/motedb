@@ -1736,6 +1736,7 @@ impl QueryExecutor {
         }
         if aggs.is_empty() { return Ok(None); }
 
+
         // 🚀 Fast path: COUNT + SUM/MIN/MAX WHERE text_col = 'val' — direct column
         // scan without Vec<Value> construction. Avoids 100K allocations + 30MB memory.
         if let Some(ref wc) = stmt.where_clause {
@@ -1801,6 +1802,60 @@ impl QueryExecutor {
                 let (fc, _, _) = comparisons[0].clone();
                 (Some(fc), comparisons[1..].to_vec())
             };
+
+        // 🔑 PERF: single-pass aggregate fast path. When all aggregates operate
+        // on the same column (or COUNT(*)) with at most a single-column WHERE,
+        // use store.aggregate_filtered — folds SUM/AVG/MIN/MAX/COUNT in one scan
+        // over raw column bytes, zero per-row Value allocation.
+        {
+            let agg_cols: Vec<Option<usize>> = aggs.iter().map(|a| a.col).collect();
+            let single_agg_col = agg_cols.iter().filter_map(|&c| c).next();
+            let all_same_col = agg_cols.iter().all(|&c| match (c, single_agg_col) {
+                (None, _) => true,
+                (Some(a), Some(b)) => a == b,
+                (Some(_), None) => false,
+            });
+            if all_same_col && post_comparisons.is_empty() {
+                if let Some(ac) = single_agg_col {
+                    let (fcol, fop, ftarget) = match comparisons.get(0) {
+                        Some((c, o, t)) => (Some(*c), o.clone(), t.clone()),
+                        None => (None, crate::sql::ast::BinaryOperator::Eq, Value::Null),
+                    };
+                    let agg = store.aggregate_filtered(fcol, ac, &fop, &ftarget);
+                    let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
+                    let mut row: Vec<Value> = Vec::with_capacity(aggs.len());
+                    for a in &aggs {
+                        match a.func.as_str() {
+                            "COUNT" => row.push(Value::Integer(agg.count)),
+                            "SUM" => {
+                                if agg.count == 0 { row.push(Value::Null); }
+                                else if agg.has_float { row.push(Value::Float(agg.float_sum + agg.int_sum as f64)); }
+                                else { row.push(Value::Integer(agg.int_sum)); }
+                            }
+                            "AVG" => {
+                                if agg.count == 0 { row.push(Value::Null); }
+                                else {
+                                    let s = if agg.has_float { agg.float_sum + agg.int_sum as f64 } else { agg.int_sum as f64 };
+                                    row.push(Value::Float(s / agg.count as f64));
+                                }
+                            }
+                            "MIN" => {
+                                if agg.count == 0 { row.push(Value::Null); }
+                                else if agg.has_float { row.push(Value::Float(agg.min_float)); }
+                                else { row.push(Value::Integer(agg.min_int)); }
+                            }
+                            "MAX" => {
+                                if agg.count == 0 { row.push(Value::Null); }
+                                else if agg.has_float { row.push(Value::Float(agg.max_float)); }
+                                else { row.push(Value::Integer(agg.max_int)); }
+                            }
+                            _ => return Ok(None),
+                        }
+                    }
+                    return Ok(Some(StreamingQueryResult::SelectReady { columns, rows: vec![row] }));
+                }
+            }
+        }
 
         let mut scan_cols: Vec<usize> = Vec::new();
         if let Some(fc) = filter_col { scan_cols.push(fc); }
