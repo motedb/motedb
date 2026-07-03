@@ -1030,11 +1030,15 @@ impl ColSegmentStore {
     /// path skip dedup entirely (the v0.5.0 performance fix).
     fn may_have_duplicate_keys(&self) -> bool {
         // The write buffer can hold a newer version of an already-segmented key.
-        // But by the time we scan, ensure_query_visibility() has flushed it, and
-        // flush runs dedup. So a single segment is deduped. Conservatively check
-        // the buffer depth: if there's substantial unflushed data, it may overlap.
+        // Multiple segments can also hold overlapping keys (e.g. an INSERT
+        // segment flushed by auto-checkpoint, then an UPDATE segment from a
+        // later flush — both contain the same composite key with different
+        // values). Conservative: dedup whenever there's buffered data OR 2+
+        // segments. A single compacted segment with empty buffer is the only
+        // safe no-dedup case.
         let buf_n = self.write_buf.lock().num_rows;
-        buf_n > 0 && self.segments.read().len() >= 1
+        let seg_count = self.segments.read().len();
+        buf_n > 0 && seg_count >= 1 || seg_count >= 2
     }
 
     /// Count rows matching a filter WITHOUT materializing Value objects.
@@ -1051,6 +1055,11 @@ impl ColSegmentStore {
         op: &crate::sql::ast::BinaryOperator,
         target: &Value,
     ) -> usize {
+
+        // 🔑 Flush buffered writes (INSERT/UPDATE/DELETE) so they're visible to
+        // the segment scan. Without this, count_filtered only sees persisted
+        // segments and misses buffered updates.
+        let _ = self.flush_buffer();
 
         // Determine dedup need BEFORE locking write_buf (may_have_duplicate_keys
         // also locks write_buf — parking_lot Mutex is not reentrant → deadlock).
@@ -1132,6 +1141,8 @@ impl ColSegmentStore {
         op: &crate::sql::ast::BinaryOperator,
         target: &Value,
     ) -> AggregateResult {
+        // 🔑 Flush buffered writes so they're visible to the segment scan.
+        let _ = self.flush_buffer();
         let need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {

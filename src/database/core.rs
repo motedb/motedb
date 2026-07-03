@@ -1108,6 +1108,14 @@ impl MoteDB {
                     }
                     row_counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
                 }
+                // 🔑 ColSegmentStore tables: data lives in segment files, not LSM.
+                // Recover row count from ColSegmentStore if LSM count is 0.
+                if row_counter.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    if let Some(store) = db.col_segment_stores.get(&table_name) {
+                        let cnt = store.count_live_rows() as u64;
+                        row_counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 db.table_row_count.insert(table_name.clone(), row_counter);
             } else if let Some(pk_col) = schema.primary_key() {
                 // Pre-warm PK lookup cache from SSTable data
@@ -1174,6 +1182,16 @@ impl MoteDB {
             // Set row count from recovered data
             if let Some(counter) = self.table_row_count.get(table_name) {
                 counter.store(count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // 🔑 ColSegmentStore tables: recover row count from segments (LSM is empty).
+        if count == 0 {
+            if let Some(store) = self.col_segment_stores.get(table_name) {
+                let cnt = store.count_live_rows() as u64;
+                if let Some(counter) = self.table_row_count.get(table_name) {
+                    counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
