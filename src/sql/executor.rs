@@ -1958,6 +1958,7 @@ impl QueryExecutor {
     /// Parse each select column into its aggregate spec (None = plain column,
     /// Some = aggregate like COUNT/SUM/MIN/MAX/AVG). Used by col_segment_group_by
     /// to decide whether the COUNT-only fast path is safe.
+    #[allow(dead_code)]
     fn parse_select_aggregates(
         &self,
         columns: &[crate::sql::ast::SelectColumn],
@@ -1975,54 +1976,16 @@ impl QueryExecutor {
 
     fn col_segment_group_by(
         &self,
-        stmt: &SelectStmt,
+        _stmt: &SelectStmt,
         _table_name: &str,
-        store: &crate::storage::col_segment::ColSegmentStore,
-        schema: &TableSchema,
+        _store: &crate::storage::col_segment::ColSegmentStore,
+        _schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
-        // Extract GROUP BY column.
-        let group_cols: Vec<usize> = stmt.group_by.as_ref().map(|gc| {
-            gc.iter().filter_map(|cn| schema.get_column_position(cn)).collect()
-        }).unwrap_or_default();
-        if group_cols.is_empty() { return Ok(None); }
-        let gc = group_cols[0]; // single GROUP BY column
-
-        // 🔑 Only the pure `SELECT g, COUNT(*) ... GROUP BY g` shape can use the
-        // store.group_by_count fast path. If the query asks for SUM/MIN/MAX/AVG,
-        // or mixes aggregates, group_by_count would silently return COUNT for
-        // every aggregate (the v0.5.0 GROUP BY SUM bug). Detect the aggregate
-        // shape; if it isn't exactly [group_col, COUNT(*)], fall back to the
-        // general materialize path which evaluates each aggregate correctly.
-        let agg_specs = self.parse_select_aggregates(&stmt.columns, schema);
-        let is_pure_count = agg_specs.iter().all(|a| matches!(a, Some(ai) if ai.func == "COUNT"))
-            && agg_specs.iter().any(|a| matches!(a, Some(ai) if ai.func == "COUNT"));
-        if !is_pure_count {
-            // Has SUM/MIN/MAX/AVG, or a mix, or no aggregate at all (plain
-            // GROUP BY + projected columns). Let the general path handle it.
-            return Ok(None);
-        }
-        // Multi-column GROUP BY (GROUP BY a, b) and HAVING are not supported by
-        // this fast path (it groups on a single column and emits no HAVING
-        // filtering). Fall back to try_apply_group_by_positional / apply_group_by,
-        // which handle composite keys and HAVING correctly.
-        if group_cols.len() > 1 || stmt.having.is_some() {
-            return Ok(None);
-        }
-
-        // Output columns: group col + aggregates.
-        let _out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
-            .unwrap_or_else(|| vec![gc]);
-        let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema).unwrap_or_default();
-
-        // Direct group-by scan: iterate group column without Vec<Value> allocation.
-        let groups = store.group_by_count(gc);
-
-        // Build result rows.
-        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-        for (gval, count) in groups {
-            rows.push(vec![Value::Text(gval.into()), Value::Integer(count)]);
-        }
-        Ok(Some(StreamingQueryResult::SelectReady { columns, rows }))
+        // 🔑 PERF: the dedicated group_by_count() fast path was SLOWER than
+        // single_pass_group_by for text columns (it re-reads the text segment
+        // per-row). All GROUP BY queries now fall through to single_pass_group_by
+        // (which projects + scans once). Return None to signal "use general path".
+        Ok(None)
     }
 
     fn materialize_as_streaming(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
