@@ -60,6 +60,68 @@ fn cmp_str(v: Option<&str>, target: Option<&str>, op: &crate::sql::ast::BinaryOp
         _ => false,
     }
 }
+
+/// Decode a single value from a ColumnarSSTableBuilder's raw column buffer.
+/// Used by ColSegmentStore::get() to read buffered (unflushed) rows.
+/// Format matches add_values: Integer/Timestamp = [8B i64 LE], Float = [8B f64 LE],
+/// Bool = [1B], Text = [u16 len][bytes].
+fn decode_buffered_value(
+    buf: &crate::storage::lsm::columnar::ColumnarSSTableBuilder,
+    col_idx: usize,
+    row_idx: usize,
+    _col_type: &ColumnType,
+) -> Value {
+    use crate::storage::lsm::columnar::ColumnTypeTag;
+    // Check NULL flag first.
+    if buf.null_flags.get(col_idx).and_then(|f| f.get(row_idx)) == Some(&true) {
+        return Value::Null;
+    }
+    let tag = buf.column_tags.get(col_idx).copied();
+    let raw = &buf.column_buffers[col_idx];
+    match tag {
+        Some(ColumnTypeTag::Integer) => {
+            let off = row_idx * 8;
+            if off + 8 > raw.len() { return Value::Null; }
+            Value::Integer(i64::from_le_bytes(raw[off..off+8].try_into().unwrap()))
+        }
+        Some(ColumnTypeTag::Timestamp) => {
+            let off = row_idx * 8;
+            if off + 8 > raw.len() { return Value::Null; }
+            let v = i64::from_le_bytes(raw[off..off+8].try_into().unwrap());
+            Value::Timestamp(crate::types::Timestamp::from_micros(v))
+        }
+        Some(ColumnTypeTag::Float) => {
+            let off = row_idx * 8;
+            if off + 8 > raw.len() { return Value::Null; }
+            Value::Float(f64::from_le_bytes(raw[off..off+8].try_into().unwrap()))
+        }
+        Some(ColumnTypeTag::Bool) => {
+            let off = row_idx;
+            if off >= raw.len() { return Value::Null; }
+            Value::Bool(raw[off] != 0)
+        }
+        Some(ColumnTypeTag::Text) => {
+            // Text rows are variable-length: [u16 len][bytes], concatenated.
+            // Walk to the row_idx-th entry.
+            let mut pos = 0usize;
+            let mut r = 0usize;
+            while pos + 2 <= raw.len() {
+                let len = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
+                pos += 2;
+                if r == row_idx {
+                    if len == 0xFFFF || pos + len > raw.len() { return Value::Null; }
+                    return Value::Text(ArcString(std::sync::Arc::from(
+                        std::str::from_utf8(&raw[pos..pos+len]).unwrap_or("")
+                    )));
+                }
+                pos += if len == 0xFFFF { 0 } else { len };
+                r += 1;
+            }
+            Value::Null
+        }
+        _ => Value::Null,
+    }
+}
 use std::sync::Arc;
 
 /// Compaction trigger: merge when segment count reaches this.
@@ -255,6 +317,27 @@ impl ColSegmentStore {
     /// `get` fell through to an older segment holding the live row and
     /// returned stale data after a DELETE.
     pub fn get(&self, key: u64) -> Option<Vec<Value>> {
+        // 🔑 Check the write buffer FIRST — it may hold a newer version (UPDATE)
+        // or a tombstone (DELETE) that supersedes the segment data. Without this,
+        // a DELETE whose tombstone is still in the buffer (lazy flush) would be
+        // invisible to get(), which would return the stale live row from a segment.
+        {
+            let buf = self.write_buf.lock();
+            if let Some(idx) = buf.keys.iter().position(|&k| k == key) {
+                // Found in buffer — newest version. If deleted, return None.
+                if buf.deleted[idx] { return None; }
+                // Live buffered row: decode from the columnar buffer.
+                let mut row = Vec::with_capacity(self.col_types.len());
+                for ci in 0..self.col_types.len() {
+                    if ci < buf.column_buffers.len() {
+                        row.push(decode_buffered_value(&buf, ci, idx, &self.col_types[ci]));
+                    } else {
+                        row.push(Value::Null);
+                    }
+                }
+                return Some(row);
+            }
+        }
         let segs = self.segments.read();
         for seg in segs.iter().rev() {
             // Check if this segment contains the key at all.

@@ -954,16 +954,16 @@ pub struct ColumnarSSTableBuilder {
     pub column_types: Vec<ColumnType>,
     pub column_tags: Vec<ColumnTypeTag>,
     pub num_rows: usize,
-    keys: Vec<u64>,
+    pub(crate) keys: Vec<u64>,
     timestamps: Vec<u64>,
-    deleted: Vec<bool>,
+    pub(crate) deleted: Vec<bool>,
     // Buffered column data (one Vec per column)
-    column_buffers: Vec<Vec<u8>>,
+    pub(crate) column_buffers: Vec<Vec<u8>>,
     // Explicit per-column NULL flags. Tracked at encode time so the NULL
     // bitmap is authoritative — no value sentinel is needed (previously
     // i64::MIN was the Integer NULL sentinel, which collided with the real
     // value i64::MIN, and f64::NAN collided with stored NaN).
-    null_flags: Vec<Vec<bool>>,
+    pub(crate) null_flags: Vec<Vec<bool>>,
     finished: bool,
 }
 
