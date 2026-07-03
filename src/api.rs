@@ -350,26 +350,28 @@ impl Database {
         // insert_row_with_txn (buffered in write_set until COMMIT).
         let in_txn = self.query_executor.is_in_transaction();
 
-        // 🚀 Fast path: simple INSERT INTO <table> VALUES (...)
-        if !in_txn {
-            if let Some(result) = self.try_fast_insert(sql)? {
-                return Ok(result);
+        // 🔑 PERF: dispatch on the first SQL keyword ONCE instead of running
+        // 4 sequential try_fast_* probes (each re-calling trim_start + prefix
+        // match). A SELECT previously paid INSERT-check + UPDATE-check +
+        // DELETE-check + SELECT-check = 4× trim_start + 4× prefix compare.
+        // Now it's 1× trim_start + 1 match → calls only the relevant path.
+        let trimmed = sql.trim_start();
+        if let Some(kw) = trimmed.as_bytes().get(0..6) {
+            match kw {
+                b"INSERT" | b"insert" if !in_txn => {
+                    if let Some(r) = self.try_fast_insert(sql)? { return Ok(r); }
+                }
+                b"UPDATE" | b"update" => {
+                    if let Some(r) = self.try_fast_update(sql)? { return Ok(r); }
+                }
+                b"DELETE" | b"delete" => {
+                    if let Some(r) = self.try_fast_delete(sql)? { return Ok(r); }
+                }
+                b"SELECT" | b"select" => {
+                    if let Some(r) = self.try_fast_select(sql)? { return Ok(r); }
+                }
+                _ => {}
             }
-        }
-
-        // 🚀 Fast path: UPDATE table SET col = val WHERE pk = value
-        if let Some(result) = self.try_fast_update(sql)? {
-            return Ok(result);
-        }
-
-        // 🚀 Fast path: DELETE FROM table WHERE pk = value
-        if let Some(result) = self.try_fast_delete(sql)? {
-            return Ok(result);
-        }
-
-        // 🚀 Fast path: SELECT ... FROM <table> WHERE <pk> = <value>
-        if let Some(result) = self.try_fast_select(sql)? {
-            return Ok(result);
         }
 
         // 🚀 Prepared statement cache: skip re-parsing on repeated queries

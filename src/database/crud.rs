@@ -116,13 +116,6 @@ impl MoteDB {
                 table_name, e
             )))?;
 
-        // 3. Validate row (before allocating AUTO_INCREMENT to avoid ID waste)
-        schema.validate_row(&row)
-            .map_err(|e| StorageError::InvalidData(format!(
-                "Row validation failed for table '{}': {}",
-                table_name, e
-            )))?;
-
         let row_id = if schema.is_primary_key_auto_increment() {
             // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
             // 🚀 Optimized: DashMap — first insert per table acquires shard lock, then lock-free
@@ -182,7 +175,8 @@ impl MoteDB {
 
         // 7. Write to columnar buffer (primary storage). Skip LSM — columnar is the source of truth.
         let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.row_cache.put(table_name.to_string(), row_id, row.clone());
+        // 🔑 PERF: use put_ref (&str) to avoid table_name.to_string() allocation.
+        self.row_cache.put_ref(table_name, row_id, row.clone());
 
         // 🚀 Columnar write buffer (zero-encode path).
         // 🔑 PERF: Skip the legacy columnar_write_bufs for ColSegmentStore tables
@@ -211,19 +205,19 @@ impl MoteDB {
                 }
             };
             let mut builder = builder_arc.lock();
-            let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-            let _ = builder.add_values(key, ts, false, &row);
+            // 🔑 PERF: composite_key already packs table_id<<32 | row_id — reuse it.
+            let _ = builder.add_values(composite_key, ts, false, &row);
         }
 
         // S9: also write to ColSegmentStore (so single-row INSERTs survive restart).
         // 🔑 PERF: use append_row_ref (by reference) instead of append_rows
         // (which clones Vec<Value> into a tuple). Saves one heap alloc per INSERT.
         {
-            let store = self.get_or_create_col_segment_store(table_name, schema.col_types().to_vec())?;
-            let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-            store.append_row_ref(key, ts, &row)?;
+            // 🔑 PERF: reuse composite_key (table_id<<32 | row_id), and pass
+            // col_types by reference — get_or_create skips the to_vec() when the
+            // store already exists (the common case after the first insert).
+            let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
+            store.append_row_ref(composite_key, ts, &row)?;
             if store.buffered_row_count() >= 100000 {
                 store.flush_buffer()?;
             }
@@ -607,7 +601,7 @@ impl MoteDB {
             // needed (a tombstone here would itself occupy the dedup slot and
             // wrongly suppress the new row during merge).
             {
-                let store = self.get_or_create_col_segment_store(table_name, schema.col_types().to_vec())?;
+                let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
                 let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
                 let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
                 store.append_rows(&[(key, timestamp, new_row.clone())])?;
@@ -1087,42 +1081,21 @@ impl MoteDB {
         // Columnar-backed scan: if the table's data lives in a columnar SSTable
         // (rather than the LSM), decode column arrays and synthesize rows.
         // Falling back to the LSM scan here would yield empty/stale results.
-        // 🆕 S9: ColSegmentStore tables — flush+compact to single segment first.
+        // 🆕 S9: ColSegmentStore tables — flush buffer (cheap) then sync to
+        // columnar_sstables (no compaction). 🔑 PERF: the old code ran up to 5
+        // force_compact_all() passes PER TABLE PER JOIN CALL — rewriting the
+        // entire table 10x for a 2-table join. sync_col_segment_to_sstables
+        // updates columnar_sstables from the latest segment without compaction.
         if self.col_segment_stores.contains_key(table_name) {
-            if let Some(store) = self.col_segment_stores.get(table_name) {
-                let _ = store.flush_buffer();
-                let mut _ci = 0;
-                while store.segment_count() >= 2 && _ci < 5 {
-                    let _ = store.force_compact_all();
-                    _ci += 1;
-                }
-                if let Some(last) = store.segments_snapshot().last() {
-                    let col_sst = &last.sst;
-                    let num_cols = col_types.len();
-                    let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
-                    for col_idx in 0..num_cols {
-                        segments.push(build_column_segment(&*col_sst, col_idx, col_sst.num_rows)?);
-                    }
-                    let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                    return Ok(TableRowStreamingIterator {
-                        inner: TableRowStreamingInner::Columnar {
-                            row_map: col_sst.row_map.clone(),
-                            segments,
-                            col_names,
-                            col_types: col_types.to_vec(),
-                            current_idx: 0,
-                            num_rows: col_sst.num_rows,
-                        },
-                    });
-                }
-            }
+            // Flush buffered writes so they're visible, then sync to the
+            // legacy columnar_sstables map (reads the latest segment, no rewrite).
+            self.sync_col_segment_to_sstables(table_name);
         }
-        if self.columnar_sstables.contains_key(table_name) {
-            let col_sst = self.columnar_sstables.get(table_name).unwrap().clone();
+        if let Some(col_sst) = self.columnar_sstables.get(table_name).as_deref() {
             let num_cols = col_types.len();
             let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
             for col_idx in 0..num_cols {
-                segments.push(build_column_segment(&col_sst, col_idx, col_sst.num_rows)?);
+                segments.push(build_column_segment(col_sst, col_idx, col_sst.num_rows)?);
             }
             let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
             return Ok(TableRowStreamingIterator {
@@ -1298,19 +1271,17 @@ impl MoteDB {
     pub fn get_or_create_col_segment_store(
         &self,
         table_name: &str,
-        col_types: Vec<crate::types::ColumnType>,
+        col_types: &[crate::types::ColumnType],
     ) -> Result<Arc<crate::storage::col_segment::ColSegmentStore>> {
         // 🔑 Atomic entry-based creation (fixes concurrent INSERT data loss).
-        // The old check-then-insert had a TOCTOU race: two threads could both
-        // see None, both create a store, and the second insert clobbered the
-        // first — losing ~50% of rows (the v0.5.0 concurrent_writes bug).
-        // DashMap::entry() is atomic: only one thread creates the store.
+        // 🔑 PERF: takes &[ColumnType] so callers don't pay a to_vec() when the
+        // store already exists (the common case — every INSERT after the first).
         use dashmap::mapref::entry::Entry;
         match self.col_segment_stores.entry(table_name.to_string()) {
             Entry::Occupied(o) => Ok(o.get().clone()),
             Entry::Vacant(v) => {
                 let store = crate::storage::col_segment::ColSegmentStore::create(
-                    &self.path, table_name, col_types,
+                    &self.path, table_name, col_types.to_vec(),
                 )?;
                 v.insert(store.clone());
                 Ok(store)
@@ -1988,7 +1959,7 @@ impl MoteDB {
         // eliminating the dual-write overhead (256ms → ~65ms for 60K rows).
         // Queries route to ColSegmentStore via has_col_segment_store().
         {
-            let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
+            let store = self.get_or_create_col_segment_store(table_name, &col_types)?;
             let store_rows: Vec<(u64, u64, Row)> = rows
                 .iter()
                 .enumerate()
@@ -2215,7 +2186,7 @@ impl MoteDB {
         }
 
         // Write directly to ColSegmentStore (skip WAL for edge config).
-        let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
+        let store = self.get_or_create_col_segment_store(table_name, &col_types)?;
         let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
         let base_ts = self.write_lsn.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 

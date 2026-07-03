@@ -55,7 +55,7 @@ impl MoteDB {
                 // — same O(1)-per-value access as the legacy single-SSTable fast
                 // path, extended to N segments with newest-version-wins dedup.
                 if self.has_col_segment_store(table_name) {
-                    let store = self.get_or_create_col_segment_store(table_name, col_types.to_vec())?;
+                    let store = self.get_or_create_col_segment_store(table_name, &col_types)?;
                     // Only flush if there are buffered rows. Avoid triggering compaction.
                     if store.buffered_row_count() > 0 {
                         store.flush_buffer()?;

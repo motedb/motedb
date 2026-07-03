@@ -193,8 +193,8 @@ impl MoteDB {
             // another thread holds it). Use get_or_create so the first transactional
             // INSERT on a table (no prior non-txn insert) still creates the store.
             let tbl_schema2 = self.table_registry.get_table(table_name)?;
-            let col_types = tbl_schema2.col_types().to_vec();
-            let store_clone = self.get_or_create_col_segment_store(table_name, col_types).ok();
+            let col_types = tbl_schema2.col_types();
+            let store_clone = self.get_or_create_col_segment_store(table_name, &col_types).ok();
             if let Some(store) = store_clone {
                 let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
                 let key = (table_id << 32) | (row_id & 0xFFFFFFFF);

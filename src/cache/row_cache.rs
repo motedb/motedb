@@ -270,6 +270,15 @@ impl RowCache {
         self.size.store(cache.len(), Ordering::Relaxed);
     }
 
+    /// Put a row into cache using &str table name (avoids String allocation).
+    /// 🔑 PERF: hot INSERT path — saves a to_string() per insert.
+    pub fn put_ref(&self, table_name: &str, row_id: RowId, row: Row) {
+        let key = (table_hash(table_name), row_id);
+        let mut cache = self.cache.write();
+        cache.put(key, Arc::new(row));
+        self.size.store(cache.len(), Ordering::Relaxed);
+    }
+
     /// Invalidate a single row
     pub fn invalidate(&self, table_name: &str, row_id: RowId) {
         let key = (table_hash(table_name), row_id);

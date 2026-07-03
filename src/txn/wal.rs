@@ -1400,6 +1400,10 @@ impl WALManager {
             let done = Arc::new((PlMutex::new(None), PlCondvar::new()));
             {
                 let mut queue = gc.state.queue.lock();
+                // NOTE: record.clone() is needed here because the timeout
+                // fallback below (wal.append(record)) reuses `record` if the
+                // group-commit thread is wedged. The clone is a WALRecord deep
+                // copy (Vec<u8> for InsertRaw) — amortized across the batch.
                 queue.push(GroupCommitEntry {
                     partition,
                     record: record.clone(),

@@ -2089,7 +2089,7 @@ impl QueryExecutor {
         {
             if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
                 if self.db.has_col_segment_store(table_name) {
-                    if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, vec![]) {
+                    if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
                         let _ = store.flush_buffer();
                         // ORDER BY LIMIT (no aggregate): full scan + in-memory sort.
                         if stmt.order_by.is_some() && !self.has_aggregates(&stmt.columns) {
@@ -2134,7 +2134,7 @@ impl QueryExecutor {
             // ColSegmentStore multi-segment aggregate (no compaction — avoids 70ms sync).
             if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
                 if self.db.has_col_segment_store(table_name) {
-                    if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, vec![]) {
+                    if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
                         let _ = store.flush_buffer();
                         if let Some(result) = self.col_segment_aggregate(stmt, table_name, &store)? {
                             return Ok(result);
@@ -3912,6 +3912,81 @@ impl QueryExecutor {
         }))
     }
 
+    /// PK point query via ColSegmentStore binary search.
+    /// Returns Some(result) if the WHERE clause is `pk_col = literal` and the
+    /// PK column is the table's primary key. Uses store.get() (O(log N) binary
+    /// search in the row_map) instead of a full-table scan. Returns None if the
+    /// WHERE clause doesn't match the PK point-query shape.
+    fn try_col_segment_pk_point_query(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        wc: &crate::sql::ast::Expr,
+    ) -> Result<Option<StreamingQueryResult>> {
+        use crate::sql::ast::{Expr, BinaryOperator};
+        // Only handle `pk_col = literal` (the common point-query shape).
+        let (col_name, literal) = match wc {
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(v)) => (c.as_str(), v.clone()),
+                    (Expr::Literal(v), Expr::Column(c)) => (c.as_str(), v.clone()),
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        // Check the column is the PK.
+        let schema = match self.db.get_table_schema(table_name) { Ok(s) => s, Err(_) => return Ok(None) };
+        let pk_name = match schema.primary_key() { Some(p) => p, None => return Ok(None) };
+        let pk_bare = pk_name.rsplit('.').next().unwrap_or(pk_name);
+        if col_name != pk_bare && col_name != pk_name { return Ok(None); }
+
+        // Resolve PK value → composite key.
+        let table_id = self.db.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+        let composite_key = match &literal {
+            Value::Integer(id) if schema.is_primary_key_auto_increment() => {
+                // AUTO_INCREMENT: pk value IS the row_id.
+                (table_id << 32) | (*id as u64 & 0xFFFFFFFF)
+            }
+            _ => {
+                // Non-AUTO_INCREMENT: use pk_lookup cache to resolve pk → row_id.
+                // If cache miss, fall back to scan (return None).
+                let pk_key = crate::database::pk_cache::PkKey::from_value(&literal);
+                match self.db.pk_lookup.get(table_name).and_then(|l| l.get_pk(&pk_key)) {
+                    Some(rid) => (table_id << 32) | (rid as u64 & 0xFFFFFFFF),
+                    None => return Ok(None), // cache miss → full scan
+                }
+            }
+        };
+
+        // Binary-search the segment's row_map.
+        let store = match self.db.get_or_create_col_segment_store(table_name, &schema.col_types()) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let _ = store.flush_buffer(); // ensure buffered rows are visible
+        let row = match store.get(composite_key) {
+            Some(r) => r,
+            None => {
+                // Not found — return empty result.
+                let columns: Vec<String> = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+                return Ok(Some(StreamingQueryResult::SelectReady { columns, rows: vec![] }));
+            }
+        };
+
+        // Build output: SELECT * → full row; SELECT col1, col2 → project.
+        let columns: Vec<String> = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+        let result_row: Vec<Value> = if stmt.columns.iter().any(|c| matches!(c, crate::sql::ast::SelectColumn::Star)) {
+            row
+        } else {
+            // Project requested columns.
+            let positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, &schema)
+                .unwrap_or_else(|| (0..schema.columns.len()).collect());
+            positions.iter().map(|&p| row.get(p).cloned().unwrap_or(Value::Null)).collect()
+        };
+        Ok(Some(StreamingQueryResult::SelectReady { columns, rows: vec![result_row] }))
+    }
+
     /// 🔥 全表扫描流式（现有实现）
     fn execute_full_scan_streaming(&self, stmt: &SelectStmt, table: &str) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
@@ -3921,7 +3996,7 @@ impl QueryExecutor {
         // pending buffer (cheap delta). Eliminates read-triggered full-table merge.
         if self.db.has_col_segment_store(table) {
             let col_types = schema.col_types().to_vec();
-            if let Ok(store) = self.db.get_or_create_col_segment_store(table, col_types.clone()) {
+            if let Ok(store) = self.db.get_or_create_col_segment_store(table, &col_types) {
                 let _ = store.flush_buffer();
                 return self.execute_full_scan_via_col_segment(stmt, table, &schema, &store);
             }
@@ -6739,12 +6814,17 @@ impl QueryExecutor {
                     // (FAST PATH 0a/0b/-1/-1b).
                     && stmt.where_clause.as_ref().map_or(true, |w| !Self::expr_needs_materialized_path(w))
                 {
-                    // Route ALL queries (including WHERE id = val) through the
-                    // ColSegmentStore full-scan path. Previously, WHERE id=val was
-                    // routed to the PK point-query path (get_table_row), which fails
-                    // for non-AUTO_INCREMENT PK tables because the row_id doesn't
-                    // match the PK value (WHERE id=1 returned 0 rows on INT-PK
-                    // tables). The full-scan WHERE filter handles all column types.
+                    // 🔑 PERF: PK point query fast path — `WHERE pk = literal`
+                    // should use binary search in the segment's row_map (O(log N)),
+                    // NOT a full-table scan. The old code routed ALL queries
+                    // (including WHERE id = val) through the full-scan path, which
+                    // decoded the filter column for every row. Now we detect PK
+                    // equality and use ColSegmentStore::get (binary search) first.
+                    if let Some(ref wc) = stmt.where_clause {
+                        if let Some(pk_result) = self.try_col_segment_pk_point_query(stmt, table_name, wc)? {
+                            return pk_result.materialize();
+                        }
+                    }
                     let stream = self.execute_full_scan_streaming(stmt, table_name)?;
                     return Ok(stream.materialize()?);
                 }
@@ -10351,7 +10431,7 @@ impl QueryExecutor {
         let proj_map: std::collections::HashMap<usize, usize> = needed_cols.iter()
             .enumerate().map(|(i, &sp)| (sp, i)).collect();
         let col_seg_rows: Option<Vec<Vec<Value>>> = if is_col_segment {
-            let store = self.db.get_or_create_col_segment_store(table_name, col_types.to_vec()).ok();
+            let store = self.db.get_or_create_col_segment_store(table_name, &col_types).ok();
             if let Some(store) = store {
                 let _ = store.flush_buffer();
                 let mut scanned = store.scan_projected_filtered(None, &needed_cols, &|_| true);
