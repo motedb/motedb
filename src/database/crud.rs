@@ -1297,29 +1297,27 @@ impl MoteDB {
     pub fn sync_col_segment_to_sstables(&self, table_name: &str) {
         if let Some(store) = self.col_segment_stores.get(table_name) {
             let _ = store.flush_buffer();
-            // Compact to a single segment so legacy aggregate paths (which read
-            // one columnar_sstables entry) see ALL data. Bounded: compaction
-            // only runs while segment count >= threshold (3).
-            let mut compactions = 0;
-            // Force compact to a SINGLE segment so legacy aggregate paths (which
-            // read one columnar_sstables entry) see ALL data. compact_once
-            // already merges all segments when count >= threshold; we lower the
-            // bar here to force at least one pass when there are 2+ segments.
-            while store.segment_count() >= 2 {
-                let _ = store.force_compact_all();
-                compactions += 1;
-                if compactions > 5 { break; }
-            }
-            // Release mmap pages after compaction (MADV_DONTNEED) to keep peak
-            // RSS low. Pages re-fault on next read access.
-            for seg in store.segments_snapshot() {
-                seg.clear_cache();
-                seg.release_pages();
+            // 🔑 PERF: only compact + release pages when there are 2+ segments.
+            // The old code always ran clear_cache()+release_pages() even for a
+            // single segment — evicting mmap pages that the next query must
+            // re-fault. For the common single-segment case, just update the
+            // columnar_sstables pointer (no compaction, no page eviction).
+            let seg_count = store.segment_count();
+            if seg_count >= 2 {
+                let mut compactions = 0;
+                while store.segment_count() >= 2 {
+                    let _ = store.force_compact_all();
+                    compactions += 1;
+                    if compactions > 5 { break; }
+                }
+                // Release mmap pages only after actual compaction.
+                for seg in store.segments_snapshot() {
+                    seg.clear_cache();
+                    seg.release_pages();
+                }
             }
             if let Some(sst) = store.latest_segment_sst() {
-                sst.release_pages();
                 self.columnar_sstables.insert(table_name.to_string(), sst);
-            } else {
             }
         }
     }

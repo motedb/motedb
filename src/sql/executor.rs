@@ -1523,8 +1523,15 @@ impl QueryExecutor {
             }
         }
 
-        // ORDER BY + LIMIT: scan + sort in memory (avoids sync compaction).
-        if stmt.order_by.is_some() && stmt.limit.is_some() {
+        // ORDER BY + LIMIT: scan only the sort column to find top-K indices,
+        // then decode output columns ONLY for those K rows (not all N).
+        // 🔑 PERF: the old code decoded ALL columns for ALL N rows via
+        // scan_projected_filtered, then sorted and took LIMIT. For LIMIT 10 on
+        // 20K rows, it decoded 20K TEXT ArcStrings that were thrown away.
+        // Now: scan 1 fixed-width column (f64/i64) → top-K heap → decode K rows.
+        // 🔑 Only for non-GROUP-BY queries — GROUP BY + LIMIT applies LIMIT to
+        // the grouped result, not to the pre-group rows.
+        if stmt.order_by.is_some() && stmt.limit.is_some() && stmt.group_by.is_none() {
             let ob = stmt.order_by.as_ref().unwrap();
             if let Some(obe) = ob.first() {
                 if let crate::sql::ast::Expr::Column(cn) = &obe.expr {
@@ -1532,16 +1539,11 @@ impl QueryExecutor {
                     let limit = stmt.limit.unwrap();
                     let out_pos: Vec<usize> = Self::resolve_select_positions(&stmt.columns, &schema)
                         .unwrap_or_else(|| (0..col_types.len()).collect());
-                    let scanned = store.scan_projected_filtered(Some(order_col), &out_pos, &|_| true);
-                    let order_idx = out_pos.iter().position(|&p| p == order_col).unwrap_or(0);
-                    let mut sorted = scanned;
-                    sorted.sort_by(|a, b| {
-                    let av = a.1.get(order_idx).cloned().unwrap_or(Value::Null);
-                    let bv = b.1.get(order_idx).cloned().unwrap_or(Value::Null);
-                    bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                    let rows: Vec<Vec<Value>> = sorted.into_iter().take(limit)
-                        .map(|(_, row)| row).collect();
+                    let is_float = matches!(col_types.get(order_col), Some(ColumnType::Float));
+                    let desc = !obe.asc;
+                    // Find top-K row indices by scanning ONLY the sort column.
+                    let top_indices = store.top_k_row_indices_typed(order_col, limit, desc, is_float);
+                    let rows = store.decode_rows_at(&top_indices, &out_pos);
                     let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
                     return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
                 }
@@ -3394,7 +3396,10 @@ impl QueryExecutor {
                 Value::Float(s / self.count as f64)
             }
         }
-        let mut groups: HashMap<&str, (GroupAcc, Vec<f64>)> = HashMap::with_capacity(num_rows / 10);
+        // 🔑 PERF: small initial capacity — most GROUP BY columns have low
+        // cardinality (4-100 distinct values). Starting with num_rows/10 wasted
+        // memory (2000 slots for 4 groups).
+        let mut groups: HashMap<&str, (GroupAcc, Vec<f64>)> = HashMap::with_capacity(64);
 
         if col_sst.column_tags[group_pos].is_fixed() {
             return Ok(None);
@@ -3412,6 +3417,38 @@ impl QueryExecutor {
             } else { return Ok(None); }
         }
 
+        // 🔑 PERF: fast path when no deletions and no NULLs in the group column.
+        // Skips 20K is_deleted() bitmap probes + 20K null-checked get_str() calls.
+        let has_deletes = col_sst.row_map.has_any_deleted();
+        let has_nulls = group_seg.has_any_null();
+        if !has_deletes && !has_nulls && agg_cols.is_empty() {
+            // Count-only GROUP BY on a text column with no deletes/nulls:
+            // tight inner loop using get_str_fast (no null/deleted checks).
+            for i in 0..num_rows {
+                let key = group_seg.get_str_fast(i);
+                let entry = groups.entry(key).or_insert_with(|| (GroupAcc::new(), Vec::new()));
+                entry.0.count += 1;
+            }
+        } else if !has_deletes && !has_nulls {
+            // GROUP BY with aggregates, no deletes/nulls.
+            for i in 0..num_rows {
+                let key = group_seg.get_str_fast(i);
+                let entry = groups.entry(key).or_insert_with(|| (GroupAcc::new(), Vec::new()));
+                entry.0.count += 1;
+                for (j, a) in agg_cols.iter().enumerate() {
+                    if a.func == "SUM" || a.func == "AVG" {
+                        let is_int = agg_is_int[j];
+                        let v = if is_int {
+                            agg_segs[j].get_i64(i).map(|x| x as f64)
+                        } else {
+                            agg_segs[j].get_f64(i)
+                        };
+                        if let Some(v) = v { entry.0.add(v, is_int); }
+                    }
+                }
+            }
+        } else {
+        // General path: check deletions + nulls per row.
         for i in 0..num_rows {
             if col_sst.row_map.is_deleted(i) { continue; }
             let key = match group_seg.get_str(i) {
@@ -3432,6 +3469,7 @@ impl QueryExecutor {
                 }
             }
         }
+        } // end else (general path with deletes/nulls)
 
         // Build output rows
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());

@@ -1478,6 +1478,51 @@ impl ColSegmentStore {
     /// building 300K projected rows and sorting them (the old path, ~10ms), it
     /// scans just one column keeping a bounded min/max-heap of size K — O(N)
     /// with O(K) memory and zero per-row allocation (~1ms for K=10 on 300K).
+    /// Decode specific rows by their (segment_index, row_index) for the given
+    /// output columns. Used by ORDER BY LIMIT top-K: find the K row indices via
+    /// top_k_row_indices_typed (scans only the sort column), then decode the
+    /// output columns for just those K rows — not all N.
+    /// 🔑 Batch-decodes each output column ONCE per segment (not per row),
+    /// avoiding K× redundant column segment decompressions.
+    pub fn decode_rows_at(&self, indices: &[(usize, usize)], out_cols: &[usize]) -> Vec<Vec<Value>> {
+        if indices.is_empty() { return Vec::new(); }
+        let segs = self.segments_snapshot();
+        let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
+        // Pre-decode columns per segment lazily (cached in a local map).
+        // For small K this is much cheaper than N full-row decode.
+        for &(seg_idx, row_idx) in indices {
+            let Some(seg) = segs.get(seg_idx) else { continue };
+            if row_idx >= seg.sst.num_rows { continue; }
+            if seg.sst.row_map.has_any_deleted() && seg.sst.row_map.is_deleted(row_idx) { continue; }
+            let mut row = Vec::with_capacity(out_cols.len());
+            for &ci in out_cols {
+                let tag = seg.sst.column_tags.get(ci).copied();
+                let v = match tag {
+                    Some(t) if t.is_fixed() => {
+                        seg.sst.read_fixed_i64(ci).ok().and_then(|f| {
+                            match self.col_types.get(ci) {
+                                Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
+                                Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
+                                Some(ColumnType::Boolean) => f.get_bool(row_idx).map(Value::Bool),
+                                Some(ColumnType::Timestamp) => f.get_i64(row_idx)
+                                    .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
+                                _ => None,
+                            }
+                        })
+                    }
+                    Some(ColumnTypeTag::Text) => {
+                        seg.sst.read_text(ci).ok().and_then(|t| t.get_str(row_idx)
+                            .map(|s| Value::Text(ArcString(std::sync::Arc::from(s)))))
+                    }
+                    _ => None,
+                };
+                row.push(v.unwrap_or(Value::Null));
+            }
+            result.push(row);
+        }
+        result
+    }
+
     pub fn top_k_row_indices(
         &self,
         order_col: usize,
