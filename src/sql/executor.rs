@@ -2203,6 +2203,14 @@ impl QueryExecutor {
                             if let Some(result) = self.col_segment_group_by(stmt, table_name, &store, &schema)? {
                                 return Ok(result);
                             }
+                            // 🔑 PERF: try try_group_by_columnar BEFORE syncing —
+                            // it reads from columnar_sstables which is usually already
+                            // populated (from a prior query or flush). The sync below
+                            // flushes the buffer + compacts + evicts mmap pages, which
+                            // is pure overhead when columnar_sstables already has data.
+                            if let Some(result) = self.try_group_by_columnar(stmt)? {
+                                return Ok(result);
+                            }
                         }
                         if stmt.group_by.is_none() {
                             if let Some(result) = self.col_segment_multi_aggregate(stmt, table_name, &store, &schema)? {
@@ -3396,10 +3404,12 @@ impl QueryExecutor {
                 Value::Float(s / self.count as f64)
             }
         }
-        // 🔑 PERF: small initial capacity — most GROUP BY columns have low
-        // cardinality (4-100 distinct values). Starting with num_rows/10 wasted
-        // memory (2000 slots for 4 groups).
-        let mut groups: HashMap<&str, (GroupAcc, Vec<f64>)> = HashMap::with_capacity(64);
+        // 🔑 PERF: low-cardinality linear-scan accumulator. For GROUP BY columns
+        // with few distinct values (typical: 4-256), a Vec<(String, GroupAcc)>
+        // with linear scan is faster than HashMap<&str> — string comparison for
+        // short keys (1-2 bytes) is 1 cycle vs hash computation + bucket probe.
+        // The HashMap path remains available for high-cardinality fallback.
+        const LINEAR_SCAN_MAX: usize = 256;
 
         if col_sst.column_tags[group_pos].is_fixed() {
             return Ok(None);
@@ -3421,19 +3431,98 @@ impl QueryExecutor {
         // Skips 20K is_deleted() bitmap probes + 20K null-checked get_str() calls.
         let has_deletes = col_sst.row_map.has_any_deleted();
         let has_nulls = group_seg.has_any_null();
+
+        // Linear-scan accumulator: Vec<(group_key, GroupAcc)>.
+        // Falls back to HashMap if cardinality exceeds LINEAR_SCAN_MAX.
+        let mut lin_groups: Vec<(String, GroupAcc)> = Vec::new();
+        let mut use_hashmap = false;
+        let mut groups: HashMap<String, (GroupAcc, Vec<f64>)> = HashMap::new();
+
+        // Helper: find-or-insert in lin_groups (linear scan).
+        // For ≤256 groups this is faster than hashing.
+        let lin_find = |groups: &mut Vec<(String, GroupAcc)>, key: &str| -> usize {
+            for (i, (k, _)) in groups.iter().enumerate() {
+                if k == key { return i; }
+            }
+            groups.push((key.to_string(), GroupAcc::new()));
+            groups.len() - 1
+        };
+
         if !has_deletes && !has_nulls && agg_cols.is_empty() {
             // Count-only GROUP BY on a text column with no deletes/nulls:
-            // tight inner loop using get_str_fast (no null/deleted checks).
+            // same get_str_fast loop as the AVG path (for_each_str closure
+            // wasn't being inlined, causing a 2.7x regression vs AVG path).
             for i in 0..num_rows {
                 let key = group_seg.get_str_fast(i);
-                let entry = groups.entry(key).or_insert_with(|| (GroupAcc::new(), Vec::new()));
-                entry.0.count += 1;
+                if !use_hashmap {
+                    let idx = lin_find(&mut lin_groups, key);
+                    lin_groups[idx].1.count += 1;
+                    if lin_groups.len() > LINEAR_SCAN_MAX { use_hashmap = true; }
+                } else {
+                    let entry = groups.entry(key.to_string()).or_insert_with(|| (GroupAcc::new(), Vec::new()));
+                    entry.0.count += 1;
+                }
             }
         } else if !has_deletes && !has_nulls {
             // GROUP BY with aggregates, no deletes/nulls.
             for i in 0..num_rows {
                 let key = group_seg.get_str_fast(i);
-                let entry = groups.entry(key).or_insert_with(|| (GroupAcc::new(), Vec::new()));
+                if !use_hashmap {
+                    let idx = lin_find(&mut lin_groups, key);
+                    lin_groups[idx].1.count += 1;
+                    for (j, a) in agg_cols.iter().enumerate() {
+                        if a.func == "SUM" || a.func == "AVG" {
+                            let is_int = agg_is_int[j];
+                            let v = if is_int {
+                                agg_segs[j].get_i64(i).map(|x| x as f64)
+                            } else {
+                                agg_segs[j].get_f64(i)
+                            };
+                            if let Some(v) = v { lin_groups[idx].1.add(v, is_int); }
+                        }
+                    }
+                    if lin_groups.len() > LINEAR_SCAN_MAX { use_hashmap = true; }
+                } else {
+                    let entry = groups.entry(key.to_string()).or_insert_with(|| (GroupAcc::new(), Vec::new()));
+                    entry.0.count += 1;
+                    for (j, a) in agg_cols.iter().enumerate() {
+                        if a.func == "SUM" || a.func == "AVG" {
+                            let is_int = agg_is_int[j];
+                            let v = if is_int {
+                                agg_segs[j].get_i64(i).map(|x| x as f64)
+                            } else {
+                                agg_segs[j].get_f64(i)
+                            };
+                            if let Some(v) = v { entry.0.add(v, is_int); }
+                        }
+                    }
+                }
+            }
+        } else {
+        // General path: check deletions + nulls per row.
+        for i in 0..num_rows {
+            if col_sst.row_map.is_deleted(i) { continue; }
+            let key = match group_seg.get_str(i) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !use_hashmap {
+                let idx = lin_find(&mut lin_groups, key);
+                lin_groups[idx].1.count += 1;
+                for (j, a) in agg_cols.iter().enumerate() {
+                    if a.func == "SUM" || a.func == "AVG" {
+                        let is_int = agg_is_int[j];
+                        let v = if is_int {
+                            agg_segs[j].get_i64(i).map(|x| x as f64)
+                        } else {
+                            agg_segs[j].get_f64(i)
+                        };
+                        if let Some(v) = v { lin_groups[idx].1.add(v, is_int); }
+                    }
+                }
+                if lin_groups.len() > LINEAR_SCAN_MAX { use_hashmap = true; }
+            } else {
+                let entry = groups.entry(key.to_string()).or_insert_with(|| (GroupAcc::new(), Vec::new()));
                 entry.0.count += 1;
                 for (j, a) in agg_cols.iter().enumerate() {
                     if a.func == "SUM" || a.func == "AVG" {
@@ -3447,36 +3536,28 @@ impl QueryExecutor {
                     }
                 }
             }
-        } else {
-        // General path: check deletions + nulls per row.
-        for i in 0..num_rows {
-            if col_sst.row_map.is_deleted(i) { continue; }
-            let key = match group_seg.get_str(i) {
-                Some(s) => s,
-                None => continue,
-            };
-            let entry = groups.entry(key).or_insert_with(|| (GroupAcc::new(), Vec::new()));
-            entry.0.count += 1;
-            for (j, a) in agg_cols.iter().enumerate() {
-                if a.func == "SUM" || a.func == "AVG" {
-                    let is_int = agg_is_int[j];
-                    let v = if is_int {
-                        agg_segs[j].get_i64(i).map(|x| x as f64)
-                    } else {
-                        agg_segs[j].get_f64(i)
-                    };
-                    if let Some(v) = v { entry.0.add(v, is_int); }
-                }
-            }
         }
         } // end else (general path with deletes/nulls)
 
-        // Build output rows
-        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-        for (key, (acc, _)) in groups {
+        // Build output rows — merge linear-scan + hashmap results.
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (key, acc) in &lin_groups {
             let mut row = Vec::new();
-            // Group-by column value
-            row.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(key))));
+            row.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(key.as_str()))));
+            if has_count_star { row.push(Value::Integer(acc.count)); }
+            for a in &agg_cols {
+                match a.func.as_str() {
+                    "SUM" => row.push(acc.sum()),
+                    "AVG" => row.push(acc.avg()),
+                    _ => row.push(Value::Null),
+                }
+            }
+            rows.push(row);
+        }
+        // Append hashmap results (high-cardinality spill).
+        for (key, (acc, _)) in &groups {
+            let mut row = Vec::new();
+            row.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(key.as_str()))));
             if has_count_star { row.push(Value::Integer(acc.count)); }
             for a in &agg_cols {
                 match a.func.as_str() {

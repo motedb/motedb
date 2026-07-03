@@ -438,6 +438,19 @@ impl TextSegment {
         (self.null_bitmap.get(row_idx / 8) >> (row_idx % 8)) & 1 != 0
     }
 
+    /// Iterate all non-null strings as &str, calling f for each.
+    /// Skips NULL rows. Used by GROUP BY to avoid per-row offset/slice overhead.
+    pub fn for_each_str<F: FnMut(&str)>(&self, mut f: F) {
+        let n = self.num_rows;
+        // If no nulls, skip the null check entirely.
+        let has_nulls = self.has_any_null();
+        for i in 0..n {
+            if has_nulls && self.is_null(i) { continue; }
+            let s = self.get_str_fast(i);
+            f(s);
+        }
+    }
+
     /// Check if ANY row in this segment has a null value. O(null_bitmap_size)
     /// — typically a few KB. Used to skip per-row null checks when no nulls exist.
     pub fn has_any_null(&self) -> bool {
