@@ -4911,7 +4911,7 @@ impl QueryExecutor {
                         (keys, row)
                     }).collect();
                     let mut keyed = keyed;
-                    keyed.sort_by(|(ka, _), (kb, _)| {
+                    let cmp_fn = |(ka, _): &(Vec<Value>, Vec<Value>), (kb, _): &(Vec<Value>, Vec<Value>)| {
                         for (i, (_, asc)) in sort_plan.iter().enumerate() {
                             let av = &ka[i];
                             let bv = &kb[i];
@@ -4926,8 +4926,26 @@ impl QueryExecutor {
                             }
                         }
                         std::cmp::Ordering::Equal
-                    });
-                    result_rows = keyed.into_iter().map(|(_, r)| r).collect();
+                    };
+                    // 🔑 PERF: top-K partial sort. When LIMIT is set and much
+                    // smaller than N, use select_nth_unstable_by (O(N) average)
+                    // to partition the top-K, then sort only those K elements.
+                    // Full sort is O(N log N); partial sort is O(N + K log K).
+                    // For ORDER BY ... LIMIT 10 on 20K rows: 20K+10log10 vs 20K·log(20K).
+                    let lim = stmt.limit.unwrap_or(usize::MAX);
+                    let off = stmt.offset.unwrap_or(0);
+                    let need = lim.saturating_add(off).min(keyed.len());
+                    if need < keyed.len() && need > 0 && need < keyed.len() / 2 {
+                        // Partition: top `need` elements moved to front (unsorted),
+                        // then sort just those. OFFSET/LIMIT applied later by the
+                        // existing code (don't apply here — would double-skip).
+                        let (top, _pivot, _rest) = keyed.select_nth_unstable_by(need, cmp_fn);
+                        top.sort_by(cmp_fn);
+                        result_rows = top.iter().take(need).map(|(_, r)| r.clone()).collect();
+                    } else {
+                        keyed.sort_by(cmp_fn);
+                        result_rows = keyed.into_iter().map(|(_, r)| r).collect();
+                    }
                 }
         }
         // Evaluate computed SELECT expressions and build the final output rows.
