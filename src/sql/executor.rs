@@ -2406,6 +2406,12 @@ impl QueryExecutor {
         match expr {
             Expr::Match { .. }
             | Expr::StWithin3D { .. } | Expr::StKnn3D { .. } | Expr::StRadius3D { .. } => true,
+            // Subqueries must be materialized by the executor before evaluation
+            // (eval_expr_on_row cannot execute them — it returns an error, which
+            // silently filters out every row). Without this, a 3-level nested
+            // `x IN (SELECT ... WHERE y IN (SELECT ...))` routed through the
+            // ColSegmentStore fast path never resolved the inner subquery.
+            Expr::Subquery(_) => true,
             Expr::FunctionCall { name, args, .. } => {
                 matches!(name.to_lowercase().as_str(),
                     "within_radius" | "st_distance" | "st_distance_3d")
@@ -2416,6 +2422,21 @@ impl QueryExecutor {
             }
             Expr::UnaryOp { expr, .. } => Self::expr_needs_materialized_path(expr),
             Expr::IsNull { expr, .. } => Self::expr_needs_materialized_path(expr),
+            // Recurse into IN/Between/Like sub-expressions so a subquery nested
+            // in the IN list (or the IN target) is detected.
+            Expr::In { expr, list, .. } => {
+                Self::expr_needs_materialized_path(expr)
+                    || list.iter().any(|e| Self::expr_needs_materialized_path(e))
+            }
+            Expr::Between { expr, low, high, .. } => {
+                Self::expr_needs_materialized_path(expr)
+                    || Self::expr_needs_materialized_path(low)
+                    || Self::expr_needs_materialized_path(high)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                Self::expr_needs_materialized_path(expr)
+                    || Self::expr_needs_materialized_path(pattern)
+            }
             _ => false,
         }
     }
@@ -3437,6 +3458,11 @@ impl QueryExecutor {
         let mut lin_groups: Vec<(String, GroupAcc)> = Vec::new();
         let mut use_hashmap = false;
         let mut groups: HashMap<String, (GroupAcc, Vec<f64>)> = HashMap::new();
+        // Separate accumulator for NULL group rows. NULL must form its own group
+        // (not be skipped), and is kept out of the &str-keyed maps to avoid
+        // needing a sentinel string that could collide with a real value.
+        let mut has_null_group = false;
+        let mut null_acc = GroupAcc::new();
 
         // Helper: find-or-insert in lin_groups (linear scan).
         // For ≤256 groups this is faster than hashing.
@@ -3502,10 +3528,25 @@ impl QueryExecutor {
         // General path: check deletions + nulls per row.
         for i in 0..num_rows {
             if col_sst.row_map.is_deleted(i) { continue; }
-            let key = match group_seg.get_str(i) {
-                Some(s) => s,
-                None => continue,
-            };
+            // NULL group-key rows form their own group instead of being skipped.
+            let key_opt = group_seg.get_str(i);
+            if key_opt.is_none() {
+                has_null_group = true;
+                null_acc.count += 1;
+                for (j, a) in agg_cols.iter().enumerate() {
+                    if a.func == "SUM" || a.func == "AVG" {
+                        let is_int = agg_is_int[j];
+                        let v = if is_int {
+                            agg_segs[j].get_i64(i).map(|x| x as f64)
+                        } else {
+                            agg_segs[j].get_f64(i)
+                        };
+                        if let Some(v) = v { null_acc.add(v, is_int); }
+                    }
+                }
+                continue;
+            }
+            let key = key_opt.unwrap();
             if !use_hashmap {
                 let idx = lin_find(&mut lin_groups, key);
                 lin_groups[idx].1.count += 1;
@@ -3563,6 +3604,20 @@ impl QueryExecutor {
                 match a.func.as_str() {
                     "SUM" => row.push(acc.sum()),
                     "AVG" => row.push(acc.avg()),
+                    _ => row.push(Value::Null),
+                }
+            }
+            rows.push(row);
+        }
+        // Append the NULL group (rows whose group-by column was NULL).
+        if has_null_group {
+            let mut row = Vec::new();
+            row.push(Value::Null);
+            if has_count_star { row.push(Value::Integer(null_acc.count)); }
+            for a in &agg_cols {
+                match a.func.as_str() {
+                    "SUM" => row.push(null_acc.sum()),
+                    "AVG" => row.push(null_acc.avg()),
                     _ => row.push(Value::Null),
                 }
             }
@@ -8276,27 +8331,35 @@ impl QueryExecutor {
             let _ = rstore.flush_buffer();
             let rtable_id = self.db.table_registry.get_table_id(rtable).unwrap_or(0) as u64;
             let limit = stmt.limit.unwrap_or(usize::MAX);
+            // 🔑 Don't early-terminate when WHERE is present — finalize_join_result
+            // applies WHERE after the join, so we need all matching rows first,
+            // THEN take LIMIT. Early-break before WHERE gives too few results.
+            let has_where = stmt.where_clause.is_some();
             let lncol = lschema.columns.len();
             let rncol = rschema.columns.len();
             let mut joined: Vec<Vec<Value>> = Vec::with_capacity(lrows.len().min(limit));
 
             for (_, lrow) in &lrows {
-                if joined.len() >= limit { break; }
+                if !has_where && joined.len() >= limit { break; }
                 let lval = match lrow.get(lcol_pos) { Some(v) => v, None => continue };
                 // Resolve PK value → composite key for right table.
                 let rkey = match lval {
                     Value::Integer(id) if rschema.is_primary_key_auto_increment() => {
                         (rtable_id << 32) | (*id as u64 & 0xFFFFFFFF)
                     }
-                    Value::Integer(id) => {
-                        // Non-AUTO_INCREMENT PK: use pk_lookup cache.
+                    Value::Integer(_) => {
+                        // Non-AUTO_INCREMENT PK: use pk_lookup cache. The join
+                        // value is a PK *value*, NOT a row_id — for non-AUTO_INCREMENT
+                        // PKs the two differ (row_id comes from a global counter).
+                        // The old code fell back to treating the value as a row_id on
+                        // a cache miss, which created spurious matches: e.g. a
+                        // self-join where manager_id=0 (no matching id) collided with
+                        // the first-inserted row's row_id=0, including unmatched rows.
+                        // On a cache miss the PK genuinely doesn't exist → no match.
                         let pk_key = crate::database::pk_cache::PkKey::from_value(lval);
                         match self.db.pk_lookup.get(rtable).and_then(|l| l.get_pk(&pk_key)) {
                             Some(rid) => (rtable_id << 32) | (rid as u64 & 0xFFFFFFFF),
-                            None => {
-                                // Cache miss — try the value as row_id directly.
-                                (rtable_id << 32) | (*id as u64 & 0xFFFFFFFF)
-                            }
+                            None => continue,
                         }
                     }
                     _ => continue,
@@ -8370,14 +8433,15 @@ impl QueryExecutor {
         // left rows when only K matches are needed. For LIMIT 100 on a 20K-row
         // table this cuts the probe loop from 20K to ~100 iterations.
         let limit = stmt.limit.unwrap_or(usize::MAX);
+        let has_where = stmt.where_clause.is_some();
         let lncol = lschema.columns.len();
         let mut joined: Vec<Vec<Value>> = Vec::with_capacity(lrows.len().min(limit));
         for (_, lrow) in &lrows {
-            if joined.len() >= limit { break; }
+            if !has_where && joined.len() >= limit { break; }
             if let Some(k) = lrow.get(lcol_pos).and_then(to_key) {
                 if let Some(matches) = hash.get(&k) {
                     for &ri in matches {
-                        if joined.len() >= limit { break; }
+                        if !has_where && joined.len() >= limit { break; }
                         let rrow = &rrows[ri].1;
                         let mut combined = Vec::with_capacity(lncol + rrow.len());
                         combined.extend_from_slice(lrow);

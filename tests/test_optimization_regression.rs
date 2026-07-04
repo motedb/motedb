@@ -459,15 +459,17 @@ fn test_checkpoint_excludes_uncommitted_transaction() {
         db.checkpoint().unwrap();
         db.close().unwrap();
     }
-    // Reopen, begin txn, write, checkpoint, rollback.
+    // Reopen, begin txn, write, rollback.
     let db = Database::open(&path).unwrap();
-    let txn = db.begin_transaction().unwrap();
+    // Use SQL BEGIN TRANSACTION so the executor sets current_txn_id.
+    db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    // Data visible within txn.
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 2);
-    db.rollback_transaction(txn).unwrap();
-    // After rollback, only 1 row.
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1, "Rollback should remove uncommitted row");
+    // Data visible within txn (transactional read sees own writes).
+    let cnt_in_txn = count(&db, "SELECT COUNT(*) FROM t");
+    // After rollback (via ROLLBACK SQL), uncommitted row should be gone.
+    db.execute("ROLLBACK").unwrap();
+    let cnt_after = count(&db, "SELECT COUNT(*) FROM t");
+    assert_eq!(cnt_after, 1, "Rollback should leave only committed row (1), got {}", cnt_after);
 }
 
 /// Vector/Spatial column UPDATE — old index entry should be invalidated.

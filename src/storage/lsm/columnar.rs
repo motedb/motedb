@@ -1024,7 +1024,21 @@ impl ColumnarSSTableBuilder {
             self.null_flags[col_idx].push(matches!(value, Value::Null));
             match &self.column_tags[col_idx] {
                 ColumnTypeTag::Integer => {
-                    let i = match value { Value::Integer(v) => *v, Value::Null => i64::MIN, _ => 0 };
+                    // An Integer column normally holds Value::Integer. But a
+                    // value can be promoted to Value::Float at runtime (e.g. an
+                    // arithmetic overflow like i64::MAX + 1 promotes to float).
+                    // Storing 0 here (the old `_ => 0` arm) silently lost the
+                    // value: after checkpoint/reopen a full scan read back 0.
+                    // Store the f64's bit pattern as i64 so the bytes survive;
+                    // the full-scan Integer decode then yields a positive value
+                    // and the PK/row path (which uses row_format's generic
+                    // bincode encoding for Float-in-Integer) recovers the float.
+                    let i = match value {
+                        Value::Integer(v) => *v,
+                        Value::Null => i64::MIN,
+                        Value::Float(f) => f.to_bits() as i64,
+                        _ => 0,
+                    };
                     buf.extend_from_slice(&i.to_le_bytes());
                 }
                 ColumnTypeTag::Float => {
