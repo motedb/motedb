@@ -1157,7 +1157,13 @@ impl ColSegmentStore {
 
         // Pre-extract target comparison value (avoids re-matching per row).
         let target_i = if let Value::Integer(v) = target { Some(*v) } else { None };
-        let target_f = if let Value::Float(v) = target { Some(*v) } else { None };
+        let mut target_f = if let Value::Float(v) = target { Some(*v) } else { None };
+        // 🔑 Cross-type: if the literal was parsed as Integer but the column is
+        // Float, convert it so the comparison works (WHERE score > 50 parses
+        // as Integer(50), but score is a FLOAT column).
+        if target_f.is_none() {
+            if let Some(i) = target_i { target_f = Some(i as f64); }
+        }
         let target_s: Option<&str> = if let Value::Text(t) = target { Some(t.as_str()) } else { None };
         let target_b = if let Value::Bool(v) = target { Some(*v) } else { None };
 
