@@ -1586,6 +1586,16 @@ impl QueryExecutor {
         schema: &TableSchema,
     ) -> Option<(usize, crate::sql::ast::BinaryOperator, Value)> {
         use crate::sql::ast::{BinaryOperator, Expr};
+
+        /// Negate a Value (for parsing -N as a literal). Returns None if the
+        /// value type can't be negated (only Integer/Float supported).
+        fn negate_value(v: &Value) -> Option<Value> {
+            match v {
+                Value::Integer(i) => i.checked_neg().map(Value::Integer),
+                Value::Float(f) => Some(Value::Float(-f)),
+                _ => None,
+            }
+        }
         let (left, op, right) = match wc {
             Expr::BinaryOp { left, op, right } => (left, op, right),
             _ => return None,
@@ -1600,6 +1610,13 @@ impl QueryExecutor {
             // col OP literal  (normal form)
             (Expr::Column(cn), Expr::Literal(v)) => {
                 (schema.get_column_position(cn)?, v.clone())
+            }
+            // col OP negative-literal  (e.g. WHERE v = -100 → UnaryOp(Minus, Literal(100)))
+            (Expr::Column(cn), Expr::UnaryOp { op: crate::sql::ast::UnaryOperator::Minus, expr }) => {
+                if let Expr::Literal(v) = expr.as_ref() {
+                    let negated = negate_value(v)?;
+                    (schema.get_column_position(cn)?, negated)
+                } else { return None; }
             }
             // literal OP col  (swapped operand form, e.g. 49000 < id)
             (Expr::Literal(v), Expr::Column(cn)) => {
