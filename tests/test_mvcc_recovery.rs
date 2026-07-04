@@ -72,11 +72,6 @@ fn test_txn_sees_own_writes() {
 }
 
 /// UPDATE within transaction, then rollback — old value restored.
-/// NOTE: Currently UPDATE/DELETE do NOT participate in transactional
-/// write_set buffering (only INSERT does). They write directly to the
-/// store. This is a known limitation. The test documents the behavior:
-/// after rollback, the UPDATE is NOT undone (engine doesn't support
-/// UPDATE undo yet). Once fixed, flip this test to assert rollback works.
 #[test]
 fn test_txn_update_rollback() {
     let (db, _d) = mk();
@@ -85,17 +80,11 @@ fn test_txn_update_rollback() {
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
     db.execute("ROLLBACK").unwrap();
-    // Current engine behavior: UPDATE is committed directly, not buffered.
-    // This is a known limitation — UPDATE/DELETE don't participate in txn.
-    // Document the current behavior; when fixed, change to assert == 10.
-    let current = val(&db, "SELECT v FROM t WHERE id = 1");
-    // Accept either behavior: old value (rollback worked) or new value (known limitation).
-    assert!(current == Value::Integer(10) || current == Value::Integer(99),
-        "Update value should be 10 (if rollback works) or 99 (known limitation), got {:?}", current);
+    assert_eq!(val(&db, "SELECT v FROM t WHERE id = 1"), Value::Integer(10),
+        "Rollback should restore original value");
 }
 
 /// DELETE within transaction, then rollback — row restored.
-/// NOTE: Same limitation as UPDATE — DELETE writes directly to store.
 #[test]
 fn test_txn_delete_rollback() {
     let (db, _d) = mk();
@@ -105,11 +94,7 @@ fn test_txn_delete_rollback() {
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
     db.execute("ROLLBACK").unwrap();
-    // Current engine behavior: DELETE is committed directly.
-    // Accept either behavior: 2 rows (rollback worked) or 1 row (known limitation).
-    let current = cnt(&db, "SELECT COUNT(*) FROM t");
-    assert!(current == 2 || current == 1,
-        "Count should be 2 (if rollback works) or 1 (known limitation), got {}", current);
+    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 2, "Rollback should restore deleted row");
 }
 
 // ═════════════════════════════════════════════════════════════════

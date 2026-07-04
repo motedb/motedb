@@ -1407,6 +1407,31 @@ impl QueryExecutor {
             Statement::RollbackTransaction => {
                 let _txn_id_opt = *self.current_txn_id.lock();
                 if let Some(txn_id) = _txn_id_opt {
+                    // 🔑 Replay undo log BEFORE clearing the transaction context.
+                    // execute_update/execute_delete recorded old values for rows
+                    // they modified directly in storage. We replay those here to
+                    // restore the pre-transaction state.
+                    if let Ok(ctx) = self.db.txn_coordinator.get_context(txn_id) {
+                        let undo_log = std::mem::take(&mut *ctx.undo_log.write());
+                        for delta in undo_log.into_iter().rev() {
+                            match delta {
+                                crate::txn::coordinator::DeltaOperation::Update(row_id, table_name, old_value) => {
+                                    let old_row = std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
+                                    if let Ok(schema) = self.db.get_table_schema(&table_name) {
+                                        let _ = self.db.update_row_in_table_with_schema(
+                                            &table_name, row_id, old_row.clone(), old_row, &schema);
+                                    }
+                                }
+                                crate::txn::coordinator::DeltaOperation::Delete(row_id, table_name, old_value) => {
+                                    let old_row = std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
+                                    let _ = self.db.insert_row_to_table(&table_name, old_row);
+                                }
+                                crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
+                                    // INSERT undo: write_set INSERT was never committed to store.
+                                }
+                            }
+                        }
+                    }
                     self.db.rollback_transaction(txn_id)?;
                     *self.current_txn_id.lock() = None;
                     StreamingQueryResult::Definition {
@@ -11724,6 +11749,15 @@ impl QueryExecutor {
                 }
             }
 
+            // 🔑 Record undo delta for transactional UPDATE (so ROLLBACK can restore).
+            let txn_id = *self.current_txn_id.lock();
+            if let Some(tid) = txn_id {
+                let _ = self.db.txn_coordinator.record_write_delta(tid,
+                    crate::txn::coordinator::DeltaOperation::Update(
+                        row_id, stmt.table.clone(), Arc::new(row.clone()),
+                    ));
+            }
+
             self.db.update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, &schema)?;
 
             affected_rows += 1;
@@ -11785,6 +11819,15 @@ impl QueryExecutor {
                 continue;
             }
             
+            // 🔑 Record undo delta for transactional DELETE (so ROLLBACK can restore).
+            let txn_id = *self.current_txn_id.lock();
+            if let Some(tid) = txn_id {
+                let _ = self.db.txn_coordinator.record_write_delta(tid,
+                    crate::txn::coordinator::DeltaOperation::Delete(
+                        row_id, stmt.table.clone(), Arc::new(row.clone()),
+                    ));
+            }
+
             // Delete row - 底层已实现增量索引维护，传入 old_row 避免重复加载
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;
             affected_rows += 1;

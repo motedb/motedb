@@ -82,6 +82,12 @@ pub struct TransactionContext {
     
     /// Read set (for conflict detection in Serializable)
     pub read_set: RwLock<HashSet<RowId>>,
+
+    /// Undo log: operations that directly modified storage (UPDATE/DELETE)
+    /// and need to be reversed on ROLLBACK. Each entry stores the old value
+    /// so rollback can restore it. Unlike write_set (which buffers INSERTs),
+    /// these ops already hit the store — rollback must actively undo them.
+    pub undo_log: RwLock<Vec<DeltaOperation>>,
     
     /// Snapshot for this transaction
     pub snapshot: Snapshot,
@@ -131,6 +137,7 @@ impl TransactionCoordinator {
             state: AtomicU8::new(TransactionState::Active as u8),
             write_set: RwLock::new(HashMap::new()),
             read_set: RwLock::new(HashSet::new()),
+            undo_log: RwLock::new(Vec::new()),
             snapshot,
             savepoints: RwLock::new(Vec::new()),  // Initialize empty savepoint stack
         });
@@ -196,16 +203,20 @@ impl TransactionCoordinator {
     /// Rollback a transaction
     pub fn rollback(&self, txn_id: TransactionId) -> Result<()> {
         let ctx = self.get_context(txn_id)?;
-        
+
+        // 🔑 Undo log replay is handled by the executor (which has db access)
+        // before calling this method. Clear the undo log here for cleanliness.
+        ctx.undo_log.write().clear();
+
         // Clear write set
         ctx.write_set.write().clear();
-        
+
         // Mark as aborted
         ctx.state.store(TransactionState::Aborted as u8, Ordering::Release);
-        
+
         // Remove from active transactions
         self.active_txns.remove(&txn_id);
-        
+
         Ok(())
     }
     
@@ -245,11 +256,13 @@ impl TransactionCoordinator {
     /// This enables rollback_to_savepoint to undo operations.
     pub fn record_write_delta(&self, txn_id: TransactionId, delta: DeltaOperation) -> Result<()> {
         let ctx = self.get_context(txn_id)?;
+        // Record in undo_log for full-transaction rollback.
+        ctx.undo_log.write().push(delta.clone());
+        // Also record in the latest savepoint if one exists.
         let mut savepoints = ctx.savepoints.write();
         if let Some(last) = savepoints.last_mut() {
             last.write_deltas.push(delta);
         }
-        // If no savepoints, the delta is not tracked (full rollback still works via write_set)
         Ok(())
     }
     /// Rollback to a savepoint (Delta Snapshot optimized)
