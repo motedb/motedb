@@ -10075,6 +10075,28 @@ impl QueryExecutor {
                     for p in Self::expr_referenced_columns(a, schema) { if !out.contains(&p) { out.push(p); } }
                 }
             }
+            // Predicates that reference a column: collect their columns so that
+            // projected scans decode the WHERE columns (otherwise COUNT(*) with
+            // a WHERE on a non-aggregate column scans no columns and evaluates
+            // the predicate against default NULLs — see single_pass_group_by).
+            Expr::IsNull { expr, .. } => {
+                for p in Self::expr_referenced_columns(expr, schema) { if !out.contains(&p) { out.push(p); } }
+            }
+            Expr::Like { expr, pattern, .. } => {
+                for p in Self::expr_referenced_columns(expr, schema) { if !out.contains(&p) { out.push(p); } }
+                for p in Self::expr_referenced_columns(pattern, schema) { if !out.contains(&p) { out.push(p); } }
+            }
+            Expr::In { expr, list, .. } => {
+                for p in Self::expr_referenced_columns(expr, schema) { if !out.contains(&p) { out.push(p); } }
+                for e in list {
+                    for p in Self::expr_referenced_columns(e, schema) { if !out.contains(&p) { out.push(p); } }
+                }
+            }
+            Expr::Between { expr, low, high, .. } => {
+                for p in Self::expr_referenced_columns(expr, schema) { if !out.contains(&p) { out.push(p); } }
+                for p in Self::expr_referenced_columns(low, schema) { if !out.contains(&p) { out.push(p); } }
+                for p in Self::expr_referenced_columns(high, schema) { if !out.contains(&p) { out.push(p); } }
+            }
             _ => {}
         }
         out
@@ -10776,7 +10798,11 @@ impl QueryExecutor {
         let where_clause = &stmt.where_clause;
         let has_where = where_clause.is_some();
 
-        // Pre-collect columns needed for partial decode (group cols + agg cols)
+        // Pre-collect columns needed for partial decode (group cols + agg cols +
+        // WHERE cols). The WHERE columns MUST be included so the projected scan
+        // decodes them — otherwise COUNT(*) with `WHERE col IS NULL` scans no
+        // columns and the predicate is evaluated against default NULLs (every
+        // row appears NULL → IS NULL matches all rows).
         let needed_cols: Vec<usize> = {
             let mut cols: Vec<usize> = group_col_positions.to_vec();
             for (_, _, agg_info) in select_col_info {
@@ -10785,6 +10811,13 @@ impl QueryExecutor {
                         if !cols.contains(&pos) {
                             cols.push(pos);
                         }
+                    }
+                }
+            }
+            if let Some(ref clause) = where_clause {
+                for p in Self::expr_referenced_columns(clause, schema) {
+                    if !cols.contains(&p) {
+                        cols.push(p);
                     }
                 }
             }
