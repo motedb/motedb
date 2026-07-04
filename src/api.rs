@@ -539,7 +539,15 @@ impl Database {
             Err(_) => return Ok(None),
         };
 
-        let _is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
+        let is_pk = schema.primary_key().map(|pk| {
+            let pk_bare = pk.rsplit('.').next().unwrap_or(pk);
+            pk_bare == col_name || pk == col_name
+        }).unwrap_or(false);
+
+        // 🔑 Only optimize PK lookups. Non-PK WHERE clauses (e.g. WHERE name = ?)
+        // must NOT use the fast PK path — it would try to resolve the column as
+        // a PK and return Modification/empty instead of a proper scan.
+        if !is_pk { return Ok(None); }
 
         let is_star = select_cols.map_or(false, |cols| cols.len() == 1 && matches!(cols[0], SelectColumn::Star));
 
