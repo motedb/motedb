@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Computed without per-row Value allocation.
 #[derive(Default, Clone)]
 pub struct AggregateResult {
-    pub count: i64,
+    pub count: i64,       // non-NULL values (for COUNT(col))
+    pub null_count: i64,  // NULL values (for COUNT(*) = count + null_count)
     pub int_sum: i64,
     pub float_sum: f64,
     pub has_float: bool,
@@ -1292,20 +1293,39 @@ impl ColSegmentStore {
                 // when the value is present (get_i64/get_f64 return None for NULL).
                 if let Some(ref af) = agg_fixed {
                     if agg_is_float {
-                        if let Some(v) = af.get_f64(i) {
-                            result.count += 1;
-                            result.float_sum += v;
-                            result.has_float = true;
-                            if result.count == 1 { result.min_float = v; result.max_float = v; }
-                            else { result.min_float = result.min_float.min(v); result.max_float = result.max_float.max(v); }
+                        match af.get_f64(i) {
+                            Some(v) => {
+                                result.count += 1;
+                                result.float_sum += v;
+                                result.has_float = true;
+                                if result.count == 1 { result.min_float = v; result.max_float = v; }
+                                else { result.min_float = result.min_float.min(v); result.max_float = result.max_float.max(v); }
+                            }
+                            None => { result.null_count += 1; }
                         }
                     } else {
-                        if let Some(v) = af.get_i64(i) {
-                            result.count += 1;
-                            result.int_sum = result.int_sum.wrapping_add(v);
-                            if result.count == 1 { result.min_int = v; result.max_int = v; }
-                            else { result.min_int = result.min_int.min(v); result.max_int = result.max_int.max(v); }
+                        match af.get_i64(i) {
+                            Some(v) => {
+                                result.count += 1;
+                                result.int_sum = result.int_sum.wrapping_add(v);
+                                if result.count == 1 { result.min_int = v; result.max_int = v; }
+                                else { result.min_int = result.min_int.min(v); result.max_int = result.max_int.max(v); }
+                            }
+                            None => { result.null_count += 1; }
                         }
+                    }
+                } else {
+                    // Variable-width column (TEXT/Vector/Spatial): COUNT(col) counts
+                    // non-NULL rows. Use the column's null_flags to determine NULL.
+                    let is_null = self.col_types.get(agg_col)
+                        .map(|_| seg.sst.read_text(agg_col).ok())
+                        .flatten()
+                        .map(|t| t.is_null(i))
+                        .unwrap_or(true);
+                    if is_null {
+                        result.null_count += 1;
+                    } else {
+                        result.count += 1;
                     }
                 }
             }

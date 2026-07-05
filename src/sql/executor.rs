@@ -1870,7 +1870,14 @@ impl QueryExecutor {
                     let mut row: Vec<Value> = Vec::with_capacity(aggs.len());
                     for a in &aggs {
                         match a.func.as_str() {
-                            "COUNT" => row.push(Value::Integer(agg.count)),
+                            "COUNT" => {
+                                // COUNT(*) counts all rows; COUNT(col) skips NULLs.
+                                if a.col.is_none() {
+                                    row.push(Value::Integer(agg.count + agg.null_count));
+                                } else {
+                                    row.push(Value::Integer(agg.count));
+                                }
+                            }
                             "SUM" => {
                                 if agg.count == 0 { row.push(Value::Null); }
                                 else if agg.has_float { row.push(Value::Float(agg.float_sum + agg.int_sum as f64)); }
@@ -4241,7 +4248,7 @@ impl QueryExecutor {
         table_name: &str,
         wc: &crate::sql::ast::Expr,
     ) -> Result<Option<StreamingQueryResult>> {
-        use crate::sql::ast::{Expr, BinaryOperator, SelectColumn};
+        use crate::sql::ast::{Expr, BinaryOperator};
         // 🔑 If SELECT has computed expressions (subqueries, arithmetic), fall
         // back to the full-scan path which resolves them via eval_expr_on_row.
         if Self::select_has_computed_expression(&stmt.columns) {
