@@ -152,21 +152,18 @@ fn test_group_by_order_by_limit_combined() {
 }
 
 /// Subquery in SELECT (scalar subquery).
-/// NOTE: Scalar subquery in SELECT projection may not be fully supported.
-/// This test verifies it doesn't crash and returns some result.
 #[test]
 fn test_scalar_subquery_in_select() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
     for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
     db.flush().unwrap();
-    let r = db.execute("SELECT id, (SELECT MAX(v) FROM t) AS max_v FROM t WHERE id = 1");
-    // May not support scalar subquery in SELECT — accept any result that doesn't panic.
-    assert!(r.is_ok(), "Scalar subquery should not error");
-    if r.is_ok() {
-        let mat = r.unwrap().materialize();
-        // Just verify it returns something.
-        assert!(mat.is_ok(), "Should materialize");
+    let r = rows(&db, "SELECT id, (SELECT MAX(v) FROM t) AS max_v FROM t WHERE id = 1");
+    assert_eq!(r.len(), 1);
+    // The scalar subquery should return 10 (MAX of 1..10).
+    match &r[0][1] {
+        Value::Integer(i) => assert_eq!(*i, 10, "MAX(v) subquery should return 10"),
+        _ => panic!("Expected Integer for scalar subquery result"),
     }
 }
 

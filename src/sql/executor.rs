@@ -2149,6 +2149,36 @@ impl QueryExecutor {
             }
         }
 
+        // 🔑 Pre-resolve scalar subqueries in SELECT columns (e.g.
+        // SELECT id, (SELECT MAX(v) FROM t) FROM t). eval_expr_on_row can't
+        // execute subqueries — resolve them once here and replace with Literal.
+        let resolved_select_stmt;
+        let stmt: &SelectStmt = if stmt.columns.iter().any(|c| matches!(c, crate::sql::ast::SelectColumn::Expr(crate::sql::ast::Expr::Subquery(_), _))) {
+            resolved_select_stmt = {
+                let mut s = stmt.clone();
+                for col in &mut s.columns {
+                    if let crate::sql::ast::SelectColumn::Expr(ref mut expr, _) = col {
+                        let sub = match expr { crate::sql::ast::Expr::Subquery(s) => Some(s.clone()), _ => None };
+                        if let Some(sub) = sub {
+                            if let Ok(sub_result) = self.execute_select_internal(&sub) {
+                                if let QueryResult::Select { rows, .. } = &sub_result {
+                                    let scalar = rows.first()
+                                        .and_then(|r| r.first())
+                                        .cloned()
+                                        .unwrap_or(Value::Null);
+                                    *expr = crate::sql::ast::Expr::Literal(scalar);
+                                }
+                            }
+                        }
+                    }
+                }
+                s
+            };
+            &resolved_select_stmt
+        } else {
+            stmt
+        };
+
         // 🚀 Fast path: Text search (MATCH AGAINST), spatial (ST_WITHIN/ST_KNN),
         // and ORDER BY ST_DISTANCE must go through execute_select_internal which
         // has the index pushdown paths. Check this BEFORE the ColSegmentStore S9
@@ -4211,7 +4241,12 @@ impl QueryExecutor {
         table_name: &str,
         wc: &crate::sql::ast::Expr,
     ) -> Result<Option<StreamingQueryResult>> {
-        use crate::sql::ast::{Expr, BinaryOperator};
+        use crate::sql::ast::{Expr, BinaryOperator, SelectColumn};
+        // 🔑 If SELECT has computed expressions (subqueries, arithmetic), fall
+        // back to the full-scan path which resolves them via eval_expr_on_row.
+        if Self::select_has_computed_expression(&stmt.columns) {
+            return Ok(None);
+        }
         // Only handle `pk_col = literal` (the common point-query shape).
         let (col_name, literal) = match wc {
             Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
@@ -5170,13 +5205,40 @@ impl QueryExecutor {
         // eval_expr_on_row can resolve Expr::Column by position, then evaluate
         // each SELECT column: Column→raw value, computed Expr→eval_expr_on_row.
         if has_computed_sel {
+            // 🔑 Pre-resolve scalar subqueries in SELECT columns (e.g.
+            // SELECT id, (SELECT MAX(v) FROM t) FROM t). eval_expr_on_row
+            // can't execute subqueries — we resolve them once here and
+            // replace the Subquery node with a Literal.
+            let mut resolved_columns = stmt.columns.clone();
+            for col in &mut resolved_columns {
+                if let SelectColumn::Expr(expr, _) = col {
+                    let subquery_stmt = match expr {
+                        Expr::Subquery(s) => Some(s.clone()),
+                        _ => None,
+                    };
+                    if let Some(subquery) = subquery_stmt {
+                        // Execute the scalar subquery once.
+                        if let Ok(sub_result) = self.execute_select_internal(&subquery) {
+                            if let QueryResult::Select { rows, .. } = &sub_result {
+                                let scalar = rows.first()
+                                    .and_then(|r| r.first())
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                *expr = Expr::Literal(scalar);
+                            }
+                        }
+                    }
+                }
+            }
+            // Re-parse out_plan with resolved columns.
+            let stmt_columns = &resolved_columns;
             let ncol = schema.columns.len();
             // Pre-compute, per SELECT column, how to produce its output value:
             //  - Some(pos): copy scan row's value at that schema position.
             //  - None + an Expr: evaluate the expression against the full row.
             // (Star/ColumnWithAlias map to Column semantics here.)
             enum OutCol { CopySchema(usize), Expr(Expr) }
-            let out_plan: Vec<OutCol> = stmt.columns.iter().map(|c| match c {
+            let out_plan: Vec<OutCol> = stmt_columns.iter().map(|c| match c {
                 SelectColumn::Star => OutCol::CopySchema(0), // rare; expanded below
                 SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
                     let bare = name.rsplit('.').next().unwrap_or(name);
@@ -5193,7 +5255,7 @@ impl QueryExecutor {
                     }
                 }
             }).collect();
-            let star_expanded = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+            let star_expanded = stmt_columns.iter().any(|c| matches!(c, SelectColumn::Star));
 
             for row in &mut result_rows {
                 // Build full-schema positional row from scan_positions.
@@ -14812,3 +14874,4 @@ mod tests {
             "Unsupported expression should return Err for fallback path");
     }
 }
+
