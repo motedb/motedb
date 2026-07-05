@@ -361,10 +361,10 @@ impl Database {
                 b"INSERT" | b"insert" if !in_txn => {
                     if let Some(r) = self.try_fast_insert(sql)? { return Ok(r); }
                 }
-                b"UPDATE" | b"update" => {
+                b"UPDATE" | b"update" if !in_txn => {
                     if let Some(r) = self.try_fast_update(sql)? { return Ok(r); }
                 }
-                b"DELETE" | b"delete" => {
+                b"DELETE" | b"delete" if !in_txn => {
                     if let Some(r) = self.try_fast_delete(sql)? { return Ok(r); }
                 }
                 b"SELECT" | b"select" => {

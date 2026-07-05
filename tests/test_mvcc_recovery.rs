@@ -214,10 +214,7 @@ fn test_spatial_st_distance_ordering() {
     }
 }
 
-/// Spatial WITHIN_RADIUS query.
-/// NOTE: WITHIN_RADIUS may not return correct results on columnar-store
-/// tables (known limitation — spatial function evaluation in columnar
-/// WHERE path). This test verifies it doesn't crash/panic.
+/// Spatial WITHIN_RADIUS query — returns points within a radius.
 #[test]
 fn test_spatial_within_radius() {
     let (db, _d) = mk();
@@ -226,9 +223,10 @@ fn test_spatial_within_radius() {
     db.execute("INSERT INTO pts VALUES (2, POINT(5, 5))").unwrap();
     db.execute("INSERT INTO pts VALUES (3, POINT(20, 20))").unwrap();
     db.flush().unwrap();
-    // Must not panic — correctness of results is a separate concern.
-    let r = db.execute("SELECT id FROM pts WHERE WITHIN_RADIUS(loc, 0, 0, 10)");
-    assert!(r.is_ok(), "WITHIN_RADIUS should not error");
+    let r = rows(&db, "SELECT id FROM pts WHERE WITHIN_RADIUS(loc, 0, 0, 10)");
+    // Points within radius 10 of origin: (0,0) dist=0, (5,5) dist≈7.07.
+    // (20,20) dist≈28.3 is outside. Should find 2.
+    assert_eq!(r.len(), 2, "Should find 2 points within radius 10, got {}", r.len());
 }
 
 // ═════════════════════════════════════════════════════════════════

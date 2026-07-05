@@ -1422,7 +1422,7 @@ impl QueryExecutor {
                                             &table_name, row_id, old_row.clone(), old_row, &schema);
                                     }
                                 }
-                                crate::txn::coordinator::DeltaOperation::Delete(row_id, table_name, old_value) => {
+                                crate::txn::coordinator::DeltaOperation::Delete(_row_id, table_name, old_value) => {
                                     let old_row = std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
                                     let _ = self.db.insert_row_to_table(&table_name, old_row);
                                 }
@@ -5821,37 +5821,53 @@ impl QueryExecutor {
                 }
             }
             "within_radius" => {
-                if args.len() != 3 {
-                    return Err(MoteDBError::InvalidArgument("WITHIN_RADIUS() takes 3 arguments".to_string()));
-                }
-                let point = Self::eval_expr_on_row(&args[0], row, schema)?;
-                let center = Self::eval_expr_on_row(&args[1], row, schema)?;
-                let radius = Self::eval_expr_on_row(&args[2], row, schema)?;
-
                 use crate::types::Geometry;
-                let (px, py) = match point {
-                    Value::Spatial(geom) => match &*geom {
-                        Geometry::Point(p) => (p.x, p.y),
-                        Geometry::Point3D(p) => (p.x, p.y),
+                let (px, py, cx, cy, radius) = if args.len() == 4 {
+                    // WITHIN_RADIUS(geom, x, y, radius) — 4-arg form
+                    let point = Self::eval_expr_on_row(&args[0], row, schema)?;
+                    let cx = Self::eval_expr_on_row(&args[1], row, schema)?;
+                    let cy = Self::eval_expr_on_row(&args[2], row, schema)?;
+                    let radius = Self::eval_expr_on_row(&args[3], row, schema)?;
+                    let (px, py) = match point {
+                        Value::Spatial(geom) => match &*geom {
+                            Geometry::Point(p) => (p.x, p.y),
+                            Geometry::Point3D(p) => (p.x, p.y),
+                            _ => return Ok(Value::Bool(false)),
+                        },
                         _ => return Ok(Value::Bool(false)),
-                    },
-                    _ => return Ok(Value::Bool(false)),
-                };
-                let (cx, cy) = match center {
-                    Value::Spatial(geom) => match &*geom {
-                        Geometry::Point(p) => (p.x, p.y),
-                        Geometry::Point3D(p) => (p.x, p.y),
+                    };
+                    let cx = match cx { Value::Float(f) => f, Value::Integer(i) => i as f64, _ => return Ok(Value::Bool(false)) };
+                    let cy = match cy { Value::Float(f) => f, Value::Integer(i) => i as f64, _ => return Ok(Value::Bool(false)) };
+                    let r = match radius { Value::Float(f) => f, Value::Integer(i) => i as f64, _ => return Ok(Value::Bool(false)) };
+                    (px, py, cx, cy, r)
+                } else if args.len() == 3 {
+                    // WITHIN_RADIUS(geom, center, radius) — 3-arg form
+                    let point = Self::eval_expr_on_row(&args[0], row, schema)?;
+                    let center = Self::eval_expr_on_row(&args[1], row, schema)?;
+                    let radius = Self::eval_expr_on_row(&args[2], row, schema)?;
+                    let (px, py) = match point {
+                        Value::Spatial(geom) => match &*geom {
+                            Geometry::Point(p) => (p.x, p.y),
+                            Geometry::Point3D(p) => (p.x, p.y),
+                            _ => return Ok(Value::Bool(false)),
+                        },
                         _ => return Ok(Value::Bool(false)),
-                    },
-                    _ => return Ok(Value::Bool(false)),
-                };
-                let r = match radius {
-                    Value::Float(f) => f,
-                    Value::Integer(i) => i as f64,
-                    _ => return Ok(Value::Bool(false)),
+                    };
+                    let (cx, cy) = match center {
+                        Value::Spatial(geom) => match &*geom {
+                            Geometry::Point(p) => (p.x, p.y),
+                            Geometry::Point3D(p) => (p.x, p.y),
+                            _ => return Ok(Value::Bool(false)),
+                        },
+                        _ => return Ok(Value::Bool(false)),
+                    };
+                    let r = match radius { Value::Float(f) => f, Value::Integer(i) => i as f64, _ => return Ok(Value::Bool(false)) };
+                    (px, py, cx, cy, r)
+                } else {
+                    return Err(MoteDBError::InvalidArgument("WITHIN_RADIUS() takes 3 or 4 arguments".to_string()));
                 };
                 let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-                Ok(Value::Bool(dist <= r))
+                Ok(Value::Bool(dist <= radius))
             }
             "st_distance" => {
                 if args.len() == 2 {
@@ -11960,6 +11976,15 @@ impl QueryExecutor {
                 new_row[*pos] = val.clone();
             }
 
+            // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
+            let txn_id = *self.current_txn_id.lock();
+            if let Some(tid) = txn_id {
+                let _ = self.db.txn_coordinator.record_write_delta(tid,
+                    crate::txn::coordinator::DeltaOperation::Update(
+                        row_id, stmt.table.clone(), Arc::new(row.clone()),
+                    ));
+            }
+
             self.db.update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, schema)?;
             affected_rows += 1;
         }
@@ -11985,6 +12010,15 @@ impl QueryExecutor {
                 Some(r) => r,
                 None => continue,
             };
+
+            // 🔑 Record undo delta for transactional DELETE (PK fast path).
+            let txn_id = *self.current_txn_id.lock();
+            if let Some(tid) = txn_id {
+                let _ = self.db.txn_coordinator.record_write_delta(tid,
+                    crate::txn::coordinator::DeltaOperation::Delete(
+                        row_id, stmt.table.clone(), Arc::new(row.clone()),
+                    ));
+            }
 
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;
             affected_rows += 1;
@@ -12033,6 +12067,15 @@ impl QueryExecutor {
                 }
             }
 
+            // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
+            let txn_id = *self.current_txn_id.lock();
+            if let Some(tid) = txn_id {
+                let _ = self.db.txn_coordinator.record_write_delta(tid,
+                    crate::txn::coordinator::DeltaOperation::Update(
+                        row_id, stmt.table.clone(), Arc::new(row.clone()),
+                    ));
+            }
+
             self.db.update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, schema)?;
             affected_rows += 1;
         }
@@ -12061,6 +12104,15 @@ impl QueryExecutor {
                 if let Some(actual_val) = row.get(col.position) {
                     if actual_val != where_val { continue; }
                 } else { continue; }
+            }
+
+            // 🔑 Record undo delta for transactional DELETE (PK/index fast path).
+            let txn_id = *self.current_txn_id.lock();
+            if let Some(tid) = txn_id {
+                let _ = self.db.txn_coordinator.record_write_delta(tid,
+                    crate::txn::coordinator::DeltaOperation::Delete(
+                        row_id, stmt.table.clone(), Arc::new(row.clone()),
+                    ));
             }
 
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;
