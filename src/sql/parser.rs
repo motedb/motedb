@@ -758,8 +758,21 @@ impl Parser {
         match &self.current().token_type {
             TokenType::Table => {
                 self.advance();
+                // Optional IF EXISTS clause (parsed as two identifiers).
+                let if_exists = if matches!(&self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("IF")) {
+                    self.advance();
+                    match &self.current().token_type {
+                        TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("EXISTS") => {
+                            self.advance();
+                            true
+                        }
+                        _ => return Err(self.error("Expected EXISTS after IF")),
+                    }
+                } else {
+                    false
+                };
                 let table = self.parse_identifier()?;
-                Ok(Statement::DropTable(DropTableStmt { table }))
+                Ok(Statement::DropTable(DropTableStmt { table, if_exists }))
             }
             TokenType::Index => {
                 self.advance();

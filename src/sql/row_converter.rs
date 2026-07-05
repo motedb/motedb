@@ -112,7 +112,15 @@ pub fn values_to_row_schema_order(
 
     for (i, col_def) in schema.columns.iter().enumerate() {
         if col_def.auto_increment {
-            row.push(Value::Null);
+            // 🔑 If the user provided an explicit value for the AUTO_INCREMENT
+            // column, keep it (e.g. INSERT INTO t VALUES (100, 'x') on an
+            // AUTO_INCREMENT PK table should store id=100, not NULL).
+            let val = values.get(i).cloned().unwrap_or(Value::Null);
+            if !matches!(val, Value::Null) {
+                row.push(val);
+            } else {
+                row.push(Value::Null);
+            }
             continue;
         }
         let val = values.get(i).cloned().unwrap_or(Value::Null);

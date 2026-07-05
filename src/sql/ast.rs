@@ -166,6 +166,7 @@ pub enum IndexType {
 #[derive(Debug, Clone)]
 pub struct DropTableStmt {
     pub table: String,
+    pub if_exists: bool,
 }
 
 /// DROP INDEX statement

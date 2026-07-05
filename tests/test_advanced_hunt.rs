@@ -114,18 +114,15 @@ fn test_auto_increment_after_delete_no_reuse() {
     assert!(id3 != Value::Integer(2), "AUTO_INCREMENT should not reuse deleted IDs, got {:?}", id3);
 }
 
-/// AUTO_INCREMENT with explicit ID.
-/// NOTE: Explicit ID in AUTO_INCREMENT table may not advance the counter.
-/// This test verifies it doesn't panic.
+/// AUTO_INCREMENT with explicit ID — counter advances past explicit ID.
 #[test]
 fn test_auto_increment_with_explicit_id() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
-    // Explicit ID insert — may or may not advance counter. Must not panic.
-    let r1 = db.execute("INSERT INTO t VALUES (100, 10)");
-    if r1.is_err() { return; } // If explicit ID on auto-inc fails, that's acceptable.
-    let r2 = db.execute("INSERT INTO t (v) VALUES (20)");
-    assert!(r2.is_ok(), "Auto-increment insert after explicit should not fail");
+    db.execute("INSERT INTO t VALUES (100, 10)").unwrap();
+    db.execute("INSERT INTO t (v) VALUES (20)").unwrap();
+    let next_id = val(&db, "SELECT id FROM t WHERE v = 20");
+    assert_eq!(next_id, Value::Integer(101), "AUTO_INCREMENT should continue from max explicit ID+1");
 }
 
 /// AUTO_INCREMENT survives recovery.
@@ -238,17 +235,11 @@ fn test_create_table_if_not_exists() {
 }
 
 /// DROP TABLE IF EXISTS — no error if not exists.
-/// NOTE: Parser doesn't support IF EXISTS clause. This test documents the
-/// limitation — DROP TABLE on a nonexistent table errors (which is valid SQL
-/// behavior, but IF EXISTS should suppress the error).
 #[test]
 fn test_drop_table_if_exists() {
     let (db, _d) = mk();
-    // DROP TABLE on nonexistent — should error (no IF EXISTS support yet).
     let r = db.execute("DROP TABLE IF EXISTS nonexistent");
-    // Accept either: error (IF EXISTS not parsed, drops "IF EXISTS" table literally)
-    // or success (IF EXISTS is supported). Key is no panic.
-    assert!(r.is_ok() || r.is_err());
+    assert!(r.is_ok(), "DROP TABLE IF EXISTS should not error on nonexistent table");
 }
 
 /// Multiple tables — interleaved operations.

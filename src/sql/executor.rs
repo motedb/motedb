@@ -12456,8 +12456,16 @@ impl QueryExecutor {
     fn execute_drop_table(&self, stmt: DropTableStmt) -> Result<QueryResult> {
         let table_name = &stmt.table;
 
-        // Verify table exists
-        let schema = self.db.get_table_schema(table_name)?;
+        // Verify table exists (or skip if IF EXISTS)
+        let schema = match self.db.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) if stmt.if_exists => {
+                return Ok(QueryResult::Definition {
+                    message: format!("Table '{}' does not exist (IF EXISTS)", table_name),
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         // 1. Drop column indexes for this table
         let prefix = format!("{}.", table_name);

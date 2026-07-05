@@ -117,8 +117,32 @@ impl MoteDB {
             )))?;
 
         let row_id = if schema.is_primary_key_auto_increment() {
+            // Check if the user provided an explicit PK value.
+            let explicit_id = schema.primary_key()
+                .and_then(|pk| schema.get_column(pk))
+                .and_then(|col| row.get(col.position).cloned())
+                .and_then(|v| if let Value::Integer(i) = v { Some(i) } else { None });
+
+            if let Some(explicit) = explicit_id {
+                // 🔑 User provided an explicit ID for an AUTO_INCREMENT column.
+                // Use it, but advance the counter past it so the next auto
+                // insert doesn't collide.
+                let counter = {
+                    self.table_auto_increment.entry(table_name.to_string())
+                        .or_insert_with(|| {
+                            Arc::new(std::sync::atomic::AtomicI64::new(schema.get_auto_increment_start()))
+                        })
+                        .value()
+                        .clone()
+                };
+                // Advance counter to max(current, explicit + 1).
+                let _ = counter.fetch_max(explicit + 1, std::sync::atomic::Ordering::Relaxed);
+                if let Err(e) = self.table_registry.update_auto_increment_counter(table_name, explicit) {
+                    warn_log!("[MoteDB] Auto-increment counter update failed for {}: {}", table_name, e);
+                }
+                explicit as RowId
+            } else {
             // 🚀 Phase 4: Use per-table AUTO_INCREMENT counter (lock-free AtomicI64)
-            // 🚀 Optimized: DashMap — first insert per table acquires shard lock, then lock-free
             let counter = {
                 self.table_auto_increment.entry(table_name.to_string())
                     .or_insert_with(|| {
@@ -152,6 +176,7 @@ impl MoteDB {
             }
 
             id as RowId
+            } // end else (auto counter path)
         } else {
             // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
             self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
