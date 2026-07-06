@@ -1,0 +1,39 @@
+[package]
+name = "motedb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Fuzz harness for MoteDB. Run with:
+#   cargo +nightly fuzz run fuzz_sql_parser
+#   cargo +nightly fuzz run fuzz_wal_recover
+#
+# This is a separate crate (not part of the published package) so it does not
+# add libfuzzer-sys to downstream consumers' builds.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+motedb = { path = ".." }
+libfuzzer-sys = "0.4"
+
+# cargo-fuzz requires the bin crate type for each target.
+[[bin]]
+name = "fuzz_sql_parser"
+path = "fuzz_targets/fuzz_sql_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wal_recover"
+path = "fuzz_targets/fuzz_wal_recover.rs"
+test = false
+doc = false
+
+[profile.release]
+# Fuzzing wants fast iteration; the default release profile is fine.
+# libfuzzer controls instrumentation via RUSTFLAGS (set automatically by
+# cargo-fuzz / -Zsanitizer), so we don't set lto here.
+opt-level = 3
+debug = true

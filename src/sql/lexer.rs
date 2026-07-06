@@ -228,7 +228,26 @@ impl<'a> Lexer<'a> {
         if self.is_eof() {
             return '\0';
         }
-        self.input[self.position..].chars().next().unwrap_or('\0')
+        // Decode from the raw byte slice at `position`. We must NOT slice
+        // `self.input[..]` (a &str) by a byte index — if `position` lands in
+        // the middle of a multi-byte UTF-8 sequence (which happens whenever a
+        // caller advances past a non-ASCII byte one byte at a time), str
+        // slicing panics. Decoding from bytes is panic-free: a lone
+        // continuation byte decodes to a replacement char, which is harmless
+        // for lexing (it just yields an Unexpected-token error).
+        let rest = &self.bytes[self.position..];
+        match std::str::from_utf8(rest) {
+            Ok(s) => s.chars().next().unwrap_or('\0'),
+            Err(e) => {
+                // `rest` starts with invalid UTF-8. If the first byte is a
+                // leading byte of a valid sequence that's simply truncated,
+                // decode just that byte's expected length; otherwise treat the
+                // single byte as a byte char.
+                let b = rest[0];
+                // Decode the first code point from up to 4 bytes.
+                decode_first_codepoint(rest).unwrap_or(b as char)
+            }
+        }
     }
 
     /// Advance past the current UTF-8 character (1-4 bytes).
@@ -236,9 +255,11 @@ impl<'a> Lexer<'a> {
         if self.is_eof() {
             return;
         }
-        let char_len = self.input[self.position..]
-            .chars()
-            .next()
+        // Compute the UTF-8 length of the code point starting at `position`
+        // WITHOUT slicing self.input (which panics on intra-character byte
+        // offsets). Decode from the byte slice.
+        let rest = &self.bytes[self.position..];
+        let char_len = decode_first_codepoint(rest)
             .map(|c| c.len_utf8())
             .unwrap_or(1);
         for _ in 0..char_len {
@@ -421,6 +442,59 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Decode the first Unicode code point from the start of `bytes`, tolerating
+/// invalid/truncated UTF-8. Used by the lexer to inspect the current character
+/// WITHOUT slicing a `&str` (which would panic if the byte offset lands inside
+/// a multi-byte sequence). Returns `None` only if `bytes` is empty.
+///
+/// For valid UTF-8 this matches `str::chars().next()`. For invalid sequences
+/// (lone continuation bytes, truncated leaders) it falls back to the first
+/// byte as a `char` — the lexer then yields an Unexpected-token error, which
+/// is the correct behavior for malformed input.
+fn decode_first_codepoint(bytes: &[u8]) -> Option<char> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let b0 = bytes[0];
+    // ASCII fast path.
+    if b0 < 0x80 {
+        return Some(b0 as char);
+    }
+    // Determine expected length from the leading byte.
+    let len = if b0 & 0xE0 == 0xC0 {
+        2
+    } else if b0 & 0xF0 == 0xE0 {
+        3
+    } else if b0 & 0xF8 == 0xF0 {
+        4
+    } else {
+        // Lone continuation byte (10xxxxxx) or invalid leader.
+        return Some(b0 as char);
+    };
+    if bytes.len() < len {
+        // Truncated sequence — not enough bytes. Decode what we have as a
+        // single byte so the lexer advances one byte and recovers.
+        return Some(b0 as char);
+    }
+    // Try to decode the full sequence; if any continuation byte is invalid,
+    // fall back to the leading byte.
+    let mut code = (b0 as u32)
+        & match len {
+            2 => 0x1F,
+            3 => 0x0F,
+            4 => 0x07,
+            _ => 0x7F,
+        };
+    for i in 1..len {
+        let b = bytes[i];
+        if b & 0xC0 != 0x80 {
+            return Some(b0 as char);
+        }
+        code = (code << 6) | (b as u32 & 0x3F);
+    }
+    char::from_u32(code).or(Some(b0 as char))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +510,27 @@ mod tests {
         assert!(matches!(tokens[2].token_type, TokenType::From));
         assert!(matches!(tokens[3].token_type, TokenType::Identifier(_)));
         assert!(matches!(tokens[4].token_type, TokenType::Eof));
+    }
+
+    /// Regression: the lexer must not panic on bytes that contain multi-byte
+    /// UTF-8 characters. Found by the fuzz_sql_parser target (the byte sequence
+    /// `]]'Ü\©\g` crashed current_utf8_char via a str slice on an
+    /// intra-character byte offset). Tokenizing may succeed or return an error,
+    /// but it must never panic.
+    #[test]
+    fn test_lexer_multibyte_utf8_no_panic() {
+        // The exact crashing input from the fuzzer.
+        let crashing: &[u8] = &[93, 93, 39, 220, 92, 169, 92, 103];
+        let sql = String::from_utf8_lossy(crashing);
+        let mut lexer = Lexer::new(&sql);
+        // Must not panic — we ignore the result (Ok or Err both fine).
+        let _ = lexer.tokenize();
+
+        // A few more multi-byte sequences that previously risked panicking
+        // when position landed inside a code point.
+        for s in &["café", "日本語", "a\0b", "表情🎓", "\u{1F916}robot"] {
+            let _ = Lexer::new(s).tokenize();
+        }
     }
 
     #[test]

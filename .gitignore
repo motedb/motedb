@@ -15,3 +15,10 @@ docs/superpowers/
 docs/benchmark_report_*
 docs/optimization*
 
+# Fuzz artifacts and corpus (regenerated locally; crash cases referenced in
+# fuzz/README.md rather than committed).
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
+fuzz/coverage/
+

@@ -21,6 +21,7 @@ exclude = [
     "docs/benchmark_report_*",
     "docs/optimization*",
     "motedb_data.mote/",
+    "fuzz/",
     "BENCHMARK.md",
     "BENCHMARK_REPORT.md",
     "PERFORMANCE_REPORT.md",
