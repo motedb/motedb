@@ -21,13 +21,10 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Cache cargo registry and git
-        uses: actions/cache@v4
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> target"
 
       - name: Install dependencies
         run: cargo fetch
@@ -42,7 +39,6 @@ jobs:
           cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear \
-            --skip test_deeply_nested_parens_rejected \
             --skip test_disk_usage \
             --skip test_no_bloat \
             --skip test_perf_insert_throughput \
@@ -66,13 +62,10 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Cache cargo registry and git
-        uses: actions/cache@v4
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> target"
 
       - name: Install dependencies
         run: cargo fetch
