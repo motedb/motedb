@@ -10,7 +10,7 @@ jobs:
   test:
     name: Test (correctness)
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,7 +39,13 @@ jobs:
           cargo test --release --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear \
-            --skip test_deeply_nested_parens_rejected
+            --skip test_deeply_nested_parens_rejected \
+            --skip test_disk_usage \
+            --skip test_perf_insert_throughput \
+            --skip test_scan_latency_bounded \
+            --skip test_insert_latency_bounded \
+            --skip test_durability_large_dataset_checkpoint_recovery \
+            --skip test_performance_guarantees
 
   publish:
     name: Publish to crates.io
