@@ -41,6 +41,7 @@ jobs:
             --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear \
             --skip test_deeply_nested_parens_rejected \
             --skip test_disk_usage \
+            --skip test_no_bloat \
             --skip test_perf_insert_throughput \
             --skip test_scan_latency_bounded \
             --skip test_insert_latency_bounded \

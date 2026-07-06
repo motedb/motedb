@@ -58,14 +58,21 @@ pub fn fast_count(db: &Database, sql: &str) -> usize {
 
 /// Insert N rows into a standard test table with batch INSERT.
 /// Table: (id INT PRIMARY KEY, val FLOAT, tag TEXT)
+/// Rows are inserted with IDs start_id..start_id+n (no overlap on repeated calls).
 pub fn insert_test_rows(db: &Database, n: usize) {
+    insert_test_rows_from(db, n, 0);
+}
+
+/// Insert N rows starting from start_id. Avoids duplicate PK on repeated calls.
+pub fn insert_test_rows_from(db: &Database, n: usize, start_id: usize) {
     let batch_size = 5000;
     for start in (0..n).step_by(batch_size) {
         let end = (start + batch_size).min(n);
         let mut sql = String::with_capacity(batch_size * 50);
         for i in start..end {
-            let tag = if i % 3 == 0 { "US" } else { "EU" };
-            sql.push_str(&format!("({}, {:.1}, '{}'),", i + 1, i as f64, tag));
+            let id = start_id + i + 1;
+            let tag = if id % 3 == 0 { "US" } else { "EU" };
+            sql.push_str(&format!("({}, {:.1}, '{}'),", id, id as f64, tag));
         }
         sql.truncate(sql.len() - 1);
         exec(db, &format!("INSERT INTO bench (id, val, tag) VALUES {}", sql));
