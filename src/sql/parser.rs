@@ -13,8 +13,11 @@ pub struct Parser {
     recursion_depth: usize,
 }
 
-/// Maximum recursion depth for parenthesized expressions
-const MAX_RECURSION_DEPTH: usize = 256;
+/// Maximum recursion depth for parenthesized / unary expressions. Kept low
+/// because each level consumes several parser stack frames and test/runtime
+/// threads often have small stacks (~512KB). 64 levels covers any realistic
+/// SQL expression while bounding worst-case stack usage to a few hundred KB.
+const MAX_RECURSION_DEPTH: usize = 64;
 /// Maximum identifier length (table/column names) — prevents DoS via memory exhaustion
 const MAX_IDENTIFIER_LENGTH: usize = 4096;
 
@@ -958,9 +961,15 @@ impl Parser {
             TokenType::LParen => {
                 self.advance();
 
-                // Guard against stack overflow on deeply nested parens
+                // Guard against stack overflow on deeply nested parens. Each
+                // nesting level adds several parser stack frames (parse_expr ->
+                // parse_prefix_expr -> ...), so the limit must stay well below
+                // the per-thread stack size (~512KB for test threads). 64 levels
+                // is ample for any real SQL and bounds the worst-case stack to
+                // a few hundred KB.
                 self.recursion_depth += 1;
                 if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    self.recursion_depth -= 1;
                     return Err(self.error("Expression nesting too deep"));
                 }
 
