@@ -50,8 +50,14 @@ jobs:
       - name: cargo test
         env:
           CI: "1"
+        # Debug build (no --release): CI correctness gate, not a perf gate.
+        # The release profile uses lto="fat" + codegen-units=1, which makes a
+        # full --release test build take 50+ min on shared runners — unusable
+        # as fast feedback. Debug compiles 5-10x faster and verifies the same
+        # correctness. Performance is covered by the bench_* examples locally
+        # and by BENCHMARK.md, not by CI.
         run: |
-          cargo test --release --workspace --all-features -- \
+          cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear \
             --skip test_deeply_nested_parens_rejected \

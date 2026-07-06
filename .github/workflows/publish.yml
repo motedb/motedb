@@ -35,8 +35,11 @@ jobs:
       - name: Run correctness tests
         env:
           CI: "1"
+        # Debug build: this is a correctness gate, not a perf gate. The release
+        # profile (lto="fat", codegen-units=1) makes a full --release test build
+        # take 50+ min on shared runners. Debug verifies the same correctness.
         run: |
-          cargo test --release --workspace --all-features -- \
+          cargo test --workspace --all-features -- \
             --test-threads=1 \
             --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear \
             --skip test_deeply_nested_parens_rejected \
