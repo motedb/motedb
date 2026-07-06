@@ -3,9 +3,6 @@
 //! Re-exports the full transaction coordinator implementation
 
 pub use crate::txn::coordinator::{
-    TransactionCoordinator,
-    TransactionContext,
-    IsolationLevel,
+    IsolationLevel, TransactionContext, TransactionCoordinator, TransactionCoordinatorStats,
     TransactionState,
-    TransactionCoordinatorStats,
 };

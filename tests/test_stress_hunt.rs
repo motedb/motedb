@@ -2,7 +2,7 @@
 //! Covers: prepared statements, range queries, multi-column WHERE,
 //! index interactions, data type round-trips, WAL recovery, compound keys.
 
-use motedb::{Database, DBConfig, types::Value, sql::QueryResult};
+use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
 use tempfile::TempDir;
 
 fn mk() -> (Database, TempDir) {
@@ -19,13 +19,25 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn cnt(db: &Database, sql: &str) -> i64 {
-    rows(db, sql).first().and_then(|r| r.first()).and_then(|v| {
-        if let Value::Integer(i) = v { Some(*i) } else { None }
-    }).unwrap_or(-1)
+    rows(db, sql)
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| {
+            if let Value::Integer(i) = v {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(-1)
 }
 
 fn val(db: &Database, sql: &str) -> Value {
-    rows(db, sql).first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null)
+    rows(db, sql)
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -36,12 +48,14 @@ fn val(db: &Database, sql: &str) -> Value {
 #[test]
 fn test_prepared_insert_auto_increment() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)")
+        .unwrap();
     for i in 0..5 {
         db.execute_prepared(
             "INSERT INTO t (v) VALUES (?)",
             vec![Value::text(format!("row{}", i))],
-        ).unwrap();
+        )
+        .unwrap();
     }
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 5);
     // Verify auto-increment IDs are 1..5.
@@ -55,13 +69,15 @@ fn test_prepared_insert_auto_increment() {
 #[test]
 fn test_prepared_update_with_param() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute_prepared(
         "UPDATE t SET v = ? WHERE id = ?",
         vec![Value::Integer(99), Value::Integer(1)],
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(val(&db, "SELECT v FROM t WHERE id = 1"), Value::Integer(99));
     assert_eq!(val(&db, "SELECT v FROM t WHERE id = 2"), Value::Integer(20));
 }
@@ -70,10 +86,12 @@ fn test_prepared_update_with_param() {
 #[test]
 fn test_prepared_delete_with_param() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    db.execute_prepared("DELETE FROM t WHERE id = ?", vec![Value::Integer(1)]).unwrap();
+    db.execute_prepared("DELETE FROM t WHERE id = ?", vec![Value::Integer(1)])
+        .unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 1);
     assert_eq!(val(&db, "SELECT v FROM t WHERE id = 2"), Value::Integer(20));
 }
@@ -82,18 +100,28 @@ fn test_prepared_delete_with_param() {
 #[test]
 fn test_prepared_multiple_params() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i, i*10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i, i * 10))
+            .unwrap();
     }
     db.flush().unwrap();
-    let r = db.execute_prepared(
-        "SELECT id FROM t WHERE a > ? AND b < ?",
-        vec![Value::Integer(3), Value::Integer(80)],
-    ).unwrap().materialize().unwrap();
+    let r = db
+        .execute_prepared(
+            "SELECT id FROM t WHERE a > ? AND b < ?",
+            vec![Value::Integer(3), Value::Integer(80)],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
     if let QueryResult::Select { rows, .. } = r {
         // a > 3 AND b < 80: a in 4..7 (b = 40..70 < 80), a=8 has b=80 not < 80
-        assert!(rows.len() >= 3, "Should find rows with a>3 and b<80, got {}", rows.len());
+        assert!(
+            rows.len() >= 3,
+            "Should find rows with a>3 and b<80, got {}",
+            rows.len()
+        );
     }
 }
 
@@ -105,18 +133,29 @@ fn test_prepared_multiple_params() {
 #[test]
 fn test_range_inclusive_both_sides() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE v >= 3 AND v <= 7"), 5);
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t WHERE v >= 3 AND v <= 7"),
+        5
+    );
 }
 
 /// Range that matches nothing.
 #[test]
 fn test_range_matches_nothing() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE v > 100"), 0);
 }
@@ -125,7 +164,8 @@ fn test_range_matches_nothing() {
 #[test]
 fn test_range_on_text_column() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'apple')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'banana')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'cherry')").unwrap();
@@ -143,12 +183,23 @@ fn test_range_on_text_column() {
 #[test]
 fn test_where_three_conditions_and() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
     for i in 1..=20 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {}, {})", i, i%5, i%3, i%2)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, {}, {}, {})",
+            i,
+            i % 5,
+            i % 3,
+            i % 2
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
-    let n = cnt(&db, "SELECT COUNT(*) FROM t WHERE a = 1 AND b = 1 AND c = 0");
+    let n = cnt(
+        &db,
+        "SELECT COUNT(*) FROM t WHERE a = 1 AND b = 1 AND c = 0",
+    );
     assert!(n > 0, "Should find rows matching all 3 conditions");
 }
 
@@ -156,8 +207,12 @@ fn test_where_three_conditions_and() {
 #[test]
 fn test_where_or_same_column() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE v = 3 OR v = 7"), 2);
 }
@@ -166,9 +221,11 @@ fn test_where_or_same_column() {
 #[test]
 fn test_where_or_different_columns() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i, i*10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i, i * 10))
+            .unwrap();
     }
     db.flush().unwrap();
     let n = cnt(&db, "SELECT COUNT(*) FROM t WHERE a = 1 OR b = 30");
@@ -184,8 +241,10 @@ fn test_where_or_different_columns() {
 #[test]
 fn test_float_precision_small() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1, {:.20})", f64::EPSILON)).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, {:.20})", f64::EPSILON))
+        .unwrap();
     db.flush().unwrap();
     match val(&db, "SELECT v FROM t WHERE id = 1") {
         Value::Float(f) => assert!(f > 0.0, "EPSILON should be positive, got {}", f),
@@ -197,20 +256,26 @@ fn test_float_precision_small() {
 #[test]
 fn test_timestamp_roundtrip() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1700000000000000)")
+        .unwrap();
     db.flush().unwrap();
     let r = rows(&db, "SELECT ts FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
     // Should be a Timestamp value, not Null.
-    assert!(!matches!(r[0][0], Value::Null), "Timestamp should not be NULL");
+    assert!(
+        !matches!(r[0][0], Value::Null),
+        "Timestamp should not be NULL"
+    );
 }
 
 /// Boolean round-trip: true, false, NULL.
 #[test]
 fn test_boolean_roundtrip_all_values() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, b BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, b BOOLEAN)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, true)").unwrap();
     db.execute("INSERT INTO t VALUES (2, false)").unwrap();
     db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
@@ -231,8 +296,12 @@ fn test_recovery_mixed_crud() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-        for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+                .unwrap();
+        }
         db.execute("DELETE FROM t WHERE id = 5").unwrap();
         db.execute("UPDATE t SET v = 99 WHERE id = 3").unwrap();
         db.execute("INSERT INTO t VALUES (11, 110)").unwrap();
@@ -240,10 +309,21 @@ fn test_recovery_mixed_crud() {
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 10, "10 rows (11 inserted, 1 deleted)");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        10,
+        "10 rows (11 inserted, 1 deleted)"
+    );
     assert_eq!(val(&db, "SELECT v FROM t WHERE id = 3"), Value::Integer(99));
-    assert_eq!(rows(&db, "SELECT * FROM t WHERE id = 5").len(), 0, "id=5 should be deleted");
-    assert_eq!(val(&db, "SELECT v FROM t WHERE id = 11"), Value::Integer(110));
+    assert_eq!(
+        rows(&db, "SELECT * FROM t WHERE id = 5").len(),
+        0,
+        "id=5 should be deleted"
+    );
+    assert_eq!(
+        val(&db, "SELECT v FROM t WHERE id = 11"),
+        Value::Integer(110)
+    );
 }
 
 /// Recovery preserves NULL values.
@@ -253,9 +333,12 @@ fn test_recovery_preserves_nulls() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, NULL, NULL, NULL)").unwrap();
-        db.execute("INSERT INTO t VALUES (2, 42, 'hello', 3.14)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL, NULL, NULL)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (2, 42, 'hello', 3.14)")
+            .unwrap();
         db.checkpoint().unwrap();
         db.close().unwrap();
     }
@@ -273,14 +356,19 @@ fn test_recovery_preserves_nulls() {
 #[test]
 fn test_drop_then_recreate_same_name() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("DROP TABLE t").unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     db.flush().unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 1);
-    assert_eq!(val(&db, "SELECT v FROM t WHERE id = 1"), Value::text("hello".into()));
+    assert_eq!(
+        val(&db, "SELECT v FROM t WHERE id = 1"),
+        Value::text("hello".into())
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -291,7 +379,8 @@ fn test_drop_then_recreate_same_name() {
 #[test]
 fn test_avg_float_values() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1.0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 2.0)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 3.0)").unwrap();
@@ -306,7 +395,8 @@ fn test_avg_float_values() {
 #[test]
 fn test_min_max_positive_negative() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -50)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 0)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 100)").unwrap();
@@ -319,9 +409,15 @@ fn test_min_max_positive_negative() {
 #[test]
 fn test_count_where_float_comparison() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {:.2})", i, i as f64 * 10.0)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, {:.2})",
+            i,
+            i as f64 * 10.0
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE score > 50.0"), 5);
@@ -336,14 +432,18 @@ fn test_count_where_float_comparison() {
 #[test]
 fn test_group_by_having() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, dept TEXT, salary INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, dept TEXT, salary INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'A', 100)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'A', 200)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'B', 50)").unwrap();
     db.execute("INSERT INTO t VALUES (4, 'B', 60)").unwrap();
     db.execute("INSERT INTO t VALUES (5, 'C', 500)").unwrap();
     db.flush().unwrap();
-    let r = rows(&db, "SELECT dept, SUM(salary) FROM t GROUP BY dept HAVING SUM(salary) > 100");
+    let r = rows(
+        &db,
+        "SELECT dept, SUM(salary) FROM t GROUP BY dept HAVING SUM(salary) > 100",
+    );
     // A: 300 (>100 ✓), B: 110 (>100 ✓), C: 500 (>100 ✓) → 3 groups
     // Or if HAVING is not supported by fast path: fall through.
     assert!(!r.is_empty(), "HAVING should return at least some groups");
@@ -353,9 +453,16 @@ fn test_group_by_having() {
 #[test]
 fn test_group_by_integer_column() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, grp INT, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, grp INT, val INT)")
+        .unwrap();
     for i in 0..20 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {})", i, i % 3, i * 10)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, {}, {})",
+            i,
+            i % 3,
+            i * 10
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
     let r = rows(&db, "SELECT grp, COUNT(*) FROM t GROUP BY grp");
@@ -370,29 +477,41 @@ fn test_group_by_integer_column() {
 #[test]
 fn test_rapid_insert_select_cycles() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=500 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
         if i % 100 == 0 {
             assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), i);
         }
     }
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 500);
     // Spot check.
-    assert_eq!(val(&db, "SELECT v FROM t WHERE id = 250"), Value::Integer(250));
+    assert_eq!(
+        val(&db, "SELECT v FROM t WHERE id = 250"),
+        Value::Integer(250)
+    );
 }
 
 /// Alternating INSERT/DELETE (churn).
 #[test]
 fn test_alternating_insert_delete() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for cycle in 0..10 {
         let id = cycle + 1;
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", id, cycle)).unwrap();
-        db.execute(&format!("DELETE FROM t WHERE id = {}", id)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", id, cycle))
+            .unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {}", id))
+            .unwrap();
     }
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 0, "All inserted rows deleted");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        0,
+        "All inserted rows deleted"
+    );
     // Can still insert after churn.
     db.execute("INSERT INTO t VALUES (1, 999)").unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 1);
@@ -406,8 +525,12 @@ fn test_concurrent_read_during_write() {
     use std::thread;
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=100 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
 
     // Share the same DB via Arc — no second open() needed.
@@ -438,24 +561,38 @@ fn test_concurrent_read_during_write() {
 #[test]
 fn test_ifnull_function() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 42)").unwrap();
     db.flush().unwrap();
-    assert_eq!(val(&db, "SELECT IFNULL(v, 0) FROM t WHERE id = 1"), Value::Integer(0));
-    assert_eq!(val(&db, "SELECT IFNULL(v, 0) FROM t WHERE id = 2"), Value::Integer(42));
+    assert_eq!(
+        val(&db, "SELECT IFNULL(v, 0) FROM t WHERE id = 1"),
+        Value::Integer(0)
+    );
+    assert_eq!(
+        val(&db, "SELECT IFNULL(v, 0) FROM t WHERE id = 2"),
+        Value::Integer(42)
+    );
 }
 
 /// ABS function.
 #[test]
 fn test_abs_function() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -5)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 10)").unwrap();
     db.flush().unwrap();
-    assert_eq!(val(&db, "SELECT ABS(v) FROM t WHERE id = 1"), Value::Integer(5));
-    assert_eq!(val(&db, "SELECT ABS(v) FROM t WHERE id = 2"), Value::Integer(10));
+    assert_eq!(
+        val(&db, "SELECT ABS(v) FROM t WHERE id = 1"),
+        Value::Integer(5)
+    );
+    assert_eq!(
+        val(&db, "SELECT ABS(v) FROM t WHERE id = 2"),
+        Value::Integer(10)
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -482,7 +619,8 @@ fn test_insert_nonexistent_table_no_panic() {
 #[test]
 fn test_duplicate_primary_key_no_panic() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let r = db.execute("INSERT INTO t VALUES (1, 20)");
     // Should error (duplicate PK), not panic.

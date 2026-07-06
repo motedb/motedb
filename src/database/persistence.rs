@@ -34,12 +34,11 @@ impl MoteDB {
     /// Flush database to disk
     pub fn flush(&self) -> Result<()> {
         ensure_open!(self);
-        if self.is_flushing.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed
-        ).is_err() {
+        if self
+            .is_flushing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return Ok(());
         }
 
@@ -48,7 +47,9 @@ impl MoteDB {
         // sstables → force_compact_all. If flush_impl's ColSegmentStore
         // flush_buffer runs concurrently with that compaction, segments can be
         // lost (the v0.5.0 large_batch data-loss bug — 10000 rows → 5000).
-        let _ckpt_guard = self.checkpoint_mutex.lock()
+        let _ckpt_guard = self
+            .checkpoint_mutex
+            .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()));
 
         let result = self.flush_impl();
@@ -80,7 +81,11 @@ impl MoteDB {
         // of the "data disappears after reopen" bug found by durability tests.
         for entry in self.col_segment_stores.iter() {
             if let Err(e) = entry.flush_buffer() {
-                debug_log!("[Flush] ColSegmentStore flush failed for {}: {:?}", entry.key(), e);
+                debug_log!(
+                    "[Flush] ColSegmentStore flush failed for {}: {:?}",
+                    entry.key(),
+                    e
+                );
             }
         }
 
@@ -93,7 +98,9 @@ impl MoteDB {
     /// Checkpoint (flush WAL and indexes)
     pub fn checkpoint(&self) -> Result<()> {
         ensure_open!(self);
-        let _guard = self.checkpoint_mutex.lock()
+        let _guard = self
+            .checkpoint_mutex
+            .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
         self.checkpoint_impl(false)
     }
@@ -101,7 +108,9 @@ impl MoteDB {
     /// Full checkpoint with index rebuild (used on shutdown/drop)
     pub fn checkpoint_full(&self) -> Result<()> {
         ensure_open!(self);
-        let _guard = self.checkpoint_mutex.lock()
+        let _guard = self
+            .checkpoint_mutex
+            .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
         self.checkpoint_impl(true)
     }
@@ -112,7 +121,9 @@ impl MoteDB {
     /// then flushes and waits for all column indexes.
     pub fn vacuum(&self) -> Result<()> {
         ensure_open!(self);
-        let _guard = self.checkpoint_mutex.lock()
+        let _guard = self
+            .checkpoint_mutex
+            .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
 
         // Pause background compaction during vacuum.
@@ -154,13 +165,24 @@ impl MoteDB {
                 drop(builder_guard);
                 // Finish the old builder (writes to disk)
                 if let Err(e) = old_builder.finish() {
-                    warn_log!("[VACUUM] Failed to finalize columnar buffer for '{}': {:?}", table_name, e);
+                    warn_log!(
+                        "[VACUUM] Failed to finalize columnar buffer for '{}': {:?}",
+                        table_name,
+                        e
+                    );
                 } else {
                     let indexes_dir = self.path.join("indexes");
                     let col_sst_path = indexes_dir.join(format!("{}_col.sst", &table_name));
-                    if let Ok(col_sst) = crate::storage::lsm::columnar::ColumnarSSTable::open(&col_sst_path) {
-                        self.columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
-                        debug_log!("[VACUUM] Columnar buffer finalized for '{}' ({} rows)", table_name, num_rows);
+                    if let Ok(col_sst) =
+                        crate::storage::lsm::columnar::ColumnarSSTable::open(&col_sst_path)
+                    {
+                        self.columnar_sstables
+                            .insert(table_name.clone(), Arc::new(col_sst));
+                        debug_log!(
+                            "[VACUUM] Columnar buffer finalized for '{}' ({} rows)",
+                            table_name,
+                            num_rows
+                        );
                     }
                 }
             }
@@ -177,13 +199,21 @@ impl MoteDB {
             }
             if let Ok(schema) = self.table_registry.get_table(&table_name) {
                 let col_types = schema.col_types();
-                match self.lsm_engine.compact_to_columnar(&col_types) {
+                match self.lsm_engine.compact_to_columnar(col_types) {
                     Ok((col_sst, _source_paths)) => {
-                        self.columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
-                        debug_log!("[VACUUM] Columnar SSTable created for table '{}'", table_name);
+                        self.columnar_sstables
+                            .insert(table_name.clone(), Arc::new(col_sst));
+                        debug_log!(
+                            "[VACUUM] Columnar SSTable created for table '{}'",
+                            table_name
+                        );
                     }
                     Err(e) => {
-                        debug_log!("[VACUUM] Columnar compaction skipped for '{}': {:?}", table_name, e);
+                        debug_log!(
+                            "[VACUUM] Columnar compaction skipped for '{}': {:?}",
+                            table_name,
+                            e
+                        );
                     }
                 }
             }
@@ -295,7 +325,9 @@ impl MoteDB {
 
         self.flush_ioctree_indexes()?;
 
-        let indexes_to_flush: Vec<_> = self.column_indexes.iter()
+        let indexes_to_flush: Vec<_> = self
+            .column_indexes
+            .iter()
             .map(|entry| entry.value().clone())
             .collect();
 

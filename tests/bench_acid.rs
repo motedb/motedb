@@ -5,33 +5,53 @@
 //!
 //! Run: cargo test --test bench_acid --profile release-test -- --nocapture --test-threads=1
 
-use motedb::{Database, DBConfig, DurabilityLevel};
-use tempfile::TempDir;
+use motedb::{DBConfig, Database, DurabilityLevel};
 use std::time::Instant;
+use tempfile::TempDir;
 
-fn is_ci() -> bool { std::env::var("CI").is_ok() }
+fn is_ci() -> bool {
+    std::env::var("CI").is_ok()
+}
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 fn query_val(db: &Database, sql: &str) -> i64 {
     let result = exec(db, sql);
     match result {
-        motedb::sql::QueryResult::Select { rows, .. } => {
-            rows.first().and_then(|r| r.first())
-                .map(|v| if let motedb::types::Value::Integer(c) = v { *c } else { 0 })
-                .unwrap_or(0)
-        }
+        motedb::sql::QueryResult::Select { rows, .. } => rows
+            .first()
+            .and_then(|r| r.first())
+            .map(|v| {
+                if let motedb::types::Value::Integer(c) = v {
+                    *c
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0),
         _ => 0,
     }
 }
 
 macro_rules! print_result {
     ($label:expr, $ops:expr, $ms:expr) => {
-        println!("{:<60} | {:>8} ops | {:>8.1} ms | {:>10.1} µs/op | {:>10} ops/s",
-            $label, $ops, $ms as f64, ($ms as f64 * 1000.0) / $ops as f64,
-            if $ms > 0 { ($ops as f64 * 1000.0 / $ms as f64) as u64 } else { u64::MAX });
+        println!(
+            "{:<60} | {:>8} ops | {:>8.1} ms | {:>10.1} µs/op | {:>10} ops/s",
+            $label,
+            $ops,
+            $ms as f64,
+            ($ms as f64 * 1000.0) / $ops as f64,
+            if $ms > 0 {
+                ($ops as f64 * 1000.0 / $ms as f64) as u64
+            } else {
+                u64::MAX
+            }
+        );
     };
 }
 
@@ -72,11 +92,22 @@ fn test_durability_comparison() {
     for (name, config) in configs {
         let dir = TempDir::new().unwrap();
         let db = Database::create_with_config(dir.path(), config).unwrap();
-        exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score FLOAT)");
+        exec(
+            &db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score FLOAT)",
+        );
 
         let start = Instant::now();
         for i in 1..=n as i64 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'v_{}', {:.1})", i, i, i as f64 * 0.5));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO t VALUES ({}, 'v_{}', {:.1})",
+                    i,
+                    i,
+                    i as f64 * 0.5
+                ),
+            );
         }
         let ms = start.elapsed().as_millis() as u64;
 
@@ -105,10 +136,21 @@ fn test_crash_recovery() {
     let n = if is_ci() { 1_000 } else { 5_000 };
     {
         let db = Database::create_with_config(&db_path, config.clone()).unwrap();
-        exec(&db, "CREATE TABLE crash_test (id INTEGER PRIMARY KEY, data TEXT, val INTEGER)");
+        exec(
+            &db,
+            "CREATE TABLE crash_test (id INTEGER PRIMARY KEY, data TEXT, val INTEGER)",
+        );
         let start = Instant::now();
         for i in 1..=n as i64 {
-            exec(&db, &format!("INSERT INTO crash_test VALUES ({}, 'data_{}', {})", i, i, i * 10));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO crash_test VALUES ({}, 'data_{}', {})",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
         }
         let insert_ms = start.elapsed().as_millis() as u64;
         print_result!("Phase 1: INSERT 5K (pre-crash)", n, insert_ms);
@@ -157,13 +199,22 @@ fn test_checkpoint_integrity() {
     // Phase 1: Insert + flush + checkpoint
     {
         let db = Database::create_with_config(&db_path, config.clone()).unwrap();
-        exec(&db, "CREATE TABLE integrity (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE integrity (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT)",
+        );
         let start = Instant::now();
         for i in 1..=n as i64 {
-            exec(&db, &format!(
-                "INSERT INTO integrity VALUES ({}, 'name_{}', {:.2}, 'tag_{}')",
-                i, i, i as f64 * 1.5, i % 5
-            ));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO integrity VALUES ({}, 'name_{}', {:.2}, 'tag_{}')",
+                    i,
+                    i,
+                    i as f64 * 1.5,
+                    i % 5
+                ),
+            );
         }
         let insert_ms = start.elapsed().as_millis() as u64;
         print_result!(format!("Phase 1: INSERT {}K", n / 1000), n, insert_ms);
@@ -188,17 +239,24 @@ fn test_checkpoint_integrity() {
     // Verify data correctness (spot check)
     let mut errors = 0;
     for i in [1, 100, 500, n as i64 / 2, n as i64] {
-        let result = exec(&db, &format!("SELECT name, score, tag FROM integrity WHERE id = {}", i));
+        let result = exec(
+            &db,
+            &format!("SELECT name, score, tag FROM integrity WHERE id = {}", i),
+        );
         match result {
             motedb::sql::QueryResult::Select { rows, .. } => {
                 if let Some(row) = rows.first() {
                     // Verify structure
-                    if row.len() != 3 { errors += 1; }
+                    if row.len() != 3 {
+                        errors += 1;
+                    }
                 } else {
                     errors += 1;
                 }
             }
-            _ => { errors += 1; }
+            _ => {
+                errors += 1;
+            }
         }
     }
     println!("  -> Spot-check errors: {}/5", errors);
@@ -217,11 +275,17 @@ fn test_update_delete_consistency() {
 
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap();
-    exec(&db, "CREATE TABLE crud (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE crud (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)",
+    );
     let n = if is_ci() { 500 } else { 1_000 };
     let start = Instant::now();
     for i in 1..=n as i64 {
-        exec(&db, &format!("INSERT INTO crud VALUES ({}, 'original_{}', {})", i, i, i));
+        exec(
+            &db,
+            &format!("INSERT INTO crud VALUES ({}, 'original_{}', {})", i, i, i),
+        );
     }
     let insert_ms = start.elapsed().as_millis() as u64;
     print_result!(format!("INSERT {}", n), n, insert_ms);
@@ -235,7 +299,13 @@ fn test_update_delete_consistency() {
     let n_update = n / 2;
     let start = Instant::now();
     for i in 1..=n_update as i64 {
-        exec(&db, &format!("UPDATE crud SET val = 'updated_{}', score = score * 2 WHERE id = {}", i, i));
+        exec(
+            &db,
+            &format!(
+                "UPDATE crud SET val = 'updated_{}', score = score * 2 WHERE id = {}",
+                i, i
+            ),
+        );
     }
     let update_ms = start.elapsed().as_millis() as u64;
     print_result!(format!("UPDATE {}", n_update), n_update, update_ms);
@@ -244,10 +314,19 @@ fn test_update_delete_consistency() {
     let updated_score = query_val(&db, "SELECT score FROM crud WHERE id = 100");
     assert_eq!(updated_score, 200, "Row 100 score should be 200 (100*2)");
     let unchanged_id = (n_update + 1 + n) / 2;
-    let unchanged_score = query_val(&db, &format!("SELECT score FROM crud WHERE id = {}", unchanged_id));
-    assert_eq!(unchanged_score, unchanged_id, "Row {} score should be unchanged", unchanged_id);
-    println!("  -> UPDATE verified: row 100 score={} (expect 200), row {} score={} (expect {}) ✓",
-        updated_score, unchanged_id, unchanged_score, unchanged_id);
+    let unchanged_score = query_val(
+        &db,
+        &format!("SELECT score FROM crud WHERE id = {}", unchanged_id),
+    );
+    assert_eq!(
+        unchanged_score, unchanged_id,
+        "Row {} score should be unchanged",
+        unchanged_id
+    );
+    println!(
+        "  -> UPDATE verified: row 100 score={} (expect 200), row {} score={} (expect {}) ✓",
+        updated_score, unchanged_id, unchanged_score, unchanged_id
+    );
 
     // Delete rows from second half
     let del_start = n_update + 1;
@@ -262,10 +341,25 @@ fn test_update_delete_consistency() {
 
     // Verify deletes
     let count_after = query_val(&db, "SELECT COUNT(*) AS cnt FROM crud");
-    assert_eq!(count_after, (n - n_delete) as i64, "Should have {} rows after deleting {}", n - n_delete, n_delete);
-    let deleted = query_val(&db, &format!("SELECT COUNT(*) AS cnt FROM crud WHERE id BETWEEN {} AND {}", del_start, del_end));
+    assert_eq!(
+        count_after,
+        (n - n_delete) as i64,
+        "Should have {} rows after deleting {}",
+        n - n_delete,
+        n_delete
+    );
+    let deleted = query_val(
+        &db,
+        &format!(
+            "SELECT COUNT(*) AS cnt FROM crud WHERE id BETWEEN {} AND {}",
+            del_start, del_end
+        ),
+    );
     assert_eq!(deleted, 0, "Deleted rows should not be visible");
-    println!("  -> DELETE verified: {} rows remain, deleted range count={} ✓", count_after, deleted);
+    println!(
+        "  -> DELETE verified: {} rows remain, deleted range count={} ✓",
+        count_after, deleted
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -278,8 +372,13 @@ fn test_concurrent_consistency() {
     println!("{}", "=".repeat(100));
 
     let dir = TempDir::new().unwrap();
-    let db = std::sync::Arc::new(Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap());
-    exec(&db, "CREATE TABLE concurrent (id INTEGER PRIMARY KEY, thread INTEGER, val TEXT)");
+    let db = std::sync::Arc::new(
+        Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap(),
+    );
+    exec(
+        &db,
+        "CREATE TABLE concurrent (id INTEGER PRIMARY KEY, thread INTEGER, val TEXT)",
+    );
 
     let n_threads = 4;
     let n_per_thread = if is_ci() { 500 } else { 2500 };
@@ -294,10 +393,12 @@ fn test_concurrent_consistency() {
             let base = t * n_per_thread + 1;
             for i in 0..n_per_thread {
                 let id = base + i;
-                db_clone.execute(&format!(
-                    "INSERT INTO concurrent VALUES ({}, {}, 'thread_{}_val_{}')",
-                    id, t, t, i
-                )).unwrap();
+                db_clone
+                    .execute(&format!(
+                        "INSERT INTO concurrent VALUES ({}, {}, 'thread_{}_val_{}')",
+                        id, t, t, i
+                    ))
+                    .unwrap();
             }
         });
         handles.push(handle);
@@ -308,12 +409,24 @@ fn test_concurrent_consistency() {
     }
 
     let ms = start.elapsed().as_millis() as u64;
-    print_result!(format!("Concurrent INSERT {}K", n_total / 1000), n_total, ms);
+    print_result!(
+        format!("Concurrent INSERT {}K", n_total / 1000),
+        n_total,
+        ms
+    );
 
     // Verify total count
     let count = query_val(&db, "SELECT COUNT(*) AS cnt FROM concurrent");
-    println!("  -> Expected: {}, Actual: {}, Loss: {}", n_total, count, n_total as i64 - count);
-    assert_eq!(count, n_total as i64, "No rows should be lost in concurrent writes");
+    println!(
+        "  -> Expected: {}, Actual: {}, Loss: {}",
+        n_total,
+        count,
+        n_total as i64 - count
+    );
+    assert_eq!(
+        count, n_total as i64,
+        "No rows should be lost in concurrent writes"
+    );
 
     // Flush to SSTables before per-thread WHERE checks to avoid scan consistency
     // issues when data straddles memtable/SSTable boundary during concurrent flush
@@ -322,7 +435,13 @@ fn test_concurrent_consistency() {
 
     // Verify per-thread counts
     for t in 0..n_threads {
-        let t_count = query_val(&db, &format!("SELECT COUNT(*) AS cnt FROM concurrent WHERE thread = {}", t));
+        let t_count = query_val(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS cnt FROM concurrent WHERE thread = {}",
+                t
+            ),
+        );
         assert_eq!(t_count, n_per_thread as i64, "Thread {} count mismatch", t);
     }
     println!("  -> Per-thread counts all correct ✓");
@@ -339,12 +458,22 @@ fn test_mixed_oltp() {
 
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap();
-    exec(&db, "CREATE TABLE oltp (id INTEGER PRIMARY KEY, status TEXT, amount FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE oltp (id INTEGER PRIMARY KEY, status TEXT, amount FLOAT)",
+    );
 
     let n = if is_ci() { 1_000 } else { 5_000 };
     let start = Instant::now();
     for i in 1..=n as i64 {
-        exec(&db, &format!("INSERT INTO oltp VALUES ({}, 'pending', {:.2})", i, i as f64 * 10.0));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO oltp VALUES ({}, 'pending', {:.2})",
+                i,
+                i as f64 * 10.0
+            ),
+        );
     }
     let insert_ms = start.elapsed().as_millis() as u64;
     print_result!(format!("INSERT {}", n), n, insert_ms);
@@ -360,15 +489,27 @@ fn test_mixed_oltp() {
     let n_update = n / 2;
     let start = Instant::now();
     for i in 1..=n_update as i64 {
-        exec(&db, &format!("UPDATE oltp SET status = 'completed' WHERE id = {}", i));
+        exec(
+            &db,
+            &format!("UPDATE oltp SET status = 'completed' WHERE id = {}", i),
+        );
     }
     let update_ms = start.elapsed().as_millis() as u64;
     print_result!(format!("UPDATE {}", n_update), n_update, update_ms);
 
     // SELECT with filter
-    let completed = query_val(&db, "SELECT COUNT(*) AS cnt FROM oltp WHERE status = 'completed'");
-    let pending = query_val(&db, "SELECT COUNT(*) AS cnt FROM oltp WHERE status = 'pending'");
-    println!("  -> completed={}, pending={} (expect {}/{})", completed, pending, n_update, n_update);
+    let completed = query_val(
+        &db,
+        "SELECT COUNT(*) AS cnt FROM oltp WHERE status = 'completed'",
+    );
+    let pending = query_val(
+        &db,
+        "SELECT COUNT(*) AS cnt FROM oltp WHERE status = 'pending'",
+    );
+    println!(
+        "  -> completed={}, pending={} (expect {}/{})",
+        completed, pending, n_update, n_update
+    );
     assert_eq!(completed, n_update as i64);
     assert_eq!(pending, n_update as i64);
 
@@ -384,7 +525,13 @@ fn test_mixed_oltp() {
 
     // Final verification
     let final_count = query_val(&db, "SELECT COUNT(*) AS cnt FROM oltp");
-    assert_eq!(final_count, (n - n_delete) as i64, "Should have {} rows after deleting {}", n - n_delete, n_delete);
+    assert_eq!(
+        final_count,
+        (n - n_delete) as i64,
+        "Should have {} rows after deleting {}",
+        n - n_delete,
+        n_delete
+    );
     println!("  -> Final count: {} ✓", final_count);
 }
 
@@ -404,11 +551,22 @@ fn test_sstable_query_correctness() {
 
     {
         let db = Database::create_with_config(&db_path, config.clone()).unwrap();
-        exec(&db, "CREATE TABLE sst (id INTEGER PRIMARY KEY, data TEXT, score FLOAT)");
+        exec(
+            &db,
+            "CREATE TABLE sst (id INTEGER PRIMARY KEY, data TEXT, score FLOAT)",
+        );
 
         let start = Instant::now();
         for i in 1..=n as i64 {
-            exec(&db, &format!("INSERT INTO sst VALUES ({}, 'row_{}', {:.3})", i, i, i as f64 * 0.123));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO sst VALUES ({}, 'row_{}', {:.3})",
+                    i,
+                    i,
+                    i as f64 * 0.123
+                ),
+            );
         }
         let insert_ms = start.elapsed().as_millis() as u64;
         print_result!(format!("INSERT {}K (MemTable)", n / 1000), n, insert_ms);
@@ -451,9 +609,14 @@ fn test_sstable_query_correctness() {
     let mut errors = 0;
     for i in [1, 50, 100, 500, n as i64 / 2, n as i64] {
         let v = query_val(&db, &format!("SELECT id FROM sst WHERE id = {}", i));
-        if v != i { errors += 1; }
+        if v != i {
+            errors += 1;
+        }
     }
-    println!("  -> Post-recovery verification: {} rows, {}/6 spot-check errors", count, errors);
+    println!(
+        "  -> Post-recovery verification: {} rows, {}/6 spot-check errors",
+        count, errors
+    );
     assert_eq!(errors, 0, "All post-recovery queries must be correct");
 }
 
@@ -476,40 +639,72 @@ fn test_edge_resource_usage() {
         {
             let output = std::process::Command::new("ps")
                 .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-                .output().unwrap();
-            String::from_utf8_lossy(&output.stdout).trim().parse::<u64>().unwrap_or(0) * 1024
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u64>()
+                .unwrap_or(0)
+                * 1024
         }
         #[cfg(not(target_os = "macos"))]
-        { 0u64 }
+        {
+            0u64
+        }
     };
 
     // Cold start
     let start = Instant::now();
     let db = Database::create_with_config(&db_path, config.clone()).unwrap();
     let cold_start_ms = start.elapsed().as_millis() as u64;
-    exec(&db, "CREATE TABLE edge (id INTEGER PRIMARY KEY, sensor TEXT, val FLOAT, ts INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE edge (id INTEGER PRIMARY KEY, sensor TEXT, val FLOAT, ts INTEGER)",
+    );
 
     let baseline_rss = get_rss();
-    println!("  -> Cold start: {}ms, baseline RSS: {:.1} MB", cold_start_ms, baseline_rss as f64 / 1024.0 / 1024.0);
+    println!(
+        "  -> Cold start: {}ms, baseline RSS: {:.1} MB",
+        cold_start_ms,
+        baseline_rss as f64 / 1024.0 / 1024.0
+    );
 
     // Insert rows (edge-scale)
     let n = if is_ci() { 5_000 } else { 50_000 };
     let start = Instant::now();
     for i in 1..=n as i64 {
-        exec(&db, &format!("INSERT INTO edge VALUES ({}, 'sensor_{}', {:.2}, {})",
-            i, i % 10, i as f64 * 0.1, 1700000000 + i));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO edge VALUES ({}, 'sensor_{}', {:.2}, {})",
+                i,
+                i % 10,
+                i as f64 * 0.1,
+                1700000000 + i
+            ),
+        );
     }
     let insert_ms = start.elapsed().as_millis() as u64;
     let after_insert_rss = get_rss();
     let delta_rss = after_insert_rss as i64 - baseline_rss as i64;
-    let bytes_per_row = if delta_rss > 0 { delta_rss as f64 / n as f64 } else { 0.0 };
+    let bytes_per_row = if delta_rss > 0 {
+        delta_rss as f64 / n as f64
+    } else {
+        0.0
+    };
 
     print_result!(format!("INSERT {}K (edge config)", n / 1000), n, insert_ms);
-    println!("  -> RSS after insert: {:.1} MB, ΔRSS: {:.1} MB ({:.0} bytes/row)",
+    println!(
+        "  -> RSS after insert: {:.1} MB, ΔRSS: {:.1} MB ({:.0} bytes/row)",
         after_insert_rss as f64 / 1024.0 / 1024.0,
         delta_rss as f64 / 1024.0 / 1024.0,
-        bytes_per_row);
+        bytes_per_row
+    );
 
-    assert!(cold_start_ms < 100, "Cold start should be <100ms, got {}ms", cold_start_ms);
+    assert!(
+        cold_start_ms < 100,
+        "Cold start should be <100ms, got {}ms",
+        cold_start_ms
+    );
     db.close().unwrap();
 }

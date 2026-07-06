@@ -8,7 +8,7 @@
 //!   - GROUP BY with NULL values
 //!   - COUNT(*) recovery from ColSegmentStore after reopen
 
-use motedb::{Database, DBConfig, types::Value, sql::QueryResult};
+use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
 use tempfile::TempDir;
 
 fn create_db() -> (Database, TempDir) {
@@ -31,14 +31,25 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn count(db: &Database, sql: &str) -> i64 {
-    rows(db, sql).first()
+    rows(db, sql)
+        .first()
         .and_then(|r| r.first())
-        .and_then(|v| if let Value::Integer(i) = v { Some(*i) } else { None })
+        .and_then(|v| {
+            if let Value::Integer(i) = v {
+                Some(*i)
+            } else {
+                None
+            }
+        })
         .unwrap_or(-1)
 }
 
 fn prepared_count(db: &Database, sql: &str, params: Vec<Value>) -> i64 {
-    let r = db.execute_prepared(sql, params).unwrap().materialize().unwrap();
+    let r = db
+        .execute_prepared(sql, params)
+        .unwrap()
+        .materialize()
+        .unwrap();
     match r {
         QueryResult::Select { rows, .. } => rows.len() as i64,
         _ => -1,
@@ -55,10 +66,17 @@ fn prepared_count(db: &Database, sql: &str, params: Vec<Value>) -> i64 {
 #[test]
 fn test_group_by_high_cardinality_spills_to_hashmap() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, val INT)")
+        .unwrap();
     // Insert 300 distinct categories (> LINEAR_SCAN_MAX=256).
     for i in 0..300i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, 'cat_{}', {})", i, i, i * 10)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, 'cat_{}', {})",
+            i,
+            i,
+            i * 10
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -68,7 +86,10 @@ fn test_group_by_high_cardinality_spills_to_hashmap() {
 
     // Verify each group has count=1 and correct sum.
     for row in &r {
-        let c = match &row[1] { Value::Integer(i) => *i, _ => -1 };
+        let c = match &row[1] {
+            Value::Integer(i) => *i,
+            _ => -1,
+        };
         assert_eq!(c, 1, "Each group should have exactly 1 row");
     }
 
@@ -85,9 +106,15 @@ fn test_prepared_select_non_pk_where_after_checkpoint() {
     let path = dir.path().join("prep.mote");
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, age INT)").unwrap();
+        db.execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, age INT)")
+            .unwrap();
         for i in 0..100i64 {
-            db.execute(&format!("INSERT INTO users VALUES (null, 'user{}', {})", i, 20 + i)).unwrap();
+            db.execute(&format!(
+                "INSERT INTO users VALUES (null, 'user{}', {})",
+                i,
+                20 + i
+            ))
+            .unwrap();
         }
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -95,10 +122,14 @@ fn test_prepared_select_non_pk_where_after_checkpoint() {
     let db = Database::open(&path).unwrap();
 
     // Prepared WHERE name = ? (non-PK column) — must return Select, not Modification.
-    let r = db.execute_prepared(
-        "SELECT * FROM users WHERE name = ?",
-        vec![Value::text("user50".to_string())],
-    ).unwrap().materialize().unwrap();
+    let r = db
+        .execute_prepared(
+            "SELECT * FROM users WHERE name = ?",
+            vec![Value::text("user50".to_string())],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
     match r {
         QueryResult::Select { rows, .. } => {
             assert_eq!(rows.len(), 1, "Should find 1 user named 'user50'");
@@ -117,24 +148,42 @@ fn test_prepared_select_non_pk_where_after_checkpoint() {
 #[test]
 fn test_count_where_after_update_changes_filter_value() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE oltp (id INT PRIMARY KEY, status TEXT)").unwrap();
+    db.execute("CREATE TABLE oltp (id INT PRIMARY KEY, status TEXT)")
+        .unwrap();
     for i in 1..=100i64 {
-        db.execute(&format!("INSERT INTO oltp VALUES ({}, 'active')", i)).unwrap();
+        db.execute(&format!("INSERT INTO oltp VALUES ({}, 'active')", i))
+            .unwrap();
     }
     // Update half to inactive.
     for i in 1..=50i64 {
-        db.execute(&format!("UPDATE oltp SET status = 'inactive' WHERE id = {}", i)).unwrap();
+        db.execute(&format!(
+            "UPDATE oltp SET status = 'inactive' WHERE id = {}",
+            i
+        ))
+        .unwrap();
     }
 
     // Count without flush — buffered UPDATEs must be visible.
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'active'"), 50);
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'inactive'"), 50);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'active'"),
+        50
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'inactive'"),
+        50
+    );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM oltp"), 100);
 
     // After flush, same results.
     db.flush().unwrap();
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'active'"), 50);
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'inactive'"), 50);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'active'"),
+        50
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM oltp WHERE status = 'inactive'"),
+        50
+    );
 }
 
 /// GROUP BY with NULL values in the group column.
@@ -142,7 +191,8 @@ fn test_count_where_after_update_changes_filter_value() {
 #[test]
 fn test_group_by_text_column_with_nulls() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'A', 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'B', 20)").unwrap();
     db.execute("INSERT INTO t VALUES (3, NULL, 30)").unwrap();
@@ -154,13 +204,23 @@ fn test_group_by_text_column_with_nulls() {
     // Should have 3 groups: A(2), B(1), NULL(2).
     // NULL group behavior varies — some DBs skip NULLs in GROUP BY.
     // Just verify total count across all groups sums to 5.
-    let total: i64 = r.iter().map(|row| {
-        match &row[1] { Value::Integer(i) => *i, _ => 0 }
-    }).sum();
-    assert_eq!(total, 5, "Total rows across all groups should be 5, got {}", total);
+    let total: i64 = r
+        .iter()
+        .map(|row| match &row[1] {
+            Value::Integer(i) => *i,
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        total, 5,
+        "Total rows across all groups should be 5, got {}",
+        total
+    );
 
     // Verify 'A' group has 2 rows.
-    let a_group = r.iter().find(|row| matches!(&row[0], Value::Text(t) if t.as_str() == "A"));
+    let a_group = r
+        .iter()
+        .find(|row| matches!(&row[0], Value::Text(t) if t.as_str() == "A"));
     assert!(a_group.is_some(), "Group 'A' should exist");
     if let Some(g) = a_group {
         assert_eq!(g[1], Value::Integer(2));
@@ -176,16 +236,21 @@ fn test_count_star_col_segment_table_after_reopen() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         for i in 1..=200i64 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, 'row_{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'row_{}')", i, i))
+                .unwrap();
         }
         db.checkpoint().unwrap();
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 200,
-        "COUNT(*) after reopen should return 200");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM t"),
+        200,
+        "COUNT(*) after reopen should return 200"
+    );
     // Also verify SELECT * returns all rows.
     let r = rows(&db, "SELECT * FROM t");
     assert_eq!(r.len(), 200);
@@ -199,7 +264,8 @@ fn test_count_star_col_segment_table_after_reopen() {
 #[test]
 fn test_update_text_to_empty_string_vs_null_distinct() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'world')").unwrap();
 
@@ -223,23 +289,37 @@ fn test_update_text_to_empty_string_vs_null_distinct() {
 #[test]
 fn test_inner_join_where_with_limit_early_termination() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, cat TEXT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT, val INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT, val INT)")
+        .unwrap();
     for i in 1..=50i64 {
         let cat = if i % 2 == 0 { "X" } else { "Y" };
-        db.execute(&format!("INSERT INTO a VALUES ({}, '{}')", i, cat)).unwrap();
-        db.execute(&format!("INSERT INTO b VALUES ({}, {}, {})", i, i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({}, '{}')", i, cat))
+            .unwrap();
+        db.execute(&format!("INSERT INTO b VALUES ({}, {}, {})", i, i, i * 10))
+            .unwrap();
     }
     db.flush().unwrap();
 
     // JOIN with WHERE filter on 'a' + LIMIT — need to verify LIMIT isn't
     // applied too early (before WHERE filtering in finalize_join_result).
-    let r = rows(&db, "SELECT a.id, b.val FROM a INNER JOIN b ON a.id = b.a_id WHERE a.cat = 'X' LIMIT 5");
-    assert_eq!(r.len(), 5, "Should return exactly 5 rows after WHERE + LIMIT");
+    let r = rows(
+        &db,
+        "SELECT a.id, b.val FROM a INNER JOIN b ON a.id = b.a_id WHERE a.cat = 'X' LIMIT 5",
+    );
+    assert_eq!(
+        r.len(),
+        5,
+        "Should return exactly 5 rows after WHERE + LIMIT"
+    );
 
     // All returned rows should have cat = 'X' (the WHERE filter).
     // Since we can't select a.cat (not in output), verify via count without LIMIT.
-    let total_x = rows(&db, "SELECT a.id FROM a INNER JOIN b ON a.id = b.a_id WHERE a.cat = 'X'");
+    let total_x = rows(
+        &db,
+        "SELECT a.id FROM a INNER JOIN b ON a.id = b.a_id WHERE a.cat = 'X'",
+    );
     assert!(total_x.len() >= 5, "Should have at least 5 cat='X' matches");
 }
 
@@ -248,8 +328,12 @@ fn test_inner_join_where_with_limit_early_termination() {
 #[test]
 fn test_in_empty_list_semantics() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=5 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=5 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
 
     // WHERE id IN () — parser may not support this; just verify no panic.
@@ -264,7 +348,8 @@ fn test_in_empty_list_semantics() {
 #[test]
 fn test_order_by_desc_limit_with_nulls() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10.0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30.0)").unwrap();
@@ -286,14 +371,19 @@ fn test_order_by_desc_limit_with_nulls() {
 #[test]
 fn test_self_join_employees_managers() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, manager_id INT)").unwrap();
+    db.execute("CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, manager_id INT)")
+        .unwrap();
     db.execute("INSERT INTO emp VALUES (1, 'CEO', 0)").unwrap();
     db.execute("INSERT INTO emp VALUES (2, 'VP', 1)").unwrap();
     db.execute("INSERT INTO emp VALUES (3, 'Eng', 2)").unwrap();
-    db.execute("INSERT INTO emp VALUES (4, 'Sales', 2)").unwrap();
+    db.execute("INSERT INTO emp VALUES (4, 'Sales', 2)")
+        .unwrap();
     db.flush().unwrap();
 
-    let r = rows(&db, "SELECT e.name, m.name FROM emp e INNER JOIN emp m ON e.manager_id = m.id");
+    let r = rows(
+        &db,
+        "SELECT e.name, m.name FROM emp e INNER JOIN emp m ON e.manager_id = m.id",
+    );
     assert_eq!(r.len(), 3, "Self-join should find 3 employee-manager pairs");
 }
 
@@ -301,13 +391,24 @@ fn test_self_join_employees_managers() {
 #[test]
 fn test_nested_subquery_three_levels() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)").unwrap();
-    db.execute("CREATE TABLE c (id INT PRIMARY KEY, b_id INT, flag TEXT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)")
+        .unwrap();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, b_id INT, flag TEXT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO a VALUES ({}, {})", i, i * 10)).unwrap();
-        db.execute(&format!("INSERT INTO b VALUES ({}, {})", i, i)).unwrap();
-        db.execute(&format!("INSERT INTO c VALUES ({}, {}, '{}')", i, i, if i <= 5 { "Y" } else { "N" })).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({}, {})", i, i * 10))
+            .unwrap();
+        db.execute(&format!("INSERT INTO b VALUES ({}, {})", i, i))
+            .unwrap();
+        db.execute(&format!(
+            "INSERT INTO c VALUES ({}, {}, '{}')",
+            i,
+            i,
+            if i <= 5 { "Y" } else { "N" }
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -322,19 +423,27 @@ fn test_nested_subquery_three_levels() {
 #[test]
 fn test_min_max_all_null_returns_null() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
     db.flush().unwrap();
 
-    let r = rows(&db, "SELECT MIN(v), MAX(v), SUM(v), AVG(v), COUNT(v) FROM t");
+    let r = rows(
+        &db,
+        "SELECT MIN(v), MAX(v), SUM(v), AVG(v), COUNT(v) FROM t",
+    );
     assert_eq!(r.len(), 1);
     // MIN/MAX over all-NULL should return NULL.
     assert_eq!(r[0][0], Value::Null, "MIN over all-NULL should be NULL");
     assert_eq!(r[0][1], Value::Null, "MAX over all-NULL should be NULL");
     // COUNT(v) skips NULLs → 0.
-    assert_eq!(r[0][4], Value::Integer(0), "COUNT(col) over all-NULL should be 0");
+    assert_eq!(
+        r[0][4],
+        Value::Integer(0),
+        "COUNT(col) over all-NULL should be 0"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -354,7 +463,8 @@ fn test_wide_table_mixed_types_with_nulls() {
             _ => {}
         }
     }
-    db.execute(&format!("CREATE TABLE wide ({})", cols.join(", "))).unwrap();
+    db.execute(&format!("CREATE TABLE wide ({})", cols.join(", ")))
+        .unwrap();
     // Insert 10 rows with some NULLs.
     for row in 0..10i64 {
         let mut vals = vec![row.to_string()];
@@ -370,7 +480,8 @@ fn test_wide_table_mixed_types_with_nulls() {
                 });
             }
         }
-        db.execute(&format!("INSERT INTO wide VALUES ({})", vals.join(", "))).unwrap();
+        db.execute(&format!("INSERT INTO wide VALUES ({})", vals.join(", ")))
+            .unwrap();
     }
     db.flush().unwrap();
     assert_eq!(count(&db, "SELECT COUNT(*) FROM wide"), 10);
@@ -383,10 +494,14 @@ fn test_wide_table_mixed_types_with_nulls() {
 #[test]
 fn test_table_all_text_columns_scan_and_filter() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT, c TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'alpha', 'beta', 'gamma')").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'delta', 'epsilon', 'zeta')").unwrap();
-    db.execute("INSERT INTO t VALUES (3, 'alpha', 'beta', 'eta')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT, c TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alpha', 'beta', 'gamma')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'delta', 'epsilon', 'zeta')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (3, 'alpha', 'beta', 'eta')")
+        .unwrap();
     db.flush().unwrap();
 
     // Scan all.
@@ -402,17 +517,31 @@ fn test_table_all_text_columns_scan_and_filter() {
 #[test]
 fn test_delete_all_then_reinsert_same_pks() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
 
     // Delete all.
-    for i in 1..=10 { db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap(); }
+    for i in 1..=10 {
+        db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+            .unwrap();
+    }
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 0, "All rows deleted");
 
     // Re-insert same PKs.
-    for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 100)).unwrap(); }
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 10, "Re-inserted 10 rows");
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 100))
+            .unwrap();
+    }
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM t"),
+        10,
+        "Re-inserted 10 rows"
+    );
     // Verify values are the new ones.
     let r = rows(&db, "SELECT v FROM t WHERE id = 5");
     assert_eq!(r[0][0], Value::Integer(500));
@@ -429,8 +558,10 @@ fn test_integer_overflow_to_float_survives_recovery() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)").unwrap();
-        db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX - 10)).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)")
+            .unwrap();
+        db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX - 10))
+            .unwrap();
         // Overflow → should promote to float.
         db.execute("UPDATE t SET v = v + 100 WHERE id = 1").unwrap();
         db.checkpoint().unwrap();
@@ -454,7 +585,8 @@ fn test_checkpoint_excludes_uncommitted_transaction() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -469,28 +601,47 @@ fn test_checkpoint_excludes_uncommitted_transaction() {
     // After rollback (via ROLLBACK SQL), uncommitted row should be gone.
     db.execute("ROLLBACK").unwrap();
     let cnt_after = count(&db, "SELECT COUNT(*) FROM t");
-    assert_eq!(cnt_after, 1, "Rollback should leave only committed row (1), got {}", cnt_after);
+    assert_eq!(
+        cnt_after, 1,
+        "Rollback should leave only committed row (1), got {}",
+        cnt_after
+    );
 }
 
 /// Vector/Spatial column UPDATE — old index entry should be invalidated.
 #[test]
 fn test_spatial_update_and_reread() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, loc GEOMETRY)").unwrap();
-    db.execute("INSERT INTO pts VALUES (1, POINT(0, 0))").unwrap();
-    db.execute("INSERT INTO pts VALUES (2, POINT(10, 10))").unwrap();
+    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, loc GEOMETRY)")
+        .unwrap();
+    db.execute("INSERT INTO pts VALUES (1, POINT(0, 0))")
+        .unwrap();
+    db.execute("INSERT INTO pts VALUES (2, POINT(10, 10))")
+        .unwrap();
     db.flush().unwrap();
 
     // Update point location.
-    db.execute("UPDATE pts SET loc = POINT(5, 5) WHERE id = 1").unwrap();
+    db.execute("UPDATE pts SET loc = POINT(5, 5) WHERE id = 1")
+        .unwrap();
     db.flush().unwrap();
 
     // Verify the update took effect.
-    let r = rows(&db, "SELECT id FROM pts ORDER BY ST_DISTANCE(loc, 5, 5) LIMIT 1");
+    let r = rows(
+        &db,
+        "SELECT id FROM pts ORDER BY ST_DISTANCE(loc, 5, 5) LIMIT 1",
+    );
     assert!(!r.is_empty(), "Should find nearest point after UPDATE");
     // id=1 should be closest to (5,5) now (distance 0 vs (10,10) distance ~7).
     let nearest_id = r.first().and_then(|row| row.first()).and_then(|v| {
-        if let Value::Integer(i) = v { Some(*i) } else { None }
+        if let Value::Integer(i) = v {
+            Some(*i)
+        } else {
+            None
+        }
     });
-    assert_eq!(nearest_id, Some(1), "Updated point should be nearest to (5,5)");
+    assert_eq!(
+        nearest_id,
+        Some(1),
+        "Updated point should be nearest to (5,5)"
+    );
 }

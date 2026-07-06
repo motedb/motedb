@@ -1,6 +1,6 @@
 //! Regression tests for bug-hunt round 5 (executor, index, storage fixes)
 
-use motedb::{Database, types::Value, sql::QueryResult};
+use motedb::{sql::QueryResult, types::Value, Database};
 use tempfile::TempDir;
 
 fn create_db() -> (Database, TempDir) {
@@ -29,14 +29,19 @@ fn test_group_by_limit() {
     let (db, _dir) = create_db();
     db.execute("CREATE TABLE t (cat TEXT, val INT)").unwrap();
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ('a', {})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('a', {})", i))
+            .unwrap();
     }
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ('b', {})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('b', {})", i))
+            .unwrap();
     }
 
     // GROUP BY with ORDER BY and LIMIT
-    let r = rows(&db, "SELECT cat, SUM(val) FROM t GROUP BY cat ORDER BY cat LIMIT 1");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(val) FROM t GROUP BY cat ORDER BY cat LIMIT 1",
+    );
     assert_eq!(r.len(), 1, "LIMIT 1 should return 1 row, got {}", r.len());
 }
 
@@ -45,15 +50,25 @@ fn test_group_by_limit_offset() {
     let (db, _dir) = create_db();
     db.execute("CREATE TABLE t (cat TEXT, val INT)").unwrap();
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ('a', {})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('a', {})", i))
+            .unwrap();
     }
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ('b', {})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('b', {})", i))
+            .unwrap();
     }
 
     // GROUP BY with ORDER BY and LIMIT + OFFSET
-    let r = rows(&db, "SELECT cat, SUM(val) FROM t GROUP BY cat ORDER BY cat LIMIT 1 OFFSET 1");
-    assert_eq!(r.len(), 1, "LIMIT 1 OFFSET 1 should return 1 row, got {}", r.len());
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(val) FROM t GROUP BY cat ORDER BY cat LIMIT 1 OFFSET 1",
+    );
+    assert_eq!(
+        r.len(),
+        1,
+        "LIMIT 1 OFFSET 1 should return 1 row, got {}",
+        r.len()
+    );
 }
 
 #[test]
@@ -61,10 +76,12 @@ fn test_group_by_no_limit_returns_all() {
     let (db, _dir) = create_db();
     db.execute("CREATE TABLE t (cat TEXT, val INT)").unwrap();
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ('a', {})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('a', {})", i))
+            .unwrap();
     }
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ('b', {})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ('b', {})", i))
+            .unwrap();
     }
 
     // GROUP BY without LIMIT should return all groups
@@ -108,7 +125,8 @@ fn test_non_group_by_column_rejected() {
 #[test]
 fn test_order_by_integer_float_mix() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5.0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 3.0)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 10.0)").unwrap();
@@ -123,7 +141,8 @@ fn test_order_by_integer_float_mix() {
 #[test]
 fn test_order_by_desc() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5.0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 3.0)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 10.0)").unwrap();
@@ -149,8 +168,12 @@ fn test_count_with_null_comparison() {
     // COUNT should exclude NULL (WHERE val > 0 is UNKNOWN for NULL row)
     // Both NULL and FALSE are filtered by WHERE, so result should be same
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE val > 0");
-    assert_eq!(r[0][0], Value::Integer(2),
-        "WHERE val > 0 should return 2 rows (1 and 3), got {:?}", r);
+    assert_eq!(
+        r[0][0],
+        Value::Integer(2),
+        "WHERE val > 0 should return 2 rows (1 and 3), got {:?}",
+        r
+    );
 }
 
 // ============================================================
@@ -160,7 +183,8 @@ fn test_count_with_null_comparison() {
 #[test]
 fn test_sstable_open_on_empty_db() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     db.flush().unwrap();
 
@@ -177,10 +201,13 @@ fn test_sstable_open_on_empty_db() {
 #[test]
 fn test_ioctree_large_coordinate_precision() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, x FLOAT, y FLOAT, z FLOAT)").unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, x FLOAT, y FLOAT, z FLOAT)")
+        .unwrap();
     // Large coordinate that exceeds f32 precision (10,000,000.5 loses sub-meter in f32)
-    db.execute("INSERT INTO points VALUES (1, 10000000.5, 10000000.5, 10000000.5)").unwrap();
-    db.execute("INSERT INTO points VALUES (2, 10000000.0, 10000000.0, 10000000.0)").unwrap();
+    db.execute("INSERT INTO points VALUES (1, 10000000.5, 10000000.5, 10000000.5)")
+        .unwrap();
+    db.execute("INSERT INTO points VALUES (2, 10000000.0, 10000000.0, 10000000.0)")
+        .unwrap();
     db.flush().unwrap();
 
     // Both points should exist and be distinguishable
@@ -202,9 +229,11 @@ fn test_sstable_metadata_survives_restart() {
     // Phase 1: create, insert, close
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
         for i in 1..=100i64 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, 'v')", i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'v')", i))
+                .unwrap();
         }
         db.flush().unwrap();
         db.close().unwrap();
@@ -214,8 +243,11 @@ fn test_sstable_metadata_survives_restart() {
     {
         let db = Database::open(&path).unwrap();
         let r = rows(&db, "SELECT COUNT(*) FROM t WHERE id >= 50 AND id <= 60");
-        assert_eq!(r[0][0], Value::Integer(11),
-            "Range query after restart should return 11 rows (ids 50-60)");
+        assert_eq!(
+            r[0][0],
+            Value::Integer(11),
+            "Range query after restart should return 11 rows (ids 50-60)"
+        );
     }
 }
 
@@ -226,10 +258,17 @@ fn test_sstable_metadata_survives_restart() {
 #[test]
 fn test_ioctree_flush_data_survival() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, x FLOAT, y FLOAT, z FLOAT)").unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, x FLOAT, y FLOAT, z FLOAT)")
+        .unwrap();
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO points VALUES ({}, {}, {}, {})",
-            i, i as f64 * 1.5, i as f64 * 2.0, i as f64 * 0.5)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO points VALUES ({}, {}, {}, {})",
+            i,
+            i as f64 * 1.5,
+            i as f64 * 2.0,
+            i as f64 * 0.5
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
 
@@ -246,7 +285,8 @@ fn test_ioctree_flush_data_survival() {
 #[test]
 fn test_order_by_with_nulls() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
@@ -267,11 +307,14 @@ fn test_order_by_with_nulls() {
 #[test]
 fn test_text_index_delete_and_reinsert() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, content TEXT)").unwrap();
+    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
 
     // Insert and flush to create FTS index entries
-    db.execute("INSERT INTO docs VALUES (1, 'hello world')").unwrap();
-    db.execute("INSERT INTO docs VALUES (2, 'hello rust')").unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'hello world')")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (2, 'hello rust')")
+        .unwrap();
     db.flush().unwrap();
 
     // Delete one document
@@ -294,7 +337,8 @@ fn test_text_index_delete_and_reinsert() {
 #[test]
 fn test_empty_string_not_null() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '')").unwrap();
     db.flush().unwrap();
 
@@ -311,7 +355,8 @@ fn test_empty_string_not_null() {
 #[test]
 fn test_null_vs_empty_string_distinct() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '')").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     db.flush().unwrap();
@@ -334,14 +379,19 @@ fn test_null_vs_empty_string_distinct() {
 #[test]
 fn test_membuffer_stable_dedup_update_survives() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("UPDATE t SET val = 20 WHERE id = 1").unwrap();
     db.flush().unwrap();
 
     let r = rows(&db, "SELECT val FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Integer(20), "UPDATE value should survive flush");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(20),
+        "UPDATE value should survive flush"
+    );
 }
 
 // ============================================================
@@ -351,9 +401,11 @@ fn test_membuffer_stable_dedup_update_survives() {
 #[test]
 fn test_sequential_row_ids() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     for i in 1..=100i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, 'v')", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, 'v')", i))
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -368,10 +420,12 @@ fn test_sequential_row_ids() {
 #[test]
 fn test_batch_insert_row_ids() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, val TEXT)")
+        .unwrap();
     // Batch insert multiple rows
     for i in 1..=50i64 {
-        db.execute(&format!("INSERT INTO t (val) VALUES ('row_{}')", i)).unwrap();
+        db.execute(&format!("INSERT INTO t (val) VALUES ('row_{}')", i))
+            .unwrap();
     }
     db.flush().unwrap();
 
@@ -386,15 +440,20 @@ fn test_batch_insert_row_ids() {
 #[test]
 fn test_hash_join_integer_float_cross_type() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     // Insert matching values: a.val=5 (Integer), b.val=5.0 (Float)
     db.execute("INSERT INTO a VALUES (1, 5)").unwrap();
     db.execute("INSERT INTO b VALUES (1, 5.0)").unwrap();
     db.execute("INSERT INTO b VALUES (2, 3.0)").unwrap();
 
     // JOIN on val — Integer(5) == Float(5.0) should match
-    let r = rows(&db, "SELECT a.id, b.id FROM a INNER JOIN b ON a.val = b.val");
+    let r = rows(
+        &db,
+        "SELECT a.id, b.id FROM a INNER JOIN b ON a.val = b.val",
+    );
     assert_eq!(r.len(), 1, "Should find 1 match: 5 == 5.0");
     assert_eq!(r[0][0], Value::Integer(1));
     assert_eq!(r[0][1], Value::Integer(1));
@@ -407,14 +466,19 @@ fn test_hash_join_integer_float_cross_type() {
 #[test]
 fn test_hash_join_multiple_matches() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, grp INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, grp INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, grp INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, grp INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO a VALUES (2, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (2, 10)").unwrap();
 
-    let r = rows(&db, "SELECT a.id, b.id FROM a INNER JOIN b ON a.grp = b.grp");
+    let r = rows(
+        &db,
+        "SELECT a.id, b.id FROM a INNER JOIN b ON a.grp = b.grp",
+    );
     assert_eq!(r.len(), 4, "2*2 = 4 matches for grp=10");
 }
 
@@ -425,8 +489,10 @@ fn test_hash_join_multiple_matches() {
 #[test]
 fn test_left_join_no_match() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (1, 99)").unwrap(); // different val
 
@@ -444,7 +510,8 @@ fn test_left_join_no_match() {
 #[test]
 fn test_deeply_nested_parens_rejected() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     // Build a very deeply nested expression
@@ -461,8 +528,11 @@ fn test_deeply_nested_parens_rejected() {
     match result {
         Err(e) => {
             let msg = format!("{:?}", e);
-            assert!(msg.contains("nesting") || msg.contains("Expected") || msg.contains("parse"),
-                "Should get parse error, got: {}", msg);
+            assert!(
+                msg.contains("nesting") || msg.contains("Expected") || msg.contains("parse"),
+                "Should get parse error, got: {}",
+                msg
+            );
         }
         Ok(_) => {} // also acceptable if it somehow succeeds
     }
@@ -475,7 +545,8 @@ fn test_deeply_nested_parens_rejected() {
 #[test]
 fn test_duplicate_pk_rejected_in_transaction() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
 
     // Second insert with same PK should fail
@@ -490,20 +561,24 @@ fn test_duplicate_pk_rejected_in_transaction() {
 #[test]
 fn test_index_rebuild_skips_deleted_rows() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     for i in 1..=10i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
     db.flush().unwrap();
 
     // Delete half the rows
     for i in 1..=5i64 {
-        db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+            .unwrap();
     }
     db.flush().unwrap();
 
     // Create a new index — should only index live rows
-    db.execute("CREATE INDEX idx_val ON t (val) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_val ON t (val) USING COLUMN")
+        .unwrap();
     db.flush().unwrap();
 
     // Query via index should only return live rows
@@ -522,7 +597,8 @@ fn test_index_rebuild_skips_deleted_rows() {
 #[test]
 fn test_sci_notation_overflow_rejected() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     // 1e500 is Infinity in f64 — should be rejected
     let result = db.execute("INSERT INTO t VALUES (1, 1e500)");
     assert!(result.is_err(), "1e500 should be rejected as out of range");
@@ -531,7 +607,8 @@ fn test_sci_notation_overflow_rejected() {
 #[test]
 fn test_sci_notation_underflow_rejected() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     // 1e-500 underflows to 0.0 in f64 — should be rejected or accepted as 0
     // (f64::MIN_POSITIVE is ~5e-324, so 1e-500 underflows)
     let result = db.execute("INSERT INTO t VALUES (1, 1e-500)");
@@ -548,15 +625,20 @@ fn test_sci_notation_underflow_rejected() {
 #[test]
 fn test_row_count_matches_after_flush() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
     db.flush().unwrap();
 
     let r = rows(&db, "SELECT COUNT(*) FROM t");
-    assert_eq!(r[0][0], Value::Integer(3),
-        "COUNT(*) should match number of inserted rows, got {:?}", r);
+    assert_eq!(
+        r[0][0],
+        Value::Integer(3),
+        "COUNT(*) should match number of inserted rows, got {:?}",
+        r
+    );
 }
 
 // ============================================================
@@ -566,13 +648,19 @@ fn test_row_count_matches_after_flush() {
 #[test]
 fn test_full_join_syntax_accepted() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (2, 20)").unwrap();
 
     let r = rows(&db, "SELECT a.id, b.id FROM a FULL JOIN b ON a.val = b.val");
-    assert_eq!(r.len(), 2, "FULL JOIN should return 2 rows (1 match + 1 NULL)");
+    assert_eq!(
+        r.len(),
+        2,
+        "FULL JOIN should return 2 rows (1 match + 1 NULL)"
+    );
 }
 
 // ============================================================
@@ -586,8 +674,11 @@ fn test_timestamp_integer_equality_consistent() {
     let ts = Value::Timestamp(Timestamp::from_micros(100));
     let int = Value::Integer(100);
     // partial_cmp says Equal → == must also be true
-    assert_eq!(ts.partial_cmp(&int), Some(std::cmp::Ordering::Equal),
-        "partial_cmp(Timestamp(100), Integer(100)) must be Equal");
+    assert_eq!(
+        ts.partial_cmp(&int),
+        Some(std::cmp::Ordering::Equal),
+        "partial_cmp(Timestamp(100), Integer(100)) must be Equal"
+    );
     assert!(ts == int, "Timestamp(100) == Integer(100) must be true");
     assert!(int == ts, "Integer(100) == Timestamp(100) must be true");
 }
@@ -597,8 +688,11 @@ fn test_timestamp_float_equality_consistent() {
     use motedb::types::Timestamp;
     let ts = Value::Timestamp(Timestamp::from_micros(42));
     let flt = Value::Float(42.0);
-    assert_eq!(ts.partial_cmp(&flt), Some(std::cmp::Ordering::Equal),
-        "partial_cmp(Timestamp(42), Float(42.0)) must be Equal");
+    assert_eq!(
+        ts.partial_cmp(&flt),
+        Some(std::cmp::Ordering::Equal),
+        "partial_cmp(Timestamp(42), Float(42.0)) must be Equal"
+    );
     assert!(ts == flt, "Timestamp(42) == Float(42.0) must be true");
 }
 
@@ -606,8 +700,10 @@ fn test_timestamp_float_equality_consistent() {
 #[test]
 fn test_mod_i64_min_minus_one() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN)).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN))
+        .unwrap();
     // Should not panic — i64::MIN % -1 is UB in C but returns 0 in our fix
     let r = rows(&db, &format!("SELECT val % -1 FROM t WHERE id = 1"));
     assert_eq!(r.len(), 1, "Should return 1 row");
@@ -619,8 +715,10 @@ fn test_mod_i64_min_minus_one() {
 #[test]
 fn test_abs_i64_min_no_panic() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN)).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN))
+        .unwrap();
     let r = rows(&db, "SELECT ABS(val) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
     // Should return Float since Integer can't hold abs(i64::MIN)
@@ -635,8 +733,10 @@ fn test_abs_i64_min_no_panic() {
 #[test]
 fn test_fast_update_add_overflow() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX - 10)).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX - 10))
+        .unwrap();
     // This UPDATE should handle overflow without panicking
     let result = db.execute("UPDATE t SET val = val + 100 WHERE id = 1");
     assert!(result.is_ok(), "UPDATE with overflow should not panic");
@@ -657,7 +757,8 @@ fn test_fast_update_add_overflow() {
 #[test]
 fn test_fast_update_mul_overflow() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val BIGINT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1000000000)").unwrap();
     let result = db.execute("UPDATE t SET val = val * val WHERE id = 1");
     assert!(result.is_ok(), "UPDATE with mul overflow should not panic");
@@ -667,14 +768,27 @@ fn test_fast_update_mul_overflow() {
 #[test]
 fn test_left_join_empty_right_table() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 'alice')").unwrap();
     // b is empty
 
-    let r = rows(&db, "SELECT a.name, b.val FROM a LEFT JOIN b ON a.id = b.id");
-    assert_eq!(r.len(), 1, "LEFT JOIN should return 1 row when right table is empty");
-    assert_eq!(r[0][0], Value::text("alice".into()), "left column should have value");
+    let r = rows(
+        &db,
+        "SELECT a.name, b.val FROM a LEFT JOIN b ON a.id = b.id",
+    );
+    assert_eq!(
+        r.len(),
+        1,
+        "LEFT JOIN should return 1 row when right table is empty"
+    );
+    assert_eq!(
+        r[0][0],
+        Value::text("alice".into()),
+        "left column should have value"
+    );
     assert_eq!(r[0][1], Value::Null, "right column should be NULL");
 }
 
@@ -682,46 +796,70 @@ fn test_left_join_empty_right_table() {
 #[test]
 fn test_right_join_empty_left_table() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO b VALUES (1, 42)").unwrap();
     // a is empty
 
-    let r = rows(&db, "SELECT a.name, b.val FROM a RIGHT JOIN b ON a.id = b.id");
-    assert_eq!(r.len(), 1, "RIGHT JOIN should return 1 row when left table is empty");
+    let r = rows(
+        &db,
+        "SELECT a.name, b.val FROM a RIGHT JOIN b ON a.id = b.id",
+    );
+    assert_eq!(
+        r.len(),
+        1,
+        "RIGHT JOIN should return 1 row when left table is empty"
+    );
     assert_eq!(r[0][0], Value::Null, "left column should be NULL");
-    assert_eq!(r[0][1], Value::Integer(42), "right column should have value");
+    assert_eq!(
+        r[0][1],
+        Value::Integer(42),
+        "right column should have value"
+    );
 }
 
 // R6-8: SUBSTR with negative start returns empty string
 #[test]
 fn test_substr_negative_start() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     // SUBSTR with negative start counts from end of string (SQL standard)
     let r = rows(&db, "SELECT SUBSTR(name, -1) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::text("o".to_string()), "SUBSTR('hello', -1) should be 'o'");
+    assert_eq!(
+        r[0][0],
+        Value::text("o".to_string()),
+        "SUBSTR('hello', -1) should be 'o'"
+    );
 }
 
 // R6-9: SUBSTR with start=0 returns empty string
 #[test]
 fn test_substr_zero_start() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     // SUBSTR with start=0 is treated as position 1 per SQL standard
     let r = rows(&db, "SELECT SUBSTR(name, 0) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::text("hello".to_string()), "SUBSTR('hello', 0) should be 'hello'");
+    assert_eq!(
+        r[0][0],
+        Value::text("hello".to_string()),
+        "SUBSTR('hello', 0) should be 'hello'"
+    );
 }
 
 // R6-10: FLOOR/CEIL on large float — should not produce garbage
 #[test]
 fn test_floor_ceil_large_float() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1e18)").unwrap();
     let r = rows(&db, "SELECT FLOOR(val), CEIL(val) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
@@ -743,31 +881,43 @@ fn test_floor_ceil_large_float() {
 fn test_create_table_duplicate_column_names() {
     let (db, _dir) = create_db();
     let result = db.execute("CREATE TABLE t (id INT, id TEXT)");
-    assert!(result.is_err(), "CREATE TABLE with duplicate column names should fail");
+    assert!(
+        result.is_err(),
+        "CREATE TABLE with duplicate column names should fail"
+    );
 }
 
 // R6-12: ALTER TABLE AUTO_INCREMENT rejects invalid values
 #[test]
 fn test_alter_auto_increment_rejects_negative() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT)")
+        .unwrap();
     let result = db.execute("ALTER TABLE t AUTO_INCREMENT = -5");
-    assert!(result.is_err(), "Negative AUTO_INCREMENT should be rejected");
+    assert!(
+        result.is_err(),
+        "Negative AUTO_INCREMENT should be rejected"
+    );
 }
 
 #[test]
 fn test_alter_auto_increment_rejects_non_integer() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT)")
+        .unwrap();
     let result = db.execute("ALTER TABLE t AUTO_INCREMENT = 1.5");
-    assert!(result.is_err(), "Fractional AUTO_INCREMENT should be rejected");
+    assert!(
+        result.is_err(),
+        "Fractional AUTO_INCREMENT should be rejected"
+    );
 }
 
 // R6-13: Integer/Integer fast div preserves Integer type
 #[test]
 fn test_fast_div_preserves_integer_type() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     // This triggers the fast UPDATE path: val = val / 3
     let result = db.execute("UPDATE t SET val = val / 3 WHERE id = 1");
@@ -782,11 +932,13 @@ fn test_fast_div_preserves_integer_type() {
 #[test]
 fn test_version_chain_end_ts_on_prepend() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     // Use explicit transaction to ensure MVCC versions are created
     let txn = db.begin_transaction().unwrap();
-    db.insert_row_with_txn("t", txn, vec![Value::Integer(1), Value::Integer(10)]).unwrap();
+    db.insert_row_with_txn("t", txn, vec![Value::Integer(1), Value::Integer(10)])
+        .unwrap();
     db.commit_transaction(txn).unwrap();
 
     // Verify the row
@@ -798,8 +950,8 @@ fn test_version_chain_end_ts_on_prepend() {
 // R6-15: Hash consistency for Timestamp vs Integer equality
 #[test]
 fn test_hash_consistency_timestamp_integer() {
-    use std::collections::HashSet;
     use motedb::types::Timestamp;
+    use std::collections::HashSet;
     let ts = Value::Timestamp(Timestamp::from_micros(42));
     let int = Value::Integer(42);
 
@@ -807,7 +959,10 @@ fn test_hash_consistency_timestamp_integer() {
     assert!(ts == int, "must be equal for hash contract");
     let mut set = HashSet::new();
     set.insert(ts.clone());
-    assert!(set.contains(&int), "HashSet lookup with equal value must succeed");
+    assert!(
+        set.contains(&int),
+        "HashSet lookup with equal value must succeed"
+    );
 }
 
 // ============================================================
@@ -818,23 +973,38 @@ fn test_hash_consistency_timestamp_integer() {
 #[test]
 fn test_order_by_column_position() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'alice', 90)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'bob', 85)").unwrap();
-    db.execute("INSERT INTO t VALUES (3, 'charlie', 95)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 'charlie', 95)")
+        .unwrap();
 
     let r = rows(&db, "SELECT id, name, score FROM t ORDER BY 3");
     assert_eq!(r.len(), 3);
-    assert_eq!(r[0][2], Value::Integer(85), "First row should have lowest score");
-    assert_eq!(r[1][2], Value::Integer(90), "Second row should have middle score");
-    assert_eq!(r[2][2], Value::Integer(95), "Third row should have highest score");
+    assert_eq!(
+        r[0][2],
+        Value::Integer(85),
+        "First row should have lowest score"
+    );
+    assert_eq!(
+        r[1][2],
+        Value::Integer(90),
+        "Second row should have middle score"
+    );
+    assert_eq!(
+        r[2][2],
+        Value::Integer(95),
+        "Third row should have highest score"
+    );
 }
 
 // R7-2: ORDER BY column position descending
 #[test]
 fn test_order_by_column_position_desc() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 30)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 20)").unwrap();
@@ -850,15 +1020,23 @@ fn test_order_by_column_position_desc() {
 #[test]
 fn test_like_no_exponential_backtracking() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'aaaaaaaaaa')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'aaaaaaaaaa')")
+        .unwrap();
 
     // Pattern with many %a segments — should complete quickly, not hang
     let start = std::time::Instant::now();
-    let r = rows(&db, "SELECT * FROM t WHERE name LIKE '%a%a%a%a%a%a%a%a%a%a'");
+    let r = rows(
+        &db,
+        "SELECT * FROM t WHERE name LIKE '%a%a%a%a%a%a%a%a%a%a'",
+    );
     let elapsed = start.elapsed();
-    assert!(elapsed < std::time::Duration::from_secs(2),
-        "LIKE with many %a patterns took {:?}", elapsed);
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "LIKE with many %a patterns took {:?}",
+        elapsed
+    );
     assert_eq!(r.len(), 1, "Should match the string of a's");
 }
 
@@ -866,10 +1044,14 @@ fn test_like_no_exponential_backtracking() {
 #[test]
 fn test_like_complex_pattern() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'hello world')").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'hellX world')").unwrap();
-    db.execute("INSERT INTO t VALUES (3, 'helloworld')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello world')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'hellX world')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (3, 'helloworld')")
+        .unwrap();
 
     // Pattern: h%l_ world — h, then anything, then l + one char + " world"
     let r = rows(&db, "SELECT * FROM t WHERE name LIKE 'h%l_ world'");
@@ -880,9 +1062,11 @@ fn test_like_complex_pattern() {
 #[test]
 fn test_like_prefix_optimization() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'apple')").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'application')").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'application')")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (3, 'banana')").unwrap();
 
     let r = rows(&db, "SELECT * FROM t WHERE name LIKE 'app%'");
@@ -898,7 +1082,8 @@ fn test_ioctree_flush_reopen() {
     // Create and insert data, then flush
     {
         let db = Database::create(&db_path).unwrap();
-        db.execute("CREATE TABLE pts (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE pts (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO pts VALUES (1, 42)").unwrap();
         db.flush().unwrap();
     }
@@ -914,46 +1099,63 @@ fn test_ioctree_flush_reopen() {
 #[test]
 fn test_substr_valid_position() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'abcdef')").unwrap();
     let r = rows(&db, "SELECT SUBSTR(name, 2, 3) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::text("bcd".into()), "SUBSTR('abcdef', 2, 3) should be 'bcd'");
+    assert_eq!(
+        r[0][0],
+        Value::text("bcd".into()),
+        "SUBSTR('abcdef', 2, 3) should be 'bcd'"
+    );
 }
 
 // R7-8: Substr with start past end returns empty
 #[test]
 fn test_substr_start_past_end() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hi')").unwrap();
     let r = rows(&db, "SELECT SUBSTR(name, 10) FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::text(String::new()), "SUBSTR past end should be empty");
+    assert_eq!(
+        r[0][0],
+        Value::text(String::new()),
+        "SUBSTR past end should be empty"
+    );
 }
 
 // R7-9: Multiple updates don't lose data (version chain integrity)
 #[test]
 fn test_multiple_updates_version_chain() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     // Multiple sequential updates
     for i in 2..=5 {
-        db.execute(&format!("UPDATE t SET val = {} WHERE id = 1", i * 10)).unwrap();
+        db.execute(&format!("UPDATE t SET val = {} WHERE id = 1", i * 10))
+            .unwrap();
     }
 
     let r = rows(&db, "SELECT val FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Integer(50), "Should have latest value after 5 updates");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(50),
+        "Should have latest value after 5 updates"
+    );
 }
 
 // R7-10: ORDER BY with table-qualified column name
 #[test]
 fn test_order_by_qualified_column() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 30)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 20)").unwrap();
@@ -969,7 +1171,8 @@ fn test_order_by_qualified_column() {
 #[test]
 fn test_like_underscore_wildcard() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, code TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, code TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'abcd')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'ab')").unwrap();
@@ -983,7 +1186,8 @@ fn test_like_underscore_wildcard() {
 #[test]
 fn test_like_empty_pattern() {
     let (db, _dir) = create_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'hello')").unwrap();
 

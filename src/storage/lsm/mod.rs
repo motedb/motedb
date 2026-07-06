@@ -10,28 +10,28 @@
 //! - Read: < 1ms (P99)
 //! - Space: 2:1 compression ratio
 
-mod memtable;
-mod unified_memtable;  // 🆕 Unified MemTable (数据 + 向量)
-mod sstable;
-pub(crate) mod columnar;           // 🆕 Columnar SSTable (column-oriented storage)
+mod blobstore;
+mod bloom;
+pub(crate) mod columnar; // 🆕 Columnar SSTable (column-oriented storage)
 mod compaction;
 mod engine;
-mod bloom;
-mod blobstore;
-mod merging_iterator;  // 🚀 流式合并迭代器
+mod memtable;
+mod merging_iterator;
+mod sstable;
+mod unified_memtable; // 🆕 Unified MemTable (数据 + 向量) // 🚀 流式合并迭代器
 
-pub use memtable::MemTable;
-pub use unified_memtable::{UnifiedMemTable, UnifiedEntry, DataEntry};
-pub use sstable::{SSTable, SSTableBuilder, SSTableIterator, BlockIndex};
-pub use columnar::{ColumnarSSTable, ColumnarSSTableBuilder, RowMap};
-pub use compaction::{CompactionWorker, CompactionConfig, Level, SSTableMeta, CompactionStats};
-pub use engine::{LSMEngine, LSMBatchedIterator};  // 🚀 Export batched iterator
-pub use bloom::BloomFilter;
 pub use blobstore::BlobStore;
-pub use merging_iterator::MergingIterator;  // 🚀 Export merging iterator
+pub use bloom::BloomFilter;
+pub use columnar::{ColumnarSSTable, ColumnarSSTableBuilder, RowMap};
+pub use compaction::{CompactionConfig, CompactionStats, CompactionWorker, Level, SSTableMeta};
+pub use engine::{LSMBatchedIterator, LSMEngine}; // 🚀 Export batched iterator
+pub use memtable::MemTable;
+pub use merging_iterator::MergingIterator;
+pub use sstable::{BlockIndex, SSTable, SSTableBuilder, SSTableIterator};
+pub use unified_memtable::{DataEntry, UnifiedEntry, UnifiedMemTable}; // 🚀 Export merging iterator
 
 /// Key type (row_id as u64)
-/// 
+///
 /// 🔧 优化：从 Vec<u8> 改为 u64
 /// - 消除 24 bytes Vec 元数据开销 (↓ 75%)
 /// - 零拷贝，无堆分配
@@ -74,10 +74,10 @@ impl ValueData {
     pub fn len(&self) -> usize {
         match self {
             ValueData::Inline(data) => data.len(),
-            ValueData::Blob(_) => 16,  // BlobRef is 16 bytes (file_id + offset + size)
+            ValueData::Blob(_) => 16, // BlobRef is 16 bytes (file_id + offset + size)
         }
     }
-    
+
     pub fn is_empty(&self) -> bool {
         match self {
             ValueData::Inline(data) => data.is_empty(),
@@ -91,10 +91,10 @@ impl ValueData {
 pub struct Value {
     /// Data payload (inline or blob reference)
     pub data: ValueData,
-    
+
     /// MVCC timestamp (transaction ID)
     pub timestamp: u64,
-    
+
     /// Tombstone marker (for deletion)
     pub deleted: bool,
 }
@@ -117,7 +117,7 @@ impl Value {
             deleted: false,
         }
     }
-    
+
     pub fn new_blob(blob_ref: BlobRef, timestamp: u64) -> Self {
         Self {
             data: ValueData::Blob(blob_ref),
@@ -125,13 +125,15 @@ impl Value {
             deleted: false,
         }
     }
-    
+
     /// Shared empty Arc for tombstones — avoids per-tombstone allocation.
     /// Every tombstone has empty data, so they can all share the same Arc.
     fn empty_arc() -> std::sync::Arc<Vec<u8>> {
         // leak is fine: this is a global singleton, lives for the process lifetime
         static EMPTY: std::sync::OnceLock<std::sync::Arc<Vec<u8>>> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(|| std::sync::Arc::new(Vec::new())).clone()
+        EMPTY
+            .get_or_init(|| std::sync::Arc::new(Vec::new()))
+            .clone()
     }
 
     pub fn tombstone(timestamp: u64) -> Self {
@@ -149,7 +151,7 @@ impl Value {
             ValueData::Blob(_) => None,
         }
     }
-    
+
     /// Check if this is a blob reference
     pub fn is_blob(&self) -> bool {
         matches!(self.data, ValueData::Blob(_))
@@ -208,7 +210,6 @@ pub struct LSMConfig {
     pub sstable_cache_memory_limit_mb: Option<usize>,
 
     // --- Compaction throttling ---
-
     /// Max compaction write rate in bytes/sec (None = unlimited, default 4 MB/s)
     pub compaction_rate_limit: Option<u64>,
 
@@ -262,16 +263,27 @@ impl LSMConfig {
             memtable_size: db_config.memtable_size_limit,
             l0_compaction_trigger: db_config.level0_compaction_threshold,
             bloom_bits_per_key: db_config.bloom_bits_per_key,
-            sstable_cache_size: db_config.sstable_cache_size.unwrap_or(defaults.sstable_cache_size),
-            sstable_cache_memory_limit_mb: db_config.sstable_cache_memory_limit_mb.or(defaults.sstable_cache_memory_limit_mb),
+            sstable_cache_size: db_config
+                .sstable_cache_size
+                .unwrap_or(defaults.sstable_cache_size),
+            sstable_cache_memory_limit_mb: db_config
+                .sstable_cache_memory_limit_mb
+                .or(defaults.sstable_cache_memory_limit_mb),
             block_size: db_config.block_size.unwrap_or(defaults.block_size),
-            enable_compression: db_config.enable_compression.unwrap_or(defaults.enable_compression),
-            compression_algorithm: db_config.compression_algorithm.map(|a| match a {
-                crate::config::CompressionAlgorithm::Zstd => CompressionAlgorithm::Zstd,
-                crate::config::CompressionAlgorithm::Snappy => CompressionAlgorithm::Snappy,
-                crate::config::CompressionAlgorithm::None => CompressionAlgorithm::None,
-            }).unwrap_or(defaults.compression_algorithm),
-            tombstone_ttl_secs: db_config.tombstone_ttl_secs.unwrap_or(defaults.tombstone_ttl_secs),
+            enable_compression: db_config
+                .enable_compression
+                .unwrap_or(defaults.enable_compression),
+            compression_algorithm: db_config
+                .compression_algorithm
+                .map(|a| match a {
+                    crate::config::CompressionAlgorithm::Zstd => CompressionAlgorithm::Zstd,
+                    crate::config::CompressionAlgorithm::Snappy => CompressionAlgorithm::Snappy,
+                    crate::config::CompressionAlgorithm::None => CompressionAlgorithm::None,
+                })
+                .unwrap_or(defaults.compression_algorithm),
+            tombstone_ttl_secs: db_config
+                .tombstone_ttl_secs
+                .unwrap_or(defaults.tombstone_ttl_secs),
             ..defaults
         }
     }
@@ -293,7 +305,7 @@ impl LSMConfig {
             ..Self::default()
         }
     }
-    
+
     /// Optimized config for write-heavy workloads
     pub fn write_optimized() -> Self {
         Self {
@@ -311,11 +323,11 @@ impl LSMConfig {
             ..Self::default()
         }
     }
-    
+
     /// 🆕 Embedded Mode: 嵌入式设备优化配置
-    /// 
+    ///
     /// **目标**: 减少 50% 内存占用，适用于嵌入式数据库
-    /// 
+    ///
     /// **优化策略**:
     /// 1. ✅ 更小的 MemTable（2MB vs 4MB）→ 峰值内存 -50%
     /// 2. ✅ 更小的 Block（32KB vs 64KB）→ SSTable -50%
@@ -325,12 +337,12 @@ impl LSMConfig {
     /// 6. ✅ 更小的 Blob 阈值（16KB vs 32KB）→ 更多数据进入 Blob
     /// 7. ✅ 更小的缓存（4个 vs 8个）→ 缓存内存 -50%
     /// 8. ✅ 6 层 LSM（vs 7 层）→ 减少空间放大
-    /// 
+    ///
     /// **适用场景**:
     /// - 嵌入式数据库（Electron, Mobile, IoT）
     /// - 内存受限环境（< 512MB RAM）
     /// - 单机应用（无需高并发）
-    /// 
+    ///
     /// **性能权衡**:
     /// - 写入吞吐：-20%（更小的 buffer）
     /// - 读取延迟：+10%（更小的 cache）
@@ -351,16 +363,16 @@ impl LSMConfig {
             ..Self::default()
         }
     }
-    
+
     /// 🆕 Tiny Mode: 微型设备优化配置（IoT / 移动端）
-    /// 
+    ///
     /// **目标**: 减少 70% 内存占用，总内存 < 20MB
-    /// 
+    ///
     /// **适用场景**:
     /// - IoT 设备（< 128MB RAM）
     /// - 移动应用（省电模式）
     /// - 边缘计算设备
-    /// 
+    ///
     /// **性能权衡**:
     /// - 写入吞吐：-40%
     /// - 读取延迟：+20%
@@ -381,16 +393,16 @@ impl LSMConfig {
             ..Self::default()
         }
     }
-    
+
     /// 🆕 P1 Memory Optimized Config (Low Memory Footprint)
-    /// 
+    ///
     /// **Target**: 减少30-50%内存占用
-    /// 
+    ///
     /// **适用场景**:
     /// - 内存受限环境（< 512MB）
     /// - 大数据量场景（> 100万条记录）
     /// - 磁盘空间充足但内存紧张
-    /// 
+    ///
     /// **性能权衡**:
     /// - 写入延迟: +10-20%（更频繁的flush）
     /// - 查询延迟: +5-10%（更多SSTable文件）
@@ -412,7 +424,7 @@ impl LSMConfig {
             ..Self::default()
         }
     }
-    
+
     /// Balanced config (current default)
     pub fn balanced() -> Self {
         Self::default()

@@ -1,14 +1,17 @@
 //! LSM-Tree Engine (main interface)
 
-use super::{UnifiedMemTable, SSTable, SSTableBuilder, Key, Value, ValueData, LSMConfig, CompactionWorker, BlobStore, BloomFilter};
+use super::{
+    BlobStore, BloomFilter, CompactionWorker, Key, LSMConfig, SSTable, SSTableBuilder,
+    UnifiedMemTable, Value, ValueData,
+};
 use crate::{Result, StorageError};
-use std::sync::{Arc, Mutex, Condvar};
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use std::collections::VecDeque;
 
 // Type aliases for complex types
 type FlushCallback = Arc<dyn Fn(&UnifiedMemTable) -> Result<()> + Send + Sync>;
@@ -36,7 +39,7 @@ impl SSTableCache {
         use std::num::NonZeroUsize;
         Self {
             cache: RwLock::new(lru::LruCache::new(
-                NonZeroUsize::new(max_size.max(1)).unwrap()
+                NonZeroUsize::new(max_size.max(1)).unwrap(),
             )),
             max_entries: max_size,
         }
@@ -78,10 +81,13 @@ impl SSTableCache {
             cache.pop_lru();
         }
 
-        cache.put(path.clone(), CachedSSTable {
-            bloom,
-            handle: sstable_arc,
-        });
+        cache.put(
+            path.clone(),
+            CachedSSTable {
+                bloom,
+                handle: sstable_arc,
+            },
+        );
 
         Ok(cached)
     }
@@ -102,28 +108,28 @@ impl SSTableCache {
 }
 
 /// LSM-Tree storage engine with multi-slot immutable queue
-/// 
+///
 /// ## Architecture (🔥 NEW: Multi-slot Immutables)
 /// - **Active MemTable**: Accepts writes (never blocks)
 /// - **Immutable Queue**: 2 slots for flushing (buffered async)
 /// - **Flush Thread**: Background thread that continuously flushes queue
-/// 
+///
 /// ## Memory Control (🔥 Backpressure-enabled)
 /// - Max memory: (1 + max_immutable_slots) × memtable_size = 5 × 4MB = 20MB
 /// - When active is full: push to immutable queue, create new active
 /// - Backpressure: If queue is full (2 slots occupied), wait for flush
 /// - Benefit: Write throughput remains high even when disk is slow
-/// 
+///
 /// ## Performance
 /// - Fast path: No backpressure, ~1μs per write
 /// - Slow disk: Up to 4 × memtable_size buffered (16MB), prevents OOM
 /// - Flush rate: Limited by disk fsync speed (~100 ops/sec on macOS)
-/// 
+///
 /// ## Thread Management (🔧 Optimized for graceful shutdown)
 /// - Background threads hold `Weak` references (not `Arc`)
 /// - Drop() signals shutdown and waits for threads to exit
 /// - No Arc cycle, memory released immediately on drop
-/// 
+///
 /// ## 🆕 Phase 1 Part 2: Unified MemTable Integration
 /// - 支持数据 + 向量的统一存储
 /// - `UnifiedMemTable` 集成 `FreshVamanaGraph`
@@ -132,41 +138,41 @@ pub struct LSMEngine {
     /// Active MemTable (accepting writes)
     /// 🆕 现在使用 UnifiedMemTable（支持数据+向量）
     memtable: Arc<RwLock<UnifiedMemTable>>,
-    
+
     /// Immutable MemTable queue (FIFO, up to 2 slots)
     /// 🔥 NEW: Changed from Option to VecDeque for multi-slot buffering
     immutable: Arc<RwLock<VecDeque<UnifiedMemTable>>>,
-    
+
     /// Maximum immutable slots (default: 4)
     max_immutable_slots: usize,
-    
+
     /// Flush lock (prevents concurrent flush operations)
     flush_lock: Arc<Mutex<()>>,
-    
+
     /// Flush in progress flag (atomic, lock-free check)
     flush_in_progress: Arc<AtomicBool>,
-    
+
     /// Shutdown signal for background threads
     shutdown: Arc<AtomicBool>,
-    
+
     /// SSTable cache (减少文件打开开销)
     sstable_cache: Arc<SSTableCache>,
-    
+
     /// Storage directory
     storage_dir: PathBuf,
-    
+
     /// Configuration
     config: LSMConfig,
-    
+
     /// Next SSTable ID (atomic increment, no lock contention)
     next_sst_id: Arc<std::sync::atomic::AtomicU64>,
-    
+
     /// Compaction worker
     compaction_worker: Arc<CompactionWorker>,
-    
+
     /// Blob store for large values
     blob_store: Arc<BlobStore>,
-    
+
     /// 🔧 Background thread handles (for graceful shutdown)
     compaction_thread: Option<JoinHandle<()>>,
     flush_thread: Option<JoinHandle<()>>,
@@ -210,14 +216,14 @@ impl LSMEngine {
     pub fn new(storage_dir: PathBuf, config: LSMConfig) -> Result<Self> {
         Self::new_internal(storage_dir, config, None)
     }
-    
+
     /// 🆕 Create a new LSM engine with vector support
-    /// 
+    ///
     /// ## Parameters
     /// - `storage_dir`: 存储目录
     /// - `config`: LSM 配置
     /// - `vector_dimension`: 向量维度（例如 128, 384, 768）
-    /// 
+    ///
     /// ## Example
     /// ```ignore
     /// let engine = LSMEngine::new_with_vector_support(
@@ -226,12 +232,20 @@ impl LSMEngine {
     ///     768  // 向量维度
     /// )?;
     /// ```ignore
-    pub fn new_with_vector_support(storage_dir: PathBuf, config: LSMConfig, vector_dimension: usize) -> Result<Self> {
+    pub fn new_with_vector_support(
+        storage_dir: PathBuf,
+        config: LSMConfig,
+        vector_dimension: usize,
+    ) -> Result<Self> {
         Self::new_internal(storage_dir, config, Some(vector_dimension))
     }
-    
+
     /// Internal constructor (统一初始化逻辑)
-    fn new_internal(storage_dir: PathBuf, config: LSMConfig, vector_dimension: Option<usize>) -> Result<Self> {
+    fn new_internal(
+        storage_dir: PathBuf,
+        config: LSMConfig,
+        vector_dimension: Option<usize>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&storage_dir)?;
 
         // Clean up leftover .sst.tmp files from interrupted flushes
@@ -287,7 +301,7 @@ impl LSMEngine {
         // Initialize blob store
         let blob_dir = storage_dir.join("blobs");
         let blob_store = Arc::new(BlobStore::new(blob_dir, config.blob_file_size)?);
-        
+
         // 🆕 Create UnifiedMemTable (with or without vector support)
         let memtable = if let Some(dim) = vector_dimension {
             UnifiedMemTable::new_with_vector_support(&config, dim)
@@ -301,7 +315,8 @@ impl LSMEngine {
         let max_existing_id = compaction_worker
             .get_all_sstables()
             .map(|metas| {
-                metas.iter()
+                metas
+                    .iter()
                     .filter_map(|m| {
                         let stem = m.path.file_stem()?.to_str()?;
                         // Strip any "lN_" prefix (l0_, l1_, l2_, etc.)
@@ -315,8 +330,8 @@ impl LSMEngine {
 
         let mut engine = Self {
             memtable: Arc::new(RwLock::new(memtable)),
-            immutable: Arc::new(RwLock::new(VecDeque::new())),  // 🔥 Empty queue
-            max_immutable_slots: 2,  // 2 slots = 8MB peak buffer (embedded-friendly)
+            immutable: Arc::new(RwLock::new(VecDeque::new())), // 🔥 Empty queue
+            max_immutable_slots: 2, // 2 slots = 8MB peak buffer (embedded-friendly)
             flush_lock: Arc::new(Mutex::new(())),
             flush_in_progress: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -340,9 +355,11 @@ impl LSMEngine {
         // Wire post-compaction callback to evict only removed SSTables from cache
         {
             let cache = engine.sstable_cache.clone();
-            engine.compaction_worker.set_post_compaction_cb(Box::new(move |removed_paths: &[PathBuf]| {
-                cache.evict(removed_paths);
-            }));
+            engine.compaction_worker.set_post_compaction_cb(Box::new(
+                move |removed_paths: &[PathBuf]| {
+                    cache.evict(removed_paths);
+                },
+            ));
         }
 
         // 🔥 Start background compaction thread with Weak references
@@ -385,12 +402,17 @@ impl LSMEngine {
                                     break;
                                 }
                                 rounds += 1;
-                                if rounds > 10 { break; }
+                                if rounds > 10 {
+                                    break;
+                                }
                             }
                             true // had work
                         }
                         Ok(false) => false, // no work
-                        Err(e) => { debug_log!("Compaction check error: {:?}", e); false }
+                        Err(e) => {
+                            debug_log!("Compaction check error: {:?}", e);
+                            false
+                        }
                     }
                 }));
 
@@ -404,7 +426,7 @@ impl LSMEngine {
                 }
             }
         });
-        
+
         // 🔥 Start background flush thread with Weak references
         let immutable_weak = Arc::downgrade(&engine.immutable);
         let flush_in_progress_weak = Arc::downgrade(&engine.flush_in_progress);
@@ -653,26 +675,26 @@ impl LSMEngine {
                 }
             }
         }).map_err(|e| StorageError::Io(std::io::Error::other(format!("Failed to spawn flush thread: {}", e))))?;
-        
+
         engine.compaction_thread = Some(compaction_thread);
         engine.flush_thread = Some(flush_thread);
-        
+
         Ok(engine)
     }
-    
+
     /// Put a key-value pair (WITH BACKPRESSURE to prevent OOM)
-    /// 
+    ///
     /// ## Multi-slot Immutable Queue Architecture
     /// 1. Insert into active MemTable
     /// 2. If active is full: push to immutable queue, create new active
     /// 3. Background thread flushes queue continuously (FIFO)
-    /// 
+    ///
     /// ## Memory Control (🔥 NEW: Queue-based Backpressure)
     /// - Max memory: (1 + max_slots) × memtable_size = 5 × 4MB = 20MB
     /// - If queue has space (< 2 slots): No blocking, instant rotation
     /// - If queue is full (= 2 slots): **Block write until a slot frees**
     /// - Benefit: Smooth writes even when disk fsync is slow
-    /// 
+    ///
     /// ## Performance
     /// - Fast path: ~1μs per write (no backpressure)
     /// - Slow disk: Up to 16MB buffered, ~10ms wait max
@@ -720,11 +742,18 @@ impl LSMEngine {
             // Queue is full, apply backpressure
             backpressure_count += 1;
             if backpressure_count == 1 {
-                debug_log!("[LSM] ⚠️  Backpressure: Queue full ({}/{}), waiting for flush...",
-                    queue_len, self.max_immutable_slots);
+                debug_log!(
+                    "[LSM] ⚠️  Backpressure: Queue full ({}/{}), waiting for flush...",
+                    queue_len,
+                    self.max_immutable_slots
+                );
             } else if backpressure_count % 100 == 0 {
-                debug_log!("[LSM] ⏳ Still waiting: {}ms (queue: {}/{})",
-                    backpressure_count * 10, queue_len, self.max_immutable_slots);
+                debug_log!(
+                    "[LSM] ⏳ Still waiting: {}ms (queue: {}/{})",
+                    backpressure_count * 10,
+                    queue_len,
+                    self.max_immutable_slots
+                );
             }
 
             thread::sleep(Duration::from_millis(10));
@@ -732,12 +761,12 @@ impl LSMEngine {
             // Safety: prevent infinite loop (100 seconds timeout)
             if backpressure_count > 10000 {
                 return Err(StorageError::Transaction(
-                    "LSM backpressure timeout: flush thread may be deadlocked".into()
+                    "LSM backpressure timeout: flush thread may be deadlocked".into(),
                 ));
             }
         }
     }
-    
+
     /// Get a value by key (LSM查询: MemTable -> Immutable -> SSTables -> Blob)
     pub fn get(&self, key: Key) -> Result<Option<Value>> {
         // 1. Check active memtable (newest data)
@@ -804,12 +833,12 @@ impl LSMEngine {
                 timestamp: entry.timestamp,
                 deleted: entry.deleted,
             };
-            
+
             // Check tombstone (DELETE 操作)
             if value.deleted {
                 return Ok(None);
             }
-            
+
             // Resolve blob reference
             if let ValueData::Blob(ref blob_ref) = value.data {
                 let blob_data = self.blob_store.get(blob_ref)?;
@@ -817,7 +846,7 @@ impl LSMEngine {
             }
             return Ok(Some(value));
         }
-        
+
         // 3. Check SSTables (Level 0 -> Level 1 -> ... -> Level N)
         //    When the same key exists in multiple SSTables (e.g. after compaction
         //    where old L0 files haven't been deleted yet), return the version with
@@ -826,7 +855,8 @@ impl LSMEngine {
         let mut best: Option<Value> = None;
 
         for level in 0..self.config.num_levels {
-            for meta in sstable_metas.iter()
+            for meta in sstable_metas
+                .iter()
                 .filter(|meta| self.get_level_from_path(&meta.path) == level)
                 .rev()
             {
@@ -884,12 +914,12 @@ impl LSMEngine {
             }
             return Ok(Some(value));
         }
-        
+
         Ok(None)
     }
-    
+
     /// 🚀 Batch get (避免在循环中反复获取锁)
-    /// 
+    ///
     /// **关键优化**：
     /// - 一次性获取immutable.read()锁，查询所有keys
     /// - 减少锁竞争：N次get() → 1次batch_get()
@@ -897,7 +927,8 @@ impl LSMEngine {
     pub fn batch_get(&self, keys: &[Key]) -> Result<Vec<Option<Value>>> {
         debug_log!("[batch_get] batch query {} keys", keys.len());
         let mut results = vec![None; keys.len()];
-        let mut remaining_keys: Vec<(usize, Key)> = keys.iter().enumerate().map(|(i, &k)| (i, k)).collect();
+        let mut remaining_keys: Vec<(usize, Key)> =
+            keys.iter().enumerate().map(|(i, &k)| (i, k)).collect();
 
         // Capture epoch for re-check after immutable scan
         let epoch_before = self.rotation_epoch.load(Ordering::Acquire);
@@ -915,13 +946,13 @@ impl LSMEngine {
                         timestamp: entry.timestamp,
                         deleted: entry.deleted,
                     };
-                    
+
                     // Resolve blob reference if needed
                     if let ValueData::Blob(ref blob_ref) = value.data {
                         let blob_data = self.blob_store.get(blob_ref)?;
                         value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                     }
-                    
+
                     // Don't return tombstones (keep as None for deleted entries)
                     if !value.deleted {
                         results[idx] = Some(value);
@@ -933,18 +964,22 @@ impl LSMEngine {
             }
             // memtable lock released here
         }
-        
+
         if remaining_keys.is_empty() {
             debug_log!("✅ [batch_get] 所有keys在active memtable中找到，直接返回");
             return Ok(results);
         }
-        
+
         // 2. Check immutable queue (批量查询，只获取一次锁)
         {
             let immutable = self.immutable.read();
 
             for (mt_idx, memtable) in immutable.iter().rev().enumerate() {
-                debug_log!("  🔍 [batch_get] 查询第 {} 个immutable memtable，剩余 {} 个keys", mt_idx + 1, remaining_keys.len());
+                debug_log!(
+                    "  🔍 [batch_get] 查询第 {} 个immutable memtable，剩余 {} 个keys",
+                    mt_idx + 1,
+                    remaining_keys.len()
+                );
                 let mut i = 0;
                 while i < remaining_keys.len() {
                     let (idx, key) = remaining_keys[i];
@@ -954,13 +989,13 @@ impl LSMEngine {
                             timestamp: entry.timestamp,
                             deleted: entry.deleted,
                         };
-                        
+
                         // Resolve blob reference
                         if let ValueData::Blob(ref blob_ref) = value.data {
                             let blob_data = self.blob_store.get(blob_ref)?;
                             value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                         }
-                        
+
                         // Don't return tombstones (keep as None for deleted entries)
                         if !value.deleted {
                             results[idx] = Some(value);
@@ -970,7 +1005,7 @@ impl LSMEngine {
                         i += 1;
                     }
                 }
-                
+
                 if remaining_keys.is_empty() {
                     debug_log!("  ✅ [batch_get] 所有keys已找到，提前退出immutable查询");
                     break;
@@ -1007,7 +1042,9 @@ impl LSMEngine {
                         i += 1;
                     }
                 }
-                if remaining_keys.is_empty() { break; }
+                if remaining_keys.is_empty() {
+                    break;
+                }
             }
         }
 
@@ -1015,35 +1052,44 @@ impl LSMEngine {
             debug_log!("[batch_get] all keys found in memory, skip SSTable");
             return Ok(results);
         }
-        
+
         // 3. Check SSTables (对剩余的keys进行查询)
-        debug_log!("🔍 [batch_get] 开始查询SSTables，剩余 {} 个keys", remaining_keys.len());
+        debug_log!(
+            "🔍 [batch_get] 开始查询SSTables，剩余 {} 个keys",
+            remaining_keys.len()
+        );
         let sstable_metas = self.compaction_worker.get_all_sstables()?;
         debug_log!("  📂 [batch_get] 共有 {} 个SSTables", sstable_metas.len());
-        
+
         for level in 0..self.config.num_levels {
-            let level_sstables: Vec<_> = sstable_metas.iter()
+            let level_sstables: Vec<_> = sstable_metas
+                .iter()
                 .filter(|meta| self.get_level_from_path(&meta.path) == level)
                 .collect();
-            
+
             if level_sstables.is_empty() {
                 continue;
             }
-            
-            debug_log!("  🔍 [batch_get] 查询Level {} ({} 个SSTables)", level, level_sstables.len());
-            
+
+            debug_log!(
+                "  🔍 [batch_get] 查询Level {} ({} 个SSTables)",
+                level,
+                level_sstables.len()
+            );
+
             // 🚀 P3+: 批量查询每个SSTable（使用 batch_get）
             for meta in level_sstables.iter().rev() {
                 // 预过滤：只查询在key range内的keys
-                let keys_in_range: Vec<(usize, Key)> = remaining_keys.iter()
+                let keys_in_range: Vec<(usize, Key)> = remaining_keys
+                    .iter()
                     .filter(|(_, key)| *key >= meta.min_key && *key <= meta.max_key)
                     .copied()
                     .collect();
-                
+
                 if keys_in_range.is_empty() {
                     continue; // 没有key在这个SSTable的范围内
                 }
-                
+
                 // Use cached SSTable handle
                 let cached = match self.sstable_cache.get_or_open(&meta.path) {
                     Ok(cached) => cached,
@@ -1055,13 +1101,13 @@ impl LSMEngine {
 
                 // 🔥 P3+: 批量查询（使用 SSTable::batch_get）
                 let sstable = cached.handle.read();
-                
+
                 // 提取 keys（只保留 key，不包含 idx）
                 let query_keys: Vec<Key> = keys_in_range.iter().map(|(_, key)| *key).collect();
-                
+
                 // 🚀 批量查询（利用批量 Bloom Filter 检查）
                 let batch_results = sstable.batch_get(&query_keys)?;
-                
+
                 // 处理批量查询结果
                 for (i, (idx, _key)) in keys_in_range.iter().enumerate() {
                     if let Some(mut value) = batch_results[i].clone() {
@@ -1070,12 +1116,12 @@ impl LSMEngine {
                             let blob_data = self.blob_store.get(blob_ref)?;
                             value.data = ValueData::Inline(std::sync::Arc::new(blob_data));
                         }
-                        
+
                         // Don't add tombstones to results (keep as None)
                         if !value.deleted {
                             results[*idx] = Some(value);
                         }
-                        
+
                         // 从 remaining_keys 中移除
                         if let Some(pos) = remaining_keys.iter().position(|(i, _)| *i == *idx) {
                             remaining_keys.swap_remove(pos);
@@ -1083,31 +1129,33 @@ impl LSMEngine {
                     }
                 }
                 // 🔓 SSTable锁在这里释放（批量处理完成）
-                
+
                 if remaining_keys.is_empty() {
                     debug_log!("  ✅ [batch_get] 所有keys已找到，提前退出Level {}", level);
                     break;
                 }
             }
-            
+
             if remaining_keys.is_empty() {
                 break;
             }
         }
-        
-        debug_log!("✅ [batch_get] 批量查询完成，返回 {} 个结果，{} 个未找到", 
-                 results.iter().filter(|r| r.is_some()).count(), 
-                 remaining_keys.len());
+
+        debug_log!(
+            "✅ [batch_get] 批量查询完成，返回 {} 个结果，{} 个未找到",
+            results.iter().filter(|r| r.is_some()).count(),
+            remaining_keys.len()
+        );
         Ok(results)
     }
-    
+
     /// 🚀 P2 优化：真正的批量插入
-    /// 
+    ///
     /// ## 优化要点
     /// - 直接调用 MemTable::batch_put()（单次加锁）
     /// - 批量检查是否需要 rotate
     /// - 减少锁竞争，提升 3-5 倍性能
-    /// 
+    ///
     /// ## 性能对比
     /// - 旧版本：1000 条 = 1000 次 put() = 1000 次加锁
     /// - 新版本：1000 条 = 1 次 batch_put() = 1 次加锁
@@ -1117,17 +1165,20 @@ impl LSMEngine {
         }
 
         // Offload large values to blob storage before inserting into memtable
-        let processed: Vec<(Key, Value)> = kvs.iter().map(|(k, v)| {
-            let mut v = v.clone();
-            if let ValueData::Inline(ref data) = v.data {
-                if data.len() >= self.config.blob_threshold {
-                    if let Ok(blob_ref) = self.blob_store.put(data) {
-                        v.data = ValueData::Blob(blob_ref);
+        let processed: Vec<(Key, Value)> = kvs
+            .iter()
+            .map(|(k, v)| {
+                let mut v = v.clone();
+                if let ValueData::Inline(ref data) = v.data {
+                    if data.len() >= self.config.blob_threshold {
+                        if let Ok(blob_ref) = self.blob_store.put(data) {
+                            v.data = ValueData::Blob(blob_ref);
+                        }
                     }
                 }
-            }
-            (k.clone(), v)
-        }).collect();
+                (*k, v)
+            })
+            .collect();
 
         // Process in chunks to apply backpressure when memtable fills up.
         // Without this, a batch of 1M rows would grow the memtable unboundedly.
@@ -1151,15 +1202,14 @@ impl LSMEngine {
                     immutable.len()
                 };
 
-                if queue_len < self.max_immutable_slots
-                    && self.try_rotate_memtable().is_ok() {
-                        break;
-                    }
+                if queue_len < self.max_immutable_slots && self.try_rotate_memtable().is_ok() {
+                    break;
+                }
 
                 backpressure_count += 1;
                 if backpressure_count > 10000 {
                     return Err(StorageError::Transaction(
-                        "LSM backpressure timeout during batch_put".into()
+                        "LSM backpressure timeout during batch_put".into(),
                     ));
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -1175,13 +1225,17 @@ impl LSMEngine {
     /// 🚀 Bulk load: sort → SSTable directly. Skips memtable + WAL entirely.
     /// For batch INSERTs, this is the fastest path — O(N log N) sort + sequential write.
     pub fn bulk_load(&self, mut kvs: Vec<(Key, Value)>) -> Result<()> {
-        if kvs.is_empty() { return Ok(()); }
+        if kvs.is_empty() {
+            return Ok(());
+        }
 
         // Sort by key for SSTable (must be in ascending order)
         kvs.sort_by_key(|(k, _)| *k);
 
         // Generate SSTable ID and path
-        let sst_id = self.next_sst_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sst_id = self
+            .next_sst_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sst_path = self.storage_dir.join(format!("l0_{:06}.sst", sst_id));
 
         let estimated = kvs.len();
@@ -1195,7 +1249,9 @@ impl LSMEngine {
         self.compaction_worker.register_sstable(meta)?;
 
         // Wake compaction thread (new SSTable at L0)
-        if let Ok(mut guard) = self.compaction_wakeup.0.lock() { *guard = true; }
+        if let Ok(mut guard) = self.compaction_wakeup.0.lock() {
+            *guard = true;
+        }
         self.compaction_wakeup.1.notify_all();
 
         Ok(())
@@ -1204,18 +1260,23 @@ impl LSMEngine {
     /// 🚀 Fast batch insert: uses Vec-based memtable append (O(1) per entry)
     /// instead of BTreeMap insert (O(log N)). Ideal for bulk data loading.
     pub fn batch_put_fast(&self, kvs: &[(Key, Value)]) -> Result<()> {
-        if kvs.is_empty() { return Ok(()); }
-        let processed: Vec<(Key, Value)> = kvs.iter().map(|(k, v)| {
-            let mut v = v.clone();
-            if let ValueData::Inline(ref data) = v.data {
-                if data.len() >= self.config.blob_threshold {
-                    if let Ok(blob_ref) = self.blob_store.put(data) {
-                        v.data = ValueData::Blob(blob_ref);
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        let processed: Vec<(Key, Value)> = kvs
+            .iter()
+            .map(|(k, v)| {
+                let mut v = v.clone();
+                if let ValueData::Inline(ref data) = v.data {
+                    if data.len() >= self.config.blob_threshold {
+                        if let Ok(blob_ref) = self.blob_store.put(data) {
+                            v.data = ValueData::Blob(blob_ref);
+                        }
                     }
                 }
-            }
-            (*k, v)
-        }).collect();
+                (*k, v)
+            })
+            .collect();
 
         let memtable = self.memtable.read();
         memtable.batch_put_fast(&processed)?;
@@ -1271,17 +1332,23 @@ impl LSMEngine {
     }
 
     /// 🆕 Insert data with vector (for vector-enabled MemTable)
-    /// 
+    ///
     /// ## Parameters
     /// - `key`: row_id
     /// - `data`: row data (protobuf bytes)
     /// - `vector`: embedding vector
     /// - `timestamp`: MVCC timestamp
-    /// 
+    ///
     /// ## Performance
     /// - 插入延迟: ~2μs (内存写 + 图索引)
     /// - 图索引: O(log n) 平均，O(R log n) 最坏
-    pub fn put_with_vector(&self, key: Key, mut data: ValueData, vector: Vec<f32>, timestamp: u64) -> Result<()> {
+    pub fn put_with_vector(
+        &self,
+        key: Key,
+        mut data: ValueData,
+        vector: Vec<f32>,
+        timestamp: u64,
+    ) -> Result<()> {
         // Check if value should go to blob storage
         if let ValueData::Inline(ref inline_data) = data {
             if inline_data.len() >= self.config.blob_threshold {
@@ -1308,15 +1375,14 @@ impl LSMEngine {
                 immutable.len()
             };
 
-            if queue_len < self.max_immutable_slots
-                && self.try_rotate_memtable().is_ok() {
-                    continue;
-                }
+            if queue_len < self.max_immutable_slots && self.try_rotate_memtable().is_ok() {
+                continue;
+            }
 
             backpressure_count += 1;
             if backpressure_count > 10000 {
                 return Err(StorageError::Transaction(
-                    "LSM backpressure timeout in put_with_vector".into()
+                    "LSM backpressure timeout in put_with_vector".into(),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
@@ -1324,20 +1390,23 @@ impl LSMEngine {
     }
 
     /// Flush all memtables to disk (THREAD-SAFE: 使用互斥锁防止并发 flush)
-    /// 
+    ///
     /// 🔥 NEW: Flushes entire immutable queue + active memtable
     pub fn flush(&self) -> Result<()> {
         self.flush_with_paths().map(|_| ())
     }
-    
+
     /// 🆕 Flush and return paths of newly created SSTables
-    /// 
+    ///
     /// This allows Database layer to backfill indexes from flushed data.
     pub fn flush_with_paths(&self) -> Result<Vec<PathBuf>> {
         debug_log!("💾 [flush] 开始flush操作...");
         // 🔧 检查存储目录是否存在（防止在数据库关闭后flush）
         if !self.storage_dir.exists() {
-            debug_log!("⚠️  [flush] 存储目录不存在，跳过flush: {:?}", self.storage_dir);
+            debug_log!(
+                "⚠️  [flush] 存储目录不存在，跳过flush: {:?}",
+                self.storage_dir
+            );
             return Ok(Vec::new());
         }
 
@@ -1351,7 +1420,9 @@ impl LSMEngine {
         // 1. Force rotate active MemTable (even if not full)
         // 🔥 CRITICAL: Use a scope to release flush_lock immediately after rotate
         {
-            let _flush_guard = self.flush_lock.lock()
+            let _flush_guard = self
+                .flush_lock
+                .lock()
                 .map_err(|_| StorageError::Lock("Flush lock poisoned".into()))?;
 
             let has_data = {
@@ -1368,7 +1439,8 @@ impl LSMEngine {
         let start_wait = std::time::Instant::now();
         {
             let (lock, cvar) = &*self.flush_wakeup;
-            let mut guard = lock.lock()
+            let mut guard = lock
+                .lock()
                 .map_err(|_| StorageError::Lock("flush_wakeup lock poisoned".into()))?;
 
             loop {
@@ -1396,18 +1468,18 @@ impl LSMEngine {
                 }
             }
         }
-        
+
         debug_log!("✅ [flush] 整个flush操作完成");
-        Ok(Vec::new())  // 不再返回 sstable_paths，因为是后台线程写入的
+        Ok(Vec::new()) // 不再返回 sstable_paths，因为是后台线程写入的
     }
-    
+
     /// 🚀 Unified Flush Callback
-    /// 
+    ///
     /// Registers a callback that will be called during flush:
     /// - Input: &UnifiedMemTable (reference to the flushing MemTable)
     /// - Called **before** SSTable is written to disk
     /// - Allows Database layer to batch build all indexes
-    /// 
+    ///
     /// ✅ 统一入口：手动Flush和后台Flush都会触发此回调
     /// ✅ 高效：传入MemTable引用，避免数据拷贝
     /// Pause the background compaction thread.
@@ -1422,7 +1494,9 @@ impl LSMEngine {
     pub fn resume_background_compaction(&self) {
         self.compaction_paused.store(false, Ordering::SeqCst);
         let (lock, cvar) = &*self.compaction_wakeup;
-        if let Ok(mut guard) = lock.lock() { *guard = true; }
+        if let Ok(mut guard) = lock.lock() {
+            *guard = true;
+        }
         cvar.notify_all();
     }
 
@@ -1436,7 +1510,9 @@ impl LSMEngine {
     pub fn resume_background_flush(&self) {
         self.flush_paused.store(false, Ordering::SeqCst);
         let (lock, cvar) = &*self.flush_wakeup;
-        if let Ok(mut guard) = lock.lock() { *guard = true; }
+        if let Ok(mut guard) = lock.lock() {
+            *guard = true;
+        }
         cvar.notify_all();
     }
 
@@ -1461,7 +1537,10 @@ impl LSMEngine {
     pub fn compact_to_columnar(
         &self,
         col_types: &[crate::types::ColumnType],
-    ) -> Result<(crate::storage::lsm::columnar::ColumnarSSTable, Vec<std::path::PathBuf>)> {
+    ) -> Result<(
+        crate::storage::lsm::columnar::ColumnarSSTable,
+        Vec<std::path::PathBuf>,
+    )> {
         self.compaction_worker.compact_to_columnar(col_types)
     }
 
@@ -1480,7 +1559,7 @@ impl LSMEngine {
     }
 
     // Internal helpers
-    
+
     fn get_level_from_path(&self, path: &std::path::Path) -> usize {
         // Parse level from filename: "l0_000001.sst" -> 0
         path.file_name()
@@ -1490,9 +1569,9 @@ impl LSMEngine {
             .and_then(|level_str| level_str.parse::<usize>().ok())
             .unwrap_or(0)
     }
-    
+
     /// Try to rotate MemTable (non-blocking if queue is full)
-    /// 
+    ///
     /// ## Multi-slot Queue Logic
     /// - Check if immutable queue has space (< max_slots)
     /// - If has space: push active → queue, create new active
@@ -1540,19 +1619,25 @@ impl LSMEngine {
                     break;
                 }
                 if wait_count % 1000 == 0 && wait_count > 0 {
-                    debug_log!("[rotate_memtable] ⏳ Waiting {}ms (queue: {}/{})",
-                        wait_count, immutable.len(), self.max_immutable_slots);
+                    debug_log!(
+                        "[rotate_memtable] ⏳ Waiting {}ms (queue: {}/{})",
+                        wait_count,
+                        immutable.len(),
+                        self.max_immutable_slots
+                    );
                 }
             }
             // Sleep briefly to avoid busy loop
             thread::sleep(Duration::from_millis(1));
             wait_count += 1;
-            
+
             if wait_count > 120000 {
-                return Err(StorageError::Transaction("rotate_memtable timeout: deadlock?".into()));
+                return Err(StorageError::Transaction(
+                    "rotate_memtable timeout: deadlock?".into(),
+                ));
             }
         }
-        
+
         // Now rotate (lock order: memtable → immutable, consistent with get/scan)
         let mut memtable_lock = self.memtable.write();
         let mut immutable_lock = self.immutable.write();
@@ -1579,7 +1664,7 @@ impl LSMEngine {
 
         Ok(())
     }
-    
+
     /// 🆕 Helper: Create a new UnifiedMemTable matching the existing one's configuration
     fn create_memtable(config: &LSMConfig, existing: &UnifiedMemTable) -> UnifiedMemTable {
         // Check if existing memtable has vector support
@@ -1589,11 +1674,9 @@ impl LSMEngine {
             UnifiedMemTable::new(config)
         }
     }
-    
-
 
     /// Scan MemTable (including immutable) with zero-copy callback
-    /// 
+    ///
     /// ✅ Zero-copy optimization: No Vec allocation, processes items in-place
     pub fn scan_memtable_with<F>(&self, start: Key, end: Key, mut f: F) -> Result<()>
     where
@@ -1611,9 +1694,13 @@ impl LSMEngine {
             for mem in immutable.iter() {
                 let entries = mem.scan(start, end)?;
                 for (k, entry) in entries {
-                    if entry.deleted { continue; }
+                    if entry.deleted {
+                        continue;
+                    }
                     match &entry.data {
-                        ValueData::Inline(d) => { merged.insert(k, d.clone()); }
+                        ValueData::Inline(d) => {
+                            merged.insert(k, d.clone());
+                        }
                         ValueData::Blob(blob_ref) => {
                             if let Ok(data) = self.blob_store.get(blob_ref) {
                                 merged.insert(k, std::sync::Arc::new(data));
@@ -1629,9 +1716,13 @@ impl LSMEngine {
             let memtable = self.memtable.read();
             let entries = memtable.scan(start, end)?;
             for (k, entry) in entries {
-                if entry.deleted { continue; }
+                if entry.deleted {
+                    continue;
+                }
                 match &entry.data {
-                    ValueData::Inline(d) => { merged.insert(k, d.clone()); }
+                    ValueData::Inline(d) => {
+                        merged.insert(k, d.clone());
+                    }
                     ValueData::Blob(blob_ref) => {
                         if let Ok(data) = self.blob_store.get(blob_ref) {
                             merged.insert(k, std::sync::Arc::new(data));
@@ -1648,9 +1739,9 @@ impl LSMEngine {
 
         Ok(())
     }
-    
+
     /// Scan MemTable (including immutable) for a key range [start, end) - Legacy API
-    /// 
+    ///
     /// ⚠️ Prefer scan_memtable_with() for zero-copy iteration
     pub fn scan_memtable(&self, start: Key, end: Key) -> Result<Vec<(Key, Vec<u8>)>> {
         // 🚀 P3 优化：预分配容量（估算范围大小）
@@ -1662,12 +1753,12 @@ impl LSMEngine {
         })?;
         Ok(results)
     }
-    
+
     /// Scan all MemTable entries with zero-copy callback
 
     /// 🔧 优化方法：只扫描增量数据 (active + immutable MemTable) - Zero-copy version
     /// 已 flush 到 SSTable 的数据应该走持久化索引 + LRU 缓存
-    /// 
+    ///
     /// ✅ Zero-copy optimization: Uses callback to avoid Vec allocation
     /// ⚠️  CRITICAL: 先收集数据，释放锁后再调用回调，避免在持锁期间执行慢操作导致阻塞
     pub fn scan_memtable_incremental_with<F>(&self, mut f: F) -> Result<()>
@@ -1676,11 +1767,11 @@ impl LSMEngine {
     {
         // Step 1: 收集所有数据（持锁时间最小化）
         let mut all_entries = Vec::new();
-        
+
         // 1.1 扫描 immutable queue (等待 flush 的数据)
         {
             let immutable = self.immutable.read();
-            
+
             for memtable in immutable.iter() {
                 let entries = memtable.scan_all()?;
                 for (k, entry) in entries {
@@ -1688,17 +1779,17 @@ impl LSMEngine {
                     if entry.deleted {
                         continue;
                     }
-                    
+
                     match &entry.data {
                         ValueData::Inline(d) => {
                             all_entries.push((k, d.clone()));
-                        },
+                        }
                         ValueData::Blob(blob_ref) => {
                             match self.blob_store.get(blob_ref) {
                                 Ok(data) => all_entries.push((k, std::sync::Arc::new(data))),
-                                Err(_) => {}, // blob resolution failed, skip entry
+                                Err(_) => {} // blob resolution failed, skip entry
                             }
-                        },
+                        }
                     }
                 }
             }
@@ -1716,27 +1807,27 @@ impl LSMEngine {
                 match &entry.data {
                     ValueData::Inline(d) => {
                         all_entries.push((k, d.clone()));
-                    },
+                    }
                     ValueData::Blob(blob_ref) => {
                         match self.blob_store.get(blob_ref) {
                             Ok(data) => all_entries.push((k, std::sync::Arc::new(data))),
-                            Err(_) => {}, // blob resolution failed, skip entry
+                            Err(_) => {} // blob resolution failed, skip entry
                         }
-                    },
+                    }
                 }
             }
         }
-        
+
         // Step 2: 释放所有锁后，再调用回调处理数据（避免在持锁期间执行慢操作）
         for (k, data) in all_entries {
             f(k, &data)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// 🔧 优化方法：只扫描增量数据 (active + immutable MemTable) - Legacy API
-    /// 
+    ///
     /// ⚠️ Prefer scan_memtable_incremental_with() for zero-copy iteration
     pub fn scan_memtable_incremental(&self) -> Result<Vec<(Key, Vec<u8>)>> {
         // 🚀 P3 优化：预分配容量
@@ -1749,27 +1840,27 @@ impl LSMEngine {
     }
 
     /// 🆕 Public API: Force rotate active MemTable to immutable queue
-    /// 
+    ///
     /// Blocks until immutable queue has space (backpressure control)
     pub fn force_rotate(&self) -> Result<()> {
         self.rotate_memtable()
     }
-    
+
     /// 🆕 Public API: Get immutable queue size
     pub fn immutable_queue_len(&self) -> usize {
         self.immutable.read().len()
     }
-    
+
     /// 🚀 Complete range scan: MemTable + Immutable + SSTables
-    /// 
+    ///
     /// This is the CORRECT way to scan a key range in LSM-Tree.
     /// Returns all non-deleted entries in [start, end), deduplicated by latest version.
-    /// 
+    ///
     /// # Performance
     /// - MemTable scan: O(log N + K) where K = result size
     /// - SSTable scan: O(B × log M) where B = number of blocks, M = entries per block
     /// - Merge: O(K log K) where K = total results
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let rows = engine.scan_range(start_key, end_key)?;
@@ -1780,26 +1871,25 @@ impl LSMEngine {
         let iter = self.scan_range_streaming(start, end)?;
         iter.collect()
     }
-    
 
     /// Get level statistics
     pub fn level_stats(&self) -> Result<Vec<(usize, usize, u64)>> {
         self.compaction_worker.level_stats()
     }
-    
+
     /// Estimate key count in a given range (fast, O(1))
-    /// 
+    ///
     /// Uses SSTable metadata to estimate count without reading actual data.
     /// Useful for query optimization (index selectivity calculation).
-    /// 
+    ///
     /// # Performance
     /// - Full scan: O(n) - 300ms for 300K keys
     /// - Estimation: O(1) - <1ms (reads metadata only)
-    /// 
+    ///
     /// # Accuracy
     /// - ±10% error rate (due to overlapping SSTables and tombstones)
     /// - Accurate enough for query planning
-    /// 
+    ///
     /// # Example
     /// ```ignore
     /// let count = engine.estimate_key_count_in_range(start, end)?;
@@ -1808,9 +1898,9 @@ impl LSMEngine {
     pub fn estimate_key_count_in_range(&self, start: Key, end: Key) -> Result<usize> {
         // Get all SSTable metadata
         let sstable_metas = self.compaction_worker.get_all_sstables()?;
-        
+
         let mut estimated_count = 0usize;
-        
+
         for meta in sstable_metas.iter() {
             // Check if SSTable key range overlaps with [start, end)
             if meta.min_key < end && meta.max_key >= start {
@@ -1819,12 +1909,12 @@ impl LSMEngine {
                 estimated_count += meta.num_entries as usize;
             }
         }
-        
+
         Ok(estimated_count)
     }
-    
+
     /// 🚀 流式范围扫描（批量迭代器，内存友好）
-    /// 
+    ///
     /// 返回一个迭代器，每次产出一批数据（默认 1000 条），而不是一次性加载全部。
     ///
     /// # 性能对比
@@ -1841,7 +1931,12 @@ impl LSMEngine {
     ///     }
     /// }
     /// ```
-    pub fn scan_range_batched(&self, start: Key, end: Key, batch_size: usize) -> Result<LSMBatchedIterator> {
+    pub fn scan_range_batched(
+        &self,
+        start: Key,
+        end: Key,
+        batch_size: usize,
+    ) -> Result<LSMBatchedIterator> {
         // Use streaming iterator internally to avoid BTreeMap materialization
         let iter = self.scan_range_streaming(start, end)?;
         let mut all_data = Vec::new();
@@ -1865,16 +1960,16 @@ pub struct LSMBatchedIterator {
 
 impl Iterator for LSMBatchedIterator {
     type Item = Result<Vec<(Key, Value)>>;
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_pos >= self.data.len() {
             return None;
         }
-        
+
         let end_pos = (self.current_pos + self.batch_size).min(self.data.len());
         let batch = self.data[self.current_pos..end_pos].to_vec();
         self.current_pos = end_pos;
-        
+
         Some(Ok(batch))
     }
 }
@@ -1882,14 +1977,14 @@ impl Iterator for LSMBatchedIterator {
 // 继续 LSMEngine 的实现
 impl LSMEngine {
     /// 🚀 真正的流式范围扫描（O(1) 内存占用）
-    /// 
+    ///
     /// 使用多路归并迭代器，逐个返回 key-value，不预先合并所有数据到内存。
-    /// 
+    ///
     /// # 内存对比
     /// - `scan_range()`: 30万条 × 1.4 KB = 420 MB 🔴
     /// - `scan_range_streaming()`: 13 个迭代器 × 1.5 KB = 20 KB ✅
     /// - **节省 99.995% 内存**
-    /// 
+    ///
     /// # 示例
     /// ```ignore
     /// for result in engine.scan_range_streaming(start, end)? {
@@ -1909,7 +2004,10 @@ impl LSMEngine {
             sources.clear();
 
             let rot_epoch_before = self.rotation_epoch.load(Ordering::Acquire);
-            let cmp_epoch_before = self.compaction_worker.compaction_epoch().load(Ordering::Acquire);
+            let cmp_epoch_before = self
+                .compaction_worker
+                .compaction_epoch()
+                .load(Ordering::Acquire);
 
             // Phase 1: Snapshot memtable + immutable (under read locks)
             {
@@ -1921,11 +2019,14 @@ impl LSMEngine {
                     let entries = memtable.scan_arcs(start, end);
                     if !entries.is_empty() {
                         let iter = entries.into_iter().map(|(k, arc)| {
-                            Ok((k, Value {
-                                data: arc.data.clone(),
-                                timestamp: arc.timestamp,
-                                deleted: arc.deleted,
-                            }))
+                            Ok((
+                                k,
+                                Value {
+                                    data: arc.data.clone(),
+                                    timestamp: arc.timestamp,
+                                    deleted: arc.deleted,
+                                },
+                            ))
                         });
                         sources.push(Box::new(iter));
                     }
@@ -1936,11 +2037,14 @@ impl LSMEngine {
                     let entries = mt.scan_arcs(start, end);
                     if !entries.is_empty() {
                         let iter = entries.into_iter().map(|(k, arc)| {
-                            Ok((k, Value {
-                                data: arc.data.clone(),
-                                timestamp: arc.timestamp,
-                                deleted: arc.deleted,
-                            }))
+                            Ok((
+                                k,
+                                Value {
+                                    data: arc.data.clone(),
+                                    timestamp: arc.timestamp,
+                                    deleted: arc.deleted,
+                                },
+                            ))
                         });
                         sources.push(Box::new(iter));
                     }
@@ -1958,7 +2062,11 @@ impl LSMEngine {
                 let cached = match self.sstable_cache.get_or_open(&meta.path) {
                     Ok(cached) => cached,
                     Err(e) => {
-                        debug_log!("[scan_range_streaming] Failed to open SSTable {:?}: {:?}", meta.path, e);
+                        debug_log!(
+                            "[scan_range_streaming] Failed to open SSTable {:?}: {:?}",
+                            meta.path,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -1967,7 +2075,9 @@ impl LSMEngine {
                 let mut sst_iter = {
                     let sstable = cached.handle.read();
                     match crate::storage::lsm::sstable::SSTableIterator::with_range(
-                        &sstable, Some(start), Some(end),
+                        &sstable,
+                        Some(start),
+                        Some(end),
                     ) {
                         Ok(iter) => iter,
                         Err(e) => {
@@ -1985,15 +2095,22 @@ impl LSMEngine {
             // Phase 3: Validate consistency — if either epoch changed during our
             // snapshot, data may have moved or SSTables replaced. Retry.
             let rot_epoch_after = self.rotation_epoch.load(Ordering::Acquire);
-            let cmp_epoch_after = self.compaction_worker.compaction_epoch().load(Ordering::Acquire);
+            let cmp_epoch_after = self
+                .compaction_worker
+                .compaction_epoch()
+                .load(Ordering::Acquire);
             if rot_epoch_after == rot_epoch_before && cmp_epoch_after == cmp_epoch_before {
                 // 🚀 Fast path: single SSTable, no memtable data — use raw (zero-Arc) iterator
                 if sources.is_empty() && sstable_metas.len() == 1 {
                     if let Ok(cached) = self.sstable_cache.get_or_open(&sstable_metas[0].path) {
                         let sstable = cached.handle.read();
-                        if let Ok(mut sst_iter) = crate::storage::lsm::sstable::SSTableIterator::with_range(
-                            &sstable, Some(start), Some(end),
-                        ) {
+                        if let Ok(mut sst_iter) =
+                            crate::storage::lsm::sstable::SSTableIterator::with_range(
+                                &sstable,
+                                Some(start),
+                                Some(end),
+                            )
+                        {
                             sst_iter.set_verify_crc(false); // Skip CRC for sequential scan
                             return Ok(super::MergingIterator::new_raw_sst(sst_iter));
                         }
@@ -2032,12 +2149,16 @@ impl Drop for LSMEngine {
         self.shutdown.store(true, Ordering::Relaxed);
         {
             let (lock, cvar) = &*self.flush_wakeup;
-            if let Ok(mut guard) = lock.lock() { *guard = true; }
+            if let Ok(mut guard) = lock.lock() {
+                *guard = true;
+            }
             cvar.notify_all();
         }
         {
             let (lock, cvar) = &*self.compaction_wakeup;
-            if let Ok(mut guard) = lock.lock() { *guard = true; }
+            if let Ok(mut guard) = lock.lock() {
+                *guard = true;
+            }
             cvar.notify_all();
         }
 
@@ -2069,50 +2190,59 @@ impl Drop for LSMEngine {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    
+
     #[test]
     fn test_basic_operations() {
         let temp_dir = TempDir::new().unwrap();
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), LSMConfig::default()).unwrap();
-        
+
         // Put
         engine.put(1u64, Value::new(b"value1".to_vec(), 1)).unwrap();
         engine.put(2u64, Value::new(b"value2".to_vec(), 2)).unwrap();
-        
+
         // Get
         let value = engine.get(1u64).unwrap().unwrap();
-        assert_eq!(value.data, ValueData::Inline(std::sync::Arc::new(b"value1".to_vec())));
-        
+        assert_eq!(
+            value.data,
+            ValueData::Inline(std::sync::Arc::new(b"value1".to_vec()))
+        );
+
         // Delete
         engine.delete(1u64, 3).unwrap();
         let value = engine.get(1u64).unwrap();
         assert!(value.is_none(), "Deleted key should return None");
     }
-    
+
     #[test]
     fn test_memtable_flush() {
         let temp_dir = TempDir::new().unwrap();
-        let config = LSMConfig { memtable_size: 100, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 100,
+            ..Default::default()
+        };
 
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
-        
+
         // Insert enough data to trigger flush
         for i in 0..20u64 {
             let value = Value::new(vec![0u8; 10], i);
             engine.put(i, value).unwrap();
         }
-        
+
         // Explicitly flush
         engine.flush().unwrap();
-        
+
         // Verify SSTable was created
         let sstables: Vec<_> = std::fs::read_dir(temp_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
             .collect();
-        
-        assert!(!sstables.is_empty(), "Should have created at least one SSTable");
+
+        assert!(
+            !sstables.is_empty(),
+            "Should have created at least one SSTable"
+        );
     }
 
     #[test]
@@ -2121,11 +2251,16 @@ mod tests {
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), LSMConfig::default()).unwrap();
 
         for i in 0..1000u64 {
-            engine.put(i, Value::new(i.to_le_bytes().to_vec(), i)).unwrap();
+            engine
+                .put(i, Value::new(i.to_le_bytes().to_vec(), i))
+                .unwrap();
         }
         for i in 0..1000u64 {
             let val = engine.get(i).unwrap().expect("key should exist");
-            assert_eq!(val.data, ValueData::Inline(std::sync::Arc::new(i.to_le_bytes().to_vec())));
+            assert_eq!(
+                val.data,
+                ValueData::Inline(std::sync::Arc::new(i.to_le_bytes().to_vec()))
+            );
         }
     }
 
@@ -2143,7 +2278,11 @@ mod tests {
 
         let iter = engine.scan_range_streaming(100, 200).unwrap();
         let results: Vec<_> = iter.filter_map(|r| r.ok()).collect();
-        assert_eq!(results.len(), 100, "should have exactly 100 entries in range [100,200)");
+        assert_eq!(
+            results.len(),
+            100,
+            "should have exactly 100 entries in range [100,200)"
+        );
         for (i, (key, _)) in results.iter().enumerate() {
             assert_eq!(*key, 100 + i as u64);
         }
@@ -2152,7 +2291,10 @@ mod tests {
     #[test]
     fn test_scan_range_after_flush() {
         let temp_dir = TempDir::new().unwrap();
-        let config = LSMConfig { memtable_size: 256, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 256,
+            ..Default::default()
+        };
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
 
         // Insert enough to trigger flush
@@ -2176,12 +2318,18 @@ mod tests {
         engine.delete(1, 200).unwrap();
 
         // Delete with higher timestamp makes key invisible
-        assert!(engine.get(1).unwrap().is_none(), "deleted key should be invisible");
+        assert!(
+            engine.get(1).unwrap().is_none(),
+            "deleted key should be invisible"
+        );
 
         // Put with even higher timestamp revives
         engine.put(1, Value::new(b"revived".to_vec(), 300)).unwrap();
         let val = engine.get(1).unwrap().unwrap();
-        assert_eq!(val.data, ValueData::Inline(std::sync::Arc::new(b"revived".to_vec())));
+        assert_eq!(
+            val.data,
+            ValueData::Inline(std::sync::Arc::new(b"revived".to_vec()))
+        );
     }
 
     #[test]
@@ -2199,22 +2347,34 @@ mod tests {
     #[test]
     fn test_flush_and_compact_preserves_data() {
         let temp_dir = TempDir::new().unwrap();
-        let config = LSMConfig { memtable_size: 512, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 512,
+            ..Default::default()
+        };
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
         for i in 0..200u64 {
-            engine.put(i, Value::new(i.to_le_bytes().to_vec(), i)).unwrap();
+            engine
+                .put(i, Value::new(i.to_le_bytes().to_vec(), i))
+                .unwrap();
         }
         engine.flush().unwrap();
         let _ = engine.compact();
         for i in 0..200u64 {
-            assert!(engine.get(i).unwrap().is_some(), "key {} lost after compaction", i);
+            assert!(
+                engine.get(i).unwrap().is_some(),
+                "key {} lost after compaction",
+                i
+            );
         }
     }
 
     #[test]
     fn test_scan_after_compact() {
         let temp_dir = TempDir::new().unwrap();
-        let config = LSMConfig { memtable_size: 1024, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 1024,
+            ..Default::default()
+        };
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
         for i in 0..100u64 {
             engine.put(i, Value::new(vec![(i % 256) as u8], i)).unwrap();
@@ -2224,24 +2384,40 @@ mod tests {
         let _ = engine.compact();
         let iter = engine.scan_range_streaming(0, 100).unwrap();
         let results: Vec<_> = iter.filter_map(|r| r.ok()).collect();
-        assert_eq!(results.len(), 100, "all keys should be visible after flush+compact");
+        assert_eq!(
+            results.len(),
+            100,
+            "all keys should be visible after flush+compact"
+        );
     }
 
     #[test]
     fn test_data_survives_multiple_flushes() {
         let temp_dir = TempDir::new().unwrap();
-        let config = LSMConfig { memtable_size: 1024, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 1024,
+            ..Default::default()
+        };
         let engine = LSMEngine::new(temp_dir.path().to_path_buf(), config).unwrap();
         // Multiple flush rounds
         for round in 0..3 {
             let base = round * 100;
             for i in 0..100u64 {
-                engine.put(base + i, Value::new((base + i).to_le_bytes().to_vec(), base + i)).unwrap();
+                engine
+                    .put(
+                        base + i,
+                        Value::new((base + i).to_le_bytes().to_vec(), base + i),
+                    )
+                    .unwrap();
             }
             engine.flush().unwrap();
         }
         for i in 0..300u64 {
-            assert!(engine.get(i).unwrap().is_some(), "key {} lost after multi-flush", i);
+            assert!(
+                engine.get(i).unwrap().is_some(),
+                "key {} lost after multi-flush",
+                i
+            );
         }
     }
 }

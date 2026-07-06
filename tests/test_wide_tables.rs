@@ -12,8 +12,8 @@
 //! - widest supported table round-trips through checkpoint + reopen
 //! - every column value is read back exactly (no column-index misalignment)
 
-use motedb::{Database, DBConfig, QueryResult};
 use motedb::types::Value;
+use motedb::{DBConfig, Database, QueryResult};
 use tempfile::TempDir;
 
 fn make_db() -> (TempDir, Database) {
@@ -214,7 +214,12 @@ fn wide_table_survives_reopen() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].len(), n + 1);
     for c in 0..n as i64 {
-        assert_eq!(rows[0][(c + 1) as usize], Value::Integer(30 + c), "col c{}", c);
+        assert_eq!(
+            rows[0][(c + 1) as usize],
+            Value::Integer(30 + c),
+            "col c{}",
+            c
+        );
     }
 }
 

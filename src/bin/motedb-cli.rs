@@ -1,14 +1,14 @@
 #!/usr/bin/env rust
 //! MoteDB 主程序 - 默认启动交互式 CLI
-//! 
+//!
 //! 这是 motedb 的主入口点,直接调用 motedb-cli 的功能
 
+use motedb::sql::{Lexer, Parser, QueryExecutor}; // ✅ 使用流式 API
 use motedb::*;
-use motedb::sql::{Lexer, Parser, QueryExecutor};  // ✅ 使用流式 API
 use std::env;
-use std::io::{self, Write, BufRead};
-use std::sync::Arc;
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -21,7 +21,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    
+
     match args.len() {
         1 => {
             // 默认: 交互式模式
@@ -47,12 +47,13 @@ fn run() -> Result<()> {
             return Err(StorageError::InvalidData("Invalid arguments".to_string()));
         }
     }
-    
+
     Ok(())
 }
 
 fn print_help() {
-    println!(r#"
+    println!(
+        r#"
 MoteDB v{} - 高性能嵌入式数据库引擎
 
 用法:
@@ -81,16 +82,18 @@ MoteDB v{} - 高性能嵌入式数据库引擎
   • 列值索引 (Column Value)
 
 更多信息: https://github.com/yourusername/motedb
-"#, VERSION);
+"#,
+        VERSION
+    );
 }
 
 fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
     let path = db_path.unwrap_or_else(|| PathBuf::from("./motedb_data"));
-    
+
     println!("🚀 MoteDB v{}", VERSION);
     println!("📂 Database: {}", path.display());
     println!("💡 Type '.help' for help, '.exit' to quit\n");
-    
+
     // 打开或创建数据库
     let db = Arc::new(if path.exists() {
         MoteDB::open(&path)?
@@ -98,11 +101,11 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
         println!("✨ Creating new database...\n");
         MoteDB::create(&path)?
     });
-    
+
     let stdin = io::stdin();
     let mut buffer = String::new();
     let mut multiline_sql = String::new();
-    
+
     loop {
         // 显示提示符
         if multiline_sql.is_empty() {
@@ -111,22 +114,22 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
             print!("     -> ");
         }
         io::stdout().flush().unwrap();
-        
+
         // 读取输入
         buffer.clear();
         if stdin.lock().read_line(&mut buffer).is_err() {
             break;
         }
-        
+
         let input = buffer.trim();
-        
+
         // 特殊命令
         if input.starts_with('.') {
             if !multiline_sql.is_empty() {
                 eprintln!("⚠️  Warning: Incomplete SQL statement discarded");
                 multiline_sql.clear();
             }
-            
+
             match input {
                 ".exit" | ".quit" => {
                     println!("👋 Goodbye!");
@@ -152,21 +155,21 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
             }
             continue;
         }
-        
+
         // 跳过空行
         if input.is_empty() {
             continue;
         }
-        
+
         // 累积多行 SQL
         multiline_sql.push_str(input);
         multiline_sql.push(' ');
-        
+
         // 检查是否是完整的 SQL 语句 (以分号结尾)
         if input.ends_with(';') {
             // 执行 SQL
             let sql = multiline_sql.trim_end_matches(';').trim();
-            
+
             // ✅ 使用流式 API 并物化
             let result = (|| -> Result<_> {
                 let mut lexer = Lexer::new(sql);
@@ -177,7 +180,7 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
                 let streaming_result = executor.execute_streaming(statement)?;
                 streaming_result.materialize()
             })();
-            
+
             match result {
                 Ok(result) => {
                     display_result(result);
@@ -186,17 +189,17 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
                     eprintln!("❌ Error: {}", e);
                 }
             }
-            
+
             multiline_sql.clear();
         }
     }
-    
+
     Ok(())
 }
 
 fn display_result(result: sql::QueryResult) {
     use sql::QueryResult;
-    
+
     match result {
         QueryResult::Definition { message } => {
             println!("✅ {}", message);
@@ -214,17 +217,15 @@ fn display_result(result: sql::QueryResult) {
 
 fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
     use types::Value;
-    
+
     if rows.is_empty() {
         println!("📊 No results");
         return;
     }
-    
+
     // 计算列宽
-    let mut widths: Vec<usize> = columns.iter()
-        .map(|col| col.len())
-        .collect();
-    
+    let mut widths: Vec<usize> = columns.iter().map(|col| col.len()).collect();
+
     for row in rows {
         for (i, value) in row.iter().enumerate() {
             let len = match value {
@@ -244,7 +245,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
             }
         }
     }
-    
+
     // 打印表头
     print!("┌");
     for (i, width) in widths.iter().enumerate() {
@@ -254,7 +255,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
         }
     }
     println!("┐");
-    
+
     print!("│");
     for (i, col) in columns.iter().enumerate() {
         let width = widths.get(i).unwrap_or(&10);
@@ -264,7 +265,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
         }
     }
     println!("│");
-    
+
     print!("├");
     for (i, width) in widths.iter().enumerate() {
         print!("{}", "─".repeat(width + 2));
@@ -273,7 +274,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
         }
     }
     println!("┤");
-    
+
     // 打印数据行
     for row in rows {
         print!("│");
@@ -297,7 +298,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
                 Value::TextDoc(_) => "<textdoc>".to_string(),
                 Value::Timestamp(ts) => {
                     format!("{} μs", ts.as_micros())
-                },
+                }
             };
             print!(" {:width$} ", s, width = width);
             if i < row.len() - 1 {
@@ -306,7 +307,7 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
         }
         println!("│");
     }
-    
+
     print!("└");
     for (i, width) in widths.iter().enumerate() {
         print!("{}", "─".repeat(width + 2));
@@ -315,12 +316,13 @@ fn display_table(columns: &[String], rows: &[Vec<types::Value>]) {
         }
     }
     println!("┘");
-    
+
     println!("\n📊 {} row(s) returned", rows.len());
 }
 
 fn print_interactive_help() {
-    println!(r#"
+    println!(
+        r#"
 特殊命令:
   .help              显示此帮助
   .exit, .quit       退出程序
@@ -342,12 +344,13 @@ SQL 示例:
   VECTOR          向量索引 (相似度搜索)
   SPATIAL         空间索引 (地理位置)
   TIMESTAMP       时间序列索引
-"#);
+"#
+    );
 }
 
 fn list_tables(db: &MoteDB) -> Result<()> {
     let tables = db.list_tables()?;
-    
+
     if tables.is_empty() {
         println!("📊 No tables found");
     } else {
@@ -356,41 +359,41 @@ fn list_tables(db: &MoteDB) -> Result<()> {
             println!("  • {}", table);
         }
     }
-    
+
     Ok(())
 }
 
 fn show_all_schemas(db: &MoteDB) -> Result<()> {
     let tables = db.list_tables()?;
-    
+
     if tables.is_empty() {
         println!("📊 No tables found");
         return Ok(());
     }
-    
+
     for table in tables {
         show_table_schema(db, &table)?;
         println!();
     }
-    
+
     Ok(())
 }
 
 fn show_table_schema(db: &MoteDB, table_name: &str) -> Result<()> {
     let schema = db.get_table_schema(table_name)?;
-    
+
     println!("📋 Table: {}", table_name);
     println!("┌─────────────────┬──────────────┬──────────┐");
     println!("│ Column          │ Type         │ Nullable │");
     println!("├─────────────────┼──────────────┼──────────┤");
-    
+
     for col in &schema.columns {
         let type_str = format!("{:?}", col.col_type);
         let nullable = if col.nullable { "YES" } else { "NO" };
         println!("│ {:15} │ {:12} │ {:8} │", col.name, type_str, nullable);
     }
-    
+
     println!("└─────────────────┴──────────────┴──────────┘");
-    
+
     Ok(())
 }

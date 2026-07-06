@@ -4,7 +4,7 @@
 //! evaluator (materialized path) but NOT in eval_expr_simple (fast path).
 //! Tests for those are relaxed to tolerate Bool(false) fallback.
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -24,10 +24,14 @@ fn row(result: motedb::StreamingQueryResult) -> Vec<Value> {
 fn setup() -> (Database, TempDir) {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT, age INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'Hello World', 95.67, 25)").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'MoteDB Engine', 88.33, 30)").unwrap();
-    db.execute("INSERT INTO t VALUES (3, '  spaced  ', 50.5, 20)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT, age INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'Hello World', 95.67, 25)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'MoteDB Engine', 88.33, 30)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (3, '  spaced  ', 50.5, 20)")
+        .unwrap();
     (db, dir)
 }
 
@@ -36,21 +40,27 @@ fn setup() -> (Database, TempDir) {
 #[test]
 fn test_lower() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT LOWER(name) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT LOWER(name) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::text("hello world".to_string()));
 }
 
 #[test]
 fn test_upper() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT UPPER(name) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT UPPER(name) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::text("HELLO WORLD".to_string()));
 }
 
 #[test]
 fn test_length() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT LENGTH(name) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT LENGTH(name) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::Integer(11));
 }
 
@@ -60,13 +70,17 @@ fn test_trim_ltrim_rtrim() {
     let r = row(db.execute("SELECT TRIM(name) FROM t WHERE id = 3").unwrap());
     assert_eq!(&r[0], &Value::text("spaced".to_string()));
 
-    let r = row(db.execute("SELECT LTRIM(name) FROM t WHERE id = 3").unwrap());
+    let r = row(db
+        .execute("SELECT LTRIM(name) FROM t WHERE id = 3")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => assert!(s.starts_with('s') && !s.starts_with(' ')),
         _ => panic!("Expected Text"),
     }
 
-    let r = row(db.execute("SELECT RTRIM(name) FROM t WHERE id = 3").unwrap());
+    let r = row(db
+        .execute("SELECT RTRIM(name) FROM t WHERE id = 3")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => assert!(!s.ends_with(' ')),
         _ => panic!("Expected Text"),
@@ -76,14 +90,18 @@ fn test_trim_ltrim_rtrim() {
 #[test]
 fn test_concat() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT CONCAT(name, ' - ', id) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT CONCAT(name, ' - ', id) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::text("Hello World - 1".to_string()));
 }
 
 #[test]
 fn test_concat_multi_args() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT CONCAT(name, ' has score ', score) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT CONCAT(name, ' has score ', score) FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => {
             assert!(s.as_str().contains("Hello World"));
@@ -105,9 +123,15 @@ fn test_abs_positive() {
 #[test]
 fn test_round() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT ROUND(score) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT ROUND(score) FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
-        Value::Float(f) => assert!((f - 96.0).abs() < 1.0, "ROUND(95.67) should be ~96, got {}", f),
+        Value::Float(f) => assert!(
+            (f - 96.0).abs() < 1.0,
+            "ROUND(95.67) should be ~96, got {}",
+            f
+        ),
         other => panic!("Expected Float, got {:?}", other),
     }
 }
@@ -115,7 +139,9 @@ fn test_round() {
 #[test]
 fn test_floor_ceil() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT FLOOR(score), CEIL(score) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT FLOOR(score), CEIL(score) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::Integer(95));
     assert_eq!(&r[1], &Value::Integer(96));
 }
@@ -133,7 +159,9 @@ fn test_sqrt() {
 #[test]
 fn test_log_ln_exp() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT LOG(1000), LN(2), EXP(1) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT LOG(1000), LN(2), EXP(1) FROM t WHERE id = 1")
+        .unwrap());
     match (&r[0], &r[1], &r[2]) {
         (Value::Float(log_val), Value::Float(ln_val), Value::Float(exp_val)) => {
             assert!((log_val - 3.0).abs() < 0.01, "LOG(1000) should be ~3");
@@ -150,7 +178,9 @@ fn test_log_ln_exp() {
 #[test]
 fn test_power_fast_path() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT POWER(2, 10) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT POWER(2, 10) FROM t WHERE id = 1")
+        .unwrap());
     // POWER is not in eval_expr_simple whitelist
     match &r[0] {
         Value::Float(f) => assert!((f - 1024.0).abs() < 0.01),
@@ -184,7 +214,9 @@ fn test_mod_fast_path() {
 #[test]
 fn test_if_function() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT IF(score > 90, 'A', 'B') FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT IF(score > 90, 'A', 'B') FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => assert_eq!(s.as_str(), "A"),
         Value::Bool(false) => {}
@@ -195,7 +227,9 @@ fn test_if_function() {
 #[test]
 fn test_ifnull_fast_path() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT IFNULL(name, 'N/A') FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT IFNULL(name, 'N/A') FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => assert_eq!(s.as_str(), "Hello World"),
         Value::Bool(false) => {} // expected fast-path fallback
@@ -206,11 +240,13 @@ fn test_ifnull_fast_path() {
 #[test]
 fn test_nullif_fast_path() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT NULLIF(1, 1) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT NULLIF(1, 1) FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
-        Value::Null => {} // correct: NULLIF(1,1) should return NULL
+        Value::Null => {}        // correct: NULLIF(1,1) should return NULL
         Value::Bool(false) => {} // fast-path fallback
-        Value::Integer(1) => {} // also acceptable if it works
+        Value::Integer(1) => {}  // also acceptable if it works
         other => panic!("Unexpected: {:?}", other),
     }
 }
@@ -220,7 +256,9 @@ fn test_nullif_fast_path() {
 #[test]
 fn test_replace_fast_path() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT REPLACE(name, 'World', 'Rust') FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT REPLACE(name, 'World', 'Rust') FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => assert_eq!(s.as_str(), "Hello Rust"),
         Value::Bool(false) => {}
@@ -231,7 +269,9 @@ fn test_replace_fast_path() {
 #[test]
 fn test_substr_fast_path() {
     let (db, _dir) = setup();
-    let r = row(db.execute("SELECT SUBSTR(name, 1, 5) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT SUBSTR(name, 1, 5) FROM t WHERE id = 1")
+        .unwrap());
     match &r[0] {
         Value::Text(s) => assert_eq!(s.as_str(), "Hello"),
         Value::Bool(false) => {}
@@ -244,7 +284,10 @@ fn test_substr_fast_path() {
 #[test]
 fn test_arithmetic_where() {
     let (db, _dir) = setup();
-    let r = rows(db.execute("SELECT id FROM t WHERE score * 1.0 > 90").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM t WHERE score * 1.0 > 90")
+            .unwrap(),
+    );
     assert!(r.len() >= 1);
 }
 
@@ -252,12 +295,16 @@ fn test_arithmetic_where() {
 fn test_negative_values() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE n (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE n (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO n VALUES (1, -100)").unwrap();
     db.execute("INSERT INTO n VALUES (2, -50)").unwrap();
     db.execute("INSERT INTO n VALUES (3, 50)").unwrap();
 
-    let r = rows(db.execute("SELECT val FROM n WHERE val < 0 ORDER BY val").unwrap());
+    let r = rows(
+        db.execute("SELECT val FROM n WHERE val < 0 ORDER BY val")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 2);
     assert_eq!(&r[0][0], &Value::Integer(-100));
     assert_eq!(&r[1][0], &Value::Integer(-50));
@@ -269,7 +316,8 @@ fn test_negative_values() {
 fn test_select_constant_with_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE dual (id INT PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE dual (id INT PRIMARY KEY)")
+        .unwrap();
     db.execute("INSERT INTO dual VALUES (1)").unwrap();
 
     let r = row(db.execute("SELECT 1 + 2 FROM dual").unwrap());
@@ -282,10 +330,16 @@ fn test_select_constant_with_table() {
 fn test_coalesce_with_column() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE c (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO c VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO c VALUES (2, 42)").unwrap();
 
-    let r = row(db.execute("SELECT COALESCE(val, 0) FROM c WHERE id = 1").unwrap());
-    assert!(!matches!(&r[0], Value::Null), "COALESCE(NULL, 0) should not be NULL");
+    let r = row(db
+        .execute("SELECT COALESCE(val, 0) FROM c WHERE id = 1")
+        .unwrap());
+    assert!(
+        !matches!(&r[0], Value::Null),
+        "COALESCE(NULL, 0) should not be NULL"
+    );
 }

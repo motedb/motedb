@@ -1,8 +1,8 @@
 //! End-to-end integration tests for the Columnar Segment Store.
 
-use motedb::Database;
 use motedb::config::DBConfig;
-use motedb::types::{Value, Timestamp};
+use motedb::types::{Timestamp, Value};
+use motedb::Database;
 use tempfile::TempDir;
 
 fn create_ts_table(db: &Database, name: &str) {
@@ -60,18 +60,29 @@ fn test_columnar_api_ingest_and_query() {
     assert!(db.columnar_store().segment_count("metrics") > 0);
 
     // Query time range
-    let results = db.columnar_store().query_time_range(
-        "metrics", 1_500_000, 1_600_000,
-        &["ts".to_string(), "temperature".to_string()],
-    ).unwrap();
+    let results = db
+        .columnar_store()
+        .query_time_range(
+            "metrics",
+            1_500_000,
+            1_600_000,
+            &["ts".to_string(), "temperature".to_string()],
+        )
+        .unwrap();
 
-    assert!(!results.is_empty(), "Should return results for overlapping time range");
+    assert!(
+        !results.is_empty(),
+        "Should return results for overlapping time range"
+    );
 
     for (_row_id, sql_row) in &results {
         if let Some(Value::Timestamp(ts)) = sql_row.get("ts") {
             let micros = ts.as_micros();
-            assert!(micros >= 1_500_000 && micros <= 1_600_000,
-                "Timestamp {} should be in [1500000, 1600000]", micros);
+            assert!(
+                micros >= 1_500_000 && micros <= 1_600_000,
+                "Timestamp {} should be in [1500000, 1600000]",
+                micros
+            );
         }
     }
 }
@@ -119,9 +130,10 @@ fn test_columnar_ttl_gc() {
     assert_eq!(db.columnar_store().segment_count("old_data"), 1);
 
     // Verify new data still accessible
-    let results = db.columnar_store().query_time_range(
-        "old_data", 1_000_000, 1_100_000, &[],
-    ).unwrap();
+    let results = db
+        .columnar_store()
+        .query_time_range("old_data", 1_000_000, 1_100_000, &[])
+        .unwrap();
     assert!(!results.is_empty());
 }
 
@@ -147,16 +159,21 @@ fn test_columnar_gorilla_compression_roundtrip() {
     assert_eq!(result.row_ids.len(), 500);
     db.flush().unwrap();
 
-    let results = db.columnar_store().query_time_range(
-        "mixed", 1_000_000, 1_500_000, &[],
-    ).unwrap();
+    let results = db
+        .columnar_store()
+        .query_time_range("mixed", 1_000_000, 1_500_000, &[])
+        .unwrap();
     assert_eq!(results.len(), 500);
 
     // Verify round-trip
     for (i, (_row_id, sql_row)) in results.iter().enumerate() {
         if let Some(Value::Timestamp(ts)) = sql_row.get("ts") {
-            assert_eq!(ts.as_micros(), 1_000_000 + i as i64 * 1_000,
-                "Timestamp mismatch at row {}", i);
+            assert_eq!(
+                ts.as_micros(),
+                1_000_000 + i as i64 * 1_000,
+                "Timestamp mismatch at row {}",
+                i
+            );
         }
         if let Some(Value::Integer(count)) = sql_row.get("count") {
             assert_eq!(*count, i as i64, "Count mismatch at row {}", i);
@@ -165,7 +182,12 @@ fn test_columnar_gorilla_compression_roundtrip() {
             assert_eq!(*active, i % 2 == 0, "Bool mismatch at row {}", i);
         }
         if let Some(Value::Text(name)) = sql_row.get("name") {
-            assert_eq!(name.as_str(), format!("entry_{}", i % 10), "Name mismatch at row {}", i);
+            assert_eq!(
+                name.as_str(),
+                format!("entry_{}", i % 10),
+                "Name mismatch at row {}",
+                i
+            );
         }
     }
 }
@@ -176,9 +198,12 @@ fn test_dual_engine_standard_and_timeseries() {
     let db = Database::create_with_config(dir.path(), DBConfig::default()).unwrap();
 
     // Standard table
-    db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
-    db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-    db.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+    db.execute("CREATE TABLE users (id INT, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .unwrap();
+    db.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .unwrap();
 
     // TimeSeries table
     create_ts_table(&db, "sensor_log");
@@ -200,8 +225,9 @@ fn test_dual_engine_standard_and_timeseries() {
     }
 
     // Query TimeSeries table via columnar store
-    let results = db.columnar_store().query_time_range(
-        "sensor_log", 0, 2_000_000, &[],
-    ).unwrap();
+    let results = db
+        .columnar_store()
+        .query_time_range("sensor_log", 0, 2_000_000, &[])
+        .unwrap();
     assert_eq!(results.len(), 1);
 }

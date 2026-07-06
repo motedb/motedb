@@ -1,11 +1,11 @@
 //! Cosine similarity and distance computation with SIMD optimization
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
 
 /// CPU feature detection cache (initialized once at startup)
 #[cfg(target_arch = "x86_64")]
@@ -63,27 +63,27 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     let chunks = n / 32; // Process 32 elements at once (4x unroll)
     let remainder = n % 32;
-    
+
     // AVX2并行处理，4路循环展开
     let mut dot_sum1 = _mm256_setzero_ps();
     let mut dot_sum2 = _mm256_setzero_ps();
     let mut dot_sum3 = _mm256_setzero_ps();
     let mut dot_sum4 = _mm256_setzero_ps();
-    
+
     let mut norm_a_sum1 = _mm256_setzero_ps();
     let mut norm_a_sum2 = _mm256_setzero_ps();
     let mut norm_a_sum3 = _mm256_setzero_ps();
     let mut norm_a_sum4 = _mm256_setzero_ps();
-    
+
     let mut norm_b_sum1 = _mm256_setzero_ps();
     let mut norm_b_sum2 = _mm256_setzero_ps();
     let mut norm_b_sum3 = _mm256_setzero_ps();
     let mut norm_b_sum4 = _mm256_setzero_ps();
-    
+
     // 4路循环展开（32 elements per iteration）
     for i in 0..chunks {
         let offset = i * 32;
-        
+
         let a_vec1 = _mm256_loadu_ps(a.as_ptr().add(offset));
         let b_vec1 = _mm256_loadu_ps(b.as_ptr().add(offset));
         let a_vec2 = _mm256_loadu_ps(a.as_ptr().add(offset + 8));
@@ -92,71 +92,71 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
         let b_vec3 = _mm256_loadu_ps(b.as_ptr().add(offset + 16));
         let a_vec4 = _mm256_loadu_ps(a.as_ptr().add(offset + 24));
         let b_vec4 = _mm256_loadu_ps(b.as_ptr().add(offset + 24));
-        
+
         // FMA: fused multiply-add for better performance
         dot_sum1 = _mm256_fmadd_ps(a_vec1, b_vec1, dot_sum1);
         dot_sum2 = _mm256_fmadd_ps(a_vec2, b_vec2, dot_sum2);
         dot_sum3 = _mm256_fmadd_ps(a_vec3, b_vec3, dot_sum3);
         dot_sum4 = _mm256_fmadd_ps(a_vec4, b_vec4, dot_sum4);
-        
+
         norm_a_sum1 = _mm256_fmadd_ps(a_vec1, a_vec1, norm_a_sum1);
         norm_a_sum2 = _mm256_fmadd_ps(a_vec2, a_vec2, norm_a_sum2);
         norm_a_sum3 = _mm256_fmadd_ps(a_vec3, a_vec3, norm_a_sum3);
         norm_a_sum4 = _mm256_fmadd_ps(a_vec4, a_vec4, norm_a_sum4);
-        
+
         norm_b_sum1 = _mm256_fmadd_ps(b_vec1, b_vec1, norm_b_sum1);
         norm_b_sum2 = _mm256_fmadd_ps(b_vec2, b_vec2, norm_b_sum2);
         norm_b_sum3 = _mm256_fmadd_ps(b_vec3, b_vec3, norm_b_sum3);
         norm_b_sum4 = _mm256_fmadd_ps(b_vec4, b_vec4, norm_b_sum4);
     }
-    
+
     // Combine 4-way unrolled accumulators
     let dot_sum = _mm256_add_ps(
         _mm256_add_ps(dot_sum1, dot_sum2),
-        _mm256_add_ps(dot_sum3, dot_sum4)
+        _mm256_add_ps(dot_sum3, dot_sum4),
     );
     let norm_a_sum = _mm256_add_ps(
         _mm256_add_ps(norm_a_sum1, norm_a_sum2),
-        _mm256_add_ps(norm_a_sum3, norm_a_sum4)
+        _mm256_add_ps(norm_a_sum3, norm_a_sum4),
     );
     let norm_b_sum = _mm256_add_ps(
         _mm256_add_ps(norm_b_sum1, norm_b_sum2),
-        _mm256_add_ps(norm_b_sum3, norm_b_sum4)
+        _mm256_add_ps(norm_b_sum3, norm_b_sum4),
     );
-    
+
     // 水平求和
     let mut dot_product = horizontal_sum_avx2(dot_sum);
     let mut norm_a = horizontal_sum_avx2(norm_a_sum);
     let mut norm_b = horizontal_sum_avx2(norm_b_sum);
-    
+
     // 处理剩余元素（8 elements at a time for remainder >= 8）
     let offset_remainder = chunks * 32;
     let remainder_chunks = remainder / 8;
     let mut dot_sum_rem = _mm256_setzero_ps();
     let mut norm_a_sum_rem = _mm256_setzero_ps();
     let mut norm_b_sum_rem = _mm256_setzero_ps();
-    
+
     for i in 0..remainder_chunks {
         let offset = offset_remainder + i * 8;
         let a_vec = _mm256_loadu_ps(a.as_ptr().add(offset));
         let b_vec = _mm256_loadu_ps(b.as_ptr().add(offset));
-        
+
         dot_sum_rem = _mm256_fmadd_ps(a_vec, b_vec, dot_sum_rem);
         norm_a_sum_rem = _mm256_fmadd_ps(a_vec, a_vec, norm_a_sum_rem);
         norm_b_sum_rem = _mm256_fmadd_ps(b_vec, b_vec, norm_b_sum_rem);
     }
-    
+
     dot_product += horizontal_sum_avx2(dot_sum_rem);
     norm_a += horizontal_sum_avx2(norm_a_sum_rem);
     norm_b += horizontal_sum_avx2(norm_b_sum_rem);
-    
+
     // 标量处理最后的元素（< 8 elements）
     for i in (offset_remainder + remainder_chunks * 8)..n {
         dot_product += a[i] * b[i];
         norm_a += a[i] * a[i];
         norm_b += b[i] * b[i];
     }
-    
+
     compute_cosine_similarity(dot_product, norm_a, norm_b)
 }
 
@@ -167,40 +167,40 @@ unsafe fn cosine_similarity_sse(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     let chunks = n / 4;
     let remainder = n % 4;
-    
+
     let mut dot_product = 0.0f32;
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
-    
+
     // SSE并行处理4个元素
     let mut dot_sum = _mm_setzero_ps();
     let mut norm_a_sum = _mm_setzero_ps();
     let mut norm_b_sum = _mm_setzero_ps();
-    
+
     for i in 0..chunks {
         let offset = i * 4;
         let a_vec = _mm_loadu_ps(a.as_ptr().add(offset));
         let b_vec = _mm_loadu_ps(b.as_ptr().add(offset));
-        
+
         // 点积
         dot_sum = _mm_add_ps(dot_sum, _mm_mul_ps(a_vec, b_vec));
         // 计算范数平方
         norm_a_sum = _mm_add_ps(norm_a_sum, _mm_mul_ps(a_vec, a_vec));
         norm_b_sum = _mm_add_ps(norm_b_sum, _mm_mul_ps(b_vec, b_vec));
     }
-    
+
     // 水平求和
     dot_product = horizontal_sum_sse(dot_sum);
     norm_a = horizontal_sum_sse(norm_a_sum);
     norm_b = horizontal_sum_sse(norm_b_sum);
-    
+
     // 处理剩余元素
     for i in (n - remainder)..n {
         dot_product += a[i] * b[i];
         norm_a += a[i] * a[i];
         norm_b += b[i] * b[i];
     }
-    
+
     compute_cosine_similarity(dot_product, norm_a, norm_b)
 }
 
@@ -209,13 +209,13 @@ fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut dot_product = 0.0f32;
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
-    
+
     for i in 0..a.len() {
         dot_product += a[i] * b[i];
         norm_a += a[i] * a[i];
         norm_b += b[i] * b[i];
     }
-    
+
     compute_cosine_similarity(dot_product, norm_a, norm_b)
 }
 
@@ -285,10 +285,7 @@ unsafe fn cosine_similarity_neon(a: &[f32], b: &[f32]) -> f32 {
     }
 
     // Combine 4-way accumulators
-    let dot_sum = vaddq_f32(
-        vaddq_f32(dot_sum1, dot_sum2),
-        vaddq_f32(dot_sum3, dot_sum4),
-    );
+    let dot_sum = vaddq_f32(vaddq_f32(dot_sum1, dot_sum2), vaddq_f32(dot_sum3, dot_sum4));
     let norm_a_sum = vaddq_f32(
         vaddq_f32(norm_a_sum1, norm_a_sum2),
         vaddq_f32(norm_a_sum3, norm_a_sum4),
@@ -428,7 +425,7 @@ mod tests {
     fn test_cosine_similarity_large_vectors() {
         let a: Vec<f32> = (0..1000).map(|i| (i as f32).sin()).collect();
         let b: Vec<f32> = (0..1000).map(|i| (i as f32).cos()).collect();
-        
+
         let sim = cosine_similarity(&a, &b);
         assert!((-1.0..=1.0).contains(&sim));
     }
@@ -438,11 +435,15 @@ mod tests {
         // Use large but manageable values
         let a = vec![1e10_f32, -1e10_f32, 1000.0];
         let b = vec![-1e10_f32, 1e10_f32, 2000.0];
-        
+
         let sim = cosine_similarity(&a, &b);
-        assert!((-1.0..=1.0).contains(&sim), "Similarity {} out of range", sim);
+        assert!(
+            (-1.0..=1.0).contains(&sim),
+            "Similarity {} out of range",
+            sim
+        );
         assert!(sim.is_finite(), "Similarity is not finite: {}", sim);
-        
+
         // Should be negative due to opposite directions
         assert!(sim < 0.0, "Expected negative similarity, got {}", sim);
     }
@@ -451,7 +452,7 @@ mod tests {
     fn test_cosine_similarity_zero_vectors() {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
-        
+
         let sim = cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
     }
@@ -461,7 +462,7 @@ mod tests {
         // Test with very small numbers
         let a = vec![1e-10, 2e-10, 3e-10];
         let b = vec![2e-10, 4e-10, 6e-10];
-        
+
         let dist = cosine_distance(&a, &b);
         assert!((0.0..=2.0).contains(&dist));
         assert!(dist.is_finite());
@@ -472,9 +473,9 @@ mod tests {
         // Test that SIMD and scalar versions produce same results
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b = vec![8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
-        
+
         let sim = cosine_similarity(&a, &b);
-        
+
         // Verify result is reasonable
         assert!((-1.0..=1.0).contains(&sim));
         assert!(sim.is_finite());

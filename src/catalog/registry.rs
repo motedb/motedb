@@ -1,6 +1,6 @@
 /// Table registry for managing table metadata
 use crate::error::{Result, StorageError};
-use crate::types::{TableSchema, IndexDef};
+use crate::types::{IndexDef, TableSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -45,20 +45,18 @@ impl TableRegistry {
     /// Create a new table registry
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Result<Self> {
         let persist_path = data_dir.as_ref().join("catalog.bin");
-        
+
         // Create directory if it doesn't exist
         if let Some(parent) = persist_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(StorageError::Io)?;
+            fs::create_dir_all(parent).map_err(StorageError::Io)?;
         }
-        
+
         // Try to load existing metadata
         let metadata = if persist_path.exists() {
-            let data = fs::read(&persist_path)
-                .map_err(StorageError::Io)?;
+            let data = fs::read(&persist_path).map_err(StorageError::Io)?;
             let mut meta: RegistryMetadata = bincode::deserialize(&data)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            
+
             // Rebuild column maps after deserialization
             for schema in meta.tables.values_mut() {
                 schema.rebuild_column_map();
@@ -93,7 +91,9 @@ impl TableRegistry {
 
     /// Create a new table
     pub fn create_table(&self, mut schema: TableSchema) -> Result<()> {
-        let mut meta = self.metadata.write()
+        let mut meta = self
+            .metadata
+            .write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         // Check if table already exists
@@ -148,15 +148,15 @@ impl TableRegistry {
 
     /// Drop a table
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
-        let mut meta = self.metadata.write()
+        let mut meta = self
+            .metadata
+            .write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         // Check if table exists
-        let schema = meta.tables.remove(table_name)
-            .ok_or_else(|| StorageError::InvalidData(format!(
-                "Table '{}' not found",
-                table_name
-            )))?;
+        let schema = meta.tables.remove(table_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' not found", table_name))
+        })?;
 
         // Remove indexes
         for index in &schema.indexes {
@@ -195,21 +195,23 @@ impl TableRegistry {
         }
 
         // Slow path: read from metadata, populate cache
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        let schema = meta.tables.get(table_name)
-            .ok_or_else(|| StorageError::InvalidData(format!(
-                "Table '{}' not found",
-                table_name
-            )))?;
+        let schema = meta.tables.get(table_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' not found", table_name))
+        })?;
 
         let arc_schema = Arc::new(schema.clone());
 
         // Populate cache (write lock only for insertion)
         {
             let mut cache = self.schema_cache.write();
-            cache.entry(table_name.to_string()).or_insert(Arc::clone(&arc_schema));
+            cache
+                .entry(table_name.to_string())
+                .or_insert(Arc::clone(&arc_schema));
         }
 
         Ok(arc_schema)
@@ -217,7 +219,9 @@ impl TableRegistry {
 
     /// List all tables
     pub fn list_tables(&self) -> Result<Vec<String>> {
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         Ok(meta.tables.keys().cloned().collect())
@@ -225,7 +229,8 @@ impl TableRegistry {
 
     /// Check if table exists
     pub fn table_exists(&self, table_name: &str) -> bool {
-        self.metadata.read()
+        self.metadata
+            .read()
             .map(|meta| meta.tables.contains_key(table_name))
             .unwrap_or(false)
     }
@@ -233,7 +238,9 @@ impl TableRegistry {
     /// Add index to existing table
     pub fn add_index(&self, index: IndexDef) -> Result<()> {
         let table_name = index.table_name.clone();
-        let mut meta = self.metadata.write()
+        let mut meta = self
+            .metadata
+            .write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         // Check if index already exists
@@ -285,34 +292,33 @@ impl TableRegistry {
 
     /// Get index definition
     pub fn get_index(&self, index_name: &str) -> Result<IndexDef> {
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        let (table_name, _column_name) = meta.index_map.get(index_name)
-            .ok_or_else(|| StorageError::InvalidData(format!(
-                "Index '{}' not found",
-                index_name
-            )))?;
+        let (table_name, _column_name) = meta.index_map.get(index_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Index '{}' not found", index_name))
+        })?;
 
-        let table = meta.tables.get(table_name)
-            .ok_or_else(|| StorageError::InvalidData(format!(
-                "Table '{}' not found",
-                table_name
-            )))?;
+        let table = meta.tables.get(table_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' not found", table_name))
+        })?;
 
-        table.indexes.iter()
+        table
+            .indexes
+            .iter()
             .find(|idx| idx.name == index_name)
             .cloned()
-            .ok_or_else(|| StorageError::InvalidData(format!(
-                "Index '{}' not found",
-                index_name
-            )))
+            .ok_or_else(|| StorageError::InvalidData(format!("Index '{}' not found", index_name)))
     }
 
     /// 🔧 FIX: Find vector index by table and column name
     /// Returns the actual index name (user-specified, not auto-generated)
     pub fn find_vector_index(&self, table_name: &str, column_name: &str) -> Result<String> {
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         // Search through index_map for a matching (table, column) pair
@@ -351,10 +357,14 @@ impl TableRegistry {
         }
 
         // Slow path: acquire metadata lock, populate cache
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        let id = meta.table_ids.get(table_name)
+        let id = meta
+            .table_ids
+            .get(table_name)
             .copied()
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?;
 
@@ -371,15 +381,15 @@ impl TableRegistry {
     ///
     /// Uses reverse index for O(1) lookup instead of linear scan.
     pub fn get_table_name_by_id(&self, table_id: u32) -> Result<String> {
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        meta.id_to_name.get(&table_id)
+        meta.id_to_name
+            .get(&table_id)
             .cloned()
-            .ok_or_else(|| StorageError::InvalidData(format!(
-                "No table found for id {}",
-                table_id
-            )))
+            .ok_or_else(|| StorageError::InvalidData(format!("No table found for id {}", table_id)))
     }
 
     /// Get or assign a table_id for the "_default" internal table.
@@ -387,7 +397,9 @@ impl TableRegistry {
     /// Called during database creation/opening to ensure the implicit
     /// "_default" table always has a stable id (= 0).
     pub fn ensure_default_table_id(&self) -> Result<()> {
-        let mut meta = self.metadata.write()
+        let mut meta = self
+            .metadata
+            .write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
         if !meta.table_ids.contains_key("_default") {
@@ -412,9 +424,12 @@ impl TableRegistry {
     /// Called after each insert that uses AUTO_INCREMENT.
     /// The counter is batch-persisted during checkpoint for efficiency.
     pub fn update_auto_increment_counter(&self, table_name: &str, value: i64) -> Result<()> {
-        let mut meta = self.metadata.write()
+        let mut meta = self
+            .metadata
+            .write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
-        meta.auto_increment_counters.insert(table_name.to_string(), value);
+        meta.auto_increment_counters
+            .insert(table_name.to_string(), value);
         drop(meta);
         // Note: don't persist on every update — too expensive.
         // Caller (checkpoint) will persist periodically.
@@ -428,11 +443,13 @@ impl TableRegistry {
 
     /// Persist metadata to disk (atomic: write to temp, fsync, rename)
     fn persist(&self) -> Result<()> {
-        let meta = self.metadata.read()
+        let meta = self
+            .metadata
+            .read()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        let data = bincode::serialize(&*meta)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let data =
+            bincode::serialize(&*meta).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         let tmp_path = self.persist_path.with_extension("bin.tmp");
         {
@@ -490,8 +507,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let registry = TableRegistry::new(temp_dir.path()).unwrap();
 
-        registry.create_table(TableSchema::new("t1".into(), vec![])).unwrap();
-        registry.create_table(TableSchema::new("t2".into(), vec![])).unwrap();
+        registry
+            .create_table(TableSchema::new("t1".into(), vec![]))
+            .unwrap();
+        registry
+            .create_table(TableSchema::new("t2".into(), vec![]))
+            .unwrap();
 
         let tables = registry.list_tables().unwrap();
         assert_eq!(tables.len(), 2);
@@ -532,7 +553,7 @@ mod tests {
     #[test]
     fn test_persistence() {
         let temp_dir = tempfile::tempdir().unwrap();
-        
+
         // Create registry and add table
         {
             let registry = TableRegistry::new(temp_dir.path()).unwrap();

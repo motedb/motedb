@@ -17,12 +17,12 @@
 //!   - crc32 covers [compress_flag][data_len][data]
 //! ```
 
+use super::BlobRef;
 use crate::{Result, StorageError};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Write, Seek, SeekFrom};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use super::BlobRef;
 
 const BLOB_MAGIC: u32 = 0x424C4F42; // "BLOB"
 const BLOB_VERSION_V2: u32 = 2;
@@ -54,7 +54,7 @@ pub struct BlobStore {
 /// Single blob file (immutable after close)
 struct BlobFile {
     file_id: u32,
-    writer: BufWriter<File>,  // 🚀 使用 BufWriter 减少系统调用
+    writer: BufWriter<File>, // 🚀 使用 BufWriter 减少系统调用
     offset: u64,
 }
 
@@ -88,14 +88,18 @@ impl BlobStore {
     /// Must be called before any SSTable referencing the blobs is synced,
     /// otherwise a crash could leave the SSTable pointing to incomplete blob data.
     pub fn flush(&self) -> Result<()> {
-        let mut state = self.state.lock()
+        let mut state = self
+            .state
+            .lock()
             .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
         state.current_file.flush()
     }
 
     /// Write large value to blob file
     pub fn put(&self, data: &[u8]) -> Result<BlobRef> {
-        let mut state = self.state.lock()
+        let mut state = self
+            .state
+            .lock()
             .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
 
         // Check if need to rotate file
@@ -155,10 +159,13 @@ impl BlobStore {
 
             // Decompress if needed
             if compress_flag == BLOB_COMPRESS_ZSTD {
-                let decompressed = zstd::decode_all(&stored_data[..])
-                    .map_err(|e| StorageError::InvalidData(format!("Blob decompress failed: {}", e)))?;
+                let decompressed = zstd::decode_all(&stored_data[..]).map_err(|e| {
+                    StorageError::InvalidData(format!("Blob decompress failed: {}", e))
+                })?;
                 if decompressed.len() != original_size as usize {
-                    return Err(StorageError::InvalidData("Blob decompressed size mismatch".into()));
+                    return Err(StorageError::InvalidData(
+                        "Blob decompressed size mismatch".into(),
+                    ));
                 }
                 Ok(decompressed)
             } else {
@@ -258,7 +265,7 @@ impl BlobStore {
             let _ = std::fs::remove_file(&path);
             return Ok(());
         }
-        let version = u32::from_le_bytes(header[4..8].try_into().unwrap_or([0,0,0,0]));
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap_or([0, 0, 0, 0]));
 
         let mut valid_offset: u64 = 8; // header size
 
@@ -316,7 +323,11 @@ impl BlobStore {
                 crc_input.extend_from_slice(&data);
                 let computed_crc = crc32fast::hash(&crc_input);
                 if stored_crc != computed_crc {
-                    debug_log!("[BlobStore] CRC mismatch in blob file {}, truncating to offset {}", last_file_id, entry_start);
+                    debug_log!(
+                        "[BlobStore] CRC mismatch in blob file {}, truncating to offset {}",
+                        last_file_id,
+                        entry_start
+                    );
                     break;
                 }
 
@@ -351,7 +362,11 @@ impl BlobStore {
 
                 let computed_crc = crc32fast::hash(&data);
                 if stored_crc != computed_crc {
-                    debug_log!("[BlobStore] CRC mismatch in blob file {}, truncating to offset {}", last_file_id, valid_offset);
+                    debug_log!(
+                        "[BlobStore] CRC mismatch in blob file {}, truncating to offset {}",
+                        last_file_id,
+                        valid_offset
+                    );
                     break;
                 }
 
@@ -365,8 +380,12 @@ impl BlobStore {
             drop(file);
             let file = OpenOptions::new().write(true).open(&path)?;
             file.set_len(valid_offset)?;
-            debug_log!("[BlobStore] Recovered blob file {}: truncated from {} to {} bytes",
-                     last_file_id, file_size, valid_offset);
+            debug_log!(
+                "[BlobStore] Recovered blob file {}: truncated from {} to {} bytes",
+                last_file_id,
+                file_size,
+                valid_offset
+            );
         }
 
         Ok(())
@@ -379,8 +398,13 @@ impl BlobStore {
     /// with zero live references is deleted.
     ///
     /// This should be called periodically or after major compaction cycles.
-    pub fn gc_unreferenced_blobs(&self, live_blob_refs: &std::collections::HashSet<(u32, u64)>) -> Result<usize> {
-        let state = self.state.lock()
+    pub fn gc_unreferenced_blobs(
+        &self,
+        live_blob_refs: &std::collections::HashSet<(u32, u64)>,
+    ) -> Result<usize> {
+        let state = self
+            .state
+            .lock()
             .map_err(|_| StorageError::Lock("BlobStore state lock poisoned".into()))?;
         let current_file_id = state.current_file_id;
         drop(state);
@@ -439,13 +463,15 @@ impl BlobFile {
         self.writer.get_mut().sync_data()?;
         Ok(())
     }
-    
+
     fn write_blob(&mut self, data: &[u8]) -> Result<BlobRef> {
         // Prevent u32 overflow for blob size
         if data.len() > u32::MAX as usize {
-            return Err(crate::StorageError::InvalidData(
-                format!("Blob too large: {} bytes (max {})", data.len(), u32::MAX)
-            ));
+            return Err(crate::StorageError::InvalidData(format!(
+                "Blob too large: {} bytes (max {})",
+                data.len(),
+                u32::MAX
+            )));
         }
         let original_size = data.len() as u32;
         let offset = self.offset;
@@ -548,7 +574,11 @@ mod tests {
         let file_size = std::fs::metadata(&blob_path).unwrap().len();
         // File: 8 (header) + 4 (orig_size) + 1 (flag) + 4 (data_len) + compressed + 4 (crc)
         // For 100KB of repeated bytes, Zstd-1 should compress to ~1KB or less
-        assert!(file_size < data.len() as u64 / 2,
-            "Blob file ({}) should be much smaller than raw data ({})", file_size, data.len());
+        assert!(
+            file_size < data.len() as u64 / 2,
+            "Blob file ({}) should be much smaller than raw data ({})",
+            file_size,
+            data.len()
+        );
     }
 }

@@ -9,13 +9,13 @@
 //! - **批量操作**: 高性能批量插入和索引构建
 //! - **性能监控**: 统计信息和性能分析
 
-use crate::database::{MoteDB, TransactionStats};
-use crate::StorageError;
 use crate::database::indexes::VectorIndexStats;
-use crate::sql::StreamingQueryResult;
+use crate::database::{MoteDB, TransactionStats};
 use crate::sql::ast::Statement;
-use crate::types::{Value, Row, RowId, SqlRow};
-use crate::{Result, DBConfig};
+use crate::sql::StreamingQueryResult;
+use crate::types::{Row, RowId, SqlRow, Value};
+use crate::StorageError;
+use crate::{DBConfig, Result};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -113,7 +113,7 @@ impl Database {
     // ============================================================================
     // 1. 数据库生命周期管理
     // ============================================================================
-    
+
     /// 创建新数据库
     ///
     /// # Examples
@@ -125,7 +125,9 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
+                NonZeroUsize::new(256).unwrap(),
+            ))),
             query_executor,
         })
     }
@@ -147,7 +149,9 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
+                NonZeroUsize::new(256).unwrap(),
+            ))),
             query_executor,
         })
     }
@@ -163,7 +167,9 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
+                NonZeroUsize::new(256).unwrap(),
+            ))),
             query_executor,
         })
     }
@@ -180,7 +186,9 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(NonZeroUsize::new(256).unwrap()))),
+            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
+                NonZeroUsize::new(256).unwrap(),
+            ))),
             query_executor,
         })
     }
@@ -252,7 +260,11 @@ impl Database {
     /// // All subsequent operations will return an error
     /// ```
     pub fn close(&self) -> Result<()> {
-        if self.inner.is_closed.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .inner
+            .is_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(());
         }
 
@@ -261,7 +273,10 @@ impl Database {
 
         // Wait for threads to actually finish before checkpoint to prevent
         // deadlock (threads may hold locks that checkpoint needs).
-        if !self.inner.wait_for_background_threads_stop(std::time::Duration::from_secs(30)) {
+        if !self
+            .inner
+            .wait_for_background_threads_stop(std::time::Duration::from_secs(30))
+        {
             warn_log!("[close] Background threads did not stop within timeout");
         }
 
@@ -273,12 +288,16 @@ impl Database {
             let _ = entry.value().flush_buffer();
             // Compact to a single segment so the reopen sees all data in one place.
             while entry.value().segment_count() >= 2 {
-                if entry.value().force_compact_all().is_err() { break; }
+                if entry.value().force_compact_all().is_err() {
+                    break;
+                }
             }
         }
 
         let result = self.inner.checkpoint_full();
-        self.inner.is_closed.store(true, std::sync::atomic::Ordering::Release);
+        self.inner
+            .is_closed
+            .store(true, std::sync::atomic::Ordering::Release);
         // Release the exclusive flock so a subsequent open() on the same
         // directory (or another process) can acquire it. Without this, the
         // lock is held until the MoteDB is dropped — which may be much later
@@ -342,8 +361,14 @@ impl Database {
 
         // 🛡️ Guard: reject all operations after close() (including read paths
         // that bypass the inner executor's own checks).
-        if self.inner.is_closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(crate::StorageError::InvalidData("Database is closed".into()));
+        if self
+            .inner
+            .is_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::StorageError::InvalidData(
+                "Database is closed".into(),
+            ));
         }
 
         // In transaction mode, skip fast INSERT paths so rows go through
@@ -359,16 +384,24 @@ impl Database {
         if let Some(kw) = trimmed.as_bytes().get(0..6) {
             match kw {
                 b"INSERT" | b"insert" if !in_txn => {
-                    if let Some(r) = self.try_fast_insert(sql)? { return Ok(r); }
+                    if let Some(r) = self.try_fast_insert(sql)? {
+                        return Ok(r);
+                    }
                 }
                 b"UPDATE" | b"update" if !in_txn => {
-                    if let Some(r) = self.try_fast_update(sql)? { return Ok(r); }
+                    if let Some(r) = self.try_fast_update(sql)? {
+                        return Ok(r);
+                    }
                 }
                 b"DELETE" | b"delete" if !in_txn => {
-                    if let Some(r) = self.try_fast_delete(sql)? { return Ok(r); }
+                    if let Some(r) = self.try_fast_delete(sql)? {
+                        return Ok(r);
+                    }
                 }
                 b"SELECT" | b"select" => {
-                    if let Some(r) = self.try_fast_select(sql)? { return Ok(r); }
+                    if let Some(r) = self.try_fast_select(sql)? {
+                        return Ok(r);
+                    }
                 }
                 _ => {}
             }
@@ -390,7 +423,13 @@ impl Database {
                     let mut parser = Parser::new(tokens);
                     let stmt = parser.parse()?;
                     let stmt_arc = Arc::new(stmt);
-                    cache.put(sql.to_string(), CachedStmt { stmt: Arc::clone(&stmt_arc), fast_pk: None });
+                    cache.put(
+                        sql.to_string(),
+                        CachedStmt {
+                            stmt: Arc::clone(&stmt_arc),
+                            fast_pk: None,
+                        },
+                    );
                     stmt_arc
                 }
             }
@@ -451,7 +490,13 @@ impl Database {
                     let mut parser = Parser::new(tokens);
                     let stmt = parser.parse()?;
                     let stmt_arc = Arc::new(stmt);
-                    cache.put(sql.to_string(), CachedStmt { stmt: Arc::clone(&stmt_arc), fast_pk: None });
+                    cache.put(
+                        sql.to_string(),
+                        CachedStmt {
+                            stmt: Arc::clone(&stmt_arc),
+                            fast_pk: None,
+                        },
+                    );
                     (stmt_arc, true)
                 }
             }
@@ -479,11 +524,15 @@ impl Database {
         self.query_executor.reset_last_insert_id();
 
         // Validate parameter count
-        if !params.is_empty() || matches!(statement.as_ref(), Statement::Select(s) if s.where_clause.is_some()) {
+        if !params.is_empty()
+            || matches!(statement.as_ref(), Statement::Select(s) if s.where_clause.is_some())
+        {
             let max_idx = crate::sql::QueryExecutor::max_parameter_index(&statement);
             if max_idx > 0 && params.len() < max_idx {
                 return Err(crate::error::MoteDBError::InvalidArgument(format!(
-                    "Query has {} parameter(s) but only {} were provided", max_idx, params.len()
+                    "Query has {} parameter(s) but only {} were provided",
+                    max_idx,
+                    params.len()
                 )));
             }
         }
@@ -496,25 +545,31 @@ impl Database {
 
     /// Detect if a statement is a simple PK SELECT pattern.
     /// Returns pre-computed FastPkMeta if it matches.
-    fn detect_fast_pk_pattern(
-        statement: &Statement,
-        db: &MoteDB,
-    ) -> Result<Option<FastPkMeta>> {
-        use crate::sql::ast::{Statement as S, Expr, BinaryOperator, TableRef, SelectColumn};
+    fn detect_fast_pk_pattern(statement: &Statement, db: &MoteDB) -> Result<Option<FastPkMeta>> {
+        use crate::sql::ast::{BinaryOperator, Expr, SelectColumn, Statement as S, TableRef};
 
         let (stmt_type, table_ref, where_expr, select_cols) = match statement {
-            S::Select(s) => ("select",
-                s.from.as_ref().and_then(|t| match t { TableRef::Table { name, .. } => Some(name.as_str()), _ => None }),
+            S::Select(s) => (
+                "select",
+                s.from.as_ref().and_then(|t| match t {
+                    TableRef::Table { name, .. } => Some(name.as_str()),
+                    _ => None,
+                }),
                 s.where_clause.as_ref(),
-                Some(s.columns.as_slice())),
-            S::Update(s) => ("update",
+                Some(s.columns.as_slice()),
+            ),
+            S::Update(s) => (
+                "update",
                 Some(s.table.as_str()),
                 s.where_clause.as_ref(),
-                None),
-            S::Delete(s) => ("delete",
+                None,
+            ),
+            S::Delete(s) => (
+                "delete",
                 Some(s.table.as_str()),
                 s.where_clause.as_ref(),
-                None),
+                None,
+            ),
             _ => return Ok(None),
         };
 
@@ -524,13 +579,15 @@ impl Database {
         };
 
         let (col_name, param_idx) = match where_expr {
-            Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) => {
-                match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(c), Expr::Parameter(idx)) => (c.as_str(), *idx),
-                    (Expr::Parameter(idx), Expr::Column(c)) => (c.as_str(), *idx),
-                    _ => return Ok(None),
-                }
-            }
+            Some(Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            }) => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Parameter(idx)) => (c.as_str(), *idx),
+                (Expr::Parameter(idx), Expr::Column(c)) => (c.as_str(), *idx),
+                _ => return Ok(None),
+            },
             _ => return Ok(None),
         };
 
@@ -539,31 +596,43 @@ impl Database {
             Err(_) => return Ok(None),
         };
 
-        let is_pk = schema.primary_key().map(|pk| {
-            let pk_bare = pk.rsplit('.').next().unwrap_or(pk);
-            pk_bare == col_name || pk == col_name
-        }).unwrap_or(false);
+        let is_pk = schema
+            .primary_key()
+            .map(|pk| {
+                let pk_bare = pk.rsplit('.').next().unwrap_or(pk);
+                pk_bare == col_name || pk == col_name
+            })
+            .unwrap_or(false);
 
         // 🔑 Only optimize PK lookups. Non-PK WHERE clauses (e.g. WHERE name = ?)
         // must NOT use the fast PK path — it would try to resolve the column as
         // a PK and return Modification/empty instead of a proper scan.
-        if !is_pk { return Ok(None); }
+        if !is_pk {
+            return Ok(None);
+        }
 
-        let is_star = select_cols.map_or(false, |cols| cols.len() == 1 && matches!(cols[0], SelectColumn::Star));
+        let is_star = select_cols
+            .is_some_and(|cols| cols.len() == 1 && matches!(cols[0], SelectColumn::Star));
 
         let select_col_positions: Vec<usize> = if let Some(cols) = select_cols {
             if is_star {
                 vec![]
             } else {
-                cols.iter().filter_map(|col_spec| {
-                    let cname = match col_spec {
-                        SelectColumn::Column(n) => n.as_str(),
-                        SelectColumn::ColumnWithAlias(n, _) => n.as_str(),
-                        _ => return None,
-                    };
-                    let lookup = if cname.contains('.') { cname.rsplit('.').next().unwrap_or(cname) } else { cname };
-                    schema.get_column_position(lookup)
-                }).collect()
+                cols.iter()
+                    .filter_map(|col_spec| {
+                        let cname = match col_spec {
+                            SelectColumn::Column(n) => n.as_str(),
+                            SelectColumn::ColumnWithAlias(n, _) => n.as_str(),
+                            _ => return None,
+                        };
+                        let lookup = if cname.contains('.') {
+                            cname.rsplit('.').next().unwrap_or(cname)
+                        } else {
+                            cname
+                        };
+                        schema.get_column_position(lookup)
+                    })
+                    .collect()
             }
         } else {
             vec![]
@@ -572,13 +641,22 @@ impl Database {
         // For UPDATE: detect SET col = ? patterns
         let set_param_positions: Vec<(usize, usize)> = if stmt_type == "update" {
             if let S::Update(s) = statement {
-                s.assignments.iter().filter_map(|(col_name, expr)| {
-                    if let Expr::Parameter(idx) = expr {
-                        schema.get_column_position(col_name).map(|pos| (pos, *idx))
-                    } else { None }
-                }).collect()
-            } else { vec![] }
-        } else { vec![] };
+                s.assignments
+                    .iter()
+                    .filter_map(|(col_name, expr)| {
+                        if let Expr::Parameter(idx) = expr {
+                            schema.get_column_position(col_name).map(|pos| (pos, *idx))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
 
         Ok(Some(FastPkMeta {
             stmt_type,
@@ -601,9 +679,12 @@ impl Database {
     ) -> Result<Option<StreamingQueryResult>> {
         let pk_value = match params.get(meta.param_idx - 1) {
             Some(v) => v,
-            None => return Err(crate::error::MoteDBError::InvalidArgument(format!(
-                "Parameter ?{} is unbound", meta.param_idx
-            ))),
+            None => {
+                return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                    "Parameter ?{} is unbound",
+                    meta.param_idx
+                )))
+            }
         };
 
         // Resolve PK → row_id.
@@ -616,11 +697,18 @@ impl Database {
         let row_id = if meta.is_auto_increment {
             match pk_value {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
-                _ => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+                _ => {
+                    return Ok(Some(StreamingQueryResult::Modification {
+                        affected_rows: 0,
+                    }))
+                }
             }
         } else {
             let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-            match self.inner.pk_lookup.get(&meta.table_name)
+            match self
+                .inner
+                .pk_lookup
+                .get(&meta.table_name)
                 .and_then(|lookup| lookup.get_pk(&pk_key))
             {
                 Some(rid) => rid,
@@ -632,16 +720,31 @@ impl Database {
             "delete" => {
                 let row = match self.inner.get_table_row(&meta.table_name, row_id)? {
                     Some(r) => r,
-                    None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+                    None => {
+                        return Ok(Some(StreamingQueryResult::Modification {
+                            affected_rows: 0,
+                        }))
+                    }
                 };
-                self.inner.delete_row_from_table(&meta.table_name, row_id, row)?;
-                Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
+                self.inner
+                    .delete_row_from_table(&meta.table_name, row_id, row)?;
+                Ok(Some(StreamingQueryResult::Modification {
+                    affected_rows: 1,
+                }))
             }
             "update" => {
-                let old_row_arc = match self.inner.get_table_row_arc(&meta.table_name, row_id, &meta.schema)? {
-                    Some(r) => r,
-                    None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
-                };
+                let old_row_arc =
+                    match self
+                        .inner
+                        .get_table_row_arc(&meta.table_name, row_id, &meta.schema)?
+                    {
+                        Some(r) => r,
+                        None => {
+                            return Ok(Some(StreamingQueryResult::Modification {
+                                affected_rows: 0,
+                            }))
+                        }
+                    };
                 let mut new_row = (*old_row_arc).clone();
                 for &(col_pos, param_idx) in &meta.set_param_positions {
                     if let Some(new_val) = params.get(param_idx - 1) {
@@ -652,18 +755,30 @@ impl Database {
                     }
                 }
                 // Pass &Arc<Row> as &Row — avoids cloning old_row
-                self.inner.update_row_with_schema_ref(&meta.table_name, row_id, &*old_row_arc, new_row, &meta.schema)?;
-                Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
+                self.inner.update_row_with_schema_ref(
+                    &meta.table_name,
+                    row_id,
+                    &old_row_arc,
+                    new_row,
+                    &meta.schema,
+                )?;
+                Ok(Some(StreamingQueryResult::Modification {
+                    affected_rows: 1,
+                }))
             }
             _ => {
                 // SELECT
-                let row_opt = self.inner.get_table_row_arc(&meta.table_name, row_id, &meta.schema)?;
+                let row_opt =
+                    self.inner
+                        .get_table_row_arc(&meta.table_name, row_id, &meta.schema)?;
                 let result_vec: Vec<Vec<Value>> = match row_opt {
                     Some(row_arc) => {
                         if meta.is_star {
                             vec![(*row_arc).clone()]
                         } else {
-                            vec![meta.select_col_positions.iter()
+                            vec![meta
+                                .select_col_positions
+                                .iter()
                                 .map(|&pos| row_arc.get(pos).cloned().unwrap_or(Value::Null))
                                 .collect()]
                         }
@@ -678,7 +793,6 @@ impl Database {
         }
     }
 
-
     /// Fast INSERT path: parses `INSERT INTO <table> VALUES (<literals>)` directly
     /// from the string without going through the full tokenizer + parser + cache.
     ///
@@ -686,31 +800,45 @@ impl Database {
     fn try_fast_insert(&self, sql: &str) -> Result<Option<StreamingQueryResult>> {
         // Quick check: must start with "INSERT" (case-insensitive)
         let trimmed = sql.trim_start();
-        if !trimmed.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"INSERT")).unwrap_or(false) {
+        if !trimmed
+            .as_bytes()
+            .get(0..6)
+            .map(|b| b.eq_ignore_ascii_case(b"INSERT"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
 
         // Find "INSERT INTO <table>"
         let rest = &trimmed[6..].trim_start();
-        if !rest.as_bytes().get(0..4).map(|b| b.eq_ignore_ascii_case(b"INTO")).unwrap_or(false) {
+        if !rest
+            .as_bytes()
+            .get(0..4)
+            .map(|b| b.eq_ignore_ascii_case(b"INTO"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let after_into = rest[4..].trim_start();
 
         // Extract table name (skip optional column list)
-        let (table_name, after_table) = match after_into.find(|c: char| c.is_whitespace() || c == '(') {
-            Some(pos) => (&after_into[..pos], after_into[pos..].trim_start()),
-            None => return Ok(None),
-        };
-        if table_name.is_empty() { return Ok(None); }
+        let (table_name, after_table) =
+            match after_into.find(|c: char| c.is_whitespace() || c == '(') {
+                Some(pos) => (&after_into[..pos], after_into[pos..].trim_start()),
+                None => return Ok(None),
+            };
+        if table_name.is_empty() {
+            return Ok(None);
+        }
 
         // Parse optional column list: INSERT INTO t (col1, col2) VALUES ...
         let (col_names, after_cols) = if after_table.starts_with('(') {
             match after_table.find(')') {
                 Some(p) => {
                     let col_str = &after_table[1..p];
-                    let cols: Vec<String> = col_str.split(',').map(|s| s.trim().to_string()).collect();
-                    (Some(cols), after_table[p+1..].trim_start())
+                    let cols: Vec<String> =
+                        col_str.split(',').map(|s| s.trim().to_string()).collect();
+                    (Some(cols), after_table[p + 1..].trim_start())
                 }
                 None => return Ok(None),
             }
@@ -719,7 +847,12 @@ impl Database {
         };
 
         // Must be followed by "VALUES"
-        if !after_cols.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"VALUES")).unwrap_or(false) {
+        if !after_cols
+            .as_bytes()
+            .get(0..6)
+            .map(|b| b.eq_ignore_ascii_case(b"VALUES"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let values_part = after_cols[6..].trim_start();
@@ -737,11 +870,20 @@ impl Database {
 
         while pos < bytes.len() {
             // Skip whitespace and commas
-            while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\n' || bytes[pos] == b'\t' || bytes[pos] == b',') {
+            while pos < bytes.len()
+                && (bytes[pos] == b' '
+                    || bytes[pos] == b'\n'
+                    || bytes[pos] == b'\t'
+                    || bytes[pos] == b',')
+            {
                 pos += 1;
             }
-            if pos >= bytes.len() { break; }
-            if bytes[pos] != b'(' { return Ok(None); }
+            if pos >= bytes.len() {
+                break;
+            }
+            if bytes[pos] != b'(' {
+                return Ok(None);
+            }
             pos += 1; // skip '('
 
             // Find matching ')'
@@ -755,15 +897,21 @@ impl Database {
                         // Skip quoted string
                         pos += 1;
                         while pos < bytes.len() && bytes[pos] != b'\'' {
-                            if bytes[pos] == b'\\' { pos += 1; }
+                            if bytes[pos] == b'\\' {
+                                pos += 1;
+                            }
                             pos += 1;
                         }
                     }
                     _ => {}
                 }
-                if depth > 0 { pos += 1; }
+                if depth > 0 {
+                    pos += 1;
+                }
             }
-            if depth != 0 { return Ok(None); }
+            if depth != 0 {
+                return Ok(None);
+            }
             let tuple_str = std::str::from_utf8(&bytes[start..pos]).unwrap_or("");
             pos += 1; // skip ')'
 
@@ -772,14 +920,18 @@ impl Database {
                 Some(v) => v,
                 None => return Ok(None),
             };
-            if values.is_empty() { continue; }
+            if values.is_empty() {
+                continue;
+            }
 
             // Build row: map values to schema positions using column list or default order
             let row = if let Some(ref cols) = col_names {
                 if values.len() != cols.len() {
-                    return Err(crate::error::MoteDBError::InvalidArgument(
-                        format!("Column count mismatch: expected {}, got {}", cols.len(), values.len())
-                    ));
+                    return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                        "Column count mismatch: expected {}, got {}",
+                        cols.len(),
+                        values.len()
+                    )));
                 }
                 match crate::sql::row_converter::values_to_row_by_columns(&values, cols, &schema) {
                     Ok(r) => r,
@@ -789,9 +941,11 @@ impl Database {
                 // Without an explicit column list, the value count must match the
                 // table's column count exactly (else fall back for error reporting).
                 if values.len() != schema.columns.len() {
-                    return Err(crate::error::MoteDBError::InvalidArgument(
-                        format!("Column count mismatch: expected {}, got {}", schema.columns.len(), values.len())
-                    ));
+                    return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                        "Column count mismatch: expected {}, got {}",
+                        schema.columns.len(),
+                        values.len()
+                    )));
                 }
                 match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
                     Ok(r) => r,
@@ -801,16 +955,21 @@ impl Database {
             rows.push(row);
         }
 
-        if rows.is_empty() { return Ok(None); }
+        if rows.is_empty() {
+            return Ok(None);
+        }
 
         let affected = rows.len();
         if rows.len() == 1 {
-            self.inner.insert_row_to_table(table_name, rows.into_iter().next().unwrap())?;
+            self.inner
+                .insert_row_to_table(table_name, rows.into_iter().next().unwrap())?;
         } else {
             self.inner.batch_insert_rows_to_table(table_name, rows)?;
         }
 
-        Ok(Some(StreamingQueryResult::Modification { affected_rows: affected }))
+        Ok(Some(StreamingQueryResult::Modification {
+            affected_rows: affected,
+        }))
     }
 
     /// Find a keyword in haystack case-insensitively, requiring word boundaries.
@@ -820,17 +979,27 @@ impl Database {
         let klen = keyword.len();
         let hbytes = haystack.as_bytes();
         let kbytes = keyword.as_bytes();
-        if hbytes.len() < klen { return None; }
+        if hbytes.len() < klen {
+            return None;
+        }
 
         for i in 0..=hbytes.len() - klen {
             // Quick check: first char must match (case-insensitive)
-            if !hbytes[i].eq_ignore_ascii_case(&kbytes[0]) { continue; }
+            if !hbytes[i].eq_ignore_ascii_case(&kbytes[0]) {
+                continue;
+            }
             // Full keyword match
-            if !hbytes[i..i+klen].eq_ignore_ascii_case(kbytes) { continue; }
+            if !hbytes[i..i + klen].eq_ignore_ascii_case(kbytes) {
+                continue;
+            }
             // Word boundary before keyword
-            if i > 0 && !hbytes[i - 1].is_ascii_whitespace() { continue; }
+            if i > 0 && !hbytes[i - 1].is_ascii_whitespace() {
+                continue;
+            }
             // Word boundary after keyword
-            if i + klen < hbytes.len() && !hbytes[i + klen].is_ascii_whitespace() { continue; }
+            if i + klen < hbytes.len() && !hbytes[i + klen].is_ascii_whitespace() {
+                continue;
+            }
             return Some(i);
         }
         None
@@ -840,7 +1009,12 @@ impl Database {
     /// Bypasses tokenizer + parser + statement cache (~280µs overhead).
     fn try_fast_select(&self, sql: &str) -> Result<Option<StreamingQueryResult>> {
         let trimmed = sql.trim_start();
-        if !trimmed.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"SELECT")).unwrap_or(false) {
+        if !trimmed
+            .as_bytes()
+            .get(0..6)
+            .map(|b| b.eq_ignore_ascii_case(b"SELECT"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let after_select = trimmed[6..].trim_start();
@@ -857,7 +1031,9 @@ impl Database {
             Some(p) => (&after_from[..p], after_from[p..].trim_start()),
             None => return Ok(None),
         };
-        if table_name.is_empty() { return Ok(None); }
+        if table_name.is_empty() {
+            return Ok(None);
+        }
 
         // 🆕 S9: ColSegmentStore tables use multi-segment storage. The fast
         // SELECT path below fetches rows via column index + get_table_row,
@@ -888,9 +1064,8 @@ impl Database {
 
         // Truncate trailing SQL keywords (ORDER BY, LIMIT, etc).
         // For quoted strings ('...'), find the closing quote first to preserve spaces.
-        let val_str = if val_str.starts_with('\'') {
+        let val_str = if let Some(after_open) = val_str.strip_prefix('\'') {
             // Find matching closing quote
-            let after_open = &val_str[1..];
             if let Some(end) = after_open.find('\'') {
                 &val_str[..end + 2] // include both quotes
             } else {
@@ -911,7 +1086,10 @@ impl Database {
         };
 
         // Only optimize primary key lookups
-        let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
+        let is_pk = schema
+            .primary_key()
+            .map(|pk| pk == col_name)
+            .unwrap_or(false);
 
         // Determine select columns (shared by both PK and column-index paths)
         let select_part = after_select[..from_pos].trim();
@@ -931,23 +1109,36 @@ impl Database {
                 let col_types = schema.col_types();
                 let filter_pos = schema.get_column_position(col_name);
                 if let Some(pos) = filter_pos {
-                    if let Ok(iter) = self.inner.scan_columnar_sstable_filtered(
-                        table_name, &col_types, pos, &value,
-                    ) {
+                    if let Ok(iter) = self
+                        .inner
+                        .scan_columnar_sstable_filtered(table_name, col_types, pos, &value)
+                    {
                         let column_names: Vec<String> = if is_star {
                             schema.column_names()
                         } else {
-                            select_part.split(',').map(|s| s.trim().to_string()).collect()
+                            select_part
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .collect()
                         };
                         let rows: Vec<Vec<Value>> = iter.collect();
-                        return Ok(Some(StreamingQueryResult::SelectReady { columns: column_names, rows }));
+                        return Ok(Some(StreamingQueryResult::SelectReady {
+                            columns: column_names,
+                            rows,
+                        }));
                     }
                 }
             }
 
             // Column index fast path: bypass parser for indexed non-PK columns
-            let index_name = self.inner.index_registry
-                .find_by_column(table_name, col_name, crate::database::index_metadata::IndexType::Column)
+            let index_name = self
+                .inner
+                .index_registry
+                .find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Column,
+                )
                 .unwrap_or_else(|| format!("{}.{}", table_name, col_name));
             if let Some(index_ref) = self.inner.column_indexes.get(&index_name) {
                 let row_ids_arc = index_ref.value().get_arc(&value)?;
@@ -962,17 +1153,25 @@ impl Database {
                     let column_names: Vec<String> = if is_star {
                         schema.column_names()
                     } else {
-                        select_part.split(',').map(|s| s.trim().to_string()).collect()
+                        select_part
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .collect()
                     };
 
                     if is_star {
                         // SELECT * — batch fetch (ArcString makes clone cheap)
-                        let batch = self.inner.get_table_rows_batch_arc(table_name, &row_ids_arc)?;
-                        let rows: Vec<Vec<Value>> = batch.into_iter()
-                            .filter_map(|(_, opt)| opt.map(|a| match Arc::try_unwrap(a) {
-                                Ok(row) => row,
-                                Err(arc) => (*arc).clone(),
-                            }))
+                        let batch = self
+                            .inner
+                            .get_table_rows_batch_arc(table_name, &row_ids_arc)?;
+                        let rows: Vec<Vec<Value>> = batch
+                            .into_iter()
+                            .filter_map(|(_, opt)| {
+                                opt.map(|a| match Arc::try_unwrap(a) {
+                                    Ok(row) => row,
+                                    Err(arc) => (*arc).clone(),
+                                })
+                            })
                             .filter(|row| {
                                 filter_col_pos
                                     .map(|pos| row.get(pos) == Some(&value))
@@ -986,28 +1185,33 @@ impl Database {
                     }
 
                     // Non-star: project specific columns
-                    let batch = self.inner.get_table_rows_batch_arc(table_name, &row_ids_arc)?;
+                    let batch = self
+                        .inner
+                        .get_table_rows_batch_arc(table_name, &row_ids_arc)?;
                     let mut result_vec = Vec::with_capacity(batch.len());
                     {
-                        let col_list: Vec<&str> = select_part.split(',').map(|s| s.trim()).collect();
-                        let col_positions: Vec<usize> = col_list.iter()
+                        let col_list: Vec<&str> =
+                            select_part.split(',').map(|s| s.trim()).collect();
+                        let col_positions: Vec<usize> = col_list
+                            .iter()
                             .filter_map(|c| schema.get_column(c).map(|cd| cd.position))
                             .collect();
-                        result_vec.extend(
-                            batch.into_iter().filter_map(|(_, opt_arc)| {
-                                opt_arc.and_then(|a| {
-                                    // Post-filter: verify actual column value matches search value
-                                    if let Some(pos) = filter_col_pos {
-                                        if a.get(pos) != Some(&value) {
-                                            return None;
-                                        }
+                        result_vec.extend(batch.into_iter().filter_map(|(_, opt_arc)| {
+                            opt_arc.and_then(|a| {
+                                // Post-filter: verify actual column value matches search value
+                                if let Some(pos) = filter_col_pos {
+                                    if a.get(pos) != Some(&value) {
+                                        return None;
                                     }
-                                    Some(col_positions.iter()
+                                }
+                                Some(
+                                    col_positions
+                                        .iter()
                                         .map(|&pos| a.get(pos).cloned().unwrap_or(Value::Null))
-                                        .collect())
-                                })
+                                        .collect(),
+                                )
                             })
-                        );
+                        }));
                     }
                     return Ok(Some(StreamingQueryResult::SelectReady {
                         columns: column_names,
@@ -1023,31 +1227,33 @@ impl Database {
         // Fetch row using Arc<Row> (avoids cloning row data for cache hits)
         let row_opt = if is_ai {
             match &value {
-                Value::Integer(id) if *id >= 0 => self.inner.get_table_row_arc(table_name, *id as RowId, &schema)?,
+                Value::Integer(id) if *id >= 0 => {
+                    self.inner
+                        .get_table_row_arc(table_name, *id as RowId, &schema)?
+                }
                 _ => return Ok(None),
             }
         } else {
             // Non-AUTO_INCREMENT PK: use pk_lookup cache (O(1)), fall back to column index
             let pk_key = crate::database::pk_cache::PkKey::from_value(&value);
-            let resolve_fallback = |db: &MoteDB, table: &str, col: &str, val: &Value| -> Option<RowId> {
-                match db.query_by_column(table, col, val) {
-                    Ok(ids) if !ids.is_empty() => ids.into_iter().next(),
-                    _ => {
-                        // Column index missing (e.g. after restart) — full scan
-                        let s = db.get_table_schema(table).ok()?;
-                        let pos = s.get_column_position(col)?;
-                        let rows = db.scan_table_rows_streaming(table).ok()?;
-                        for item in rows {
-                            if let Ok((rid, row)) = item {
+            let resolve_fallback =
+                |db: &MoteDB, table: &str, col: &str, val: &Value| -> Option<RowId> {
+                    match db.query_by_column(table, col, val) {
+                        Ok(ids) if !ids.is_empty() => ids.into_iter().next(),
+                        _ => {
+                            // Column index missing (e.g. after restart) — full scan
+                            let s = db.get_table_schema(table).ok()?;
+                            let pos = s.get_column_position(col)?;
+                            let rows = db.scan_table_rows_streaming(table).ok()?;
+                            for (rid, row) in rows.flatten() {
                                 if row.get(pos)? == val {
                                     return Some(rid);
                                 }
                             }
+                            None
                         }
-                        None
                     }
-                }
-            };
+                };
             let row_id = if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
                 if let Some(rid) = lookup.get_pk(&pk_key) {
                     Some(rid)
@@ -1091,7 +1297,10 @@ impl Database {
         let column_names: Vec<String> = if is_star {
             schema.column_names()
         } else {
-            select_part.split(',').map(|s| s.trim().to_string()).collect()
+            select_part
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
         };
 
         Ok(Some(StreamingQueryResult::SelectReady {
@@ -1131,9 +1340,11 @@ impl Database {
 
     fn parse_single_literal(s: &str) -> Option<Value> {
         let s = s.trim();
-        if s.is_empty() { return None; }
+        if s.is_empty() {
+            return None;
+        }
         if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-            let inner = &s[1..s.len()-1];
+            let inner = &s[1..s.len() - 1];
             let mut text = String::with_capacity(inner.len());
             let mut chars = inner.chars().peekable();
             while let Some(c) = chars.next() {
@@ -1144,7 +1355,10 @@ impl Database {
                         Some('r') => text.push('\r'),
                         Some('\\') => text.push('\\'),
                         Some('\'') => text.push('\''),
-                        Some(c2) => { text.push('\\'); text.push(c2); }
+                        Some(c2) => {
+                            text.push('\\');
+                            text.push(c2);
+                        }
                         None => text.push('\\'),
                     },
                     '\'' if chars.peek() == Some(&'\'') => {
@@ -1158,16 +1372,26 @@ impl Database {
             return Some(Value::text(text));
         }
         if s.starts_with('-') || s.as_bytes().first()?.is_ascii_digit() {
-            if let Ok(i) = s.parse::<i64>() { return Some(Value::Integer(i)); }
-            if let Ok(f) = s.parse::<f64>() { return Some(Value::Float(f)); }
+            if let Ok(i) = s.parse::<i64>() {
+                return Some(Value::Integer(i));
+            }
+            if let Ok(f) = s.parse::<f64>() {
+                return Some(Value::Float(f));
+            }
         }
-        if s.eq_ignore_ascii_case("NULL") { return Some(Value::Null); }
+        if s.eq_ignore_ascii_case("NULL") {
+            return Some(Value::Null);
+        }
         None
     }
 
     /// Try to evaluate a simple SET expression like `col + 10` or `col * 2`
     /// against the old row. Returns None if the expression is too complex.
-    fn evaluate_simple_set_expr(expr_str: &str, old_row: &[Value], schema: &crate::types::TableSchema) -> Option<Value> {
+    fn evaluate_simple_set_expr(
+        expr_str: &str,
+        old_row: &[Value],
+        schema: &crate::types::TableSchema,
+    ) -> Option<Value> {
         // Pattern: column_name operator literal
         let expr_str = expr_str.trim();
         for &op in &[" + ", " - ", " * ", " / "] {
@@ -1193,9 +1417,7 @@ impl Database {
     fn positional_fast_add(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => {
-                a.checked_add(*b).map(|r| Value::Integer(r))
-            }
+            (Value::Integer(a), Value::Integer(b)) => a.checked_add(*b).map(Value::Integer),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a + *b as f64)),
@@ -1205,9 +1427,7 @@ impl Database {
     fn positional_fast_sub(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => {
-                a.checked_sub(*b).map(|r| Value::Integer(r))
-            }
+            (Value::Integer(a), Value::Integer(b)) => a.checked_sub(*b).map(Value::Integer),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a - b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 - b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a - *b as f64)),
@@ -1217,9 +1437,7 @@ impl Database {
     fn positional_fast_mul(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => {
-                a.checked_mul(*b).map(|r| Value::Integer(r))
-            }
+            (Value::Integer(a), Value::Integer(b)) => a.checked_mul(*b).map(Value::Integer),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a * b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 * b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a * *b as f64)),
@@ -1234,7 +1452,7 @@ impl Database {
             (Value::Integer(a), Value::Float(b)) if *b != 0.0 => Some(Value::Float(*a as f64 / b)),
             (Value::Integer(a), Value::Integer(b)) if *b != 0 => {
                 // Integer division truncates toward zero, matching SQL semantics
-                a.checked_div(*b).map(|r| Value::Integer(r))
+                a.checked_div(*b).map(Value::Integer)
             }
             _ => None,
         }
@@ -1243,7 +1461,12 @@ impl Database {
     /// Fast UPDATE path: parses `UPDATE <table> SET col1=v1, col2=v2 WHERE pk = value`
     fn try_fast_update(&self, sql: &str) -> Result<Option<StreamingQueryResult>> {
         let trimmed = sql.trim_start();
-        if !trimmed.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"UPDATE")).unwrap_or(false) {
+        if !trimmed
+            .as_bytes()
+            .get(0..6)
+            .map(|b| b.eq_ignore_ascii_case(b"UPDATE"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let after_update = trimmed[6..].trim_start();
@@ -1253,10 +1476,17 @@ impl Database {
             Some(p) => (&after_update[..p], after_update[p..].trim_start()),
             None => return Ok(None),
         };
-        if table_name.is_empty() { return Ok(None); }
+        if table_name.is_empty() {
+            return Ok(None);
+        }
 
         // Must have "SET" (word boundary at start)
-        if !after_table.as_bytes().get(0..3).map(|b| b.eq_ignore_ascii_case(b"set")).unwrap_or(false) {
+        if !after_table
+            .as_bytes()
+            .get(0..3)
+            .map(|b| b.eq_ignore_ascii_case(b"set"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         if after_table.len() > 3 && !after_table.as_bytes()[3].is_ascii_whitespace() {
@@ -1267,8 +1497,8 @@ impl Database {
         // Find "WHERE" keyword (word boundary, search from end for rfind semantics)
         let where_pos = match after_set.as_bytes().windows(7).rposition(|w| {
             w[0].is_ascii_whitespace()
-            && w[1..6].eq_ignore_ascii_case(b"where".as_ref())
-            && w[6].is_ascii_whitespace()
+                && w[1..6].eq_ignore_ascii_case(b"where".as_ref())
+                && w[6].is_ascii_whitespace()
         }) {
             Some(p) => p + 1,
             None => return Ok(None),
@@ -1293,7 +1523,10 @@ impl Database {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        let is_pk = schema.primary_key().map(|pk| pk == where_col).unwrap_or(false);
+        let is_pk = schema
+            .primary_key()
+            .map(|pk| pk == where_col)
+            .unwrap_or(false);
         // This fast path only accelerates `WHERE pk = value`. For non-PK WHERE
         // columns query_by_column would error (no index) — bail to the general
         // UPDATE path, which scans + filters positionally.
@@ -1325,7 +1558,9 @@ impl Database {
                 if let Some(rid) = lookup.get_pk(&pk_key) {
                     rid
                 } else {
-                    let row_ids = self.inner.query_by_column(table_name, where_col, &where_value)?;
+                    let row_ids =
+                        self.inner
+                            .query_by_column(table_name, where_col, &where_value)?;
                     match row_ids.into_iter().next() {
                         Some(rid) => {
                             if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
@@ -1333,22 +1568,39 @@ impl Database {
                             }
                             rid
                         }
-                        None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+                        None => {
+                            return Ok(Some(StreamingQueryResult::Modification {
+                                affected_rows: 0,
+                            }))
+                        }
                     }
                 }
             } else {
-                let row_ids = self.inner.query_by_column(table_name, where_col, &where_value)?;
+                let row_ids = self
+                    .inner
+                    .query_by_column(table_name, where_col, &where_value)?;
                 match row_ids.into_iter().next() {
                     Some(rid) => rid,
-                    None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+                    None => {
+                        return Ok(Some(StreamingQueryResult::Modification {
+                            affected_rows: 0,
+                        }))
+                    }
                 }
             }
         };
 
         // Load old row, resolve SET values, apply updates, write back
-        let old_row = match self.inner.get_table_row_with_schema(table_name, row_id, &schema)? {
+        let old_row = match self
+            .inner
+            .get_table_row_with_schema(table_name, row_id, &schema)?
+        {
             Some(r) => r,
-            None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+            None => {
+                return Ok(Some(StreamingQueryResult::Modification {
+                    affected_rows: 0,
+                }))
+            }
         };
 
         let mut new_row = old_row.clone();
@@ -1356,9 +1608,10 @@ impl Database {
             let cd = match schema.get_column(col_name) {
                 Some(cd) => cd,
                 None => {
-                    return Err(StorageError::ColumnNotFound(
-                        format!("'{}' in table '{}'", col_name, table_name)
-                    ));
+                    return Err(StorageError::ColumnNotFound(format!(
+                        "'{}' in table '{}'",
+                        col_name, table_name
+                    )));
                 }
             };
             let val = match Self::parse_single_literal(val_str) {
@@ -1374,20 +1627,33 @@ impl Database {
             new_row[cd.position] = val;
         }
 
-        self.inner.update_row_in_table_with_schema(table_name, row_id, old_row, new_row, &schema)?;
-        Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
+        self.inner
+            .update_row_in_table_with_schema(table_name, row_id, old_row, new_row, &schema)?;
+        Ok(Some(StreamingQueryResult::Modification {
+            affected_rows: 1,
+        }))
     }
 
     /// Fast DELETE path: parses `DELETE FROM <table> WHERE pk = value`
     fn try_fast_delete(&self, sql: &str) -> Result<Option<StreamingQueryResult>> {
         let trimmed = sql.trim_start();
-        if !trimmed.as_bytes().get(0..6).map(|b| b.eq_ignore_ascii_case(b"DELETE")).unwrap_or(false) {
+        if !trimmed
+            .as_bytes()
+            .get(0..6)
+            .map(|b| b.eq_ignore_ascii_case(b"DELETE"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let after_delete = trimmed[6..].trim_start();
 
         // Must have "FROM"
-        if !after_delete.as_bytes().get(0..4).map(|b| b.eq_ignore_ascii_case(b"FROM")).unwrap_or(false) {
+        if !after_delete
+            .as_bytes()
+            .get(0..4)
+            .map(|b| b.eq_ignore_ascii_case(b"FROM"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         let after_from = after_delete[4..].trim_start();
@@ -1397,10 +1663,17 @@ impl Database {
             Some(p) => (&after_from[..p], after_from[p..].trim_start()),
             None => return Ok(None),
         };
-        if table_name.is_empty() { return Ok(None); }
+        if table_name.is_empty() {
+            return Ok(None);
+        }
 
         // Check for "WHERE" (word boundary at start)
-        if !after_table.as_bytes().get(0..5).map(|b| b.eq_ignore_ascii_case(b"where")).unwrap_or(false) {
+        if !after_table
+            .as_bytes()
+            .get(0..5)
+            .map(|b| b.eq_ignore_ascii_case(b"where"))
+            .unwrap_or(false)
+        {
             return Ok(None);
         }
         if after_table.len() > 5 && !after_table.as_bytes()[5].is_ascii_whitespace() {
@@ -1425,7 +1698,10 @@ impl Database {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        let is_pk = schema.primary_key().map(|pk| pk == col_name).unwrap_or(false);
+        let is_pk = schema
+            .primary_key()
+            .map(|pk| pk == col_name)
+            .unwrap_or(false);
         // This fast path only accelerates `WHERE pk = value`. For non-PK WHERE
         // columns query_by_column would error (no index) — bail to the general
         // DELETE path, which scans + filters positionally.
@@ -1453,26 +1729,44 @@ impl Database {
                             }
                             rid
                         }
-                        None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+                        None => {
+                            return Ok(Some(StreamingQueryResult::Modification {
+                                affected_rows: 0,
+                            }))
+                        }
                     }
                 }
             } else {
                 let row_ids = self.inner.query_by_column(table_name, col_name, &value)?;
                 match row_ids.into_iter().next() {
                     Some(rid) => rid,
-                    None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+                    None => {
+                        return Ok(Some(StreamingQueryResult::Modification {
+                            affected_rows: 0,
+                        }))
+                    }
                 }
             }
         };
 
         // Load old row, then delete
-        let old_row = match self.inner.get_table_row_with_schema(table_name, row_id, &schema)? {
+        let old_row = match self
+            .inner
+            .get_table_row_with_schema(table_name, row_id, &schema)?
+        {
             Some(r) => r,
-            None => return Ok(Some(StreamingQueryResult::Modification { affected_rows: 0 })),
+            None => {
+                return Ok(Some(StreamingQueryResult::Modification {
+                    affected_rows: 0,
+                }))
+            }
         };
 
-        self.inner.delete_row_from_table(table_name, row_id, old_row)?;
-        Ok(Some(StreamingQueryResult::Modification { affected_rows: 1 }))
+        self.inner
+            .delete_row_from_table(table_name, row_id, old_row)?;
+        Ok(Some(StreamingQueryResult::Modification {
+            affected_rows: 1,
+        }))
     }
 
     /// Parse a comma-separated list of SQL literals from a VALUES clause.
@@ -1485,9 +1779,15 @@ impl Database {
         while chars.peek().is_some() {
             // Skip whitespace
             while let Some(&(_i, c)) = chars.peek() {
-                if c.is_whitespace() { chars.next(); } else { break; }
+                if c.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
             }
-            if chars.peek().is_none() { break; }
+            if chars.peek().is_none() {
+                break;
+            }
 
             let (start_idx, start_char) = chars.peek().copied().unwrap();
 
@@ -1506,17 +1806,18 @@ impl Database {
                                 break; // end of string
                             }
                         }
-                        Some((_, '\\')) => {
-                            match chars.next() {
-                                Some((_, 'n')) => text.push('\n'),
-                                Some((_, 't')) => text.push('\t'),
-                                Some((_, 'r')) => text.push('\r'),
-                                Some((_, '\\')) => text.push('\\'),
-                                Some((_, '\'')) => text.push('\''),
-                                Some((_, c)) => { text.push('\\'); text.push(c); }
-                                None => return None,
+                        Some((_, '\\')) => match chars.next() {
+                            Some((_, 'n')) => text.push('\n'),
+                            Some((_, 't')) => text.push('\t'),
+                            Some((_, 'r')) => text.push('\r'),
+                            Some((_, '\\')) => text.push('\\'),
+                            Some((_, '\'')) => text.push('\''),
+                            Some((_, c)) => {
+                                text.push('\\');
+                                text.push(c);
                             }
-                        }
+                            None => return None,
+                        },
                         Some((_, c)) => text.push(c),
                         None => return None,
                     }
@@ -1525,35 +1826,63 @@ impl Database {
             } else if start_char == '-' || start_char.is_ascii_digit() {
                 // Number (integer or float)
                 let mut num_str = String::new();
-                if start_char == '-' { num_str.push('-'); chars.next(); }
+                if start_char == '-' {
+                    num_str.push('-');
+                    chars.next();
+                }
                 let mut has_dot = false;
                 while let Some(&(_, c)) = chars.peek() {
-                    if c.is_ascii_digit() { num_str.push(c); chars.next(); }
-                    else if c == '.' && !has_dot { has_dot = true; num_str.push(c); chars.next(); }
-                    else { break; }
+                    if c.is_ascii_digit() {
+                        num_str.push(c);
+                        chars.next();
+                    } else if c == '.' && !has_dot {
+                        has_dot = true;
+                        num_str.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
-                if num_str.is_empty() || num_str == "-" || num_str == "-." { return None; }
+                if num_str.is_empty() || num_str == "-" || num_str == "-." {
+                    return None;
+                }
                 if has_dot {
                     values.push(Value::Float(num_str.parse().ok()?));
                 } else {
                     values.push(Value::Integer(num_str.parse().ok()?));
                 }
-            } else if len - start_idx >= 4 && s[start_idx..start_idx+4].eq_ignore_ascii_case("NULL") {
+            } else if len - start_idx >= 4
+                && s[start_idx..start_idx + 4].eq_ignore_ascii_case("NULL")
+            {
                 values.push(Value::Null);
-                for _ in 0..4 { chars.next(); }
-            } else if len - start_idx >= 4 && s[start_idx..start_idx+4].eq_ignore_ascii_case("TRUE") {
+                for _ in 0..4 {
+                    chars.next();
+                }
+            } else if len - start_idx >= 4
+                && s[start_idx..start_idx + 4].eq_ignore_ascii_case("TRUE")
+            {
                 values.push(Value::Bool(true));
-                for _ in 0..4 { chars.next(); }
-            } else if len - start_idx >= 5 && s[start_idx..start_idx+5].eq_ignore_ascii_case("FALSE") {
+                for _ in 0..4 {
+                    chars.next();
+                }
+            } else if len - start_idx >= 5
+                && s[start_idx..start_idx + 5].eq_ignore_ascii_case("FALSE")
+            {
                 values.push(Value::Bool(false));
-                for _ in 0..5 { chars.next(); }
+                for _ in 0..5 {
+                    chars.next();
+                }
             } else {
                 return None; // unsupported literal, fall back to full parser
             }
 
             // Skip whitespace and comma
             while let Some(&(_, c)) = chars.peek() {
-                if c.is_whitespace() { chars.next(); } else { break; }
+                if c.is_whitespace() {
+                    chars.next();
+                } else {
+                    break;
+                }
             }
             if let Some(&(_, ',')) = chars.peek() {
                 chars.next(); // consume comma
@@ -1572,10 +1901,10 @@ impl Database {
     /// # Examples
     /// ```ignore
     /// let tx_id = db.begin_transaction()?;
-    /// 
+    ///
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
     /// db.execute("INSERT INTO users VALUES (2, 'Bob', 30)")?;
-    /// 
+    ///
     /// db.commit_transaction(tx_id)?;
     /// ```
     pub fn begin_transaction(&self) -> Result<u64> {
@@ -1611,13 +1940,13 @@ impl Database {
     /// # Examples
     /// ```ignore
     /// let tx_id = db.begin_transaction()?;
-    /// 
+    ///
     /// db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
     /// db.savepoint(tx_id, "sp1")?;
-    /// 
+    ///
     /// db.execute("INSERT INTO users VALUES (2, 'Bob', 30)")?;
     /// db.rollback_to_savepoint(tx_id, "sp1")?; // 只回滚 Bob 的插入
-    /// 
+    ///
     /// db.commit_transaction(tx_id)?;
     /// ```
     pub fn savepoint(&self, tx_id: u64, name: &str) -> Result<()> {
@@ -1685,21 +2014,28 @@ impl Database {
     pub fn batch_insert_map(&self, table_name: &str, sql_rows: Vec<SqlRow>) -> Result<Vec<RowId>> {
         // 获取表结构
         let schema = self.inner.get_table_schema(table_name)?;
-        
+
         // 将 SqlRow (HashMap) 转换为 Row (Vec<Value>)
-        let rows: Result<Vec<Row>> = sql_rows.into_iter().map(|sql_row| {
-            crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)
-        }).collect();
-        
+        let rows: Result<Vec<Row>> = sql_rows
+            .into_iter()
+            .map(|sql_row| crate::sql::row_converter::sql_row_to_row(&sql_row, &schema))
+            .collect();
+
         // 🚀 使用新的 batch_insert_rows_to_table (支持增量索引更新)
         self.inner.batch_insert_rows_to_table(table_name, rows?)
     }
 
-    pub fn batch_insert_with_vectors_map(&self, table_name: &str, sql_rows: Vec<SqlRow>, vector_columns: &[&str]) -> Result<Vec<RowId>> {
+    pub fn batch_insert_with_vectors_map(
+        &self,
+        table_name: &str,
+        sql_rows: Vec<SqlRow>,
+        vector_columns: &[&str],
+    ) -> Result<Vec<RowId>> {
         let schema = self.inner.get_table_schema(table_name)?;
-        let rows: Result<Vec<Row>> = sql_rows.into_iter().map(|sql_row| {
-            crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)
-        }).collect();
+        let rows: Result<Vec<Row>> = sql_rows
+            .into_iter()
+            .map(|sql_row| crate::sql::row_converter::sql_row_to_row(&sql_row, &schema))
+            .collect();
         self.batch_insert_with_vectors(table_name, rows?, vector_columns)
     }
 
@@ -1722,7 +2058,12 @@ impl Database {
     ///
     /// let row_ids = db.batch_insert_with_vectors("documents", rows, &["embedding"])?;
     /// ```
-    pub fn batch_insert_with_vectors(&self, table_name: &str, rows: Vec<Row>, _vector_columns: &[&str]) -> Result<Vec<RowId>> {
+    pub fn batch_insert_with_vectors(
+        &self,
+        table_name: &str,
+        rows: Vec<Row>,
+        _vector_columns: &[&str],
+    ) -> Result<Vec<RowId>> {
         // 🚀 使用新的 batch_insert_rows_to_table (已包含向量索引增量更新)
         self.inner.batch_insert_rows_to_table(table_name, rows)
     }
@@ -1770,8 +2111,8 @@ impl Database {
     /// db.create_vector_index("docs_embedding", 128)?;
     ///
     /// // SQL 向量搜索
-    /// let query = "SELECT * FROM docs 
-    ///              ORDER BY embedding <-> [0.1, 0.2, ...] 
+    /// let query = "SELECT * FROM docs
+    ///              ORDER BY embedding <-> [0.1, 0.2, ...]
     ///              LIMIT 10";
     /// let results = db.query(query)?;
     /// ```
@@ -1810,12 +2151,17 @@ impl Database {
     ///
     /// // 快速查询（使用索引）
     /// let row_ids = db.query_by_column(
-    ///     "users", 
-    ///     "email", 
+    ///     "users",
+    ///     "email",
     ///     &Value::Text("alice@example.com".into())
     /// )?;
     /// ```
-    pub fn query_by_column(&self, table_name: &str, column_name: &str, value: &Value) -> Result<Vec<RowId>> {
+    pub fn query_by_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        value: &Value,
+    ) -> Result<Vec<RowId>> {
         self.inner.query_by_column(table_name, column_name, value)
     }
 
@@ -1833,11 +2179,17 @@ impl Database {
     ///     &Value::Integer(30)
     /// )?;
     /// ```
-    pub fn query_by_column_range(&self, table_name: &str, column_name: &str, 
-                                 start: &Value, end: &Value) -> Result<Vec<RowId>> {
-        self.inner.query_by_column_range(table_name, column_name, start, end)
+    pub fn query_by_column_range(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        start: &Value,
+        end: &Value,
+    ) -> Result<Vec<RowId>> {
+        self.inner
+            .query_by_column_range(table_name, column_name, start, end)
     }
-    
+
     /// 按列范围查询（精确控制边界，使用列索引）
     ///
     /// ## 边界语义
@@ -1856,10 +2208,23 @@ impl Database {
     ///     &Value::Integer(200), false
     /// )?;
     /// ```
-    pub fn query_by_column_between(&self, table_name: &str, column_name: &str,
-                                  start: &Value, start_inclusive: bool,
-                                  end: &Value, end_inclusive: bool) -> Result<Vec<RowId>> {
-        self.inner.query_by_column_between(table_name, column_name, start, start_inclusive, end, end_inclusive)
+    pub fn query_by_column_between(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        start: &Value,
+        start_inclusive: bool,
+        end: &Value,
+        end_inclusive: bool,
+    ) -> Result<Vec<RowId>> {
+        self.inner.query_by_column_between(
+            table_name,
+            column_name,
+            start,
+            start_inclusive,
+            end,
+            end_inclusive,
+        )
     }
 
     /// 向量KNN搜索
@@ -1874,7 +2239,12 @@ impl Database {
     ///     println!("RowID: {}, Distance: {}", row_id, distance);
     /// }
     /// ```
-    pub fn vector_search(&self, index_name: &str, query: &[f32], k: usize) -> Result<Vec<(RowId, f32)>> {
+    pub fn vector_search(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(RowId, f32)>> {
         self.inner.vector_search(index_name, query, k)
     }
 
@@ -1889,7 +2259,12 @@ impl Database {
     ///     println!("RowID: {}, BM25 Score: {}", row_id, score);
     /// }
     /// ```
-    pub fn text_search_ranked(&self, index_name: &str, query: &str, top_k: usize) -> Result<Vec<(RowId, f32)>> {
+    pub fn text_search_ranked(
+        &self,
+        index_name: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<(RowId, f32)>> {
         self.inner.text_search_ranked(index_name, query, top_k)
     }
 
@@ -2004,10 +2379,10 @@ impl Database {
     pub fn insert_row_map(&self, table_name: &str, sql_row: SqlRow) -> Result<RowId> {
         // 获取表结构
         let schema = self.inner.get_table_schema(table_name)?;
-        
+
         // 将 SqlRow (HashMap) 转换为 Row (Vec<Value>)
         let row = crate::sql::row_converter::sql_row_to_row(&sql_row, &schema)?;
-        
+
         self.inner.insert_row_to_table(table_name, row)
     }
 
@@ -2027,7 +2402,9 @@ impl Database {
     pub fn get_row_map(&self, table_name: &str, row_id: RowId) -> Result<Option<SqlRow>> {
         if let Some(row) = self.inner.get_table_row(table_name, row_id)? {
             let schema = self.inner.get_table_schema(table_name)?;
-            Ok(Some(crate::sql::row_converter::row_to_sql_row(&row, &schema)?))
+            Ok(Some(crate::sql::row_converter::row_to_sql_row(
+                &row, &schema,
+            )?))
         } else {
             Ok(None)
         }
@@ -2036,23 +2413,34 @@ impl Database {
     /// 更新行（底层API，推荐使用 SQL UPDATE）
     pub fn update_row(&self, table_name: &str, row_id: RowId, new_row: Row) -> Result<()> {
         // 先获取旧行
-        let old_row = self.inner.get_table_row(table_name, row_id)?
-            .ok_or_else(|| crate::StorageError::InvalidData(
-                format!("Row {} not found in table '{}'", row_id, table_name)
-            ))?;
-        self.inner.update_row_in_table(table_name, row_id, old_row, new_row)
+        let old_row = self
+            .inner
+            .get_table_row(table_name, row_id)?
+            .ok_or_else(|| {
+                crate::StorageError::InvalidData(format!(
+                    "Row {} not found in table '{}'",
+                    row_id, table_name
+                ))
+            })?;
+        self.inner
+            .update_row_in_table(table_name, row_id, old_row, new_row)
     }
 
     /// 删除行（底层API，推荐使用 SQL DELETE）
     pub fn delete_row(&self, table_name: &str, row_id: RowId) -> Result<()> {
         // 先获取旧行
-        let old_row = self.inner.get_table_row(table_name, row_id)?
-            .ok_or_else(|| crate::StorageError::InvalidData(
-                format!("Row {} not found in table '{}'", row_id, table_name)
-            ))?;
-        self.inner.delete_row_from_table(table_name, row_id, old_row)
+        let old_row = self
+            .inner
+            .get_table_row(table_name, row_id)?
+            .ok_or_else(|| {
+                crate::StorageError::InvalidData(format!(
+                    "Row {} not found in table '{}'",
+                    row_id, table_name
+                ))
+            })?;
+        self.inner
+            .delete_row_from_table(table_name, row_id, old_row)
     }
-
 }
 
 // 自动在 Drop 时关闭数据库

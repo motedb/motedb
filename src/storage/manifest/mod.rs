@@ -10,4 +10,4 @@ mod manifest;
 mod version;
 
 pub use manifest::{Manifest, ManifestRecord};
-pub use version::{Version, VersionEdit, FileMetadata, FileType};
+pub use version::{FileMetadata, FileType, Version, VersionEdit};

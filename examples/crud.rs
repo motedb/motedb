@@ -23,11 +23,13 @@ fn main() -> motedb::Result<()> {
     {
         let db = Database::create(&path)?;
 
-        db.execute("CREATE TABLE sensors (
+        db.execute(
+            "CREATE TABLE sensors (
             id INT PRIMARY KEY AUTO_INCREMENT,
             location TEXT,
             reading FLOAT
-        )")?;
+        )",
+        )?;
 
         // Batch via a single multi-row INSERT (fast path).
         let mut sql = String::from("INSERT INTO sensors (location, reading) VALUES ");
@@ -47,7 +49,10 @@ fn main() -> motedb::Result<()> {
         println!("deleted rows: {:?}", deleted.affected_rows());
 
         // SELECT with WHERE + aggregate
-        println!("roof sensors after update: {}", count(&db, "SELECT * FROM sensors WHERE reading = -1.0"));
+        println!(
+            "roof sensors after update: {}",
+            count(&db, "SELECT * FROM sensors WHERE reading = -1.0")
+        );
         println!("rows remaining: {}", count(&db, "SELECT * FROM sensors"));
 
         // A clean close flushes the write buffer and stops background threads.
@@ -58,7 +63,10 @@ fn main() -> motedb::Result<()> {
     {
         let db = Database::open(&path)?;
         println!("rows after reopen: {}", count(&db, "SELECT * FROM sensors"));
-        println!("roof sensors after reopen: {}", count(&db, "SELECT * FROM sensors WHERE reading = -1.0"));
+        println!(
+            "roof sensors after reopen: {}",
+            count(&db, "SELECT * FROM sensors WHERE reading = -1.0")
+        );
     }
 
     let _ = std::fs::remove_dir_all(&path);

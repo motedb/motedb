@@ -2,4 +2,4 @@
 
 pub mod row_cache;
 
-pub use row_cache::{RowCache, CacheStats};
+pub use row_cache::{CacheStats, RowCache};

@@ -2,8 +2,8 @@
 //! Covers: vector_search, text_search_ranked, create_vector_index,
 //! create_text_index, create_ioctree_index, ioctree_knn_search
 
-use motedb::{Database, types::Value};
 use motedb::types::Tensor;
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -21,18 +21,25 @@ fn test_vector_index_create_and_search() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR(4))").unwrap();
+    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, embedding VECTOR(4))")
+        .unwrap();
 
     // Insert vectors via insert_row
     for i in 0..20 {
         let row = vec![
             Value::Integer(i),
-            Value::tensor(Tensor::new(vec![i as f32, (i + 1) as f32, (i + 2) as f32, (i + 3) as f32])),
+            Value::tensor(Tensor::new(vec![
+                i as f32,
+                (i + 1) as f32,
+                (i + 2) as f32,
+                (i + 3) as f32,
+            ])),
         ];
         db.insert_row("docs", row).unwrap();
     }
 
-    db.execute("CREATE VECTOR INDEX idx_emb ON docs(embedding)").unwrap();
+    db.execute("CREATE VECTOR INDEX idx_emb ON docs(embedding)")
+        .unwrap();
     db.wait_for_indexes_ready();
 
     // Search for nearest neighbors
@@ -43,8 +50,10 @@ fn test_vector_index_create_and_search() {
             assert!(neighbors.len() <= 5, "Should return at most 5 results");
             // Results should be sorted by distance (closest first)
             for i in 1..neighbors.len() {
-                assert!(neighbors[i].1 >= neighbors[i - 1].1,
-                    "Results should be sorted by distance");
+                assert!(
+                    neighbors[i].1 >= neighbors[i - 1].1,
+                    "Results should be sorted by distance"
+                );
             }
         }
         Err(_) => {
@@ -58,7 +67,8 @@ fn test_vector_index_stats() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, v VECTOR(3))").unwrap();
+    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, v VECTOR(3))")
+        .unwrap();
     for i in 0..5 {
         let row = vec![
             Value::Integer(i),
@@ -81,12 +91,19 @@ fn test_text_index_create_and_search() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE articles (id INT PRIMARY KEY, content TEXT)").unwrap();
-    db.execute("INSERT INTO articles VALUES (1, 'Rust is a systems programming language')").unwrap();
-    db.execute("INSERT INTO articles VALUES (2, 'Python is popular for data science')").unwrap();
-    db.execute("INSERT INTO articles VALUES (3, 'Rust provides memory safety without garbage collection')").unwrap();
+    db.execute("CREATE TABLE articles (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO articles VALUES (1, 'Rust is a systems programming language')")
+        .unwrap();
+    db.execute("INSERT INTO articles VALUES (2, 'Python is popular for data science')")
+        .unwrap();
+    db.execute(
+        "INSERT INTO articles VALUES (3, 'Rust provides memory safety without garbage collection')",
+    )
+    .unwrap();
 
-    db.execute("CREATE TEXT INDEX idx_content ON articles(content)").unwrap();
+    db.execute("CREATE TEXT INDEX idx_content ON articles(content)")
+        .unwrap();
     db.wait_for_indexes_ready();
 
     // Text search
@@ -117,14 +134,17 @@ fn test_ioctree_index_create() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE points (id INT PRIMARY KEY, location GEOMETRY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE points (id INT PRIMARY KEY, location GEOMETRY, name TEXT)")
+        .unwrap();
     for i in 0..5 {
         let x = i as f64;
         let y = i as f64 + 1.0;
         let z = i as f64 + 2.0;
         let row = vec![
             Value::Integer(i),
-            Value::spatial(motedb::types::Geometry::Point3D(motedb::types::Point3D::new(x, y, z))),
+            Value::spatial(motedb::types::Geometry::Point3D(
+                motedb::types::Point3D::new(x, y, z),
+            )),
             Value::text(format!("P{}", i)),
         ];
         db.insert_row("points", row).unwrap();
@@ -139,14 +159,17 @@ fn test_ioctree_knn_search() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, pos GEOMETRY)").unwrap();
+    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, pos GEOMETRY)")
+        .unwrap();
     for i in 0..20 {
         let x = i as f64 * 0.5;
         let y = i as f64 * 0.5;
         let z = i as f64 * 0.5;
         let row = vec![
             Value::Integer(i),
-            Value::spatial(motedb::types::Geometry::Point3D(motedb::types::Point3D::new(x, y, z))),
+            Value::spatial(motedb::types::Geometry::Point3D(
+                motedb::types::Point3D::new(x, y, z),
+            )),
         ];
         db.insert_row("pts", row).unwrap();
     }
@@ -171,7 +194,8 @@ fn test_vector_order_by_distance() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, embedding VECTOR(3))").unwrap();
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY, embedding VECTOR(3))")
+        .unwrap();
     for i in 0..10 {
         let row = vec![
             Value::Integer(i),
@@ -179,12 +203,13 @@ fn test_vector_order_by_distance() {
         ];
         db.insert_row("items", row).unwrap();
     }
-    db.execute("CREATE VECTOR INDEX idx_emb ON items(embedding)").unwrap();
+    db.execute("CREATE VECTOR INDEX idx_emb ON items(embedding)")
+        .unwrap();
     db.wait_for_indexes_ready();
 
     // SQL query with vector distance
     let result = db.execute(
-        "SELECT id FROM items ORDER BY VECTOR_DISTANCE(embedding, '[3.0, 0.0, 0.0]') LIMIT 3"
+        "SELECT id FROM items ORDER BY VECTOR_DISTANCE(embedding, '[3.0, 0.0, 0.0]') LIMIT 3",
     );
     match result {
         Ok(r) => {
@@ -204,18 +229,22 @@ fn test_match_against_sql() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, content TEXT)").unwrap();
-    db.execute("INSERT INTO docs VALUES (1, 'database management system')").unwrap();
-    db.execute("INSERT INTO docs VALUES (2, 'machine learning algorithms')").unwrap();
-    db.execute("INSERT INTO docs VALUES (3, 'database optimization techniques')").unwrap();
+    db.execute("CREATE TABLE docs (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'database management system')")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (2, 'machine learning algorithms')")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (3, 'database optimization techniques')")
+        .unwrap();
 
-    db.execute("CREATE TEXT INDEX idx_doc ON docs(content)").unwrap();
+    db.execute("CREATE TEXT INDEX idx_doc ON docs(content)")
+        .unwrap();
     db.wait_for_indexes_ready();
 
     // MATCH AGAINST query
-    let result = db.execute(
-        "SELECT id FROM docs WHERE MATCH_AGAINST(content, 'database') ORDER BY id"
-    );
+    let result =
+        db.execute("SELECT id FROM docs WHERE MATCH_AGAINST(content, 'database') ORDER BY id");
     match result {
         Ok(r) => {
             let r = rows(r);
@@ -237,7 +266,10 @@ fn test_create_text_index_nonexistent_table() {
 
     // SQL path validates table existence
     let result = db.execute("CREATE TEXT INDEX ghost_idx ON ghost_table(content)");
-    assert!(result.is_err(), "Text index on nonexistent table should error");
+    assert!(
+        result.is_err(),
+        "Text index on nonexistent table should error"
+    );
 }
 
 #[test]
@@ -247,5 +279,8 @@ fn test_create_vector_index_nonexistent_table() {
 
     // SQL path validates table existence
     let result = db.execute("CREATE VECTOR INDEX ghost_idx ON ghost_table(embedding)");
-    assert!(result.is_err(), "Vector index on nonexistent table should error");
+    assert!(
+        result.is_err(),
+        "Vector index on nonexistent table should error"
+    );
 }

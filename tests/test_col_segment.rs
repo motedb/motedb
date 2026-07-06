@@ -48,11 +48,7 @@ fn s2_multiple_flushes_create_multiple_segments() {
     assert_eq!(store.segment_count(), 1);
 
     store
-        .append_rows(&[(
-            3,
-            200,
-            vec![Value::Integer(30), Value::Text("c".into())],
-        )])
+        .append_rows(&[(3, 200, vec![Value::Integer(30), Value::Text("c".into())])])
         .unwrap();
     store.flush_buffer().unwrap();
     assert_eq!(store.segment_count(), 2);
@@ -91,20 +87,12 @@ fn s3_merge_newest_version_wins() {
     let store = ColSegmentStore::create(dir.path(), "t", col_types()).unwrap();
     // seg1: key=1 val=10 ts=100
     store
-        .append_rows(&[(
-            1,
-            100,
-            vec![Value::Integer(10), Value::Text("old".into())],
-        )])
+        .append_rows(&[(1, 100, vec![Value::Integer(10), Value::Text("old".into())])])
         .unwrap();
     store.flush_buffer().unwrap();
     // seg2: key=1 val=99 ts=200 (newer)
     store
-        .append_rows(&[(
-            1,
-            200,
-            vec![Value::Integer(99), Value::Text("new".into())],
-        )])
+        .append_rows(&[(1, 200, vec![Value::Integer(99), Value::Text("new".into())])])
         .unwrap();
     store.flush_buffer().unwrap();
 
@@ -171,7 +159,11 @@ fn s5_compaction_merges_to_one_segment() {
     assert_eq!(store.segment_count(), 1, "compaction reduces to 1 segment");
 
     let keys: Vec<u64> = store.scan().map(|(k, _, _)| k).collect();
-    assert_eq!(keys, vec![1, 2, 3, 4, 5, 6], "all data still visible after compaction");
+    assert_eq!(
+        keys,
+        vec![1, 2, 3, 4, 5, 6],
+        "all data still visible after compaction"
+    );
 }
 
 #[test]

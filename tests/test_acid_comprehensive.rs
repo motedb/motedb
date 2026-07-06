@@ -12,9 +12,9 @@
 //! - Concurrent PK insertion
 //! - Large dataset checkpoint recovery
 
-use motedb::{Database, types::Value, config::DBConfig};
-use tempfile::TempDir;
+use motedb::{config::DBConfig, types::Value, Database};
 use std::collections::HashSet;
+use tempfile::TempDir;
 
 fn setup_db(dir: &std::path::Path) -> Database {
     Database::create(dir.join("acid.mote")).unwrap()
@@ -43,7 +43,8 @@ fn test_atomicity_rollback_preserves_data() {
     // This test documents current behavior: auto-commit writes survive rollback.
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     db.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
     let tx = db.begin_transaction().unwrap();
@@ -52,7 +53,11 @@ fn test_atomicity_rollback_preserves_data() {
 
     let rows = query_rows(&db, "SELECT * FROM t");
     // Both rows visible — auto-commit writes are durable regardless of tx state
-    assert_eq!(rows.len(), 2, "Auto-commit writes are durable; rollback does not undo them");
+    assert_eq!(
+        rows.len(),
+        2,
+        "Auto-commit writes are durable; rollback does not undo them"
+    );
 }
 
 #[test]
@@ -61,7 +66,8 @@ fn test_atomicity_savepoint_rollback_partial() {
     // Same as above — auto-commit writes bypass MVCC
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 'before_sp')").unwrap();
@@ -72,7 +78,11 @@ fn test_atomicity_savepoint_rollback_partial() {
     let _ = db.commit_transaction(tx);
 
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
-    assert_eq!(rows.len(), 2, "Auto-commit writes survive savepoint rollback");
+    assert_eq!(
+        rows.len(),
+        2,
+        "Auto-commit writes survive savepoint rollback"
+    );
 }
 
 #[test]
@@ -80,7 +90,8 @@ fn test_atomicity_savepoint_rollback_partial() {
 fn test_atomicity_nested_savepoints() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 'root')").unwrap();
@@ -93,7 +104,11 @@ fn test_atomicity_nested_savepoints() {
     let _ = db.commit_transaction(tx);
 
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
-    assert_eq!(rows.len(), 3, "Auto-commit writes survive nested savepoint rollback");
+    assert_eq!(
+        rows.len(),
+        3,
+        "Auto-commit writes survive nested savepoint rollback"
+    );
 }
 
 #[test]
@@ -101,7 +116,8 @@ fn test_atomicity_nested_savepoints() {
 fn test_atomicity_double_delete_no_panic() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
 
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
@@ -125,7 +141,8 @@ fn test_atomicity_double_delete_no_panic() {
 fn test_consistency_pk_uniqueness_rejected() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
 
     let result = db.execute("INSERT INTO t VALUES (1, 'duplicate')");
@@ -142,20 +159,25 @@ fn test_consistency_pk_uniqueness_rejected() {
 fn test_consistency_auto_increment_pk_unique() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)")
+        .unwrap();
 
     for i in 0..100 {
-        db.execute(&format!("INSERT INTO t VALUES (null, 'v{}')", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES (null, 'v{}')", i))
+            .unwrap();
     }
 
     let rows = query_rows(&db, "SELECT * FROM t");
     assert_eq!(rows.len(), 100);
 
     // Verify all IDs are unique
-    let ids: HashSet<i64> = rows.iter().map(|r| match &r[0] {
-        Value::Integer(id) => *id,
-        _ => panic!("expected integer"),
-    }).collect();
+    let ids: HashSet<i64> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(id) => *id,
+            _ => panic!("expected integer"),
+        })
+        .collect();
     assert_eq!(ids.len(), 100, "All AUTO_INCREMENT IDs must be unique");
 }
 
@@ -164,7 +186,8 @@ fn test_consistency_auto_increment_pk_unique() {
 fn test_consistency_not_null_rejection() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
 
     // INSERT with NULL for NOT NULL column should fail
     let result = db.execute("INSERT INTO t VALUES (1, NULL)");
@@ -176,7 +199,8 @@ fn test_consistency_not_null_rejection() {
 fn test_consistency_type_mismatch() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, score FLOAT)")
+        .unwrap();
 
     // Inserting text into FLOAT column should fail or coerce, not corrupt
     let result = db.execute("INSERT INTO t VALUES (1, 'not_a_number')");
@@ -188,21 +212,31 @@ fn test_consistency_type_mismatch() {
 fn test_consistency_column_index_after_insert() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX t_cat ON t(cat)").unwrap();
 
     for cat in ["A", "B", "C"] {
         for _ in 0..10 {
-            db.execute(&format!("INSERT INTO t VALUES (null, '{}')", cat)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES (null, '{}')", cat))
+                .unwrap();
         }
     }
 
     // Index scan should return correct count per category
     let rows_a = query_rows(&db, "SELECT * FROM t WHERE cat = 'A'");
-    assert_eq!(rows_a.len(), 10, "Index scan: cat='A' should return 10 rows");
+    assert_eq!(
+        rows_a.len(),
+        10,
+        "Index scan: cat='A' should return 10 rows"
+    );
 
     let rows_b = query_rows(&db, "SELECT * FROM t WHERE cat = 'B'");
-    assert_eq!(rows_b.len(), 10, "Index scan: cat='B' should return 10 rows");
+    assert_eq!(
+        rows_b.len(),
+        10,
+        "Index scan: cat='B' should return 10 rows"
+    );
 }
 
 #[test]
@@ -210,7 +244,8 @@ fn test_consistency_column_index_after_insert() {
 fn test_consistency_index_after_delete() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX t_cat ON t(cat)").unwrap();
 
     for _ in 0..20 {
@@ -219,12 +254,17 @@ fn test_consistency_index_after_delete() {
 
     // Delete half
     for i in 1..=10 {
-        db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+            .unwrap();
     }
 
     // Index should now return only remaining rows
     let rows = query_rows(&db, "SELECT * FROM t WHERE cat = 'X'");
-    assert_eq!(rows.len(), 10, "After deleting 10 of 20, index should return 10");
+    assert_eq!(
+        rows.len(),
+        10,
+        "After deleting 10 of 20, index should return 10"
+    );
 }
 
 #[test]
@@ -232,7 +272,8 @@ fn test_consistency_index_after_delete() {
 fn test_consistency_index_after_update() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX t_cat ON t(cat)").unwrap();
 
     for _ in 0..10 {
@@ -241,7 +282,8 @@ fn test_consistency_index_after_update() {
 
     // Change 5 rows from 'A' to 'B'
     for i in 1..=5 {
-        db.execute(&format!("UPDATE t SET cat = 'B' WHERE id = {}", i)).unwrap();
+        db.execute(&format!("UPDATE t SET cat = 'B' WHERE id = {}", i))
+            .unwrap();
     }
 
     let rows_a = query_rows(&db, "SELECT * FROM t WHERE cat = 'A'");
@@ -259,7 +301,8 @@ fn test_consistency_index_after_update() {
 fn test_isolation_tx_sees_own_writes() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 'in_tx')").unwrap();
@@ -276,10 +319,12 @@ fn test_isolation_tx_sees_own_writes() {
 fn test_isolation_committed_tx_data_persists() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
-    db.execute("INSERT INTO t VALUES (42, 'committed')").unwrap();
+    db.execute("INSERT INTO t VALUES (42, 'committed')")
+        .unwrap();
     db.commit_transaction(tx).unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 42");
@@ -294,15 +339,21 @@ fn test_isolation_rolled_back_tx_data_gone() {
     // This test documents the current behavior.
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
-    db.execute("INSERT INTO t VALUES (99, 'will_rollback')").unwrap();
+    db.execute("INSERT INTO t VALUES (99, 'will_rollback')")
+        .unwrap();
     db.rollback_transaction(tx).unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 99");
     // Auto-commit write is visible despite rollback
-    assert_eq!(rows.len(), 1, "Auto-commit writes are durable despite transaction rollback");
+    assert_eq!(
+        rows.len(),
+        1,
+        "Auto-commit writes are durable despite transaction rollback"
+    );
 }
 
 // ============================================================================
@@ -318,9 +369,11 @@ fn test_durability_wal_recovery_no_checkpoint() {
     // Insert data WITHOUT checkpoint — relies on WAL for recovery
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
         for i in 1..=50 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, 'val_{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'val_{}')", i, i))
+                .unwrap();
         }
         db.flush().unwrap();
         // Intentionally drop without close (simulate crash)
@@ -345,7 +398,8 @@ fn test_durability_update_recovery() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         db.checkpoint().unwrap();
         db.execute("UPDATE t SET v = 999 WHERE id = 1").unwrap();
@@ -357,7 +411,11 @@ fn test_durability_update_recovery() {
         let db = Database::open(&path).unwrap();
         let rows = query_rows(&db, "SELECT * FROM t WHERE id = 1");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][1], Value::Integer(999), "Updated value must survive WAL recovery");
+        assert_eq!(
+            rows[0][1],
+            Value::Integer(999),
+            "Updated value must survive WAL recovery"
+        );
     }
 }
 
@@ -369,7 +427,8 @@ fn test_durability_delete_recovery() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
         db.execute("INSERT INTO t VALUES (2, 'delete')").unwrap();
         db.checkpoint().unwrap();
@@ -394,27 +453,38 @@ fn test_durability_mixed_crud_recovery() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT, score FLOAT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT, score FLOAT)")
+            .unwrap();
 
         // Insert 100 rows
         for i in 0..100 {
-            db.execute(&format!("INSERT INTO t VALUES (null, 'v{}', {})", i, i as f64)).unwrap();
+            db.execute(&format!(
+                "INSERT INTO t VALUES (null, 'v{}', {})",
+                i, i as f64
+            ))
+            .unwrap();
         }
         db.checkpoint().unwrap();
 
         // Update 50 rows
         for i in 1..=50 {
-            db.execute(&format!("UPDATE t SET score = -1.0 WHERE id = {}", i)).unwrap();
+            db.execute(&format!("UPDATE t SET score = -1.0 WHERE id = {}", i))
+                .unwrap();
         }
 
         // Delete 25 rows
         for i in 26..=50 {
-            db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap();
+            db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+                .unwrap();
         }
 
         // Insert 10 more
         for i in 100..110 {
-            db.execute(&format!("INSERT INTO t VALUES (null, 'new_{}', {})", i, i as f64)).unwrap();
+            db.execute(&format!(
+                "INSERT INTO t VALUES (null, 'new_{}', {})",
+                i, i as f64
+            ))
+            .unwrap();
         }
 
         db.flush().unwrap();
@@ -426,7 +496,12 @@ fn test_durability_mixed_crud_recovery() {
         let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
 
         // 100 original - 25 deleted + 10 new = 85
-        assert_eq!(rows.len(), 85, "Mixed CRUD recovery: expected 85 rows, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            85,
+            "Mixed CRUD recovery: expected 85 rows, got {}",
+            rows.len()
+        );
 
         // Verify updated rows (1..25 should have score = -1.0)
         for row in &rows {
@@ -454,12 +529,14 @@ fn test_durability_prepared_stmt_after_recovery() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         for i in 1..=20 {
             db.execute_prepared(
                 "INSERT INTO t VALUES (?, ?)",
                 vec![Value::Integer(i), Value::text(format!("name_{}", i))],
-            ).unwrap();
+            )
+            .unwrap();
         }
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -468,10 +545,11 @@ fn test_durability_prepared_stmt_after_recovery() {
     {
         let db = Database::open(&path).unwrap();
         // Prepared select after recovery
-        let rows = db.execute_prepared(
-            "SELECT * FROM t WHERE id = ?",
-            vec![Value::Integer(15)],
-        ).unwrap().materialize().unwrap();
+        let rows = db
+            .execute_prepared("SELECT * FROM t WHERE id = ?", vec![Value::Integer(15)])
+            .unwrap()
+            .materialize()
+            .unwrap();
 
         match rows {
             motedb::sql::QueryResult::Select { rows, .. } => {
@@ -493,20 +571,28 @@ fn test_durability_large_dataset_checkpoint_recovery() {
 
     {
         let db = Database::create_with_config(&path, DBConfig::for_testing()).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT, score FLOAT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT, score FLOAT)")
+            .unwrap();
 
         for i in 0..n {
-            db.execute(&format!("INSERT INTO t VALUES (null, 'v{}', {})", i, i as f64 * 1.5)).unwrap();
+            db.execute(&format!(
+                "INSERT INTO t VALUES (null, 'v{}', {})",
+                i,
+                i as f64 * 1.5
+            ))
+            .unwrap();
         }
 
         // Update some
         for i in 1..=100i64 {
-            db.execute(&format!("UPDATE t SET score = -1.0 WHERE id = {}", i)).unwrap();
+            db.execute(&format!("UPDATE t SET score = -1.0 WHERE id = {}", i))
+                .unwrap();
         }
 
         // Delete some
         for i in 200..250 {
-            db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap();
+            db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+                .unwrap();
         }
 
         db.checkpoint().unwrap();
@@ -518,25 +604,34 @@ fn test_durability_large_dataset_checkpoint_recovery() {
         let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
 
         let expected = n - 50; // 500 - 50 deleted
-        assert_eq!(rows.len(), expected, "Checkpoint recovery: expected {} rows", expected);
+        assert_eq!(
+            rows.len(),
+            expected,
+            "Checkpoint recovery: expected {} rows",
+            expected
+        );
 
         // Verify updated values
-        let updated = rows.iter().filter(|r| {
-            matches!(&r[0], Value::Integer(id) if *id >= 1 && *id <= 100)
-        }).all(|r| r[2] == Value::Float(-1.0));
+        let updated = rows
+            .iter()
+            .filter(|r| matches!(&r[0], Value::Integer(id) if *id >= 1 && *id <= 100))
+            .all(|r| r[2] == Value::Float(-1.0));
         assert!(updated, "Updated rows should have score = -1.0");
 
         // Verify deleted rows are gone
-        let deleted_exist = rows.iter().any(|r| {
-            matches!(&r[0], Value::Integer(id) if *id >= 200 && *id < 250)
-        });
+        let deleted_exist = rows
+            .iter()
+            .any(|r| matches!(&r[0], Value::Integer(id) if *id >= 200 && *id < 250));
         assert!(!deleted_exist, "Deleted rows should not exist");
 
         // Verify all IDs unique
-        let ids: HashSet<i64> = rows.iter().map(|r| match &r[0] {
-            Value::Integer(id) => *id,
-            _ => -1,
-        }).collect();
+        let ids: HashSet<i64> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Integer(id) => *id,
+                _ => -1,
+            })
+            .collect();
         assert_eq!(ids.len(), expected, "All IDs must be unique after recovery");
     }
 }
@@ -550,7 +645,8 @@ fn test_durability_large_dataset_checkpoint_recovery() {
 fn test_integrity_string_values_preserved() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
 
     let long_str = "x".repeat(1000);
     let special: Vec<(&str, &str)> = vec![
@@ -562,7 +658,12 @@ fn test_integrity_string_values_preserved() {
     ];
 
     for (i, (_label, s)) in special.iter().enumerate() {
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, s.replace('\'', "''"))).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, '{}')",
+            i,
+            s.replace('\'', "''")
+        ))
+        .unwrap();
     }
 
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
@@ -570,8 +671,14 @@ fn test_integrity_string_values_preserved() {
 
     for (i, (_label, expected)) in special.iter().enumerate() {
         let actual = &rows[i][1];
-        assert_eq!(actual, &Value::text(expected.to_string()),
-            "String mismatch at index {}: expected {:?}, got {:?}", i, expected, actual);
+        assert_eq!(
+            actual,
+            &Value::text(expected.to_string()),
+            "String mismatch at index {}: expected {:?}, got {:?}",
+            i,
+            expected,
+            actual
+        );
     }
 }
 
@@ -580,7 +687,8 @@ fn test_integrity_string_values_preserved() {
 fn test_integrity_numeric_precision() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, i INT, f FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, i INT, f FLOAT)")
+        .unwrap();
 
     let cases: Vec<(i64, i64, f64)> = vec![
         (1, 0, 0.0),
@@ -592,7 +700,8 @@ fn test_integrity_numeric_precision() {
     ];
 
     for (id, i, f) in &cases {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {:.15})", id, i, f)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {}, {:.15})", id, i, f))
+            .unwrap();
     }
 
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
@@ -602,8 +711,13 @@ fn test_integrity_numeric_precision() {
         assert_eq!(rows[i][0], Value::Integer(*id));
         assert_eq!(rows[i][1], Value::Integer(*expected_i));
         match &rows[i][2] {
-            Value::Float(actual) => assert!((actual - expected_f).abs() < 1e-10,
-                "Float mismatch for id={}: expected {}, got {}", id, expected_f, actual),
+            Value::Float(actual) => assert!(
+                (actual - expected_f).abs() < 1e-10,
+                "Float mismatch for id={}: expected {}, got {}",
+                id,
+                expected_f,
+                actual
+            ),
             _ => panic!("Expected Float"),
         }
     }
@@ -614,10 +728,13 @@ fn test_integrity_numeric_precision() {
 fn test_integrity_update_all_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)")
+        .unwrap();
 
-    db.execute("INSERT INTO t VALUES (1, 10, 'hello', 3.14)").unwrap();
-    db.execute("UPDATE t SET a = 20, b = 'world', c = 2.71 WHERE id = 1").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 'hello', 3.14)")
+        .unwrap();
+    db.execute("UPDATE t SET a = 20, b = 'world', c = 2.71 WHERE id = 1")
+        .unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 1");
     assert_eq!(rows.len(), 1);
@@ -634,27 +751,35 @@ fn test_integrity_update_all_columns() {
 fn test_integrity_prepared_vs_raw_consistency() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     for i in 1..=50 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, 'val_{}')", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, 'val_{}')", i, i))
+            .unwrap();
     }
 
     // Query same data via raw SQL and prepared statement
     for i in 1..=50 {
         let raw_rows = query_rows(&db, &format!("SELECT * FROM t WHERE id = {}", i));
         let prep_rows = {
-            let r = db.execute_prepared(
-                "SELECT * FROM t WHERE id = ?",
-                vec![Value::Integer(i)],
-            ).unwrap().materialize().unwrap();
+            let r = db
+                .execute_prepared("SELECT * FROM t WHERE id = ?", vec![Value::Integer(i)])
+                .unwrap()
+                .materialize()
+                .unwrap();
             match r {
                 motedb::sql::QueryResult::Select { rows, .. } => rows,
                 _ => vec![],
             }
         };
 
-        assert_eq!(raw_rows.len(), prep_rows.len(), "Row count mismatch for id={}", i);
+        assert_eq!(
+            raw_rows.len(),
+            prep_rows.len(),
+            "Row count mismatch for id={}",
+            i
+        );
         if !raw_rows.is_empty() {
             assert_eq!(raw_rows[0], prep_rows[0], "Value mismatch for id={}", i);
         }
@@ -670,7 +795,8 @@ fn test_integrity_prepared_vs_raw_consistency() {
 fn test_edge_delete_reinsert_different_value() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     db.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
@@ -686,7 +812,8 @@ fn test_edge_delete_reinsert_different_value() {
 fn test_edge_empty_table_operations() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     // SELECT on empty table
     let rows = query_rows(&db, "SELECT * FROM t");
@@ -706,12 +833,17 @@ fn test_edge_empty_table_operations() {
 fn test_edge_null_where_clause() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     // NULL = NULL should return 0 rows per SQL semantics
     let rows = query_rows(&db, "SELECT * FROM t WHERE v = NULL");
-    assert_eq!(rows.len(), 0, "NULL = NULL should return no rows (SQL NULL semantics)");
+    assert_eq!(
+        rows.len(),
+        0,
+        "NULL = NULL should return no rows (SQL NULL semantics)"
+    );
 
     let all = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(all.len(), 1);
@@ -722,7 +854,8 @@ fn test_edge_null_where_clause() {
 fn test_edge_table_qualified_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'test')").unwrap();
 
     let rows = query_rows(&db, "SELECT t.v FROM t WHERE t.id = 1");
@@ -738,11 +871,17 @@ fn test_edge_multiple_checkpoints() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
 
         for round in 0..3 {
             for i in 1..=20 {
-                db.execute(&format!("INSERT INTO t VALUES ({}, {})", round * 100 + i, round)).unwrap();
+                db.execute(&format!(
+                    "INSERT INTO t VALUES ({}, {})",
+                    round * 100 + i,
+                    round
+                ))
+                .unwrap();
             }
             db.checkpoint().unwrap();
         }
@@ -764,26 +903,41 @@ fn test_edge_multiple_checkpoints() {
 fn test_edge_prepared_insert_and_select_cycle() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+        .unwrap();
 
     // Insert via prepared
     for i in 0..50 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::text(format!("user{}", i)), Value::Integer(20 + i)],
-        ).unwrap();
+            vec![
+                Value::Integer(i),
+                Value::text(format!("user{}", i)),
+                Value::Integer(20 + i),
+            ],
+        )
+        .unwrap();
     }
 
     // Select each via prepared
     for i in 0..50 {
         let rows = {
-            let r = db.execute_prepared(
-                "SELECT * FROM t WHERE id = ?",
-                vec![Value::Integer(i)],
-            ).unwrap().materialize().unwrap();
-            match r { motedb::sql::QueryResult::Select { rows, .. } => rows, _ => vec![] }
+            let r = db
+                .execute_prepared("SELECT * FROM t WHERE id = ?", vec![Value::Integer(i)])
+                .unwrap()
+                .materialize()
+                .unwrap();
+            match r {
+                motedb::sql::QueryResult::Select { rows, .. } => rows,
+                _ => vec![],
+            }
         };
-        assert_eq!(rows.len(), 1, "Prepared select for id={} should return 1 row", i);
+        assert_eq!(
+            rows.len(),
+            1,
+            "Prepared select for id={} should return 1 row",
+            i
+        );
         assert_eq!(rows[0][1], Value::text(format!("user{}", i)));
         assert_eq!(rows[0][2], Value::Integer(20 + i));
     }

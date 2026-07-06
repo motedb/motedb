@@ -1,6 +1,6 @@
 //! In-memory columnar write buffer for accumulating rows before flushing to segment files.
 
-use crate::types::{ColumnType, RowId, SqlRow, TableSchema, Value, Timestamp};
+use crate::types::{ColumnType, RowId, SqlRow, TableSchema, Timestamp, Value};
 
 use super::config::ColumnarConfig;
 
@@ -56,7 +56,10 @@ impl ColumnBuffer {
             Self::Integer(v) => v.len() * 8,
             Self::Float(v) => v.len() * 8,
             Self::Bool(v) => v.len(),
-            Self::Text(v) => v.iter().map(|s| s.as_ref().map_or(1, |s| s.len() + 8)).sum(),
+            Self::Text(v) => v
+                .iter()
+                .map(|s| s.as_ref().map_or(1, |s| s.len() + 8))
+                .sum(),
             Self::Other(v) => v.len() * 32,
         }
     }
@@ -75,7 +78,10 @@ impl ColumnBuffer {
     }
 
     /// Compute column statistics (min/max/null_count) for zone map pruning.
-    pub(crate) fn compute_statistics(&self, col_id: u16) -> Option<super::segment::ColumnStatistics> {
+    pub(crate) fn compute_statistics(
+        &self,
+        col_id: u16,
+    ) -> Option<super::segment::ColumnStatistics> {
         use super::segment::{value_to_raw_bytes, ColumnStatistics};
 
         match self {
@@ -120,7 +126,9 @@ impl ColumnBuffer {
                 })
             }
             Self::Float(vals) if !vals.is_empty() => {
-                let non_null: Vec<&f64> = vals.iter().filter_map(|v| v.as_ref())
+                let non_null: Vec<&f64> = vals
+                    .iter()
+                    .filter_map(|v| v.as_ref())
                     .filter(|f| !f.is_nan())
                     .collect();
                 if non_null.is_empty() {
@@ -133,7 +141,10 @@ impl ColumnBuffer {
                     });
                 }
                 let min = non_null.iter().map(|&&v| v).fold(f64::INFINITY, f64::min);
-                let max = non_null.iter().map(|&&v| v).fold(f64::NEG_INFINITY, f64::max);
+                let max = non_null
+                    .iter()
+                    .map(|&&v| v)
+                    .fold(f64::NEG_INFINITY, f64::max);
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 Some(ColumnStatistics {
                     column_id: col_id,
@@ -155,8 +166,13 @@ impl ColumnBuffer {
                         None => null_count += 1,
                     }
                 }
-                if has_false { min_val[0] = 0; }
-                if has_true { min_val[0] = if has_false { 0 } else { 1 }; max_val[0] = 1; }
+                if has_false {
+                    min_val[0] = 0;
+                }
+                if has_true {
+                    min_val[0] = if has_false { 0 } else { 1 };
+                    max_val[0] = 1;
+                }
                 if !has_false && !has_true && null_count > 0 {
                     return Some(ColumnStatistics {
                         column_id: col_id,
@@ -275,11 +291,14 @@ pub struct ColumnarWriteBuffer {
 
 impl ColumnarWriteBuffer {
     pub fn new(table_id: u32, schema: &TableSchema, config: ColumnarConfig) -> Self {
-        let ts_column_idx = schema.timeseries_column.as_ref().and_then(|ts_col| {
-            schema.columns.iter().position(|c| c.name == *ts_col)
-        });
+        let ts_column_idx = schema
+            .timeseries_column
+            .as_ref()
+            .and_then(|ts_col| schema.columns.iter().position(|c| c.name == *ts_col));
 
-        let columns = schema.columns.iter()
+        let columns = schema
+            .columns
+            .iter()
             .map(|c| ColumnBuffer::new(&c.col_type))
             .collect();
 
@@ -318,8 +337,8 @@ impl ColumnarWriteBuffer {
         self.row_count += 1;
 
         // Update byte size estimate
-        self.byte_size = self.columns.iter().map(|c| c.byte_size()).sum::<usize>()
-            + self.row_ids.len() * 8;
+        self.byte_size =
+            self.columns.iter().map(|c| c.byte_size()).sum::<usize>() + self.row_ids.len() * 8;
 
         // Flush decision
         if self.row_count >= self.config.buffer_row_capacity
@@ -407,9 +426,9 @@ impl ColumnarWriteBuffer {
             // Check timestamp range
             if let Some(ts_idx) = self.ts_column_idx {
                 let in_range = match &self.columns[ts_idx] {
-                    ColumnBuffer::Timestamp(vals) => {
-                        vals.get(row_idx).is_some_and(|ts| ts.is_some_and(|ts| ts >= start_ts && ts <= end_ts))
-                    }
+                    ColumnBuffer::Timestamp(vals) => vals
+                        .get(row_idx)
+                        .is_some_and(|ts| ts.is_some_and(|ts| ts >= start_ts && ts <= end_ts)),
                     _ => false,
                 };
                 if !in_range {
@@ -425,24 +444,27 @@ impl ColumnarWriteBuffer {
                     continue;
                 }
                 let val = match &self.columns[idx] {
-                    ColumnBuffer::Timestamp(vals) => {
-                        vals.get(row_idx).and_then(|v| v.map(|ts| Value::Timestamp(Timestamp::from_micros(ts)))).or(Some(Value::Null))
-                    }
-                    ColumnBuffer::Integer(vals) => {
-                        vals.get(row_idx).and_then(|v| v.map(Value::Integer)).or(Some(Value::Null))
-                    }
-                    ColumnBuffer::Float(vals) => {
-                        vals.get(row_idx).and_then(|v| v.map(Value::Float)).or(Some(Value::Null))
-                    }
-                    ColumnBuffer::Bool(vals) => {
-                        vals.get(row_idx).and_then(|v| v.map(Value::Bool)).or(Some(Value::Null))
-                    }
-                    ColumnBuffer::Text(vals) => {
-                        vals.get(row_idx).and_then(|v| v.as_ref().map(|s| Value::text(s.clone()))).or(Some(Value::Null))
-                    }
-                    ColumnBuffer::Other(vals) => {
-                        vals.get(row_idx).cloned()
-                    }
+                    ColumnBuffer::Timestamp(vals) => vals
+                        .get(row_idx)
+                        .and_then(|v| v.map(|ts| Value::Timestamp(Timestamp::from_micros(ts))))
+                        .or(Some(Value::Null)),
+                    ColumnBuffer::Integer(vals) => vals
+                        .get(row_idx)
+                        .and_then(|v| v.map(Value::Integer))
+                        .or(Some(Value::Null)),
+                    ColumnBuffer::Float(vals) => vals
+                        .get(row_idx)
+                        .and_then(|v| v.map(Value::Float))
+                        .or(Some(Value::Null)),
+                    ColumnBuffer::Bool(vals) => vals
+                        .get(row_idx)
+                        .and_then(|v| v.map(Value::Bool))
+                        .or(Some(Value::Null)),
+                    ColumnBuffer::Text(vals) => vals
+                        .get(row_idx)
+                        .and_then(|v| v.as_ref().map(|s| Value::text(s.clone())))
+                        .or(Some(Value::Null)),
+                    ColumnBuffer::Other(vals) => vals.get(row_idx).cloned(),
                 };
                 if let Some(v) = val {
                     sql_row.insert(col_name.clone(), v);
@@ -628,16 +650,22 @@ mod tests {
         let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
 
         // Insert two rows, one with NULL float
-        buf.append(0, &[
-            Value::Timestamp(Timestamp::from_micros(1000)),
-            Value::Float(1.5),
-            Value::text("a".to_string()),
-        ]);
-        buf.append(1, &[
-            Value::Timestamp(Timestamp::from_micros(2000)),
-            Value::Null,
-            Value::text("b".to_string()),
-        ]);
+        buf.append(
+            0,
+            &[
+                Value::Timestamp(Timestamp::from_micros(1000)),
+                Value::Float(1.5),
+                Value::text("a".to_string()),
+            ],
+        );
+        buf.append(
+            1,
+            &[
+                Value::Timestamp(Timestamp::from_micros(2000)),
+                Value::Null,
+                Value::text("b".to_string()),
+            ],
+        );
 
         let batch = buf.take().unwrap();
         let stats = batch.columns[1].compute_statistics(1);
@@ -653,11 +681,14 @@ mod tests {
         let config = ColumnarConfig::default();
         let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
 
-        buf.append(0, &[
-            Value::Timestamp(Timestamp::from_micros(1000)),
-            Value::Null,
-            Value::text("test".to_string()),
-        ]);
+        buf.append(
+            0,
+            &[
+                Value::Timestamp(Timestamp::from_micros(1000)),
+                Value::Null,
+                Value::text("test".to_string()),
+            ],
+        );
 
         let column_ids = vec![
             (0u16, "ts".to_string()),

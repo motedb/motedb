@@ -44,6 +44,20 @@
 //! ~5×, ORDER BY + LIMIT ~2.5×, PK point lookup sub-microsecond. See
 //! `BENCHMARK.md` and the docs for methodology and full numbers.
 
+// Crate-wide clippy allowances for lint classes that are design choices in a
+// columnar DB rather than bugs. Per-site cleanups are still welcome, but these
+// fire often enough on the hot paths that we silence them globally rather than
+// annotate every signature.
+#![allow(
+    clippy::type_complexity,    // heavily-typed columnar decoders/iterators
+    clippy::too_many_arguments, // batch write/scan constructors
+    clippy::needless_range_loop, // index loops over fixed-width column slots
+    // Doc-comment markdown rendering preferences (mixed Chinese/English comments
+    // trip these); not code defects.
+    clippy::doc_lazy_continuation,
+    clippy::empty_line_after_doc_comments
+)]
+
 // 🧠 jemalloc: background thread returns freed memory to OS (RSS plateaus instead of growing forever)
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 use tikv_jemallocator::Jemalloc;
@@ -61,7 +75,7 @@ pub fn purge_memory_to_os() {
     {
         // Advance epoch to refresh arena stats, then purge each arena.
         // "arena.<i>.purge" forces all dirty/muzzy pages back to the OS.
-        use tikv_jemalloc_ctl::{epoch, arenas};
+        use tikv_jemalloc_ctl::{arenas, epoch};
         let _ = epoch::advance();
         if let Ok(n) = arenas::narenas::read() {
             for i in 0..n {
@@ -86,10 +100,19 @@ macro_rules! debug_log {
         {
             println!($($arg)*);
         }
+        // In release builds this is a true no-op. The arguments are still
+        // type-checked because the debug branch references them, but they are
+        // not evaluated at runtime in release.
         #[cfg(not(debug_assertions))]
-        let _ = || {
-            let _ = format_args!($($arg)*);
-        };
+        {
+            // Expand (but don't evaluate) the args so they remain part of the
+            // syntax tree; `format_args!` is const-evaluated away to nothing.
+            // Wrapped in a block (not `let _ = || ...`) to avoid clippy's
+            // non-binding-lock-on-sync false positive.
+            if false {
+                let _ = format_args!($($arg)*);
+            }
+        }
     };
 }
 
@@ -111,36 +134,36 @@ macro_rules! info_log {
     };
 }
 
+pub mod catalog;
 pub mod config;
-pub mod storage;
+pub mod distance;
 pub mod index;
+pub mod sql;
+pub mod storage;
 pub mod txn;
 pub mod types;
-pub mod distance;
-pub mod catalog;
-pub mod sql;
 
 // ⚠️ EXPERIMENTAL: the C ABI in `ffi` is incomplete (no open_with_config,
 // no transaction/batch APIs, no error reporting, execute() returns a Debug
 // string). There is no C header file and no versioned symbol scheme yet.
 // Do not rely on it for production bindings until it stabilizes — it will
 // change without a SemVer bump. Tracked as a pre-1.0 limitation.
-pub mod ffi;
-pub mod cache;  // 🚀 P1: Row cache for performance
+pub mod cache;
+pub mod ffi; // 🚀 P1: Row cache for performance
 
 // 🔄 Modular database module (refactored from database_legacy.rs)
 pub mod database;
 
-mod error;
-mod api;  // 内部 API 包装层
+mod api;
+mod error; // 内部 API 包装层
 
-pub use config::{DBConfig, DurabilityLevel, LSMConfig, WALConfig, AutoCheckpointConfig};
-pub use error::{Result, StorageError, MoteDBError};
+pub use config::{AutoCheckpointConfig, DBConfig, DurabilityLevel, LSMConfig, WALConfig};
+pub use error::{MoteDBError, Result, StorageError};
 
 // 主要对外 API (now using modular database)
-pub use database::{MoteDB, QueryProfile, TransactionStats};
-pub use api::Database;  // 简化 API 包装
+pub use api::Database; // 简化 API 包装
 pub use catalog::TableRegistry;
+pub use database::{MoteDB, QueryProfile, TransactionStats};
 pub use sql::{ForEachResult, QueryResult, StreamingControl, StreamingQueryResult};
 
 // 🔌 导出分词器插件系统（方便用户直接使用）

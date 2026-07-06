@@ -32,7 +32,11 @@ pub enum ColumnCondition {
     /// Column equals a specific value.
     Equals { column_idx: usize, value: Value },
     /// Column value is within [low, high] range (inclusive).
-    Range { column_idx: usize, low: Value, high: Value },
+    Range {
+        column_idx: usize,
+        low: Value,
+        high: Value,
+    },
 }
 
 /// Manages all segment files for a single table.
@@ -50,8 +54,7 @@ impl SegmentManager {
     /// Also recovers from interrupted merge operations by checking for a
     /// `merge_manifest.json` left behind by a crash during `replace_segments()`.
     pub fn open(directory: &Path, table_id: u32) -> Result<Self> {
-        std::fs::create_dir_all(directory)
-            .map_err(StorageError::Io)?;
+        std::fs::create_dir_all(directory).map_err(StorageError::Io)?;
 
         // Recover from interrupted merges BEFORE scanning for segments
         Self::recover_merge_manifest(directory);
@@ -100,7 +103,10 @@ impl SegmentManager {
         let data = match std::fs::read_to_string(&manifest_path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[WARN] Failed to read merge manifest {:?}: {}", manifest_path, e);
+                eprintln!(
+                    "[WARN] Failed to read merge manifest {:?}: {}",
+                    manifest_path, e
+                );
                 let _ = std::fs::remove_file(&manifest_path);
                 return;
             }
@@ -210,8 +216,10 @@ impl SegmentManager {
                         let query_bytes = super::segment::value_to_raw_bytes(value);
 
                         // Check: value must be >= min AND <= max
-                        if raw_bytes_compare_bytes(&query_bytes, &stat.min_value_raw) == std::cmp::Ordering::Less
-                            || raw_bytes_compare_bytes(&query_bytes, &stat.max_value_raw) == std::cmp::Ordering::Greater
+                        if raw_bytes_compare_bytes(&query_bytes, &stat.min_value_raw)
+                            == std::cmp::Ordering::Less
+                            || raw_bytes_compare_bytes(&query_bytes, &stat.max_value_raw)
+                                == std::cmp::Ordering::Greater
                         {
                             return false; // Value outside zone map range
                         }
@@ -219,14 +227,20 @@ impl SegmentManager {
                         // For Text columns, also check bloom filter
                         if let Value::Text(ref text_val) = value {
                             if segment.has_bloom_filters {
-                                if let Ok(false) = self.may_contain_text(segment, *column_idx, text_val) {
+                                if let Ok(false) =
+                                    self.may_contain_text(segment, *column_idx, text_val)
+                                {
                                     return false; // Bloom filter says no
                                 }
                             }
                         }
                     }
                 }
-                ColumnCondition::Range { column_idx, low, high } => {
+                ColumnCondition::Range {
+                    column_idx,
+                    low,
+                    high,
+                } => {
                     let col_id = *column_idx as u16;
                     if let Some(stat) = stats.iter().find(|s| s.column_id == col_id) {
                         let low_bytes = super::segment::value_to_raw_bytes(low);
@@ -234,8 +248,10 @@ impl SegmentManager {
 
                         // Range [low, high] overlaps with segment [min, max] iff
                         // high >= min AND low <= max
-                        if raw_bytes_compare_bytes(&high_bytes, &stat.min_value_raw) == std::cmp::Ordering::Less
-                            || raw_bytes_compare_bytes(&low_bytes, &stat.max_value_raw) == std::cmp::Ordering::Greater
+                        if raw_bytes_compare_bytes(&high_bytes, &stat.min_value_raw)
+                            == std::cmp::Ordering::Less
+                            || raw_bytes_compare_bytes(&low_bytes, &stat.max_value_raw)
+                                == std::cmp::Ordering::Greater
                         {
                             return false;
                         }
@@ -247,7 +263,12 @@ impl SegmentManager {
     }
 
     /// Check if a segment's bloom filter may contain a text value for the given column.
-    pub fn may_contain_text(&self, segment: &SegmentMetadata, column_idx: usize, value: &str) -> Result<bool> {
+    pub fn may_contain_text(
+        &self,
+        segment: &SegmentMetadata,
+        column_idx: usize,
+        value: &str,
+    ) -> Result<bool> {
         let reader = self.get_reader(&segment.path)?;
         let filters = reader.read_bloom_filters()?;
         match filters {
@@ -321,7 +342,9 @@ impl SegmentManager {
         if count > 0 {
             debug_log!(
                 "[Columnar] Table {}: deleted {} expired segments (cutoff={})",
-                self.table_id, count, cutoff_ts
+                self.table_id,
+                count,
+                cutoff_ts
             );
         }
 
@@ -333,7 +356,8 @@ impl SegmentManager {
         // Lock ordering: segments first, then reader_cache.
         let paths: Vec<PathBuf> = {
             let mut segments = self.segments.write();
-            let paths: Vec<PathBuf> = segments.iter()
+            let paths: Vec<PathBuf> = segments
+                .iter()
                 .filter(|s| s.path.exists())
                 .map(|s| s.path.clone())
                 .collect();
@@ -388,29 +412,28 @@ impl SegmentManager {
         let manifest_path = self.directory.join(MERGE_MANIFEST_NAME);
         let manifest = MergeManifest {
             new: vec![new_segment_path.to_string_lossy().into_owned()],
-            old: old_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            old: old_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
         };
         {
             let json = serde_json::to_string_pretty(&manifest)
                 .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
-            let mut file = std::fs::File::create(&manifest_path)
-                .map_err(StorageError::Io)?;
-            file.write_all(json.as_bytes())
-                .map_err(StorageError::Io)?;
-            file.sync_all()
-                .map_err(StorageError::Io)?;
+            let mut file = std::fs::File::create(&manifest_path).map_err(StorageError::Io)?;
+            file.write_all(json.as_bytes()).map_err(StorageError::Io)?;
+            file.sync_all().map_err(StorageError::Io)?;
         }
 
         // Collect file deletions, perform I/O outside of locks
-        let paths_to_delete: Vec<PathBuf> = old_paths.iter()
-            .filter(|p| p.exists())
-            .cloned()
-            .collect();
+        let paths_to_delete: Vec<PathBuf> =
+            old_paths.iter().filter(|p| p.exists()).cloned().collect();
 
         // Step 2: Lock ordering: always segments first, then reader_cache
         {
             let mut segments = self.segments.write();
-            let old_path_set: std::collections::HashSet<PathBuf> = old_paths.iter().cloned().collect();
+            let old_path_set: std::collections::HashSet<PathBuf> =
+                old_paths.iter().cloned().collect();
             segments.retain(|s| !old_path_set.contains(&s.path));
             segments.push(new_meta);
             segments.sort_by_key(|s| s.min_timestamp);
@@ -484,7 +507,9 @@ mod tests {
         let path = dir.join(format!("seg_{}_{}.mcdb", min_ts, max_ts));
         let mut builder = SegmentBuilder::new(&path, table_id, 1).unwrap();
         let ts_data = super::super::gorilla::encode_timestamps(&[min_ts, max_ts]);
-        builder.write_column(0, ColumnEncoding::GorillaTimestamp, &ts_data, 16, 0).unwrap();
+        builder
+            .write_column(0, ColumnEncoding::GorillaTimestamp, &ts_data, 16, 0)
+            .unwrap();
         builder.finish(2, min_ts, max_ts, 0, 1).unwrap();
         path
     }

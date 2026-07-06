@@ -19,7 +19,7 @@
 //!   deserialized btree results match their tombstones correctly for long text
 
 use crate::database::mem_buffer::IndexMemBuffer;
-use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig, BTreeKey};
+use crate::index::btree_generic::{BTreeKey, GenericBTree, GenericBTreeConfig};
 use crate::index::cached_index::CachedIndex;
 use crate::types::{RowId, Value};
 use crate::{Result, StorageError};
@@ -112,7 +112,9 @@ impl BTreeKey for IndexKey {
     fn deserialize(bytes: &[u8]) -> Result<Self> {
         let key_size = Self::key_size();
         if bytes.len() < key_size {
-            return Err(StorageError::Serialization("Invalid key: too short".to_string()));
+            return Err(StorageError::Serialization(
+                "Invalid key: too short".to_string(),
+            ));
         }
 
         // Reconstruct fixed-size value_bytes
@@ -123,10 +125,13 @@ impl BTreeKey for IndexKey {
         let row_id = u64::from_be_bytes(
             bytes[VALUE_DATA_SIZE..VALUE_DATA_SIZE + ROW_ID_SIZE]
                 .try_into()
-                .map_err(|_| StorageError::Serialization("Invalid row_id".to_string()))?
+                .map_err(|_| StorageError::Serialization("Invalid row_id".to_string()))?,
         );
 
-        Ok(IndexKey { value_bytes, row_id })
+        Ok(IndexKey {
+            value_bytes,
+            row_id,
+        })
     }
 
     fn key_size() -> usize {
@@ -219,7 +224,9 @@ impl ColumnValueIndex {
         config: ColumnValueIndexConfig,
     ) -> Result<Self> {
         let index = Self::create(path, table_name, column_name, config)?;
-        index.needs_rebuild.store(false, std::sync::atomic::Ordering::Relaxed);
+        index
+            .needs_rebuild
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(index)
     }
 
@@ -232,9 +239,10 @@ impl ColumnValueIndex {
         };
 
         // Write to mem buffer (primary write path)
-        let full = self.mem_buffer.insert(key.clone(), ()).map_err(|e| {
-            StorageError::InvalidData(e)
-        })?;
+        let full = self
+            .mem_buffer
+            .insert(key.clone(), ())
+            .map_err(StorageError::InvalidData)?;
 
         // Re-insert cancels any pending tombstone — must succeed (blocking).
         // A skipped tombstone removal would leave the re-inserted key invisible.
@@ -257,13 +265,19 @@ impl ColumnValueIndex {
     /// entries and uses bulk_load (O(N/B) sequential page writes). Otherwise
     /// falls back to per-row insert with tombstone/LRU skip.
     pub fn bulk_insert_entry(&self, entries: &[(Value, RowId)]) -> Result<()> {
-        if entries.is_empty() { return Ok(()); }
+        if entries.is_empty() {
+            return Ok(());
+        }
 
         // Pre-serialize all values to IndexKey bytes.
-        let keys: Vec<IndexKey> = entries.iter()
+        let keys: Vec<IndexKey> = entries
+            .iter()
             .map(|(value, row_id)| {
-                let value_bytes = self.value_to_bytes(value).unwrap_or_else(|_| [0u8; 64]);
-                IndexKey { value_bytes, row_id: *row_id }
+                let value_bytes = self.value_to_bytes(value).unwrap_or([0u8; 64]);
+                IndexKey {
+                    value_bytes,
+                    row_id: *row_id,
+                }
             })
             .collect();
 
@@ -274,9 +288,15 @@ impl ColumnValueIndex {
     /// directly, skipping Value construction entirely. ~2x faster than
     /// bulk_insert_entry for text columns.
     pub fn bulk_insert_raw(&self, entries: Vec<([u8; 64], RowId)>) -> Result<()> {
-        if entries.is_empty() { return Ok(()); }
-        let keys: Vec<IndexKey> = entries.into_iter()
-            .map(|(value_bytes, row_id)| IndexKey { value_bytes, row_id })
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<IndexKey> = entries
+            .into_iter()
+            .map(|(value_bytes, row_id)| IndexKey {
+                value_bytes,
+                row_id,
+            })
             .collect();
         self.bulk_load_or_insert(keys)
     }
@@ -286,9 +306,13 @@ impl ColumnValueIndex {
         // bottom-up in a single sequential pass — far faster than per-key insert
         // for CREATE INDEX (110ms vs 2800ms for 300K entries).
         #[cfg(feature = "rayon")]
-        { keys.par_sort_unstable(); }
+        {
+            keys.par_sort_unstable();
+        }
         #[cfg(not(feature = "rayon"))]
-        { keys.sort_unstable(); }
+        {
+            keys.sort_unstable();
+        }
         keys.dedup();
         let mut btree = self.btree.write();
         btree.bulk_load(keys)?;
@@ -300,8 +324,14 @@ impl ColumnValueIndex {
     pub fn update(&self, old_value: &Value, new_value: &Value, row_id: RowId) -> Result<()> {
         let old_value_bytes = self.value_to_bytes(old_value)?;
         let new_value_bytes = self.value_to_bytes(new_value)?;
-        let old_key = IndexKey { value_bytes: old_value_bytes, row_id };
-        let new_key = IndexKey { value_bytes: new_value_bytes, row_id };
+        let old_key = IndexKey {
+            value_bytes: old_value_bytes,
+            row_id,
+        };
+        let new_key = IndexKey {
+            value_bytes: new_value_bytes,
+            row_id,
+        };
 
         // 1. Remove old key from active mem_buffer
         self.mem_buffer.delete(&old_key);
@@ -327,9 +357,10 @@ impl ColumnValueIndex {
         }
 
         // 4. Write new key to mem_buffer
-        let full = self.mem_buffer.insert(new_key.clone(), ()).map_err(|e| {
-            StorageError::InvalidData(e)
-        })?;
+        let full = self
+            .mem_buffer
+            .insert(new_key.clone(), ())
+            .map_err(StorageError::InvalidData)?;
 
         // 5. Drain if buffer is full OR pending_deletes accumulated too many
         if full || pending_len > 10_000 {
@@ -352,7 +383,8 @@ impl ColumnValueIndex {
         }
 
         // Sort keys by value for sequential access
-        let mut keys: Vec<(IndexKey, Value)> = items.into_iter()
+        let mut keys: Vec<(IndexKey, Value)> = items
+            .into_iter()
             .map(|(value, row_id)| {
                 let value_bytes = self.value_to_bytes(&value)?;
                 let key = IndexKey {
@@ -374,10 +406,12 @@ impl ColumnValueIndex {
         }
 
         // Batch insert into mem_buffer — single RwLock acquisition for all keys
-        let buffer_entries: Vec<(IndexKey, ())> = keys.iter().map(|(k, _)| (k.clone(), ())).collect();
-        let full = self.mem_buffer.batch_insert(buffer_entries).map_err(|e| {
-            StorageError::InvalidData(e)
-        })?;
+        let buffer_entries: Vec<(IndexKey, ())> =
+            keys.iter().map(|(k, _)| (k.clone(), ())).collect();
+        let full = self
+            .mem_buffer
+            .batch_insert(buffer_entries)
+            .map_err(StorageError::InvalidData)?;
         if full {
             if let Some(_guard) = self.drain_lock.try_lock() {
                 self.drain_immutable_to_btree()?;
@@ -404,11 +438,11 @@ impl ColumnValueIndex {
 
         let value_bytes = self.value_to_bytes(value)?;
         let start_key = IndexKey {
-            value_bytes: value_bytes.clone(),
+            value_bytes,
             row_id: 0,
         };
         let end_key = IndexKey {
-            value_bytes: value_bytes.clone(),
+            value_bytes,
             row_id: RowId::MAX,
         };
 
@@ -466,11 +500,11 @@ impl ColumnValueIndex {
 
         let value_bytes = self.value_to_bytes(value)?;
         let start_key = IndexKey {
-            value_bytes: value_bytes.clone(),
+            value_bytes,
             row_id: 0,
         };
         let end_key = IndexKey {
-            value_bytes: value_bytes.clone(),
+            value_bytes,
             row_id: RowId::MAX,
         };
 
@@ -609,7 +643,7 @@ impl ColumnValueIndex {
             row_id: 0,
         };
         let end_key = IndexKey {
-            value_bytes: upper_bytes.clone(),
+            value_bytes: upper_bytes,
             row_id: RowId::MAX,
         };
 
@@ -653,7 +687,7 @@ impl ColumnValueIndex {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
 
         let start_key = IndexKey {
-            value_bytes: lower_bytes.clone(),
+            value_bytes: lower_bytes,
             row_id: 0,
         };
         let end_key = IndexKey {
@@ -781,20 +815,24 @@ impl ColumnValueIndex {
     }
 
     /// Dual-bound range query with flexible boundaries
-    pub fn query_between(&self,
-                        lower_bound: &Value, lower_inclusive: bool,
-                        upper_bound: &Value, upper_inclusive: bool) -> Result<Vec<RowId>> {
+    pub fn query_between(
+        &self,
+        lower_bound: &Value,
+        lower_inclusive: bool,
+        upper_bound: &Value,
+        upper_inclusive: bool,
+    ) -> Result<Vec<RowId>> {
         let lower_bytes = self.value_to_bytes(lower_bound)?;
         let upper_bytes = self.value_to_bytes(upper_bound)?;
 
         let start_key = IndexKey {
-            value_bytes: lower_bytes.clone(),
+            value_bytes: lower_bytes,
             row_id: if lower_inclusive { 0 } else { RowId::MAX },
         };
         // For exclusive upper: scan one value past upper, then post-filter.
         // Using (upper_bytes, 0) would incorrectly include row_id=0 entries.
         let end_key = IndexKey {
-            value_bytes: upper_bytes.clone(),
+            value_bytes: upper_bytes,
             row_id: RowId::MAX,
         };
 
@@ -868,18 +906,20 @@ impl ColumnValueIndex {
         let end_bytes = self.value_to_bytes(end)?;
 
         let start_key = IndexKey {
-            value_bytes: start_bytes.clone(),
+            value_bytes: start_bytes,
             row_id: 0,
         };
         let end_key = IndexKey {
-            value_bytes: end_bytes.clone(),
+            value_bytes: end_bytes,
             row_id: RowId::MAX,
         };
 
         let mut deleted_count = 0;
 
         // Phase 1: Collect mem_buffer keys (takes active.read() briefly, no tombstones held)
-        let buffer_keys: Vec<IndexKey> = self.mem_buffer.range(&start_key, &end_key)
+        let buffer_keys: Vec<IndexKey> = self
+            .mem_buffer
+            .range(&start_key, &end_key)
             .into_iter()
             .map(|(k, _)| k)
             .collect();
@@ -888,7 +928,8 @@ impl ColumnValueIndex {
         let mut tombstones = self.tombstones.lock();
         let mut btree = self.btree.write();
 
-        let btree_keys: Vec<IndexKey> = btree.range(&start_key, &end_key)?
+        let btree_keys: Vec<IndexKey> = btree
+            .range(&start_key, &end_key)?
             .into_iter()
             .map(|(key, _)| key)
             .collect();
@@ -901,9 +942,7 @@ impl ColumnValueIndex {
         drop(btree);
 
         // Tombstone mem_buffer keys while still holding tombstones lock
-        let mem_tombstone_keys: Vec<IndexKey> = buffer_keys.iter()
-            .map(|k| tombstone_key(k))
-            .collect();
+        let mem_tombstone_keys: Vec<IndexKey> = buffer_keys.iter().map(tombstone_key).collect();
         for tk in &mem_tombstone_keys {
             tombstones.insert(tk.clone());
             deleted_count += 1;
@@ -944,7 +983,7 @@ impl ColumnValueIndex {
             return Ok(());
         }
         while self.mem_buffer.should_flush() {
-            if let Some(entries) = self.mem_buffer.flush().map_err(|e| StorageError::InvalidData(e))? {
+            if let Some(entries) = self.mem_buffer.flush().map_err(StorageError::InvalidData)? {
                 if !entries.is_empty() {
                     let tombstones = self.tombstones.lock();
                     let mut btree = self.btree.write();
@@ -1035,12 +1074,14 @@ impl ColumnValueIndex {
     /// Returns true if this index needs to be rebuilt by the async pipeline.
     /// Newly created indexes or those that missed synchronous updates need rebuilding.
     pub fn needs_rebuild(&self) -> bool {
-        self.needs_rebuild.load(std::sync::atomic::Ordering::Acquire)
+        self.needs_rebuild
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Clear the rebuild flag after the async pipeline successfully builds the index.
     pub fn mark_rebuilt(&self) {
-        self.needs_rebuild.store(false, std::sync::atomic::Ordering::Release);
+        self.needs_rebuild
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Get the approximate number of entries in the index
@@ -1066,8 +1107,14 @@ impl ColumnValueIndex {
         //    Always scan BTree in addition to mem_buffer — after a flush/compaction,
         //    mem_buffer may be empty and all data lives in BTree.
         {
-            let min_key = IndexKey { value_bytes: [0u8; VALUE_DATA_SIZE], row_id: 0 };
-            let max_key = IndexKey { value_bytes: [0xFFu8; VALUE_DATA_SIZE], row_id: u64::MAX };
+            let min_key = IndexKey {
+                value_bytes: [0u8; VALUE_DATA_SIZE],
+                row_id: 0,
+            };
+            let max_key = IndexKey {
+                value_bytes: [0xFFu8; VALUE_DATA_SIZE],
+                row_id: u64::MAX,
+            };
             let btree = self.btree.read();
             if let Ok(entries) = btree.range(&min_key, &max_key) {
                 for (idx_key, _) in entries {
@@ -1101,12 +1148,13 @@ impl ColumnValueIndex {
                 let ts = i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
                 Value::Timestamp(crate::types::Timestamp::from_micros(ts))
             }
-            crate::types::ColumnType::Boolean => {
-                Value::Bool(bytes[0] != 0)
-            }
+            crate::types::ColumnType::Boolean => Value::Bool(bytes[0] != 0),
             crate::types::ColumnType::Text => {
                 // Text is stored raw, find the actual length (trim trailing zeros)
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(VALUE_DATA_SIZE);
+                let end = bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(VALUE_DATA_SIZE);
                 let s = std::str::from_utf8(&bytes[..end]).unwrap_or("");
                 Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))
             }
@@ -1133,7 +1181,7 @@ impl ColumnValueIndex {
                     bits ^ (1u64 << 63) // positive: flip sign bit
                 };
                 buf[..8].copy_from_slice(&sortable.to_be_bytes());
-            },
+            }
             Value::Timestamp(ts) => buf[..8].copy_from_slice(&ts.as_micros().to_be_bytes()),
             Value::Bool(b) => buf[0] = if *b { 1 } else { 0 },
             Value::Text(s) => {
@@ -1142,9 +1190,10 @@ impl ColumnValueIndex {
                 buf[..len].copy_from_slice(&raw[..len]);
             }
             _ => {
-                return Err(StorageError::InvalidData(
-                    format!("Unsupported value type for indexing: {:?}", value)
-                ));
+                return Err(StorageError::InvalidData(format!(
+                    "Unsupported value type for indexing: {:?}",
+                    value
+                )));
             }
         };
         Ok(buf)
@@ -1160,13 +1209,15 @@ pub struct IndexStats {
 
 // ==================== Batch Index Builder Implementation ====================
 
-use crate::index::builder::{IndexBuilder, BuildStats};
+use crate::index::builder::{BuildStats, IndexBuilder};
 use crate::types::Row;
 
 impl IndexBuilder for ColumnValueIndex {
     fn build_from_memtable(&mut self, _rows: &[(RowId, Row)]) -> Result<()> {
-        debug_log!("[ColumnIndex::{}] ⚠️  build_from_memtable is deprecated, use insert_batch instead",
-                 self.column_name);
+        debug_log!(
+            "[ColumnIndex::{}] ⚠️  build_from_memtable is deprecated, use insert_batch instead",
+            self.column_name
+        );
         Ok(())
     }
 
@@ -1177,7 +1228,11 @@ impl IndexBuilder for ColumnValueIndex {
         self.flush()?;
 
         let duration = start.elapsed();
-        debug_log!("[ColumnIndex::{}] Persist: {:?}", self.column_name, duration);
+        debug_log!(
+            "[ColumnIndex::{}] Persist: {:?}",
+            self.column_name,
+            duration
+        );
 
         Ok(())
     }
@@ -1311,13 +1366,19 @@ mod tests {
     fn test_tombstone_key_normalization() {
         let mut vb = [0u8; VALUE_DATA_SIZE];
         vb[..5].copy_from_slice(b"hello");
-        let short = IndexKey { value_bytes: vb, row_id: 42 };
+        let short = IndexKey {
+            value_bytes: vb,
+            row_id: 42,
+        };
         let tk_short = tombstone_key(&short);
         assert_eq!(tk_short.value_bytes, vb);
 
         let mut vb2 = [0u8; VALUE_DATA_SIZE];
         vb2[..12].copy_from_slice(b"abcdefghijkl");
-        let long = IndexKey { value_bytes: vb2, row_id: 99 };
+        let long = IndexKey {
+            value_bytes: vb2,
+            row_id: 99,
+        };
         let tk_long = tombstone_key(&long);
         assert_eq!(tk_long.value_bytes, vb2);
         assert_eq!(tk_long.row_id, 99);
@@ -1410,14 +1471,12 @@ mod tests {
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok(ids) = index.get(&Value::Integer(25)) {
                         for &id in &ids {
-                            assert!(id < n as RowId,
-                                "get() returned unexpected row_id {}", id);
+                            assert!(id < n as RowId, "get() returned unexpected row_id {}", id);
                         }
                     }
                     if let Ok(ids) = index.query_less_than_or_equal(&Value::Integer(10)) {
                         for &id in &ids {
-                            assert!(id < n as RowId,
-                                "range() returned unexpected row_id {}", id);
+                            assert!(id < n as RowId, "range() returned unexpected row_id {}", id);
                         }
                     }
                 }
@@ -1437,8 +1496,12 @@ mod tests {
         }
         for i in 0..10 {
             let ids = index.get(&Value::Integer(i))?;
-            assert!(!ids.contains(&(i as RowId)),
-                "Deleted key (value={}, row_id={}) still present", i, i);
+            assert!(
+                !ids.contains(&(i as RowId)),
+                "Deleted key (value={}, row_id={}) still present",
+                i,
+                i
+            );
         }
 
         Ok(())
@@ -1454,7 +1517,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_deadlock2.idx");
         let index = Arc::new(ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?);
 
@@ -1500,7 +1565,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_update.idx");
         let index = ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
 
@@ -1513,13 +1580,20 @@ mod tests {
         index.update(&Value::Integer(100), &Value::Integer(200), 1)?;
 
         // Old value should NOT have row 1 anymore
-        assert!(!index.get(&Value::Integer(100))?.contains(&1),
-            "old value should not contain updated row");
+        assert!(
+            !index.get(&Value::Integer(100))?.contains(&1),
+            "old value should not contain updated row"
+        );
         // New value SHOULD have row 1
-        assert!(index.get(&Value::Integer(200))?.contains(&1),
-            "new value should contain updated row");
+        assert!(
+            index.get(&Value::Integer(200))?.contains(&1),
+            "new value should contain updated row"
+        );
         // Only one entry for row 1 across both values
-        assert_eq!(index.get(&Value::Integer(100))?.len() + index.get(&Value::Integer(200))?.len(), 1);
+        assert_eq!(
+            index.get(&Value::Integer(100))?.len() + index.get(&Value::Integer(200))?.len(),
+            1
+        );
 
         Ok(())
     }
@@ -1530,7 +1604,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_update_same.idx");
         let index = ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
 
@@ -1538,8 +1614,10 @@ mod tests {
         // Update to same value — should be a noop, not a delete
         index.update(&Value::Integer(100), &Value::Integer(100), 5)?;
 
-        assert!(index.get(&Value::Integer(100))?.contains(&5),
-            "row should still be present after same-value update");
+        assert!(
+            index.get(&Value::Integer(100))?.contains(&5),
+            "row should still be present after same-value update"
+        );
         Ok(())
     }
 
@@ -1549,7 +1627,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_flush_get.idx");
         let index = ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
 
@@ -1578,7 +1658,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_batch2.idx");
         let index = ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
         let items: Vec<(Value, RowId)> = (0..1000i64)
@@ -1587,8 +1669,12 @@ mod tests {
         index.batch_insert(items)?;
         index.flush()?;
         for v in 0..10i64 {
-            assert_eq!(index.get(&Value::Integer(v))?.len(), 100,
-                "value {} should have 100 row_ids", v);
+            assert_eq!(
+                index.get(&Value::Integer(v))?.len(),
+                100,
+                "value {} should have 100 row_ids",
+                v
+            );
         }
         Ok(())
     }
@@ -1599,7 +1685,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_del2.idx");
         let index = ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
         index.insert(&Value::Integer(42), 100)?;
@@ -1614,16 +1702,22 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let path = temp_dir.path().join("test_upd_flush2.idx");
         let index = ColumnValueIndex::create(
-            &path, "t".to_string(), "c".to_string(),
+            &path,
+            "t".to_string(),
+            "c".to_string(),
             ColumnValueIndexConfig::default(),
         )?;
         index.insert(&Value::Integer(10), 1)?;
         index.update(&Value::Integer(10), &Value::Integer(20), 1)?;
         index.flush()?;
-        assert!(index.get(&Value::Integer(20))?.contains(&1),
-            "after update+flush: row 1 should be at new value");
-        assert!(!index.get(&Value::Integer(10))?.contains(&1),
-            "after update+flush: row 1 should NOT be at old value");
+        assert!(
+            index.get(&Value::Integer(20))?.contains(&1),
+            "after update+flush: row 1 should be at new value"
+        );
+        assert!(
+            !index.get(&Value::Integer(10))?.contains(&1),
+            "after update+flush: row 1 should NOT be at old value"
+        );
         Ok(())
     }
 
@@ -1645,20 +1739,40 @@ mod tests {
 
         // Inclusive both ends: [10, 30] → should find all 3
         let result = index.query_between(&Value::Integer(10), true, &Value::Integer(30), true)?;
-        assert_eq!(result.len(), 3, "[10,30] inclusive should find 3, got {}", result.len());
+        assert_eq!(
+            result.len(),
+            3,
+            "[10,30] inclusive should find 3, got {}",
+            result.len()
+        );
 
         // Exclusive both ends: (10, 30) → should find only 20
         let result = index.query_between(&Value::Integer(10), false, &Value::Integer(30), false)?;
-        assert_eq!(result.len(), 1, "(10,30) exclusive should find 1, got {}", result.len());
+        assert_eq!(
+            result.len(),
+            1,
+            "(10,30) exclusive should find 1, got {}",
+            result.len()
+        );
         assert!(result.contains(&1), "should contain row_id=1 (value=20)");
 
         // Lower exclusive, upper inclusive: (10, 30] → should find 20, 30
         let result = index.query_between(&Value::Integer(10), false, &Value::Integer(30), true)?;
-        assert_eq!(result.len(), 2, "(10,30] should find 2, got {}", result.len());
+        assert_eq!(
+            result.len(),
+            2,
+            "(10,30] should find 2, got {}",
+            result.len()
+        );
 
         // Lower inclusive, upper exclusive: [10, 30) → should find 10, 20
         let result = index.query_between(&Value::Integer(10), true, &Value::Integer(30), false)?;
-        assert_eq!(result.len(), 2, "[10,30) should find 2, got {}", result.len());
+        assert_eq!(
+            result.len(),
+            2,
+            "[10,30) should find 2, got {}",
+            result.len()
+        );
 
         Ok(())
     }

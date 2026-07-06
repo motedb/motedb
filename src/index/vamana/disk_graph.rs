@@ -84,14 +84,19 @@ impl DiskGraph {
         let idx_path = data_dir.join("graph.idx");
 
         let mut file = OpenOptions::new()
-            .create(true).read(true).write(true).truncate(true)
-            .open(&file_path).map_err(StorageError::Io)?;
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&file_path)
+            .map_err(StorageError::Io)?;
 
         Self::write_header(&mut file, max_degree, 0)?;
 
         // Create empty sidecar index
         let mut idx = File::create(&idx_path).map_err(StorageError::Io)?;
-        idx.write_all(&0u64.to_le_bytes()).map_err(StorageError::Io)?;
+        idx.write_all(&0u64.to_le_bytes())
+            .map_err(StorageError::Io)?;
 
         Ok(Self {
             max_degree,
@@ -101,7 +106,9 @@ impl DiskGraph {
             index: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
-            index_file: Arc::new(RwLock::new(File::open(&idx_path).map_err(StorageError::Io)?)),
+            index_file: Arc::new(RwLock::new(
+                File::open(&idx_path).map_err(StorageError::Io)?,
+            )),
             index_count: Arc::new(RwLock::new(0)),
             count: Arc::new(RwLock::new(0)),
             cache: Arc::new(Mutex::new(LruCache::new(
@@ -134,8 +141,11 @@ impl DiskGraph {
         let file_path = data_dir.join("graph.bin");
         let idx_path = data_dir.join("graph.idx");
 
-        let mut file = OpenOptions::new().read(true).write(true)
-            .open(&file_path).map_err(StorageError::Io)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .map_err(StorageError::Io)?;
 
         let (max_degree, node_count) = Self::read_header(&mut file)?;
 
@@ -148,8 +158,11 @@ impl DiskGraph {
         } else {
             Self::build_sidecar_index(&file_path, &idx_path, node_count)?;
             // Reopen file after building
-            let mut file = OpenOptions::new().read(true).write(true)
-                .open(&file_path).map_err(StorageError::Io)?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .map_err(StorageError::Io)?;
             // Recalculate next_offset by scanning
             let (_, _next_off) = Self::scan_for_next_offset(&mut file, node_count)?;
             // We return count, next_offset is derived later
@@ -158,15 +171,22 @@ impl DiskGraph {
 
         // Derive next_offset
         let next_off = {
-            let mut file = OpenOptions::new().read(true).write(true)
-                .open(&file_path).map_err(StorageError::Io)?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .map_err(StorageError::Io)?;
             let (_, off) = Self::scan_for_next_offset(&mut file, node_count)?;
             off
         };
 
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
-        let rw_file = OpenOptions::new().read(true).write(true).open(&file_path).map_err(StorageError::Io)?;
+        let rw_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .map_err(StorageError::Io)?;
 
         // mmap data file and sidecar for zero-syscall reads
         let data_mmap = unsafe { Mmap::map(&rw_file).ok() };
@@ -199,27 +219,38 @@ impl DiskGraph {
     }
 
     fn scan_for_next_offset(file: &mut File, node_count: usize) -> Result<(usize, u64)> {
-        file.seek(SeekFrom::Start(HEADER_SIZE)).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE))
+            .map_err(StorageError::Io)?;
         let mut offset = HEADER_SIZE;
         let mut actual_count = 0usize;
         let mut buf8 = [0u8; 8];
         let mut buf4 = [0u8; 4];
 
         for _ in 0..node_count {
-            if file.read_exact(&mut buf8).is_err() { break; }
-            if file.read_exact(&mut buf4).is_err() { break; }
+            if file.read_exact(&mut buf8).is_err() {
+                break;
+            }
+            if file.read_exact(&mut buf4).is_err() {
+                break;
+            }
             let ncount = u32::from_le_bytes(buf4) as usize;
             let record_size = 8 + 4 + (ncount * 8);
             offset += record_size as u64;
             actual_count += 1;
-            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() { break; }
+            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() {
+                break;
+            }
         }
         Ok((actual_count, offset))
     }
 
     fn build_sidecar_index(data_path: &Path, idx_path: &Path, node_count: usize) -> Result<u64> {
-        let mut file = OpenOptions::new().read(true).open(data_path).map_err(StorageError::Io)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE)).map_err(StorageError::Io)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(data_path)
+            .map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(HEADER_SIZE))
+            .map_err(StorageError::Io)?;
 
         let mut entries: Vec<(RowId, u64)> = Vec::with_capacity(node_count);
         let mut offset = HEADER_SIZE;
@@ -227,25 +258,37 @@ impl DiskGraph {
         let mut buf4 = [0u8; 4];
 
         for _ in 0..node_count {
-            if file.read_exact(&mut buf8).is_err() { break; }
+            if file.read_exact(&mut buf8).is_err() {
+                break;
+            }
             let node_id = u64::from_le_bytes(buf8);
-            if file.read_exact(&mut buf4).is_err() { break; }
+            if file.read_exact(&mut buf4).is_err() {
+                break;
+            }
             let ncount = u32::from_le_bytes(buf4) as usize;
 
             entries.push((node_id, offset));
             let record_size = 8 + 4 + (ncount * 8);
             offset += record_size as u64;
-            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() { break; }
+            if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() {
+                break;
+            }
         }
 
         entries.sort_by_key(|(id, _)| *id);
 
         let mut idx_file = File::create(idx_path).map_err(StorageError::Io)?;
         let count = entries.len() as u64;
-        idx_file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+        idx_file
+            .write_all(&count.to_le_bytes())
+            .map_err(StorageError::Io)?;
         for (row_id, off) in &entries {
-            idx_file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
-            idx_file.write_all(&off.to_le_bytes()).map_err(StorageError::Io)?;
+            idx_file
+                .write_all(&row_id.to_le_bytes())
+                .map_err(StorageError::Io)?;
+            idx_file
+                .write_all(&off.to_le_bytes())
+                .map_err(StorageError::Io)?;
         }
         idx_file.sync_all().map_err(StorageError::Io)?;
 
@@ -262,7 +305,9 @@ impl DiskGraph {
         }
 
         let count = *self.index_count.read();
-        if count == 0 { return None; }
+        if count == 0 {
+            return None;
+        }
 
         // Try mmap path first (zero syscall)
         {
@@ -275,9 +320,11 @@ impl DiskGraph {
                 while lo <= hi {
                     let mid = lo + (hi - lo) / 2;
                     let off = 8 + mid as usize * entry_size;
-                    if off + 16 > mmap.len() { break; }
-                    let mid_id = u64::from_le_bytes(mmap[off..off+8].try_into().ok()?);
-                    let mid_offset = u64::from_le_bytes(mmap[off+8..off+16].try_into().ok()?);
+                    if off + 16 > mmap.len() {
+                        break;
+                    }
+                    let mid_id = u64::from_le_bytes(mmap[off..off + 8].try_into().ok()?);
+                    let mid_offset = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().ok()?);
 
                     match mid_id.cmp(&node_id) {
                         std::cmp::Ordering::Equal => {
@@ -321,17 +368,23 @@ impl DiskGraph {
         None
     }
 
-    pub fn max_degree(&self) -> usize { self.max_degree }
+    pub fn max_degree(&self) -> usize {
+        self.max_degree
+    }
 
     pub fn node_count(&self) -> usize {
         *self.count.read() as usize
     }
 
-    pub fn is_empty(&self) -> bool { self.node_count() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.node_count() == 0
+    }
 
     /// Pin hot node (bounded — evicts oldest when at capacity)
     pub fn pin_hot_node(&self, node_id: RowId) {
-        if self.hot_nodes.read().contains(&node_id) { return; }
+        if self.hot_nodes.read().contains(&node_id) {
+            return;
+        }
         if let Some(neighbors) = self.get_from_cache_or_disk(node_id) {
             // Evict from hot_cache if at capacity
             if self.hot_nodes.read().len() >= self.max_hot_nodes {
@@ -342,7 +395,9 @@ impl DiskGraph {
                         self.hot_nodes.write().remove(&evict_id);
                         drop(hc);
                         Some(evict_id)
-                    } else { None }
+                    } else {
+                        None
+                    }
                 };
             }
             self.hot_cache.write().put(node_id, neighbors);
@@ -358,7 +413,8 @@ impl DiskGraph {
             index.iter().map(|(&id, _)| id).take(top_k * 10).collect()
         };
 
-        let mut degrees: Vec<(RowId, usize)> = ids.iter()
+        let mut degrees: Vec<(RowId, usize)> = ids
+            .iter()
             .map(|&id| (id, self.neighbors(id).len()))
             .collect();
         degrees.sort_by(|a, b| b.1.cmp(&a.1));
@@ -388,7 +444,9 @@ impl DiskGraph {
 
     /// Add node (without neighbors)
     pub fn add_node(&self, node_id: RowId) {
-        if self.lookup_offset(node_id).is_some() { return; }
+        if self.lookup_offset(node_id).is_some() {
+            return;
+        }
         *self.dirty.write() = true;
     }
 
@@ -399,12 +457,16 @@ impl DiskGraph {
         // 1. Hot cache (peek = no LRU promotion, only needs &self)
         {
             let hot = self.hot_cache.read();
-            if let Some(n) = hot.peek(&node_id) { return Arc::clone(n); }
+            if let Some(n) = hot.peek(&node_id) {
+                return Arc::clone(n);
+            }
         }
         // 2. LRU cache (peek = no promotion)
         {
             let cache = self.cache.lock();
-            if let Some(n) = cache.peek(&node_id) { return Arc::clone(n); }
+            if let Some(n) = cache.peek(&node_id) {
+                return Arc::clone(n);
+            }
         }
         // 3. Disk (populates cache for future lookups)
         match self.get_from_cache_or_disk(node_id) {
@@ -432,7 +494,9 @@ impl DiskGraph {
         neighbors.retain(|&id| id != node_id);
         neighbors.sort_unstable();
         neighbors.dedup();
-        if neighbors.len() > self.max_degree { neighbors.truncate(self.max_degree); }
+        if neighbors.len() > self.max_degree {
+            neighbors.truncate(self.max_degree);
+        }
 
         let offset = {
             let mut next_offset = self.next_offset.lock();
@@ -486,7 +550,9 @@ impl DiskGraph {
     /// Flush to disk — blocks concurrent set_neighbors to prevent
     /// the sidecar index from being built with stale node_count.
     pub fn flush(&self) -> Result<()> {
-        if !*self.dirty.read() { return Ok(()); }
+        if !*self.dirty.read() {
+            return Ok(());
+        }
 
         // Prevent concurrent writes during flush so node_count and
         // sidecar index are consistent. Flush is infrequent enough
@@ -494,7 +560,9 @@ impl DiskGraph {
         let _flush_guard = self.flush_lock.lock();
         // Re-check dirty after acquiring lock (could have been flushed
         // by another thread while we waited).
-        if !*self.dirty.read() { return Ok(()); }
+        if !*self.dirty.read() {
+            return Ok(());
+        }
 
         let node_count = self.node_count();
         {
@@ -527,8 +595,11 @@ impl DiskGraph {
 
         {
             let mut temp_file = OpenOptions::new()
-                .create(true).write(true).truncate(true)
-                .open(&temp_path).map_err(StorageError::Io)?;
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)
+                .map_err(StorageError::Io)?;
 
             // Get all node IDs from sidecar
             let ids = self.node_ids();
@@ -539,10 +610,16 @@ impl DiskGraph {
 
             for &node_id in &ids {
                 let neighbors = self.neighbors(node_id);
-                temp_file.write_all(&node_id.to_le_bytes()).map_err(StorageError::Io)?;
-                temp_file.write_all(&(neighbors.len() as u32).to_le_bytes()).map_err(StorageError::Io)?;
+                temp_file
+                    .write_all(&node_id.to_le_bytes())
+                    .map_err(StorageError::Io)?;
+                temp_file
+                    .write_all(&(neighbors.len() as u32).to_le_bytes())
+                    .map_err(StorageError::Io)?;
                 for &neighbor in neighbors.iter() {
-                    temp_file.write_all(&neighbor.to_le_bytes()).map_err(StorageError::Io)?;
+                    temp_file
+                        .write_all(&neighbor.to_le_bytes())
+                        .map_err(StorageError::Io)?;
                 }
                 new_entries.push((node_id, offset));
                 let record_size = 8 + 4 + (neighbors.len() * 8);
@@ -555,10 +632,16 @@ impl DiskGraph {
             new_entries.sort_by_key(|(id, _)| *id);
             let mut idx_file = File::create(&idx_path).map_err(StorageError::Io)?;
             let count = new_entries.len() as u64;
-            idx_file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+            idx_file
+                .write_all(&count.to_le_bytes())
+                .map_err(StorageError::Io)?;
             for (row_id, off) in &new_entries {
-                idx_file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
-                idx_file.write_all(&off.to_le_bytes()).map_err(StorageError::Io)?;
+                idx_file
+                    .write_all(&row_id.to_le_bytes())
+                    .map_err(StorageError::Io)?;
+                idx_file
+                    .write_all(&off.to_le_bytes())
+                    .map_err(StorageError::Io)?;
             }
             idx_file.sync_all().map_err(StorageError::Io)?;
 
@@ -567,8 +650,11 @@ impl DiskGraph {
 
         std::fs::rename(&temp_path, &self.file_path).map_err(StorageError::Io)?;
 
-        let file = OpenOptions::new().read(true).write(true)
-            .open(&self.file_path).map_err(StorageError::Io)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.file_path)
+            .map_err(StorageError::Io)?;
         *self.file.write() = file;
 
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
@@ -621,10 +707,14 @@ impl DiskGraph {
 
     fn write_header(file: &mut File, max_degree: usize, node_count: usize) -> Result<()> {
         file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
-        file.write_all(&MAGIC.to_le_bytes()).map_err(StorageError::Io)?;
-        file.write_all(&VERSION.to_le_bytes()).map_err(StorageError::Io)?;
-        file.write_all(&(max_degree as u32).to_le_bytes()).map_err(StorageError::Io)?;
-        file.write_all(&(node_count as u32).to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&MAGIC.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&VERSION.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&(max_degree as u32).to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&(node_count as u32).to_le_bytes())
+            .map_err(StorageError::Io)?;
         Ok(())
     }
 
@@ -650,11 +740,15 @@ impl DiskGraph {
 
     fn write_neighbors_at(&self, node_id: RowId, neighbors: &[RowId], offset: u64) -> Result<()> {
         let mut file = self.file.write();
-        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
-        file.write_all(&node_id.to_le_bytes()).map_err(StorageError::Io)?;
-        file.write_all(&(neighbors.len() as u32).to_le_bytes()).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(StorageError::Io)?;
+        file.write_all(&node_id.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&(neighbors.len() as u32).to_le_bytes())
+            .map_err(StorageError::Io)?;
         for &neighbor in neighbors {
-            file.write_all(&neighbor.to_le_bytes()).map_err(StorageError::Io)?;
+            file.write_all(&neighbor.to_le_bytes())
+                .map_err(StorageError::Io)?;
         }
         Ok(())
     }
@@ -666,15 +760,18 @@ impl DiskGraph {
             if let Some(ref mmap) = *guard {
                 let off = offset as usize;
                 if off + 12 <= mmap.len() {
-                    let _node_id = u64::from_le_bytes(mmap[off..off+8].try_into().unwrap());
-                    let count = u32::from_le_bytes(mmap[off+8..off+12].try_into().unwrap()) as usize;
+                    let _node_id = u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap());
+                    let count =
+                        u32::from_le_bytes(mmap[off + 8..off + 12].try_into().unwrap()) as usize;
                     let neighbors_start = off + 12;
                     let neighbors_end = neighbors_start + count * 8;
                     if neighbors_end <= mmap.len() {
                         let mut neighbors = Vec::with_capacity(count);
                         for i in 0..count {
                             let n_off = neighbors_start + i * 8;
-                            neighbors.push(u64::from_le_bytes(mmap[n_off..n_off+8].try_into().unwrap()));
+                            neighbors.push(u64::from_le_bytes(
+                                mmap[n_off..n_off + 8].try_into().unwrap(),
+                            ));
                         }
                         return Ok(neighbors);
                     }
@@ -685,7 +782,8 @@ impl DiskGraph {
 
         // Fallback: seek+read
         let mut file = self.file.write();
-        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(StorageError::Io)?;
         let mut buf8 = [0u8; 8];
         file.read_exact(&mut buf8).map_err(StorageError::Io)?;
         let mut buf4 = [0u8; 4];

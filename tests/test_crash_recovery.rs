@@ -2,7 +2,7 @@
 //!
 //! Run: cargo test --release --test test_crash_recovery -- --test-threads=1
 
-use motedb::{Database, types::Value, sql::QueryResult};
+use motedb::{sql::QueryResult, types::Value, Database};
 
 fn exec(db: &Database, sql: &str) -> QueryResult {
     db.execute(sql).unwrap().materialize().unwrap()
@@ -10,12 +10,14 @@ fn exec(db: &Database, sql: &str) -> QueryResult {
 
 fn get_first_count(db: &Database, sql: &str) -> i64 {
     match exec(db, sql) {
-        QueryResult::Select { rows, .. } => {
-            rows.first().and_then(|r| r.first()).and_then(|v| match v {
+        QueryResult::Select { rows, .. } => rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| match v {
                 Value::Integer(i) => Some(*i),
                 _ => None,
-            }).unwrap_or(0)
-        }
+            })
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -36,11 +38,14 @@ fn test_crash_committed_rows_survive() {
     // Phase 1: Create, insert, commit, close
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
 
         let txn_id = db.begin_transaction().unwrap();
-        db.insert_row_with_txn("t", txn_id, vec![Value::Integer(1), Value::Integer(100)]).unwrap();
-        db.insert_row_with_txn("t", txn_id, vec![Value::Integer(2), Value::Integer(200)]).unwrap();
+        db.insert_row_with_txn("t", txn_id, vec![Value::Integer(1), Value::Integer(100)])
+            .unwrap();
+        db.insert_row_with_txn("t", txn_id, vec![Value::Integer(2), Value::Integer(200)])
+            .unwrap();
         db.commit_transaction(txn_id).unwrap();
 
         db.flush().unwrap();
@@ -78,7 +83,8 @@ fn test_crash_raw_insert_survives() {
 
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         db.execute("INSERT INTO t VALUES (2, 200)").unwrap();
         db.flush().unwrap();
@@ -106,17 +112,20 @@ fn test_crash_multiple_checkpoints() {
     let n = 500;
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
 
         // Batch 1
         for i in 0..n / 2 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         db.flush().unwrap();
 
         // Batch 2
         for i in n / 2..n {
-            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         db.flush().unwrap();
 
@@ -133,9 +142,18 @@ fn test_crash_multiple_checkpoints() {
         let r_mid = exec(&db, &format!("SELECT * FROM t WHERE id = {}", n / 2));
         let r_last = exec(&db, &format!("SELECT * FROM t WHERE id = {}", n - 1));
 
-        assert!(!matches!(&r0, QueryResult::Select { rows, .. } if rows.is_empty()), "Row 0 missing");
-        assert!(!matches!(&r_mid, QueryResult::Select { rows, .. } if rows.is_empty()), "Mid row missing");
-        assert!(!matches!(&r_last, QueryResult::Select { rows, .. } if rows.is_empty()), "Last row missing");
+        assert!(
+            !matches!(&r0, QueryResult::Select { rows, .. } if rows.is_empty()),
+            "Row 0 missing"
+        );
+        assert!(
+            !matches!(&r_mid, QueryResult::Select { rows, .. } if rows.is_empty()),
+            "Mid row missing"
+        );
+        assert!(
+            !matches!(&r_last, QueryResult::Select { rows, .. } if rows.is_empty()),
+            "Last row missing"
+        );
 
         db.close().unwrap();
     }
@@ -153,16 +171,19 @@ fn test_crash_multiple_transactions() {
 
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
 
         for txn_round in 0..5 {
             let txn_id = db.begin_transaction().unwrap();
             for i in 0..10 {
                 let rid = txn_round * 10 + i + 1;
-                db.insert_row_with_txn("t", txn_id, vec![
-                    Value::Integer(rid as i64),
-                    Value::Integer(rid as i64 * 100),
-                ]).unwrap();
+                db.insert_row_with_txn(
+                    "t",
+                    txn_id,
+                    vec![Value::Integer(rid as i64), Value::Integer(rid as i64 * 100)],
+                )
+                .unwrap();
             }
             db.commit_transaction(txn_id).unwrap();
         }
@@ -180,8 +201,15 @@ fn test_crash_multiple_transactions() {
         for txn_round in 0..5 {
             let rid = txn_round * 10 + 1;
             let result = exec(&db, &format!("SELECT val FROM t WHERE id = {}", rid));
-            let rows = match result { QueryResult::Select { rows, .. } => rows, _ => vec![] };
-            assert!(!rows.is_empty(), "Row from txn round {} should exist", txn_round);
+            let rows = match result {
+                QueryResult::Select { rows, .. } => rows,
+                _ => vec![],
+            };
+            assert!(
+                !rows.is_empty(),
+                "Row from txn round {} should exist",
+                txn_round
+            );
             assert_eq!(rows[0][0], Value::Integer(rid as i64 * 100));
         }
 
@@ -202,10 +230,12 @@ fn test_crash_many_small_writes() {
     let n = 2000;
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, data TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, data TEXT)")
+            .unwrap();
 
         for i in 0..n {
-            db.execute(&format!("INSERT INTO t VALUES ({}, 'row_{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({}, 'row_{}')", i, i))
+                .unwrap();
         }
 
         db.close().unwrap();
@@ -231,7 +261,8 @@ fn test_crash_update_survives() {
 
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         db.execute("UPDATE t SET val = 999 WHERE id = 1").unwrap();
         db.flush().unwrap();
@@ -241,9 +272,16 @@ fn test_crash_update_survives() {
     {
         let db = Database::open(dir).unwrap();
         let result = exec(&db, "SELECT val FROM t WHERE id = 1");
-        let rows = match result { QueryResult::Select { rows, .. } => rows, _ => vec![] };
+        let rows = match result {
+            QueryResult::Select { rows, .. } => rows,
+            _ => vec![],
+        };
         assert!(!rows.is_empty(), "Row should exist after crash");
-        assert_eq!(rows[0][0], Value::Integer(999), "Updated value should survive crash");
+        assert_eq!(
+            rows[0][0],
+            Value::Integer(999),
+            "Updated value should survive crash"
+        );
         db.close().unwrap();
     }
 
@@ -260,7 +298,8 @@ fn test_crash_delete_survives() {
 
     {
         let db = Database::create(dir).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         db.execute("INSERT INTO t VALUES (2, 200)").unwrap();
         db.execute("DELETE FROM t WHERE id = 1").unwrap();
@@ -271,14 +310,23 @@ fn test_crash_delete_survives() {
     {
         let db = Database::open(dir).unwrap();
         let cnt = get_first_count(&db, "SELECT COUNT(*) FROM t");
-        assert_eq!(cnt, 1, "Only 1 row should remain after delete survives crash");
+        assert_eq!(
+            cnt, 1,
+            "Only 1 row should remain after delete survives crash"
+        );
 
         let result = exec(&db, "SELECT * FROM t WHERE id = 1");
-        let rows = match result { QueryResult::Select { rows, .. } => rows, _ => vec![] };
+        let rows = match result {
+            QueryResult::Select { rows, .. } => rows,
+            _ => vec![],
+        };
         assert!(rows.is_empty(), "Deleted row should not come back");
 
         let result2 = exec(&db, "SELECT * FROM t WHERE id = 2");
-        let rows2 = match result2 { QueryResult::Select { rows, .. } => rows, _ => vec![] };
+        let rows2 = match result2 {
+            QueryResult::Select { rows, .. } => rows,
+            _ => vec![],
+        };
         assert!(!rows2.is_empty(), "Non-deleted row should survive");
         db.close().unwrap();
     }

@@ -70,10 +70,10 @@
 //! [data: f32 × num_rows × stride]
 //! ```
 
+use crate::types::{ColumnType, RowId, Value};
 use crate::{Result, StorageError};
-use crate::types::{ColumnType, Value, RowId};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom, BufWriter};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -130,7 +130,10 @@ impl ColumnTypeTag {
     }
 
     pub(crate) fn is_fixed(&self) -> bool {
-        matches!(self, Self::Integer | Self::Float | Self::Bool | Self::Timestamp)
+        matches!(
+            self,
+            Self::Integer | Self::Float | Self::Bool | Self::Timestamp
+        )
     }
 
     fn fixed_size(&self) -> usize {
@@ -165,25 +168,33 @@ impl ColumnarHeader {
 
     fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_SIZE {
-            return Err(StorageError::InvalidData("Columnar header too short".into()));
+            return Err(StorageError::InvalidData(
+                "Columnar header too short".into(),
+            ));
         }
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         if magic != COLUMNAR_MAGIC {
-            return Err(StorageError::InvalidData(
-                format!("Bad columnar magic: 0x{:08X}", magic)
-            ));
+            return Err(StorageError::InvalidData(format!(
+                "Bad columnar magic: 0x{:08X}",
+                magic
+            )));
         }
         let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         if version != COLUMNAR_VERSION {
-            return Err(StorageError::InvalidData(
-                format!("Unsupported columnar version: {}", version)
-            ));
+            return Err(StorageError::InvalidData(format!(
+                "Unsupported columnar version: {}",
+                version
+            )));
         }
         let num_rows = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         let num_columns = u16::from_le_bytes([data[12], data[13]]);
         let mut column_tags = [0u8; MAX_COLUMNS];
         column_tags.copy_from_slice(&data[14..14 + MAX_COLUMNS]);
-        Ok(Self { num_rows, num_columns, column_tags })
+        Ok(Self {
+            num_rows,
+            num_columns,
+            column_tags,
+        })
     }
 }
 
@@ -220,24 +231,40 @@ impl RowMap {
     fn compute_sizes(num_rows: usize) -> (usize, usize, usize, usize) {
         let keys_size = num_rows * 8;
         let timestamps_size = num_rows * 8;
-        let deleted_len = (num_rows + 7) / 8;
-        (keys_size + timestamps_size + deleted_len, keys_size, timestamps_size, deleted_len)
+        let deleted_len = num_rows.div_ceil(8);
+        (
+            keys_size + timestamps_size + deleted_len,
+            keys_size,
+            timestamps_size,
+            deleted_len,
+        )
     }
 
     #[allow(dead_code)]
     pub(crate) fn from_bytes(data: Vec<u8>, num_rows: usize) -> Self {
         let (_, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
-        Self { num_rows, keys_offset: 0, timestamps_offset: keys_size,
-            deleted_offset: keys_size + timestamps_size, deleted_len, data: SegData::Owned(data) }
+        Self {
+            num_rows,
+            keys_offset: 0,
+            timestamps_offset: keys_size,
+            deleted_offset: keys_size + timestamps_size,
+            deleted_len,
+            data: SegData::Owned(data),
+        }
     }
 
     /// Zero-copy view into mmap data.
     #[allow(dead_code)]
     pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize) -> Result<Self> {
         let (_total, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
-        Ok(Self { num_rows, keys_offset: offset, timestamps_offset: offset + keys_size,
-            deleted_offset: offset + keys_size + timestamps_size, deleted_len,
-            data: SegData::Mmap { mmap, offset } })
+        Ok(Self {
+            num_rows,
+            keys_offset: offset,
+            timestamps_offset: offset + keys_size,
+            deleted_offset: offset + keys_size + timestamps_size,
+            deleted_len,
+            data: SegData::Mmap { mmap, offset },
+        })
     }
 
     #[inline]
@@ -261,9 +288,13 @@ impl RowMap {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let k = self.key(mid);
-            if k < target { lo = mid + 1; }
-            else if k > target { hi = mid; }
-            else { return Some(mid); }
+            if k < target {
+                lo = mid + 1;
+            } else if k > target {
+                hi = mid;
+            } else {
+                return Some(mid);
+            }
         }
         None
     }
@@ -278,9 +309,11 @@ impl RowMap {
     /// Used to skip per-row is_deleted checks when no deletions exist.
     pub fn has_any_deleted(&self) -> bool {
         let n = self.num_rows;
-        let nb = (n + 7) / 8;
+        let nb = n.div_ceil(8);
         for i in 0..nb {
-            if self.data.get(self.deleted_offset + i) != 0 { return true; }
+            if self.data.get(self.deleted_offset + i) != 0 {
+                return true;
+            }
         }
         false
     }
@@ -307,7 +340,7 @@ impl SegData {
     }
     fn slice(&self, start: usize, len: usize) -> &[u8] {
         match self {
-            SegData::Owned(v) => &v[start..start+len],
+            SegData::Owned(v) => &v[start..start + len],
             SegData::Mmap { mmap, offset } => &mmap[*offset + start..*offset + start + len],
         }
     }
@@ -334,31 +367,46 @@ pub struct FixedSegment {
 impl FixedSegment {
     #[allow(dead_code)]
     pub(crate) fn from_bytes(data: &[u8], num_rows: usize, tag: ColumnTypeTag) -> Result<Self> {
-        let null_bytes = (num_rows + 7) / 8;
+        let null_bytes = num_rows.div_ceil(8);
         let elem_size = tag.fixed_size();
         let data_size = num_rows * elem_size;
         let expected = null_bytes + data_size;
         if data.len() < expected {
-            return Err(StorageError::InvalidData(
-                format!("Fixed segment too short: {} < {}", data.len(), expected)
-            ));
+            return Err(StorageError::InvalidData(format!(
+                "Fixed segment too short: {} < {}",
+                data.len(),
+                expected
+            )));
         }
         Ok(Self {
             num_rows,
             null_bitmap: SegData::Owned(data[..null_bytes].to_vec()),
             data: SegData::Owned(data[null_bytes..null_bytes + data_size].to_vec()),
-            elem_size, tag,
+            elem_size,
+            tag,
         })
     }
 
     #[allow(dead_code)]
-    pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize, tag: ColumnTypeTag) -> Self {
-        let null_bytes = (num_rows + 7) / 8;
+    pub(crate) fn from_mmap(
+        mmap: Arc<Mmap>,
+        offset: usize,
+        num_rows: usize,
+        tag: ColumnTypeTag,
+    ) -> Self {
+        let null_bytes = num_rows.div_ceil(8);
         Self {
             num_rows,
-            null_bitmap: SegData::Mmap { mmap: mmap.clone(), offset },
-            data: SegData::Mmap { mmap, offset: offset + null_bytes },
-            elem_size: tag.fixed_size(), tag,
+            null_bitmap: SegData::Mmap {
+                mmap: mmap.clone(),
+                offset,
+            },
+            data: SegData::Mmap {
+                mmap,
+                offset: offset + null_bytes,
+            },
+            elem_size: tag.fixed_size(),
+            tag,
         }
     }
 
@@ -369,23 +417,33 @@ impl FixedSegment {
 
     #[inline]
     pub fn get_i64(&self, row_idx: usize) -> Option<i64> {
-        if self.is_null(row_idx) { return None; }
+        if self.is_null(row_idx) {
+            return None;
+        }
         let off = row_idx * 8;
         let s = self.data.slice(off, 8);
-        Some(i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+        Some(i64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
 
     #[inline]
     pub fn get_f64(&self, row_idx: usize) -> Option<f64> {
-        if self.is_null(row_idx) { return None; }
+        if self.is_null(row_idx) {
+            return None;
+        }
         let off = row_idx * 8;
         let s = self.data.slice(off, 8);
-        Some(f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+        Some(f64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
     }
 
     #[inline]
     pub fn get_bool(&self, row_idx: usize) -> Option<bool> {
-        if self.is_null(row_idx) { return None; }
+        if self.is_null(row_idx) {
+            return None;
+        }
         Some(self.data.get(row_idx) != 0)
     }
 }
@@ -405,7 +463,7 @@ pub struct TextSegment {
 
 impl TextSegment {
     pub(crate) fn from_bytes(data: &[u8], num_rows: usize) -> Result<Self> {
-        let null_bytes = (num_rows + 7) / 8;
+        let null_bytes = num_rows.div_ceil(8);
         let offsets_size = (num_rows + 1) * 4;
         if data.len() < null_bytes + offsets_size {
             return Err(StorageError::InvalidData("Text segment too short".into()));
@@ -415,19 +473,29 @@ impl TextSegment {
             null_bitmap: SegData::Owned(data[..null_bytes].to_vec()),
             offsets_data: SegData::Owned(data[null_bytes..null_bytes + offsets_size].to_vec()),
             string_data: SegData::Owned(data[null_bytes + offsets_size..].to_vec()),
-            trust_utf8: false, offsets_start: 0,
+            trust_utf8: false,
+            offsets_start: 0,
         })
     }
 
     #[allow(dead_code)]
     pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize) -> Self {
-        let null_bytes = (num_rows + 7) / 8;
+        let null_bytes = num_rows.div_ceil(8);
         let offsets_size = (num_rows + 1) * 4;
         Self {
             num_rows,
-            null_bitmap: SegData::Mmap { mmap: mmap.clone(), offset },
-            offsets_data: SegData::Mmap { mmap: mmap.clone(), offset: offset + null_bytes },
-            string_data: SegData::Mmap { mmap, offset: offset + null_bytes + offsets_size },
+            null_bitmap: SegData::Mmap {
+                mmap: mmap.clone(),
+                offset,
+            },
+            offsets_data: SegData::Mmap {
+                mmap: mmap.clone(),
+                offset: offset + null_bytes,
+            },
+            string_data: SegData::Mmap {
+                mmap,
+                offset: offset + null_bytes + offsets_size,
+            },
             trust_utf8: true, // Our builder only writes valid UTF-8
             offsets_start: 0,
         }
@@ -445,7 +513,9 @@ impl TextSegment {
         // If no nulls, skip the null check entirely.
         let has_nulls = self.has_any_null();
         for i in 0..n {
-            if has_nulls && self.is_null(i) { continue; }
+            if has_nulls && self.is_null(i) {
+                continue;
+            }
             let s = self.get_str_fast(i);
             f(s);
         }
@@ -456,7 +526,9 @@ impl TextSegment {
     pub fn has_any_null(&self) -> bool {
         let nb = self.null_bitmap.len();
         for i in 0..nb {
-            if self.null_bitmap.get(i) != 0 { return true; }
+            if self.null_bitmap.get(i) != 0 {
+                return true;
+            }
         }
         false
     }
@@ -469,10 +541,14 @@ impl TextSegment {
 
     #[inline]
     pub fn get_str(&self, row_idx: usize) -> Option<&str> {
-        if self.is_null(row_idx) { return None; }
+        if self.is_null(row_idx) {
+            return None;
+        }
         let start = self.get_offset(row_idx) as usize;
         let end = self.get_offset(row_idx + 1) as usize;
-        if start > end { return None; }
+        if start > end {
+            return None;
+        }
         let bytes = self.string_data.slice(start, end - start);
         if self.trust_utf8 {
             unsafe { Some(std::str::from_utf8_unchecked(bytes)) }
@@ -489,8 +565,14 @@ impl TextSegment {
         let off_base = row_idx * 4;
         let start_bytes = self.offsets_data.slice(off_base, 4);
         let end_bytes = self.offsets_data.slice(off_base + 4, 4);
-        let start = u32::from_le_bytes([start_bytes[0], start_bytes[1], start_bytes[2], start_bytes[3]]) as usize;
-        let end = u32::from_le_bytes([end_bytes[0], end_bytes[1], end_bytes[2], end_bytes[3]]) as usize;
+        let start = u32::from_le_bytes([
+            start_bytes[0],
+            start_bytes[1],
+            start_bytes[2],
+            start_bytes[3],
+        ]) as usize;
+        let end =
+            u32::from_le_bytes([end_bytes[0], end_bytes[1], end_bytes[2], end_bytes[3]]) as usize;
         let bytes = self.string_data.slice(start, end - start);
         if self.trust_utf8 {
             unsafe { std::str::from_utf8_unchecked(bytes) }
@@ -516,21 +598,28 @@ impl TextSegment {
         let string_bytes: &[u8] = self.string_data.slice(0, total_str_len);
 
         // Parallel extraction: each row independently extracts its bytes.
-        (0..n).into_par_iter().map(|i| {
-            let off_base = i * 4;
-            let start = u32::from_le_bytes([
-                offsets_bytes[off_base], offsets_bytes[off_base+1],
-                offsets_bytes[off_base+2], offsets_bytes[off_base+3],
-            ]) as usize;
-            let end = u32::from_le_bytes([
-                offsets_bytes[off_base+4], offsets_bytes[off_base+5],
-                offsets_bytes[off_base+6], offsets_bytes[off_base+7],
-            ]) as usize;
-            let len = (end - start).min(64);
-            let mut buf = [0u8; 64];
-            buf[..len].copy_from_slice(&string_bytes[start..start+len]);
-            (buf, i)
-        }).collect()
+        (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let off_base = i * 4;
+                let start = u32::from_le_bytes([
+                    offsets_bytes[off_base],
+                    offsets_bytes[off_base + 1],
+                    offsets_bytes[off_base + 2],
+                    offsets_bytes[off_base + 3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    offsets_bytes[off_base + 4],
+                    offsets_bytes[off_base + 5],
+                    offsets_bytes[off_base + 6],
+                    offsets_bytes[off_base + 7],
+                ]) as usize;
+                let len = (end - start).min(64);
+                let mut buf = [0u8; 64];
+                buf[..len].copy_from_slice(&string_bytes[start..start + len]);
+                (buf, i)
+            })
+            .collect()
     }
 
     /// 🚀 Ultra-fast batch extract: directly copies all string bytes into
@@ -555,16 +644,20 @@ impl TextSegment {
         for i in 0..n {
             let off_base = i * 4;
             let start = u32::from_le_bytes([
-                offsets_bytes[off_base], offsets_bytes[off_base+1],
-                offsets_bytes[off_base+2], offsets_bytes[off_base+3],
+                offsets_bytes[off_base],
+                offsets_bytes[off_base + 1],
+                offsets_bytes[off_base + 2],
+                offsets_bytes[off_base + 3],
             ]) as usize;
             let end = u32::from_le_bytes([
-                offsets_bytes[off_base+4], offsets_bytes[off_base+5],
-                offsets_bytes[off_base+6], offsets_bytes[off_base+7],
+                offsets_bytes[off_base + 4],
+                offsets_bytes[off_base + 5],
+                offsets_bytes[off_base + 6],
+                offsets_bytes[off_base + 7],
             ]) as usize;
             let len = (end - start).min(64);
             let mut buf = [0u8; 64];
-            buf[..len].copy_from_slice(&string_bytes[start..start+len]);
+            buf[..len].copy_from_slice(&string_bytes[start..start + len]);
             result.push((buf, i));
         }
         result
@@ -586,8 +679,12 @@ impl TextSegment {
                 let off_base = i * 4;
                 // Read start/end offsets via slice (single 8-byte read).
                 let off_bytes = self.offsets_data.slice(off_base, 8);
-                let start = u32::from_le_bytes([off_bytes[0], off_bytes[1], off_bytes[2], off_bytes[3]]) as usize;
-                let end = u32::from_le_bytes([off_bytes[4], off_bytes[5], off_bytes[6], off_bytes[7]]) as usize;
+                let start =
+                    u32::from_le_bytes([off_bytes[0], off_bytes[1], off_bytes[2], off_bytes[3]])
+                        as usize;
+                let end =
+                    u32::from_le_bytes([off_bytes[4], off_bytes[5], off_bytes[6], off_bytes[7]])
+                        as usize;
                 let len = (end - start).min(64);
                 let mut buf = [0u8; 64];
                 let src = self.string_data.slice(start, len);
@@ -596,7 +693,9 @@ impl TextSegment {
             }
         } else {
             for i in 0..n {
-                if self.is_null(i) { continue; }
+                if self.is_null(i) {
+                    continue;
+                }
                 let start = self.get_offset(i) as usize;
                 let end = self.get_offset(i + 1) as usize;
                 let len = (end - start).min(64);
@@ -637,11 +736,7 @@ impl ColumnarSSTable {
     pub fn release_pages(&self) {
         if let Some(ref m) = self.mmap {
             unsafe {
-                libc::madvise(
-                    m.as_ptr() as *mut _,
-                    m.len(),
-                    libc::MADV_DONTNEED,
-                );
+                libc::madvise(m.as_ptr() as *mut _, m.len(), libc::MADV_DONTNEED);
             }
         }
     }
@@ -652,15 +747,14 @@ impl ColumnarSSTable {
         if let Ok(mut file) = OpenOptions::new().read(true).open(path) {
             if let Ok(metadata) = file.metadata() {
                 let file_len = metadata.len();
-                if file_len >= FOOTER_SIZE as u64 {
-                    if file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).is_ok() {
-                        let mut footer = [0u8; FOOTER_SIZE];
-                        if file.read_exact(&mut footer).is_ok() {
-                            let magic = u32::from_le_bytes([
-                                footer[16], footer[17], footer[18], footer[19],
-                            ]);
-                            return magic == COLUMNAR_MAGIC;
-                        }
+                if file_len >= FOOTER_SIZE as u64
+                    && file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).is_ok()
+                {
+                    let mut footer = [0u8; FOOTER_SIZE];
+                    if file.read_exact(&mut footer).is_ok() {
+                        let magic =
+                            u32::from_le_bytes([footer[16], footer[17], footer[18], footer[19]]);
+                        return magic == COLUMNAR_MAGIC;
                     }
                 }
             }
@@ -676,25 +770,42 @@ impl ColumnarSSTable {
 
         // Read footer
         if file_len < FOOTER_SIZE as u64 {
-            return Err(StorageError::InvalidData("File too small for columnar footer".into()));
+            return Err(StorageError::InvalidData(
+                "File too small for columnar footer".into(),
+            ));
         }
         file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
         let mut footer_buf = [0u8; FOOTER_SIZE];
         file.read_exact(&mut footer_buf)?;
 
         let magic = u32::from_le_bytes([
-            footer_buf[16], footer_buf[17], footer_buf[18], footer_buf[19],
+            footer_buf[16],
+            footer_buf[17],
+            footer_buf[18],
+            footer_buf[19],
         ]);
         if magic != COLUMNAR_MAGIC {
             return Err(StorageError::InvalidData("Not a columnar SSTable".into()));
         }
         let _column_index_offset = u64::from_le_bytes([
-            footer_buf[0], footer_buf[1], footer_buf[2], footer_buf[3],
-            footer_buf[4], footer_buf[5], footer_buf[6], footer_buf[7],
+            footer_buf[0],
+            footer_buf[1],
+            footer_buf[2],
+            footer_buf[3],
+            footer_buf[4],
+            footer_buf[5],
+            footer_buf[6],
+            footer_buf[7],
         ]);
         let row_map_offset = u64::from_le_bytes([
-            footer_buf[8], footer_buf[9], footer_buf[10], footer_buf[11],
-            footer_buf[12], footer_buf[13], footer_buf[14], footer_buf[15],
+            footer_buf[8],
+            footer_buf[9],
+            footer_buf[10],
+            footer_buf[11],
+            footer_buf[12],
+            footer_buf[13],
+            footer_buf[14],
+            footer_buf[15],
         ]);
 
         // 🚀 Lazy loading: for files > 512KB, don't read/mmap the entire file.
@@ -702,7 +813,7 @@ impl ColumnarSSTable {
         // is read on-demand via seek+read in read_segment_bytes.
         // For small files (< 512KB), read fully (avoids seek overhead).
         let lazy_load = file_len > 256 * 1024;
-        
+
         let mmap: Option<Arc<Mmap>> = None;
         let mut file_data: Vec<u8> = Vec::new();
 
@@ -742,12 +853,24 @@ impl ColumnarSSTable {
                 let off = i * COLUMN_INDEX_ENTRY_SIZE;
                 ColumnIndexEntry {
                     offset: u64::from_le_bytes([
-                        ci_data[off], ci_data[off+1], ci_data[off+2], ci_data[off+3],
-                        ci_data[off+4], ci_data[off+5], ci_data[off+6], ci_data[off+7],
+                        ci_data[off],
+                        ci_data[off + 1],
+                        ci_data[off + 2],
+                        ci_data[off + 3],
+                        ci_data[off + 4],
+                        ci_data[off + 5],
+                        ci_data[off + 6],
+                        ci_data[off + 7],
                     ]),
                     size: u64::from_le_bytes([
-                        ci_data[off+8], ci_data[off+9], ci_data[off+10], ci_data[off+11],
-                        ci_data[off+12], ci_data[off+13], ci_data[off+14], ci_data[off+15],
+                        ci_data[off + 8],
+                        ci_data[off + 9],
+                        ci_data[off + 10],
+                        ci_data[off + 11],
+                        ci_data[off + 12],
+                        ci_data[off + 13],
+                        ci_data[off + 14],
+                        ci_data[off + 15],
                     ]),
                 }
             })
@@ -780,7 +903,7 @@ impl ColumnarSSTable {
         Ok(Self {
             path,
             file_data,
-            mmap: mmap,
+            mmap,
             file: None,
             header,
             column_index,
@@ -793,9 +916,12 @@ impl ColumnarSSTable {
     /// Read a fixed column as an i64 array (zero-copy from mmap).
     /// Decompress segment data if needed. Format: [flag: u8] [data].
     fn decompress_segment(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-        if data.is_empty() { return std::borrow::Cow::Borrowed(data); }
+        if data.is_empty() {
+            return std::borrow::Cow::Borrowed(data);
+        }
         match data[0] {
-            1 => { // Snappy compressed
+            1 => {
+                // Snappy compressed
                 match snap::raw::Decoder::new().decompress_vec(&data[1..]) {
                     Ok(v) => std::borrow::Cow::Owned(v),
                     Err(_) => std::borrow::Cow::Borrowed(&data[1..]), // fallback: use as-is
@@ -808,7 +934,9 @@ impl ColumnarSSTable {
     pub fn read_fixed_i64(&self, col_idx: usize) -> Result<FixedSegment> {
         let tag = self.column_tags[col_idx];
         if !tag.is_fixed() {
-            return Err(StorageError::InvalidData("Column is not fixed-width".into()));
+            return Err(StorageError::InvalidData(
+                "Column is not fixed-width".into(),
+            ));
         }
         let entry = &self.column_index[col_idx];
         let start = entry.offset as usize;
@@ -845,11 +973,9 @@ impl ColumnarSSTable {
         let len = end - start;
         let mut buf = vec![0u8; len];
         if let Ok(mut f) = std::fs::File::open(&self.path) {
-            use std::io::{Seek, Read};
-            if f.seek(SeekFrom::Start(start as u64)).is_ok() {
-                if f.read_exact(&mut buf).is_ok() {
-                    return Self::decompress_segment(&buf).into_owned().into();
-                }
+            use std::io::{Read, Seek};
+            if f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok() {
+                return Self::decompress_segment(&buf).into_owned().into();
             }
         }
         std::borrow::Cow::Owned(Vec::new())
@@ -865,25 +991,34 @@ impl ColumnarSSTable {
         // layout is [flag][compressed or raw bytes], same as Fixed/Text segments.
         let seg_bytes = self.read_segment_bytes(seg_start, seg_end);
         let data = seg_bytes.as_ref();
-        let null_bytes = (self.num_rows + 7) / 8;
-        if null_bytes + 2 > data.len() { return Ok(Vec::new()); }
+        let null_bytes = self.num_rows.div_ceil(8);
+        if null_bytes + 2 > data.len() {
+            return Ok(Vec::new());
+        }
         let mut result = Vec::new();
         let mut pos = null_bytes;
         for i in 0..self.num_rows {
-            if (data[i/8] >> (i%8)) & 1 != 0 {
+            if (data[i / 8] >> (i % 8)) & 1 != 0 {
                 // Null — skip to next row (read len to skip its bytes).
                 if pos + 2 <= data.len() {
-                    let len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                    let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
                     pos += 2 + len;
                 }
                 continue;
             }
-            if self.row_map.is_deleted(i) { continue; }
-            if pos + 2 > data.len() { break; }
-            let len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+            if self.row_map.is_deleted(i) {
+                continue;
+            }
+            if pos + 2 > data.len() {
+                break;
+            }
+            let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            if len == 0 || pos + len > data.len() { continue; }
-            if let Ok(geom) = bincode::deserialize::<crate::types::Geometry>(&data[pos..pos+len]) {
+            if len == 0 || pos + len > data.len() {
+                continue;
+            }
+            if let Ok(geom) = bincode::deserialize::<crate::types::Geometry>(&data[pos..pos + len])
+            {
                 let row_id = (self.row_map.key(i) & 0xFFFFFFFF) as RowId;
                 result.push((row_id, geom));
             }
@@ -896,26 +1031,57 @@ impl ColumnarSSTable {
     /// Returns row as Vec<Value>, or None if not found or deleted.
     pub fn get_row(&self, key: u64, col_types: &[ColumnType]) -> Option<Vec<Value>> {
         // Binary search in RowMap keys
-        let idx = match self.row_map.find_key(key) {
-            Some(i) => i,
-            None => return None,
-        };
-        if self.row_map.is_deleted(idx) { return None; }
+        let idx = self.row_map.find_key(key)?;
+        if self.row_map.is_deleted(idx) {
+            return None;
+        }
         let mut row = Vec::with_capacity(col_types.len());
         for ci in 0..col_types.len() {
             if self.column_tags[ci].is_fixed() {
                 if let Ok(seg) = self.read_fixed_i64(ci) {
                     match &col_types[ci] {
-                        crate::types::ColumnType::Integer => row.push(seg.get_i64(idx).map(crate::types::Value::Integer).unwrap_or(crate::types::Value::Null)),
-                        crate::types::ColumnType::Float => row.push(seg.get_f64(idx).map(crate::types::Value::Float).unwrap_or(crate::types::Value::Null)),
-                        crate::types::ColumnType::Boolean => row.push(seg.get_bool(idx).map(crate::types::Value::Bool).unwrap_or(crate::types::Value::Null)),
-                        crate::types::ColumnType::Timestamp => row.push(seg.get_i64(idx).map(|v| crate::types::Value::Timestamp(crate::types::Timestamp::from_micros(v))).unwrap_or(crate::types::Value::Null)),
+                        crate::types::ColumnType::Integer => row.push(
+                            seg.get_i64(idx)
+                                .map(crate::types::Value::Integer)
+                                .unwrap_or(crate::types::Value::Null),
+                        ),
+                        crate::types::ColumnType::Float => row.push(
+                            seg.get_f64(idx)
+                                .map(crate::types::Value::Float)
+                                .unwrap_or(crate::types::Value::Null),
+                        ),
+                        crate::types::ColumnType::Boolean => row.push(
+                            seg.get_bool(idx)
+                                .map(crate::types::Value::Bool)
+                                .unwrap_or(crate::types::Value::Null),
+                        ),
+                        crate::types::ColumnType::Timestamp => row.push(
+                            seg.get_i64(idx)
+                                .map(|v| {
+                                    crate::types::Value::Timestamp(
+                                        crate::types::Timestamp::from_micros(v),
+                                    )
+                                })
+                                .unwrap_or(crate::types::Value::Null),
+                        ),
                         _ => row.push(crate::types::Value::Null),
                     }
-                } else { row.push(crate::types::Value::Null); }
+                } else {
+                    row.push(crate::types::Value::Null);
+                }
             } else if let Ok(seg) = self.read_text(ci) {
-                row.push(seg.get_str(idx).map(|s| crate::types::Value::Text(crate::types::ArcString(std::sync::Arc::from(s)))).unwrap_or(crate::types::Value::Null));
-            } else { row.push(crate::types::Value::Null); }
+                row.push(
+                    seg.get_str(idx)
+                        .map(|s| {
+                            crate::types::Value::Text(crate::types::ArcString(
+                                std::sync::Arc::from(s),
+                            ))
+                        })
+                        .unwrap_or(crate::types::Value::Null),
+                );
+            } else {
+                row.push(crate::types::Value::Null);
+            }
         }
         Some(row)
     }
@@ -928,25 +1094,39 @@ impl ColumnarSSTable {
         // and returns empty on failure) rather than slicing self.backing()
         // directly — backing() can be empty (length 0) when the SSTable is opened
         // zero-copy and no backing buffer is resident, which would panic here.
-        let seg_bytes = self.read_segment_bytes(entry.offset as usize, (entry.offset + entry.size) as usize);
+        let seg_bytes =
+            self.read_segment_bytes(entry.offset as usize, (entry.offset + entry.size) as usize);
         let data = seg_bytes.as_ref();
-        let null_bytes = (self.num_rows + 7) / 8;
-        if null_bytes + 2 > data.len() { return Ok(Vec::new()); }
-        let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes+1]]) as usize;
-        if dim == 0 || dim > 65536 { return Ok(Vec::new()); }
+        let null_bytes = self.num_rows.div_ceil(8);
+        if null_bytes + 2 > data.len() {
+            return Ok(Vec::new());
+        }
+        let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes + 1]]) as usize;
+        if dim == 0 || dim > 65536 {
+            return Ok(Vec::new());
+        }
         let stride = dim * 4;
         let data_start = null_bytes + 2;
         let n = ((data.len() - data_start) / stride).min(self.num_rows);
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
-            if (data[i/8] >> (i%8)) & 1 != 0 { continue; } // null check
-            if self.row_map.is_deleted(i) { continue; }
+            if (data[i / 8] >> (i % 8)) & 1 != 0 {
+                continue;
+            } // null check
+            if self.row_map.is_deleted(i) {
+                continue;
+            }
             let row_id = (self.row_map.key(i) & 0xFFFFFFFF) as RowId;
             let mut v = Vec::with_capacity(dim);
             let base = data_start + i * stride;
             for j in 0..dim {
                 let off = base + j * 4;
-                v.push(f32::from_le_bytes([data[off],data[off+1],data[off+2],data[off+3]]));
+                v.push(f32::from_le_bytes([
+                    data[off],
+                    data[off + 1],
+                    data[off + 2],
+                    data[off + 3],
+                ]));
             }
             result.push((row_id, v));
         }
@@ -1042,17 +1222,34 @@ impl ColumnarSSTableBuilder {
                     buf.extend_from_slice(&i.to_le_bytes());
                 }
                 ColumnTypeTag::Float => {
-                    let f = match value { Value::Float(v) => *v, Value::Null => f64::NAN, _ => 0.0 };
+                    let f = match value {
+                        Value::Float(v) => *v,
+                        Value::Null => f64::NAN,
+                        _ => 0.0,
+                    };
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
                 ColumnTypeTag::Bool => {
                     // 1-byte storage: 0=false, 1=true, 2=NULL sentinel.
                     // (Value::Null must be distinguishable from Bool(false).)
-                    let b = match value { Value::Bool(v) => if *v { 1 } else { 0 }, _ => 2 };
+                    let b = match value {
+                        Value::Bool(v) => {
+                            if *v {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 2,
+                    };
                     buf.push(b);
                 }
                 ColumnTypeTag::Timestamp => {
-                    let ts = match value { Value::Timestamp(t) => t.as_micros(), Value::Null => i64::MIN, _ => 0 };
+                    let ts = match value {
+                        Value::Timestamp(t) => t.as_micros(),
+                        Value::Null => i64::MIN,
+                        _ => 0,
+                    };
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
                 ColumnTypeTag::Text => {
@@ -1084,12 +1281,16 @@ impl ColumnarSSTableBuilder {
                         Value::Vector(v) => {
                             let floats: &[f32] = &v.0;
                             buf.extend_from_slice(&(floats.len() as u16).to_le_bytes());
-                            for f in floats { buf.extend_from_slice(&f.to_le_bytes()); }
+                            for f in floats {
+                                buf.extend_from_slice(&f.to_le_bytes());
+                            }
                         }
                         Value::Tensor(t) => {
                             let floats = t.to_f32();
                             buf.extend_from_slice(&(floats.len() as u16).to_le_bytes());
-                            for f in &floats { buf.extend_from_slice(&f.to_le_bytes()); }
+                            for f in &floats {
+                                buf.extend_from_slice(&f.to_le_bytes());
+                            }
                         }
                         _ => buf.extend_from_slice(&0u16.to_le_bytes()),
                     }
@@ -1228,7 +1429,13 @@ impl ColumnarSSTableBuilder {
                 }
                 ColumnTypeTag::Bool => {
                     let b = match value {
-                        Value::Bool(v) => if *v { 1 } else { 0 },
+                        Value::Bool(v) => {
+                            if *v {
+                                1
+                            } else {
+                                0
+                            }
+                        }
                         _ => 2, // NULL sentinel
                     };
                     buf.push(b);
@@ -1258,7 +1465,9 @@ impl ColumnarSSTableBuilder {
                             let floats: &[f32] = &v.0;
                             let mut b = Vec::with_capacity(2 + floats.len() * 4);
                             b.extend_from_slice(&(floats.len() as u16).to_le_bytes());
-                            for f in floats { b.extend_from_slice(&f.to_le_bytes()); }
+                            for f in floats {
+                                b.extend_from_slice(&f.to_le_bytes());
+                            }
                             b
                         }
                         _ => vec![0u8; 2],
@@ -1271,8 +1480,10 @@ impl ColumnarSSTableBuilder {
                         Value::Spatial(g) => {
                             use crate::types::Geometry;
                             match **g {
-                                Geometry::Point3D(ref p) => format!("POINT({},{},{})", p.x, p.y, p.z),
-                                
+                                Geometry::Point3D(ref p) => {
+                                    format!("POINT({},{},{})", p.x, p.y, p.z)
+                                }
+
                                 _ => String::new(),
                             }
                         }
@@ -1312,7 +1523,8 @@ impl ColumnarSSTableBuilder {
     /// live rows correctly (a buffered tombstone suppresses an older live row
     /// with the same key). Newest-version-wins semantics.
     pub fn latest_entries(&self) -> Vec<(u64, bool)> {
-        let mut latest: std::collections::HashMap<u64, bool> = std::collections::HashMap::with_capacity(self.num_rows);
+        let mut latest: std::collections::HashMap<u64, bool> =
+            std::collections::HashMap::with_capacity(self.num_rows);
         for i in 0..self.num_rows {
             latest.insert(self.keys[i], self.deleted[i]);
         }
@@ -1363,7 +1575,10 @@ impl ColumnarSSTableBuilder {
                     ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
                         let buf = &self.column_buffers[ci];
                         let off = i * 8;
-                        if off + 8 > buf.len() { row.push(Value::Null); continue; }
+                        if off + 8 > buf.len() {
+                            row.push(Value::Null);
+                            continue;
+                        }
                         // Use the authoritative NULL flag (not a value sentinel),
                         // so the real value i64::MIN round-trips correctly.
                         if self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true) {
@@ -1371,8 +1586,14 @@ impl ColumnarSSTableBuilder {
                             continue;
                         }
                         let val = i64::from_le_bytes([
-                            buf[off], buf[off+1], buf[off+2], buf[off+3],
-                            buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+                            buf[off],
+                            buf[off + 1],
+                            buf[off + 2],
+                            buf[off + 3],
+                            buf[off + 4],
+                            buf[off + 5],
+                            buf[off + 6],
+                            buf[off + 7],
                         ]);
                         if matches!(tag, ColumnTypeTag::Timestamp) {
                             row.push(Value::Timestamp(crate::types::Timestamp::from_micros(val)));
@@ -1383,7 +1604,10 @@ impl ColumnarSSTableBuilder {
                     ColumnTypeTag::Float => {
                         let buf = &self.column_buffers[ci];
                         let off = i * 8;
-                        if off + 8 > buf.len() { row.push(Value::Null); continue; }
+                        if off + 8 > buf.len() {
+                            row.push(Value::Null);
+                            continue;
+                        }
                         // Authoritative NULL flag (not the NaN sentinel), so a
                         // stored NaN round-trips as Float(NaN) rather than Null.
                         if self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true) {
@@ -1391,8 +1615,14 @@ impl ColumnarSSTableBuilder {
                             continue;
                         }
                         let bits = u64::from_le_bytes([
-                            buf[off], buf[off+1], buf[off+2], buf[off+3],
-                            buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+                            buf[off],
+                            buf[off + 1],
+                            buf[off + 2],
+                            buf[off + 3],
+                            buf[off + 4],
+                            buf[off + 5],
+                            buf[off + 6],
+                            buf[off + 7],
                         ]);
                         row.push(Value::Float(f64::from_bits(bits)));
                     }
@@ -1413,14 +1643,15 @@ impl ColumnarSSTableBuilder {
                         let mut r = 0usize;
                         let mut found = None;
                         while p + 2 <= buf.len() {
-                            let len = u16::from_le_bytes([buf[p], buf[p+1]]) as usize;
+                            let len = u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
                             p += 2;
                             if r == i {
                                 if len == 0xFFFF {
                                     found = Some(Value::Null);
                                 } else if p + len <= buf.len() {
                                     found = Some(Value::text(
-                                        String::from_utf8_lossy(&buf[p..p+len]).into_owned()));
+                                        String::from_utf8_lossy(&buf[p..p + len]).into_owned(),
+                                    ));
                                 } else {
                                     found = Some(Value::Null);
                                 }
@@ -1438,7 +1669,7 @@ impl ColumnarSSTableBuilder {
                         let mut r = 0usize;
                         let mut found = None;
                         while p + 2 <= buf.len() {
-                            let dim = u16::from_le_bytes([buf[p], buf[p+1]]) as usize;
+                            let dim = u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
                             p += 2;
                             if r == i {
                                 if dim == 0 {
@@ -1447,9 +1678,16 @@ impl ColumnarSSTableBuilder {
                                     let mut v = Vec::with_capacity(dim);
                                     for j in 0..dim {
                                         let off = p + j * 4;
-                                        v.push(f32::from_le_bytes([buf[off],buf[off+1],buf[off+2],buf[off+3]]));
+                                        v.push(f32::from_le_bytes([
+                                            buf[off],
+                                            buf[off + 1],
+                                            buf[off + 2],
+                                            buf[off + 3],
+                                        ]));
                                     }
-                                    found = Some(Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v))));
+                                    found = Some(Value::Vector(crate::types::ArcVec(
+                                        std::sync::Arc::new(v),
+                                    )));
                                 } else {
                                     found = Some(Value::Null);
                                 }
@@ -1467,14 +1705,18 @@ impl ColumnarSSTableBuilder {
                         let mut r = 0usize;
                         let mut found = None;
                         while p + 2 <= buf.len() {
-                            let len = u16::from_le_bytes([buf[p], buf[p+1]]) as usize;
+                            let len = u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
                             p += 2;
                             if r == i {
                                 if len == 0 || p + len > buf.len() {
                                     found = Some(Value::Null);
                                 } else {
-                                    match bincode::deserialize::<crate::types::Geometry>(&buf[p..p+len]) {
-                                        Ok(g) => found = Some(Value::Spatial(std::boxed::Box::new(g))),
+                                    match bincode::deserialize::<crate::types::Geometry>(
+                                        &buf[p..p + len],
+                                    ) {
+                                        Ok(g) => {
+                                            found = Some(Value::Spatial(std::boxed::Box::new(g)))
+                                        }
                                         Err(_) => found = Some(Value::Null),
                                     }
                                 }
@@ -1493,8 +1735,12 @@ impl ColumnarSSTableBuilder {
         self.keys.clear();
         self.timestamps.clear();
         self.deleted.clear();
-        for b in self.column_buffers.iter_mut() { b.clear(); }
-        for f in self.null_flags.iter_mut() { f.clear(); }
+        for b in self.column_buffers.iter_mut() {
+            b.clear();
+        }
+        for f in self.null_flags.iter_mut() {
+            f.clear();
+        }
         self.num_rows = 0;
         for (key, ts, deleted, row) in kept_rows {
             // Re-add using the SAME encoding + the preserved deleted flag. A
@@ -1505,8 +1751,12 @@ impl ColumnarSSTableBuilder {
     }
 
     pub fn finish_and_reset(&mut self) -> Result<()> {
-        if self.finished { return Ok(()); }
-        if self.num_rows == 0 { return Ok(()); }
+        if self.finished {
+            return Ok(());
+        }
+        if self.num_rows == 0 {
+            return Ok(());
+        }
 
         // 🔑 Dedup same-key rows BEFORE writing (newest-version-wins). An UPDATE
         // appends a newer row with the SAME composite key; if both versions are
@@ -1520,7 +1770,9 @@ impl ColumnarSSTableBuilder {
             self.dedup_keys_newest_wins();
         }
         let num_rows = self.num_rows;
-        if num_rows == 0 { return Ok(()); }
+        if num_rows == 0 {
+            return Ok(());
+        }
         let num_cols = self.column_tags.len();
 
         // Build column segments with null bitmaps
@@ -1528,7 +1780,7 @@ impl ColumnarSSTableBuilder {
         for col_idx in 0..num_cols {
             let tag = &self.column_tags[col_idx];
             let raw = &self.column_buffers[col_idx];
-            let null_bytes = (num_rows + 7) / 8;
+            let null_bytes = num_rows.div_ceil(8);
             let mut seg = Vec::with_capacity(null_bytes + raw.len());
 
             if tag.is_fixed() {
@@ -1562,17 +1814,21 @@ impl ColumnarSSTableBuilder {
 
                 let mut pos = 0usize;
                 for row_idx in 0..num_rows {
-                    if pos + 2 > raw.len() { break; }
-                    let len = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
+                    if pos + 2 > raw.len() {
+                        break;
+                    }
+                    let len = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
                     pos += 2;
-                    let is_null = null_flags.get(row_idx).copied().unwrap_or(false)
-                        || len == 0xFFFF; // also catch legacy sentinel bytes
+                    let is_null =
+                        null_flags.get(row_idx).copied().unwrap_or(false) || len == 0xFFFF; // also catch legacy sentinel bytes
                     if is_null {
                         nulls[row_idx / 8] |= 1 << (row_idx % 8);
                         offsets.push(current_offset);
                         // NULL rows have no string data; skip their bytes (len
                         // is 0xFFFF sentinel or 0 for an empty-but-flagged NULL).
-                        if len != 0xFFFF { pos += len; }
+                        if len != 0xFFFF {
+                            pos += len;
+                        }
                         continue;
                     }
                     offsets.push(current_offset);
@@ -1601,13 +1857,18 @@ impl ColumnarSSTableBuilder {
                 {
                     let mut pos = 0usize;
                     for row_idx in 0..num_rows {
-                        if pos + 2 > raw.len() { row_dims.push(0); continue; }
-                        let d = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
+                        if pos + 2 > raw.len() {
+                            row_dims.push(0);
+                            continue;
+                        }
+                        let d = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
                         if d == 0 {
                             nulls[row_idx / 8] |= 1 << (row_idx % 8);
                             row_dims.push(0);
                         } else {
-                            if d > col_dim { col_dim = d; }
+                            if d > col_dim {
+                                col_dim = d;
+                            }
                             row_dims.push(d);
                         }
                         pos += 2 + d * 4;
@@ -1626,11 +1887,18 @@ impl ColumnarSSTableBuilder {
                         for j in 0..d.min(col_dim) {
                             let off = base + j * 4;
                             if off + 4 <= raw.len() {
-                                vals[j] = f32::from_le_bytes([raw[off],raw[off+1],raw[off+2],raw[off+3]]);
+                                vals[j] = f32::from_le_bytes([
+                                    raw[off],
+                                    raw[off + 1],
+                                    raw[off + 2],
+                                    raw[off + 3],
+                                ]);
                             }
                         }
                     }
-                    for v in &vals { seg.extend_from_slice(&v.to_le_bytes()); }
+                    for v in &vals {
+                        seg.extend_from_slice(&v.to_le_bytes());
+                    }
                     pos += 2 + d * 4;
                 }
             } else {
@@ -1652,13 +1920,13 @@ impl ColumnarSSTableBuilder {
         // Keys
         for (i, k) in self.keys.iter().enumerate() {
             let off = i * 8;
-            row_map[off..off+8].copy_from_slice(&k.to_le_bytes());
+            row_map[off..off + 8].copy_from_slice(&k.to_le_bytes());
         }
         // Timestamps
         let ts_off = num_rows * 8;
         for (i, ts) in self.timestamps.iter().enumerate() {
             let off = ts_off + i * 8;
-            row_map[off..off+8].copy_from_slice(&ts.to_le_bytes());
+            row_map[off..off + 8].copy_from_slice(&ts.to_le_bytes());
         }
         // Deleted bitset
         let del_off = num_rows * 16;
@@ -1695,7 +1963,10 @@ impl ColumnarSSTableBuilder {
                 out
             };
             let size = seg_data.len() as u64;
-            column_entries.push(ColumnIndexEntry { offset: current_offset, size });
+            column_entries.push(ColumnIndexEntry {
+                offset: current_offset,
+                size,
+            });
             current_offset += size;
             compressed_segs.push(seg_data);
         }
@@ -1707,8 +1978,14 @@ impl ColumnarSSTableBuilder {
 
         // Header
         let mut header_tags = [0u8; MAX_COLUMNS];
-        for (i, tag) in self.column_tags.iter().enumerate() { header_tags[i] = *tag as u8; }
-        let header = ColumnarHeader { num_rows: num_rows as u32, num_columns: num_cols as u16, column_tags: header_tags };
+        for (i, tag) in self.column_tags.iter().enumerate() {
+            header_tags[i] = *tag as u8;
+        }
+        let header = ColumnarHeader {
+            num_rows: num_rows as u32,
+            num_columns: num_cols as u16,
+            column_tags: header_tags,
+        };
         buf.extend_from_slice(&header.serialize());
 
         // Column index
@@ -1718,7 +1995,9 @@ impl ColumnarSSTableBuilder {
         }
 
         // Column segments (compressed)
-        for seg in &compressed_segs { buf.extend_from_slice(seg); }
+        for seg in &compressed_segs {
+            buf.extend_from_slice(seg);
+        }
 
         // Row map
         buf.extend_from_slice(&row_map);
@@ -1740,12 +2019,21 @@ impl ColumnarSSTableBuilder {
         // WAL checkpoint path, and the temp-file fsync is what makes rename
         // crash-safe on POSIX.
         let final_path = self.path.clone();
-        let dir = final_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let dir = final_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
         let tmp_path = dir.join(format!(
             ".{}.tmp",
-            final_path.file_name().and_then(|n| n.to_str()).unwrap_or("col.tmp")
+            final_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("col.tmp")
         ));
-        let file = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&buf)?;
         writer.flush()?;
@@ -1787,7 +2075,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "macOS mmap coherence issue with files < page size")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS mmap coherence issue with files < page size"
+    )]
     fn test_columnar_build_and_read() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.col.sst");
@@ -1868,14 +2159,17 @@ mod tests {
             let region = if i % 3 == 0 { "US" } else { "EU" };
             let row = vec![
                 Value::Integer(i as i64),
-                Value::Text(crate::types::ArcString(std::sync::Arc::from(
-                    format!("cust_{}", i % 100)
-                ))),
+                Value::Text(crate::types::ArcString(std::sync::Arc::from(format!(
+                    "cust_{}",
+                    i % 100
+                )))),
                 Value::Float(i as f64 * 1.5),
                 Value::Text(crate::types::ArcString(std::sync::Arc::from(region))),
             ];
             let encoded = crate::storage::row_format::encode(&row, &col_types).unwrap();
-            builder.add_row(i as u64, i as u64 + 1000, i % 7 == 0, &encoded).unwrap();
+            builder
+                .add_row(i as u64, i as u64 + 1000, i % 7 == 0, &encoded)
+                .unwrap();
         }
         builder.finish().unwrap();
 
@@ -1891,9 +2185,18 @@ mod tests {
             assert_eq!(id_seg.get_i64(i), Some(i as i64), "id mismatch at {}", i);
             let expected_amt = i as f64 * 1.5;
             let got_amt = amt_seg.get_f64(i).unwrap();
-            assert!((got_amt - expected_amt).abs() < 0.001, "amount mismatch at {}", i);
+            assert!(
+                (got_amt - expected_amt).abs() < 0.001,
+                "amount mismatch at {}",
+                i
+            );
             let expected_reg = if i % 3 == 0 { "US" } else { "EU" };
-            assert_eq!(reg_seg.get_str(i), Some(expected_reg), "region mismatch at {}", i);
+            assert_eq!(
+                reg_seg.get_str(i),
+                Some(expected_reg),
+                "region mismatch at {}",
+                i
+            );
         }
     }
 }

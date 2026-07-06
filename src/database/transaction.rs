@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use crate::database::core::MoteDB;
-use crate::types::{Row, RowId, Value, PartitionId};
 use crate::txn::IsolationLevel;
+use crate::types::{PartitionId, Row, RowId, Value};
 use crate::{Result, StorageError};
 
 type TransactionId = u64;
@@ -54,9 +54,9 @@ impl MoteDB {
         }
 
         // Validate row against schema (before allocating ID to avoid waste on failure)
-        schema.validate_row(&row).map_err(|e| {
-            StorageError::InvalidData(format!("Row validation failed: {}", e))
-        })?;
+        schema
+            .validate_row(&row)
+            .map_err(|e| StorageError::InvalidData(format!("Row validation failed: {}", e)))?;
 
         // Primary key uniqueness check (same as non-transactional path)
         if !schema.is_primary_key_auto_increment() {
@@ -64,12 +64,15 @@ impl MoteDB {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if let Some(pk_value) = row.get(pk_col.position) {
                         let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-                        let exists_in_cache = self.pk_lookup.get(table_name)
+                        let exists_in_cache = self
+                            .pk_lookup
+                            .get(table_name)
                             .map(|lookup| lookup.get_pk(&pk_key).is_some())
                             .unwrap_or(false);
                         if exists_in_cache {
                             return Err(StorageError::InvalidData(format!(
-                                "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                "Duplicate primary key {:?} for table '{}'",
+                                pk_value, table_name
                             )));
                         }
                         if let Ok(found) = self.query_by_column(table_name, pk_name, pk_value) {
@@ -83,7 +86,8 @@ impl MoteDB {
                                 }
                                 if has_live {
                                     return Err(StorageError::InvalidData(format!(
-                                        "Duplicate primary key {:?} for table '{}'", pk_value, table_name
+                                        "Duplicate primary key {:?} for table '{}'",
+                                        pk_value, table_name
                                     )));
                                 }
                             }
@@ -95,7 +99,8 @@ impl MoteDB {
 
         // Allocate row_id
         let row_id = if schema.is_primary_key_auto_increment() {
-            let counter = self.table_auto_increment
+            let counter = self
+                .table_auto_increment
                 .entry(table_name.to_string())
                 .or_insert_with(|| {
                     Arc::new(std::sync::atomic::AtomicI64::new(
@@ -109,12 +114,15 @@ impl MoteDB {
                 return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
             }
             if let Some(pk_col) = schema.primary_key().and_then(|n| schema.get_column(n)) {
-                while row.len() <= pk_col.position { row.push(Value::Null); }
+                while row.len() <= pk_col.position {
+                    row.push(Value::Null);
+                }
                 row[pk_col.position] = Value::Integer(id);
             }
             id as RowId
         } else {
-            self.next_row_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            self.next_row_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         };
 
         // Add to transaction write_set — NOT written to WAL or LSM yet
@@ -123,8 +131,14 @@ impl MoteDB {
         write_set.insert(row_id, (table_name.to_string(), row.clone()));
 
         // Record delta for savepoint rollback
-        let _ = self.txn_coordinator.record_write_delta(txn_id,
-            crate::txn::coordinator::DeltaOperation::Insert(row_id, table_name.to_string(), Arc::new(row)));
+        let _ = self.txn_coordinator.record_write_delta(
+            txn_id,
+            crate::txn::coordinator::DeltaOperation::Insert(
+                row_id,
+                table_name.to_string(),
+                Arc::new(row),
+            ),
+        );
         drop(write_set);
 
         Ok(row_id)
@@ -143,7 +157,6 @@ impl MoteDB {
         };
         // ctx dropped here — DashMap read guard released.
 
-
         if write_set.is_empty() {
             // Nothing to commit — still finalize
             self.txn_coordinator.commit(txn_id)?;
@@ -156,9 +169,10 @@ impl MoteDB {
 
         // 2. Write each row to WAL (coordinator already committed)
         for (row_id, (table_name, row_data)) in &write_set {
-                let partition = (*row_id % self.num_partitions as u64) as PartitionId;
-            self.wal.log_insert(table_name, partition, *row_id, row_data.clone(), txn_id)?;
-            }
+            let partition = (*row_id % self.num_partitions as u64) as PartitionId;
+            self.wal
+                .log_insert(table_name, partition, *row_id, row_data.clone(), txn_id)?;
+        }
 
         // 3. Write WAL Commit record
         self.wal.log_commit(0, txn_id, commit_ts)?;
@@ -172,10 +186,13 @@ impl MoteDB {
             let composite_key = self.make_composite_key(table_name, *row_id);
             let tbl_schema = self.table_registry.get_table(table_name)?;
             let col_types = tbl_schema.col_types();
-            let raw = crate::storage::row_format::encode(row_data, col_types)
-                .or_else(|_| bincode::serialize(row_data)
-                    .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e))))?;
-            let ts = self.write_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let raw = crate::storage::row_format::encode(row_data, col_types).or_else(|_| {
+                bincode::serialize(row_data)
+                    .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e)))
+            })?;
+            let ts = self
+                .write_lsn
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             kvs.push((composite_key, crate::storage::lsm::Value::new(raw, ts)));
         }
         // Skip LSM batch_put (pre-existing backpressure deadlock with async flush).
@@ -185,7 +202,8 @@ impl MoteDB {
         //
         // Update caches so the data is visible to queries via row_cache.
         for (row_id, (table_name, row_data)) in &write_set {
-            self.row_cache.put(table_name.to_string(), *row_id, row_data.clone());
+            self.row_cache
+                .put(table_name.to_string(), *row_id, row_data.clone());
 
             // Also write ColSegmentStore for query visibility (no LSM backpressure).
             // Clone the store Arc first to avoid holding DashMap read guard across
@@ -194,7 +212,9 @@ impl MoteDB {
             // INSERT on a table (no prior non-txn insert) still creates the store.
             let tbl_schema2 = self.table_registry.get_table(table_name)?;
             let col_types = tbl_schema2.col_types();
-            let store_clone = self.get_or_create_col_segment_store(table_name, &col_types).ok();
+            let store_clone = self
+                .get_or_create_col_segment_store(table_name, col_types)
+                .ok();
             if let Some(store) = store_clone {
                 let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
                 let key = (table_id << 32) | (row_id & 0xFFFFFFFF);

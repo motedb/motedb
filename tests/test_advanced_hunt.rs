@@ -1,10 +1,10 @@
 //! Round 5: Advanced hunt — concurrent writes, B-tree boundaries,
 //! AUTO_INCREMENT edge cases, WAL truncation, and schema operations.
 
-use motedb::{Database, DBConfig, types::Value, sql::QueryResult};
-use tempfile::TempDir;
+use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
 use std::sync::Arc;
 use std::thread;
+use tempfile::TempDir;
 
 fn mk() -> (Database, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -20,13 +20,25 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn cnt(db: &Database, sql: &str) -> i64 {
-    rows(db, sql).first().and_then(|r| r.first()).and_then(|v| {
-        if let Value::Integer(i) = v { Some(*i) } else { None }
-    }).unwrap_or(-1)
+    rows(db, sql)
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| {
+            if let Value::Integer(i) = v {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(-1)
 }
 
 fn val(db: &Database, sql: &str) -> Value {
-    rows(db, sql).first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null)
+    rows(db, sql)
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -38,7 +50,8 @@ fn val(db: &Database, sql: &str) -> Value {
 fn test_concurrent_insert_4_threads() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
 
     let mut handles = vec![];
     for t in 0..4u32 {
@@ -50,7 +63,9 @@ fn test_concurrent_insert_4_threads() {
             }
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     db.flush().unwrap();
     let total = cnt(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(total, 200, "4 threads × 50 = 200 rows, got {}", total);
@@ -61,8 +76,12 @@ fn test_concurrent_insert_4_threads() {
 fn test_concurrent_readers_one_writer() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=100 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
 
     let mut handles = vec![];
@@ -83,7 +102,9 @@ fn test_concurrent_readers_one_writer() {
             }
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -94,35 +115,52 @@ fn test_concurrent_readers_one_writer() {
 #[test]
 fn test_auto_increment_starts_from_1() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES ('a')").unwrap();
     db.execute("INSERT INTO t (v) VALUES ('b')").unwrap();
-    assert_eq!(val(&db, "SELECT id FROM t WHERE v = 'a'"), Value::Integer(1));
-    assert_eq!(val(&db, "SELECT id FROM t WHERE v = 'b'"), Value::Integer(2));
+    assert_eq!(
+        val(&db, "SELECT id FROM t WHERE v = 'a'"),
+        Value::Integer(1)
+    );
+    assert_eq!(
+        val(&db, "SELECT id FROM t WHERE v = 'b'"),
+        Value::Integer(2)
+    );
 }
 
 /// AUTO_INCREMENT after DELETE — ID keeps incrementing (no reuse).
 #[test]
 fn test_auto_increment_after_delete_no_reuse() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (10)").unwrap(); // id=1
     db.execute("INSERT INTO t (v) VALUES (20)").unwrap(); // id=2
     db.execute("DELETE FROM t WHERE id = 2").unwrap();
     db.execute("INSERT INTO t (v) VALUES (30)").unwrap(); // id=3 (not reuse of 2)
     let id3 = val(&db, "SELECT id FROM t WHERE v = 30");
-    assert!(id3 != Value::Integer(2), "AUTO_INCREMENT should not reuse deleted IDs, got {:?}", id3);
+    assert!(
+        id3 != Value::Integer(2),
+        "AUTO_INCREMENT should not reuse deleted IDs, got {:?}",
+        id3
+    );
 }
 
 /// AUTO_INCREMENT with explicit ID — counter advances past explicit ID.
 #[test]
 fn test_auto_increment_with_explicit_id() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (100, 10)").unwrap();
     db.execute("INSERT INTO t (v) VALUES (20)").unwrap();
     let next_id = val(&db, "SELECT id FROM t WHERE v = 20");
-    assert_eq!(next_id, Value::Integer(101), "AUTO_INCREMENT should continue from max explicit ID+1");
+    assert_eq!(
+        next_id,
+        Value::Integer(101),
+        "AUTO_INCREMENT should continue from max explicit ID+1"
+    );
 }
 
 /// AUTO_INCREMENT survives recovery.
@@ -132,8 +170,12 @@ fn test_auto_increment_survives_recovery() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
-        for i in 0..5 { db.execute(&format!("INSERT INTO t (v) VALUES ({})", i)).unwrap(); }
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+            .unwrap();
+        for i in 0..5 {
+            db.execute(&format!("INSERT INTO t (v) VALUES ({})", i))
+                .unwrap();
+        }
         db.checkpoint().unwrap();
         db.close().unwrap();
     }
@@ -141,7 +183,12 @@ fn test_auto_increment_survives_recovery() {
     // Next insert should get id=6 (not restart from 1).
     db.execute("INSERT INTO t (v) VALUES (99)").unwrap();
     let id = val(&db, "SELECT id FROM t WHERE v = 99");
-    assert_eq!(id, Value::Integer(6), "AUTO_INCREMENT should continue after recovery, got {:?}", id);
+    assert_eq!(
+        id,
+        Value::Integer(6),
+        "AUTO_INCREMENT should continue after recovery, got {:?}",
+        id
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -152,9 +199,14 @@ fn test_auto_increment_survives_recovery() {
 #[test]
 fn test_column_index_range_query() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, age INT)").unwrap();
-    for i in 1..=100 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
-    db.execute("CREATE INDEX idx_age ON t (age) USING COLUMN").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, age INT)")
+        .unwrap();
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
+    db.execute("CREATE INDEX idx_age ON t (age) USING COLUMN")
+        .unwrap();
     db.wait_for_indexes_ready();
     let r = rows(&db, "SELECT id FROM t WHERE age >= 50 AND age <= 55");
     assert_eq!(r.len(), 6, "age 50..55 = 6 rows");
@@ -164,12 +216,15 @@ fn test_column_index_range_query() {
 #[test]
 fn test_column_index_after_update() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
     for i in 1..=10 {
         let cat = if i <= 5 { "A" } else { "B" };
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, cat)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, cat))
+            .unwrap();
     }
-    db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN")
+        .unwrap();
     db.wait_for_indexes_ready();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE cat = 'A'"), 5);
     // Move one row from A to B.
@@ -192,14 +247,19 @@ fn test_wal_recovery_without_checkpoint() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         // No explicit checkpoint — WAL should recover.
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 2, "WAL should recover uncommitted data");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "WAL should recover uncommitted data"
+    );
 }
 
 /// Recovery after DELETE — deleted rows stay deleted via WAL.
@@ -210,12 +270,19 @@ fn test_wal_recovery_after_delete() {
     {
         let db = Database::create(&path).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
-        for i in 1..=5 { db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap(); }
+        for i in 1..=5 {
+            db.execute(&format!("INSERT INTO t VALUES ({})", i))
+                .unwrap();
+        }
         db.execute("DELETE FROM t WHERE id = 3").unwrap();
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 4, "4 rows after deleting id=3");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        4,
+        "4 rows after deleting id=3"
+    );
     assert_eq!(rows(&db, "SELECT * FROM t WHERE id = 3").len(), 0);
 }
 
@@ -239,16 +306,22 @@ fn test_create_table_if_not_exists() {
 fn test_drop_table_if_exists() {
     let (db, _d) = mk();
     let r = db.execute("DROP TABLE IF EXISTS nonexistent");
-    assert!(r.is_ok(), "DROP TABLE IF EXISTS should not error on nonexistent table");
+    assert!(
+        r.is_ok(),
+        "DROP TABLE IF EXISTS should not error on nonexistent table"
+    );
 }
 
 /// Multiple tables — interleaved operations.
 #[test]
 fn test_multiple_tables_interleaved() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("CREATE TABLE c (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO b VALUES (1, 20)").unwrap();
     db.execute("INSERT INTO c VALUES (1, 30)").unwrap();
@@ -267,11 +340,16 @@ fn test_multiple_tables_interleaved() {
 #[test]
 fn test_1000_rows_exact_values() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)")
+        .unwrap();
     for i in 1..=1000i64 {
         let name = format!("user_{}_{}", i, i * 7 % 13);
         let score = (i as f64 * 3.14159) % 100.0;
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}', {:.4})", i, name, score)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, '{}', {:.4})",
+            i, name, score
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
     // Verify every 100th row.
@@ -279,7 +357,12 @@ fn test_1000_rows_exact_values() {
         let expected_name = format!("user_{}_{}", i, i * 7 % 13);
         let r = rows(&db, &format!("SELECT name FROM t WHERE id = {}", i));
         assert_eq!(r.len(), 1, "Row id={} should exist", i);
-        assert_eq!(r[0][0], Value::text(expected_name), "Name mismatch at id={}", i);
+        assert_eq!(
+            r[0][0],
+            Value::text(expected_name),
+            "Name mismatch at id={}",
+            i
+        );
     }
 }
 
@@ -287,8 +370,12 @@ fn test_1000_rows_exact_values() {
 #[test]
 fn test_select_all_no_truncation() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    for i in 1..=500 { db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for i in 1..=500 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
     db.flush().unwrap();
     let r = rows(&db, "SELECT * FROM t");
     assert_eq!(r.len(), 500, "SELECT * should return all 500 rows");
@@ -298,10 +385,12 @@ fn test_select_all_no_truncation() {
 #[test]
 fn test_sum_large_dataset_accuracy() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let n = 1000i64;
     for i in 1..=n {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
     }
     db.flush().unwrap();
     // SUM(1..1000) = 1000 * 1001 / 2 = 500500
@@ -317,7 +406,8 @@ fn test_sum_large_dataset_accuracy() {
 #[test]
 fn test_count_distinct() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'A')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'B')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'A')").unwrap();
@@ -337,10 +427,12 @@ fn test_count_distinct() {
 #[test]
 fn test_select_distinct_values() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
     for i in 1..=10 {
         let cat = ["X", "Y", "Z"][(i % 3) as usize];
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, cat)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, cat))
+            .unwrap();
     }
     db.flush().unwrap();
     let r = rows(&db, "SELECT DISTINCT cat FROM t");
@@ -355,7 +447,8 @@ fn test_select_distinct_values() {
 #[test]
 fn test_null_primary_key_no_panic() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let r = db.execute("INSERT INTO t VALUES (NULL, 10)");
     // NULL PK should error (PK can't be NULL), but must not panic.
     assert!(r.is_ok() || r.is_err());
@@ -365,9 +458,12 @@ fn test_null_primary_key_no_panic() {
 #[test]
 fn test_all_null_table() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, NULL, NULL, NULL)").unwrap();
-    db.execute("INSERT INTO t VALUES (2, NULL, NULL, NULL)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL, NULL, NULL)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, NULL, NULL, NULL)")
+        .unwrap();
     db.flush().unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 2);
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE a IS NULL"), 2);

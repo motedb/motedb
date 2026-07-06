@@ -13,8 +13,8 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Row cache key: (table_hash, row_id) — avoids String allocation per lookup
 pub type CacheKey = (u64, RowId);
@@ -76,7 +76,11 @@ pub struct CacheStats {
 impl CacheStats {
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
-        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
     }
 }
 
@@ -109,9 +113,9 @@ impl RowCache {
         let capacity = capacity.max(1);
 
         Self {
-            cache: Arc::new(RwLock::new(
-                LruCache::new(NonZeroUsize::new(capacity).unwrap())
-            )),
+            cache: Arc::new(RwLock::new(LruCache::new(
+                NonZeroUsize::new(capacity).unwrap(),
+            ))),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             size: AtomicUsize::new(0),
@@ -224,12 +228,15 @@ impl RowCache {
                 }
             }
             None => {
-                patterns.insert(table_name.to_string(), AccessPattern {
-                    last_row_id: row_id,
-                    stride: 0,
-                    sequential_count: 1,
-                    last_access: now,
-                });
+                patterns.insert(
+                    table_name.to_string(),
+                    AccessPattern {
+                        last_row_id: row_id,
+                        stride: 0,
+                        sequential_count: 1,
+                        last_access: now,
+                    },
+                );
                 None
             }
         };
@@ -324,7 +331,8 @@ impl RowCache {
 
     /// 🚀 P2: Record that a prefetch was triggered
     pub fn record_prefetch(&self, count: usize) {
-        self.prefetch_triggered.fetch_add(count as u64, Ordering::Relaxed);
+        self.prefetch_triggered
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     /// 🚀 P2: Record that a prefetched row was actually used
@@ -348,7 +356,7 @@ impl RowCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Value, ArcString};
+    use crate::types::{ArcString, Value};
     use std::sync::Arc;
 
     #[test]

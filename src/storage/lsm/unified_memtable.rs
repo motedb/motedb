@@ -11,14 +11,14 @@
 //! - 非 ACP 表省 24 bytes/row 的 Option<Vec> 开销
 //! - 分片设计：put/get 只锁单个分片，并发写入 ~16x 扩展
 
-use super::{Key, Value, ValueData, LSMConfig};
-use crate::index::fresh_graph::{FreshVamanaGraph, FreshGraphConfig};
+use super::{Key, LSMConfig, Value, ValueData};
 use crate::distance::DistanceKind;
+use crate::index::fresh_graph::{FreshGraphConfig, FreshVamanaGraph};
 use crate::{Result, StorageError};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Type alias for the vector storage map
 type VectorMap = Arc<RwLock<BTreeMap<Key, Vec<f32>>>>;
@@ -55,7 +55,12 @@ pub struct UnifiedEntry {
 
 impl UnifiedEntry {
     pub fn new(data: ValueData, vector: Option<Vec<f32>>, timestamp: u64) -> Self {
-        Self { data, vector, timestamp, deleted: false }
+        Self {
+            data,
+            vector,
+            timestamp,
+            deleted: false,
+        }
     }
 
     pub fn tombstone(timestamp: u64) -> Self {
@@ -173,12 +178,20 @@ impl UnifiedMemTable {
     }
 
     /// 插入数据 + 向量
-    pub fn put_with_vector(&self, key: Key, data: ValueData, vector: Vec<f32>, timestamp: u64) -> Result<()> {
+    pub fn put_with_vector(
+        &self,
+        key: Key,
+        data: ValueData,
+        vector: Vec<f32>,
+        timestamp: u64,
+    ) -> Result<()> {
         if let Some(expected_dim) = self.vector_dimension {
             if vector.len() != expected_dim {
-                return Err(StorageError::InvalidData(
-                    format!("Vector dimension mismatch: expected {}, got {}", expected_dim, vector.len())
-                ));
+                return Err(StorageError::InvalidData(format!(
+                    "Vector dimension mismatch: expected {}, got {}",
+                    expected_dim,
+                    vector.len()
+                )));
             }
         }
 
@@ -226,7 +239,9 @@ impl UnifiedMemTable {
     /// O(1) amortized per entry instead of O(log N). Entries are merged
     /// into sharded BTree Maps during scan/flush.
     pub fn batch_put_fast(&self, kvs: &[(Key, Value)]) -> Result<()> {
-        if kvs.is_empty() { return Ok(()); }
+        if kvs.is_empty() {
+            return Ok(());
+        }
         let mut buffer = self.batch_buffer.write();
         let mut total_size: usize = 0;
         for (key, value) in kvs {
@@ -248,7 +263,9 @@ impl UnifiedMemTable {
     /// Merge batch buffer into sharded BTreeMaps. Called before scan or flush.
     pub(crate) fn merge_batch_buffer(&self) {
         let mut buffer = self.batch_buffer.write();
-        if buffer.is_empty() { return; }
+        if buffer.is_empty() {
+            return;
+        }
         let entries: Vec<(Key, Arc<DataEntry>)> = std::mem::take(&mut *buffer);
         let count = entries.len();
         drop(buffer);
@@ -256,7 +273,8 @@ impl UnifiedMemTable {
         debug_log!("[merge_batch_buffer] Merging {} entries into shards", count);
 
         // Group by shard and insert
-        let mut groups: [Vec<(Key, Arc<DataEntry>)>; SHARD_COUNT] = core::array::from_fn(|_| Vec::new());
+        let mut groups: [Vec<(Key, Arc<DataEntry>)>; SHARD_COUNT] =
+            core::array::from_fn(|_| Vec::new());
         for (key, entry) in entries {
             groups[Self::shard_index(key)].push((key, entry));
         }
@@ -276,7 +294,8 @@ impl UnifiedMemTable {
         }
 
         // Group by shard
-        let mut groups: [Vec<(Key, Arc<DataEntry>)>; SHARD_COUNT] = core::array::from_fn(|_| Vec::new());
+        let mut groups: [Vec<(Key, Arc<DataEntry>)>; SHARD_COUNT] =
+            core::array::from_fn(|_| Vec::new());
         for (key, value) in kvs {
             let entry = Arc::new(DataEntry {
                 data: value.data.clone(),
@@ -303,9 +322,11 @@ impl UnifiedMemTable {
         }
 
         if total_size_change > 0 {
-            self.size.fetch_add(total_size_change as usize, Ordering::Relaxed);
+            self.size
+                .fetch_add(total_size_change as usize, Ordering::Relaxed);
         } else if total_size_change < 0 {
-            self.size.fetch_sub((-total_size_change) as usize, Ordering::Relaxed);
+            self.size
+                .fetch_sub((-total_size_change) as usize, Ordering::Relaxed);
         }
 
         self.next_seq.fetch_add(kvs.len(), Ordering::Relaxed);
@@ -319,9 +340,10 @@ impl UnifiedMemTable {
             return Ok(None);
         };
 
-        let vector = self.vectors.as_ref().and_then(|vm| {
-            vm.read().get(&key).cloned()
-        });
+        let vector = self
+            .vectors
+            .as_ref()
+            .and_then(|vm| vm.read().get(&key).cloned());
 
         Ok(Some(UnifiedEntry {
             data: arc_entry.data.clone(),
@@ -342,7 +364,8 @@ impl UnifiedMemTable {
         let mut shard = self.shards[Self::shard_index(key)].write();
 
         if let Some(old_entry) = shard.get(&key) {
-            self.size.fetch_sub(old_entry.memory_size(), Ordering::Relaxed);
+            self.size
+                .fetch_sub(old_entry.memory_size(), Ordering::Relaxed);
         }
 
         let entry_size = entry.memory_size();
@@ -384,13 +407,14 @@ impl UnifiedMemTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.shards.iter().all(|s| s.read().is_empty())
-            && self.batch_buffer.read().is_empty()
+        self.shards.iter().all(|s| s.read().is_empty()) && self.batch_buffer.read().is_empty()
     }
 
     /// Vector search (in-memory graph) — per-key single shard lookup
     pub fn vector_search(&self, query: &[f32], k: usize) -> Result<Vec<(Key, UnifiedEntry, f32)>> {
-        let graph = self.vector_graph.as_ref()
+        let graph = self
+            .vector_graph
+            .as_ref()
             .ok_or_else(|| StorageError::Index("Vector search not supported".into()))?;
 
         let ef = k * 5;
@@ -404,12 +428,16 @@ impl UnifiedMemTable {
             if let Some(arc_entry) = shard.get(&candidate.id) {
                 if !arc_entry.deleted {
                     let vector = vec_map.and_then(|vm| vm.read().get(&candidate.id).cloned());
-                    results.push((candidate.id, UnifiedEntry {
-                        data: arc_entry.data.clone(),
-                        vector,
-                        timestamp: arc_entry.timestamp,
-                        deleted: false,
-                    }, candidate.distance));
+                    results.push((
+                        candidate.id,
+                        UnifiedEntry {
+                            data: arc_entry.data.clone(),
+                            vector,
+                            timestamp: arc_entry.timestamp,
+                            deleted: false,
+                        },
+                        candidate.distance,
+                    ));
                 }
             }
         }
@@ -426,17 +454,25 @@ impl UnifiedMemTable {
         all.sort_by_key(|(k, _)| *k);
 
         let vec_map = self.vectors.clone();
-        let items: Vec<(Key, UnifiedEntry)> = all.into_iter().map(|(k, arc)| {
-            let vector = vec_map.as_ref().and_then(|vm| vm.read().get(&k).cloned());
-            (k, UnifiedEntry {
-                data: arc.data.clone(),
-                vector,
-                timestamp: arc.timestamp,
-                deleted: arc.deleted,
+        let items: Vec<(Key, UnifiedEntry)> = all
+            .into_iter()
+            .map(|(k, arc)| {
+                let vector = vec_map.as_ref().and_then(|vm| vm.read().get(&k).cloned());
+                (
+                    k,
+                    UnifiedEntry {
+                        data: arc.data.clone(),
+                        vector,
+                        timestamp: arc.timestamp,
+                        deleted: arc.deleted,
+                    },
+                )
             })
-        }).collect();
+            .collect();
 
-        UnifiedMemTableIterator { entries: items.into_iter() }
+        UnifiedMemTableIterator {
+            entries: items.into_iter(),
+        }
     }
 
     pub fn snapshot(&self) -> Vec<(Key, UnifiedEntry)> {
@@ -448,15 +484,20 @@ impl UnifiedMemTable {
         all.sort_by_key(|(k, _)| *k);
 
         let vec_map = self.vectors.as_ref();
-        all.into_iter().map(|(k, arc)| {
-            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
-            (k, UnifiedEntry {
-                data: arc.data.clone(),
-                vector,
-                timestamp: arc.timestamp,
-                deleted: arc.deleted,
+        all.into_iter()
+            .map(|(k, arc)| {
+                let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+                (
+                    k,
+                    UnifiedEntry {
+                        data: arc.data.clone(),
+                        vector,
+                        timestamp: arc.timestamp,
+                        deleted: arc.deleted,
+                    },
+                )
             })
-        }).collect()
+            .collect()
     }
 
     /// Range scan — merge ranges from all shards
@@ -466,24 +507,27 @@ impl UnifiedMemTable {
         for shard in &self.shards {
             let s = shard.read();
             use std::ops::Bound;
-            let range = s.range((
-                Bound::Included(&start),
-                Bound::Excluded(&end)
-            ));
+            let range = s.range((Bound::Included(&start), Bound::Excluded(&end)));
             all.extend(range.map(|(k, v)| (*k, Arc::clone(v))));
         }
         all.sort_by_key(|(k, _)| *k);
 
         let vec_map = self.vectors.as_ref();
-        let results: Vec<(Key, UnifiedEntry)> = all.into_iter().map(|(k, arc)| {
-            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
-            (k, UnifiedEntry {
-                data: arc.data.clone(),
-                vector,
-                timestamp: arc.timestamp,
-                deleted: arc.deleted,
+        let results: Vec<(Key, UnifiedEntry)> = all
+            .into_iter()
+            .map(|(k, arc)| {
+                let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+                (
+                    k,
+                    UnifiedEntry {
+                        data: arc.data.clone(),
+                        vector,
+                        timestamp: arc.timestamp,
+                        deleted: arc.deleted,
+                    },
+                )
             })
-        }).collect();
+            .collect();
 
         Ok(results)
     }
@@ -497,10 +541,7 @@ impl UnifiedMemTable {
         for shard in &self.shards {
             let s = shard.read();
             use std::ops::Bound;
-            let range = s.range((
-                Bound::Included(&start),
-                Bound::Excluded(&end)
-            ));
+            let range = s.range((Bound::Included(&start), Bound::Excluded(&end)));
             all.extend(range.map(|(k, v)| (*k, Arc::clone(v))));
         }
         all.sort_by_key(|(k, _)| *k);
@@ -508,13 +549,19 @@ impl UnifiedMemTable {
     }
 
     /// Like scan_arcs but also fetches vector data (for vector search paths).
-    pub fn scan_arcs_with_vectors(&self, start: Key, end: Key) -> Vec<(Key, Arc<DataEntry>, Option<Vec<f32>>)> {
+    pub fn scan_arcs_with_vectors(
+        &self,
+        start: Key,
+        end: Key,
+    ) -> Vec<(Key, Arc<DataEntry>, Option<Vec<f32>>)> {
         let all = self.scan_arcs(start, end);
         let vec_map = self.vectors.as_ref();
-        all.into_iter().map(|(k, arc)| {
-            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
-            (k, arc, vector)
-        }).collect()
+        all.into_iter()
+            .map(|(k, arc)| {
+                let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+                (k, arc, vector)
+            })
+            .collect()
     }
 
     /// Full table scan — merge from all shards
@@ -528,15 +575,21 @@ impl UnifiedMemTable {
         all.sort_by_key(|(k, _)| *k);
 
         let vec_map = self.vectors.as_ref();
-        let results: Vec<(Key, UnifiedEntry)> = all.into_iter().map(|(k, arc)| {
-            let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
-            (k, UnifiedEntry {
-                data: arc.data.clone(),
-                vector,
-                timestamp: arc.timestamp,
-                deleted: arc.deleted,
+        let results: Vec<(Key, UnifiedEntry)> = all
+            .into_iter()
+            .map(|(k, arc)| {
+                let vector = vec_map.and_then(|vm| vm.read().get(&k).cloned());
+                (
+                    k,
+                    UnifiedEntry {
+                        data: arc.data.clone(),
+                        vector,
+                        timestamp: arc.timestamp,
+                        deleted: arc.deleted,
+                    },
+                )
             })
-        }).collect();
+            .collect();
 
         Ok(results)
     }
@@ -641,12 +694,19 @@ mod tests {
         debug_log!("Memory size: {} bytes", size_after);
 
         // data (4 bytes + 16 overhead) + vector (128 f32 * 4 bytes)
-        assert!(size_after > 500, "expected >500 bytes with vector, got {}", size_after);
+        assert!(
+            size_after > 500,
+            "expected >500 bytes with vector, got {}",
+            size_after
+        );
     }
 
     #[test]
     fn test_should_flush() {
-        let config = LSMConfig { memtable_size: 5000, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 5000,
+            ..Default::default()
+        };
 
         let memtable = UnifiedMemTable::new_with_vector_support(&config, 128);
 

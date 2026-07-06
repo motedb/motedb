@@ -59,7 +59,8 @@ impl Default for IOctreeConfig {
 impl IOctreeConfig {
     /// Return the effective leaf cache capacity
     pub fn cache_capacity(&self) -> usize {
-        self.leaf_cache_capacity.unwrap_or(DEFAULT_LEAF_CACHE_CAPACITY)
+        self.leaf_cache_capacity
+            .unwrap_or(DEFAULT_LEAF_CACHE_CAPACITY)
     }
 }
 
@@ -79,13 +80,15 @@ impl IOctreeIndex {
     pub fn new(config: IOctreeConfig, name: String) -> Result<Self> {
         let world_bounds = BoundingBox3D::new(-500.0, -500.0, -500.0, 500.0, 500.0, 500.0);
         let center = {
-    let c = world_bounds.center();
-    [c.x, c.y, c.z]
-};
+            let c = world_bounds.center();
+            [c.x, c.y, c.z]
+        };
         let extent = world_bounds.extent() /*as f64*/;
 
         // data_dir may point to a file (ioctree.bin) or directory; use parent for LeafStore/WAL
-        let work_dir = config.data_dir.as_ref()
+        let work_dir = config
+            .data_dir
+            .as_ref()
             .map(|p| {
                 if p.extension().map(|e| e == "bin").unwrap_or(false) {
                     p.parent().unwrap_or(p).to_path_buf()
@@ -95,10 +98,12 @@ impl IOctreeIndex {
             })
             .unwrap_or_else(|| std::env::temp_dir().join(format!("motedb_ioctree_{}", name)));
 
-        let leaf_store = LeafStore::open(&work_dir, config.cache_capacity())
-            .map_err(|e| crate::StorageError::Index(format!("Failed to create LeafStore: {}", e)))?;
-        let root_leaf_id = leaf_store.create_leaf(vec![])
-            .map_err(|e| crate::StorageError::Index(format!("Failed to create root leaf: {}", e)))?;
+        let leaf_store = LeafStore::open(&work_dir, config.cache_capacity()).map_err(|e| {
+            crate::StorageError::Index(format!("Failed to create LeafStore: {}", e))
+        })?;
+        let root_leaf_id = leaf_store.create_leaf(vec![]).map_err(|e| {
+            crate::StorageError::Index(format!("Failed to create root leaf: {}", e))
+        })?;
 
         Ok(Self {
             root: Octant::new_leaf(center, extent, root_leaf_id),
@@ -119,7 +124,11 @@ impl IOctreeIndex {
                 owned = Point3D::new(p.x, p.y, 0.0);
                 &owned
             }
-            _ => return Err(StorageError::InvalidData("i-Octree only accepts point geometry".into())),
+            _ => {
+                return Err(StorageError::InvalidData(
+                    "i-Octree only accepts point geometry".into(),
+                ))
+            }
         };
 
         let indexed = IndexedPoint3D::from_point3d(point, row_id);
@@ -128,7 +137,11 @@ impl IOctreeIndex {
         self.world_bounds.expand(point);
 
         // Expand root upward if point outside bounds
-        let p = [point.x /*as f64*/, point.y /*as f64*/, point.z /*as f64*/];
+        let p = [
+            point.x, /*as f64*/
+            point.y, /*as f64*/
+            point.z, /*as f64*/
+        ];
         while !self.root_contains(&p) {
             self.expand_root();
         }
@@ -143,7 +156,13 @@ impl IOctreeIndex {
     fn insert_into_tree(&mut self, point: IndexedPoint3D) -> Result<()> {
         let bucket_size = self.config.bucket_size;
         let min_extent = self.config.min_extent /*as f64*/;
-        tree_insert(&self.leaf_store, &mut self.root, point, bucket_size, min_extent)
+        tree_insert(
+            &self.leaf_store,
+            &mut self.root,
+            point,
+            bucket_size,
+            min_extent,
+        )
     }
 
     /// Delete a point by row_id
@@ -157,20 +176,36 @@ impl IOctreeIndex {
 
     /// Range query: find all points within a 3D bounding box
     pub fn range_query(&self, bbox: &BoundingBox3D) -> Vec<u64> {
-        let min = [bbox.min_x /*as f64*/, bbox.min_y /*as f64*/, bbox.min_z /*as f64*/];
-        let max = [bbox.max_x /*as f64*/, bbox.max_y /*as f64*/, bbox.max_z /*as f64*/];
+        let min = [
+            bbox.min_x, /*as f64*/
+            bbox.min_y, /*as f64*/
+            bbox.min_z, /*as f64*/
+        ];
+        let max = [
+            bbox.max_x, /*as f64*/
+            bbox.max_y, /*as f64*/
+            bbox.max_z, /*as f64*/
+        ];
         search::range_search(&self.root, &min, &max, &self.leaf_store)
     }
 
     /// KNN query: find k nearest neighbors
     pub fn knn_query(&self, point: &Point3D, k: usize) -> Vec<(u64, f64)> {
-        let query = [point.x /*as f64*/, point.y /*as f64*/, point.z /*as f64*/];
+        let query = [
+            point.x, /*as f64*/
+            point.y, /*as f64*/
+            point.z, /*as f64*/
+        ];
         search::knn_search(&self.root, &query, k, &self.leaf_store)
     }
 
     /// Radius search: find all points within a given radius
     pub fn radius_search(&self, center: &Point3D, radius: f64) -> Vec<(u64, f64)> {
-        let c = [center.x /*as f64*/, center.y /*as f64*/, center.z /*as f64*/];
+        let c = [
+            center.x, /*as f64*/
+            center.y, /*as f64*/
+            center.z, /*as f64*/
+        ];
         search::radius_search(&self.root, &c, radius /*as f64*/, &self.leaf_store)
     }
 
@@ -218,9 +253,12 @@ impl IOctreeIndex {
             Octant::Leaf { center, extent, .. } => (center, extent),
         };
         let e = *extent;
-        p[0] >= center[0] - e && p[0] <= center[0] + e
-            && p[1] >= center[1] - e && p[1] <= center[1] + e
-            && p[2] >= center[2] - e && p[2] <= center[2] + e
+        p[0] >= center[0] - e
+            && p[0] <= center[0] + e
+            && p[1] >= center[1] - e
+            && p[1] <= center[1] + e
+            && p[2] >= center[2] - e
+            && p[2] <= center[2] + e
     }
 
     fn expand_root(&mut self) {
@@ -229,7 +267,10 @@ impl IOctreeIndex {
             Octant::Leaf { center, extent, .. } => (*center, *extent * 2.0),
         };
         let old_root = std::mem::replace(&mut self.root, Octant::new_inner(center, extent));
-        if let Octant::Inner { ref mut children, .. } = self.root {
+        if let Octant::Inner {
+            ref mut children, ..
+        } = self.root
+        {
             let code = node::octant_code(&center, &center);
             children[code] = Some(Box::new(old_root));
         }
@@ -239,9 +280,20 @@ impl IOctreeIndex {
 
 // === Free functions for tree operations (avoids borrow checker issues) ===
 
-fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bucket_size: usize, min_extent: f64) -> Result<()> {
+fn tree_insert(
+    store: &LeafStore,
+    octant: &mut Octant,
+    point: IndexedPoint3D,
+    bucket_size: usize,
+    min_extent: f64,
+) -> Result<()> {
     match octant {
-        Octant::Leaf { center: _, extent, leaf_id, point_count } => {
+        Octant::Leaf {
+            center: _,
+            extent,
+            leaf_id,
+            point_count,
+        } => {
             let added = store.add_point(*leaf_id, point)?;
             if !added {
                 // Leaf is full — split first, then retry insert into the new child
@@ -259,7 +311,12 @@ fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bu
                 split_leaf(store, octant)?;
             }
         }
-        Octant::Inner { center, extent, children, size } => {
+        Octant::Inner {
+            center,
+            extent,
+            children,
+            size,
+        } => {
             *size += 1;
             let code = node::octant_code(center, &point.as_array());
             let child_ctr = node::child_center(center, *extent, code);
@@ -267,7 +324,11 @@ fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bu
             if children[code].is_none() {
                 let new_leaf_id = store.create_leaf(vec![])?;
                 let child_ext = *extent / 2.0;
-                children[code] = Some(Box::new(Octant::new_leaf(child_ctr, child_ext, new_leaf_id)));
+                children[code] = Some(Box::new(Octant::new_leaf(
+                    child_ctr,
+                    child_ext,
+                    new_leaf_id,
+                )));
             }
             if let Some(ref mut child) = children[code] {
                 tree_insert(store, child, point, bucket_size, min_extent)?;
@@ -279,7 +340,12 @@ fn tree_insert(store: &LeafStore, octant: &mut Octant, point: IndexedPoint3D, bu
 
 fn split_leaf(store: &LeafStore, octant: &mut Octant) -> Result<()> {
     let (center, extent, old_leaf_id) = match octant {
-        Octant::Leaf { center, extent, leaf_id, .. } => (*center, *extent, *leaf_id),
+        Octant::Leaf {
+            center,
+            extent,
+            leaf_id,
+            ..
+        } => (*center, *extent, *leaf_id),
         _ => unreachable!(),
     };
 
@@ -294,10 +360,19 @@ fn split_leaf(store: &LeafStore, octant: &mut Octant) -> Result<()> {
             if children[code].is_none() {
                 let child_ctr = node::child_center(&center, extent, code);
                 let new_leaf_id = store.create_leaf(vec![])?;
-                children[code] = Some(Box::new(Octant::new_leaf(child_ctr, child_extent, new_leaf_id)));
+                children[code] = Some(Box::new(Octant::new_leaf(
+                    child_ctr,
+                    child_extent,
+                    new_leaf_id,
+                )));
             }
             if let Some(ref mut child) = children[code] {
-                if let Octant::Leaf { leaf_id, point_count, .. } = child.as_mut() {
+                if let Octant::Leaf {
+                    leaf_id,
+                    point_count,
+                    ..
+                } = child.as_mut()
+                {
                     store.add_point(*leaf_id, point)?;
                     *point_count = store.point_count(*leaf_id)? as u32;
                 }
@@ -316,15 +391,17 @@ fn split_leaf(store: &LeafStore, octant: &mut Octant) -> Result<()> {
 
 fn tree_delete(store: &LeafStore, octant: &mut Octant, row_id: u64) -> bool {
     match octant {
-        Octant::Leaf { leaf_id, point_count, .. } => {
-            match store.remove_point(*leaf_id, row_id) {
-                Ok(true) => {
-                    *point_count = store.point_count(*leaf_id).unwrap_or(0) as u32;
-                    true
-                }
-                _ => false,
+        Octant::Leaf {
+            leaf_id,
+            point_count,
+            ..
+        } => match store.remove_point(*leaf_id, row_id) {
+            Ok(true) => {
+                *point_count = store.point_count(*leaf_id).unwrap_or(0) as u32;
+                true
             }
-        }
+            _ => false,
+        },
         Octant::Inner { children, size, .. } => {
             for child_slot in children.iter_mut() {
                 if let Some(ref mut c) = child_slot {

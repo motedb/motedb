@@ -1,7 +1,7 @@
+use super::ast::*;
 /// SQL Parser - converts tokens into AST
 use super::token::{Token, TokenType};
-use super::ast::*;
-use crate::error::{Result, MoteDBError};
+use crate::error::{MoteDBError, Result};
 use crate::types::Value;
 
 pub struct Parser {
@@ -20,9 +20,14 @@ const MAX_IDENTIFIER_LENGTH: usize = 4096;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, position: 0, next_param_idx: 1, recursion_depth: 0 }
+        Self {
+            tokens,
+            position: 0,
+            next_param_idx: 1,
+            recursion_depth: 0,
+        }
     }
-    
+
     /// Parse a SQL statement
     pub fn parse(&mut self) -> Result<Statement> {
         let stmt = match &self.current().token_type {
@@ -40,7 +45,7 @@ impl Parser {
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
             _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
         };
-        
+
         // Optionally consume semicolon
         if matches!(self.current().token_type, TokenType::Semicolon) {
             self.advance();
@@ -48,36 +53,37 @@ impl Parser {
 
         // Reject multiple statements (security: prevents silent truncation)
         if !matches!(self.current().token_type, TokenType::Eof) {
-            return Err(self.error("Multiple statements are not supported; unexpected input after statement"));
+            return Err(self
+                .error("Multiple statements are not supported; unexpected input after statement"));
         }
 
         Ok(stmt)
     }
-    
+
     /// Parse SELECT statement
     fn parse_select(&mut self) -> Result<SelectStmt> {
         self.expect(TokenType::Select)?;
-        
+
         // Parse DISTINCT (optional)
         let distinct = self.match_token(TokenType::Distinct);
-        
+
         // Parse columns
         let columns = self.parse_select_columns()?;
-        
+
         // FROM clause (optional - for queries like SELECT LAST_INSERT_ID())
         let from = if self.match_token(TokenType::From) {
             Some(self.parse_table_ref()?)
         } else {
             None
         };
-        
+
         // WHERE clause (optional)
         let where_clause = if self.match_token(TokenType::Where) {
             Some(self.parse_expr(0)?)
         } else {
             None
         };
-        
+
         // GROUP BY clause (optional)
         let group_by = if self.match_token(TokenType::Group) {
             self.expect(TokenType::By)?;
@@ -85,14 +91,14 @@ impl Parser {
         } else {
             None
         };
-        
+
         // HAVING clause (optional, requires GROUP BY)
         let having = if self.match_token(TokenType::Having) {
             Some(self.parse_expr(0)?)
         } else {
             None
         };
-        
+
         // ORDER BY clause (optional)
         let order_by = if self.match_token(TokenType::Order) {
             self.expect(TokenType::By)?;
@@ -100,21 +106,21 @@ impl Parser {
         } else {
             None
         };
-        
+
         // LIMIT clause (optional)
         let limit = if self.match_token(TokenType::Limit) {
             Some(self.parse_usize()?)
         } else {
             None
         };
-        
+
         // OFFSET clause (optional)
         let offset = if self.match_token(TokenType::Offset) {
             Some(self.parse_usize()?)
         } else {
             None
         };
-        
+
         // LATEST BY clause (optional)
         let latest_by = if self.match_token(TokenType::Latest) {
             self.expect(TokenType::By)?;
@@ -122,7 +128,7 @@ impl Parser {
         } else {
             None
         };
-        
+
         Ok(SelectStmt {
             distinct,
             columns,
@@ -136,7 +142,7 @@ impl Parser {
             latest_by,
         })
     }
-    
+
     fn parse_column_list(&mut self) -> Result<Vec<String>> {
         let mut columns = Vec::new();
         loop {
@@ -147,10 +153,10 @@ impl Parser {
         }
         Ok(columns)
     }
-    
+
     fn parse_select_columns(&mut self) -> Result<Vec<SelectColumn>> {
         let mut columns = Vec::new();
-        
+
         loop {
             if matches!(self.current().token_type, TokenType::Star) {
                 self.advance();
@@ -158,14 +164,14 @@ impl Parser {
             } else {
                 // Try to parse as expression
                 let expr = self.parse_expr(0)?;
-                
+
                 // Check for AS alias
                 let alias = if self.match_token(TokenType::As) {
                     Some(self.parse_identifier()?)
                 } else {
                     None
                 };
-                
+
                 // If it's a simple column reference, use Column variant
                 if let Expr::Column(name) = expr {
                     if let Some(alias) = alias {
@@ -177,22 +183,22 @@ impl Parser {
                     columns.push(SelectColumn::Expr(expr, alias));
                 }
             }
-            
+
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
-        
+
         if columns.is_empty() {
             return Err(self.error("Expected at least one column in SELECT"));
         }
-        
+
         Ok(columns)
     }
-    
+
     fn parse_order_by(&mut self) -> Result<Vec<OrderByExpr>> {
         let mut order_by = Vec::new();
-        
+
         loop {
             let expr = self.parse_expr(0)?;
             let asc = if self.match_token(TokenType::Desc) {
@@ -201,32 +207,32 @@ impl Parser {
                 self.match_token(TokenType::Asc); // Optional
                 true
             };
-            
+
             order_by.push(OrderByExpr { expr, asc });
-            
+
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
-        
+
         Ok(order_by)
     }
-    
+
     /// Parse table reference with JOIN support
     /// Syntax: table1 [AS alias1] [JOIN table2 [AS alias2] ON condition]
     fn parse_table_ref(&mut self) -> Result<TableRef> {
         // Parse left table
         let mut left = self.parse_single_table()?;
-        
+
         // Parse JOINs (can chain multiple JOINs)
         while self.is_join_keyword() {
             let join_type = self.parse_join_type()?;
             let right = self.parse_single_table()?;
-            
+
             // Expect ON condition
             self.expect(TokenType::On)?;
             let on_condition = self.parse_expr(0)?;
-            
+
             left = TableRef::Join {
                 left: Box::new(left),
                 right: Box::new(right),
@@ -234,24 +240,24 @@ impl Parser {
                 on_condition,
             };
         }
-        
+
         Ok(left)
     }
-    
+
     /// Parse a single table reference: table_name [AS alias] or (SELECT ...) AS alias
     fn parse_single_table(&mut self) -> Result<TableRef> {
         // Check for subquery: (SELECT ...)
         if matches!(self.current().token_type, TokenType::LParen) {
             self.advance(); // consume '('
-            
+
             // Expect SELECT
             if !matches!(self.current().token_type, TokenType::Select) {
                 return Err(self.error("Expected SELECT in subquery"));
             }
-            
+
             let subquery = self.parse_select()?;
             self.expect(TokenType::RParen)?;
-            
+
             // Alias is REQUIRED for subqueries in FROM
             let alias = if self.match_token(TokenType::As) {
                 self.parse_identifier()?
@@ -261,16 +267,16 @@ impl Parser {
             } else {
                 return Err(self.error("Subquery in FROM clause must have an alias"));
             };
-            
+
             return Ok(TableRef::Subquery {
                 query: Box::new(subquery),
                 alias,
             });
         }
-        
+
         // Regular table
         let name = self.parse_identifier()?;
-        
+
         // Check for optional AS alias
         let alias = if self.match_token(TokenType::As) {
             Some(self.parse_identifier()?)
@@ -280,18 +286,22 @@ impl Parser {
         } else {
             None
         };
-        
+
         Ok(TableRef::Table { name, alias })
     }
-    
+
     /// Check if current token is a JOIN keyword
     fn is_join_keyword(&self) -> bool {
         matches!(
             self.current().token_type,
-            TokenType::Join | TokenType::Inner | TokenType::Left | TokenType::Right | TokenType::Full
+            TokenType::Join
+                | TokenType::Inner
+                | TokenType::Left
+                | TokenType::Right
+                | TokenType::Full
         )
     }
-    
+
     /// Parse JOIN type
     fn parse_join_type(&mut self) -> Result<JoinType> {
         let join_type = match self.current().token_type {
@@ -324,17 +334,17 @@ impl Parser {
             }
             _ => return Err(self.error("Expected JOIN keyword")),
         };
-        
+
         Ok(join_type)
     }
-    
+
     /// Parse INSERT statement
     fn parse_insert(&mut self) -> Result<InsertStmt> {
         self.expect(TokenType::Insert)?;
         self.expect(TokenType::Into)?;
-        
+
         let table = self.parse_identifier()?;
-        
+
         // Optional column list
         let columns = if matches!(self.current().token_type, TokenType::LParen) {
             self.advance();
@@ -344,9 +354,9 @@ impl Parser {
         } else {
             None
         };
-        
+
         self.expect(TokenType::Values)?;
-        
+
         // Parse value rows
         let mut values = Vec::new();
         loop {
@@ -354,21 +364,25 @@ impl Parser {
             let row = self.parse_expr_list()?;
             self.expect(TokenType::RParen)?;
             values.push(row);
-            
+
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
-        
-        Ok(InsertStmt { table, columns, values })
+
+        Ok(InsertStmt {
+            table,
+            columns,
+            values,
+        })
     }
-    
+
     /// Parse UPDATE statement
     fn parse_update(&mut self) -> Result<UpdateStmt> {
         self.expect(TokenType::Update)?;
         let table = self.parse_identifier()?;
         self.expect(TokenType::Set)?;
-        
+
         // Parse assignments
         let mut assignments = Vec::new();
         loop {
@@ -376,42 +390,49 @@ impl Parser {
             self.expect(TokenType::Eq)?;
             let expr = self.parse_expr(0)?;
             assignments.push((column, expr));
-            
+
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
-        
+
         // WHERE clause (optional)
         let where_clause = if self.match_token(TokenType::Where) {
             Some(self.parse_expr(0)?)
         } else {
             None
         };
-        
-        Ok(UpdateStmt { table, assignments, where_clause })
+
+        Ok(UpdateStmt {
+            table,
+            assignments,
+            where_clause,
+        })
     }
-    
+
     /// Parse DELETE statement
     fn parse_delete(&mut self) -> Result<DeleteStmt> {
         self.expect(TokenType::Delete)?;
         self.expect(TokenType::From)?;
         let table = self.parse_identifier()?;
-        
+
         // WHERE clause (optional)
         let where_clause = if self.match_token(TokenType::Where) {
             Some(self.parse_expr(0)?)
         } else {
             None
         };
-        
-        Ok(DeleteStmt { table, where_clause })
+
+        Ok(DeleteStmt {
+            table,
+            where_clause,
+        })
     }
-    
+
     /// Parse CREATE statement
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect(TokenType::Create)?;
-        
+
         match &self.current().token_type {
             TokenType::Table => Ok(Statement::CreateTable(self.parse_create_table()?)),
             TokenType::Index => Ok(Statement::CreateIndex(self.parse_create_index()?)),
@@ -431,7 +452,7 @@ impl Parser {
             _ => Err(self.error("Expected TABLE or INDEX after CREATE")),
         }
     }
-    
+
     fn parse_create_table(&mut self) -> Result<CreateTableStmt> {
         self.expect(TokenType::Table)?;
         let table = self.parse_identifier()?;
@@ -494,22 +515,20 @@ impl Parser {
             "h" | "hr" | "hrs" | "hour" | "hours" => {
                 crate::types::TTLDuration::from_hours(value as u64)
             }
-            "d" | "day" | "days" => {
-                crate::types::TTLDuration::from_days(value as u64)
-            }
+            "d" | "day" | "days" => crate::types::TTLDuration::from_days(value as u64),
             _ => return Err(self.error(&format!("Unknown TTL unit: '{}'", unit))),
         };
 
         Ok(duration)
     }
-    
+
     fn parse_column_defs(&mut self) -> Result<Vec<ColumnDef>> {
         let mut columns = Vec::new();
-        
+
         loop {
             let name = self.parse_identifier()?;
             let data_type = self.parse_data_type()?;
-            
+
             // Parse constraints in any order
             let mut nullable = true;
             let mut primary_key = false;
@@ -545,7 +564,9 @@ impl Parser {
                         return Err(self.error("AUTO_INCREMENT can only be used with PRIMARY KEY"));
                     }
                     if data_type != DataType::Integer && data_type != DataType::BigInt {
-                        return Err(self.error("AUTO_INCREMENT can only be used with INTEGER or BIGINT columns"));
+                        return Err(self.error(
+                            "AUTO_INCREMENT can only be used with INTEGER or BIGINT columns",
+                        ));
                     }
                     if self.match_token(TokenType::Eq) {
                         let start = self.parse_i64()?;
@@ -559,7 +580,7 @@ impl Parser {
 
                 break;
             }
-            
+
             columns.push(ColumnDef {
                 name,
                 data_type,
@@ -572,7 +593,10 @@ impl Parser {
             // Check for duplicate column names
             if columns.len() > 1 {
                 let new_name = &columns.last().unwrap().name;
-                if columns[..columns.len() - 1].iter().any(|c| c.name == *new_name) {
+                if columns[..columns.len() - 1]
+                    .iter()
+                    .any(|c| c.name == *new_name)
+                {
                     return Err(self.error(&format!("Duplicate column name '{}'", new_name)));
                 }
             }
@@ -581,10 +605,10 @@ impl Parser {
                 break;
             }
         }
-        
+
         Ok(columns)
     }
-    
+
     fn parse_data_type(&mut self) -> Result<DataType> {
         let data_type = match &self.current().token_type {
             TokenType::Integer => DataType::Integer,
@@ -607,11 +631,11 @@ impl Parser {
             }
             _ => return Err(self.error("Expected data type")),
         };
-        
+
         self.advance();
         Ok(data_type)
     }
-    
+
     fn parse_create_index(&mut self) -> Result<CreateIndexStmt> {
         // Parse optional index type: TEXT/VECTOR/SPATIAL/TIMESTAMP
         let index_type = match &self.current().token_type {
@@ -643,12 +667,12 @@ impl Parser {
                         self.advance();
                         IndexType::Octree
                     }
-                    _ => IndexType::BTree,  // Default
+                    _ => IndexType::BTree, // Default
                 }
             }
-            _ => IndexType::BTree,  // Default
+            _ => IndexType::BTree, // Default
         };
-        
+
         self.expect(TokenType::Index)?;
         let index_name = self.parse_identifier()?;
         self.expect(TokenType::On)?;
@@ -656,14 +680,14 @@ impl Parser {
         self.expect(TokenType::LParen)?;
         let column = self.parse_identifier()?;
         self.expect(TokenType::RParen)?;
-        
+
         // 🆕 Parse optional USING clause: USING COLUMN|BTREE|...
         let final_index_type = if self.current().token_type == TokenType::Using {
             self.advance(); // consume USING
-            
+
             // Clone the identifier to avoid borrow issues
             let token_type = self.current().token_type.clone();
-            
+
             match token_type {
                 TokenType::Identifier(id) => {
                     let id_upper = id.to_uppercase();
@@ -676,9 +700,12 @@ impl Parser {
                         "SPATIAL" => IndexType::Octree,
                         "OCTREE" => IndexType::Octree,
                         "TIMESTAMP" => IndexType::Timestamp,
-                        _ => return Err(MoteDBError::ParseError(
-                            format!("Unknown index type: {}", id)
-                        )),
+                        _ => {
+                            return Err(MoteDBError::ParseError(format!(
+                                "Unknown index type: {}",
+                                id
+                            )))
+                        }
                     }
                 }
                 TokenType::Text => {
@@ -693,9 +720,11 @@ impl Parser {
                     self.advance();
                     IndexType::Timestamp
                 }
-                _ => return Err(MoteDBError::ParseError(
-                    "Expected index type after USING".to_string()
-                )),
+                _ => {
+                    return Err(MoteDBError::ParseError(
+                        "Expected index type after USING".to_string(),
+                    ))
+                }
             }
         } else {
             // No USING clause, use the index_type determined at the beginning
@@ -723,14 +752,20 @@ impl Parser {
                             match value_lower.as_str() {
                                 "l2" | "euclidean" => metric = Some("l2".to_string()),
                                 "cosine" => metric = Some("cosine".to_string()),
-                                _ => return Err(MoteDBError::ParseError(
-                                    format!("Unknown metric '{}'. Use 'l2' or 'cosine'", value)
-                                )),
+                                _ => {
+                                    return Err(MoteDBError::ParseError(format!(
+                                        "Unknown metric '{}'. Use 'l2' or 'cosine'",
+                                        value
+                                    )))
+                                }
                             }
                         }
-                        _ => return Err(MoteDBError::ParseError(
-                            format!("Unknown WITH option '{}'. Supported: metric", key)
-                        )),
+                        _ => {
+                            return Err(MoteDBError::ParseError(format!(
+                                "Unknown WITH option '{}'. Supported: metric",
+                                key
+                            )))
+                        }
                     }
 
                     if !self.match_token(TokenType::Comma) {
@@ -750,16 +785,17 @@ impl Parser {
             metric,
         })
     }
-    
+
     /// Parse DROP statement
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect(TokenType::Drop)?;
-        
+
         match &self.current().token_type {
             TokenType::Table => {
                 self.advance();
                 // Optional IF EXISTS clause (parsed as two identifiers).
-                let if_exists = if matches!(&self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("IF")) {
+                let if_exists = if matches!(&self.current().token_type, TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("IF"))
+                {
                     self.advance();
                     match &self.current().token_type {
                         TokenType::Identifier(ref w) if w.eq_ignore_ascii_case("EXISTS") => {
@@ -786,12 +822,13 @@ impl Parser {
             _ => Err(self.error("Expected TABLE or INDEX after DROP")),
         }
     }
-    
+
     /// Parse BEGIN [TRANSACTION]
     fn parse_begin(&mut self) -> Result<Statement> {
         self.expect(TokenType::Begin)?;
         // Optionally consume "TRANSACTION" keyword (not reserved, so it's an Identifier token)
-        if matches!(&self.current().token_type, TokenType::Identifier(ref s) if s.eq_ignore_ascii_case("transaction")) {
+        if matches!(&self.current().token_type, TokenType::Identifier(ref s) if s.eq_ignore_ascii_case("transaction"))
+        {
             self.advance();
         }
         Ok(Statement::BeginTransaction)
@@ -812,26 +849,29 @@ impl Parser {
     /// Parse SHOW statement
     fn parse_show(&mut self) -> Result<Statement> {
         self.expect(TokenType::Show)?;
-        
+
         if self.match_token(TokenType::Tables) {
             Ok(Statement::ShowTables)
         } else {
             Err(self.error("Expected TABLES after SHOW"))
         }
     }
-    
+
     /// Parse DESCRIBE statement
     fn parse_describe(&mut self) -> Result<Statement> {
         // Accept both DESC and DESCRIBE
-        if !matches!(self.current().token_type, TokenType::Describe | TokenType::Desc) {
+        if !matches!(
+            self.current().token_type,
+            TokenType::Describe | TokenType::Desc
+        ) {
             return Err(self.error("Expected DESCRIBE or DESC"));
         }
         self.advance();
-        
+
         let table_name = self.parse_identifier()?;
         Ok(Statement::DescribeTable(table_name))
     }
-    
+
     /// Parse expression using Pratt parsing (handles operator precedence elegantly)
     fn parse_expr(&mut self, min_precedence: u8) -> Result<Expr> {
         // Parse prefix (unary operators, literals, identifiers, etc.)
@@ -867,7 +907,7 @@ impl Parser {
 
         Ok(left)
     }
-    
+
     fn parse_prefix_expr(&mut self) -> Result<Expr> {
         match &self.current().token_type {
             // Unary operators (with depth guard to prevent stack overflow on chained NOT/-)
@@ -913,7 +953,7 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
-            
+
             // Parenthesized expression OR subquery
             TokenType::LParen => {
                 self.advance();
@@ -939,7 +979,7 @@ impl Parser {
                 self.recursion_depth -= 1;
                 result
             }
-            
+
             // Literals
             TokenType::Number(n) => {
                 let n = *n;
@@ -996,12 +1036,12 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Parameter(idx))
             }
-            
+
             // ARRAY[...] literal for vectors
             TokenType::Array => {
                 self.advance();
                 self.expect(TokenType::LBracket)?;
-                
+
                 // Parse array elements
                 let mut elements = Vec::new();
                 if !matches!(self.current().token_type, TokenType::RBracket) {
@@ -1019,27 +1059,31 @@ impl Parser {
                                     self.advance();
                                     -(n as f32)
                                 } else {
-                                    return Err(self.error("Expected number after minus sign in ARRAY"));
+                                    return Err(
+                                        self.error("Expected number after minus sign in ARRAY")
+                                    );
                                 }
                             }
                             _ => return Err(self.error("ARRAY elements must be numeric literals")),
                         };
                         elements.push(elem);
-                        
+
                         if !self.match_token(TokenType::Comma) {
                             break;
                         }
                     }
                 }
-                
+
                 self.expect(TokenType::RBracket)?;
-                Ok(Expr::Literal(Value::Vector(crate::types::ArcVec::new(elements))))
+                Ok(Expr::Literal(Value::Vector(crate::types::ArcVec::new(
+                    elements,
+                ))))
             }
-            
+
             // Identifier or function call or qualified column
             TokenType::Identifier(_) => {
                 let name = self.parse_identifier()?;
-                
+
                 // Check for qualified column name (table.column)
                 if matches!(self.current().token_type, TokenType::Dot) {
                     self.advance(); // consume the dot
@@ -1047,14 +1091,14 @@ impl Parser {
                     let qualified_name = format!("{}.{}", name, column_name);
                     return Ok(Expr::Column(qualified_name));
                 }
-                
+
                 // Check for function call
                 if matches!(self.current().token_type, TokenType::LParen) {
                     self.advance();
-                    
+
                     // Check for DISTINCT keyword (COUNT(DISTINCT column))
                     let distinct = self.match_token(TokenType::Distinct);
-                    
+
                     let args = if matches!(self.current().token_type, TokenType::RParen) {
                         Vec::new()
                     } else if matches!(self.current().token_type, TokenType::Star) {
@@ -1065,7 +1109,7 @@ impl Parser {
                         self.parse_expr_list()?
                     };
                     self.expect(TokenType::RParen)?;
-                    
+
                     // Special handling for POINT(x, y) constructor — auto-converts to 3D (z=0)
                     if name.to_uppercase() == "POINT" {
                         if args.len() != 2 {
@@ -1073,50 +1117,88 @@ impl Parser {
                         }
 
                         // Evaluate arguments to get numeric values (supports negatives)
-                        let x = self.eval_num(&args[0]).map_err(|_| self.error("POINT() arguments must be numeric literals"))?;
-                        let y = self.eval_num(&args[1]).map_err(|_| self.error("POINT() arguments must be numeric literals"))?;
+                        let x = self.eval_num(&args[0]).map_err(|_| {
+                            self.error("POINT() arguments must be numeric literals")
+                        })?;
+                        let y = self.eval_num(&args[1]).map_err(|_| {
+                            self.error("POINT() arguments must be numeric literals")
+                        })?;
 
                         use crate::types::{Geometry, Point3D};
-                        Ok(Expr::Literal(Value::spatial(Geometry::Point3D(Point3D::new(x, y, 0.0)))))
+                        Ok(Expr::Literal(Value::spatial(Geometry::Point3D(
+                            Point3D::new(x, y, 0.0),
+                        ))))
                     } else if name.to_uppercase() == "POINT3D" {
                         if args.len() != 3 {
-                            return Err(self.error("POINT3D() requires exactly 3 arguments (x, y, z)"));
+                            return Err(
+                                self.error("POINT3D() requires exactly 3 arguments (x, y, z)")
+                            );
                         }
                         let x = match &args[0] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
+                            _ => {
+                                return Err(
+                                    self.error("POINT3D() arguments must be numeric literals")
+                                )
+                            }
                         };
                         let y = match &args[1] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
+                            _ => {
+                                return Err(
+                                    self.error("POINT3D() arguments must be numeric literals")
+                                )
+                            }
                         };
                         let z = match &args[2] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("POINT3D() arguments must be numeric literals")),
+                            _ => {
+                                return Err(
+                                    self.error("POINT3D() arguments must be numeric literals")
+                                )
+                            }
                         };
                         use crate::types::{Geometry as G3, Point3D};
-                        Ok(Expr::Literal(Value::spatial(G3::Point3D(Point3D::new(x, y, z)))))
-                    } else if name.to_uppercase() == "MATCH" || name.to_uppercase() == "MATCH_AGAINST" {
+                        Ok(Expr::Literal(Value::spatial(G3::Point3D(Point3D::new(
+                            x, y, z,
+                        )))))
+                    } else if name.to_uppercase() == "MATCH"
+                        || name.to_uppercase() == "MATCH_AGAINST"
+                    {
                         // MATCH(column) AGAINST(query) or MATCH(column, query)
                         if args.len() == 2 {
                             // Short form: MATCH(column, query_text)
                             let column = match &args[0] {
                                 Expr::Column(col_name) => col_name.clone(),
-                                _ => return Err(self.error("MATCH() first argument must be a column name")),
+                                _ => {
+                                    return Err(
+                                        self.error("MATCH() first argument must be a column name")
+                                    )
+                                }
                             };
                             let query = match &args[1] {
                                 Expr::Literal(Value::Text(s)) => s.to_string(),
-                                _ => return Err(self.error("MATCH() second argument must be a string")),
+                                _ => {
+                                    return Err(
+                                        self.error("MATCH() second argument must be a string")
+                                    )
+                                }
                             };
-                            Ok(Expr::Match { column, query, phrase: false })
+                            Ok(Expr::Match {
+                                column,
+                                query,
+                                phrase: false,
+                            })
                         } else if args.len() == 1 {
                             // Long form: MATCH(column) AGAINST(query)
                             let column = match &args[0] {
                                 Expr::Column(col_name) => col_name.clone(),
-                                _ => return Err(self.error("MATCH() argument must be a column name")),
+                                _ => {
+                                    return Err(self.error("MATCH() argument must be a column name"))
+                                }
                             };
 
                             // Expect AGAINST keyword
@@ -1134,182 +1216,305 @@ impl Parser {
                             self.expect(TokenType::RParen)?;
 
                             // Detect phrase query: query starts and ends with double quotes
-                            let phrase = query.starts_with('"') && query.ends_with('"') && query.len() >= 2;
+                            let phrase =
+                                query.starts_with('"') && query.ends_with('"') && query.len() >= 2;
                             let query = if phrase {
-                                query[1..query.len()-1].to_string()
+                                query[1..query.len() - 1].to_string()
                             } else {
                                 query
                             };
 
-                            Ok(Expr::Match { column, query, phrase })
+                            Ok(Expr::Match {
+                                column,
+                                query,
+                                phrase,
+                            })
                         } else {
                             Err(self.error("MATCH() requires 1 or 2 arguments"))
                         }
                     } else if name.to_uppercase() == "KNN_SEARCH" {
                         // KNN_SEARCH(vector_column, query_vector, k)
                         if args.len() != 3 {
-                            return Err(self.error("KNN_SEARCH() requires 3 arguments: column, query_vector, k"));
+                            return Err(self.error(
+                                "KNN_SEARCH() requires 3 arguments: column, query_vector, k",
+                            ));
                         }
-                        
+
                         // Extract column name
                         let column = match &args[0] {
                             Expr::Column(col_name) => col_name.clone(),
-                            _ => return Err(self.error("KNN_SEARCH() first argument must be a column name")),
+                            _ => {
+                                return Err(
+                                    self.error("KNN_SEARCH() first argument must be a column name")
+                                )
+                            }
                         };
-                        
+
                         // Extract query vector
-                        let query_vector = match &args[1] {
-                            Expr::Literal(Value::Vector(vec)) => vec.clone(),
-                            _ => return Err(self.error("KNN_SEARCH() second argument must be a vector literal [...]")),
-                        };
-                        
+                        let query_vector =
+                            match &args[1] {
+                                Expr::Literal(Value::Vector(vec)) => vec.clone(),
+                                _ => return Err(self.error(
+                                    "KNN_SEARCH() second argument must be a vector literal [...]",
+                                )),
+                            };
+
                         // Extract k
                         let k = match &args[2] {
                             Expr::Literal(Value::Integer(i)) if *i > 0 => *i as usize,
-                            _ => return Err(self.error("KNN_SEARCH() third argument must be a positive integer")),
+                            _ => {
+                                return Err(self.error(
+                                    "KNN_SEARCH() third argument must be a positive integer",
+                                ))
+                            }
                         };
-                        
-                        Ok(Expr::KnnSearch { column, query_vector, k })
+
+                        Ok(Expr::KnnSearch {
+                            column,
+                            query_vector,
+                            k,
+                        })
                     } else if name.to_uppercase() == "KNN_DISTANCE" {
                         // KNN_DISTANCE(vector_column, query_vector)
                         if args.len() != 2 {
-                            return Err(self.error("KNN_DISTANCE() requires 2 arguments: column, query_vector"));
+                            return Err(self.error(
+                                "KNN_DISTANCE() requires 2 arguments: column, query_vector",
+                            ));
                         }
-                        
+
                         // Extract column name
                         let column = match &args[0] {
                             Expr::Column(col_name) => col_name.clone(),
-                            _ => return Err(self.error("KNN_DISTANCE() first argument must be a column name")),
+                            _ => {
+                                return Err(self
+                                    .error("KNN_DISTANCE() first argument must be a column name"))
+                            }
                         };
-                        
+
                         // Extract query vector
-                        let query_vector = match &args[1] {
-                            Expr::Literal(Value::Vector(vec)) => vec.clone(),
-                            _ => return Err(self.error("KNN_DISTANCE() second argument must be a vector literal [...]")),
-                        };
-                        
-                        Ok(Expr::KnnDistance { column, query_vector })
+                        let query_vector =
+                            match &args[1] {
+                                Expr::Literal(Value::Vector(vec)) => vec.clone(),
+                                _ => return Err(self.error(
+                                    "KNN_DISTANCE() second argument must be a vector literal [...]",
+                                )),
+                            };
+
+                        Ok(Expr::KnnDistance {
+                            column,
+                            query_vector,
+                        })
                     } else if name.to_uppercase() == "ST_WITHIN" {
                         // ST_WITHIN(point_column, min_x, min_y, max_x, max_y)
                         if args.len() != 5 {
                             return Err(self.error("ST_WITHIN() requires 5 arguments: column, min_x, min_y, max_x, max_y"));
                         }
-                        
+
                         let column = match &args[0] {
                             Expr::Column(col_name) => col_name.clone(),
-                            _ => return Err(self.error("ST_WITHIN() first argument must be a column name")),
+                            _ => {
+                                return Err(
+                                    self.error("ST_WITHIN() first argument must be a column name")
+                                )
+                            }
                         };
-                        
+
                         let min_x = match &args[1] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("ST_WITHIN() min_x must be a number")),
                         };
-                        
+
                         let min_y = match &args[2] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("ST_WITHIN() min_y must be a number")),
                         };
-                        
+
                         let max_x = match &args[3] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("ST_WITHIN() max_x must be a number")),
                         };
-                        
+
                         let max_y = match &args[4] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("ST_WITHIN() max_y must be a number")),
                         };
-                        
+
                         // 2D ST_WITHIN: the z range is unbounded (±∞) so it does
                         // not filter out any point based on z. Using z∈[0,0] would
                         // wrongly exclude points whose stored z ≠ 0.
-                        Ok(Expr::StWithin3D { column, min_x, min_y, min_z: f64::NEG_INFINITY, max_x, max_y, max_z: f64::INFINITY })
+                        Ok(Expr::StWithin3D {
+                            column,
+                            min_x,
+                            min_y,
+                            min_z: f64::NEG_INFINITY,
+                            max_x,
+                            max_y,
+                            max_z: f64::INFINITY,
+                        })
                     } else if name.to_uppercase() == "ST_DISTANCE" {
                         // ST_DISTANCE(point_column, x, y)
                         if args.len() != 3 {
-                            return Err(self.error("ST_DISTANCE() requires 3 arguments: column, x, y"));
+                            return Err(
+                                self.error("ST_DISTANCE() requires 3 arguments: column, x, y")
+                            );
                         }
-                        
+
                         let column = match &args[0] {
                             Expr::Column(col_name) => col_name.clone(),
-                            _ => return Err(self.error("ST_DISTANCE() first argument must be a column name")),
+                            _ => {
+                                return Err(self
+                                    .error("ST_DISTANCE() first argument must be a column name"))
+                            }
                         };
-                        
-                        let x = self.eval_num(&args[1]).map_err(|_| self.error("ST_DISTANCE() x must be a number"))?;
-                        let y = self.eval_num(&args[2]).map_err(|_| self.error("ST_DISTANCE() y must be a number"))?;
-                        
-                        Ok(Expr::StDistance3D { column, x, y, z: 0.0 })
+
+                        let x = self
+                            .eval_num(&args[1])
+                            .map_err(|_| self.error("ST_DISTANCE() x must be a number"))?;
+                        let y = self
+                            .eval_num(&args[2])
+                            .map_err(|_| self.error("ST_DISTANCE() y must be a number"))?;
+
+                        Ok(Expr::StDistance3D {
+                            column,
+                            x,
+                            y,
+                            z: 0.0,
+                        })
                     } else if name.to_uppercase() == "ST_KNN" {
                         // ST_KNN(point_column, x, y, k)
                         if args.len() != 4 {
-                            return Err(self.error("ST_KNN() requires 4 arguments: column, x, y, k"));
+                            return Err(
+                                self.error("ST_KNN() requires 4 arguments: column, x, y, k")
+                            );
                         }
-                        
+
                         let column = match &args[0] {
                             Expr::Column(col_name) => col_name.clone(),
-                            _ => return Err(self.error("ST_KNN() first argument must be a column name")),
+                            _ => {
+                                return Err(
+                                    self.error("ST_KNN() first argument must be a column name")
+                                )
+                            }
                         };
-                        
+
                         let x = match &args[1] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("ST_KNN() x must be a number")),
                         };
-                        
+
                         let y = match &args[2] {
                             Expr::Literal(Value::Float(f)) => *f,
                             Expr::Literal(Value::Integer(i)) => *i as f64,
                             _ => return Err(self.error("ST_KNN() y must be a number")),
                         };
-                        
+
                         let k = match &args[3] {
                             Expr::Literal(Value::Integer(i)) if *i > 0 => *i as usize,
                             _ => return Err(self.error("ST_KNN() k must be a positive integer")),
                         };
-                        
-                        Ok(Expr::StKnn3D { column, x, y, z: 0.0, k })
+
+                        Ok(Expr::StKnn3D {
+                            column,
+                            x,
+                            y,
+                            z: 0.0,
+                            k,
+                        })
                     } else if name.to_uppercase() == "ST_WITHIN_3D" {
                         if args.len() != 7 {
                             return Err(self.error("ST_WITHIN_3D() requires 7 arguments: column, min_x, min_y, min_z, max_x, max_y, max_z"));
                         }
                         let column = match &args[0] {
                             Expr::Column(n) => n.clone(),
-                            _ => return Err(self.error("ST_WITHIN_3D() first argument must be a column")),
+                            _ => {
+                                return Err(
+                                    self.error("ST_WITHIN_3D() first argument must be a column")
+                                )
+                            }
                         };
-                        let nums: Result<Vec<f64>> = args[1..].iter().map(|a| match a {
-                            Expr::Literal(Value::Float(f)) => Ok(*f),
-                            Expr::Literal(Value::Integer(i)) => Ok(*i as f64),
-                            _ => Err(self.error("ST_WITHIN_3D() bounds must be numeric literals")),
-                        }).collect();
+                        let nums: Result<Vec<f64>> =
+                            args[1..]
+                                .iter()
+                                .map(|a| match a {
+                                    Expr::Literal(Value::Float(f)) => Ok(*f),
+                                    Expr::Literal(Value::Integer(i)) => Ok(*i as f64),
+                                    _ => Err(self
+                                        .error("ST_WITHIN_3D() bounds must be numeric literals")),
+                                })
+                                .collect();
                         let nums = nums?;
-                        Ok(Expr::StWithin3D { column, min_x: nums[0], min_y: nums[1], min_z: nums[2], max_x: nums[3], max_y: nums[4], max_z: nums[5] })
+                        Ok(Expr::StWithin3D {
+                            column,
+                            min_x: nums[0],
+                            min_y: nums[1],
+                            min_z: nums[2],
+                            max_x: nums[3],
+                            max_y: nums[4],
+                            max_z: nums[5],
+                        })
                     } else if name.to_uppercase() == "ST_DISTANCE_3D" {
                         if args.len() != 4 {
-                            return Err(self.error("ST_DISTANCE_3D() requires 4 arguments: column, x, y, z"));
+                            return Err(self
+                                .error("ST_DISTANCE_3D() requires 4 arguments: column, x, y, z"));
                         }
                         let column = match &args[0] {
                             Expr::Column(n) => n.clone(),
-                            _ => return Err(self.error("ST_DISTANCE_3D() first argument must be a column")),
+                            _ => {
+                                return Err(
+                                    self.error("ST_DISTANCE_3D() first argument must be a column")
+                                )
+                            }
                         };
-                        let x = match &args[1] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("x must be numeric")) };
-                        let y = match &args[2] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("y must be numeric")) };
-                        let z = match &args[3] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("z must be numeric")) };
+                        let x = match &args[1] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("x must be numeric")),
+                        };
+                        let y = match &args[2] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("y must be numeric")),
+                        };
+                        let z = match &args[3] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("z must be numeric")),
+                        };
                         Ok(Expr::StDistance3D { column, x, y, z })
                     } else if name.to_uppercase() == "ST_KNN_3D" {
                         if args.len() != 5 {
-                            return Err(self.error("ST_KNN_3D() requires 5 arguments: column, x, y, z, k"));
+                            return Err(
+                                self.error("ST_KNN_3D() requires 5 arguments: column, x, y, z, k")
+                            );
                         }
                         let column = match &args[0] {
                             Expr::Column(n) => n.clone(),
-                            _ => return Err(self.error("ST_KNN_3D() first argument must be a column")),
+                            _ => {
+                                return Err(
+                                    self.error("ST_KNN_3D() first argument must be a column")
+                                )
+                            }
                         };
-                        let x = match &args[1] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("x must be numeric")) };
-                        let y = match &args[2] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("y must be numeric")) };
-                        let z = match &args[3] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("z must be numeric")) };
+                        let x = match &args[1] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("x must be numeric")),
+                        };
+                        let y = match &args[2] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("y must be numeric")),
+                        };
+                        let z = match &args[3] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("z must be numeric")),
+                        };
                         let k = match &args[4] {
                             Expr::Literal(Value::Integer(i)) if *i > 0 => *i as usize,
                             _ => return Err(self.error("ST_KNN_3D() k must be a positive integer")),
@@ -1317,65 +1522,112 @@ impl Parser {
                         Ok(Expr::StKnn3D { column, x, y, z, k })
                     } else if name.to_uppercase() == "ST_RADIUS_3D" {
                         if args.len() != 5 {
-                            return Err(self.error("ST_RADIUS_3D() requires 5 arguments: column, x, y, z, radius"));
+                            return Err(self.error(
+                                "ST_RADIUS_3D() requires 5 arguments: column, x, y, z, radius",
+                            ));
                         }
                         let column = match &args[0] {
                             Expr::Column(n) => n.clone(),
-                            _ => return Err(self.error("ST_RADIUS_3D() first argument must be a column")),
+                            _ => {
+                                return Err(
+                                    self.error("ST_RADIUS_3D() first argument must be a column")
+                                )
+                            }
                         };
-                        let x = match &args[1] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("x must be numeric")) };
-                        let y = match &args[2] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("y must be numeric")) };
-                        let z = match &args[3] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("z must be numeric")) };
-                        let radius = match &args[4] { Expr::Literal(Value::Float(f)) => *f, Expr::Literal(Value::Integer(i)) => *i as f64, _ => return Err(self.error("radius must be numeric")) };
-                        Ok(Expr::StRadius3D { column, x, y, z, radius })
+                        let x = match &args[1] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("x must be numeric")),
+                        };
+                        let y = match &args[2] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("y must be numeric")),
+                        };
+                        let z = match &args[3] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("z must be numeric")),
+                        };
+                        let radius = match &args[4] {
+                            Expr::Literal(Value::Float(f)) => *f,
+                            Expr::Literal(Value::Integer(i)) => *i as f64,
+                            _ => return Err(self.error("radius must be numeric")),
+                        };
+                        Ok(Expr::StRadius3D {
+                            column,
+                            x,
+                            y,
+                            z,
+                            radius,
+                        })
                     } else {
-                        Ok(Expr::FunctionCall { name, args, distinct })
+                        Ok(Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct,
+                        })
                     }
                 } else {
                     Ok(Expr::Column(name))
                 }
             }
-            
+
             // Vector literal [1.0, 2.0, 3.0]
             TokenType::LBracket => {
                 self.advance();
                 let values = self.parse_expr_list()?;
                 self.expect(TokenType::RBracket)?;
-                
+
                 // Convert to Value::Vector
-                let floats: Vec<f32> = values.into_iter().enumerate().map(|(idx, e)| {
-                    match e {
-                        Expr::Literal(Value::Float(f)) => Ok(f as f32),
-                        Expr::Literal(Value::Integer(i)) => Ok(i as f32),
-                        // 🔧 支持负数：-1.0 会被解析成 UnaryOp
-                        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => {
-                            match *expr {
+                let floats: Vec<f32> = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, e)| {
+                        match e {
+                            Expr::Literal(Value::Float(f)) => Ok(f as f32),
+                            Expr::Literal(Value::Integer(i)) => Ok(i as f32),
+                            // 🔧 支持负数：-1.0 会被解析成 UnaryOp
+                            Expr::UnaryOp {
+                                op: UnaryOperator::Minus,
+                                expr,
+                            } => match *expr {
                                 Expr::Literal(Value::Float(f)) => Ok(-(f as f32)),
                                 Expr::Literal(Value::Integer(i)) => Ok(-(i as f32)),
-                                _ => Err(self.error(&format!("Invalid vector element at index {}", idx))),
+                                _ => {
+                                    Err(self
+                                        .error(&format!("Invalid vector element at index {}", idx)))
+                                }
+                            },
+                            _ => {
+                                debug_log!("🔍 向量解析失败 at index {}: expr = {:?}", idx, e);
+                                Err(self.error(&format!(
+                                    "Vector elements must be numbers (found {:?} at index {})",
+                                    e, idx
+                                )))
                             }
                         }
-                        _ => {
-                            debug_log!("🔍 向量解析失败 at index {}: expr = {:?}", idx, e);
-                            Err(self.error(&format!("Vector elements must be numbers (found {:?} at index {})", e, idx)))
-                        }
-                    }
-                }).collect::<Result<Vec<f32>>>()?;
-                
-                Ok(Expr::Literal(Value::Vector(crate::types::ArcVec::new(floats))))
+                    })
+                    .collect::<Result<Vec<f32>>>()?;
+
+                Ok(Expr::Literal(Value::Vector(crate::types::ArcVec::new(
+                    floats,
+                ))))
             }
-            
+
             _ => Err(self.error("Expected expression")),
         }
     }
-    
+
     /// Check if the current token starts a postfix operator.
     fn can_parse_postfix(&self) -> bool {
         match &self.current().token_type {
             TokenType::Is => true,
             TokenType::Not => {
-                matches!(self.peek_token_type(),
-                    TokenType::In | TokenType::Like | TokenType::Between)
+                matches!(
+                    self.peek_token_type(),
+                    TokenType::In | TokenType::Like | TokenType::Between
+                )
             }
             TokenType::Like | TokenType::In | TokenType::Between => true,
             _ => false,
@@ -1482,7 +1734,7 @@ impl Parser {
             _ => unreachable!("can_parse_postfix should prevent this"),
         }
     }
-    
+
     fn try_parse_binary_op(&self) -> Option<BinaryOperator> {
         match &self.current().token_type {
             TokenType::Eq => Some(BinaryOperator::Eq),
@@ -1505,9 +1757,9 @@ impl Parser {
             _ => None,
         }
     }
-    
+
     // Helper methods
-    
+
     fn parse_identifier(&mut self) -> Result<String> {
         if let TokenType::Identifier(name) = &self.current().token_type {
             if name.len() > MAX_IDENTIFIER_LENGTH {
@@ -1520,7 +1772,7 @@ impl Parser {
             Err(self.error("Expected identifier"))
         }
     }
-    
+
     fn parse_identifier_list(&mut self) -> Result<Vec<String>> {
         let mut list = Vec::new();
         loop {
@@ -1531,7 +1783,7 @@ impl Parser {
         }
         Ok(list)
     }
-    
+
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>> {
         let mut list = Vec::new();
         loop {
@@ -1542,7 +1794,7 @@ impl Parser {
         }
         Ok(list)
     }
-    
+
     fn eval_num(&self, expr: &Expr) -> std::result::Result<f64, ()> {
         match expr {
             Expr::Literal(Value::Float(f)) => Ok(*f),
@@ -1597,10 +1849,14 @@ impl Parser {
             Err(self.error("Expected number"))
         }
     }
-    
+
     fn current(&self) -> &Token {
         self.tokens.get(self.position).unwrap_or_else(|| {
-            static EOF: Token = Token { token_type: TokenType::Eof, line: 0, column: 0 };
+            static EOF: Token = Token {
+                token_type: TokenType::Eof,
+                line: 0,
+                column: 0,
+            };
             &EOF
         })
     }
@@ -1618,16 +1874,17 @@ impl Parser {
             self.position += 1;
         }
     }
-    
+
     fn match_token(&mut self, token_type: TokenType) -> bool {
-        if std::mem::discriminant(&self.current().token_type) == std::mem::discriminant(&token_type) {
+        if std::mem::discriminant(&self.current().token_type) == std::mem::discriminant(&token_type)
+        {
             self.advance();
             true
         } else {
             false
         }
     }
-    
+
     fn match_keyword(&mut self, keyword: &str) -> bool {
         if let TokenType::Identifier(ref id) = self.current().token_type {
             if id.to_uppercase() == keyword.to_uppercase() {
@@ -1637,16 +1894,17 @@ impl Parser {
         }
         false
     }
-    
+
     fn expect(&mut self, token_type: TokenType) -> Result<()> {
-        if std::mem::discriminant(&self.current().token_type) == std::mem::discriminant(&token_type) {
+        if std::mem::discriminant(&self.current().token_type) == std::mem::discriminant(&token_type)
+        {
             self.advance();
             Ok(())
         } else {
             Err(self.error(&format!("Expected {:?}", token_type)))
         }
     }
-    
+
     fn error(&self, msg: &str) -> MoteDBError {
         let token = self.current();
         MoteDBError::ParseError(format!(
@@ -1654,20 +1912,20 @@ impl Parser {
             msg, token.line, token.column
         ))
     }
-    
+
     /// 🆕 Parse ALTER TABLE statement
-    /// 
+    ///
     /// Syntax: ALTER TABLE table_name AUTO_INCREMENT = value
     fn parse_alter_table(&mut self) -> Result<AlterTableStmt> {
         self.expect(TokenType::Alter)?;
         self.expect(TokenType::Table)?;
-        
+
         let table = self.parse_identifier()?;
-        
+
         // Currently only support AUTO_INCREMENT modification
         self.expect(TokenType::AutoIncrement)?;
         self.expect(TokenType::Eq)?;
-        
+
         let value = match &self.current().token_type {
             TokenType::Number(n) => {
                 let f = *n;
@@ -1680,7 +1938,7 @@ impl Parser {
             }
             _ => return Err(self.error("Expected integer value for AUTO_INCREMENT")),
         };
-        
+
         Ok(AlterTableStmt {
             table,
             action: AlterTableAction::SetAutoIncrement(value),

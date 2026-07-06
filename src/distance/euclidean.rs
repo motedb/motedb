@@ -1,9 +1,9 @@
 //! Euclidean distance computation with SIMD optimization
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// Compute Euclidean distance between two vectors with SIMD optimization
 ///
@@ -31,7 +31,7 @@ pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
     {
         unsafe { euclidean_distance_squared_avx2(a, b) }
     }
-    
+
     // 否则，运行时检测
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     {
@@ -43,7 +43,7 @@ pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
             euclidean_distance_squared_scalar(a, b)
         }
     }
-    
+
     #[cfg(target_arch = "aarch64")]
     {
         if a.len() >= 4 {
@@ -66,31 +66,31 @@ unsafe fn euclidean_distance_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     let chunks = n / 8;
     let remainder = n % 8;
-    
+
     // AVX2并行处理8个元素
     let mut sum_vec = _mm256_setzero_ps();
-    
+
     for i in 0..chunks {
         let offset = i * 8;
         let a_vec = _mm256_loadu_ps(a.as_ptr().add(offset));
         let b_vec = _mm256_loadu_ps(b.as_ptr().add(offset));
-        
+
         // 计算差值
         let diff = _mm256_sub_ps(a_vec, b_vec);
         // 计算平方并累加
         let sq = _mm256_mul_ps(diff, diff);
         sum_vec = _mm256_add_ps(sum_vec, sq);
     }
-    
+
     // 🚀 优化：直接水平求和（避免存储到数组）
     let mut sum_squared = horizontal_sum_avx2_fast(sum_vec);
-    
+
     // 处理剩余元素
     for i in (n - remainder)..n {
         let diff = a[i] - b[i];
         sum_squared += diff * diff;
     }
-    
+
     sum_squared
 }
 
@@ -101,32 +101,32 @@ unsafe fn euclidean_distance_squared_sse(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
     let chunks = n / 4;
     let remainder = n % 4;
-    
+
     let mut sum_squared = 0.0f32;
-    
+
     // SSE并行处理4个元素
     let mut sum_vec = _mm_setzero_ps();
-    
+
     for i in 0..chunks {
         let offset = i * 4;
         let a_vec = _mm_loadu_ps(a.as_ptr().add(offset));
         let b_vec = _mm_loadu_ps(b.as_ptr().add(offset));
-        
+
         // 计算差值
         let diff = _mm_sub_ps(a_vec, b_vec);
         // 计算平方并累加
         sum_vec = _mm_add_ps(sum_vec, _mm_mul_ps(diff, diff));
     }
-    
+
     // 水平求和
     sum_squared = horizontal_sum_sse(sum_vec);
-    
+
     // 处理剩余元素
     for i in (n - remainder)..n {
         let diff = a[i] - b[i];
         sum_squared += diff * diff;
     }
-    
+
     sum_squared
 }
 
@@ -180,10 +180,7 @@ unsafe fn euclidean_distance_squared_neon(a: &[f32], b: &[f32]) -> f32 {
         sum4 = vfmaq_f32(sum4, diff4, diff4);
     }
 
-    let combined = vaddq_f32(
-        vaddq_f32(sum1, sum2),
-        vaddq_f32(sum3, sum4),
-    );
+    let combined = vaddq_f32(vaddq_f32(sum1, sum2), vaddq_f32(sum3, sum4));
     let mut total = vaddvq_f32(combined);
 
     // Process remainder (4 floats at a time)
@@ -218,13 +215,13 @@ unsafe fn horizontal_sum_avx2_fast(v: __m256) -> f32 {
     let high = _mm256_extractf128_ps(v, 1);
     let low = _mm256_castps256_ps128(v);
     let sum128 = _mm_add_ps(high, low);
-    
+
     // 水平求和128位
     let shuf = _mm_movehdup_ps(sum128);
     let sum64 = _mm_add_ps(sum128, shuf);
     let shuf2 = _mm_movehl_ps(shuf, sum64);
     let sum32 = _mm_add_ss(sum64, shuf2);
-    
+
     _mm_cvtss_f32(sum32)
 }
 
@@ -236,7 +233,7 @@ unsafe fn horizontal_sum_avx2(v: __m256) -> f32 {
     let sum1 = _mm256_add_ps(v, _mm256_permute2f128_ps(v, v, 0x01));
     let sum2 = _mm256_hadd_ps(sum1, sum1);
     let sum3 = _mm256_hadd_ps(sum2, sum2);
-    
+
     // 取第一个元素（总和）
     _mm256_cvtss_f32(sum3)
 }
@@ -250,8 +247,6 @@ unsafe fn horizontal_sum_sse(v: __m128) -> f32 {
     let sum2 = _mm_add_ss(sum1, _mm_shuffle_ps(sum1, sum1, 1));
     _mm_cvtss_f32(sum2)
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -292,7 +287,7 @@ mod tests {
     fn test_euclidean_distance_large_vectors() {
         let a: Vec<f32> = (0..1000).map(|i| i as f32).collect();
         let b: Vec<f32> = (0..1000).map(|i| (i * 2) as f32).collect();
-        
+
         let dist = euclidean_distance(&a, &b);
         assert!(dist.is_finite());
         assert!(dist > 0.0);
@@ -303,11 +298,14 @@ mod tests {
         // Use large but manageable values
         let a = vec![1e10_f32, -1e10_f32, 1000.0];
         let b = vec![-1e10_f32, 1e10_f32, 2000.0];
-        
+
         let dist = euclidean_distance(&a, &b);
         assert!(dist.is_finite(), "Distance is not finite: {}", dist);
         assert!(dist >= 0.0, "Distance is negative: {}", dist);
-        assert!(dist > 0.0, "Distance should be positive for different vectors");
+        assert!(
+            dist > 0.0,
+            "Distance should be positive for different vectors"
+        );
     }
 
     #[test]
@@ -315,7 +313,7 @@ mod tests {
         // Test with very small numbers
         let a = vec![1e-10, 2e-10, 3e-10];
         let b = vec![2e-10, 4e-10, 6e-10];
-        
+
         let dist = euclidean_distance(&a, &b);
         assert!(dist.is_finite());
         assert!(dist >= 0.0);
@@ -326,7 +324,7 @@ mod tests {
         // Test with vector size that should trigger SIMD optimizations
         let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b = vec![8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
-        
+
         let dist = euclidean_distance(&a, &b);
         assert!(dist.is_finite());
         assert!(dist >= 0.0);
@@ -336,10 +334,10 @@ mod tests {
     fn test_euclidean_distance_squared_vs_sqrt() {
         let a = vec![3.0, 4.0];
         let b = vec![0.0, 0.0];
-        
+
         let dist_sq = euclidean_distance_squared(&a, &b);
         let dist = euclidean_distance(&a, &b);
-        
+
         assert_eq!(dist_sq, 25.0);
         assert!((dist - 5.0).abs() < 1e-6);
     }

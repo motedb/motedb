@@ -8,35 +8,33 @@
 //! - Detects corruption during crash recovery
 //! - Partial writes are detected and skipped
 
-use crate::txn::version_store::{TransactionId, Timestamp};
-use crate::types::{Row, RowId, PartitionId};
-use crate::{Result, StorageError};
 use crate::config::DurabilityLevel;
 use crate::storage::checksum::{Checksum, ChecksumType};
+use crate::txn::version_store::{Timestamp, TransactionId};
+use crate::types::{PartitionId, Row, RowId};
+use crate::{Result, StorageError};
+use dashmap::DashMap;
+use parking_lot::Condvar as PlCondvar;
+use parking_lot::Mutex as PlMutex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use parking_lot::Mutex as PlMutex;
-use parking_lot::Condvar as PlCondvar;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
 use std::thread;
-use dashmap::DashMap;
+use std::time::Duration;
 
 /// Log sequence number (monotonically increasing)
 pub type LogSequenceNumber = u64;
 
 /// WAL 配置（简化版，用于内部）
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct WALConfig {
     /// 持久性级别
     pub durability_level: DurabilityLevel,
 }
-
 
 impl From<crate::config::WALConfig> for WALConfig {
     fn from(config: crate::config::WALConfig) -> Self {
@@ -132,9 +130,7 @@ pub enum WALRecord {
     },
 
     /// Transaction rollback marker
-    Rollback {
-        txn_id: TransactionId,
-    },
+    Rollback { txn_id: TransactionId },
 
     /// Checkpoint marker (all records before this LSN are persisted)
     Checkpoint { lsn: LogSequenceNumber },
@@ -158,7 +154,13 @@ impl WALRecord {
     fn encode_native(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         match self {
-            WALRecord::InsertRaw { table_name, row_id, partition, raw_data, txn_id } => {
+            WALRecord::InsertRaw {
+                table_name,
+                row_id,
+                partition,
+                raw_data,
+                txn_id,
+            } => {
                 buf.push(TAG_INSERT_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -167,7 +169,13 @@ impl WALRecord {
                 buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(raw_data);
             }
-            WALRecord::InsertRawArc { table_name, row_id, partition, raw_data, txn_id } => {
+            WALRecord::InsertRawArc {
+                table_name,
+                row_id,
+                partition,
+                raw_data,
+                txn_id,
+            } => {
                 buf.push(TAG_INSERT_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -176,7 +184,13 @@ impl WALRecord {
                 buf.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(raw_data.as_slice());
             }
-            WALRecord::Insert { table_name, row_id, partition, data, txn_id } => {
+            WALRecord::Insert {
+                table_name,
+                row_id,
+                partition,
+                data,
+                txn_id,
+            } => {
                 buf.push(TAG_INSERT_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -186,7 +200,14 @@ impl WALRecord {
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&bytes);
             }
-            WALRecord::UpdateRaw { table_name, row_id, partition, raw_old, raw_new, txn_id } => {
+            WALRecord::UpdateRaw {
+                table_name,
+                row_id,
+                partition,
+                raw_old,
+                raw_new,
+                txn_id,
+            } => {
                 buf.push(TAG_UPDATE_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -197,7 +218,14 @@ impl WALRecord {
                 buf.extend_from_slice(&(raw_new.len() as u32).to_le_bytes());
                 buf.extend_from_slice(raw_new);
             }
-            WALRecord::Update { table_name, row_id, partition, old_data, new_data, txn_id } => {
+            WALRecord::Update {
+                table_name,
+                row_id,
+                partition,
+                old_data,
+                new_data,
+                txn_id,
+            } => {
                 buf.push(TAG_UPDATE_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -210,7 +238,14 @@ impl WALRecord {
                 buf.extend_from_slice(&(new_bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&new_bytes);
             }
-            WALRecord::DeleteRaw { table_name, row_id, partition, raw_old, timestamp, txn_id } => {
+            WALRecord::DeleteRaw {
+                table_name,
+                row_id,
+                partition,
+                raw_old,
+                timestamp,
+                txn_id,
+            } => {
                 buf.push(TAG_DELETE_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -220,7 +255,14 @@ impl WALRecord {
                 buf.extend_from_slice(&(raw_old.len() as u32).to_le_bytes());
                 buf.extend_from_slice(raw_old);
             }
-            WALRecord::Delete { table_name, row_id, partition, old_data, timestamp, txn_id } => {
+            WALRecord::Delete {
+                table_name,
+                row_id,
+                partition,
+                old_data,
+                timestamp,
+                txn_id,
+            } => {
                 buf.push(TAG_DELETE_RAW);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 encode_str(&mut buf, table_name);
@@ -231,7 +273,10 @@ impl WALRecord {
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(&bytes);
             }
-            WALRecord::Begin { txn_id, isolation_level } => {
+            WALRecord::Begin {
+                txn_id,
+                isolation_level,
+            } => {
                 buf.push(TAG_BEGIN);
                 buf.extend_from_slice(&txn_id.to_le_bytes());
                 buf.push(*isolation_level);
@@ -273,7 +318,13 @@ impl WALRecord {
                     return None;
                 }
                 let raw_data = data[pos..pos + payload_len].to_vec();
-                Some(Ok(WALRecord::InsertRaw { table_name, row_id, partition, raw_data, txn_id }))
+                Some(Ok(WALRecord::InsertRaw {
+                    table_name,
+                    row_id,
+                    partition,
+                    raw_data,
+                    txn_id,
+                }))
             }
             TAG_UPDATE_RAW => {
                 let txn_id = read_u64(data, &mut pos)?;
@@ -291,7 +342,14 @@ impl WALRecord {
                     return None;
                 }
                 let raw_new = data[pos..pos + new_len].to_vec();
-                Some(Ok(WALRecord::UpdateRaw { table_name, row_id, partition, raw_old, raw_new, txn_id }))
+                Some(Ok(WALRecord::UpdateRaw {
+                    table_name,
+                    row_id,
+                    partition,
+                    raw_old,
+                    raw_new,
+                    txn_id,
+                }))
             }
             TAG_DELETE_RAW => {
                 let txn_id = read_u64(data, &mut pos)?;
@@ -304,7 +362,14 @@ impl WALRecord {
                     return None;
                 }
                 let raw_old = data[pos..pos + old_len].to_vec();
-                Some(Ok(WALRecord::DeleteRaw { table_name, row_id, partition, raw_old, timestamp, txn_id }))
+                Some(Ok(WALRecord::DeleteRaw {
+                    table_name,
+                    row_id,
+                    partition,
+                    raw_old,
+                    timestamp,
+                    txn_id,
+                }))
             }
             TAG_BEGIN => {
                 let txn_id = read_u64(data, &mut pos)?;
@@ -312,7 +377,10 @@ impl WALRecord {
                     return None;
                 }
                 let isolation_level = data[pos];
-                Some(Ok(WALRecord::Begin { txn_id, isolation_level }))
+                Some(Ok(WALRecord::Begin {
+                    txn_id,
+                    isolation_level,
+                }))
             }
             TAG_COMMIT => {
                 let txn_id = read_u64(data, &mut pos)?;
@@ -337,17 +405,24 @@ impl WALRecord {
         if !data.is_empty() && data[0] == TAG_COMPRESSED {
             // Compressed: [0x00][u32 original_len][zstd_data...]
             if data.len() < 5 {
-                return Err(StorageError::Serialization("WAL: truncated compressed record".into()));
-            }
-            let original_len = u32::from_le_bytes(
-                data[1..5].try_into().map_err(|_| StorageError::Serialization("WAL: bad compression header".into()))?
-            ) as usize;
-            let compressed = &data[5..];
-            let decompressed = zstd::decode_all(compressed)
-                .map_err(|e| StorageError::Serialization(format!("WAL zstd decompress failed: {}", e)))?;
-            if decompressed.len() != original_len {
                 return Err(StorageError::Serialization(
-                    format!("WAL: decompressed size {} != expected {}", decompressed.len(), original_len)));
+                    "WAL: truncated compressed record".into(),
+                ));
+            }
+            let original_len =
+                u32::from_le_bytes(data[1..5].try_into().map_err(|_| {
+                    StorageError::Serialization("WAL: bad compression header".into())
+                })?) as usize;
+            let compressed = &data[5..];
+            let decompressed = zstd::decode_all(compressed).map_err(|e| {
+                StorageError::Serialization(format!("WAL zstd decompress failed: {}", e))
+            })?;
+            if decompressed.len() != original_len {
+                return Err(StorageError::Serialization(format!(
+                    "WAL: decompressed size {} != expected {}",
+                    decompressed.len(),
+                    original_len
+                )));
             }
             // Recurse on decompressed data
             return Self::decode_with_fallback(&decompressed);
@@ -445,7 +520,9 @@ fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -453,32 +530,103 @@ fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
 /// Legacy WAL record format (bincode-encoded, for reading old WAL files)
 #[derive(Debug, Clone, Deserialize)]
 enum LegacyWALRecord {
-    Insert { table_name: String, row_id: RowId, partition: PartitionId, data: Row, txn_id: TransactionId },
-    Update { table_name: String, row_id: RowId, partition: PartitionId, old_data: Row, new_data: Row, txn_id: TransactionId },
-    Delete { table_name: String, row_id: RowId, partition: PartitionId, old_data: Row, timestamp: u64, txn_id: TransactionId },
-    Begin { txn_id: TransactionId, isolation_level: u8 },
-    Commit { txn_id: TransactionId, commit_ts: Timestamp },
-    Rollback { txn_id: TransactionId },
-    Checkpoint { lsn: LogSequenceNumber },
+    Insert {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        data: Row,
+        txn_id: TransactionId,
+    },
+    Update {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        old_data: Row,
+        new_data: Row,
+        txn_id: TransactionId,
+    },
+    Delete {
+        table_name: String,
+        row_id: RowId,
+        partition: PartitionId,
+        old_data: Row,
+        timestamp: u64,
+        txn_id: TransactionId,
+    },
+    Begin {
+        txn_id: TransactionId,
+        isolation_level: u8,
+    },
+    Commit {
+        txn_id: TransactionId,
+        commit_ts: Timestamp,
+    },
+    Rollback {
+        txn_id: TransactionId,
+    },
+    Checkpoint {
+        lsn: LogSequenceNumber,
+    },
 }
 
 impl From<LegacyWALRecord> for WALRecord {
     fn from(legacy: LegacyWALRecord) -> Self {
         match legacy {
-            LegacyWALRecord::Insert { table_name, row_id, partition, data, txn_id } =>
-                WALRecord::Insert { table_name, row_id, partition, data, txn_id },
-            LegacyWALRecord::Update { table_name, row_id, partition, old_data, new_data, txn_id } =>
-                WALRecord::Update { table_name, row_id, partition, old_data, new_data, txn_id },
-            LegacyWALRecord::Delete { table_name, row_id, partition, old_data, timestamp, txn_id } =>
-                WALRecord::Delete { table_name, row_id, partition, old_data, timestamp, txn_id },
-            LegacyWALRecord::Begin { txn_id, isolation_level } =>
-                WALRecord::Begin { txn_id, isolation_level },
-            LegacyWALRecord::Commit { txn_id, commit_ts } =>
-                WALRecord::Commit { txn_id, commit_ts },
-            LegacyWALRecord::Rollback { txn_id } =>
-                WALRecord::Rollback { txn_id },
-            LegacyWALRecord::Checkpoint { lsn } =>
-                WALRecord::Checkpoint { lsn },
+            LegacyWALRecord::Insert {
+                table_name,
+                row_id,
+                partition,
+                data,
+                txn_id,
+            } => WALRecord::Insert {
+                table_name,
+                row_id,
+                partition,
+                data,
+                txn_id,
+            },
+            LegacyWALRecord::Update {
+                table_name,
+                row_id,
+                partition,
+                old_data,
+                new_data,
+                txn_id,
+            } => WALRecord::Update {
+                table_name,
+                row_id,
+                partition,
+                old_data,
+                new_data,
+                txn_id,
+            },
+            LegacyWALRecord::Delete {
+                table_name,
+                row_id,
+                partition,
+                old_data,
+                timestamp,
+                txn_id,
+            } => WALRecord::Delete {
+                table_name,
+                row_id,
+                partition,
+                old_data,
+                timestamp,
+                txn_id,
+            },
+            LegacyWALRecord::Begin {
+                txn_id,
+                isolation_level,
+            } => WALRecord::Begin {
+                txn_id,
+                isolation_level,
+            },
+            LegacyWALRecord::Commit { txn_id, commit_ts } => {
+                WALRecord::Commit { txn_id, commit_ts }
+            }
+            LegacyWALRecord::Rollback { txn_id } => WALRecord::Rollback { txn_id },
+            LegacyWALRecord::Checkpoint { lsn } => WALRecord::Checkpoint { lsn },
         }
     }
 }
@@ -521,16 +669,13 @@ impl PartitionWAL {
 
     /// Open existing partition WAL with config
     fn open_with_config(path: PathBuf, config: WALConfig) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .read(true)
-            .open(&path)?;
-        
+        let mut file = OpenOptions::new().append(true).read(true).open(&path)?;
+
         // Scan to find next LSN and verify checksums
         let mut next_lsn = 0;
         let mut last_checkpoint = 0;
         let mut corrupted_count = 0;
-        
+
         // Simple recovery: read all records with new header format
         file.seek(SeekFrom::Start(0))?;
 
@@ -546,7 +691,7 @@ impl PartitionWAL {
             let total_len = u32::from_le_bytes(len_buf) as usize;
 
             // Sanity check: reject obviously corrupted total_len
-            if total_len < 20 || total_len > Self::MAX_WAL_FRAME_SIZE {
+            if !(20..=Self::MAX_WAL_FRAME_SIZE).contains(&total_len) {
                 debug_log!("WAL open: Corrupted total_len={}, stopping", total_len);
                 break;
             }
@@ -568,8 +713,11 @@ impl PartitionWAL {
 
             // record_len must fit inside total_len
             if record_len > total_len.saturating_sub(20) || record_len > Self::MAX_WAL_FRAME_SIZE {
-                debug_log!("WAL open: Corrupted record_len={} (total_len={}), stopping",
-                    record_len, total_len);
+                debug_log!(
+                    "WAL open: Corrupted record_len={} (total_len={}), stopping",
+                    record_len,
+                    total_len
+                );
                 break;
             }
 
@@ -607,15 +755,20 @@ impl PartitionWAL {
 
             next_lsn = lsn + 1;
             // Deserialize record to check for Checkpoint
-            if let Ok(WALRecord::Checkpoint { lsn: cp_lsn }) = WALRecord::decode_with_fallback(&record_data) {
+            if let Ok(WALRecord::Checkpoint { lsn: cp_lsn }) =
+                WALRecord::decode_with_fallback(&record_data)
+            {
                 last_checkpoint = cp_lsn;
             }
         }
-        
+
         if corrupted_count > 0 {
-            debug_log!("WAL open: Found {} corrupted records (will skip during recovery)", corrupted_count);
+            debug_log!(
+                "WAL open: Found {} corrupted records (will skip during recovery)",
+                corrupted_count
+            );
         }
-        
+
         Ok(Self {
             path,
             file: BufWriter::new(file),
@@ -642,7 +795,9 @@ impl PartitionWAL {
         self.write_record(lsn, &record_data)?;
 
         match self.config.durability_level {
-            DurabilityLevel::Synchronous => { self.sync_flush()?; }
+            DurabilityLevel::Synchronous => {
+                self.sync_flush()?;
+            }
             DurabilityLevel::GroupCommit { .. } => {
                 // Flush BufWriter to OS buffers; group commit thread handles fsync
                 self.file.flush()?;
@@ -702,8 +857,9 @@ impl PartitionWAL {
 
         self.file.write_all(&write_buf)?;
 
-
-        if self.config.durability_level == DurabilityLevel::Synchronous { self.sync_flush()?; }
+        if self.config.durability_level == DurabilityLevel::Synchronous {
+            self.sync_flush()?;
+        }
 
         Ok(lsn)
     }
@@ -721,7 +877,8 @@ impl PartitionWAL {
         self.next_lsn += 1;
 
         let table_bytes = table_name.as_bytes();
-        let record_len = 1 + 8 + (2 + table_bytes.len()) + 8 + 2 + 4 + raw_old.len() + 4 + raw_new.len();
+        let record_len =
+            1 + 8 + (2 + table_bytes.len()) + 8 + 2 + 4 + raw_old.len() + 4 + raw_new.len();
 
         let mut record_body = Vec::with_capacity(record_len);
         record_body.push(TAG_UPDATE_RAW);
@@ -752,7 +909,9 @@ impl PartitionWAL {
 
         self.file.write_all(&write_buf)?;
 
-        if self.config.durability_level == DurabilityLevel::Synchronous { self.sync_flush()?; }
+        if self.config.durability_level == DurabilityLevel::Synchronous {
+            self.sync_flush()?;
+        }
 
         Ok(lsn)
     }
@@ -796,14 +955,14 @@ impl PartitionWAL {
     }
 
     /// Batch append multiple records (optimized - single fsync)
-    /// 
+    ///
     /// CRITICAL FOR ACID DURABILITY:
     /// - All records are serialized to a single buffer
     /// - Buffer is written in ONE syscall
     /// - IMMEDIATE fsync to guarantee persistence
     /// - Only returns after data is durable on disk
     /// - Each record has checksum protection
-    /// 
+    ///
     /// This is the CORRECT way to batch WAL writes:
     /// - Maintains ACID durability (fsync before return)
     /// - Amortizes fsync cost across N records
@@ -838,10 +997,10 @@ impl PartitionWAL {
             buffer.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             buffer.extend_from_slice(&payload);
         }
-        
+
         // 2. Single write operation (append 模式自动追加)
         self.file.write_all(&buffer)?;
-        
+
         // 3. Fsync based on durability level
         match self.config.durability_level {
             DurabilityLevel::Synchronous | DurabilityLevel::GroupCommit { .. } => {
@@ -852,7 +1011,7 @@ impl PartitionWAL {
             }
             DurabilityLevel::NoSync => {}
         }
-        
+
         Ok(lsns)
     }
 
@@ -905,12 +1064,11 @@ impl PartitionWAL {
         self.next_lsn = 0;
         self.last_checkpoint = 0;
 
-
         Ok(())
     }
 
     /// Recover records since last checkpoint
-    /// 
+    ///
     /// Verifies checksum for each record. Corrupted records are skipped with warning.
     /// Partial writes (incomplete records at end of file) are automatically detected.
     /// Maximum sane WAL frame size (64 MB). Frames larger than this are almost
@@ -937,7 +1095,7 @@ impl PartitionWAL {
             let total_len = u32::from_le_bytes(len_buf) as usize;
 
             // Sanity check: reject obviously corrupted total_len
-            if total_len < 20 || total_len > Self::MAX_WAL_FRAME_SIZE {
+            if !(20..=Self::MAX_WAL_FRAME_SIZE).contains(&total_len) {
                 debug_log!("WAL recovery: Corrupted total_len={}, stopping", total_len);
                 break;
             }
@@ -959,8 +1117,11 @@ impl PartitionWAL {
 
             // record_len must fit inside total_len (20 bytes = 4 len prefix + 16 header)
             if record_len > total_len.saturating_sub(20) || record_len > Self::MAX_WAL_FRAME_SIZE {
-                debug_log!("WAL recovery: Corrupted record_len={} (total_len={}), stopping",
-                    record_len, total_len);
+                debug_log!(
+                    "WAL recovery: Corrupted record_len={} (total_len={}), stopping",
+                    record_len,
+                    total_len
+                );
                 break;
             }
 
@@ -977,7 +1138,11 @@ impl PartitionWAL {
 
             // Verify checksum directly on record_data (no re-serialization needed!)
             if let Err(e) = Checksum::verify(ChecksumType::CRC32C, &record_data, checksum) {
-                debug_log!("WAL recovery: Checksum verification failed for LSN {}: {}", lsn, e);
+                debug_log!(
+                    "WAL recovery: Checksum verification failed for LSN {}: {}",
+                    lsn,
+                    e
+                );
                 skipped_corrupted += 1;
                 // Seek to next record boundary using total_len to correct for
                 // potentially corrupted record_len in the header.
@@ -985,7 +1150,10 @@ impl PartitionWAL {
                     let seek_offset = (total_len - 20) as i64 - record_len as i64;
                     if seek_offset != 0 {
                         if let Err(seek_err) = file.seek(SeekFrom::Current(seek_offset)) {
-                            debug_log!("WAL recovery: Failed to seek past corrupted record: {}", seek_err);
+                            debug_log!(
+                                "WAL recovery: Failed to seek past corrupted record: {}",
+                                seek_err
+                            );
                             break;
                         }
                     }
@@ -1005,7 +1173,10 @@ impl PartitionWAL {
                         let seek_offset = (total_len - 20) as i64 - record_len as i64;
                         if seek_offset != 0 {
                             if let Err(seek_err) = file.seek(SeekFrom::Current(seek_offset)) {
-                                debug_log!("WAL recovery: Failed to seek past corrupted record: {}", seek_err);
+                                debug_log!(
+                                    "WAL recovery: Failed to seek past corrupted record: {}",
+                                    seek_err
+                                );
                                 break;
                             }
                         }
@@ -1024,9 +1195,12 @@ impl PartitionWAL {
         }
 
         if skipped_corrupted > 0 {
-            debug_log!("WAL recovery: Skipped {} corrupted records", skipped_corrupted);
+            debug_log!(
+                "WAL recovery: Skipped {} corrupted records",
+                skipped_corrupted
+            );
         }
-        
+
         Ok(records)
     }
 }
@@ -1103,7 +1277,7 @@ impl WALManager {
     pub fn create<P: AsRef<Path>>(base_path: P, num_partitions: u8) -> Result<Self> {
         Self::create_with_config(base_path, num_partitions, WALConfig::default())
     }
-    
+
     /// Create a new WAL manager with config
     pub fn create_with_config<P: AsRef<Path>>(
         base_path: P,
@@ -1124,7 +1298,8 @@ impl WALManager {
         let new_writes = Arc::new(AtomicBool::new(false));
 
         // Start background threads
-        let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone(), new_writes.clone());
+        let flush_thread =
+            Self::start_flush_thread_if_needed(&config, partitions.clone(), new_writes.clone());
         let group_commit = Self::start_group_commit_thread_if_needed(&config, partitions.clone());
 
         Ok(Self {
@@ -1167,7 +1342,8 @@ impl WALManager {
         let new_writes = Arc::new(AtomicBool::new(false));
 
         // Start background threads
-        let flush_thread = Self::start_flush_thread_if_needed(&config, partitions.clone(), new_writes.clone());
+        let flush_thread =
+            Self::start_flush_thread_if_needed(&config, partitions.clone(), new_writes.clone());
         let group_commit = Self::start_group_commit_thread_if_needed(&config, partitions.clone());
 
         Ok(Self {
@@ -1213,9 +1389,9 @@ impl WALManager {
                         // Flush all partitions: BufWriter flush → OS buffer, then sync_data → disk
                         for entry in partitions.iter() {
                             let mut wal = entry.value().lock();
-                        if let Err(e) = wal.sync_flush() {
-                            warn_log!("[WAL] Periodic sync_flush failed: {}", e);
-                        }
+                            if let Err(e) = wal.sync_flush() {
+                                warn_log!("[WAL] Periodic sync_flush failed: {}", e);
+                            }
                         }
 
                         // Adaptive backoff: if no writes, double interval; if writes, reset
@@ -1243,7 +1419,11 @@ impl WALManager {
         config: &WALConfig,
         partitions: Arc<DashMap<PartitionId, parking_lot::Mutex<PartitionWAL>>>,
     ) -> Option<GroupCommitThread> {
-        if let DurabilityLevel::GroupCommit { max_batch_size, max_wait_us } = config.durability_level {
+        if let DurabilityLevel::GroupCommit {
+            max_batch_size,
+            max_wait_us,
+        } = config.durability_level
+        {
             let should_stop = Arc::new(AtomicBool::new(false));
             let state = Arc::new(GroupCommitState {
                 queue: PlMutex::new(Vec::new()),
@@ -1279,9 +1459,8 @@ impl WALManager {
                         {
                             let mut queue = state_clone.queue.lock();
                             if !queue.is_empty() && queue.len() < state_clone.max_batch_size {
-                                let accrue = Duration::from_micros(
-                                    (state_clone.max_wait_us / 10).max(50)
-                                );
+                                let accrue =
+                                    Duration::from_micros((state_clone.max_wait_us / 10).max(50));
                                 let _ = state_clone.wakeup.wait_for(&mut queue, accrue);
                             }
                         }
@@ -1299,10 +1478,15 @@ impl WALManager {
 
                         // Group by partition
                         let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
-                        let mut done_signals: Vec<Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>> = Vec::new();
+                        let mut done_signals: Vec<
+                            Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>,
+                        > = Vec::new();
 
                         for entry in entries {
-                            groups.entry(entry.partition).or_default().push(entry.record);
+                            groups
+                                .entry(entry.partition)
+                                .or_default()
+                                .push(entry.record);
                             done_signals.push(entry.done);
                         }
 
@@ -1328,7 +1512,8 @@ impl WALManager {
 
                         if let Err(ref msg) = flush_ok {
                             warn_log!("[GroupCommit] Flush error: {}", msg);
-                            *state_clone.last_error.lock() = Some(StorageError::Transaction(msg.clone()));
+                            *state_clone.last_error.lock() =
+                                Some(StorageError::Transaction(msg.clone()));
                         }
                     }
 
@@ -1340,10 +1525,15 @@ impl WALManager {
 
                     if !entries.is_empty() {
                         let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
-                        let mut done_signals: Vec<Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>> = Vec::new();
+                        let mut done_signals: Vec<
+                            Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>,
+                        > = Vec::new();
 
                         for entry in entries {
-                            groups.entry(entry.partition).or_default().push(entry.record);
+                            groups
+                                .entry(entry.partition)
+                                .or_default()
+                                .push(entry.record);
                             done_signals.push(entry.done);
                         }
 
@@ -1426,7 +1616,9 @@ impl WALManager {
                     let start = std::time::Instant::now();
                     let res = done.1.wait_for(&mut flag, Duration::from_millis(100));
                     waited += start.elapsed();
-                    if flag.is_some() { break; }
+                    if flag.is_some() {
+                        break;
+                    }
                     if waited >= max_wait {
                         // Group-commit thread didn't process in time — fall back
                         // to a direct append so the caller doesn't hang.
@@ -1447,12 +1639,15 @@ impl WALManager {
                     wal.sync_flush()?;
                 } else {
                     return Err(StorageError::Transaction(
-                        "group-commit timed out and partition missing".to_string()));
+                        "group-commit timed out and partition missing".to_string(),
+                    ));
                 }
                 Ok(0)
             }
         } else {
-            let entry = self.partitions.get(&partition)
+            let entry = self
+                .partitions
+                .get(&partition)
                 .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
             let mut wal = entry.value().lock();
             wal.append(record)
@@ -1568,7 +1763,9 @@ impl WALManager {
         }
 
         // Direct path (Periodic/NoSync): encode and write in one step, zero clone
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.append_insert_raw_ref(table_name, row_id, partition, raw_data, txn_id)
@@ -1600,7 +1797,9 @@ impl WALManager {
         }
 
         // Direct path: encode and write in one step
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.append_update_raw_ref(table_name, row_id, partition, &raw_old, &raw_new, txn_id)
@@ -1632,7 +1831,9 @@ impl WALManager {
             return self.group_commit_append(partition, record);
         }
 
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.append_update_raw_ref(table_name, row_id, partition, raw_old, raw_new, txn_id)
@@ -1693,7 +1894,9 @@ impl WALManager {
             isolation_level,
         };
 
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.append(record)
@@ -1707,12 +1910,11 @@ impl WALManager {
         commit_ts: Timestamp,
     ) -> Result<LogSequenceNumber> {
         self.periodic_new_writes.store(true, Ordering::Relaxed);
-        let record = WALRecord::Commit {
-            txn_id,
-            commit_ts,
-        };
+        let record = WALRecord::Commit { txn_id, commit_ts };
 
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.append(record)
@@ -1725,11 +1927,11 @@ impl WALManager {
         txn_id: TransactionId,
     ) -> Result<LogSequenceNumber> {
         self.periodic_new_writes.store(true, Ordering::Relaxed);
-        let record = WALRecord::Rollback {
-            txn_id,
-        };
+        let record = WALRecord::Rollback { txn_id };
 
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.append(record)
@@ -1748,7 +1950,9 @@ impl WALManager {
         if !records.is_empty() {
             self.periodic_new_writes.store(true, Ordering::Relaxed);
         }
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.batch_append(records)
@@ -1756,7 +1960,9 @@ impl WALManager {
 
     /// Create checkpoint for a partition
     pub fn checkpoint(&self, partition: PartitionId) -> Result<()> {
-        let entry = self.partitions.get(&partition)
+        let entry = self
+            .partitions
+            .get(&partition)
             .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
         let mut wal = entry.value().lock();
         wal.checkpoint()
@@ -1806,7 +2012,10 @@ impl WALManager {
             if !entries.is_empty() {
                 let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
                 for entry in entries {
-                    groups.entry(entry.partition).or_default().push(entry.record);
+                    groups
+                        .entry(entry.partition)
+                        .or_default()
+                        .push(entry.record);
                 }
                 for (partition, records) in groups {
                     if let Some(entry) = self.partitions.get(&partition) {
@@ -1849,7 +2058,11 @@ impl WALManager {
     /// Idempotent: safe to call multiple times (sets stop flags; threads exit
     /// their loops on the next wake).
     pub fn shutdown(&self) {
-        eprintln!("[WAL] shutdown: gc={} flush={}", self.group_commit.is_some(), self.flush_thread.is_some());
+        eprintln!(
+            "[WAL] shutdown: gc={} flush={}",
+            self.group_commit.is_some(),
+            self.flush_thread.is_some()
+        );
         // Stop group commit thread (wake it so it checks should_stop).
         if let Some(gc) = self.group_commit.as_ref() {
             gc.should_stop.store(true, Ordering::Relaxed);
@@ -1897,14 +2110,14 @@ impl Drop for WALManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Value, Timestamp};
+    use crate::types::{Timestamp, Value};
     use tempfile::TempDir;
 
     #[test]
     fn test_wal_create() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 4).unwrap();
-        
+
         assert_eq!(wal.num_partitions, 4);
     }
 
@@ -1912,10 +2125,10 @@ mod tests {
     fn test_wal_log_insert() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 4).unwrap();
-        
+
         let row = vec![Value::Null];
         let lsn = wal.log_insert("test_table", 0, 1, row, 0).unwrap();
-        
+
         assert_eq!(lsn, 0);
     }
 
@@ -1923,8 +2136,9 @@ mod tests {
     fn test_wal_checkpoint() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 4).unwrap();
-        
-        wal.log_insert("test_table", 0, 1, vec![Value::Null], 0).unwrap();
+
+        wal.log_insert("test_table", 0, 1, vec![Value::Null], 0)
+            .unwrap();
         wal.checkpoint(0).unwrap();
     }
 
@@ -1936,22 +2150,28 @@ mod tests {
         // Write some records
         {
             let wal = WALManager::create(path, 2).unwrap();
-            wal.log_insert("test_table", 0, 1, vec![Value::Null], 0).unwrap();
-            wal.log_insert("test_table", 0, 2, vec![Value::Null], 0).unwrap();
-            wal.log_insert("test_table", 1, 3, vec![Value::Null], 0).unwrap();
+            wal.log_insert("test_table", 0, 1, vec![Value::Null], 0)
+                .unwrap();
+            wal.log_insert("test_table", 0, 2, vec![Value::Null], 0)
+                .unwrap();
+            wal.log_insert("test_table", 1, 3, vec![Value::Null], 0)
+                .unwrap();
         }
-        
+
         // Recover
         {
             let wal = WALManager::open(path, 2).unwrap();
             let recovered = wal.recover().unwrap();
-            
+
             assert_eq!(recovered.len(), 2);
-            
+
             let count_inserts = |records: &[WALRecord]| -> usize {
-                records.iter().filter(|r| matches!(r, WALRecord::Insert { .. } | WALRecord::InsertRaw { .. })).count()
+                records
+                    .iter()
+                    .filter(|r| matches!(r, WALRecord::Insert { .. } | WALRecord::InsertRaw { .. }))
+                    .count()
             };
-            
+
             assert_eq!(count_inserts(recovered.get(&0).unwrap()), 2);
             assert_eq!(count_inserts(recovered.get(&1).unwrap()), 1);
         }
@@ -1961,87 +2181,110 @@ mod tests {
     fn test_wal_update_operation() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 2).unwrap();
-        
+
         let old_data = vec![Value::Null];
         let new_data = vec![Value::Null];
-        let lsn = wal.log_update("test_table", 0, 1, old_data.clone(), new_data.clone(), 0).unwrap();
-        
+        let lsn = wal
+            .log_update("test_table", 0, 1, old_data.clone(), new_data.clone(), 0)
+            .unwrap();
+
         assert_eq!(lsn, 0);
-        
+
         // Verify recovery
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0], WALRecord::Update { .. } | WALRecord::UpdateRaw { .. }));
+        assert!(matches!(
+            records[0],
+            WALRecord::Update { .. } | WALRecord::UpdateRaw { .. }
+        ));
     }
 
     #[test]
     fn test_wal_delete_operation() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 2).unwrap();
-        
+
         let old_data = vec![Value::Null];
-        let lsn = wal.log_delete("test_table", 0, 1, old_data.clone(), 12345, 0).unwrap();
-        
+        let lsn = wal
+            .log_delete("test_table", 0, 1, old_data.clone(), 12345, 0)
+            .unwrap();
+
         assert_eq!(lsn, 0);
-        
+
         // Verify recovery
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 1);
-        assert!(matches!(records[0], WALRecord::Delete { .. } | WALRecord::DeleteRaw { .. }));
+        assert!(matches!(
+            records[0],
+            WALRecord::Delete { .. } | WALRecord::DeleteRaw { .. }
+        ));
     }
 
     #[test]
     fn test_wal_transaction_boundaries() {
         let temp_dir = TempDir::new().unwrap();
-        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let config = WALConfig {
+            durability_level: DurabilityLevel::Synchronous,
+        };
         let wal = WALManager::create_with_config(temp_dir.path(), 2, config).unwrap();
-        
+
         // Begin transaction
         let lsn1 = wal.log_begin(0, 1, 1).unwrap();
         assert_eq!(lsn1, 0);
-        
+
         // Insert data
-        let lsn2 = wal.log_insert("test_table", 0, 10, vec![Value::Null], 1).unwrap();
+        let lsn2 = wal
+            .log_insert("test_table", 0, 10, vec![Value::Null], 1)
+            .unwrap();
         assert_eq!(lsn2, 1);
-        
+
         // Commit transaction
         let lsn3 = wal.log_commit(0, 1, 100).unwrap();
         assert_eq!(lsn3, 2);
-        
+
         // Verify recovery
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 3);
-        
+
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
-        assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }));
+        assert!(matches!(
+            records[1],
+            WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }
+        ));
         assert!(matches!(records[2], WALRecord::Commit { txn_id: 1, .. }));
     }
 
     #[test]
     fn test_wal_transaction_rollback() {
         let temp_dir = TempDir::new().unwrap();
-        let config = WALConfig { durability_level: DurabilityLevel::Synchronous };
+        let config = WALConfig {
+            durability_level: DurabilityLevel::Synchronous,
+        };
         let wal = WALManager::create_with_config(temp_dir.path(), 2, config).unwrap();
-        
+
         // Begin transaction
         wal.log_begin(0, 1, 1).unwrap();
-        
+
         // Insert data
-        wal.log_insert("test_table", 0, 10, vec![Value::Null], 1).unwrap();
-        
+        wal.log_insert("test_table", 0, 10, vec![Value::Null], 1)
+            .unwrap();
+
         // Rollback transaction
         wal.log_rollback(0, 1).unwrap();
-        
+
         // Verify recovery
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 3);
 
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
-        assert!(matches!(records[1], WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }));
+        assert!(matches!(
+            records[1],
+            WALRecord::Insert { row_id: 10, .. } | WALRecord::InsertRaw { row_id: 10, .. }
+        ));
         assert!(matches!(records[2], WALRecord::Rollback { txn_id: 1 }));
     }
 
@@ -2049,47 +2292,85 @@ mod tests {
     fn test_wal_complete_transaction_flow() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path();
-        
+
         // Simulate complete transaction flow
         {
             let wal = WALManager::create(path, 2).unwrap();
-            
+
             // T1: Begin, Insert, Update, Commit
             wal.log_begin(0, 1, 2).unwrap();
-            wal.log_insert("test_table", 0, 100, vec![Value::Null], 1).unwrap();
-            wal.log_update("test_table", 0, 100, vec![Value::Null], vec![Value::Null], 1).unwrap();
+            wal.log_insert("test_table", 0, 100, vec![Value::Null], 1)
+                .unwrap();
+            wal.log_update(
+                "test_table",
+                0,
+                100,
+                vec![Value::Null],
+                vec![Value::Null],
+                1,
+            )
+            .unwrap();
             wal.log_commit(0, 1, 1000).unwrap();
 
             // T2: Begin, Insert, Rollback
             wal.log_begin(0, 2, 2).unwrap();
-            wal.log_insert("test_table", 0, 200, vec![Value::Null], 2).unwrap();
+            wal.log_insert("test_table", 0, 200, vec![Value::Null], 2)
+                .unwrap();
             wal.log_rollback(0, 2).unwrap();
 
             // T3: Begin, Delete, Commit
             wal.log_begin(0, 3, 2).unwrap();
-            wal.log_delete("test_table", 0, 100, vec![Value::Null], 12345, 3).unwrap();
+            wal.log_delete("test_table", 0, 100, vec![Value::Null], 12345, 3)
+                .unwrap();
             wal.log_commit(0, 3, 2000).unwrap();
         }
-        
+
         // Recover and verify
         {
             let wal = WALManager::open(path, 2).unwrap();
             let recovered = wal.recover().unwrap();
             let records = recovered.get(&0).unwrap();
-            
+
             assert_eq!(records.len(), 10);
-            
+
             // Count record types
             let count_type = |records: &[WALRecord], pred: fn(&WALRecord) -> bool| -> usize {
                 records.iter().filter(|r| pred(r)).count()
             };
-            
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Begin { .. })), 3);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Insert { .. } | WALRecord::InsertRaw { .. })), 2);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Update { .. } | WALRecord::UpdateRaw { .. })), 1);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Delete { .. } | WALRecord::DeleteRaw { .. })), 1);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Commit { .. })), 2);
-            assert_eq!(count_type(records, |r| matches!(r, WALRecord::Rollback { .. })), 1);
+
+            assert_eq!(
+                count_type(records, |r| matches!(r, WALRecord::Begin { .. })),
+                3
+            );
+            assert_eq!(
+                count_type(records, |r| matches!(
+                    r,
+                    WALRecord::Insert { .. } | WALRecord::InsertRaw { .. }
+                )),
+                2
+            );
+            assert_eq!(
+                count_type(records, |r| matches!(
+                    r,
+                    WALRecord::Update { .. } | WALRecord::UpdateRaw { .. }
+                )),
+                1
+            );
+            assert_eq!(
+                count_type(records, |r| matches!(
+                    r,
+                    WALRecord::Delete { .. } | WALRecord::DeleteRaw { .. }
+                )),
+                1
+            );
+            assert_eq!(
+                count_type(records, |r| matches!(r, WALRecord::Commit { .. })),
+                2
+            );
+            assert_eq!(
+                count_type(records, |r| matches!(r, WALRecord::Rollback { .. })),
+                1
+            );
         }
     }
 
@@ -2097,10 +2378,13 @@ mod tests {
     fn test_wal_batch_append() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 2).unwrap();
-        
+
         // Create a batch of records for a transaction
         let records = vec![
-            WALRecord::Begin { txn_id: 1, isolation_level: 2 },
+            WALRecord::Begin {
+                txn_id: 1,
+                isolation_level: 2,
+            },
             WALRecord::Insert {
                 table_name: "test_table".to_string(),
                 row_id: 100,
@@ -2123,12 +2407,15 @@ mod tests {
                 new_data: vec![Value::Timestamp(Timestamp::from_micros(100))],
                 txn_id: 1,
             },
-            WALRecord::Commit { txn_id: 1, commit_ts: 1000 },
+            WALRecord::Commit {
+                txn_id: 1,
+                commit_ts: 1000,
+            },
         ];
-        
+
         // Batch append all records
         let lsns = wal.batch_append(0, records).unwrap();
-        
+
         // Verify LSNs are sequential
         assert_eq!(lsns.len(), 5);
         assert_eq!(lsns[0], 0);
@@ -2136,16 +2423,25 @@ mod tests {
         assert_eq!(lsns[2], 2);
         assert_eq!(lsns[3], 3);
         assert_eq!(lsns[4], 4);
-        
+
         // Verify recovery
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 5);
-        
+
         assert!(matches!(records[0], WALRecord::Begin { txn_id: 1, .. }));
-        assert!(matches!(records[1], WALRecord::Insert { row_id: 100, .. } | WALRecord::InsertRaw { row_id: 100, .. }));
-        assert!(matches!(records[2], WALRecord::Insert { row_id: 101, .. } | WALRecord::InsertRaw { row_id: 101, .. }));
-        assert!(matches!(records[3], WALRecord::Update { row_id: 100, .. } | WALRecord::UpdateRaw { row_id: 100, .. }));
+        assert!(matches!(
+            records[1],
+            WALRecord::Insert { row_id: 100, .. } | WALRecord::InsertRaw { row_id: 100, .. }
+        ));
+        assert!(matches!(
+            records[2],
+            WALRecord::Insert { row_id: 101, .. } | WALRecord::InsertRaw { row_id: 101, .. }
+        ));
+        assert!(matches!(
+            records[3],
+            WALRecord::Update { row_id: 100, .. } | WALRecord::UpdateRaw { row_id: 100, .. }
+        ));
         assert!(matches!(records[4], WALRecord::Commit { txn_id: 1, .. }));
     }
 
@@ -2153,7 +2449,7 @@ mod tests {
     fn test_wal_batch_append_empty() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 2).unwrap();
-        
+
         // Empty batch should succeed without doing anything
         let lsns = wal.batch_append(0, vec![]).unwrap();
         assert_eq!(lsns.len(), 0);
@@ -2163,46 +2459,95 @@ mod tests {
     fn test_wal_batch_append_multiple_transactions() {
         let temp_dir = TempDir::new().unwrap();
         let wal = WALManager::create(temp_dir.path(), 2).unwrap();
-        
+
         // Simulate multiple concurrent transactions
         // T1
         let records1 = vec![
-            WALRecord::Begin { txn_id: 1, isolation_level: 2 },
-            WALRecord::Insert { table_name: "test_table".to_string(), row_id: 100, partition: 0, data: vec![Value::Null], txn_id: 1 },
-            WALRecord::Commit { txn_id: 1, commit_ts: 1000 },
+            WALRecord::Begin {
+                txn_id: 1,
+                isolation_level: 2,
+            },
+            WALRecord::Insert {
+                table_name: "test_table".to_string(),
+                row_id: 100,
+                partition: 0,
+                data: vec![Value::Null],
+                txn_id: 1,
+            },
+            WALRecord::Commit {
+                txn_id: 1,
+                commit_ts: 1000,
+            },
         ];
         wal.batch_append(0, records1).unwrap();
 
         // T2
         let records2 = vec![
-            WALRecord::Begin { txn_id: 2, isolation_level: 2 },
-            WALRecord::Insert { table_name: "test_table".to_string(), row_id: 200, partition: 0, data: vec![Value::Null], txn_id: 2 },
-            WALRecord::Insert { table_name: "test_table".to_string(), row_id: 201, partition: 0, data: vec![Value::Null], txn_id: 2 },
-            WALRecord::Commit { txn_id: 2, commit_ts: 2000 },
+            WALRecord::Begin {
+                txn_id: 2,
+                isolation_level: 2,
+            },
+            WALRecord::Insert {
+                table_name: "test_table".to_string(),
+                row_id: 200,
+                partition: 0,
+                data: vec![Value::Null],
+                txn_id: 2,
+            },
+            WALRecord::Insert {
+                table_name: "test_table".to_string(),
+                row_id: 201,
+                partition: 0,
+                data: vec![Value::Null],
+                txn_id: 2,
+            },
+            WALRecord::Commit {
+                txn_id: 2,
+                commit_ts: 2000,
+            },
         ];
         wal.batch_append(0, records2).unwrap();
-        
+
         // T3
         let records3 = vec![
-            WALRecord::Begin { txn_id: 3, isolation_level: 2 },
-            WALRecord::Delete { table_name: "test_table".to_string(), row_id: 100, partition: 0, old_data: vec![Value::Null], timestamp: 0, txn_id: 3 },
+            WALRecord::Begin {
+                txn_id: 3,
+                isolation_level: 2,
+            },
+            WALRecord::Delete {
+                table_name: "test_table".to_string(),
+                row_id: 100,
+                partition: 0,
+                old_data: vec![Value::Null],
+                timestamp: 0,
+                txn_id: 3,
+            },
             WALRecord::Rollback { txn_id: 3 },
         ];
         wal.batch_append(0, records3).unwrap();
-        
+
         // Verify recovery
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).unwrap();
         assert_eq!(records.len(), 10);
-        
+
         // Verify transaction boundaries
         let count_type = |records: &[WALRecord], pred: fn(&WALRecord) -> bool| -> usize {
             records.iter().filter(|r| pred(r)).count()
         };
-        
-        assert_eq!(count_type(records, |r| matches!(r, WALRecord::Begin { .. })), 3);
-        assert_eq!(count_type(records, |r| matches!(r, WALRecord::Commit { .. })), 2);
-        assert_eq!(count_type(records, |r| matches!(r, WALRecord::Rollback { .. })), 1);
+
+        assert_eq!(
+            count_type(records, |r| matches!(r, WALRecord::Begin { .. })),
+            3
+        );
+        assert_eq!(
+            count_type(records, |r| matches!(r, WALRecord::Commit { .. })),
+            2
+        );
+        assert_eq!(
+            count_type(records, |r| matches!(r, WALRecord::Rollback { .. })),
+            1
+        );
     }
 
     /// Regression test: corrupted total_len should stop recovery, not cause misaligned seeks.
@@ -2217,7 +2562,8 @@ mod tests {
         {
             let wal = WALManager::create(path, 1).unwrap();
             for i in 0..3u64 {
-                wal.log_insert("t", 0, i, vec![Value::Integer(i as i64)], 0).unwrap();
+                wal.log_insert("t", 0, i, vec![Value::Integer(i as i64)], 0)
+                    .unwrap();
             }
         }
 
@@ -2245,7 +2591,11 @@ mod tests {
         let wal = WALManager::open(path, 1).unwrap();
         let recovered = wal.recover().unwrap();
         let records = recovered.get(&0).map(|r| r.len()).unwrap_or(0);
-        assert!(records >= 1, "Should recover at least 1 record before corruption, got {}", records);
+        assert!(
+            records >= 1,
+            "Should recover at least 1 record before corruption, got {}",
+            records
+        );
     }
 
     /// Test that corrupted record_len (larger than total_len) stops recovery cleanly.
@@ -2256,7 +2606,8 @@ mod tests {
 
         {
             let wal = WALManager::create(path, 1).unwrap();
-            wal.log_insert("t", 0, 1, vec![Value::Integer(42)], 0).unwrap();
+            wal.log_insert("t", 0, 1, vec![Value::Integer(42)], 0)
+                .unwrap();
         }
 
         // Corrupt record_len to be larger than total_len

@@ -1,6 +1,6 @@
 //! Tests for SQL JOIN operations (INNER, LEFT, RIGHT, FULL)
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn setup_db() -> (Database, TempDir) {
@@ -8,18 +8,27 @@ fn setup_db() -> (Database, TempDir) {
     let db = Database::create(dir.path()).unwrap();
 
     // departments: id, name
-    db.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO departments VALUES (1, 'Engineering')").unwrap();
-    db.execute("INSERT INTO departments VALUES (2, 'Marketing')").unwrap();
-    db.execute("INSERT INTO departments VALUES (3, 'Sales')").unwrap();
+    db.execute("CREATE TABLE departments (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO departments VALUES (1, 'Engineering')")
+        .unwrap();
+    db.execute("INSERT INTO departments VALUES (2, 'Marketing')")
+        .unwrap();
+    db.execute("INSERT INTO departments VALUES (3, 'Sales')")
+        .unwrap();
     // department 4 exists but has no employees — tests RIGHT/FULL unmatched rows
 
     // employees: id, name, dept_id, salary
-    db.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT, salary FLOAT)").unwrap();
-    db.execute("INSERT INTO employees VALUES (1, 'Alice', 1, 120000)").unwrap();
-    db.execute("INSERT INTO employees VALUES (2, 'Bob', 1, 110000)").unwrap();
-    db.execute("INSERT INTO employees VALUES (3, 'Charlie', 2, 95000)").unwrap();
-    db.execute("INSERT INTO employees VALUES (4, 'Diana', 99, 80000)").unwrap();
+    db.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept_id INT, salary FLOAT)")
+        .unwrap();
+    db.execute("INSERT INTO employees VALUES (1, 'Alice', 1, 120000)")
+        .unwrap();
+    db.execute("INSERT INTO employees VALUES (2, 'Bob', 1, 110000)")
+        .unwrap();
+    db.execute("INSERT INTO employees VALUES (3, 'Charlie', 2, 95000)")
+        .unwrap();
+    db.execute("INSERT INTO employees VALUES (4, 'Diana', 99, 80000)")
+        .unwrap();
     // Diana's dept_id=99 has no matching department — tests LEFT/FULL unmatched rows
 
     (db, dir)
@@ -77,8 +86,14 @@ fn test_left_join() {
     // All 4 employees. Diana gets NULL for department name.
     assert_eq!(r.len(), 4, "LEFT JOIN should return all left rows");
 
-    let null_count = r.iter().filter(|row| matches!(&row[1], Value::Null)).count();
-    assert_eq!(null_count, 1, "Diana (dept_id=99) should have NULL department");
+    let null_count = r
+        .iter()
+        .filter(|row| matches!(&row[1], Value::Null))
+        .count();
+    assert_eq!(
+        null_count, 1,
+        "Diana (dept_id=99) should have NULL department"
+    );
 }
 
 #[test]
@@ -94,8 +109,14 @@ fn test_right_join() {
     // Engineering has 2 employees, Marketing has 1, Sales has 0, so Sales gets NULL.
     assert_eq!(r.len(), 4, "RIGHT JOIN should return all right rows");
 
-    let null_count = r.iter().filter(|row| matches!(&row[0], Value::Null)).count();
-    assert!(null_count >= 1, "Sales department (no employees) should have NULL employee name");
+    let null_count = r
+        .iter()
+        .filter(|row| matches!(&row[0], Value::Null))
+        .count();
+    assert!(
+        null_count >= 1,
+        "Sales department (no employees) should have NULL employee name"
+    );
 }
 
 #[test]
@@ -114,19 +135,29 @@ fn test_full_join() {
 
     // FULL JOIN should return at least 4 rows (3 matched + 1 unmatched Diana)
     // May include Sales with NULL employee depending on implementation
-    assert!(r.len() >= 4, "FULL JOIN should return matched + unmatched rows, got {}", r.len());
+    assert!(
+        r.len() >= 4,
+        "FULL JOIN should return matched + unmatched rows, got {}",
+        r.len()
+    );
 
-    let right_nulls = r.iter().filter(|row| matches!(&row[1], Value::Null)).count();
-    assert!(right_nulls >= 1, "Diana (dept_id=99) should produce NULL on right");
+    let right_nulls = r
+        .iter()
+        .filter(|row| matches!(&row[1], Value::Null))
+        .count();
+    assert!(
+        right_nulls >= 1,
+        "Diana (dept_id=99) should produce NULL on right"
+    );
 }
 
 #[test]
 fn test_join_with_table_alias() {
     let (db, _dir) = setup_db();
 
-    let result = db.execute(
-        "SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id"
-    ).unwrap();
+    let result = db
+        .execute("SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id")
+        .unwrap();
     let r = rows(result);
 
     assert_eq!(r.len(), 3, "JOIN with aliases should work");
@@ -143,12 +174,13 @@ fn test_join_with_order_by() {
 
     assert_eq!(r.len(), 3);
     // Ordered by employee name: Alice, Bob, Charlie
-    let names: Vec<String> = r.iter().map(|row| {
-        match &row[0] {
+    let names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
             Value::Text(s) => s.as_str().to_string(),
             v => format!("{:?}", v),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
 }
 
@@ -157,16 +189,18 @@ fn test_cross_join_no_match() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t1 VALUES (1, 'a')").unwrap();
 
-    db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t2 VALUES (1, 'b')").unwrap();
 
     // INNER JOIN with condition that never matches
-    let result = db.execute(
-        "SELECT t1.val, t2.val FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE 1 = 0"
-    ).unwrap();
+    let result = db
+        .execute("SELECT t1.val, t2.val FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE 1 = 0")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 0, "No rows should match impossible WHERE");
 }

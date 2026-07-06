@@ -9,7 +9,7 @@
 #[path = "common/mod.rs"]
 mod common;
 use common::*;
-use motedb::{Database, DBConfig};
+use motedb::{DBConfig, Database};
 
 /// Flush + drop, simulating a clean checkpoint before crash.
 fn flush_and_drop(db: Database) {
@@ -49,7 +49,10 @@ fn test_batch_insert_survives_crash() {
 
     {
         let db = create_db_at(&path);
-        exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+        );
         insert_test_rows(&db, 1000);
         flush_and_drop(db);
     }
@@ -188,8 +191,14 @@ fn test_transaction_rollback_lost_on_crash() {
     }
     let db = open_db_at(&path);
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 1);
-    assert_eq!(count_rows(&db, "SELECT * FROM t WHERE val = 'committed'"), 1);
-    assert_eq!(count_rows(&db, "SELECT * FROM t WHERE val = 'uncommitted'"), 0);
+    assert_eq!(
+        count_rows(&db, "SELECT * FROM t WHERE val = 'committed'"),
+        1
+    );
+    assert_eq!(
+        count_rows(&db, "SELECT * FROM t WHERE val = 'uncommitted'"),
+        0
+    );
 }
 
 // ─── 压缩 & 段恢复 ──────────────────────────────────────────────────────
@@ -209,10 +218,16 @@ fn test_tombstone_survives_compaction() {
     // Verify deletions honored
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 50);
     for i in (1..=100).step_by(2) {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)), 0);
+        assert_eq!(
+            count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)),
+            0
+        );
     }
     for i in (2..=100).step_by(2) {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)), 1);
+        assert_eq!(
+            count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)),
+            1
+        );
     }
 }
 
@@ -226,7 +241,10 @@ fn test_update_survives_compaction() {
     // Update all rows multiple times
     for round in 0..5 {
         for i in 1..=50 {
-            exec(&db, &format!("UPDATE t SET val = {} WHERE id = {}", round * 1000 + i, i));
+            exec(
+                &db,
+                &format!("UPDATE t SET val = {} WHERE id = {}", round * 1000 + i, i),
+            );
         }
     }
     // Trigger compaction via query
@@ -238,7 +256,9 @@ fn test_update_survives_compaction() {
         assert_eq!(
             count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", expected)),
             1,
-            "id={} should have val={}", i, expected
+            "id={} should have val={}",
+            i,
+            expected
         );
     }
 }
@@ -288,7 +308,10 @@ fn test_large_batch_durability() {
         config.auto_checkpoint = None;
         config.wal_config.durability_level = motedb::DurabilityLevel::Synchronous;
         let db = Database::create_with_config(&path, config).unwrap();
-        exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+        );
         insert_test_rows(&db, 10_000);
         let _ = db.close();
         drop(db);
@@ -299,7 +322,10 @@ fn test_large_batch_durability() {
     config2.wal_config.durability_level = motedb::DurabilityLevel::Synchronous;
     let db = Database::open_with_config(&path, config2).unwrap();
     assert_eq!(count_rows(&db, "SELECT * FROM bench"), 10_000);
-    assert_eq!(count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"), 3_333);
+    assert_eq!(
+        count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"),
+        3_333
+    );
 }
 
 #[test]
@@ -309,7 +335,10 @@ fn test_auto_increment_persistence() {
 
     {
         let db = create_db_at(&path);
-        exec(&db, "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT)",
+        );
         exec(&db, "INSERT INTO t (name) VALUES ('A')");
         exec(&db, "INSERT INTO t (name) VALUES ('B')");
         exec(&db, "INSERT INTO t (name) VALUES ('C')");
@@ -371,14 +400,19 @@ fn test_concurrent_writes_durability() {
                 })
             })
             .collect();
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let _ = db.close();
         drop(db);
     }
     let db = open_db_at(&path);
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 1000);
     for tid in 0..4 {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE thread_id = {}", tid)), 250);
+        assert_eq!(
+            count_rows(&db, &format!("SELECT * FROM t WHERE thread_id = {}", tid)),
+            250
+        );
     }
 }
 
@@ -389,7 +423,10 @@ fn test_null_value_durability() {
 
     {
         let db = create_db_at(&path);
-        exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)");
+        exec(
+            &db,
+            "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)",
+        );
         exec(&db, "INSERT INTO t VALUES (1, NULL, NULL)");
         exec(&db, "INSERT INTO t VALUES (2, 'hello', 3.14)");
         exec(&db, "INSERT INTO t VALUES (3, NULL, 42.0)");

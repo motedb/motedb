@@ -16,7 +16,12 @@ pub struct IndexedPoint3D {
 
 impl IndexedPoint3D {
     pub fn from_point3d(p: &crate::types::Point3D, row_id: u64) -> Self {
-        Self { x: p.x, y: p.y, z: p.z, row_id }
+        Self {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            row_id,
+        }
     }
 
     pub fn distance_squared(&self, other: &[f64; 3]) -> f64 {
@@ -53,9 +58,15 @@ pub enum Octant {
 /// Compute which child octant a point belongs to (Morton code)
 pub fn octant_code(center: &[f64; 3], point: &[f64; 3]) -> usize {
     let mut code = 0u8;
-    if point[0] >= center[0] { code |= 1; }
-    if point[1] >= center[1] { code |= 2; }
-    if point[2] >= center[2] { code |= 4; }
+    if point[0] >= center[0] {
+        code |= 1;
+    }
+    if point[1] >= center[1] {
+        code |= 2;
+    }
+    if point[2] >= center[2] {
+        code |= 4;
+    }
     code as usize
 }
 
@@ -63,15 +74,32 @@ pub fn octant_code(center: &[f64; 3], point: &[f64; 3]) -> usize {
 pub fn child_center(parent_center: &[f64; 3], parent_extent: f64, code: usize) -> [f64; 3] {
     let half = parent_extent / 2.0;
     let mut center = *parent_center;
-    if code & 1 != 0 { center[0] += half; } else { center[0] -= half; }
-    if code & 2 != 0 { center[1] += half; } else { center[1] -= half; }
-    if code & 4 != 0 { center[2] += half; } else { center[2] -= half; }
+    if code & 1 != 0 {
+        center[0] += half;
+    } else {
+        center[0] -= half;
+    }
+    if code & 2 != 0 {
+        center[1] += half;
+    } else {
+        center[1] -= half;
+    }
+    if code & 4 != 0 {
+        center[2] += half;
+    } else {
+        center[2] -= half;
+    }
     center
 }
 
 impl Octant {
     pub fn new_leaf(center: [f64; 3], extent: f64, leaf_id: u64) -> Self {
-        Octant::Leaf { center, extent, leaf_id, point_count: 0 }
+        Octant::Leaf {
+            center,
+            extent,
+            leaf_id,
+            point_count: 0,
+        }
     }
 
     pub fn new_inner(center: [f64; 3], extent: f64) -> Self {
@@ -136,9 +164,12 @@ impl Octant {
 
 /// Check if an octant (center + extent) overlaps with a 3D box [min, max]
 pub fn overlaps(center: &[f64; 3], extent: f64, min: &[f64; 3], max: &[f64; 3]) -> bool {
-    center[0] + extent >= min[0] && center[0] - extent <= max[0]
-        && center[1] + extent >= min[1] && center[1] - extent <= max[1]
-        && center[2] + extent >= min[2] && center[2] - extent <= max[2]
+    center[0] + extent >= min[0]
+        && center[0] - extent <= max[0]
+        && center[1] + extent >= min[1]
+        && center[1] - extent <= max[1]
+        && center[2] + extent >= min[2]
+        && center[2] - extent <= max[2]
 }
 
 /// Minimum squared distance from a point to an octant's boundary (0 if inside)

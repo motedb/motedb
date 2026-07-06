@@ -16,7 +16,7 @@
 //! - Queries check: Active + Immutable + Persistent Index
 //! - Flush doesn't block writes (switch to new active buffer)
 
-use parking_lot::{RwLock, Mutex};
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ where
 
     /// Size limit in bytes (e.g., 1MB)
     size_limit: usize,
-    
+
     /// Flush lock (prevents concurrent flush operations)
     flush_lock: Arc<Mutex<()>>,
 }
@@ -123,7 +123,7 @@ where
     /// - Space: Estimated based on sizeof<K> + sizeof<V>
     pub fn insert(&self, key: K, value: V) -> Result<bool, String> {
         let mut active = self.active.write();
-        
+
         // Estimate entry size (rough approximation)
         let entry_size = std::mem::size_of::<K>() + std::mem::size_of::<V>();
 
@@ -138,10 +138,10 @@ where
                 size: active.size,
             };
             active.size = 0;
-            
+
             // Add to immutable queue
             self.immutable.write().push(Arc::new(old_active));
-            
+
             return Ok(true); // Signal: flush needed
         }
 
@@ -202,7 +202,7 @@ where
                 return Some(value.clone());
             }
         }
-        
+
         // 2. Check immutable buffers (reverse order: newest first)
         {
             let immutable = self.immutable.read();
@@ -212,7 +212,7 @@ where
                 }
             }
         }
-        
+
         None
     }
 
@@ -228,24 +228,26 @@ where
         {
             let active = self.active.read();
             results.extend(
-                active.data
+                active
+                    .data
                     .range((Bound::Included(start), Bound::Included(end)))
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
-        
+
         // 2. Collect from immutable buffers (newest first for correct dedup)
         {
             let immutable = self.immutable.read();
             for buffer in immutable.iter().rev() {
                 results.extend(
-                    buffer.data
+                    buffer
+                        .data
                         .range((Bound::Included(start), Bound::Included(end)))
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .map(|(k, v)| (k.clone(), v.clone())),
                 );
             }
         }
-        
+
         // 3. Deduplicate (keep newest value for each key)
         results.sort_by_key(|a| a.0.clone()); // stable sort: equal keys retain insert order
         results.dedup_by(|a, b| a.0 == b.0);
@@ -263,25 +265,21 @@ where
         // 1. Collect from active
         {
             let active = self.active.read();
-            results.extend(
-                active.data.iter().map(|(k, v)| (k.clone(), v.clone()))
-            );
+            results.extend(active.data.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
 
         // 2. Collect from immutable (newest first for correct dedup)
         {
             let immutable = self.immutable.read();
             for buffer in immutable.iter().rev() {
-                results.extend(
-                    buffer.data.iter().map(|(k, v)| (k.clone(), v.clone()))
-                );
+                results.extend(buffer.data.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
         }
 
         // 3. Deduplicate (keep newest value for each key)
         results.sort_by_key(|a| a.0.clone());
         results.dedup_by(|a, b| a.0 == b.0);
-        
+
         results
     }
 
@@ -297,7 +295,9 @@ where
         // from swapping the newly-emptied active to immutable between phases.
         // Lock order: active.write → immutable.write, consistent with insert().
         let mut active = self.active.write();
-        let mut results: Vec<(K, V)> = active.data.iter()
+        let mut results: Vec<(K, V)> = active
+            .data
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         active.data.clear();
@@ -308,9 +308,7 @@ where
         {
             let mut immutable = self.immutable.write();
             for buffer in immutable.iter().rev() {
-                results.extend(
-                    buffer.data.iter().map(|(k, v)| (k.clone(), v.clone()))
-                );
+                results.extend(buffer.data.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
             immutable.clear();
         }
@@ -342,7 +340,7 @@ where
     pub fn flush(&self) -> Result<Option<Vec<(K, V)>>, String> {
         // 🔒 Acquire flush lock (prevents concurrent flush)
         let _lock = self.flush_lock.lock();
-        
+
         // Get oldest immutable buffer
         let buffer = {
             let mut immutable = self.immutable.write();
@@ -351,12 +349,14 @@ where
             }
             immutable.remove(0) // Remove oldest
         };
-        
+
         // Extract entries
-        let entries: Vec<_> = buffer.data.iter()
+        let entries: Vec<_> = buffer
+            .data
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        
+
         Ok(Some(entries))
     }
 
@@ -381,13 +381,13 @@ where
     pub fn stats(&self) -> BufferStats {
         let active = self.active.read();
         let immutable = self.immutable.read();
-        
+
         let active_size = active.size;
         let active_count = active.data.len();
-        
+
         let immutable_count = immutable.len();
         let immutable_size: usize = immutable.iter().map(|b| b.size).sum();
-        
+
         BufferStats {
             active_size_bytes: active_size,
             active_entry_count: active_count,
@@ -395,7 +395,8 @@ where
             immutable_size_bytes: immutable_size,
             total_size_bytes: active_size + immutable_size,
             size_limit: self.size_limit,
-            fullness: ((active_size + immutable_size) as f64 / self.size_limit as f64 * 100.0) as u8,
+            fullness: ((active_size + immutable_size) as f64 / self.size_limit as f64 * 100.0)
+                as u8,
         }
     }
 
@@ -417,7 +418,7 @@ where
     pub fn should_flush(&self) -> bool {
         !self.immutable.read().is_empty()
     }
-    
+
     /// Get number of immutable buffers waiting to flush
     pub fn immutable_count(&self) -> usize {
         self.immutable.read().len()
@@ -523,8 +524,8 @@ mod tests {
         // Verifies that drain() holds active.write lock long enough
         // to prevent an insert from pushing entries to immutable between
         // the active drain and the immutable drain phases.
-        use std::thread;
         use std::sync::{Arc, Barrier};
+        use std::thread;
 
         let buffer = Arc::new(IndexMemBuffer::<i32, String>::new(128));
         let n: i32 = 500;
@@ -553,13 +554,22 @@ mod tests {
 
         // After drain, the buffer should NOT have pre-populated entries.
         // Extra inserts might remain in active.
-        assert!(drained.len() >= n as usize, "drain should collect at least {} pre-populated entries, got {}", n, drained.len());
+        assert!(
+            drained.len() >= n as usize,
+            "drain should collect at least {} pre-populated entries, got {}",
+            n,
+            drained.len()
+        );
 
         // Verify no duplicates in drained output
         let mut keys: Vec<i32> = drained.iter().map(|(k, _)| *k).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), drained.len(), "drain output contains duplicate keys");
+        assert_eq!(
+            keys.len(),
+            drained.len(),
+            "drain output contains duplicate keys"
+        );
 
         // Extra entries from concurrent inserts should still be in active buffer
         // or drained — either way, no data is lost.
@@ -581,12 +591,23 @@ mod tests {
                 }
             }
             // Should have at least 1 immutable buffer
-            assert!(buffer.immutable_count() >= 1,
-                "round {}: expected immutable buffers after filling", round);
+            assert!(
+                buffer.immutable_count() >= 1,
+                "round {}: expected immutable buffers after filling",
+                round
+            );
 
             let drained = buffer.drain();
-            assert!(!drained.is_empty(), "round {}: drain should not be empty", round);
-            assert!(buffer.is_empty(), "round {}: buffer should be empty after drain", round);
+            assert!(
+                !drained.is_empty(),
+                "round {}: drain should not be empty",
+                round
+            );
+            assert!(
+                buffer.is_empty(),
+                "round {}: buffer should be empty after drain",
+                round
+            );
             assert_eq!(buffer.size(), 0, "round {}: buffer size should be 0", round);
         }
     }

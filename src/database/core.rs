@@ -7,30 +7,29 @@
 //! - open() with WAL recovery
 //! - Index loading helpers
 
-use std::io::Write;
+use crate::cache::RowCache;
+use crate::catalog::TableRegistry;
 use crate::config::DBConfig;
 use crate::index::btree::{BTree, BTreeConfig};
-use crate::index::vamana::{DiskANNIndex, VamanaConfig};
-use crate::index::text_fts::TextFTSIndex;
 use crate::index::column_value::ColumnValueIndex;
 use crate::index::ioctree::IOctreeIndex;
+use crate::index::text_fts::TextFTSIndex;
+use crate::index::vamana::{DiskANNIndex, VamanaConfig};
 use crate::storage::LSMEngine;
 use crate::txn::coordinator::TransactionCoordinator;
 use crate::txn::version_store::VersionStore;
 use crate::txn::wal::{WALManager, WALRecord};
 use crate::types::RowId;
-use crate::catalog::TableRegistry;
-use crate::cache::RowCache;
-use crate::{Result, StorageError, MoteDBError};
+use crate::{MoteDBError, Result, StorageError};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+use std::sync::{Arc, Mutex};
 
 /// Vector index statistics
-
 
 /// MoteDB instance
 pub struct MoteDB {
@@ -39,7 +38,7 @@ pub struct MoteDB {
 
     /// WAL manager
     pub(crate) wal: Arc<WALManager>,
-    
+
     /// LSM-Tree storage engine (main data storage)
     pub(crate) lsm_engine: Arc<LSMEngine>,
 
@@ -53,7 +52,7 @@ pub struct MoteDB {
     /// timestamp for all LSM Value writes. Initialized to max(current_time_micros,
     /// max_row_id + 1) on open, guaranteeing it exceeds any pre-existing timestamp.
     pub(crate) write_lsn: Arc<AtomicU64>,
-    
+
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
     /// 🚀 Optimized: DashMap for lock-free reads after first insert per table.
@@ -68,7 +67,7 @@ pub struct MoteDB {
 
     /// Version store for MVCC
     pub(crate) version_store: Arc<VersionStore>,
-    
+
     /// Pending index updates counter (for triggering background flush)
     /// 🚀 P0 CRITICAL FIX: 使用 AtomicUsize 避免锁竞争，解决 CPU 飙升问题
     pub(crate) pending_updates: Arc<std::sync::atomic::AtomicUsize>,
@@ -78,7 +77,7 @@ pub struct MoteDB {
 
     /// i-Octree indexes (3D point cloud) for embodied intelligence
     pub(crate) ioctree_indexes: Arc<DashMap<String, Arc<RwLock<IOctreeIndex>>>>,
-    
+
     /// 🚀 Text indexes (FTS with single-file B-Tree) - 使用 DashMap 提升并发性能
     pub(crate) text_indexes: Arc<DashMap<String, Arc<RwLock<TextFTSIndex>>>>,
 
@@ -90,18 +89,25 @@ pub struct MoteDB {
 
     /// Columnar SSTable for this table (if compaction has produced one).
     /// Stored per table: table_name → ColumnarSSTable
-    pub(crate) columnar_sstables: Arc<DashMap<String, Arc<crate::storage::lsm::columnar::ColumnarSSTable>>>,
+    pub(crate) columnar_sstables:
+        Arc<DashMap<String, Arc<crate::storage::lsm::columnar::ColumnarSSTable>>>,
 
     /// Columnar write buffer — accumulates INSERT rows across batches.
     /// Zero encoding overhead: Values pushed directly to per-column arrays.
     /// Finalized during flush/vacuum to a columnar SSTable.
-    pub(crate) columnar_write_bufs: Arc<DashMap<String, Arc<parking_lot::Mutex<crate::storage::lsm::columnar::ColumnarSSTableBuilder>>>>,
+    pub(crate) columnar_write_bufs: Arc<
+        DashMap<
+            String,
+            Arc<parking_lot::Mutex<crate::storage::lsm::columnar::ColumnarSSTableBuilder>>,
+        >,
+    >,
 
     /// 🆕 Multi-segment columnar store (append-only + compaction).
     /// Replaces the single-SSTable full-rewrite path. Each table that opts in
     /// gets a ColSegmentStore; writes append delta segments (O(1)), reads
     /// multi-way merge. Coexists with the legacy fields during migration.
-    pub(crate) col_segment_stores: Arc<DashMap<String, Arc<crate::storage::col_segment::ColSegmentStore>>>,
+    pub(crate) col_segment_stores:
+        Arc<DashMap<String, Arc<crate::storage::col_segment::ColSegmentStore>>>,
 
     /// 🚀 In-memory PK lookup: table_name → (PK_value_key → RowId)
     /// Bypasses disk-based column index for O(1) PK → row_id resolution.
@@ -115,10 +121,10 @@ pub struct MoteDB {
 
     /// Table registry (catalog)
     pub(crate) table_registry: Arc<TableRegistry>,
-    
+
     /// 🆕 Index metadata registry
     pub(crate) index_registry: Arc<crate::database::index_metadata::IndexRegistry>,
-    
+
     /// 🚀 P1: Row cache (hot data cache)
     pub(crate) row_cache: Arc<RowCache>,
 
@@ -226,18 +232,19 @@ impl MoteDB {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::create_with_config(path, DBConfig::default())
     }
-    
+
     /// Create a new database with custom configuration
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         config.validate()?;
         let path = path.as_ref();
         let db_path = path.with_extension("mote");
-        
+
         // 🎯 统一目录结构：所有文件放在 {name}.mote/ 目录下
         if db_path.exists() && db_path.join("lsm").exists() {
-            return Err(StorageError::InvalidData(
-                format!("Database already exists at {:?}; use open() instead of create()", db_path)
-            ));
+            return Err(StorageError::InvalidData(format!(
+                "Database already exists at {:?}; use open() instead of create()",
+                db_path
+            )));
         }
         std::fs::create_dir_all(&db_path)?;
 
@@ -253,18 +260,25 @@ impl MoteDB {
         // Create WAL directory with config
         std::fs::create_dir_all(&wal_path)?;
         let wal_config = crate::txn::wal::WALConfig::from(config.wal_config);
-        let wal = Arc::new(WALManager::create_with_config(&wal_path, num_partitions, wal_config)?);
+        let wal = Arc::new(WALManager::create_with_config(
+            &wal_path,
+            num_partitions,
+            wal_config,
+        )?);
 
         // Create timestamp index with BTree storage (放在 indexes/ 目录)
         std::fs::create_dir_all(&indexes_dir)?;
         let timestamp_storage = indexes_dir.join("timestamp.idx");
         let btree_config = BTreeConfig {
-            unique_keys: false,  // Allow duplicate timestamps
+            unique_keys: false, // Allow duplicate timestamps
             allow_updates: true,
             ..Default::default()
         };
-        let timestamp_index = Arc::new(RwLock::new(BTree::with_config(timestamp_storage, btree_config)?));
-        
+        let timestamp_index = Arc::new(RwLock::new(BTree::with_config(
+            timestamp_storage,
+            btree_config,
+        )?));
+
         // Create LSM-Tree storage engine
         std::fs::create_dir_all(&lsm_dir)?;
         // Use edge-optimized LSM config if memtable_size_limit differs from default
@@ -279,7 +293,9 @@ impl MoteDB {
         let table_registry = Arc::new(TableRegistry::new(&db_path)?);
 
         // 🆕 Create index metadata registry
-        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
+        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(
+            &db_path,
+        ));
 
         // 🚀 P1: Create row cache (default 10000 rows ≈ 10MB)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
@@ -302,14 +318,12 @@ impl MoteDB {
 
         // Create columnar store for TimeSeries tables (shares next_row_id and table_registry)
         let columnar_dir = db_path.join("columnar");
-        let columnar_store = Arc::new(
-            crate::storage::ColumnarStore::create(
-                &columnar_dir,
-                config.columnar_config.clone(),
-                next_row_id.clone(),
-                table_registry.clone(),
-            )?
-        );
+        let columnar_store = Arc::new(crate::storage::ColumnarStore::create(
+            &columnar_dir,
+            config.columnar_config.clone(),
+            next_row_id.clone(),
+            table_registry.clone(),
+        )?);
         // Set WAL on columnar store for crash recovery
         columnar_store.set_wal(wal.clone());
 
@@ -320,14 +334,20 @@ impl MoteDB {
             if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "sst") {
+                    if path.extension().is_some_and(|e| e == "sst") {
                         if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
                             if name.ends_with("_col") {
                                 let table_name = name.trim_end_matches("_col").to_string();
-                                if let Ok(col_sst) = crate::storage::lsm::columnar::ColumnarSSTable::open(&path) {
+                                if let Ok(col_sst) =
+                                    crate::storage::lsm::columnar::ColumnarSSTable::open(&path)
+                                {
                                     let rows = col_sst.num_rows;
                                     columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
-                                    debug_log!("[Recovery] Loaded columnar SSTable for '{}' ({} rows)", table_name, rows);
+                                    debug_log!(
+                                        "[Recovery] Loaded columnar SSTable for '{}' ({} rows)",
+                                        table_name,
+                                        rows
+                                    );
                                 }
                             }
                         }
@@ -343,7 +363,7 @@ impl MoteDB {
             if !columnar_sstables.contains_key(&table_name) {
                 if let Ok(schema) = table_registry.get_table(&table_name) {
                     let col_types = schema.col_types();
-                    match lsm_engine.compact_to_columnar(&col_types) {
+                    match lsm_engine.compact_to_columnar(col_types) {
                         Ok((col_sst, _paths)) => {
                             columnar_sstables.insert(table_name.clone(), Arc::new(col_sst));
                             debug_log!("[Recovery] Built columnar SSTable for '{}'", table_name);
@@ -407,30 +427,31 @@ impl MoteDB {
             Self::start_index_builder_pipeline(db.clone_for_callback());
         db.index_build_tx = Some(index_build_tx);
         db.index_builder_thread = Some(index_builder_thread);
-        db.is_pipeline_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        db.is_pipeline_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Set flush callback
         {
-            let tx = db.index_build_tx.clone()
-                .ok_or_else(|| StorageError::Index("Index builder pipeline not initialized".into()))?;
+            let tx = db.index_build_tx.clone().ok_or_else(|| {
+                StorageError::Index("Index builder pipeline not initialized".into())
+            })?;
             let registry = db.table_registry.clone();
             let pending = db.pending_index_batches.clone();
             let lsm = db.lsm_engine.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
                 let result = Self::extract_and_send_index_batch(memtable, &tx, &registry, &lsm);
-                if result.is_ok() && memtable.len() > 0 {
+                if result.is_ok() && !memtable.is_empty() {
                     pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 result
             })?;
         }
-        
+
         // 🚀 Start auto-checkpoint thread if enabled
-        let auto_checkpoint_thread = config.auto_checkpoint.map(|auto_config| Self::start_auto_checkpoint_thread(
-                db.clone_for_callback(),
-                auto_config,
-            ));
-        
+        let auto_checkpoint_thread = config.auto_checkpoint.map(|auto_config| {
+            Self::start_auto_checkpoint_thread(db.clone_for_callback(), auto_config)
+        });
+
         // Update db with the thread handle
         let mut db = db;
         db.auto_checkpoint_thread = auto_checkpoint_thread;
@@ -441,12 +462,13 @@ impl MoteDB {
 
         Ok(db)
     }
-    
+
     /// Check whether the async index-build pipeline is active.
     /// When active, `flush_impl` skips vector/text index flushing to avoid
     /// write-lock contention with the builder thread.
     pub(crate) fn is_async_index_pipeline_active(&self) -> bool {
-        self.is_pipeline_active.load(std::sync::atomic::Ordering::Relaxed)
+        self.is_pipeline_active
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait until all pending index build batches have been processed.
@@ -464,22 +486,32 @@ impl MoteDB {
     pub fn wait_for_indexes_ready_timeout(&self, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
         loop {
-            if self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if self
+                .pending_index_batches
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
                 return true;
             }
             // Check if index builder thread has crashed (thread handle finished but work remains)
             if let Some(ref thread) = self.index_builder_thread {
                 if let Some(ref handle) = thread.handle {
                     if handle.is_finished() {
-                        let pending = self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed);
+                        let pending = self
+                            .pending_index_batches
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         warn_log!("[wait_for_indexes_ready] Index builder thread exited with {} batches pending", pending);
                         return false;
                     }
                 }
             }
             if start.elapsed() > timeout {
-                warn_log!("[wait_for_indexes_ready] Timed out after {:?}, pending={}",
-                    timeout, self.pending_index_batches.load(std::sync::atomic::Ordering::Relaxed));
+                warn_log!(
+                    "[wait_for_indexes_ready] Timed out after {:?}, pending={}",
+                    timeout,
+                    self.pending_index_batches
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -491,15 +523,21 @@ impl MoteDB {
     /// index write locks without contention.
     pub(crate) fn signal_background_threads_stop(&self) {
         if let Some(ref thread) = self.index_builder_thread {
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            thread
+                .should_stop
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         if let Some(ref thread) = self.auto_flush_thread {
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            thread
+                .should_stop
+                .store(true, std::sync::atomic::Ordering::Release);
             // Wake the auto-flush thread from its recv_timeout
             let _ = thread.flush_tx.send(());
         }
         if let Some(ref thread) = self.auto_checkpoint_thread {
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            thread
+                .should_stop
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -539,7 +577,10 @@ impl MoteDB {
             }
 
             if start.elapsed() > timeout {
-                warn_log!("[wait_for_background_threads_stop] Timed out after {:?}", timeout);
+                warn_log!(
+                    "[wait_for_background_threads_stop] Timed out after {:?}",
+                    timeout
+                );
                 return false;
             }
 
@@ -556,7 +597,7 @@ impl MoteDB {
             timestamp_index: self.timestamp_index.clone(),
             next_row_id: self.next_row_id.clone(),
             write_lsn: self.write_lsn.clone(),
-            table_auto_increment: self.table_auto_increment.clone(),  // 🚀 Phase 4
+            table_auto_increment: self.table_auto_increment.clone(), // 🚀 Phase 4
             num_partitions: self.num_partitions,
             txn_coordinator: self.txn_coordinator.clone(),
             version_store: self.version_store.clone(),
@@ -574,24 +615,24 @@ impl MoteDB {
             pk_lookup: self.pk_lookup.clone(),
             table_row_count: self.table_row_count.clone(),
             table_registry: self.table_registry.clone(),
-            index_registry: self.index_registry.clone(),  // 🆕
+            index_registry: self.index_registry.clone(), // 🆕
             row_cache: self.row_cache.clone(),
             index_update_strategy: self.index_update_strategy.clone(),
-            query_timeout_secs: self.query_timeout_secs,  // 🚀 P0
+            query_timeout_secs: self.query_timeout_secs, // 🚀 P0
             pk_lookup_capacity: self.pk_lookup_capacity,
             column_index_buffer_size: self.column_index_buffer_size,
             max_result_rows: self.max_result_rows,
             is_flushing: self.is_flushing.clone(),
-            is_pipeline_active: self.is_pipeline_active.clone(),  // shared — clones see true when pipeline runs
+            is_pipeline_active: self.is_pipeline_active.clone(), // shared — clones see true when pipeline runs
             pending_index_batches: self.pending_index_batches.clone(),
             checkpoint_mutex: self.checkpoint_mutex.clone(),
             is_closed: self.is_closed.clone(),
-            auto_checkpoint_thread: None,  // Don't clone thread (only owned by original)
-            index_build_tx: None,  // Don't clone sender (only owned by original)
-            index_builder_thread: None,  // Don't clone thread (only owned by original)
-            auto_flush_thread: None,    // Don't clone thread (only owned by original)
-            _lock_file: std::sync::Mutex::new(None),  // Don't clone lock (only owned by original)
-            _is_clone: true,   // Skip Drop checkpoint for clones
+            auto_checkpoint_thread: None, // Don't clone thread (only owned by original)
+            index_build_tx: None,         // Don't clone sender (only owned by original)
+            index_builder_thread: None,   // Don't clone thread (only owned by original)
+            auto_flush_thread: None,      // Don't clone thread (only owned by original)
+            _lock_file: std::sync::Mutex::new(None), // Don't clone lock (only owned by original)
+            _is_clone: true,              // Skip Drop checkpoint for clones
         }
     }
 
@@ -627,10 +668,18 @@ impl MoteDB {
         // Open or create WAL (pass user config — fixes config loss on reopen)
         let wal_config = crate::txn::wal::WALConfig::from(config.wal_config.clone());
         let wal = if wal_path.exists() {
-            Arc::new(WALManager::open_with_config(&wal_path, num_partitions, wal_config)?)
+            Arc::new(WALManager::open_with_config(
+                &wal_path,
+                num_partitions,
+                wal_config,
+            )?)
         } else {
             std::fs::create_dir_all(&wal_path)?;
-            Arc::new(WALManager::create_with_config(&wal_path, num_partitions, wal_config)?)
+            Arc::new(WALManager::create_with_config(
+                &wal_path,
+                num_partitions,
+                wal_config,
+            )?)
         };
 
         // Replay WAL records into LSM Engine.
@@ -639,7 +688,7 @@ impl MoteDB {
         // (crash mid-batch) are detected by checksum verification and skipped.
         // TimeSeries data is replayed separately into the columnar store below.
         let recovered_records = wal.recover()?;
-        
+
         // Open timestamp index with BTree storage (从 indexes/ 目录)
         std::fs::create_dir_all(&indexes_dir)?;
         let timestamp_storage = indexes_dir.join("timestamp.idx");
@@ -649,10 +698,10 @@ impl MoteDB {
             ..Default::default()
         };
         let mut timestamp_idx = BTree::with_config(timestamp_storage, btree_config)?;
-        
+
         // Get total entries from timestamp index (already persisted data)
         let persisted_count = timestamp_idx.len();
-        
+
         let mut max_row_id = if persisted_count > 0 {
             // Estimate max_row_id from persisted count
             // Since row_ids are sequential starting from 0, max is count-1
@@ -682,9 +731,16 @@ impl MoteDB {
         for records in recovered_records.values() {
             for record in records {
                 match record {
-                    WALRecord::Begin { txn_id, .. } => { active_txns.insert(*txn_id); }
-                    WALRecord::Commit { txn_id, .. } => { active_txns.remove(txn_id); committed_txns.insert(*txn_id); }
-                    WALRecord::Rollback { txn_id } => { active_txns.remove(txn_id); }
+                    WALRecord::Begin { txn_id, .. } => {
+                        active_txns.insert(*txn_id);
+                    }
+                    WALRecord::Commit { txn_id, .. } => {
+                        active_txns.remove(txn_id);
+                        committed_txns.insert(*txn_id);
+                    }
+                    WALRecord::Rollback { txn_id } => {
+                        active_txns.remove(txn_id);
+                    }
                     _ => {}
                 }
             }
@@ -694,25 +750,41 @@ impl MoteDB {
         for records in recovered_records.values() {
             for record in records {
                 match record {
-                    WALRecord::Insert { row_id, data, txn_id, .. } => {
+                    WALRecord::Insert {
+                        row_id,
+                        data,
+                        txn_id,
+                        ..
+                    } => {
                         max_row_id = max_row_id.max(*row_id);
                         if *txn_id == 0 || committed_txns.contains(txn_id) {
                             if let Some(crate::types::Value::Timestamp(ts)) = data.first() {
                                 if let Err(e) = timestamp_idx.insert(ts.as_micros_u64(), *row_id) {
-                                    warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
+                                    warn_log!(
+                                        "[Recovery] Timestamp index insert failed for row {}: {}",
+                                        row_id,
+                                        e
+                                    );
                                 }
                             }
                         }
                     }
-                    WALRecord::InsertRaw { row_id, raw_data, txn_id, .. } => {
+                    WALRecord::InsertRaw {
+                        row_id,
+                        raw_data,
+                        txn_id,
+                        ..
+                    } => {
                         max_row_id = max_row_id.max(*row_id);
                         if *txn_id == 0 || committed_txns.contains(txn_id) {
                             // Extract timestamp from raw data for index
                             if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
                                 if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
-                                    if let Err(e) = timestamp_idx.insert(ts.as_micros_u64(), *row_id) {
-                                    warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
-                                }
+                                    if let Err(e) =
+                                        timestamp_idx.insert(ts.as_micros_u64(), *row_id)
+                                    {
+                                        warn_log!("[Recovery] Timestamp index insert failed for row {}: {}", row_id, e);
+                                    }
                                 }
                             }
                         }
@@ -741,28 +813,42 @@ impl MoteDB {
         // Phase 2: Redo — replay into LSM + columnar buffers simultaneously.
         // Columnar data is finalized below; LSM provides backward compat.
         // Prepare columnar builders for all tables (pre-allocate before replay)
-        let col_builders: Arc<DashMap<String, Arc<parking_lot::Mutex<
-            crate::storage::lsm::columnar::ColumnarSSTableBuilder
-        >>>> = Arc::new(DashMap::new());
+        let col_builders: Arc<
+            DashMap<
+                String,
+                Arc<parking_lot::Mutex<crate::storage::lsm::columnar::ColumnarSSTableBuilder>>,
+            >,
+        > = Arc::new(DashMap::new());
         for table_name in table_registry.list_tables()? {
             if let Ok(schema) = table_registry.get_table(&table_name) {
                 let indexes_dir = db_path.join("indexes");
                 std::fs::create_dir_all(&indexes_dir).ok();
                 let col_path = indexes_dir.join(format!("{}_col.sst", &table_name));
                 let builder = crate::storage::lsm::columnar::ColumnarSSTableBuilder::new(
-                    col_path, schema.col_types().to_vec(),
+                    col_path,
+                    schema.col_types().to_vec(),
                 );
-                col_builders.insert(table_name.clone(), Arc::new(parking_lot::Mutex::new(builder)));
+                col_builders.insert(
+                    table_name.clone(),
+                    Arc::new(parking_lot::Mutex::new(builder)),
+                );
             }
         }
 
         for records in recovered_records.values() {
             for record in records {
                 match record {
-                    WALRecord::InsertRaw { table_name, row_id, raw_data, txn_id, .. } => {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        let table_id = table_registry.get_table_id(table_name)
-                            .unwrap_or(0);
+                    WALRecord::InsertRaw {
+                        table_name,
+                        row_id,
+                        raw_data,
+                        txn_id,
+                        ..
+                    } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                            continue;
+                        }
+                        let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let value = crate::storage::lsm::Value::new(raw_data.clone(), ts);
@@ -776,8 +862,16 @@ impl MoteDB {
                         }
                         _recovered_count += 1;
                     }
-                    WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                    WALRecord::Insert {
+                        table_name,
+                        row_id,
+                        data,
+                        txn_id,
+                        ..
+                    } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                            continue;
+                        }
                         let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let row_data = bincode::serialize(data)?;
@@ -790,8 +884,16 @@ impl MoteDB {
                         }
                         _recovered_count += 1;
                     }
-                    WALRecord::UpdateRaw { table_name, row_id, raw_new, txn_id, .. } => {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                    WALRecord::UpdateRaw {
+                        table_name,
+                        row_id,
+                        raw_new,
+                        txn_id,
+                        ..
+                    } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                            continue;
+                        }
                         let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -805,8 +907,16 @@ impl MoteDB {
                         }
                         _recovered_count += 1;
                     }
-                    WALRecord::Update { table_name, row_id, new_data, txn_id, .. } => {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
+                    WALRecord::Update {
+                        table_name,
+                        row_id,
+                        new_data,
+                        txn_id,
+                        ..
+                    } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                            continue;
+                        }
                         let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let row_data = bincode::serialize(new_data)?;
@@ -815,23 +925,38 @@ impl MoteDB {
                         lsm_engine.put(composite_key, value)?;
                         if let Some(builder_arc) = col_builders.get(table_name) {
                             let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
-                            let _ = builder_arc.value().lock().add_values(key, ts, false, new_data);
+                            let _ = builder_arc
+                                .value()
+                                .lock()
+                                .add_values(key, ts, false, new_data);
                         }
                         _recovered_count += 1;
                     }
-                    WALRecord::DeleteRaw { table_name, row_id, txn_id, .. } => {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        let table_id = table_registry.get_table_id(table_name)
-                            .unwrap_or(0);
+                    WALRecord::DeleteRaw {
+                        table_name,
+                        row_id,
+                        txn_id,
+                        ..
+                    } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                            continue;
+                        }
+                        let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         lsm_engine.delete(composite_key, ts)?;
                         _recovered_count += 1;
                     }
-                    WALRecord::Delete { table_name, row_id, txn_id, .. } => {
-                        if *txn_id != 0 && !committed_txns.contains(txn_id) { continue; }
-                        let table_id = table_registry.get_table_id(table_name)
-                            .unwrap_or(0);
+                    WALRecord::Delete {
+                        table_name,
+                        row_id,
+                        txn_id,
+                        ..
+                    } => {
+                        if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                            continue;
+                        }
+                        let table_id = table_registry.get_table_id(table_name).unwrap_or(0);
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
 
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -842,16 +967,24 @@ impl MoteDB {
                 }
             }
         }
-        debug_log!("[database] WAL 恢复完成，恢复了 {} 条记录", _recovered_count);
+        debug_log!(
+            "[database] WAL 恢复完成，恢复了 {} 条记录",
+            _recovered_count
+        );
 
         // Create version store and transaction coordinator
         let version_store = Arc::new(VersionStore::new());
         let txn_coordinator = Arc::new(TransactionCoordinator::new(version_store.clone()));
 
         // 🆕 Load index metadata registry first (needed for metric info)
-        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(&db_path));
+        let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(
+            &db_path,
+        ));
         if let Err(e) = index_registry.load() {
-            debug_log!("[database] ⚠️ Failed to load index_metadata: {:?}. Indexes will need rebuild.", e);
+            debug_log!(
+                "[database] ⚠️ Failed to load index_metadata: {:?}. Indexes will need rebuild.",
+                e
+            );
             // Not fatal — indexes can be rebuilt, but user should be warned
         }
 
@@ -866,7 +999,7 @@ impl MoteDB {
 
         // Load existing column indexes
         let column_indexes = Self::load_column_indexes(&db_path, &index_registry)?;
-        
+
         // 🚀 P1: Create row cache (use config or default 10000)
         let row_cache = Arc::new(RowCache::new(config.row_cache_size.unwrap_or(10000)));
 
@@ -891,7 +1024,10 @@ impl MoteDB {
                                 let path = sub_entry.path();
                                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                                     if name.ends_with(".mcdb.tmp") {
-                                        debug_log!("[database] Cleaning up temp columnar segment: {:?}", path);
+                                        debug_log!(
+                                            "[database] Cleaning up temp columnar segment: {:?}",
+                                            path
+                                        );
                                         let _ = std::fs::remove_file(&path);
                                     }
                                 }
@@ -902,14 +1038,12 @@ impl MoteDB {
             }
         }
 
-        let columnar_store = Arc::new(
-            crate::storage::ColumnarStore::create(
-                &columnar_dir,
-                config.columnar_config.clone(),
-                next_row_id.clone(),
-                table_registry.clone(),
-            )?
-        );
+        let columnar_store = Arc::new(crate::storage::ColumnarStore::create(
+            &columnar_dir,
+            config.columnar_config.clone(),
+            next_row_id.clone(),
+            table_registry.clone(),
+        )?);
 
         // Register existing TimeSeries tables with columnar store
         for table_name in table_registry.list_tables()? {
@@ -917,7 +1051,11 @@ impl MoteDB {
                 if schema.table_type == crate::types::TableType::TimeSeries {
                     if let Ok(table_id) = table_registry.get_table_id(&table_name) {
                         if let Err(e) = columnar_store.register_table(table_id, &schema) {
-                            debug_log!("[database] ⚠️ Failed to register columnar table '{}': {:?}", table_name, e);
+                            debug_log!(
+                                "[database] ⚠️ Failed to register columnar table '{}': {:?}",
+                                table_name,
+                                e
+                            );
                         }
                     }
                 }
@@ -935,10 +1073,20 @@ impl MoteDB {
             for records in recovered_records.values() {
                 for record in records {
                     let (table_name, row_id, txn_id, row_data) = match record {
-                        WALRecord::Insert { table_name, row_id, data, txn_id, .. } => {
-                            (table_name.clone(), *row_id, *txn_id, data.clone())
-                        }
-                        WALRecord::InsertRaw { table_name, row_id, raw_data, txn_id, .. } => {
+                        WALRecord::Insert {
+                            table_name,
+                            row_id,
+                            data,
+                            txn_id,
+                            ..
+                        } => (table_name.clone(), *row_id, *txn_id, data.clone()),
+                        WALRecord::InsertRaw {
+                            table_name,
+                            row_id,
+                            raw_data,
+                            txn_id,
+                            ..
+                        } => {
                             let row = match crate::storage::row_format::decode_any(raw_data) {
                                 Ok(r) => r,
                                 Err(_) => continue,
@@ -947,11 +1095,18 @@ impl MoteDB {
                         }
                         _ => continue,
                     };
-                    if txn_id != 0 && !committed_txns.contains(&txn_id) { continue; }
+                    if txn_id != 0 && !committed_txns.contains(&txn_id) {
+                        continue;
+                    }
                     if let Ok(schema) = table_registry.get_table(&table_name) {
                         if schema.table_type == crate::types::TableType::TimeSeries {
-                            if let Err(e) = columnar_store.replay_row(&table_name, row_id, row_data) {
-                                debug_log!("[database] ⚠️ Failed to replay columnar row for '{}': {:?}", table_name, e);
+                            if let Err(e) = columnar_store.replay_row(&table_name, row_id, row_data)
+                            {
+                                debug_log!(
+                                    "[database] ⚠️ Failed to replay columnar row for '{}': {:?}",
+                                    table_name,
+                                    e
+                                );
                             }
                             columnar_replay_count += 1;
                         }
@@ -959,7 +1114,10 @@ impl MoteDB {
                 }
             }
             if columnar_replay_count > 0 {
-                debug_log!("[database] Replayed {} columnar rows from WAL", columnar_replay_count);
+                debug_log!(
+                    "[database] Replayed {} columnar rows from WAL",
+                    columnar_replay_count
+                );
             }
         }
 
@@ -1019,9 +1177,13 @@ impl MoteDB {
                             let table_name = entry.file_name().to_string_lossy().to_string();
                             if let Ok(schema) = db.table_registry.get_table(&table_name) {
                                 let col_types = schema.col_types().to_vec();
-                                if let Ok(store) = crate::storage::col_segment::ColSegmentStore::create(
-                                    &db.path, &table_name, col_types,
-                                ) {
+                                if let Ok(store) =
+                                    crate::storage::col_segment::ColSegmentStore::create(
+                                        &db.path,
+                                        &table_name,
+                                        col_types,
+                                    )
+                                {
                                     store.recover_from_disk();
                                     // Pre-compact to single segment so queries
                                     // use fast SelectColumnar path (zero-copy).
@@ -1040,13 +1202,16 @@ impl MoteDB {
             // Without this, the non-AUTO_INCREMENT row_id counter resets to 0/1
             // after reopen, causing key collisions and data loss (the 3-cycle
             // count=2 bug — cycle 3 reused row_id 1 instead of allocating 2).
-            let max_seg_row_id = db.col_segment_stores.iter()
+            let max_seg_row_id = db
+                .col_segment_stores
+                .iter()
                 .map(|e| e.value().max_row_id())
                 .max()
                 .unwrap_or(0);
             let current = db.next_row_id.load(std::sync::atomic::Ordering::Relaxed);
             if max_seg_row_id + 1 > current {
-                db.next_row_id.store(max_seg_row_id + 1, std::sync::atomic::Ordering::Relaxed);
+                db.next_row_id
+                    .store(max_seg_row_id + 1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -1055,7 +1220,8 @@ impl MoteDB {
             Self::start_index_builder_pipeline(db.clone_for_callback());
         db.index_build_tx = Some(index_build_tx);
         db.index_builder_thread = Some(index_builder_thread);
-        db.is_pipeline_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        db.is_pipeline_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         {
             let tx = db.index_build_tx.clone().unwrap();
@@ -1064,7 +1230,7 @@ impl MoteDB {
             let lsm = db.lsm_engine.clone();
             db.lsm_engine.set_flush_callback(move |memtable| {
                 let result = Self::extract_and_send_index_batch(memtable, &tx, &registry, &lsm);
-                if result.is_ok() && memtable.len() > 0 {
+                if result.is_ok() && !memtable.is_empty() {
                     pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 result
@@ -1072,9 +1238,9 @@ impl MoteDB {
         }
 
         // 🚀 Start auto-checkpoint thread (only if config provided, matching create behavior)
-        let auto_checkpoint_thread = config.auto_checkpoint.map(|cfg| {
-            Self::start_auto_checkpoint_thread(db.clone_for_callback(), cfg)
-        });
+        let auto_checkpoint_thread = config
+            .auto_checkpoint
+            .map(|cfg| Self::start_auto_checkpoint_thread(db.clone_for_callback(), cfg));
 
         db.auto_checkpoint_thread = auto_checkpoint_thread;
 
@@ -1088,13 +1254,14 @@ impl MoteDB {
             let schema = db.table_registry.get_table(&table_name)?;
             if schema.is_primary_key_auto_increment() {
                 let max_id = db.recover_auto_increment_counter(&table_name, &schema)?;
-                debug_log!("[database] 🔄 Recovered AUTO_INCREMENT counter for '{}': next_id = {}",
-                    table_name, max_id + 1);
-
-                db.table_auto_increment.insert(
-                    table_name.clone(),
-                    Arc::new(AtomicI64::new(max_id + 1))
+                debug_log!(
+                    "[database] 🔄 Recovered AUTO_INCREMENT counter for '{}': next_id = {}",
+                    table_name,
+                    max_id + 1
                 );
+
+                db.table_auto_increment
+                    .insert(table_name.clone(), Arc::new(AtomicI64::new(max_id + 1)));
 
                 // Initialize row count counter (will count via streaming scan)
                 let row_counter = Arc::new(AtomicU64::new(0));
@@ -1104,7 +1271,9 @@ impl MoteDB {
                 if let Ok(stream) = db.lsm_engine.scan_range_streaming(start_key, end_key) {
                     let mut cnt = 0u64;
                     for (_, value) in stream.flatten() {
-                        if !value.deleted { cnt += 1; }
+                        if !value.deleted {
+                            cnt += 1;
+                        }
                     }
                     row_counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1122,10 +1291,10 @@ impl MoteDB {
                 db.warm_pk_cache(&table_name, &schema, pk_col);
             }
         }
-        
+
         Ok(db)
     }
-    
+
     /// Pre-warm PK lookup cache by scanning SSTable data for a table.
     /// This avoids cold-start misses where every PK SELECT requires a full SSTable scan.
     fn warm_pk_cache(&self, table_name: &str, schema: &crate::types::TableSchema, pk_col: &str) {
@@ -1135,11 +1304,15 @@ impl MoteDB {
         };
 
         // Create the PK lookup cache for this table
-        let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(self.pk_lookup_capacity));
-        self.pk_lookup.insert(table_name.to_string(), pk_cache.clone());
+        let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(
+            self.pk_lookup_capacity,
+        ));
+        self.pk_lookup
+            .insert(table_name.to_string(), pk_cache.clone());
 
         // Initialize row count counter
-        self.table_row_count.insert(table_name.to_string(), Arc::new(AtomicU64::new(0)));
+        self.table_row_count
+            .insert(table_name.to_string(), Arc::new(AtomicU64::new(0)));
 
         // Scan LSM for this table's data
         let table_prefix = self.compute_table_prefix(table_name);
@@ -1170,15 +1343,24 @@ impl MoteDB {
                     }
                 };
 
-                if let Ok(pk_value) = crate::storage::row_format::get_column(&data_bytes, col_types, pk_position) {
-                    pk_cache.insert(crate::database::pk_cache::PkKey::from_value(&pk_value), row_id);
+                if let Ok(pk_value) =
+                    crate::storage::row_format::get_column(&data_bytes, col_types, pk_position)
+                {
+                    pk_cache.insert(
+                        crate::database::pk_cache::PkKey::from_value(&pk_value),
+                        row_id,
+                    );
                     count += 1;
                 }
             }
         }
 
         if count > 0 {
-            debug_log!("[warm_pk_cache] ✅ Pre-warmed PK cache for '{}': {} entries", table_name, count);
+            debug_log!(
+                "[warm_pk_cache] ✅ Pre-warmed PK cache for '{}': {} entries",
+                table_name,
+                count
+            );
             // Set row count from recovered data
             if let Some(counter) = self.table_row_count.get(table_name) {
                 counter.store(count as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1204,30 +1386,38 @@ impl MoteDB {
         }
         dashmap
     }
-    
+
     /// 🆕 Set AUTO_INCREMENT value for a table
-    /// 
+    ///
     /// # Arguments
     /// * `table_name` - Table name
     /// * `new_value` - New AUTO_INCREMENT starting value
-    /// 
+    ///
     /// # Errors
     /// Returns error if table doesn't exist or doesn't have AUTO_INCREMENT
     pub fn set_auto_increment_value(&self, table_name: &str, new_value: i64) -> Result<()> {
         // Verify table has AUTO_INCREMENT
         if let Some(counter_ref) = self.table_auto_increment.get(table_name) {
             counter_ref.store(new_value, std::sync::atomic::Ordering::SeqCst);
-            debug_log!("[database] ✓ Set AUTO_INCREMENT for '{}' to {}", table_name, new_value);
+            debug_log!(
+                "[database] ✓ Set AUTO_INCREMENT for '{}' to {}",
+                table_name,
+                new_value
+            );
             Ok(())
         } else {
-            Err(MoteDBError::InvalidArgument(
-                format!("Table {} does not have AUTO_INCREMENT", table_name)
-            ))
+            Err(MoteDBError::InvalidArgument(format!(
+                "Table {} does not have AUTO_INCREMENT",
+                table_name
+            )))
         }
     }
-    
+
     /// Load existing vector indexes from disk
-    fn load_vector_indexes(db_path: &Path, index_registry: &crate::database::index_metadata::IndexRegistry) -> Result<HashMap<String, Arc<RwLock<DiskANNIndex>>>> {
+    fn load_vector_indexes(
+        db_path: &Path,
+        index_registry: &crate::database::index_metadata::IndexRegistry,
+    ) -> Result<HashMap<String, Arc<RwLock<DiskANNIndex>>>> {
         let mut indexes = HashMap::new();
 
         // 🎯 从统一目录加载：{db}.mote/indexes/vector_*/
@@ -1244,7 +1434,8 @@ impl MoteDB {
                             let index_path = entry.path();
 
                             // Resolve metric from metadata registry
-                            let distance_kind = index_registry.get(index_name)
+                            let distance_kind = index_registry
+                                .get(index_name)
                                 .and_then(|meta| meta.metric.clone())
                                 .map(|m| match m.as_str() {
                                     "cosine" => crate::distance::DistanceKind::Cosine,
@@ -1254,11 +1445,13 @@ impl MoteDB {
 
                             let config = VamanaConfig::default().with_metric(distance_kind);
                             if let Ok(index) = DiskANNIndex::load(&index_path, config) {
-                                indexes.insert(
-                                    index_name.to_string(),
-                                    Arc::new(RwLock::new(index))
+                                indexes
+                                    .insert(index_name.to_string(), Arc::new(RwLock::new(index)));
+                                debug_log!(
+                                    "[MoteDB] Loaded vector index: {} (metric={:?})",
+                                    index_name,
+                                    distance_kind
                                 );
-                                debug_log!("[MoteDB] Loaded vector index: {} (metric={:?})", index_name, distance_kind);
                             }
                         }
                     }
@@ -1268,21 +1461,24 @@ impl MoteDB {
 
         Ok(indexes)
     }
-    
+
     /// Load existing text indexes from disk
     fn load_text_indexes(db_path: &Path) -> Result<HashMap<String, Arc<RwLock<TextFTSIndex>>>> {
         let mut indexes = HashMap::new();
-        
+
         // 🧹 Clean up legacy text_indexes_metadata.bin (no longer used)
         let legacy_metadata_path = db_path.join("text_indexes_metadata.bin");
         if legacy_metadata_path.exists() {
             if let Err(e) = std::fs::remove_file(&legacy_metadata_path) {
-                debug_log!("⚠️ Failed to remove legacy text_indexes_metadata.bin: {}", e);
+                debug_log!(
+                    "⚠️ Failed to remove legacy text_indexes_metadata.bin: {}",
+                    e
+                );
             } else {
                 debug_log!("[MoteDB] 🧹 Removed legacy text_indexes_metadata.bin (replaced by index_metadata.bin)");
             }
         }
-        
+
         // 🎯 从统一目录加载：{db}.mote/indexes/text_*/
         let indexes_dir = db_path.join("indexes");
         if indexes_dir.exists() {
@@ -1295,13 +1491,11 @@ impl MoteDB {
                                 None => continue,
                             };
                             let index_path = entry.path();
-                            
+
                             // Try to load the index
                             if let Ok(index) = TextFTSIndex::new(index_path) {
-                                indexes.insert(
-                                    index_name.to_string(),
-                                    Arc::new(RwLock::new(index))
-                                );
+                                indexes
+                                    .insert(index_name.to_string(), Arc::new(RwLock::new(index)));
                                 debug_log!("[MoteDB] Loaded text index: {}", index_name);
                             }
                         }
@@ -1334,7 +1528,7 @@ impl MoteDB {
                                 if let Ok(index) = IOctreeIndex::load_from_path(&index_file) {
                                     indexes.insert(
                                         index_name.to_string(),
-                                        Arc::new(RwLock::new(index))
+                                        Arc::new(RwLock::new(index)),
                                     );
                                     debug_log!("[MoteDB] Loaded ioctree index: {}", index_name);
                                 }
@@ -1384,20 +1578,27 @@ impl MoteDB {
                     if parts.len() == 2 {
                         (parts[0].to_string(), parts[1].to_string())
                     } else {
-                        debug_log!("[load_column_indexes] Skipping {}: cannot resolve table/column", name);
+                        debug_log!(
+                            "[load_column_indexes] Skipping {}: cannot resolve table/column",
+                            name
+                        );
                         continue;
                     }
                 }
             };
 
             let config = crate::index::column_value::ColumnValueIndexConfig::default();
-            match ColumnValueIndex::open(&entry.path(), table_name, column_name, config) {
+            match ColumnValueIndex::open(entry.path(), table_name, column_name, config) {
                 Ok(index) => {
                     debug_log!("[MoteDB] Loaded column index: {}", index_name);
                     indexes.insert(index_name, Arc::new(index));
                 }
                 Err(e) => {
-                    debug_log!("[MoteDB] Failed to load column index {}: {:?}", index_name, e);
+                    debug_log!(
+                        "[MoteDB] Failed to load column index {}: {:?}",
+                        index_name,
+                        e
+                    );
                 }
             }
         }
@@ -1432,20 +1633,31 @@ impl MoteDB {
                                 }
                                 impl Drop for BatchGuard {
                                     fn drop(&mut self) {
-                                        self.pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                        self.pending
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
-                                let _guard = BatchGuard { pending: db.pending_index_batches.clone() };
+                                let _guard = BatchGuard {
+                                    pending: db.pending_index_batches.clone(),
+                                };
 
                                 for (table_name, raw_rows) in &batch.tables_data {
-                                    if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
-                                        warn_log!("[IndexBuilder] Index build failed for '{}': {:?}",
-                                            table_name, e);
-                                        db.index_build_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if let Err(e) =
+                                        db.batch_build_table_indexes_raw(table_name, raw_rows)
+                                    {
+                                        warn_log!(
+                                            "[IndexBuilder] Index build failed for '{}': {:?}",
+                                            table_name,
+                                            e
+                                        );
+                                        db.index_build_errors
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
-                                debug_log!("[IndexBuilder] Processed batch ({} tables)",
-                                    batch.tables_data.len());
+                                debug_log!(
+                                    "[IndexBuilder] Processed batch ({} tables)",
+                                    batch.tables_data.len()
+                                );
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1472,10 +1684,13 @@ impl MoteDB {
             })
             .expect("Failed to spawn index-builder thread");
 
-        (tx, IndexBuilderThread {
-            handle: Some(handle),
-            should_stop,
-        })
+        (
+            tx,
+            IndexBuilderThread {
+                handle: Some(handle),
+                should_stop,
+            },
+        )
     }
 
     /// Extract rows from a flushed memtable and send through the channel.
@@ -1534,7 +1749,10 @@ impl MoteDB {
                 Some(name) => name,
                 None => continue, // Unknown table — skip
             };
-            tables_data.entry(table_name.to_string()).or_default().push((row_id, row_bytes));
+            tables_data
+                .entry(table_name.to_string())
+                .or_default()
+                .push((row_id, row_bytes));
         }
 
         if !tables_data.is_empty() {
@@ -1545,9 +1763,9 @@ impl MoteDB {
 
         Ok(())
     }
-    
+
     /// Start auto-checkpoint background thread
-    /// 
+    ///
     /// 🚀 Optimized for embedded environments:
     /// 1. Lazy-checking: Only checks WAL size when interval reached (no unnecessary fs calls)
     /// 2. Start a single background thread for auto-flush requests.
@@ -1570,7 +1788,8 @@ impl MoteDB {
                                 while flush_rx.try_recv().is_ok() {}
                                 if let Err(e) = db.flush() {
                                     warn_log!("[AutoFlush] Flush failed: {}", e);
-                                    db.flush_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    db.flush_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 true
                             }
@@ -1581,7 +1800,9 @@ impl MoteDB {
                     match result {
                         Ok(true) => {}
                         Ok(false) | Err(_) => {
-                            if result.is_ok() { break; } // disconnected
+                            if result.is_ok() {
+                                break;
+                            } // disconnected
                             eprintln!("[MoteDB] Auto-flush thread panicked, restarting...");
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
@@ -1616,24 +1837,26 @@ impl MoteDB {
         config: crate::config::AutoCheckpointConfig,
     ) -> AutoCheckpointThread {
         use std::time::{Duration, Instant};
-        
+
         let should_stop = Arc::new(AtomicBool::new(false));
         let should_stop_clone = should_stop.clone();
-        
+
         let handle = std::thread::spawn(move || {
             let mut last_checkpoint = Instant::now();
-            
+
             // 🚀 Adaptive check interval:
             // - Start with min_interval (avoid too-frequent checks)
             // - Only check WAL size when interval reached
             let check_interval = Duration::from_secs(config.min_interval_secs.max(10));
-            
+
             debug_log!("[AutoCheckpoint] 🚀 Background thread started (embedded-optimized)");
-            debug_log!("[AutoCheckpoint] Config: max_wal={}MB, interval={}s, check_every={}s",
-                config.max_wal_size_bytes / 1024 / 1024, 
+            debug_log!(
+                "[AutoCheckpoint] Config: max_wal={}MB, interval={}s, check_every={}s",
+                config.max_wal_size_bytes / 1024 / 1024,
                 config.min_interval_secs,
-                check_interval.as_secs());
-            
+                check_interval.as_secs()
+            );
+
             while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                 // 🚀 **CRITICAL FIX**: Use interruptible sleep (check every 1s)
                 // This allows fast shutdown when Drop is called
@@ -1643,32 +1866,35 @@ impl MoteDB {
                         debug_log!("[AutoCheckpoint] 🛑 Shutdown signal received during sleep");
                         break;
                     }
-                    
+
                     // Use 100ms chunks so shutdown is responsive (was 1s)
                     let sleep_chunk = Duration::from_millis(100).min(remaining);
                     std::thread::sleep(sleep_chunk);
                     remaining = remaining.saturating_sub(sleep_chunk);
                 }
-                
+
                 // Check if stop signal was set during sleep
                 if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
-                
+
                 // 🚀 Only check WAL size when enough time has passed
                 // (avoids unnecessary filesystem calls)
                 let elapsed = last_checkpoint.elapsed();
                 if elapsed.as_secs() < config.min_interval_secs {
                     continue;
                 }
-                
+
                 // 🚀 Lazy WAL size check - only when needed
                 let wal_dir = db.path.join("wal");
                 match super::helpers::dir_size(&wal_dir) {
                     Ok(wal_size) if wal_size >= config.max_wal_size_bytes => {
-                        debug_log!("[AutoCheckpoint] 🔔 Trigger: WAL {}MB >= {}MB",
-                            wal_size / 1024 / 1024, config.max_wal_size_bytes / 1024 / 1024);
-                        
+                        debug_log!(
+                            "[AutoCheckpoint] 🔔 Trigger: WAL {}MB >= {}MB",
+                            wal_size / 1024 / 1024,
+                            config.max_wal_size_bytes / 1024 / 1024
+                        );
+
                         // Trigger checkpoint
                         if let Err(e) = db.checkpoint() {
                             debug_log!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
@@ -1685,16 +1911,16 @@ impl MoteDB {
                     }
                 }
             }
-            
+
             debug_log!("[AutoCheckpoint] 👋 Background thread stopped");
         });
-        
+
         AutoCheckpointThread {
             handle: Some(handle),
             should_stop,
         }
     }
-    
+
     /// 🚀 Phase 5: Recover AUTO_INCREMENT counter (B3: Crash Recovery)
     ///
     /// Fast path: Read persisted counter from catalog.bin (O(1)).
@@ -1706,18 +1932,22 @@ impl MoteDB {
     ) -> Result<i64> {
         // Fast path: use persisted counter from catalog.bin
         if let Some(persisted_max) = self.table_registry.get_auto_increment_counter(table_name) {
-            debug_log!("[database] ⚡ Recovered AUTO_INCREMENT for '{}' from catalog: {}", table_name, persisted_max);
+            debug_log!(
+                "[database] ⚡ Recovered AUTO_INCREMENT for '{}' from catalog: {}",
+                table_name,
+                persisted_max
+            );
             return Ok(persisted_max);
         }
 
         // Slow path: scan all rows to find max ID
         use crate::types::Value;
 
-        let pk_col_name = schema.primary_key()
-            .ok_or_else(|| StorageError::InvalidData(
-                format!("Table '{}' has no primary key", table_name)
-            ))?;
-        let pk_col = schema.get_column(pk_col_name)
+        let pk_col_name = schema.primary_key().ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' has no primary key", table_name))
+        })?;
+        let pk_col = schema
+            .get_column(pk_col_name)
             .ok_or_else(|| StorageError::ColumnNotFound(pk_col_name.to_string()))?;
 
         let mut max_id = schema.get_auto_increment_start() - 1;
@@ -1732,7 +1962,10 @@ impl MoteDB {
                             }
                         }
                         Err(_e) => {
-                            debug_log!("[database] Warning: Error during AUTO_INCREMENT scan: {:?}", _e);
+                            debug_log!(
+                                "[database] Warning: Error during AUTO_INCREMENT scan: {:?}",
+                                _e
+                            );
                             break;
                         }
                     }
@@ -1783,7 +2016,7 @@ impl MoteDB {
                     || err.raw_os_error() == Some(libc::EWOULDBLOCK)
                 {
                     return Err(StorageError::InvalidData(
-                        "Database is already open by another process".into()
+                        "Database is already open by another process".into(),
                     ));
                 }
                 return Err(StorageError::Io(err));
@@ -1821,15 +2054,27 @@ impl MoteDB {
         match std::fs::File::create(&path) {
             Ok(mut file) => {
                 if let Err(e) = file.write_all(&lsn.to_le_bytes()) {
-                    warn_log!("[persist_lsn_counter] write failed {}: {}", path.display(), e);
+                    warn_log!(
+                        "[persist_lsn_counter] write failed {}: {}",
+                        path.display(),
+                        e
+                    );
                     return;
                 }
                 if let Err(e) = file.sync_all() {
-                    warn_log!("[persist_lsn_counter] fsync failed {}: {}", path.display(), e);
+                    warn_log!(
+                        "[persist_lsn_counter] fsync failed {}: {}",
+                        path.display(),
+                        e
+                    );
                 }
             }
             Err(e) => {
-                warn_log!("[persist_lsn_counter] create failed {}: {}", path.display(), e);
+                warn_log!(
+                    "[persist_lsn_counter] create failed {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -1847,12 +2092,12 @@ impl MoteDB {
 }
 
 /// Automatic cleanup when database is dropped
-/// 
+///
 /// This ensures proper shutdown:
 /// 1. Flush all in-memory data (MemTable → SSTable)
 /// 2. Persist all indexes
 /// 3. Checkpoint WAL (truncate log files)
-/// 
+///
 /// This prevents WAL files from accumulating indefinitely and ensures
 /// clean shutdown even if user forgets to call checkpoint().
 impl Drop for MoteDB {
@@ -1867,21 +2112,31 @@ impl Drop for MoteDB {
         if let Some(mut thread) = self.index_builder_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping index builder thread...");
             self.index_build_tx = None;
-            self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Relaxed);
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            self.is_pipeline_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            thread
+                .should_stop
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Some(handle) = thread.handle.take() {
                 Self::join_with_timeout("index-builder", handle, std::time::Duration::from_secs(5));
             }
         }
         self.index_build_tx = None;
-        self.is_pipeline_active.store(false, std::sync::atomic::Ordering::Release);
+        self.is_pipeline_active
+            .store(false, std::sync::atomic::Ordering::Release);
 
         // 🛑 Step 2: Stop auto-checkpoint thread
         if let Some(mut thread) = self.auto_checkpoint_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-checkpoint thread...");
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            thread
+                .should_stop
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Some(handle) = thread.handle.take() {
-                Self::join_with_timeout("auto-checkpoint", handle, std::time::Duration::from_secs(5));
+                Self::join_with_timeout(
+                    "auto-checkpoint",
+                    handle,
+                    std::time::Duration::from_secs(5),
+                );
             }
             debug_log!("[MoteDB::Drop] ✅ Auto-checkpoint thread stopped");
         }
@@ -1889,7 +2144,9 @@ impl Drop for MoteDB {
         // 🛑 Step 2.5: Stop auto-flush thread
         if let Some(mut thread) = self.auto_flush_thread.take() {
             debug_log!("[MoteDB::Drop] 🛑 Stopping auto-flush thread...");
-            thread.should_stop.store(true, std::sync::atomic::Ordering::Release);
+            thread
+                .should_stop
+                .store(true, std::sync::atomic::Ordering::Release);
             // Drop sender to unblock recv
             drop(thread.flush_tx);
             if let Some(handle) = thread.handle.take() {
@@ -1910,7 +2167,7 @@ impl Drop for MoteDB {
         } else {
             debug_log!("[MoteDB::Drop] ✅ Final checkpoint complete, WAL cleaned");
         }
-        
+
         debug_log!("[MoteDB::Drop] 👋 Database closed cleanly");
     }
 }

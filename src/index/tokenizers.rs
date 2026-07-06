@@ -58,10 +58,10 @@
 //! }
 //! ```
 // 导出核心 trait 和数据结构
-pub use crate::index::text_types::{Tokenizer, Token, Position};
+pub use crate::index::text_types::{Position, Token, Tokenizer};
 
 // 导出内置分词器（零依赖，始终可用）
-pub use crate::index::text_types::{WhitespaceTokenizer, NgramTokenizer};
+pub use crate::index::text_types::{NgramTokenizer, WhitespaceTokenizer};
 
 //=============================================================================
 // 🔌 Plugin: Jieba 中文分词器（可选）
@@ -116,7 +116,7 @@ mod jieba_plugin {
         fn default() -> Self {
             Self {
                 jieba: Arc::new(Jieba::new()),
-                mode: JiebaMode::Search,  // 默认搜索模式，适合全文检索
+                mode: JiebaMode::Search, // 默认搜索模式，适合全文检索
                 case_sensitive: false,
                 min_len: 1,
                 max_len: 64,
@@ -193,8 +193,11 @@ mod jieba_plugin {
         fn test_jieba_tokenizer() {
             let tokenizer = JiebaTokenizer::default();
             let tokens = tokenizer.tokenize("我爱自然语言处理");
-            
-            debug_log!("Tokens: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+
+            debug_log!(
+                "Tokens: {:?}",
+                tokens.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
             assert!(!tokens.is_empty());
             assert!(tokens.iter().any(|t| t.text == "自然语言"));
         }
@@ -206,23 +209,32 @@ mod jieba_plugin {
             // 精确模式
             let precise = JiebaTokenizer::default().with_mode(JiebaMode::Precise);
             let tokens = precise.tokenize(text);
-            debug_log!("Precise: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!(
+                "Precise: {:?}",
+                tokens.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
 
             // 全模式
             let full = JiebaTokenizer::default().with_mode(JiebaMode::Full);
             let tokens = full.tokenize(text);
-            debug_log!("Full: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!(
+                "Full: {:?}",
+                tokens.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
 
             // 搜索模式
             let search = JiebaTokenizer::default().with_mode(JiebaMode::Search);
             let tokens = search.tokenize(text);
-            debug_log!("Search: {:?}", tokens.iter().map(|t| &t.text).collect::<Vec<_>>());
+            debug_log!(
+                "Search: {:?}",
+                tokens.iter().map(|t| &t.text).collect::<Vec<_>>()
+            );
         }
     }
 }
 
 #[cfg(feature = "tokenizer-jieba")]
-pub use jieba_plugin::{JiebaTokenizer, JiebaMode};
+pub use jieba_plugin::{JiebaMode, JiebaTokenizer};
 
 //=============================================================================
 // 🔌 Future Plugins (Placeholder)
@@ -331,7 +343,7 @@ mod tests {
     fn test_custom_tokenizer() {
         // 用户自定义分词器示例
         struct CharTokenizer;
-        
+
         impl Tokenizer for CharTokenizer {
             fn tokenize(&self, text: &str) -> Vec<Token> {
                 text.chars()
@@ -342,7 +354,7 @@ mod tests {
                     })
                     .collect()
             }
-            
+
             fn name(&self) -> &str {
                 "char"
             }

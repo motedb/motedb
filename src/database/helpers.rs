@@ -5,7 +5,7 @@
 //! Rows are sent as raw bytes from the flush callback and decoded
 //! lazily in the builder thread to minimize flush latency.
 
-use crate::types::{Row, RowId, Value, TableSchema};
+use crate::types::{Row, RowId, TableSchema, Value};
 use crate::{Result, StorageError};
 
 use super::core::MoteDB;
@@ -31,7 +31,11 @@ impl MoteDB {
     ///
     /// Receives raw bytes from the flush callback, decodes them using schema,
     /// then dispatches to 4 parallel index builder threads sharing one Arc.
-    pub(crate) fn batch_build_table_indexes_raw(&self, table_name: &str, raw_rows: &[(RowId, Vec<u8>)]) -> Result<()> {
+    pub(crate) fn batch_build_table_indexes_raw(
+        &self,
+        table_name: &str,
+        raw_rows: &[(RowId, Vec<u8>)],
+    ) -> Result<()> {
         use std::sync::Arc;
         use std::time::Instant;
         let _start = Instant::now();
@@ -39,7 +43,11 @@ impl MoteDB {
         let schema = match self.table_registry.get_table(table_name) {
             Ok(s) => s,
             Err(e) => {
-                debug_log!("[BatchIndexBuilder] Table '{}' not found during index build: {}", table_name, e);
+                debug_log!(
+                    "[BatchIndexBuilder] Table '{}' not found during index build: {}",
+                    table_name,
+                    e
+                );
                 return Ok(());
             }
         };
@@ -61,14 +69,22 @@ impl MoteDB {
             }
         }
         if decode_failures > 0 {
-            debug_log!("[BatchIndexBuilder] Table '{}': {} rows failed to decode", table_name, decode_failures);
+            debug_log!(
+                "[BatchIndexBuilder] Table '{}': {} rows failed to decode",
+                table_name,
+                decode_failures
+            );
         }
 
         if rows.is_empty() {
             return Ok(());
         }
 
-        debug_log!("[BatchIndexBuilder]   📊 Table '{}': {} rows", table_name, rows.len());
+        debug_log!(
+            "[BatchIndexBuilder]   📊 Table '{}': {} rows",
+            table_name,
+            rows.len()
+        );
 
         let rows = Arc::new(rows);
         let mut handles = vec![];
@@ -79,9 +95,10 @@ impl MoteDB {
             let table_name = table_name.to_string();
             let schema = schema.clone();
             let rows = Arc::clone(&rows);
-            handles.push(std::thread::Builder::new().spawn(move || {
-                db.batch_build_column_indexes(&table_name, &schema, &rows)
-            }));
+            handles.push(
+                std::thread::Builder::new()
+                    .spawn(move || db.batch_build_column_indexes(&table_name, &schema, &rows)),
+            );
         }
 
         // 2. Timestamp indexes
@@ -89,9 +106,10 @@ impl MoteDB {
             let db = self.clone_for_callback();
             let schema = schema.clone();
             let rows = Arc::clone(&rows);
-            handles.push(std::thread::Builder::new().spawn(move || {
-                db.batch_build_timestamp_indexes(&schema, &rows)
-            }));
+            handles.push(
+                std::thread::Builder::new()
+                    .spawn(move || db.batch_build_timestamp_indexes(&schema, &rows)),
+            );
         }
 
         // 3. Vector indexes
@@ -100,9 +118,10 @@ impl MoteDB {
             let table_name = table_name.to_string();
             let schema = schema.clone();
             let rows = Arc::clone(&rows);
-            handles.push(std::thread::Builder::new().spawn(move || {
-                db.batch_build_vector_indexes(&table_name, &schema, &rows)
-            }));
+            handles.push(
+                std::thread::Builder::new()
+                    .spawn(move || db.batch_build_vector_indexes(&table_name, &schema, &rows)),
+            );
         }
 
         // 4. Text indexes
@@ -111,9 +130,10 @@ impl MoteDB {
             let table_name = table_name.to_string();
             let schema = schema.clone();
             let rows = Arc::clone(&rows);
-            handles.push(std::thread::Builder::new().spawn(move || {
-                db.batch_build_text_indexes(&table_name, &schema, &rows)
-            }));
+            handles.push(
+                std::thread::Builder::new()
+                    .spawn(move || db.batch_build_text_indexes(&table_name, &schema, &rows)),
+            );
         }
 
         // Wait for all threads
@@ -121,61 +141,88 @@ impl MoteDB {
             let handle = match handle_result {
                 Ok(h) => h,
                 Err(e) => {
-                    debug_log!("[BatchIndexBuilder] ⚠️  Index type {} thread spawn failed: {}", idx, e);
+                    debug_log!(
+                        "[BatchIndexBuilder] ⚠️  Index type {} thread spawn failed: {}",
+                        idx,
+                        e
+                    );
                     continue;
                 }
             };
             match handle.join() {
-                Ok(Ok(())) => {},
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    debug_log!("[BatchIndexBuilder] ⚠️  Index type {} build failed: {}", idx, e);
+                    debug_log!(
+                        "[BatchIndexBuilder] ⚠️  Index type {} build failed: {}",
+                        idx,
+                        e
+                    );
                     return Err(e);
                 }
                 Err(_) => {
-                    return Err(StorageError::Index("Thread panicked during index build".into()));
+                    return Err(StorageError::Index(
+                        "Thread panicked during index build".into(),
+                    ));
                 }
             }
         }
 
-        debug_log!("[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?}", table_name, _start.elapsed());
+        debug_log!(
+            "[BatchIndexBuilder]   ✓ Table '{}' indexes built in {:?}",
+            table_name,
+            _start.elapsed()
+        );
         Ok(())
     }
 
     /// Batch build column indexes
-    fn batch_build_column_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
+    fn batch_build_column_indexes(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        rows: &[(RowId, Row)],
+    ) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
 
         let indexes_with_data: Vec<_> = {
-            schema.columns.iter().filter_map(|col_def| {
-                let index_name = format!("{}.{}", table_name, col_def.name);
-                self.column_indexes.get(&index_name).and_then(|index_ref| {
-                    let index = index_ref.value();
-                    // Skip if index is already up-to-date from synchronous path
-                    if !index.needs_rebuild() {
-                        return None;
-                    }
-                    let mut batch: Vec<(RowId, Value)> = Vec::with_capacity(rows.len());
-                    for (row_id, row) in rows {
-                        if let Some(value) = row.get(col_def.position) {
-                            batch.push((*row_id, value.clone()));
+            schema
+                .columns
+                .iter()
+                .filter_map(|col_def| {
+                    let index_name = format!("{}.{}", table_name, col_def.name);
+                    self.column_indexes.get(&index_name).and_then(|index_ref| {
+                        let index = index_ref.value();
+                        // Skip if index is already up-to-date from synchronous path
+                        if !index.needs_rebuild() {
+                            return None;
                         }
-                    }
-                    Some((index.clone(), col_def.name.clone(), batch))
+                        let mut batch: Vec<(RowId, Value)> = Vec::with_capacity(rows.len());
+                        for (row_id, row) in rows {
+                            if let Some(value) = row.get(col_def.position) {
+                                batch.push((*row_id, value.clone()));
+                            }
+                        }
+                        Some((index.clone(), col_def.name.clone(), batch))
+                    })
                 })
-            }).collect()
+                .collect()
         };
 
         for (index, _col_name, batch) in indexes_with_data {
             if !batch.is_empty() {
-                let batch_refs: Vec<(RowId, &Value)> = batch.iter()
+                let batch_refs: Vec<(RowId, &Value)> = batch
+                    .iter()
                     .map(|(row_id, value)| (*row_id, value))
                     .collect();
 
                 index.insert_batch(&batch_refs)?;
                 index.mark_rebuilt();
-                debug_log!("[ColumnIndex]   ✓ Built {} entries for column '{}'",
-                         batch.len(), _col_name);
+                debug_log!(
+                    "[ColumnIndex]   ✓ Built {} entries for column '{}'",
+                    batch.len(),
+                    _col_name
+                );
             }
         }
 
@@ -186,11 +233,19 @@ impl MoteDB {
     }
 
     /// Batch build timestamp indexes
-    fn batch_build_timestamp_indexes(&self, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
+    fn batch_build_timestamp_indexes(
+        &self,
+        schema: &TableSchema,
+        rows: &[(RowId, Row)],
+    ) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
 
-        let ts_col = match schema.columns.iter().find(|c| c.col_type == crate::types::ColumnType::Timestamp) {
+        let ts_col = match schema
+            .columns
+            .iter()
+            .find(|c| c.col_type == crate::types::ColumnType::Timestamp)
+        {
             Some(col) => col,
             None => return Ok(()),
         };
@@ -206,21 +261,30 @@ impl MoteDB {
         }
 
         if count > 0 {
-            debug_log!("[TimestampIndex] Batch built {} entries in {:?}", count, start.elapsed());
+            debug_log!(
+                "[TimestampIndex] Batch built {} entries in {:?}",
+                count,
+                start.elapsed()
+            );
         }
 
         Ok(())
     }
 
     /// Batch build vector indexes
-    fn batch_build_vector_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
-
+    fn batch_build_vector_indexes(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        rows: &[(RowId, Row)],
+    ) -> Result<()> {
         for col_def in &schema.columns {
             if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
                 // Look up actual index name from registry (supports custom names)
                 let index_name = match self.index_registry.find_by_column(
-                    table_name, &col_def.name,
-                    crate::database::index_metadata::IndexType::Vector
+                    table_name,
+                    &col_def.name,
+                    crate::database::index_metadata::IndexType::Vector,
                 ) {
                     Some(name) => name,
                     None => continue,
@@ -245,15 +309,21 @@ impl MoteDB {
     }
 
     /// Batch build text indexes
-    fn batch_build_text_indexes(&self, table_name: &str, schema: &TableSchema, rows: &[(RowId, Row)]) -> Result<()> {
+    fn batch_build_text_indexes(
+        &self,
+        table_name: &str,
+        schema: &TableSchema,
+        rows: &[(RowId, Row)],
+    ) -> Result<()> {
         use crate::index::builder::IndexBuilder;
 
         for col_def in &schema.columns {
             if matches!(col_def.col_type, crate::types::ColumnType::Text) {
                 // Look up actual index name from registry (supports custom names)
                 let index_name = match self.index_registry.find_by_column(
-                    table_name, &col_def.name,
-                    crate::database::index_metadata::IndexType::Text
+                    table_name,
+                    &col_def.name,
+                    crate::database::index_metadata::IndexType::Text,
                 ) {
                     Some(name) => name,
                     None => continue,
@@ -263,11 +333,14 @@ impl MoteDB {
                     let mut index_guard = index.write();
                     // Filter rows to only include the target column's text value
                     let col_pos = col_def.position;
-                    let filtered: Vec<(RowId, Vec<Value>)> = rows.iter()
+                    let filtered: Vec<(RowId, Vec<Value>)> = rows
+                        .iter()
                         .filter_map(|(row_id, row)| {
                             row.get(col_pos).and_then(|v| match v {
                                 Value::Text(t) => Some((*row_id, vec![Value::text(t.to_string())])),
-                                Value::TextDoc(t) => Some((*row_id, vec![Value::text(t.content().to_string())])),
+                                Value::TextDoc(t) => {
+                                    Some((*row_id, vec![Value::text(t.content().to_string())]))
+                                }
                                 _ => None,
                             })
                         })

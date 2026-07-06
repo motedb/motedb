@@ -14,12 +14,12 @@
 //! - 流式合并：13 个迭代器 × 1.5 KB = 20 KB ✅
 //! - **节省 99.995% 内存**
 
+use super::sstable::SSTableIterator;
 use super::{Key, Value};
 use crate::Result;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use super::sstable::SSTableIterator;
 
 // Type alias for KV iterator
 type KVIterator = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
@@ -29,7 +29,7 @@ type KVIterator = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
 struct HeapItem {
     key: Key,
     value: Value,
-    source_id: usize,  // 数据源 ID（用于去重后重新填充）
+    source_id: usize, // 数据源 ID（用于去重后重新填充）
 }
 
 impl PartialEq for HeapItem {
@@ -52,8 +52,9 @@ impl Ord for HeapItem {
         // 2. Same key: timestamp descending (newest first) so the freshest
         //    version is yielded first and older duplicates are skipped by dedup.
         // 3. Same key + timestamp: source_id ascending (MemTable first)
-        self.key.cmp(&other.key)
-            .then(other.value.timestamp.cmp(&self.value.timestamp))  // newest first
+        self.key
+            .cmp(&other.key)
+            .then(other.value.timestamp.cmp(&self.value.timestamp)) // newest first
             .then(self.source_id.cmp(&other.source_id))
     }
 }
@@ -136,7 +137,9 @@ impl MergingIterator {
     pub fn next_raw(&mut self) -> Option<Result<(Key, u64, bool, super::sstable::ValueBytes)>> {
         // Single raw SSTable path
         if let Some(ref mut sst) = self.raw_sst {
-            return sst.next_raw().map(|(key, ts, del, vb)| Ok((key, ts, del, vb)));
+            return sst
+                .next_raw()
+                .map(|(key, ts, del, vb)| Ok((key, ts, del, vb)));
         }
         // Multi raw SSTable path — fall through to normal path for now
         // (multi-raw needs value_bytes caching, not yet implemented)
@@ -174,7 +177,11 @@ impl MergingIterator {
         for (source_id, source) in self.sources.iter_mut().enumerate() {
             match source.next() {
                 Some(Ok((key, value))) => {
-                    self.heap.push(Reverse(HeapItem { key, value, source_id }));
+                    self.heap.push(Reverse(HeapItem {
+                        key,
+                        value,
+                        source_id,
+                    }));
                 }
                 Some(Err(e)) => {
                     if self.first_error.is_none() {
@@ -190,7 +197,11 @@ impl MergingIterator {
         if let Some(source) = self.sources.get_mut(source_id) {
             match source.next() {
                 Some(Ok((key, value))) => {
-                    self.heap.push(Reverse(HeapItem { key, value, source_id }));
+                    self.heap.push(Reverse(HeapItem {
+                        key,
+                        value,
+                        source_id,
+                    }));
                 }
                 Some(Err(e)) => {
                     if self.first_error.is_none() {
@@ -215,14 +226,19 @@ impl Iterator for MergingIterator {
         if self.single_source {
             let source = match self.sources.get_mut(0) {
                 Some(s) => s,
-                None => { self.finished = true; return None; }
+                None => {
+                    self.finished = true;
+                    return None;
+                }
             };
             loop {
                 match source.next() {
                     Some(Ok((key, value))) => {
                         // Dedup check
                         if let Some(last_key) = self.last_key {
-                            if key == last_key { continue; }
+                            if key == last_key {
+                                continue;
+                            }
                         }
                         // Tombstone filter
                         if value.deleted {
@@ -289,7 +305,7 @@ mod tests {
 
     /// Type alias to reduce complexity of boxed iterator sources in tests.
     type BoxedIter = Box<dyn Iterator<Item = Result<(Key, Value)>> + Send>;
-    
+
     #[test]
     fn test_merging_iterator_basic() {
         // 创建两个数据源
@@ -298,92 +314,96 @@ mod tests {
             Ok((3, Value::new(vec![3], 100))),
             Ok((5, Value::new(vec![5], 100))),
         ];
-        
+
         let source2: Vec<Result<(Key, Value)>> = vec![
             Ok((2, Value::new(vec![2], 100))),
             Ok((4, Value::new(vec![4], 100))),
             Ok((6, Value::new(vec![6], 100))),
         ];
-        
-        let sources: Vec<BoxedIter> = vec![
-            Box::new(source1.into_iter()),
-            Box::new(source2.into_iter()),
-        ];
-        
+
+        let sources: Vec<BoxedIter> =
+            vec![Box::new(source1.into_iter()), Box::new(source2.into_iter())];
+
         let iter = MergingIterator::new(sources);
         let keys: Vec<Key> = iter.map(|r| r.unwrap().0).collect();
-        
+
         assert_eq!(keys, vec![1, 2, 3, 4, 5, 6]);
     }
-    
+
     #[test]
     fn test_merging_iterator_mvcc() {
         // 相同 key 在不同数据源（模拟多版本）
-        let source1: Vec<Result<(Key, Value)>> = vec![
-            Ok((1, Value { 
-                data: ValueData::Inline(std::sync::Arc::new(vec![1, 0, 0])),  // v3 (newest)
+        let source1: Vec<Result<(Key, Value)>> = vec![Ok((
+            1,
+            Value {
+                data: ValueData::Inline(std::sync::Arc::new(vec![1, 0, 0])), // v3 (newest)
                 timestamp: 300,
                 deleted: false,
-            })),
-        ];
-        
-        let source2: Vec<Result<(Key, Value)>> = vec![
-            Ok((1, Value { 
-                data: ValueData::Inline(std::sync::Arc::new(vec![1, 0])),  // v2
+            },
+        ))];
+
+        let source2: Vec<Result<(Key, Value)>> = vec![Ok((
+            1,
+            Value {
+                data: ValueData::Inline(std::sync::Arc::new(vec![1, 0])), // v2
                 timestamp: 200,
                 deleted: false,
-            })),
-        ];
-        
-        let source3: Vec<Result<(Key, Value)>> = vec![
-            Ok((1, Value { 
-                data: ValueData::Inline(std::sync::Arc::new(vec![1])),  // v1 (oldest)
+            },
+        ))];
+
+        let source3: Vec<Result<(Key, Value)>> = vec![Ok((
+            1,
+            Value {
+                data: ValueData::Inline(std::sync::Arc::new(vec![1])), // v1 (oldest)
                 timestamp: 100,
                 deleted: false,
-            })),
-        ];
-        
+            },
+        ))];
+
         let sources: Vec<BoxedIter> = vec![
             Box::new(source1.into_iter()),
             Box::new(source2.into_iter()),
             Box::new(source3.into_iter()),
         ];
-        
+
         let iter = MergingIterator::new(sources);
-        let results: Vec<(Key, Vec<u8>)> = iter.map(|r| {
-            let (k, v) = r.unwrap();
-            match v.data {
-                ValueData::Inline(data) => (k, data.to_vec()),
-                _ => panic!("Expected inline data"),
-            }
-        }).collect();
-        
+        let results: Vec<(Key, Vec<u8>)> = iter
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                match v.data {
+                    ValueData::Inline(data) => (k, data.to_vec()),
+                    _ => panic!("Expected inline data"),
+                }
+            })
+            .collect();
+
         // 应该只返回最新版本
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 1);
-        assert_eq!(results[0].1, vec![1, 0, 0]);  // v3
+        assert_eq!(results[0].1, vec![1, 0, 0]); // v3
     }
-    
+
     #[test]
     fn test_merging_iterator_tombstone() {
         // 测试 tombstone 过滤
         let source1: Vec<Result<(Key, Value)>> = vec![
             Ok((1, Value::new(vec![1], 100))),
-            Ok((2, Value { 
-                data: ValueData::Inline(std::sync::Arc::new(vec![])),
-                timestamp: 200,
-                deleted: true,  // tombstone
-            })),
+            Ok((
+                2,
+                Value {
+                    data: ValueData::Inline(std::sync::Arc::new(vec![])),
+                    timestamp: 200,
+                    deleted: true, // tombstone
+                },
+            )),
             Ok((3, Value::new(vec![3], 100))),
         ];
-        
-        let sources: Vec<BoxedIter> = vec![
-            Box::new(source1.into_iter()),
-        ];
-        
+
+        let sources: Vec<BoxedIter> = vec![Box::new(source1.into_iter())];
+
         let iter = MergingIterator::new(sources);
         let keys: Vec<Key> = iter.map(|r| r.unwrap().0).collect();
-        
+
         // key=2 应该被过滤掉
         assert_eq!(keys, vec![1, 3]);
     }

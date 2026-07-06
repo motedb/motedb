@@ -44,11 +44,14 @@ fn test_top_k_desc_returns_largest() {
     assert_eq!(top.len(), 2, "top-2 returns 2 indices");
     // The indices reference (segment_idx, local_row). Fetch the scores to verify.
     let segs = store.segments_snapshot();
-    let mut scores: Vec<f64> = top.iter().filter_map(|(s, r)| {
-        let seg = segs.get(*s)?;
-        // col 1 is Float — decode as f64.
-        seg.sst.read_fixed_f64(1).ok().and_then(|f| f.get_f64(*r))
-    }).collect();
+    let mut scores: Vec<f64> = top
+        .iter()
+        .filter_map(|(s, r)| {
+            let seg = segs.get(*s)?;
+            // col 1 is Float — decode as f64.
+            seg.sst.read_fixed_f64(1).ok().and_then(|f| f.get_f64(*r))
+        })
+        .collect();
     scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
     assert_eq!(scores, vec![90.0, 50.0], "DESC top-2 must be 90 and 50");
 }
@@ -65,10 +68,13 @@ fn test_top_k_asc_returns_smallest() {
     store.flush_buffer().unwrap();
     let top = store.top_k_row_indices(1, 2, false);
     let segs = store.segments_snapshot();
-    let mut scores: Vec<f64> = top.iter().filter_map(|(s, r)| {
-        let seg = segs.get(*s)?;
-        seg.sst.read_fixed_f64(1).ok().and_then(|f| f.get_f64(*r))
-    }).collect();
+    let mut scores: Vec<f64> = top
+        .iter()
+        .filter_map(|(s, r)| {
+            let seg = segs.get(*s)?;
+            seg.sst.read_fixed_f64(1).ok().and_then(|f| f.get_f64(*r))
+        })
+        .collect();
     scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
     assert_eq!(scores, vec![5.0, 10.0], "ASC top-2 must be 5 and 10");
 }
@@ -76,7 +82,9 @@ fn test_top_k_asc_returns_smallest() {
 #[test]
 fn test_top_k_k_exceeds_rows() {
     let (_dir, store) = make_store(vec![ColumnType::Integer]);
-    store.append_rows(&[row(1, 1, vec![Value::Integer(10)])]).unwrap();
+    store
+        .append_rows(&[row(1, 1, vec![Value::Integer(10)])])
+        .unwrap();
     store.flush_buffer().unwrap();
     let top = store.top_k_row_indices(0, 10, true);
     assert_eq!(top.len(), 1, "k>rows returns all rows");
@@ -93,7 +101,9 @@ fn test_top_k_empty_store() {
 #[test]
 fn test_top_k_k_zero() {
     let (_dir, store) = make_store(vec![ColumnType::Integer]);
-    store.append_rows(&[row(1, 1, vec![Value::Integer(10)])]).unwrap();
+    store
+        .append_rows(&[row(1, 1, vec![Value::Integer(10)])])
+        .unwrap();
     store.flush_buffer().unwrap();
     let top = store.top_k_row_indices(0, 0, true);
     assert!(top.is_empty(), "k=0 returns nothing");
@@ -133,7 +143,11 @@ fn test_top_k_typed_float_desc_order() {
     let top = store.top_k_row_indices_typed(1, 3, true, true);
     let scores = fetch_floats(&store, 1, &top);
     // DESC, no re-sort: largest first → 90.0, 50.0, 30.0
-    assert_eq!(scores, vec![90.0, 50.0, 30.0], "DESC Float top-3 must be largest-first");
+    assert_eq!(
+        scores,
+        vec![90.0, 50.0, 30.0],
+        "DESC Float top-3 must be largest-first"
+    );
 }
 
 #[test]
@@ -151,7 +165,11 @@ fn test_top_k_typed_float_asc_order() {
     let top = store.top_k_row_indices_typed(1, 3, false, true);
     let scores = fetch_floats(&store, 1, &top);
     // ASC, no re-sort: smallest first → 5.0, 10.0, 30.0
-    assert_eq!(scores, vec![5.0, 10.0, 30.0], "ASC Float top-3 must be smallest-first");
+    assert_eq!(
+        scores,
+        vec![5.0, 10.0, 30.0],
+        "ASC Float top-3 must be smallest-first"
+    );
 }
 
 #[test]
@@ -168,14 +186,19 @@ fn test_top_k_typed_integer_desc_order() {
 
     let top = store.top_k_row_indices_typed(1, 3, true, false);
     let segs = store.segments_snapshot();
-    let vals: Vec<i64> = top.iter()
+    let vals: Vec<i64> = top
+        .iter()
         .filter_map(|(s, r)| {
             let seg = segs.get(*s)?;
             seg.sst.read_fixed_i64(1).ok().and_then(|f| f.get_i64(*r))
         })
         .collect();
     // DESC: largest first → 90, 50, 30
-    assert_eq!(vals, vec![90, 50, 30], "DESC Integer top-3 must be largest-first");
+    assert_eq!(
+        vals,
+        vec![90, 50, 30],
+        "DESC Integer top-3 must be largest-first"
+    );
 }
 
 #[test]
@@ -195,12 +218,20 @@ fn test_top_k_typed_float_with_negatives_and_zero() {
     // ASC: -20.0, -5.0, -1.25, 0.0, 7.5
     let top = store.top_k_row_indices_typed(1, 5, false, true);
     let scores = fetch_floats(&store, 1, &top);
-    assert_eq!(scores, vec![-20.0, -5.0, -1.25, 0.0, 7.5], "ASC with negatives");
+    assert_eq!(
+        scores,
+        vec![-20.0, -5.0, -1.25, 0.0, 7.5],
+        "ASC with negatives"
+    );
 
     // DESC: 7.5, 0.0, -1.25, -5.0, -20.0
     let top = store.top_k_row_indices_typed(1, 5, true, true);
     let scores = fetch_floats(&store, 1, &top);
-    assert_eq!(scores, vec![7.5, 0.0, -1.25, -5.0, -20.0], "DESC with negatives");
+    assert_eq!(
+        scores,
+        vec![7.5, 0.0, -1.25, -5.0, -20.0],
+        "DESC with negatives"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -211,25 +242,38 @@ fn test_top_k_typed_float_with_negatives_and_zero() {
 fn test_distinct_text_low_cardinality() {
     let (_dir, store) = make_store(vec![ColumnType::Integer, ColumnType::Text]);
     // 100 rows, only 3 distinct values
-    let rows: Vec<_> = (0..100).map(|i| {
-        let region = match i % 3 { 0 => "US", 1 => "EU", _ => "AS" };
-        row(i + 1, 1, vec![Value::Integer(i as i64), Value::text(region.to_string())])
-    }).collect();
+    let rows: Vec<_> = (0..100)
+        .map(|i| {
+            let region = match i % 3 {
+                0 => "US",
+                1 => "EU",
+                _ => "AS",
+            };
+            row(
+                i + 1,
+                1,
+                vec![Value::Integer(i as i64), Value::text(region.to_string())],
+            )
+        })
+        .collect();
     store.append_rows(&rows).unwrap();
     store.flush_buffer().unwrap();
     let vals = store.distinct_text_values(1, 10000);
     let mut s: Vec<String> = vals.clone();
     s.sort();
-    assert_eq!(s, vec!["AS".to_string(), "EU".to_string(), "US".to_string()],
-              "low-cardinality column returns exactly the distinct values");
+    assert_eq!(
+        s,
+        vec!["AS".to_string(), "EU".to_string(), "US".to_string()],
+        "low-cardinality column returns exactly the distinct values"
+    );
 }
 
 #[test]
 fn test_distinct_text_respects_max_values() {
     let (_dir, store) = make_store(vec![ColumnType::Text]);
-    let rows: Vec<_> = (0..50).map(|i| {
-        row(i as u64 + 1, 1, vec![Value::text(format!("v{}", i))])
-    }).collect();
+    let rows: Vec<_> = (0..50)
+        .map(|i| row(i as u64 + 1, 1, vec![Value::text(format!("v{}", i))]))
+        .collect();
     store.append_rows(&rows).unwrap();
     store.flush_buffer().unwrap();
     // max_values=5 caps the result
@@ -262,7 +306,13 @@ fn test_scan_text_eq_build_matches() {
     store.append_rows(&rows).unwrap();
     store.flush_buffer().unwrap();
     // WHERE col1 = 'US', project [0, 1]
-    let result = store.scan_text_eq_build(1, "US", &[0, 1], &[ColumnType::Integer, ColumnType::Text], 100);
+    let result = store.scan_text_eq_build(
+        1,
+        "US",
+        &[0, 1],
+        &[ColumnType::Integer, ColumnType::Text],
+        100,
+    );
     let rows = result.expect("scan returned Some");
     assert_eq!(rows.len(), 3, "3 rows match 'US'");
     for r in &rows {
@@ -273,7 +323,9 @@ fn test_scan_text_eq_build_matches() {
 #[test]
 fn test_scan_text_eq_build_no_match() {
     let (_dir, store) = make_store(vec![ColumnType::Text]);
-    store.append_rows(&[row(1, 1, vec![Value::text("a".to_string())])]).unwrap();
+    store
+        .append_rows(&[row(1, 1, vec![Value::text("a".to_string())])])
+        .unwrap();
     store.flush_buffer().unwrap();
     let result = store.scan_text_eq_build(0, "zzz", &[0], &[ColumnType::Text], 100);
     let rows = result.expect("scan returned Some");
@@ -283,12 +335,24 @@ fn test_scan_text_eq_build_no_match() {
 #[test]
 fn test_scan_text_eq_build_limit() {
     let (_dir, store) = make_store(vec![ColumnType::Integer, ColumnType::Text]);
-    let rows: Vec<_> = (0..10).map(|i| {
-        row(i as u64 + 1, 1, vec![Value::Integer(i), Value::text("dup".to_string())])
-    }).collect();
+    let rows: Vec<_> = (0..10)
+        .map(|i| {
+            row(
+                i as u64 + 1,
+                1,
+                vec![Value::Integer(i), Value::text("dup".to_string())],
+            )
+        })
+        .collect();
     store.append_rows(&rows).unwrap();
     store.flush_buffer().unwrap();
-    let result = store.scan_text_eq_build(1, "dup", &[0, 1], &[ColumnType::Integer, ColumnType::Text], 3);
+    let result = store.scan_text_eq_build(
+        1,
+        "dup",
+        &[0, 1],
+        &[ColumnType::Integer, ColumnType::Text],
+        3,
+    );
     let rows = result.expect("scan returned Some");
     assert_eq!(rows.len(), 3, "limit caps result at 3");
 }

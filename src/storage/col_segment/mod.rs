@@ -9,12 +9,12 @@
 //! time-series store). This module serves tables using the v0.3.0 columnar
 //! SSTable format with multi-segment + compaction semantics.
 
+mod manifest;
+mod merge;
 mod segment;
 mod store;
-mod merge;
-mod manifest;
 
+pub use manifest::{Manifest, ManifestState};
+pub use merge::MergeCursor;
 pub use segment::Segment;
 pub use store::ColSegmentStore;
-pub use merge::MergeCursor;
-pub use manifest::{Manifest, ManifestState};

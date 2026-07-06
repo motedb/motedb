@@ -5,8 +5,8 @@
 //!
 //! v1 migration: on load, converts old Vec<IndexedPoint3D> format to v2
 
-use super::{IOctreeConfig, IOctreeIndex};
 use super::leaf_store::LeafStore;
+use super::{IOctreeConfig, IOctreeIndex};
 use crate::types::BoundingBox3D;
 use crate::{Result, StorageError};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -30,24 +30,39 @@ pub fn save(tree: &IOctreeIndex, path: &std::path::Path) -> Result<()> {
 
     // Header
     writer.write_all(&MAGIC.to_le_bytes()).map_err(io_err)?;
-    writer.write_all(&VERSION_V2.to_le_bytes()).map_err(io_err)?;
-    writer.write_all(&(tree.size as u64).to_le_bytes()).map_err(io_err)?;
+    writer
+        .write_all(&VERSION_V2.to_le_bytes())
+        .map_err(io_err)?;
+    writer
+        .write_all(&(tree.size as u64).to_le_bytes())
+        .map_err(io_err)?;
 
     // Config
     let config_bytes = bincode::serialize(&tree.config)
         .map_err(|e| StorageError::InvalidData(format!("Serialize config: {}", e)))?;
-    writer.write_all(&(config_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+    writer
+        .write_all(&(config_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     writer.write_all(&config_bytes).map_err(io_err)?;
 
     // World bounds
     let bounds = &tree.world_bounds;
-    for val in &[bounds.min_x, bounds.min_y, bounds.min_z, bounds.max_x, bounds.max_y, bounds.max_z] {
+    for val in &[
+        bounds.min_x,
+        bounds.min_y,
+        bounds.min_z,
+        bounds.max_x,
+        bounds.max_y,
+        bounds.max_z,
+    ] {
         writer.write_all(&val.to_le_bytes()).map_err(io_err)?;
     }
 
     // Name
     let name_bytes = tree.name.as_bytes();
-    writer.write_all(&(name_bytes.len() as u32).to_le_bytes()).map_err(io_err)?;
+    writer
+        .write_all(&(name_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     writer.write_all(name_bytes).map_err(io_err)?;
 
     // Tree structure (Octant with leaf handles)
@@ -78,7 +93,10 @@ pub fn load(path: &std::path::Path, _config: IOctreeConfig, _name: String) -> Re
     reader.read_exact(&mut buf4).map_err(io_err)?;
     let magic = u32::from_le_bytes(buf4);
     if magic != MAGIC {
-        return Err(StorageError::InvalidData(format!("Invalid i-Octree file: bad magic {:x}", magic)));
+        return Err(StorageError::InvalidData(format!(
+            "Invalid i-Octree file: bad magic {:x}",
+            magic
+        )));
     }
 
     // Version
@@ -88,7 +106,10 @@ pub fn load(path: &std::path::Path, _config: IOctreeConfig, _name: String) -> Re
     match version {
         VERSION_V1 => load_v1(&mut reader, path),
         VERSION_V2 => load_v2(&mut reader, path),
-        _ => Err(StorageError::InvalidData(format!("Unsupported i-Octree version {}", version))),
+        _ => Err(StorageError::InvalidData(format!(
+            "Unsupported i-Octree version {}",
+            version
+        ))),
     }
 }
 
@@ -115,8 +136,12 @@ fn load_v2(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         Ok(f64::from_le_bytes(buf))
     };
     let world_bounds = BoundingBox3D::new(
-        read_f64(reader)?, read_f64(reader)?, read_f64(reader)?,
-        read_f64(reader)?, read_f64(reader)?, read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
     );
 
     // Name
@@ -137,16 +162,19 @@ fn load_v2(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
     let stored_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
     let computed_crc = crc32fast::hash(&tree_buf);
     if stored_crc != computed_crc {
-        return Err(StorageError::InvalidData(
-            format!("CRC mismatch: stored={:x}, computed={:x}", stored_crc, computed_crc),
-        ));
+        return Err(StorageError::InvalidData(format!(
+            "CRC mismatch: stored={:x}, computed={:x}",
+            stored_crc, computed_crc
+        )));
     }
 
     let root = bincode::deserialize(&tree_buf)
         .map_err(|e| StorageError::InvalidData(format!("Deserialize tree: {}", e)))?;
 
     // Set up work_dir for LeafStore/WAL (parent of the ioctree.bin file)
-    let work_dir = config.data_dir.as_ref()
+    let work_dir = config
+        .data_dir
+        .as_ref()
         .map(|p| {
             if p.extension().map(|e| e == "bin").unwrap_or(false) {
                 p.parent().unwrap_or(p).to_path_buf()
@@ -154,7 +182,11 @@ fn load_v2(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
                 p.clone()
             }
         })
-        .unwrap_or_else(|| path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+        .unwrap_or_else(|| {
+            path.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        });
 
     let leaf_store = LeafStore::open(&work_dir, config.cache_capacity())?;
 
@@ -191,8 +223,12 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         Ok(f64::from_le_bytes(buf))
     };
     let world_bounds = BoundingBox3D::new(
-        read_f64(reader)?, read_f64(reader)?, read_f64(reader)?,
-        read_f64(reader)?, read_f64(reader)?, read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
+        read_f64(reader)?,
     );
 
     // Name
@@ -213,14 +249,17 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
     let stored_crc = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
     let computed_crc = crc32fast::hash(&tree_buf);
     if stored_crc != computed_crc {
-        return Err(StorageError::InvalidData(
-            format!("CRC mismatch: stored={:x}, computed={:x}", stored_crc, computed_crc),
-        ));
+        return Err(StorageError::InvalidData(format!(
+            "CRC mismatch: stored={:x}, computed={:x}",
+            stored_crc, computed_crc
+        )));
     }
 
     // Set up data_dir for v2
     let data_dir = config.data_dir.clone().unwrap_or_else(|| {
-        path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+        path.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
     });
 
     let leaf_store = LeafStore::open(&data_dir, config.cache_capacity())?;
@@ -267,7 +306,12 @@ enum LegacyOctant {
 
 fn migrate_octant(legacy: LegacyOctant, store: &LeafStore) -> Result<super::node::Octant> {
     match legacy {
-        LegacyOctant::Inner { center, extent, children, size } => {
+        LegacyOctant::Inner {
+            center,
+            extent,
+            children,
+            size,
+        } => {
             let new_children: Box<[Option<Box<super::node::Octant>>; 8]> = {
                 let mut result: Vec<Option<Box<super::node::Octant>>> = Vec::with_capacity(8);
                 for opt in children.into_iter() {
@@ -278,13 +322,28 @@ fn migrate_octant(legacy: LegacyOctant, store: &LeafStore) -> Result<super::node
                 }
                 result.into_boxed_slice().try_into().unwrap()
             };
-            Ok(super::node::Octant::Inner { center, extent, children: new_children, size })
+            Ok(super::node::Octant::Inner {
+                center,
+                extent,
+                children: new_children,
+                size,
+            })
         }
-        LegacyOctant::Leaf { center, extent, points } => {
+        LegacyOctant::Leaf {
+            center,
+            extent,
+            points,
+        } => {
             let point_count = points.len() as u32;
-            let leaf_id = store.create_leaf(points)
-                .map_err(|e| StorageError::Index(format!("Failed to create leaf during migration: {}", e)))?;
-            Ok(super::node::Octant::Leaf { center, extent, leaf_id, point_count })
+            let leaf_id = store.create_leaf(points).map_err(|e| {
+                StorageError::Index(format!("Failed to create leaf during migration: {}", e))
+            })?;
+            Ok(super::node::Octant::Leaf {
+                center,
+                extent,
+                leaf_id,
+                point_count,
+            })
         }
     }
 }

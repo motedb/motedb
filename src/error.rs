@@ -30,47 +30,47 @@ pub enum StorageError {
 
     #[error("Resource exhausted: {0}")]
     ResourceExhausted(String),
-    
+
     #[error("Data corruption: {0}")]
     Corruption(String),
-    
+
     #[error("Lock error: {0}")]
     Lock(String),
-    
+
     #[error("File not found: {0}")]
     FileNotFound(std::path::PathBuf),
-    
+
     #[error("Corrupted file: {0}")]
     CorruptedFile(std::path::PathBuf),
-    
+
     // SQL-related errors
     #[error("Parse error: {0}")]
     ParseError(String),
-    
+
     #[error("Type error: {0}")]
     TypeError(String),
-    
+
     #[error("Column not found: {0}")]
     ColumnNotFound(String),
-    
+
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
     #[error("Index not found: {0}")]
     IndexNotFound(String),
-    
+
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
-    
+
     #[error("Unknown function: {0}")]
     UnknownFunction(String),
-    
+
     #[error("Division by zero")]
     DivisionByZero,
-    
+
     #[error("Not implemented: {0}")]
     NotImplemented(String),
-    
+
     /// 🚀 Phase 5: AUTO_INCREMENT overflow error
     #[error("AUTO_INCREMENT overflow for table '{0}': counter has reached i64::MAX")]
     AutoIncrementOverflow(String),

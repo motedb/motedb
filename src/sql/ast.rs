@@ -15,7 +15,7 @@ pub enum Statement {
     DropIndex(DropIndexStmt),
     AlterTable(AlterTableStmt),
     ShowTables,
-    DescribeTable(String),  // table name
+    DescribeTable(String), // table name
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
@@ -24,16 +24,16 @@ pub enum Statement {
 /// SELECT statement
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
-    pub distinct: bool,                    // SELECT DISTINCT
+    pub distinct: bool, // SELECT DISTINCT
     pub columns: Vec<SelectColumn>,
-    pub from: Option<TableRef>,            // Optional FROM clause (for SELECT without tables)
+    pub from: Option<TableRef>, // Optional FROM clause (for SELECT without tables)
     pub where_clause: Option<Expr>,
-    pub group_by: Option<Vec<String>>,     // GROUP BY column_list
-    pub having: Option<Expr>,              // HAVING condition
+    pub group_by: Option<Vec<String>>, // GROUP BY column_list
+    pub having: Option<Expr>,          // HAVING condition
     pub order_by: Option<Vec<OrderByExpr>>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    pub latest_by: Option<Vec<String>>,    // LATEST BY column_list
+    pub latest_by: Option<Vec<String>>, // LATEST BY column_list
 }
 
 /// Table reference in FROM clause (supports JOINs and subqueries)
@@ -49,11 +49,11 @@ pub enum TableRef {
         on_condition: Expr,
     },
     /// Subquery in FROM: (SELECT ...) AS alias
-    /// 
+    ///
     /// Example: FROM (SELECT id, name FROM users WHERE age > 18) AS adults
     Subquery {
         query: Box<SelectStmt>,
-        alias: String,  // Alias is required for subqueries in FROM
+        alias: String, // Alias is required for subqueries in FROM
     },
 }
 
@@ -68,31 +68,31 @@ pub enum JoinType {
 
 #[derive(Debug, Clone)]
 pub enum SelectColumn {
-    Star,                          // *
-    Column(String),                // column_name
+    Star,                            // *
+    Column(String),                  // column_name
     ColumnWithAlias(String, String), // column_name AS alias
-    Expr(Expr, Option<String>),    // expression [AS alias]
+    Expr(Expr, Option<String>),      // expression [AS alias]
 }
 
 #[derive(Debug, Clone)]
 pub struct OrderByExpr {
     pub expr: Expr,
-    pub asc: bool,  // true = ASC, false = DESC
+    pub asc: bool, // true = ASC, false = DESC
 }
 
 /// INSERT statement
 #[derive(Debug, Clone)]
 pub struct InsertStmt {
     pub table: String,
-    pub columns: Option<Vec<String>>,  // None means all columns
-    pub values: Vec<Vec<Expr>>,        // Multiple rows
+    pub columns: Option<Vec<String>>, // None means all columns
+    pub values: Vec<Vec<Expr>>,       // Multiple rows
 }
 
 /// UPDATE statement
 #[derive(Debug, Clone)]
 pub struct UpdateStmt {
     pub table: String,
-    pub assignments: Vec<(String, Expr)>,  // column = expr
+    pub assignments: Vec<(String, Expr)>, // column = expr
     pub where_clause: Option<Expr>,
 }
 
@@ -137,7 +137,7 @@ pub enum DataType {
     Text,
     Boolean,
     Timestamp,
-    Vector(Option<usize>),    // Vector dimension
+    Vector(Option<usize>), // Vector dimension
     Geometry,
 }
 
@@ -155,10 +155,10 @@ pub struct CreateIndexStmt {
 #[derive(Debug, Clone)]
 pub enum IndexType {
     BTree,
-    Column,      // 🆕 Column value index (same as BTree but explicit name)
+    Column, // 🆕 Column value index (same as BTree but explicit name)
     Text,
     Vector,
-    Octree,      // i-Octree for 3D point cloud (embodied intelligence)
+    Octree, // i-Octree for 3D point cloud (embodied intelligence)
     Timestamp,
 }
 
@@ -207,24 +207,21 @@ pub enum Expr {
         op: BinaryOperator,
         right: Box<Expr>,
     },
-    
+
     /// Unary operation
-    UnaryOp {
-        op: UnaryOperator,
-        expr: Box<Expr>,
-    },
-    
+    UnaryOp { op: UnaryOperator, expr: Box<Expr> },
+
     /// Function call
     FunctionCall {
         name: String,
         args: Vec<Expr>,
-        distinct: bool,  // For COUNT(DISTINCT column)
+        distinct: bool, // For COUNT(DISTINCT column)
     },
-    
+
     /// 🆕 Window function call
-    /// 
+    ///
     /// Syntax: function_name(args) OVER ([PARTITION BY ...] [ORDER BY ...])
-    /// 
+    ///
     /// Examples:
     /// - ROW_NUMBER() OVER (ORDER BY id)
     /// - RANK() OVER (PARTITION BY category ORDER BY score DESC)
@@ -234,18 +231,18 @@ pub enum Expr {
         partition_by: Option<Vec<String>>,  // PARTITION BY columns
         order_by: Option<Vec<OrderByExpr>>, // ORDER BY in window
     },
-    
+
     /// IN expression: column IN (val1, val2, ...) or column IN (SELECT ...)
-    /// 
+    ///
     /// Examples:
     /// - WHERE id IN (1, 2, 3)  -> list contains literal expressions
     /// - WHERE id IN (SELECT user_id FROM orders)  -> list contains a single Subquery expression
     In {
         expr: Box<Expr>,
-        list: Vec<Expr>,  // Either multiple literals OR a single Subquery
+        list: Vec<Expr>, // Either multiple literals OR a single Subquery
         negated: bool,
     },
-    
+
     /// BETWEEN expression: column BETWEEN low AND high
     Between {
         expr: Box<Expr>,
@@ -253,33 +250,30 @@ pub enum Expr {
         high: Box<Expr>,
         negated: bool,
     },
-    
+
     /// LIKE expression: column LIKE pattern
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
     },
-    
+
     /// IS NULL expression
-    IsNull {
-        expr: Box<Expr>,
-        negated: bool,
-    },
-    
+    IsNull { expr: Box<Expr>, negated: bool },
+
     /// Subquery expression
-    /// 
+    ///
     /// Used in multiple contexts:
     /// - WHERE x IN (SELECT ...)
     /// - WHERE x = (SELECT ...)  (scalar subquery)
     /// - SELECT (SELECT ...) AS col (scalar subquery in projection)
     Subquery(Box<SelectStmt>),
-    
+
     /// MATCH...AGAINST full-text search
-    /// 
+    ///
     /// Syntax: MATCH(column) AGAINST(query_string)
     /// Returns: BM25 relevance score (Float)
-    /// 
+    ///
     /// Examples:
     /// - WHERE MATCH(content) AGAINST('rust database')
     /// - ORDER BY MATCH(content) AGAINST('search query') DESC
@@ -290,12 +284,12 @@ pub enum Expr {
         /// If true, the query is an exact phrase (wrapped in double quotes)
         phrase: bool,
     },
-    
+
     /// KNN_SEARCH vector similarity search
-    /// 
+    ///
     /// Syntax: KNN_SEARCH(vector_column, query_vector, k)
     /// Returns: Bool (true if in top-k results)
-    /// 
+    ///
     /// Examples:
     /// - WHERE KNN_SEARCH(embedding, [0.1, 0.2], 10)
     /// - Used with KNN_DISTANCE() for scoring
@@ -304,12 +298,12 @@ pub enum Expr {
         query_vector: crate::types::ArcVec,
         k: usize,
     },
-    
+
     /// KNN_DISTANCE vector distance function
-    /// 
+    ///
     /// Syntax: KNN_DISTANCE(vector_column, query_vector)
     /// Returns: Float (distance/similarity score)
-    /// 
+    ///
     /// Examples:
     /// - SELECT KNN_DISTANCE(embedding, [0.1, 0.2]) AS distance
     /// - ORDER BY KNN_DISTANCE(embedding, [0.1, 0.2])
@@ -317,9 +311,8 @@ pub enum Expr {
         column: String,
         query_vector: crate::types::ArcVec,
     },
-    
-    // ---- 3D Spatial expressions (i-Octree) ----
 
+    // ---- 3D Spatial expressions (i-Octree) ----
     /// ST_WITHIN_3D: 3D bounding box range query
     /// Syntax: WHERE ST_WITHIN_3D(column, min_x, min_y, min_z, max_x, max_y, max_z)
     StWithin3D {
@@ -365,28 +358,28 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BinaryOperator {
     // Comparison
-    Eq,   // =
-    Ne,   // !=
-    Lt,   // <
-    Gt,   // >
-    Le,   // <=
-    Ge,   // >=
-    
+    Eq, // =
+    Ne, // !=
+    Lt, // <
+    Gt, // >
+    Le, // <=
+    Ge, // >=
+
     // Logical
     And,
     Or,
-    
+
     // Arithmetic
-    Add,  // +
-    Sub,  // -
-    Mul,  // *
-    Div,  // /
-    Mod,  // %
-    
+    Add, // +
+    Sub, // -
+    Mul, // *
+    Div, // /
+    Mod, // %
+
     // E-SQL Vector Distance Operators
-    L2Distance,      // <-> (Euclidean distance)
-    CosineDistance,  // <=> (Cosine distance)
-    DotProduct,      // <#> (Inner product)
+    L2Distance,     // <-> (Euclidean distance)
+    CosineDistance, // <=> (Cosine distance)
+    DotProduct,     // <#> (Inner product)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -402,11 +395,16 @@ impl BinaryOperator {
         match self {
             BinaryOperator::Or => 1,
             BinaryOperator::And => 2,
-            BinaryOperator::Eq | BinaryOperator::Ne |
-            BinaryOperator::Lt | BinaryOperator::Gt |
-            BinaryOperator::Le | BinaryOperator::Ge => 3,
+            BinaryOperator::Eq
+            | BinaryOperator::Ne
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::Le
+            | BinaryOperator::Ge => 3,
             // Vector distance operators have same precedence as comparison
-            BinaryOperator::L2Distance | BinaryOperator::CosineDistance | BinaryOperator::DotProduct => 3,
+            BinaryOperator::L2Distance
+            | BinaryOperator::CosineDistance
+            | BinaryOperator::DotProduct => 3,
             BinaryOperator::Add | BinaryOperator::Sub => 4,
             BinaryOperator::Mul | BinaryOperator::Div | BinaryOperator::Mod => 5,
         }
@@ -425,13 +423,13 @@ pub enum WindowFunc {
     /// LAG(expr, offset, default) - value from previous row
     Lag {
         expr: Box<Expr>,
-        offset: Option<usize>,  // Default: 1
-        default: Option<Box<Expr>>,  // Default: NULL
+        offset: Option<usize>,      // Default: 1
+        default: Option<Box<Expr>>, // Default: NULL
     },
     /// LEAD(expr, offset, default) - value from next row
     Lead {
         expr: Box<Expr>,
-        offset: Option<usize>,  // Default: 1
-        default: Option<Box<Expr>>,  // Default: NULL
+        offset: Option<usize>,      // Default: 1
+        default: Option<Box<Expr>>, // Default: NULL
     },
 }

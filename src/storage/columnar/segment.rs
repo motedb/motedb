@@ -91,7 +91,8 @@ impl TryFrom<u8> for ColumnEncoding {
             4 => Ok(Self::Dictionary),
             5 => Ok(Self::BoolPacked),
             _ => Err(StorageError::InvalidData(format!(
-                "Unknown column encoding: {}", value
+                "Unknown column encoding: {}",
+                value
             ))),
         }
     }
@@ -235,12 +236,12 @@ impl SegmentBuilder {
     /// Create a new segment builder. Writes to `path.tmp`, renamed on `finish()`.
     pub fn new(path: &Path, table_id: u32, column_count: u16) -> Result<Self> {
         let tmp_path = path.with_extension("mcdb.tmp");
-        let file = std::fs::File::create(&tmp_path)
-            .map_err(StorageError::Io)?;
+        let file = std::fs::File::create(&tmp_path).map_err(StorageError::Io)?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
         // Reserve space for header (64 bytes)
-        writer.write_all(&[0u8; HEADER_SIZE])
+        writer
+            .write_all(&[0u8; HEADER_SIZE])
             .map_err(StorageError::Io)?;
 
         Ok(Self {
@@ -359,14 +360,15 @@ impl SegmentBuilder {
             full_block.extend_from_slice(&(block.len() as u32).to_le_bytes());
             full_block.extend_from_slice(&block);
 
-            self.writer.write_all(&full_block).map_err(StorageError::Io)?;
+            self.writer
+                .write_all(&full_block)
+                .map_err(StorageError::Io)?;
             self.current_offset += full_block.len() as u64;
         }
 
         // --- Write footer (v2 format) ---
-        let mut footer_bytes = Vec::with_capacity(
-            self.column_offsets.len() * 8 + 8 + 8 + 8 + 8 + 4
-        );
+        let mut footer_bytes =
+            Vec::with_capacity(self.column_offsets.len() * 8 + 8 + 8 + 8 + 8 + 4);
 
         // Column offsets
         for &offset in &self.column_offsets {
@@ -385,8 +387,11 @@ impl SegmentBuilder {
         let footer_crc = crc32fast::hash(&footer_bytes);
 
         // Write footer
-        self.writer.write_all(&footer_bytes).map_err(StorageError::Io)?;
-        self.writer.write_all(&footer_crc.to_le_bytes())
+        self.writer
+            .write_all(&footer_bytes)
+            .map_err(StorageError::Io)?;
+        self.writer
+            .write_all(&footer_crc.to_le_bytes())
             .map_err(StorageError::Io)?;
 
         // --- Write header ---
@@ -421,7 +426,9 @@ impl SegmentBuilder {
         header[36..40].copy_from_slice(&header_crc.to_le_bytes());
 
         // Seek to beginning and write header
-        self.writer.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
+        self.writer
+            .seek(SeekFrom::Start(0))
+            .map_err(StorageError::Io)?;
         self.writer.write_all(&header).map_err(StorageError::Io)?;
 
         // Flush and sync
@@ -459,12 +466,12 @@ pub struct SegmentReader {
 impl SegmentReader {
     /// Open a segment file and read header + footer.
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = std::fs::File::open(path)
-            .map_err(StorageError::Io)?;
+        let mut file = std::fs::File::open(path).map_err(StorageError::Io)?;
 
         // Read header
         let mut header_bytes = [0u8; HEADER_SIZE];
-        file.read_exact(&mut header_bytes).map_err(StorageError::Io)?;
+        file.read_exact(&mut header_bytes)
+            .map_err(StorageError::Io)?;
 
         let magic = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
         if magic != SEGMENT_MAGIC {
@@ -474,7 +481,8 @@ impl SegmentReader {
         let version = u32::from_le_bytes(header_bytes[4..8].try_into().unwrap());
         if version != SEGMENT_VERSION && version != SEGMENT_VERSION_V1 {
             return Err(StorageError::InvalidData(format!(
-                "Unsupported segment version: {}", version
+                "Unsupported segment version: {}",
+                version
             )));
         }
 
@@ -512,7 +520,8 @@ impl SegmentReader {
                 // v1 footer: column_offsets + min_row_id + max_row_id + crc
                 let footer_data_size = total_col_offsets * 8 + 8 + 8 + 4;
                 let footer_start = file_size - footer_data_size as u64;
-                file.seek(SeekFrom::Start(footer_start)).map_err(StorageError::Io)?;
+                file.seek(SeekFrom::Start(footer_start))
+                    .map_err(StorageError::Io)?;
 
                 let mut footer_buf = vec![0u8; footer_data_size];
                 file.read_exact(&mut footer_buf).map_err(StorageError::Io)?;
@@ -520,20 +529,24 @@ impl SegmentReader {
                 let mut cursor = 0usize;
                 let mut col_offsets = Vec::with_capacity(total_col_offsets);
                 for _ in 0..total_col_offsets {
-                    let offset = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                    let offset =
+                        u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
                     col_offsets.push(offset);
                     cursor += 8;
                 }
-                let min_rid = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                let min_rid =
+                    u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
                 cursor += 8;
-                let max_rid = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                let max_rid =
+                    u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
 
                 (col_offsets, min_rid, max_rid, 0u64, 0u64)
             } else {
                 // v2 footer: column_offsets + stats_offset + bloom_offset + min_row_id + max_row_id + crc
                 let footer_data_size = total_col_offsets * 8 + 8 + 8 + 8 + 8 + 4;
                 let footer_start = file_size - footer_data_size as u64;
-                file.seek(SeekFrom::Start(footer_start)).map_err(StorageError::Io)?;
+                file.seek(SeekFrom::Start(footer_start))
+                    .map_err(StorageError::Io)?;
 
                 let mut footer_buf = vec![0u8; footer_data_size];
                 file.read_exact(&mut footer_buf).map_err(StorageError::Io)?;
@@ -541,17 +554,22 @@ impl SegmentReader {
                 let mut cursor = 0usize;
                 let mut col_offsets = Vec::with_capacity(total_col_offsets);
                 for _ in 0..total_col_offsets {
-                    let offset = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                    let offset =
+                        u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
                     col_offsets.push(offset);
                     cursor += 8;
                 }
-                let stats_off = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                let stats_off =
+                    u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
                 cursor += 8;
-                let bloom_off = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                let bloom_off =
+                    u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
                 cursor += 8;
-                let min_rid = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                let min_rid =
+                    u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
                 cursor += 8;
-                let max_rid = u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
+                let max_rid =
+                    u64::from_le_bytes(footer_buf[cursor..cursor + 8].try_into().unwrap());
 
                 (col_offsets, min_rid, max_rid, stats_off, bloom_off)
             };
@@ -579,9 +597,7 @@ impl SegmentReader {
 
     /// Get lightweight metadata for pruning.
     pub fn metadata(&self) -> SegmentMetadata {
-        let file_size = std::fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         let has_row_id_column = self.column_offsets.len() > self.header.column_count as usize;
         let is_timestamp_sorted = self.header.flags & FLAG_TIMESTAMP_SORTED != 0;
         let has_bloom_filters = self.header.flags & FLAG_HAS_BLOOM_FILTERS != 0;
@@ -607,7 +623,9 @@ impl SegmentReader {
         let idx = column_id as usize;
         if idx >= self.column_offsets.len() {
             return Err(StorageError::InvalidData(format!(
-                "Column {} out of range (max {})", column_id, self.column_offsets.len()
+                "Column {} out of range (max {})",
+                column_id,
+                self.column_offsets.len()
             )));
         }
 
@@ -705,7 +723,7 @@ impl SegmentReader {
             if off + 4 > mmap.len() {
                 return Err(StorageError::CorruptedFile(self.path.clone()));
             }
-            let buf = &mmap[off..off+4];
+            let buf = &mmap[off..off + 4];
             let num_stats = u32::from_le_bytes(buf.try_into().unwrap()) as usize;
 
             let stats_data_size = num_stats * ColumnStatistics::SERIALIZED_SIZE;
@@ -714,14 +732,16 @@ impl SegmentReader {
                 return Err(StorageError::CorruptedFile(self.path.clone()));
             }
 
-            let stats_buf = &mmap[off+4..off+4+stats_data_size+4];
+            let stats_buf = &mmap[off + 4..off + 4 + stats_data_size + 4];
 
             // Verify CRC
             let mut crc_input = Vec::with_capacity(4 + stats_data_size);
             crc_input.extend_from_slice(buf);
             crc_input.extend_from_slice(&stats_buf[..stats_data_size]);
             let stored_crc = u32::from_le_bytes(
-                stats_buf[stats_data_size..stats_data_size+4].try_into().unwrap()
+                stats_buf[stats_data_size..stats_data_size + 4]
+                    .try_into()
+                    .unwrap(),
             );
             let computed_crc = crc32fast::hash(&crc_input);
             if stored_crc != computed_crc {
@@ -732,7 +752,7 @@ impl SegmentReader {
             for i in 0..num_stats {
                 let s_off = i * ColumnStatistics::SERIALIZED_SIZE;
                 if let Some(stat) = ColumnStatistics::from_bytes(
-                    &stats_buf[s_off..s_off + ColumnStatistics::SERIALIZED_SIZE]
+                    &stats_buf[s_off..s_off + ColumnStatistics::SERIALIZED_SIZE],
                 ) {
                     stats.push(stat);
                 }
@@ -757,7 +777,9 @@ impl SegmentReader {
         crc_input.extend_from_slice(&buf);
         crc_input.extend_from_slice(&stats_buf[..stats_data_size]);
         let stored_crc = u32::from_le_bytes(
-            stats_buf[stats_data_size..stats_data_size + 4].try_into().unwrap()
+            stats_buf[stats_data_size..stats_data_size + 4]
+                .try_into()
+                .unwrap(),
         );
         let computed_crc = crc32fast::hash(&crc_input);
         if stored_crc != computed_crc {
@@ -768,7 +790,7 @@ impl SegmentReader {
         for i in 0..num_stats {
             let offset = i * ColumnStatistics::SERIALIZED_SIZE;
             if let Some(stat) = ColumnStatistics::from_bytes(
-                &stats_buf[offset..offset + ColumnStatistics::SERIALIZED_SIZE]
+                &stats_buf[offset..offset + ColumnStatistics::SERIALIZED_SIZE],
             ) {
                 stats.push(stat);
             }
@@ -791,35 +813,42 @@ impl SegmentReader {
             if off + 4 > mmap.len() {
                 return Err(StorageError::CorruptedFile(self.path.clone()));
             }
-            let block_len = u32::from_le_bytes(mmap[off..off+4].try_into().unwrap()) as usize;
+            let block_len = u32::from_le_bytes(mmap[off..off + 4].try_into().unwrap()) as usize;
             if block_len < 4 || off + 4 + block_len > mmap.len() {
                 return Err(StorageError::CorruptedFile(self.path.clone()));
             }
-            let block_buf = &mmap[off+4..off+4+block_len];
+            let block_buf = &mmap[off + 4..off + 4 + block_len];
 
             let data_len = block_len - 4;
-            let stored_crc = u32::from_le_bytes(
-                block_buf[data_len..data_len+4].try_into().unwrap()
-            );
+            let stored_crc =
+                u32::from_le_bytes(block_buf[data_len..data_len + 4].try_into().unwrap());
             let computed_crc = crc32fast::hash(&block_buf[..data_len]);
             if stored_crc != computed_crc {
                 return Err(StorageError::CorruptedFile(self.path.clone()));
             }
 
             let mut cursor = 0usize;
-            if data_len < 2 { return Ok(None); }
-            let num_filters = u16::from_le_bytes(block_buf[cursor..cursor+2].try_into().unwrap()) as usize;
+            if data_len < 2 {
+                return Ok(None);
+            }
+            let num_filters =
+                u16::from_le_bytes(block_buf[cursor..cursor + 2].try_into().unwrap()) as usize;
             cursor += 2;
 
             let mut filters = HashMap::new();
             for _ in 0..num_filters {
-                if cursor + 6 > data_len { break; }
-                let col_id = u16::from_le_bytes(block_buf[cursor..cursor+2].try_into().unwrap());
+                if cursor + 6 > data_len {
+                    break;
+                }
+                let col_id = u16::from_le_bytes(block_buf[cursor..cursor + 2].try_into().unwrap());
                 cursor += 2;
-                let filter_len = u32::from_le_bytes(block_buf[cursor..cursor+4].try_into().unwrap()) as usize;
+                let filter_len =
+                    u32::from_le_bytes(block_buf[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                if cursor + filter_len > data_len { break; }
-                filters.insert(col_id, block_buf[cursor..cursor+filter_len].to_vec());
+                if cursor + filter_len > data_len {
+                    break;
+                }
+                filters.insert(col_id, block_buf[cursor..cursor + filter_len].to_vec());
                 cursor += filter_len;
             }
             return Ok(Some(filters));
@@ -844,9 +873,7 @@ impl SegmentReader {
             return Err(StorageError::CorruptedFile(self.path.clone()));
         }
         let data_len = block_len - 4;
-        let stored_crc = u32::from_le_bytes(
-            block_buf[data_len..data_len + 4].try_into().unwrap()
-        );
+        let stored_crc = u32::from_le_bytes(block_buf[data_len..data_len + 4].try_into().unwrap());
         let computed_crc = crc32fast::hash(&block_buf[..data_len]);
         if stored_crc != computed_crc {
             return Err(StorageError::CorruptedFile(self.path.clone()));
@@ -854,9 +881,8 @@ impl SegmentReader {
 
         // Parse: num_filters(u16) + per filter: col_id(u16) + len(u32) + data
         let mut cursor = 0usize;
-        let num_filters = u16::from_le_bytes(
-            block_buf[cursor..cursor + 2].try_into().unwrap()
-        ) as usize;
+        let num_filters =
+            u16::from_le_bytes(block_buf[cursor..cursor + 2].try_into().unwrap()) as usize;
         cursor += 2;
 
         let mut filters = HashMap::with_capacity(num_filters);
@@ -864,13 +890,10 @@ impl SegmentReader {
             if cursor + 6 > data_len {
                 break;
             }
-            let col_id = u16::from_le_bytes(
-                block_buf[cursor..cursor + 2].try_into().unwrap()
-            );
+            let col_id = u16::from_le_bytes(block_buf[cursor..cursor + 2].try_into().unwrap());
             cursor += 2;
-            let filter_data_len = u32::from_le_bytes(
-                block_buf[cursor..cursor + 4].try_into().unwrap()
-            ) as usize;
+            let filter_data_len =
+                u32::from_le_bytes(block_buf[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
             if cursor + filter_data_len > data_len {
                 break;
@@ -904,15 +927,21 @@ mod tests {
 
             // Column 0: timestamp (Gorilla encoded)
             let ts_data = super::super::gorilla::encode_timestamps(&[1000i64, 2000, 3000]);
-            builder.write_column(0, ColumnEncoding::GorillaTimestamp, &ts_data, 24, 0).unwrap();
+            builder
+                .write_column(0, ColumnEncoding::GorillaTimestamp, &ts_data, 24, 0)
+                .unwrap();
 
             // Column 1: float (XOR encoded)
             let float_data = super::super::gorilla::encode_floats(&[25.0f64, 26.0, 27.0]);
-            builder.write_column(1, ColumnEncoding::GorillaXorFloat, &float_data, 24, 0).unwrap();
+            builder
+                .write_column(1, ColumnEncoding::GorillaXorFloat, &float_data, 24, 0)
+                .unwrap();
 
             // Column 2: integer (delta-varint)
             let int_data = super::super::gorilla::encode_integers(&[100i64, 200, 300]);
-            builder.write_column(2, ColumnEncoding::DeltaVarint, &int_data, 24, 0).unwrap();
+            builder
+                .write_column(2, ColumnEncoding::DeltaVarint, &int_data, 24, 0)
+                .unwrap();
 
             builder.finish(3, 1000, 3000, 10, 12).unwrap();
         }
@@ -958,7 +987,9 @@ mod tests {
         {
             let mut builder = SegmentBuilder::new(&path, 1, 5).unwrap();
             for i in 0..5u16 {
-                builder.write_column(i, ColumnEncoding::Raw, &[i as u8; 100], 100, 0).unwrap();
+                builder
+                    .write_column(i, ColumnEncoding::Raw, &[i as u8; 100], 100, 0)
+                    .unwrap();
             }
             builder.finish(10, 0, 100, 0, 9).unwrap();
         }
@@ -981,7 +1012,9 @@ mod tests {
         // Write a valid segment
         {
             let mut builder = SegmentBuilder::new(&path, 1, 1).unwrap();
-            builder.write_column(0, ColumnEncoding::Raw, &[1, 2, 3], 3, 0).unwrap();
+            builder
+                .write_column(0, ColumnEncoding::Raw, &[1, 2, 3], 3, 0)
+                .unwrap();
             builder.finish(1, 0, 1, 0, 0).unwrap();
         }
 
@@ -1002,9 +1035,15 @@ mod tests {
 
         {
             let mut builder = SegmentBuilder::new(&path, 1, 3).unwrap();
-            builder.write_column(0, ColumnEncoding::Raw, &[0u8; 50], 50, 0).unwrap();
-            builder.write_column(1, ColumnEncoding::Raw, &[1u8; 50], 50, 0).unwrap();
-            builder.write_column(2, ColumnEncoding::Raw, &[2u8; 50], 50, 0).unwrap();
+            builder
+                .write_column(0, ColumnEncoding::Raw, &[0u8; 50], 50, 0)
+                .unwrap();
+            builder
+                .write_column(1, ColumnEncoding::Raw, &[1u8; 50], 50, 0)
+                .unwrap();
+            builder
+                .write_column(2, ColumnEncoding::Raw, &[2u8; 50], 50, 0)
+                .unwrap();
             builder.finish(5, 0, 100, 0, 4).unwrap();
         }
 
@@ -1025,9 +1064,13 @@ mod tests {
         {
             let mut builder = SegmentBuilder::new(&path, 1, 2).unwrap();
             let ts_data = super::super::gorilla::encode_timestamps(&[1000i64, 2000, 3000]);
-            builder.write_column(0, ColumnEncoding::GorillaTimestamp, &ts_data, 24, 0).unwrap();
+            builder
+                .write_column(0, ColumnEncoding::GorillaTimestamp, &ts_data, 24, 0)
+                .unwrap();
             let float_data = super::super::gorilla::encode_floats(&[10.0f64, 20.0, 30.0]);
-            builder.write_column(1, ColumnEncoding::GorillaXorFloat, &float_data, 24, 0).unwrap();
+            builder
+                .write_column(1, ColumnEncoding::GorillaXorFloat, &float_data, 24, 0)
+                .unwrap();
 
             let stats = vec![
                 ColumnStatistics {
@@ -1083,7 +1126,9 @@ mod tests {
         {
             let mut builder = SegmentBuilder::new(&path, 1, 1).unwrap();
             let text_data = vec![0u8; 50]; // dummy
-            builder.write_column(0, ColumnEncoding::Raw, &text_data, 50, 0).unwrap();
+            builder
+                .write_column(0, ColumnEncoding::Raw, &text_data, 50, 0)
+                .unwrap();
             builder.set_bloom_filters(vec![(0u16, bloom_bytes)]);
             builder.finish(10, 0, 100, 0, 9).unwrap();
         }
@@ -1112,8 +1157,12 @@ mod tests {
         // Write v2 segment without stats or bloom
         {
             let mut builder = SegmentBuilder::new(&path, 1, 2).unwrap();
-            builder.write_column(0, ColumnEncoding::Raw, &[1u8; 20], 20, 0).unwrap();
-            builder.write_column(1, ColumnEncoding::Raw, &[2u8; 20], 20, 0).unwrap();
+            builder
+                .write_column(0, ColumnEncoding::Raw, &[1u8; 20], 20, 0)
+                .unwrap();
+            builder
+                .write_column(1, ColumnEncoding::Raw, &[2u8; 20], 20, 0)
+                .unwrap();
             builder.finish(5, 0, 100, 0, 4).unwrap();
         }
 
@@ -1145,7 +1194,7 @@ mod tests {
 
     #[test]
     fn test_value_to_raw_bytes() {
-        use crate::types::{Timestamp, Value, ArcString};
+        use crate::types::{ArcString, Timestamp, Value};
         use std::sync::Arc;
 
         let v_int = Value::Integer(42);

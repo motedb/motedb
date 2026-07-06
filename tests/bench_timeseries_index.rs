@@ -53,8 +53,12 @@ fn bench_timeseries_full_suite() {
     let t0 = Instant::now();
     ingest_batch(&db, "bench", total_rows, base_ts);
     let ingest_time = t0.elapsed();
-    println!("Ingest {} rows: {:.2?} ({:.0} rows/sec)",
-        total_rows, ingest_time, total_rows as f64 / ingest_time.as_secs_f64());
+    println!(
+        "Ingest {} rows: {:.2?} ({:.0} rows/sec)",
+        total_rows,
+        ingest_time,
+        total_rows as f64 / ingest_time.as_secs_f64()
+    );
 
     db.flush().unwrap();
     let seg_count = db.columnar_store().segment_count("bench");
@@ -65,28 +69,51 @@ fn bench_timeseries_full_suite() {
 
     // 2a: Full scan
     let t0 = Instant::now();
-    let full = db.columnar_store().query_time_range("bench", 0, i64::MAX, &[]).unwrap();
+    let full = db
+        .columnar_store()
+        .query_time_range("bench", 0, i64::MAX, &[])
+        .unwrap();
     let full_time = t0.elapsed();
-    println!("Full scan ({} rows): {:.2?} ({:.0} rows/sec)",
-        full.len(), full_time, full.len() as f64 / full_time.as_secs_f64());
+    println!(
+        "Full scan ({} rows): {:.2?} ({:.0} rows/sec)",
+        full.len(),
+        full_time,
+        full.len() as f64 / full_time.as_secs_f64()
+    );
     assert_eq!(full.len(), total_rows);
 
     // 2b: Narrow time range (~5% of data)
     let narrow_start = base_ts + 2_000_000i64;
     let narrow_end = base_ts + 2_250_000i64;
     let t0 = Instant::now();
-    let narrow = db.columnar_store().query_time_range("bench", narrow_start, narrow_end, &[]).unwrap();
+    let narrow = db
+        .columnar_store()
+        .query_time_range("bench", narrow_start, narrow_end, &[])
+        .unwrap();
     let narrow_time = t0.elapsed();
-    println!("Narrow time range ({} rows): {:.2?}", narrow.len(), narrow_time);
+    println!(
+        "Narrow time range ({} rows): {:.2?}",
+        narrow.len(),
+        narrow_time
+    );
 
     // 2c: Column projection (only 2 of 5 columns)
     let t0 = Instant::now();
-    let projected = db.columnar_store().query_time_range(
-        "bench", narrow_start, narrow_end,
-        &["ts".to_string(), "temperature".to_string()],
-    ).unwrap();
+    let projected = db
+        .columnar_store()
+        .query_time_range(
+            "bench",
+            narrow_start,
+            narrow_end,
+            &["ts".to_string(), "temperature".to_string()],
+        )
+        .unwrap();
     let proj_time = t0.elapsed();
-    println!("Column projection ({} rows): {:.2?}", projected.len(), proj_time);
+    println!(
+        "Column projection ({} rows): {:.2?}",
+        projected.len(),
+        proj_time
+    );
 
     // ---- Phase 3: Condition-Based Queries ----
     println!("\n=== Phase 3: Condition Pruning Performance ===");
@@ -97,9 +124,10 @@ fn bench_timeseries_full_suite() {
         value: Value::Integer(5),
     }];
     let t0 = Instant::now();
-    let zone_results = db.columnar_store().query_with_conditions(
-        "bench", 0, i64::MAX, &zone_cond, &[],
-    ).unwrap();
+    let zone_results = db
+        .columnar_store()
+        .query_with_conditions("bench", 0, i64::MAX, &zone_cond, &[])
+        .unwrap();
     let zone_time = t0.elapsed();
     println!("Zone=5 ({} rows): {:.2?}", zone_results.len(), zone_time);
     // zone 5 is every 10th row
@@ -111,11 +139,16 @@ fn bench_timeseries_full_suite() {
         value: Value::text("label_7".to_string()),
     }];
     let t0 = Instant::now();
-    let label_results = db.columnar_store().query_with_conditions(
-        "bench", 0, i64::MAX, &label_cond, &[],
-    ).unwrap();
+    let label_results = db
+        .columnar_store()
+        .query_with_conditions("bench", 0, i64::MAX, &label_cond, &[])
+        .unwrap();
     let label_time = t0.elapsed();
-    println!("Label='label_7' ({} rows): {:.2?}", label_results.len(), label_time);
+    println!(
+        "Label='label_7' ({} rows): {:.2?}",
+        label_results.len(),
+        label_time
+    );
 
     // 3c: Label nonexistent (bloom filter negative — fast path)
     let no_cond = vec![ColumnCondition::Equals {
@@ -123,11 +156,16 @@ fn bench_timeseries_full_suite() {
         value: Value::text("NONEXISTENT_LABEL".to_string()),
     }];
     let t0 = Instant::now();
-    let no_results = db.columnar_store().query_with_conditions(
-        "bench", 0, i64::MAX, &no_cond, &[],
-    ).unwrap();
+    let no_results = db
+        .columnar_store()
+        .query_with_conditions("bench", 0, i64::MAX, &no_cond, &[])
+        .unwrap();
     let no_time = t0.elapsed();
-    println!("Label='NONEXISTENT' ({} rows): {:.2?} (bloom filter fast path)", no_results.len(), no_time);
+    println!(
+        "Label='NONEXISTENT' ({} rows): {:.2?} (bloom filter fast path)",
+        no_results.len(),
+        no_time
+    );
     assert!(no_results.is_empty());
 
     // 3d: Temperature range condition
@@ -137,11 +175,16 @@ fn bench_timeseries_full_suite() {
         high: Value::Float(28.0),
     }];
     let t0 = Instant::now();
-    let temp_results = db.columnar_store().query_with_conditions(
-        "bench", 0, i64::MAX, &temp_cond, &[],
-    ).unwrap();
+    let temp_results = db
+        .columnar_store()
+        .query_with_conditions("bench", 0, i64::MAX, &temp_cond, &[])
+        .unwrap();
     let temp_time = t0.elapsed();
-    println!("Temp [25,28] ({} rows): {:.2?}", temp_results.len(), temp_time);
+    println!(
+        "Temp [25,28] ({} rows): {:.2?}",
+        temp_results.len(),
+        temp_time
+    );
 
     // 3e: Combined: time range + zone
     let combined_conds = vec![ColumnCondition::Equals {
@@ -149,31 +192,70 @@ fn bench_timeseries_full_suite() {
         value: Value::Integer(3),
     }];
     let t0 = Instant::now();
-    let combined = db.columnar_store().query_with_conditions(
-        "bench", base_ts, base_ts + 2_500_000i64, &combined_conds, &[],
-    ).unwrap();
+    let combined = db
+        .columnar_store()
+        .query_with_conditions(
+            "bench",
+            base_ts,
+            base_ts + 2_500_000i64,
+            &combined_conds,
+            &[],
+        )
+        .unwrap();
     let combined_time = t0.elapsed();
-    println!("Time+Zone combined ({} rows): {:.2?}", combined.len(), combined_time);
+    println!(
+        "Time+Zone combined ({} rows): {:.2?}",
+        combined.len(),
+        combined_time
+    );
 
     // ---- Phase 4: Benchmark Segment Pruning Effectiveness ----
     println!("\n=== Phase 4: Pruning Effectiveness ===");
     let narrow_seg_count = seg_count; // total segments
-    // Estimate how many segments the narrow query had to scan
+                                      // Estimate how many segments the narrow query had to scan
     let narrow_seg_estimate = 1.max(narrow_seg_count / 20); // ~5% of range
     println!("Total segments: {}", narrow_seg_count);
-    println!("Estimated segments scanned for narrow query: ~{}", narrow_seg_estimate);
-    println!("Pruning ratio: ~{:.1}x reduction", narrow_seg_count as f64 / narrow_seg_estimate as f64);
+    println!(
+        "Estimated segments scanned for narrow query: ~{}",
+        narrow_seg_estimate
+    );
+    println!(
+        "Pruning ratio: ~{:.1}x reduction",
+        narrow_seg_count as f64 / narrow_seg_estimate as f64
+    );
 
     // ---- Summary ----
     println!("\n=== Summary ===");
     println!("Rows: {} | Segments: {}", total_rows, seg_count);
-    println!("Ingest: {:.0} rows/sec", total_rows as f64 / ingest_time.as_secs_f64());
-    println!("Full scan: {:.0} rows/sec", full.len() as f64 / full_time.as_secs_f64());
+    println!(
+        "Ingest: {:.0} rows/sec",
+        total_rows as f64 / ingest_time.as_secs_f64()
+    );
+    println!(
+        "Full scan: {:.0} rows/sec",
+        full.len() as f64 / full_time.as_secs_f64()
+    );
     println!("Narrow range: {:.2?}", narrow_time);
-    println!("Zone condition: {:.2?} ({} rows)", zone_time, zone_results.len());
-    println!("Label bloom hit: {:.2?} ({} rows)", label_time, label_results.len());
-    println!("Label bloom miss: {:.2?} ({} rows)", no_time, no_results.len());
-    println!("Combined query: {:.2?} ({} rows)", combined_time, combined.len());
+    println!(
+        "Zone condition: {:.2?} ({} rows)",
+        zone_time,
+        zone_results.len()
+    );
+    println!(
+        "Label bloom hit: {:.2?} ({} rows)",
+        label_time,
+        label_results.len()
+    );
+    println!(
+        "Label bloom miss: {:.2?} ({} rows)",
+        no_time,
+        no_results.len()
+    );
+    println!(
+        "Combined query: {:.2?} ({} rows)",
+        combined_time,
+        combined.len()
+    );
 }
 
 #[test]
@@ -184,14 +266,26 @@ fn bench_ingest_throughput() {
     let rows_per_batch = 10_000usize;
     let num_batches = 5;
 
-    println!("\n=== Ingest Throughput ({} batches × {} rows) ===", num_batches, rows_per_batch);
+    println!(
+        "\n=== Ingest Throughput ({} batches × {} rows) ===",
+        num_batches, rows_per_batch
+    );
 
     for batch in 0..num_batches {
         let t0 = Instant::now();
-        ingest_batch(&db, "bench", rows_per_batch, 1_000_000 + batch as i64 * 10_000_000);
+        ingest_batch(
+            &db,
+            "bench",
+            rows_per_batch,
+            1_000_000 + batch as i64 * 10_000_000,
+        );
         let elapsed = t0.elapsed();
-        println!("Batch {}: {:.2?} ({:.0} rows/sec)",
-            batch, elapsed, rows_per_batch as f64 / elapsed.as_secs_f64());
+        println!(
+            "Batch {}: {:.2?} ({:.0} rows/sec)",
+            batch,
+            elapsed,
+            rows_per_batch as f64 / elapsed.as_secs_f64()
+        );
     }
 
     let t0 = Instant::now();

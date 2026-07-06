@@ -2,8 +2,8 @@
 //!
 //! Validates Atomicity, Consistency, Isolation, Durability across CRUD operations.
 
-use motedb::Database;
 use motedb::types::Value;
+use motedb::Database;
 use tempfile::TempDir;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -20,23 +20,26 @@ fn open_test_db(path: &std::path::Path) -> Database {
 
 /// Execute SQL and get the materialized QueryResult
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 /// Execute a SELECT and return rows as Vec<HashMap<col, val>>
 fn select_maps(db: &Database, sql: &str) -> Vec<std::collections::HashMap<String, Value>> {
     let result = exec(db, sql);
     match result {
-        motedb::sql::QueryResult::Select { columns, rows } => {
-            rows.into_iter()
-                .map(|row| {
-                    columns.iter()
-                        .zip(row)
-                        .map(|(col, val)| (col.clone(), val))
-                        .collect()
-                })
-                .collect()
-        }
+        motedb::sql::QueryResult::Select { columns, rows } => rows
+            .into_iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .zip(row)
+                    .map(|(col, val)| (col.clone(), val))
+                    .collect()
+            })
+            .collect(),
         _ => panic!("Expected SELECT result, got {:?}", result),
     }
 }
@@ -45,12 +48,18 @@ fn select_maps(db: &Database, sql: &str) -> Vec<std::collections::HashMap<String
 fn count_rows(db: &Database, table: &str) -> usize {
     let rows = select_maps(db, &format!("SELECT COUNT(*) AS cnt FROM {}", table));
     // The executor fast-path may return "COUNT(*)" instead of alias "cnt"
-    let row = rows.first().unwrap_or_else(|| panic!("COUNT returned no rows for table {}", table));
-    let val = row.get("cnt")
-        .or_else(|| row.get("COUNT(*)"));
+    let row = rows
+        .first()
+        .unwrap_or_else(|| panic!("COUNT returned no rows for table {}", table));
+    let val = row.get("cnt").or_else(|| row.get("COUNT(*)"));
     match val {
         Some(Value::Integer(n)) => *n as usize,
-        other => panic!("COUNT returned unexpected value for table {}: {:?}, row keys: {:?}", table, other, row.keys().collect::<Vec<_>>()),
+        other => panic!(
+            "COUNT returned unexpected value for table {}: {:?}, row keys: {:?}",
+            table,
+            other,
+            row.keys().collect::<Vec<_>>()
+        ),
     }
 }
 
@@ -62,7 +71,10 @@ fn count_rows(db: &Database, table: &str) -> usize {
 fn test_crud_insert_and_select() {
     let (db, _dir) = create_test_db();
 
-    exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    );
 
     let result = exec(&db, "INSERT INTO users VALUES (1, 'Alice', 30)");
     assert_eq!(result.affected_rows(), 1);
@@ -76,7 +88,10 @@ fn test_crud_insert_and_select() {
 #[test]
 fn test_crud_update() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)",
+    );
     exec(&db, "INSERT INTO users VALUES (1, 'Alice', 30)");
 
     let result = exec(&db, "UPDATE users SET name = 'Bob', age = 25 WHERE id = 1");
@@ -91,7 +106,10 @@ fn test_crud_update() {
 #[test]
 fn test_crud_delete() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    );
     exec(&db, "INSERT INTO users VALUES (1, 'Alice')");
     exec(&db, "INSERT INTO users VALUES (2, 'Bob')");
 
@@ -122,10 +140,21 @@ fn test_crud_delete_all() {
 #[test]
 fn test_crud_multiple_rows() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)",
+    );
 
     for i in 0..50i64 {
-        exec(&db, &format!("INSERT INTO products VALUES ({}, 'Product{}', {})", i, i, i as f64 * 1.5));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO products VALUES ({}, 'Product{}', {})",
+                i,
+                i,
+                i as f64 * 1.5
+            ),
+        );
     }
 
     assert_eq!(count_rows(&db, "products"), 50);
@@ -151,10 +180,16 @@ fn test_crud_multiple_rows() {
 #[test]
 fn test_consistency_update_preserves_other_rows() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)",
+    );
 
     for i in 1..=5i64 {
-        exec(&db, &format!("INSERT INTO items VALUES ({}, {})", i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO items VALUES ({}, {})", i, i * 10),
+        );
     }
 
     exec(&db, "UPDATE items SET val = 999 WHERE id = 3");
@@ -185,8 +220,15 @@ fn test_consistency_delete_does_not_corrupt_neighbors() {
     let rows = select_maps(&db, "SELECT * FROM seq ORDER BY id");
     assert_eq!(rows.len(), 5);
 
-    let ids: Vec<i64> = rows.iter()
-        .filter_map(|r| if let Some(Value::Integer(id)) = r.get("id") { Some(*id) } else { None })
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let Some(Value::Integer(id)) = r.get("id") {
+                Some(*id)
+            } else {
+                None
+            }
+        })
         .collect();
     assert_eq!(ids, vec![1, 3, 5, 7, 9]);
 }
@@ -227,7 +269,10 @@ fn test_consistency_idempotent_update() {
 #[test]
 fn test_consistency_sequential_updates() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
     exec(&db, "INSERT INTO counter VALUES (1, 0)");
 
     for i in 1..=10i64 {
@@ -266,7 +311,10 @@ fn test_isolation_separate_tables_independent() {
 #[test]
 fn test_isolation_same_key_different_tables() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE alpha (id INTEGER PRIMARY KEY, data TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE alpha (id INTEGER PRIMARY KEY, data TEXT)",
+    );
     exec(&db, "CREATE TABLE beta (id INTEGER PRIMARY KEY, data TEXT)");
 
     exec(&db, "INSERT INTO alpha VALUES (42, 'alpha_data')");
@@ -275,15 +323,24 @@ fn test_isolation_same_key_different_tables() {
     let alpha = select_maps(&db, "SELECT * FROM alpha WHERE id = 42");
     let beta = select_maps(&db, "SELECT * FROM beta WHERE id = 42");
 
-    assert_eq!(alpha[0].get("data"), Some(&Value::text("alpha_data".into())));
+    assert_eq!(
+        alpha[0].get("data"),
+        Some(&Value::text("alpha_data".into()))
+    );
     assert_eq!(beta[0].get("data"), Some(&Value::text("beta_data".into())));
 }
 
 #[test]
 fn test_isolation_update_one_table_does_not_affect_another() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE source (id INTEGER PRIMARY KEY, v INTEGER)");
-    exec(&db, "CREATE TABLE target (id INTEGER PRIMARY KEY, v INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE source (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE target (id INTEGER PRIMARY KEY, v INTEGER)",
+    );
 
     exec(&db, "INSERT INTO source VALUES (1, 100)");
     exec(&db, "INSERT INTO target VALUES (1, 200)");
@@ -300,9 +357,18 @@ fn test_isolation_update_one_table_does_not_affect_another() {
 #[test]
 fn test_isolation_three_tables_full_crud() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-    exec(&db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT)");
-    exec(&db, "CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT, price FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, title TEXT, price FLOAT)",
+    );
 
     exec(&db, "INSERT INTO users VALUES (1, 'Alice')");
     exec(&db, "INSERT INTO orders VALUES (10, 1, 99.9)");
@@ -320,7 +386,10 @@ fn test_isolation_three_tables_full_crud() {
 
     let products = select_maps(&db, "SELECT * FROM products");
     assert_eq!(products.len(), 1);
-    assert_eq!(products[0].get("title"), Some(&Value::text("Widget".into())));
+    assert_eq!(
+        products[0].get("title"),
+        Some(&Value::text("Widget".into()))
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -330,10 +399,16 @@ fn test_isolation_three_tables_full_crud() {
 #[test]
 fn test_durability_flush_then_read() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE durable (id INTEGER PRIMARY KEY, data TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE durable (id INTEGER PRIMARY KEY, data TEXT)",
+    );
 
     for i in 1..=10i64 {
-        exec(&db, &format!("INSERT INTO durable VALUES ({}, 'data_{}')", i, i));
+        exec(
+            &db,
+            &format!("INSERT INTO durable VALUES ({}, 'data_{}')", i, i),
+        );
     }
 
     db.flush().unwrap();
@@ -352,7 +427,10 @@ fn test_durability_data_persists_across_close() {
     // Phase 1: Create, insert, checkpoint, close
     {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE persist_test (id INTEGER PRIMARY KEY, val TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE persist_test (id INTEGER PRIMARY KEY, val TEXT)",
+        );
         exec(&db, "INSERT INTO persist_test VALUES (1, 'hello')");
         exec(&db, "INSERT INTO persist_test VALUES (2, 'world')");
         db.checkpoint().unwrap();
@@ -378,9 +456,15 @@ fn test_durability_wal_recovery_after_unclean_shutdown() {
     // Phase 1: Create and insert, flush but drop without close (simulate crash)
     {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE crash_test (id INTEGER PRIMARY KEY, payload TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE crash_test (id INTEGER PRIMARY KEY, payload TEXT)",
+        );
         exec(&db, "INSERT INTO crash_test VALUES (1, 'before_crash')");
-        exec(&db, "INSERT INTO crash_test VALUES (2, 'also_before_crash')");
+        exec(
+            &db,
+            "INSERT INTO crash_test VALUES (2, 'also_before_crash')",
+        );
         db.flush().unwrap();
         drop(db);
     }
@@ -389,13 +473,30 @@ fn test_durability_wal_recovery_after_unclean_shutdown() {
     {
         let db = open_test_db(&db_path);
         let rows = select_maps(&db, "SELECT * FROM crash_test ORDER BY id");
-        assert!(rows.len() >= 2, "Expected at least 2 rows after WAL recovery, got {}", rows.len());
+        assert!(
+            rows.len() >= 2,
+            "Expected at least 2 rows after WAL recovery, got {}",
+            rows.len()
+        );
 
-        let found_ids: Vec<i64> = rows.iter()
-            .filter_map(|r| if let Some(Value::Integer(id)) = r.get("id") { Some(*id) } else { None })
+        let found_ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| {
+                if let Some(Value::Integer(id)) = r.get("id") {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .collect();
-        assert!(found_ids.contains(&1), "Row id=1 should exist after WAL recovery");
-        assert!(found_ids.contains(&2), "Row id=2 should exist after WAL recovery");
+        assert!(
+            found_ids.contains(&1),
+            "Row id=1 should exist after WAL recovery"
+        );
+        assert!(
+            found_ids.contains(&2),
+            "Row id=2 should exist after WAL recovery"
+        );
     }
 }
 
@@ -406,7 +507,10 @@ fn test_durability_update_survives_restart() {
 
     {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE up_test (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(
+            &db,
+            "CREATE TABLE up_test (id INTEGER PRIMARY KEY, v INTEGER)",
+        );
         exec(&db, "INSERT INTO up_test VALUES (1, 100)");
         exec(&db, "UPDATE up_test SET v = 200 WHERE id = 1");
         db.checkpoint().unwrap();
@@ -428,7 +532,10 @@ fn test_durability_delete_survives_restart() {
 
     {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE del_test (id INTEGER PRIMARY KEY, v TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE del_test (id INTEGER PRIMARY KEY, v TEXT)",
+        );
         exec(&db, "INSERT INTO del_test VALUES (1, 'a')");
         exec(&db, "INSERT INTO del_test VALUES (2, 'b')");
         exec(&db, "INSERT INTO del_test VALUES (3, 'c')");
@@ -441,8 +548,15 @@ fn test_durability_delete_survives_restart() {
         let db = open_test_db(&db_path);
         let rows = select_maps(&db, "SELECT * FROM del_test ORDER BY id");
         assert_eq!(rows.len(), 2);
-        let ids: Vec<i64> = rows.iter()
-            .filter_map(|r| if let Some(Value::Integer(id)) = r.get("id") { Some(*id) } else { None })
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| {
+                if let Some(Value::Integer(id)) = r.get("id") {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(ids, vec![1, 3]);
     }
@@ -475,8 +589,15 @@ fn test_durability_full_crud_cycle_across_restart() {
         assert_eq!(rows.len(), 4, "Should have 4 rows (5 inserted - 1 deleted)");
 
         assert_eq!(rows[2].get("v"), Some(&Value::text("updated".into())));
-        let ids: Vec<i64> = rows.iter()
-            .filter_map(|r| if let Some(Value::Integer(id)) = r.get("id") { Some(*id) } else { None })
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| {
+                if let Some(Value::Integer(id)) = r.get("id") {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
     }
@@ -493,7 +614,10 @@ fn test_multi_table_same_key_persists_across_restart() {
 
     {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE alpha (id INTEGER PRIMARY KEY, data TEXT)");
+        exec(
+            &db,
+            "CREATE TABLE alpha (id INTEGER PRIMARY KEY, data TEXT)",
+        );
         exec(&db, "CREATE TABLE beta (id INTEGER PRIMARY KEY, data TEXT)");
 
         exec(&db, "INSERT INTO alpha VALUES (42, 'alpha_data')");
@@ -508,7 +632,10 @@ fn test_multi_table_same_key_persists_across_restart() {
         let alpha = select_maps(&db, "SELECT * FROM alpha WHERE id = 42");
         let beta = select_maps(&db, "SELECT * FROM beta WHERE id = 42");
 
-        assert_eq!(alpha[0].get("data"), Some(&Value::text("alpha_data".into())));
+        assert_eq!(
+            alpha[0].get("data"),
+            Some(&Value::text("alpha_data".into()))
+        );
         assert_eq!(beta[0].get("data"), Some(&Value::text("beta_data".into())));
     }
 }
@@ -520,12 +647,18 @@ fn test_multi_table_same_key_persists_across_restart() {
 #[test]
 fn test_stress_large_dataset_crud() {
     let (db, _dir) = create_test_db();
-    exec(&db, "CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+    );
 
     const N: i64 = 200;
 
     for i in 1..=N {
-        exec(&db, &format!("INSERT INTO big VALUES ({}, 'user_{}', {})", i, i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO big VALUES ({}, 'user_{}', {})", i, i, i * 10),
+        );
     }
 
     assert_eq!(count_rows(&db, "big"), N as usize);
@@ -567,14 +700,23 @@ fn test_stress_restart_with_large_dataset() {
 
     {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE restart_test (id INTEGER PRIMARY KEY, v INTEGER)");
+        exec(
+            &db,
+            "CREATE TABLE restart_test (id INTEGER PRIMARY KEY, v INTEGER)",
+        );
 
         for i in 1..=N {
-            exec(&db, &format!("INSERT INTO restart_test VALUES ({}, {})", i, i * 100));
+            exec(
+                &db,
+                &format!("INSERT INTO restart_test VALUES ({}, {})", i, i * 100),
+            );
         }
 
         for i in (10..=N).step_by(10) {
-            exec(&db, &format!("UPDATE restart_test SET v = -{} WHERE id = {}", i, i));
+            exec(
+                &db,
+                &format!("UPDATE restart_test SET v = -{} WHERE id = {}", i, i),
+            );
         }
 
         for i in (5..=N).step_by(10) {
@@ -603,4 +745,3 @@ fn test_stress_restart_with_large_dataset() {
         assert_eq!(rows[0].get("v"), Some(&Value::Integer(100)));
     }
 }
-

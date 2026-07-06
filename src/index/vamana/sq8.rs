@@ -58,10 +58,16 @@ impl SQ8Quantizer {
         let mut max = f32::NEG_INFINITY;
         for &val in vector.iter() {
             if val.is_nan() {
-                return Err(StorageError::InvalidData("Vector contains NaN values".into()));
+                return Err(StorageError::InvalidData(
+                    "Vector contains NaN values".into(),
+                ));
             }
-            if val < min { min = val; }
-            if val > max { max = val; }
+            if val < min {
+                min = val;
+            }
+            if val > max {
+                max = val;
+            }
         }
 
         // Handle constant vectors
@@ -107,19 +113,19 @@ impl SQ8Quantizer {
     /// Save quantizer to file
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let mut file = File::create(path).map_err(StorageError::Io)?;
-        
+
         // Header: "SQ8\0" (4 bytes) + dimension (8 bytes)
         file.write_all(b"SQ8\0").map_err(StorageError::Io)?;
         file.write_all(&self.dimension.to_le_bytes())
             .map_err(StorageError::Io)?;
-        
+
         Ok(())
     }
 
     /// Load quantizer from file
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let mut file = File::open(path).map_err(StorageError::Io)?;
-        
+
         // Read header
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic).map_err(StorageError::Io)?;
@@ -128,50 +134,46 @@ impl SQ8Quantizer {
                 "Invalid SQ8 file magic".to_string(),
             ));
         }
-        
+
         // Read dimension
         let mut dim_bytes = [0u8; 8];
         file.read_exact(&mut dim_bytes).map_err(StorageError::Io)?;
         let dimension = usize::from_le_bytes(dim_bytes);
-        
+
         Ok(Self { dimension })
     }
 
     pub fn dimension(&self) -> usize {
         self.dimension
     }
-    
+
     /// 🚀 **OPTIMIZED: Asymmetric SQ8 distance calculation**
-    /// 
+    ///
     /// Computes distance between f32 query and SQ8 data vector without full decompression
-    /// 
+    ///
     /// **Performance:**
     /// - 2-3x faster than dequantize + f32 distance (in real I/O scenarios)
     /// - 4x less memory bandwidth (u8 vs f32)
     /// - SIMD-friendly operations
-    /// 
+    ///
     /// **Math:**
     /// ```ignore
     /// q: f32 query vector
     /// d: SQ8 data vector (codes, min, max)
-    /// 
+    ///
     /// distance = 1 - cosine_similarity
     /// cosine_sim = dot(q, d) / (norm(q) * norm(d))
-    /// 
+    ///
     /// Asymmetric optimization:
     /// - Query: keep f32 (only 1 vector, already in L1 cache)
     /// - Data: stay u8 (thousands of vectors, save bandwidth)
     /// - Partial dequantization: only scale/offset, no full f32 conversion
     /// ```ignore
-    pub fn asymmetric_distance_cosine(
-        &self,
-        query: &[f32],
-        data: &QuantizedVector,
-    ) -> f32 {
+    pub fn asymmetric_distance_cosine(&self, query: &[f32], data: &QuantizedVector) -> f32 {
         if query.len() != self.dimension || data.codes.len() != self.dimension {
             return f32::MAX; // Invalid dimension
         }
-        
+
         // Handle constant vector (zero range)
         let range = data.max - data.min;
         if range < 1e-8 {
@@ -181,25 +183,25 @@ impl SQ8Quantizer {
             if query_norm < 1e-8 {
                 return 0.0; // Both zero vectors
             }
-            
+
             let sum: f32 = query.iter().sum();
             let dot = sum * constant_val;
             let data_norm = (self.dimension as f32).sqrt() * constant_val.abs();
-            
+
             if data_norm < 1e-8 {
                 return 1.0; // Zero data vector
             }
-            
+
             return 1.0 - (dot / (query_norm * data_norm));
         }
-        
+
         // 🚀 OPTIMIZED: Single-pass computation (fused operations)
         let scale = range / 255.0;
-        
+
         let mut dot_product = 0.0f32;
         let mut query_norm_sq = 0.0f32;
         let mut data_norm_sq = 0.0f32;
-        
+
         // SIMD-friendly loop (all operations fused)
         for (&q, &code) in query.iter().zip(data.codes.iter()) {
             let d = code as f32 * scale + data.min;
@@ -208,16 +210,16 @@ impl SQ8Quantizer {
             query_norm_sq += q * q;
             data_norm_sq += d * d;
         }
-        
+
         // Fast sqrt + division
         let query_norm = query_norm_sq.sqrt();
         let data_norm = data_norm_sq.sqrt();
-        
+
         // Avoid division by zero
         if query_norm < 1e-8 || data_norm < 1e-8 {
             return 1.0; // Maximum distance
         }
-        
+
         // Cosine distance = 1 - cosine_similarity
         let cosine_sim = dot_product / (query_norm * data_norm);
         1.0 - cosine_sim.clamp(-1.0, 1.0)
@@ -227,11 +229,7 @@ impl SQ8Quantizer {
     ///
     /// Computes squared L2 distance between f32 query and SQ8 data vector.
     /// Returns squared distance (no sqrt) for faster comparison/sorting.
-    pub fn asymmetric_distance_l2(
-        &self,
-        query: &[f32],
-        data: &QuantizedVector,
-    ) -> f32 {
+    pub fn asymmetric_distance_l2(&self, query: &[f32], data: &QuantizedVector) -> f32 {
         if query.len() != self.dimension || data.codes.len() != self.dimension {
             return f32::MAX;
         }
@@ -269,11 +267,7 @@ impl SQ8Quantizer {
     /// - vcvtq_f32_u32: convert to f32
     /// - vfmaq_f32: fused multiply-add
     #[cfg(target_arch = "aarch64")]
-    pub fn asymmetric_distance_cosine_neon(
-        &self,
-        query: &[f32],
-        data: &QuantizedVector,
-    ) -> f32 {
+    pub fn asymmetric_distance_cosine_neon(&self, query: &[f32], data: &QuantizedVector) -> f32 {
         if query.len() != self.dimension || data.codes.len() != self.dimension {
             return f32::MAX;
         }
@@ -370,14 +364,10 @@ impl SQ8Quantizer {
             1.0 - cosine_sim.clamp(-1.0, 1.0)
         }
     }
-    
+
     /// 🚀 ARM NEON optimized asymmetric SQ8 L2 (squared Euclidean) distance
     #[cfg(target_arch = "aarch64")]
-    pub fn asymmetric_distance_l2_neon(
-        &self,
-        query: &[f32],
-        data: &QuantizedVector,
-    ) -> f32 {
+    pub fn asymmetric_distance_l2_neon(&self, query: &[f32], data: &QuantizedVector) -> f32 {
         if query.len() != self.dimension || data.codes.len() != self.dimension {
             return f32::MAX;
         }
@@ -594,88 +584,103 @@ mod tests {
 
         assert!(compressed_size < original_size);
     }
-    
+
     #[test]
     fn test_asymmetric_distance() {
         let quantizer = SQ8Quantizer::new(4);
-        
+
         // Test vectors (normalized-ish)
         let query = vec![1.0, 0.0, 0.0, 0.0];
         let data1 = vec![0.9, 0.1, 0.0, 0.0]; // Similar to query
         let data2 = vec![0.0, 1.0, 0.0, 0.0]; // Orthogonal to query
-        
+
         let qdata1 = quantizer.quantize(&data1).unwrap();
         let qdata2 = quantizer.quantize(&data2).unwrap();
-        
+
         // Compute distances using asymmetric method
         let dist1 = quantizer.asymmetric_distance_cosine(&query, &qdata1);
         let dist2 = quantizer.asymmetric_distance_cosine(&query, &qdata2);
-        
+
         // dist1 should be smaller (more similar)
-        assert!(dist1 < dist2, "Similar vectors should have smaller distance");
-        
+        assert!(
+            dist1 < dist2,
+            "Similar vectors should have smaller distance"
+        );
+
         // Compare with traditional method (dequantize + cosine)
         let data1_deq = quantizer.dequantize(&qdata1);
         let traditional_dist1 = cosine_distance(&query, &data1_deq);
-        
+
         // Should be close (within quantization error)
         let error = (dist1 - traditional_dist1).abs();
-        assert!(error < 0.05, "Asymmetric distance error too large: {}", error);
-        
-        debug_log!("Asymmetric dist: {:.4}, Traditional dist: {:.4}, Error: {:.4}",
-                 dist1, traditional_dist1, error);
+        assert!(
+            error < 0.05,
+            "Asymmetric distance error too large: {}",
+            error
+        );
+
+        debug_log!(
+            "Asymmetric dist: {:.4}, Traditional dist: {:.4}, Error: {:.4}",
+            dist1,
+            traditional_dist1,
+            error
+        );
     }
-    
+
     #[test]
     fn test_asymmetric_distance_normalized() {
         let quantizer = SQ8Quantizer::new(128);
-        
+
         // Normalized vectors (common in embeddings)
         let query = vec![0.577; 128]; // Roughly normalized
         let data = vec![0.577; 128];
-        
+
         let qdata = quantizer.quantize(&data).unwrap();
-        
+
         let dist = quantizer.asymmetric_distance_cosine(&query, &qdata);
-        
+
         // Same vector should have ~0 distance
         assert!(dist < 0.01, "Same vector distance too large: {}", dist);
     }
-    
+
     #[test]
     fn test_asymmetric_distance_orthogonal() {
         let quantizer = SQ8Quantizer::new(4);
-        
+
         // Orthogonal vectors
         let query = vec![1.0, 0.0, 0.0, 0.0];
         let data = vec![0.0, 1.0, 0.0, 0.0];
-        
+
         let qdata = quantizer.quantize(&data).unwrap();
         let dist = quantizer.asymmetric_distance_cosine(&query, &qdata);
-        
+
         // Orthogonal vectors should have distance ≈ 1.0 (cosine = 0)
-        assert!((dist - 1.0).abs() < 0.1, "Orthogonal distance incorrect: {}", dist);
+        assert!(
+            (dist - 1.0).abs() < 0.1,
+            "Orthogonal distance incorrect: {}",
+            dist
+        );
     }
-    
+
     // Helper function for traditional cosine distance
     fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
         let mut dot = 0.0;
         let mut norm_a = 0.0;
         let mut norm_b = 0.0;
-        
+
         for i in 0..a.len() {
             dot += a[i] * b[i];
             norm_a += a[i] * a[i];
             norm_b += b[i] * b[i];
         }
-        
+
         let norm_a = norm_a.sqrt();
         let norm_b = norm_b.sqrt();
-        
+
         if norm_a < 1e-8 || norm_b < 1e-8 {
             return 1.0;
         }
-        
+
         1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
     }
 }

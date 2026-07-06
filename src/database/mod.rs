@@ -18,26 +18,28 @@
 macro_rules! ensure_open {
     ($self:expr) => {
         if $self.is_closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(crate::StorageError::InvalidData("Database is closed".into()));
+            return Err(crate::StorageError::InvalidData(
+                "Database is closed".into(),
+            ));
         }
     };
 }
 
 pub mod core;
 pub mod crud;
-pub mod table;
 pub mod helpers;
-pub mod indexes;
-pub mod persistence;
-pub mod transaction;
-pub mod mem_buffer;
 pub mod index_metadata;
+pub mod indexes;
+pub mod mem_buffer;
+pub mod persistence;
 pub mod pk_cache;
+pub mod table;
 pub mod timeseries;
+pub mod transaction;
 
 // Re-export main types
 pub use core::MoteDB;
-pub use mem_buffer::{IndexMemBuffer, BufferStats};
-pub use indexes::{QueryProfile, MemTableScanProfile};
+pub use index_metadata::{IndexMetadata, IndexRegistry, IndexType};
+pub use indexes::{MemTableScanProfile, QueryProfile};
+pub use mem_buffer::{BufferStats, IndexMemBuffer};
 pub use transaction::TransactionStats;
-pub use index_metadata::{IndexRegistry, IndexMetadata, IndexType};

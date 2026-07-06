@@ -1,7 +1,7 @@
 //! Round 4: Untouched subsystems — MVCC, transaction isolation, WAL recovery,
 //! vector/spatial index interactions, and data integrity edge cases.
 
-use motedb::{Database, DBConfig, types::Value, sql::QueryResult};
+use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
 use tempfile::TempDir;
 
 fn mk() -> (Database, TempDir) {
@@ -18,13 +18,25 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn cnt(db: &Database, sql: &str) -> i64 {
-    rows(db, sql).first().and_then(|r| r.first()).and_then(|v| {
-        if let Value::Integer(i) = v { Some(*i) } else { None }
-    }).unwrap_or(-1)
+    rows(db, sql)
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| {
+            if let Value::Integer(i) = v {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(-1)
 }
 
 fn val(db: &Database, sql: &str) -> Value {
-    rows(db, sql).first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null)
+    rows(db, sql)
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -35,7 +47,8 @@ fn val(db: &Database, sql: &str) -> Value {
 #[test]
 fn test_txn_commit_visible() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -47,12 +60,17 @@ fn test_txn_commit_visible() {
 #[test]
 fn test_txn_rollback_not_visible() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("ROLLBACK").unwrap();
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 1, "Rollback should leave only committed data");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        1,
+        "Rollback should leave only committed data"
+    );
 }
 
 /// Transaction sees its own writes within the same txn.
@@ -62,39 +80,53 @@ fn test_txn_rollback_not_visible() {
 #[test]
 fn test_txn_sees_own_writes() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("COMMIT").unwrap();
     // After commit, data should be visible.
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 2, "Committed data should be visible");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "Committed data should be visible"
+    );
 }
 
 /// UPDATE within transaction, then rollback — old value restored.
 #[test]
 fn test_txn_update_rollback() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
     db.execute("ROLLBACK").unwrap();
-    assert_eq!(val(&db, "SELECT v FROM t WHERE id = 1"), Value::Integer(10),
-        "Rollback should restore original value");
+    assert_eq!(
+        val(&db, "SELECT v FROM t WHERE id = 1"),
+        Value::Integer(10),
+        "Rollback should restore original value"
+    );
 }
 
 /// DELETE within transaction, then rollback — row restored.
 #[test]
 fn test_txn_delete_rollback() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
     db.execute("ROLLBACK").unwrap();
-    assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 2, "Rollback should restore deleted row");
+    assert_eq!(
+        cnt(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "Rollback should restore deleted row"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -108,9 +140,16 @@ fn test_checkpoint_reopen_all_data_survives() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)")
+            .unwrap();
         for i in 1..=500i64 {
-            db.execute(&format!("INSERT INTO t VALUES ({}, 'n{}', {:.2})", i, i, i as f64 * 1.5)).unwrap();
+            db.execute(&format!(
+                "INSERT INTO t VALUES ({}, 'n{}', {:.2})",
+                i,
+                i,
+                i as f64 * 1.5
+            ))
+            .unwrap();
         }
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -118,9 +157,18 @@ fn test_checkpoint_reopen_all_data_survives() {
     let db = Database::open(&path).unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t"), 500);
     // Spot checks.
-    assert_eq!(val(&db, "SELECT name FROM t WHERE id = 1"), Value::text("n1".into()));
-    assert_eq!(val(&db, "SELECT name FROM t WHERE id = 250"), Value::text("n250".into()));
-    assert_eq!(val(&db, "SELECT name FROM t WHERE id = 500"), Value::text("n500".into()));
+    assert_eq!(
+        val(&db, "SELECT name FROM t WHERE id = 1"),
+        Value::text("n1".into())
+    );
+    assert_eq!(
+        val(&db, "SELECT name FROM t WHERE id = 250"),
+        Value::text("n250".into())
+    );
+    assert_eq!(
+        val(&db, "SELECT name FROM t WHERE id = 500"),
+        Value::text("n500".into())
+    );
 }
 
 /// Multiple checkpoints — data accumulates correctly.
@@ -130,7 +178,8 @@ fn test_multiple_checkpoints_accumulate() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.checkpoint().unwrap();
         db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -153,7 +202,10 @@ fn test_checkpoint_after_delete_stays_deleted() {
     {
         let db = Database::create(&path).unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
-        for i in 1..=10 { db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap(); }
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO t VALUES ({})", i))
+                .unwrap();
+        }
         db.execute("DELETE FROM t WHERE id = 5").unwrap();
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -171,11 +223,16 @@ fn test_checkpoint_after_delete_stays_deleted() {
 #[test]
 fn test_vector_knn_basic() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4))").unwrap();
-    db.execute("INSERT INTO vecs (emb) VALUES ([1.0, 0.0, 0.0, 0.0])").unwrap();
-    db.execute("INSERT INTO vecs (emb) VALUES ([0.0, 1.0, 0.0, 0.0])").unwrap();
-    db.execute("INSERT INTO vecs (emb) VALUES ([1.0, 1.0, 0.0, 0.0])").unwrap();
-    db.execute("CREATE VECTOR INDEX idx_emb ON vecs (emb)").unwrap();
+    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4))")
+        .unwrap();
+    db.execute("INSERT INTO vecs (emb) VALUES ([1.0, 0.0, 0.0, 0.0])")
+        .unwrap();
+    db.execute("INSERT INTO vecs (emb) VALUES ([0.0, 1.0, 0.0, 0.0])")
+        .unwrap();
+    db.execute("INSERT INTO vecs (emb) VALUES ([1.0, 1.0, 0.0, 0.0])")
+        .unwrap();
+    db.execute("CREATE VECTOR INDEX idx_emb ON vecs (emb)")
+        .unwrap();
     let r = db.execute("SELECT id FROM vecs ORDER BY emb <-> [1.0, 0.0, 0.0, 0.0] LIMIT 2");
     assert!(r.is_ok(), "Vector KNN should not error");
 }
@@ -184,8 +241,10 @@ fn test_vector_knn_basic() {
 #[test]
 fn test_vector_null_embedding() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, emb VECTOR(3))").unwrap();
-    db.execute("INSERT INTO vecs VALUES (1, [1.0, 2.0, 3.0])").unwrap();
+    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, emb VECTOR(3))")
+        .unwrap();
+    db.execute("INSERT INTO vecs VALUES (1, [1.0, 2.0, 3.0])")
+        .unwrap();
     db.execute("INSERT INTO vecs VALUES (2, NULL)").unwrap();
     db.flush().unwrap();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM vecs"), 2);
@@ -201,12 +260,19 @@ fn test_vector_null_embedding() {
 #[test]
 fn test_spatial_st_distance_ordering() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE pts (id INT PRIMARY KEY AUTO_INCREMENT, loc GEOMETRY)").unwrap();
-    db.execute("INSERT INTO pts (loc) VALUES (POINT(0, 0))").unwrap();
-    db.execute("INSERT INTO pts (loc) VALUES (POINT(10, 10))").unwrap();
-    db.execute("INSERT INTO pts (loc) VALUES (POINT(1, 1))").unwrap();
+    db.execute("CREATE TABLE pts (id INT PRIMARY KEY AUTO_INCREMENT, loc GEOMETRY)")
+        .unwrap();
+    db.execute("INSERT INTO pts (loc) VALUES (POINT(0, 0))")
+        .unwrap();
+    db.execute("INSERT INTO pts (loc) VALUES (POINT(10, 10))")
+        .unwrap();
+    db.execute("INSERT INTO pts (loc) VALUES (POINT(1, 1))")
+        .unwrap();
     db.flush().unwrap();
-    let r = rows(&db, "SELECT id FROM pts ORDER BY ST_DISTANCE(loc, 0, 0) LIMIT 2");
+    let r = rows(
+        &db,
+        "SELECT id FROM pts ORDER BY ST_DISTANCE(loc, 0, 0) LIMIT 2",
+    );
     assert_eq!(r.len(), 2);
     // Closest to (0,0) should be id=1 (distance 0) then id=3 (distance ~1.4).
     if let Value::Integer(id) = &r[0][0] {
@@ -218,15 +284,24 @@ fn test_spatial_st_distance_ordering() {
 #[test]
 fn test_spatial_within_radius() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, loc GEOMETRY)").unwrap();
-    db.execute("INSERT INTO pts VALUES (1, POINT(0, 0))").unwrap();
-    db.execute("INSERT INTO pts VALUES (2, POINT(5, 5))").unwrap();
-    db.execute("INSERT INTO pts VALUES (3, POINT(20, 20))").unwrap();
+    db.execute("CREATE TABLE pts (id INT PRIMARY KEY, loc GEOMETRY)")
+        .unwrap();
+    db.execute("INSERT INTO pts VALUES (1, POINT(0, 0))")
+        .unwrap();
+    db.execute("INSERT INTO pts VALUES (2, POINT(5, 5))")
+        .unwrap();
+    db.execute("INSERT INTO pts VALUES (3, POINT(20, 20))")
+        .unwrap();
     db.flush().unwrap();
     let r = rows(&db, "SELECT id FROM pts WHERE WITHIN_RADIUS(loc, 0, 0, 10)");
     // Points within radius 10 of origin: (0,0) dist=0, (5,5) dist≈7.07.
     // (20,20) dist≈28.3 is outside. Should find 2.
-    assert_eq!(r.len(), 2, "Should find 2 points within radius 10, got {}", r.len());
+    assert_eq!(
+        r.len(),
+        2,
+        "Should find 2 points within radius 10, got {}",
+        r.len()
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -237,11 +312,16 @@ fn test_spatial_within_radius() {
 #[test]
 fn test_fts_match_against() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE docs (id INT PRIMARY KEY AUTO_INCREMENT, body TEXT)").unwrap();
-    db.execute("INSERT INTO docs (body) VALUES ('the quick brown fox')").unwrap();
-    db.execute("INSERT INTO docs (body) VALUES ('lazy dog sleeps')").unwrap();
-    db.execute("INSERT INTO docs (body) VALUES ('fox and dog play')").unwrap();
-    db.execute("CREATE TEXT INDEX idx_body ON docs (body)").unwrap();
+    db.execute("CREATE TABLE docs (id INT PRIMARY KEY AUTO_INCREMENT, body TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO docs (body) VALUES ('the quick brown fox')")
+        .unwrap();
+    db.execute("INSERT INTO docs (body) VALUES ('lazy dog sleeps')")
+        .unwrap();
+    db.execute("INSERT INTO docs (body) VALUES ('fox and dog play')")
+        .unwrap();
+    db.execute("CREATE TEXT INDEX idx_body ON docs (body)")
+        .unwrap();
     // MATCH should find documents containing 'fox'.
     let r = rows(&db, "SELECT id FROM docs WHERE MATCH(body, 'fox')");
     assert!(r.len() >= 1, "Should find at least 1 doc with 'fox'");
@@ -251,7 +331,8 @@ fn test_fts_match_against() {
 #[test]
 fn test_like_literal_percent_char() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '50%off')").unwrap();
     db.execute("INSERT INTO t VALUES (2, '50off')").unwrap();
     db.flush().unwrap();
@@ -268,10 +349,14 @@ fn test_like_literal_percent_char() {
 #[test]
 fn test_column_index_query() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'a@x.com', 'Alice')").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'b@x.com', 'Bob')").unwrap();
-    db.execute("CREATE INDEX idx_email ON t (email) USING COLUMN").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a@x.com', 'Alice')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'b@x.com', 'Bob')")
+        .unwrap();
+    db.execute("CREATE INDEX idx_email ON t (email) USING COLUMN")
+        .unwrap();
     let r = rows(&db, "SELECT name FROM t WHERE email = 'a@x.com'");
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::text("Alice".into()));
@@ -281,12 +366,15 @@ fn test_column_index_query() {
 #[test]
 fn test_column_index_after_bulk_insert() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
     for i in 1..=200 {
         let cat = ["X", "Y", "Z"][(i % 3) as usize];
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, cat)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i, cat))
+            .unwrap();
     }
-    db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN")
+        .unwrap();
     db.wait_for_indexes_ready();
     assert_eq!(cnt(&db, "SELECT COUNT(*) FROM t WHERE cat = 'X'"), 66);
 }
@@ -299,7 +387,8 @@ fn test_column_index_after_bulk_insert() {
 #[test]
 fn test_empty_string_where_filter() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'hello')").unwrap();
     db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
@@ -316,7 +405,8 @@ fn test_empty_string_survives_recovery() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, '')").unwrap();
         db.execute("INSERT INTO t VALUES (2, 'data')").unwrap();
         db.checkpoint().unwrap();
@@ -338,7 +428,8 @@ fn test_empty_string_survives_recovery() {
 #[test]
 fn test_select_arithmetic_expression() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 3)").unwrap();
     db.flush().unwrap();
     let r = rows(&db, "SELECT a + b, a - b, a * b FROM t WHERE id = 1");
@@ -366,13 +457,23 @@ fn test_select_constant_expression() {
 #[test]
 fn test_order_by_where_limit_combined() {
     let (db, _d) = mk();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, cat TEXT)")
+        .unwrap();
     for i in 1..=20 {
         let cat = if i <= 10 { "A" } else { "B" };
-        db.execute(&format!("INSERT INTO t VALUES ({}, {}, '{}')", i, i * 10, cat)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, {}, '{}')",
+            i,
+            i * 10,
+            cat
+        ))
+        .unwrap();
     }
     db.flush().unwrap();
-    let r = rows(&db, "SELECT id FROM t WHERE cat = 'A' ORDER BY v DESC LIMIT 3");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE cat = 'A' ORDER BY v DESC LIMIT 3",
+    );
     assert_eq!(r.len(), 3, "Should return 3 rows");
     // Should be the highest v values in cat A: ids 10, 9, 8 (v=100, 90, 80).
     if let Value::Integer(id) = &r[0][0] {
@@ -389,15 +490,27 @@ fn test_order_by_where_limit_combined() {
 fn test_wide_table_30_cols_all_correct() {
     let (db, _d) = mk();
     let mut cols = String::from("id INT PRIMARY KEY");
-    for i in 0..30 { cols.push_str(&format!(", c{} INT", i)); }
-    db.execute(&format!("CREATE TABLE wide ({})", cols)).unwrap();
+    for i in 0..30 {
+        cols.push_str(&format!(", c{} INT", i));
+    }
+    db.execute(&format!("CREATE TABLE wide ({})", cols))
+        .unwrap();
     let mut vals = String::from("1");
-    for i in 0..30 { vals.push_str(&format!(", {}", i * 10)); }
-    db.execute(&format!("INSERT INTO wide VALUES ({})", vals)).unwrap();
+    for i in 0..30 {
+        vals.push_str(&format!(", {}", i * 10));
+    }
+    db.execute(&format!("INSERT INTO wide VALUES ({})", vals))
+        .unwrap();
     db.flush().unwrap();
     // Verify all columns.
     for i in 0..30 {
         let r = rows(&db, &format!("SELECT c{} FROM wide WHERE id = 1", i));
-        assert_eq!(r[0][0], Value::Integer(i * 10), "c{} should be {}", i, i * 10);
+        assert_eq!(
+            r[0][0],
+            Value::Integer(i * 10),
+            "c{} should be {}",
+            i,
+            i * 10
+        );
     }
 }

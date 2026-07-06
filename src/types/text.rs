@@ -70,7 +70,9 @@ impl From<String> for TextDoc {
 
 impl From<&str> for TextDoc {
     fn from(s: &str) -> Self {
-        Self { content: s.to_string() }
+        Self {
+            content: s.to_string(),
+        }
     }
 }
 

@@ -2,11 +2,11 @@
 //!
 //! Optimized distance functions for embedded environments.
 
-pub mod euclidean;
 pub mod cosine;
+pub mod euclidean;
 
-pub use euclidean::euclidean_distance;
 pub use cosine::{cosine_distance, cosine_similarity};
+pub use euclidean::euclidean_distance;
 
 /// Distance metric trait
 pub trait DistanceMetric: Send + Sync {

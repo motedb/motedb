@@ -31,7 +31,12 @@ pub struct BoundingBox {
 impl BoundingBox {
     pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
         assert!(min_x <= max_x && min_y <= max_y, "Invalid bounding box");
-        Self { min_x, min_y, max_x, max_y }
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
     }
 
     pub fn from_point(point: Point) -> Self {
@@ -83,9 +88,7 @@ impl Point3D {
     }
 
     pub fn distance_squared(&self, other: &Point3D) -> f64 {
-        (self.x - other.x).powi(2)
-            + (self.y - other.y).powi(2)
-            + (self.z - other.z).powi(2)
+        (self.x - other.x).powi(2) + (self.y - other.y).powi(2) + (self.z - other.z).powi(2)
     }
 
     pub fn distance(&self, other: &Point3D) -> f64 {
@@ -110,23 +113,43 @@ pub struct BoundingBox3D {
 
 impl BoundingBox3D {
     pub fn new(min_x: f64, min_y: f64, min_z: f64, max_x: f64, max_y: f64, max_z: f64) -> Self {
-        Self { min_x, min_y, min_z, max_x, max_y, max_z }
+        Self {
+            min_x,
+            min_y,
+            min_z,
+            max_x,
+            max_y,
+            max_z,
+        }
     }
 
     pub fn from_point(p: Point3D) -> Self {
-        Self { min_x: p.x, min_y: p.y, min_z: p.z, max_x: p.x, max_y: p.y, max_z: p.z }
+        Self {
+            min_x: p.x,
+            min_y: p.y,
+            min_z: p.z,
+            max_x: p.x,
+            max_y: p.y,
+            max_z: p.z,
+        }
     }
 
     pub fn contains_point(&self, p: &Point3D) -> bool {
-        p.x >= self.min_x && p.x <= self.max_x
-            && p.y >= self.min_y && p.y <= self.max_y
-            && p.z >= self.min_z && p.z <= self.max_z
+        p.x >= self.min_x
+            && p.x <= self.max_x
+            && p.y >= self.min_y
+            && p.y <= self.max_y
+            && p.z >= self.min_z
+            && p.z <= self.max_z
     }
 
     pub fn intersects(&self, other: &BoundingBox3D) -> bool {
-        !(self.max_x < other.min_x || self.min_x > other.max_x
-            || self.max_y < other.min_y || self.min_y > other.max_y
-            || self.max_z < other.min_z || self.min_z > other.max_z)
+        !(self.max_x < other.min_x
+            || self.min_x > other.max_x
+            || self.max_y < other.min_y
+            || self.min_y > other.max_y
+            || self.max_z < other.min_z
+            || self.min_z > other.max_z)
     }
 
     pub fn expand(&mut self, p: &Point3D) {
@@ -148,7 +171,10 @@ impl BoundingBox3D {
 
     /// Half side-length (assumes cubic bounds)
     pub fn extent(&self) -> f64 {
-        ((self.max_x - self.min_x).max(self.max_y - self.min_y).max(self.max_z - self.min_z)) / 2.0
+        ((self.max_x - self.min_x)
+            .max(self.max_y - self.min_y)
+            .max(self.max_z - self.min_z))
+            / 2.0
     }
 
     pub fn volume(&self) -> f64 {
@@ -225,7 +251,7 @@ mod tests {
         let bbox1 = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
         let bbox2 = BoundingBox::new(5.0, 5.0, 15.0, 15.0);
         let bbox3 = BoundingBox::new(20.0, 20.0, 30.0, 30.0);
-        
+
         assert!(bbox1.intersects(&bbox2));
         assert!(!bbox1.intersects(&bbox3));
     }

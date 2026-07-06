@@ -3,7 +3,7 @@
 **AI-native embedded multimodal database for embodied intelligence.**
 Columnar storage engine with ACID transactions, vector search, full-text search, and spatial indexing — in a single embedded library.
 
-[![Rust](https://img.shields.io/badge/rust-1.74+-orange.svg)](https://rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.87+-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/motedb.svg)](https://crates.io/crates/motedb)
 

@@ -3,7 +3,7 @@
 //! NULL PK rejected, DROP TABLE persistence, row count underflow,
 //! Integer overflow fast paths, AND/OR NULL handling
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -30,7 +30,11 @@ fn test_and_null_returns_null() {
     // TRUE AND NULL = NULL (not FALSE)
     let r = rows(db.execute("SELECT TRUE AND NULL").unwrap());
     assert_eq!(r.len(), 1);
-    assert!(matches!(&r[0][0], Value::Null), "TRUE AND NULL should be NULL, got {:?}", r[0][0]);
+    assert!(
+        matches!(&r[0][0], Value::Null),
+        "TRUE AND NULL should be NULL, got {:?}",
+        r[0][0]
+    );
 }
 
 #[test]
@@ -63,7 +67,10 @@ fn test_false_or_null_returns_null() {
     // FALSE OR NULL = NULL (not FALSE)
     let r = rows(db.execute("SELECT FALSE OR NULL").unwrap());
     assert_eq!(r.len(), 1);
-    assert!(matches!(&r[0][0], Value::Null), "FALSE OR NULL should be NULL");
+    assert!(
+        matches!(&r[0][0], Value::Null),
+        "FALSE OR NULL should be NULL"
+    );
 }
 
 #[test]
@@ -71,13 +78,17 @@ fn test_and_or_null_in_where() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL, 1)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 0, NULL)").unwrap();
 
     // a=1 AND b=1 → should be NULL for id=1 (b is NULL), row excluded
-    let r = rows(db.execute("SELECT id FROM t WHERE a = 1 AND b = 1").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM t WHERE a = 1 AND b = 1")
+            .unwrap(),
+    );
     assert!(r.is_empty(), "a=1 AND b=NULL should not match any row");
 
     // a=1 OR b=1 → should match id=1 (a=1, b=NULL)
@@ -94,7 +105,11 @@ fn test_substr_position_zero_treated_as_one() {
 
     // SUBSTR with position 0 should be treated as position 1 (SQL standard)
     let r = row(&db, "SELECT SUBSTR('hello', 0, 2)");
-    assert_eq!(&r[0], &Value::text("he".to_string()), "SUBSTR('hello', 0, 2) should be 'he'");
+    assert_eq!(
+        &r[0],
+        &Value::text("he".to_string()),
+        "SUBSTR('hello', 0, 2) should be 'he'"
+    );
 }
 
 #[test]
@@ -104,7 +119,11 @@ fn test_substr_negative_position() {
 
     // Negative position counts from end
     let r = row(&db, "SELECT SUBSTR('hello', -2)");
-    assert_eq!(&r[0], &Value::text("lo".to_string()), "SUBSTR('hello', -2) should be 'lo'");
+    assert_eq!(
+        &r[0],
+        &Value::text("lo".to_string()),
+        "SUBSTR('hello', -2) should be 'lo'"
+    );
 }
 
 // === NULL PK rejected ===
@@ -114,7 +133,8 @@ fn test_null_pk_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let result = db.execute("INSERT INTO t VALUES (NULL, 'x')");
     assert!(result.is_err(), "NULL primary key should be rejected");
@@ -140,7 +160,10 @@ fn test_drop_table_persists_across_reopen() {
         let db = Database::open(&path).unwrap();
         // Table should be gone
         let result = db.execute("SELECT * FROM t");
-        assert!(result.is_err(), "Table 't' should not exist after DROP TABLE + reopen");
+        assert!(
+            result.is_err(),
+            "Table 't' should not exist after DROP TABLE + reopen"
+        );
     }
 }
 
@@ -151,15 +174,18 @@ fn test_row_count_after_delete_all() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
     }
 
     // Delete all rows
     for i in 1..=10 {
-        db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+            .unwrap();
     }
 
     // COUNT(*) should be 0
@@ -169,7 +195,11 @@ fn test_row_count_after_delete_all() {
     // Re-insert should work correctly and COUNT(*) should be 1
     db.execute("INSERT INTO t VALUES (99, 99)").unwrap();
     let r = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
-    assert_eq!(&r[0][0], &Value::Integer(1), "COUNT(*) after delete-all + re-insert should be 1");
+    assert_eq!(
+        &r[0][0],
+        &Value::Integer(1),
+        "COUNT(*) after delete-all + re-insert should be 1"
+    );
 }
 
 // === Integer arithmetic overflow in fast paths ===
@@ -179,8 +209,10 @@ fn test_integer_overflow_add() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a BIGINT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX)).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a BIGINT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX))
+        .unwrap();
 
     // INT_MAX + 1 — should either error, or produce a result > i64::MAX (not wrap to INT_MIN)
     let result = db.execute(&format!("UPDATE t SET a = a + 1 WHERE id = 1"));
@@ -192,11 +224,19 @@ fn test_integer_overflow_add() {
                     // Overflow-to-f64 is acceptable. i64::MAX + 1 as f64 equals
                     // i64::MAX as f64 (both round to 2^63 — f64 ULP at this
                     // magnitude is 2048), so compare with >= not >.
-                    assert!(*f >= i64::MAX as f64, "Float result {} should be >= i64::MAX as f64", f);
+                    assert!(
+                        *f >= i64::MAX as f64,
+                        "Float result {} should be >= i64::MAX as f64",
+                        f
+                    );
                 }
                 Value::Integer(i) => {
                     // Should NOT wrap to negative or be a small value
-                    assert!(*i > 0, "Integer overflow should not wrap to {}, got error instead", i);
+                    assert!(
+                        *i > 0,
+                        "Integer overflow should not wrap to {}, got error instead",
+                        i
+                    );
                 }
                 _ => {}
             }
@@ -234,13 +274,19 @@ fn test_unary_minus_i64_min() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN)).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MIN))
+        .unwrap();
 
     // -(-9223372036854775808) should promote to Float or error
     let r = row(&db, &format!("SELECT -v FROM t WHERE id = 1"));
     // Should be Float(i64::MIN as f64) = 9.223372036854776e18
-    assert!(matches!(&r[0], Value::Float(f) if *f > 9e18), "-i64::MIN should promote to Float, got {:?}", r[0]);
+    assert!(
+        matches!(&r[0], Value::Float(f) if *f > 9e18),
+        "-i64::MIN should promote to Float, got {:?}",
+        r[0]
+    );
 }
 
 // === AND/OR with NULL in WHERE via table data ===
@@ -250,12 +296,16 @@ fn test_and_condition_with_null_column() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, x INT, y INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, x INT, y INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 1, 2)").unwrap();
 
     // x=1 AND y=2 should only match row 2
-    let r = rows(db.execute("SELECT id FROM t WHERE x = 1 AND y = 2 ORDER BY id").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM t WHERE x = 1 AND y = 2 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(&r[0][0], &Value::Integer(2));
 }
@@ -267,17 +317,24 @@ fn test_large_integers_stored_and_retrieved() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, big_val BIGINT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, big_val BIGINT)")
+        .unwrap();
 
     // Values near i64 boundaries
     let values = [i64::MAX, i64::MIN, i64::MAX - 1, 0, 1, -1];
     for (i, v) in values.iter().enumerate() {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i + 1, v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i + 1, v))
+            .unwrap();
     }
 
     for (i, v) in values.iter().enumerate() {
         let r = row(&db, &format!("SELECT big_val FROM t WHERE id = {}", i + 1));
-        assert_eq!(&r[0], &Value::Integer(*v), "Large int mismatch for id={}", i + 1);
+        assert_eq!(
+            &r[0],
+            &Value::Integer(*v),
+            "Large int mismatch for id={}",
+            i + 1
+        );
     }
 }
 

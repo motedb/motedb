@@ -23,7 +23,10 @@ fn test_rss_stable_under_repeated_crud() {
     for round in 0..20 {
         for i in 1..=100 {
             let id = (i % 1000) + 1;
-            exec(&db, &format!("UPDATE t SET val = {} WHERE id = {}", round * 100 + i, id));
+            exec(
+                &db,
+                &format!("UPDATE t SET val = {} WHERE id = {}", round * 100 + i, id),
+            );
         }
         // Trigger compaction
         let _ = fast_count(&db, "SELECT * FROM t");
@@ -35,7 +38,9 @@ fn test_rss_stable_under_repeated_crud() {
     assert!(
         growth < 20.0,
         "RSS grew {:.1}MB under repeated CRUD (initial={:.1}, final={:.1})",
-        growth, initial_rss, final_rss
+        growth,
+        initial_rss,
+        final_rss
     );
 }
 
@@ -46,7 +51,10 @@ fn test_rss_stable_under_repeated_crud() {
 #[cfg(not(target_os = "macos"))]
 fn test_rss_grows_sublinearly() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
 
     let mut rss_points: Vec<(usize, f64)> = Vec::new();
 
@@ -73,19 +81,28 @@ fn test_rss_grows_sublinearly() {
     assert!(
         rss_growth < data_growth * 1.25,
         "RSS growth {:.1}x should be < data growth×1.25 ({:.1}x) (10K={:.1}MB, 40K={:.1}MB)",
-        rss_growth, data_growth, rss1, rss3
+        rss_growth,
+        data_growth,
+        rss1,
+        rss3
     );
 }
 
 #[test]
 fn test_compaction_preserves_data() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT, tag TEXT)",
+    );
     // Insert in small batches to create segments
     for batch in 0..10 {
         for i in 0..100 {
             let id = batch * 100 + i + 1;
-            exec(&db, &format!("INSERT INTO t VALUES ({}, {}, 'tag{}')", id, id, id % 5));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, {}, 'tag{}')", id, id, id % 5),
+            );
         }
     }
 
@@ -102,7 +119,10 @@ fn test_compaction_preserves_data() {
     let after_tag0 = count_rows(&db, "SELECT * FROM t WHERE tag = 'tag0'");
 
     assert_eq!(before, after, "Row count changed after compaction");
-    assert_eq!(before_tag0, after_tag0, "Filtered count changed after compaction");
+    assert_eq!(
+        before_tag0, after_tag0,
+        "Filtered count changed after compaction"
+    );
     assert_eq!(after, 1000);
     assert_eq!(after_tag0, 200);
 }
@@ -125,7 +145,10 @@ fn test_compaction_drops_tombstones() {
     // Deleted rows must stay deleted
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 100);
     for i in (1..=200).step_by(2) {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)), 0);
+        assert_eq!(
+            count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)),
+            0
+        );
     }
 }
 
@@ -136,7 +159,10 @@ fn test_compaction_dedup_updates() {
     exec(&db, "INSERT INTO t VALUES (1, 1)");
     // Update same row 10 times
     for round in 1..=10 {
-        exec(&db, &format!("UPDATE t SET val = {} WHERE id = 1", round * 100));
+        exec(
+            &db,
+            &format!("UPDATE t SET val = {} WHERE id = 1", round * 100),
+        );
     }
     // Trigger compaction
     let _ = fast_count(&db, "SELECT * FROM t");
@@ -165,7 +191,10 @@ fn test_cache_invalidation_on_write() {
 #[test]
 fn test_no_memory_leak_in_queries() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 5000);
     // Warm up
     let _ = fast_count(&db, "SELECT * FROM bench");
@@ -182,7 +211,9 @@ fn test_no_memory_leak_in_queries() {
     assert!(
         growth < 15.0,
         "RSS grew {:.1}MB after 500 queries (initial={:.1}, final={:.1})",
-        growth, initial_rss, final_rss
+        growth,
+        initial_rss,
+        final_rss
     );
 }
 
@@ -201,7 +232,12 @@ fn test_repeated_compaction_stable() {
         let _ = fast_count(&db, "SELECT * FROM t");
         // Verify count
         let count = count_rows(&db, "SELECT * FROM t");
-        assert_eq!(count, (cycle + 1) * 100, "Count wrong after cycle {}", cycle);
+        assert_eq!(
+            count,
+            (cycle + 1) * 100,
+            "Count wrong after cycle {}",
+            cycle
+        );
     }
     // Final verify after 5 compaction cycles
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 500);
@@ -210,7 +246,10 @@ fn test_repeated_compaction_stable() {
 #[test]
 fn test_memory_after_index_creation() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 10_000);
     let before_index = get_rss_mb();
 
@@ -219,7 +258,7 @@ fn test_memory_after_index_creation() {
     {
         #[cfg(feature = "jemalloc")]
         {
-            use tikv_jemalloc_ctl::{epoch, arenas};
+            use tikv_jemalloc_ctl::{arenas, epoch};
             let _ = epoch::advance();
             if let Ok(n) = arenas::narenas::read() {
                 for i in 0..n {
@@ -235,7 +274,8 @@ fn test_memory_after_index_creation() {
     assert!(
         after_index < before_index * 3.0,
         "RSS {:.1}MB > 3x of {:.1}MB after index creation",
-        after_index, before_index
+        after_index,
+        before_index
     );
 }
 
@@ -266,7 +306,7 @@ fn test_table_drop_frees_memory() {
     {
         #[cfg(feature = "jemalloc")]
         {
-            use tikv_jemalloc_ctl::{epoch, arenas};
+            use tikv_jemalloc_ctl::{arenas, epoch};
             let _ = epoch::advance();
             if let Ok(n) = arenas::narenas::read() {
                 for i in 0..n {
@@ -282,7 +322,9 @@ fn test_table_drop_frees_memory() {
     assert!(
         after_drop <= before_drop + 5.0,
         "RSS increased {:.1}MB after DROP TABLE (before={:.1}, after={:.1})",
-        after_drop - before_drop, before_drop, after_drop
+        after_drop - before_drop,
+        before_drop,
+        after_drop
     );
 }
 
@@ -303,10 +345,16 @@ fn test_count_live_rows_after_deletes() {
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 300);
     // Deleted rows gone
     for i in 1..=200 {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)), 0);
+        assert_eq!(
+            count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)),
+            0
+        );
     }
     // Surviving rows
     for i in 201..=500 {
-        assert_eq!(count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)), 1);
+        assert_eq!(
+            count_rows(&db, &format!("SELECT * FROM t WHERE val = {}", i)),
+            1
+        );
     }
 }

@@ -9,14 +9,21 @@ use common::*;
 #[test]
 fn test_10k_insert_consistency() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 10_000);
 
     // Exact count verification
     assert_eq!(count_rows(&db, "SELECT * FROM bench"), 10_000);
     // Distribution: insert_test_rows marks 'US' when id % 3 == 0 (id=3,6,9,...,9999) → 3333 rows.
     let us_count = count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'");
-    assert!(us_count > 3000 && us_count < 4000, "US count {} unexpected", us_count);
+    assert!(
+        us_count > 3000 && us_count < 4000,
+        "US count {} unexpected",
+        us_count
+    );
     let eu_count = count_rows(&db, "SELECT * FROM bench WHERE tag = 'EU'");
     assert_eq!(us_count + eu_count, 10_000);
 }
@@ -73,7 +80,10 @@ fn test_many_small_batches() {
 #[test]
 fn test_large_result_set() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 50_000);
 
     // Full table scan returns 50K rows
@@ -88,13 +98,19 @@ fn test_large_result_set() {
 #[test]
 fn test_mixed_read_write_stability() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 5_000);
 
     // Interleave reads and writes
     for round in 0..10 {
         // Write
-        exec(&db, &format!("INSERT INTO bench VALUES ({}, 0.0, 'NEW')", 900000 + round));
+        exec(
+            &db,
+            &format!("INSERT INTO bench VALUES ({}, 0.0, 'NEW')", 900000 + round),
+        );
         // Read
         let _ = fast_count(&db, "SELECT * FROM bench WHERE tag = 'US'");
         // Read again
@@ -108,7 +124,10 @@ fn test_mixed_read_write_stability() {
 #[test]
 fn test_index_after_bulk_insert() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 5_000);
 
     // Create index after data is inserted
@@ -122,7 +141,10 @@ fn test_index_after_bulk_insert() {
 #[test]
 fn test_50k_full_workload() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 50_000);
 
     // Run all query types

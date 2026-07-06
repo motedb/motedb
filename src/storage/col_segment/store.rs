@@ -1,8 +1,8 @@
-use super::segment::Segment;
-use super::merge::MergeCursor;
 use super::manifest::Manifest;
-use crate::storage::lsm::columnar::{ColumnarSSTableBuilder, ColumnTypeTag};
-use crate::types::{ColumnType, Value, ArcString};
+use super::merge::MergeCursor;
+use super::segment::Segment;
+use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTableBuilder};
+use crate::types::{ArcString, ColumnType, Value};
 use crate::Result;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Computed without per-row Value allocation.
 #[derive(Default, Clone)]
 pub struct AggregateResult {
-    pub count: i64,       // non-NULL values (for COUNT(col))
-    pub null_count: i64,  // NULL values (for COUNT(*) = count + null_count)
+    pub count: i64,      // non-NULL values (for COUNT(col))
+    pub null_count: i64, // NULL values (for COUNT(*) = count + null_count)
     pub int_sum: i64,
     pub float_sum: f64,
     pub has_float: bool,
@@ -27,17 +27,28 @@ pub struct AggregateResult {
 // ── Comparison helpers for count_filtered (zero-allocation) ──────────
 #[inline]
 fn cmp_opt<T: Copy + PartialEq + PartialOrd>(
-    v: Option<T>, target: Option<T>, op: &crate::sql::ast::BinaryOperator,
+    v: Option<T>,
+    target: Option<T>,
+    op: &crate::sql::ast::BinaryOperator,
 ) -> bool {
     use crate::sql::ast::BinaryOperator;
-    let (v, t) = match (v, target) { (Some(a), Some(b)) => (a, b), _ => return false };
+    let (v, t) = match (v, target) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
     match op {
         BinaryOperator::Eq => v == t,
         BinaryOperator::Ne => v != t,
         BinaryOperator::Lt => v.partial_cmp(&t) == Some(std::cmp::Ordering::Less),
         BinaryOperator::Gt => v.partial_cmp(&t) == Some(std::cmp::Ordering::Greater),
-        BinaryOperator::Le => matches!(v.partial_cmp(&t), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
-        BinaryOperator::Ge => matches!(v.partial_cmp(&t), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+        BinaryOperator::Le => matches!(
+            v.partial_cmp(&t),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ),
+        BinaryOperator::Ge => matches!(
+            v.partial_cmp(&t),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ),
         _ => false,
     }
 }
@@ -50,7 +61,10 @@ fn cmp_opt_f64(v: Option<f64>, target: Option<f64>, op: &crate::sql::ast::Binary
 #[inline]
 fn cmp_str(v: Option<&str>, target: Option<&str>, op: &crate::sql::ast::BinaryOperator) -> bool {
     use crate::sql::ast::BinaryOperator;
-    let (v, t) = match (v, target) { (Some(a), Some(b)) => (a, b), _ => return false };
+    let (v, t) = match (v, target) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
     match op {
         BinaryOperator::Eq => v == t,
         BinaryOperator::Ne => v != t,
@@ -82,23 +96,31 @@ fn decode_buffered_value(
     match tag {
         Some(ColumnTypeTag::Integer) => {
             let off = row_idx * 8;
-            if off + 8 > raw.len() { return Value::Null; }
-            Value::Integer(i64::from_le_bytes(raw[off..off+8].try_into().unwrap()))
+            if off + 8 > raw.len() {
+                return Value::Null;
+            }
+            Value::Integer(i64::from_le_bytes(raw[off..off + 8].try_into().unwrap()))
         }
         Some(ColumnTypeTag::Timestamp) => {
             let off = row_idx * 8;
-            if off + 8 > raw.len() { return Value::Null; }
-            let v = i64::from_le_bytes(raw[off..off+8].try_into().unwrap());
+            if off + 8 > raw.len() {
+                return Value::Null;
+            }
+            let v = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
             Value::Timestamp(crate::types::Timestamp::from_micros(v))
         }
         Some(ColumnTypeTag::Float) => {
             let off = row_idx * 8;
-            if off + 8 > raw.len() { return Value::Null; }
-            Value::Float(f64::from_le_bytes(raw[off..off+8].try_into().unwrap()))
+            if off + 8 > raw.len() {
+                return Value::Null;
+            }
+            Value::Float(f64::from_le_bytes(raw[off..off + 8].try_into().unwrap()))
         }
         Some(ColumnTypeTag::Bool) => {
             let off = row_idx;
-            if off >= raw.len() { return Value::Null; }
+            if off >= raw.len() {
+                return Value::Null;
+            }
             Value::Bool(raw[off] != 0)
         }
         Some(ColumnTypeTag::Text) => {
@@ -107,12 +129,14 @@ fn decode_buffered_value(
             let mut pos = 0usize;
             let mut r = 0usize;
             while pos + 2 <= raw.len() {
-                let len = u16::from_le_bytes([raw[pos], raw[pos+1]]) as usize;
+                let len = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
                 pos += 2;
                 if r == row_idx {
-                    if len == 0xFFFF || pos + len > raw.len() { return Value::Null; }
+                    if len == 0xFFFF || pos + len > raw.len() {
+                        return Value::Null;
+                    }
                     return Value::Text(ArcString(std::sync::Arc::from(
-                        std::str::from_utf8(&raw[pos..pos+len]).unwrap_or("")
+                        std::str::from_utf8(&raw[pos..pos + len]).unwrap_or(""),
                     )));
                 }
                 pos += if len == 0xFFFF { 0 } else { len };
@@ -156,7 +180,11 @@ pub struct ColSegmentStore {
 impl ColSegmentStore {
     /// Create a new store for a table at `base_dir/columnar_ms/<table_name>/`.
     /// (`columnar_ms` to avoid clashing with the time-series `columnar/` dir.)
-    pub fn create(base_dir: &Path, table_name: &str, col_types: Vec<ColumnType>) -> Result<Arc<Self>> {
+    pub fn create(
+        base_dir: &Path,
+        table_name: &str,
+        col_types: Vec<ColumnType>,
+    ) -> Result<Arc<Self>> {
         let dir = base_dir.join("columnar_ms").join(table_name);
         std::fs::create_dir_all(&dir)?;
         let manifest_path = dir.join("MANIFEST");
@@ -326,7 +354,9 @@ impl ColSegmentStore {
             let buf = self.write_buf.lock();
             if let Some(idx) = buf.keys.iter().position(|&k| k == key) {
                 // Found in buffer — newest version. If deleted, return None.
-                if buf.deleted[idx] { return None; }
+                if buf.deleted[idx] {
+                    return None;
+                }
                 // Live buffered row: decode from the columnar buffer.
                 let mut row = Vec::with_capacity(self.col_types.len());
                 for ci in 0..self.col_types.len() {
@@ -402,8 +432,11 @@ impl ColSegmentStore {
         max_results: usize,
     ) -> Vec<(u64, Vec<Value>)> {
         let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
-        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(total_rows.min(max_results).min(65536));
-        if max_results == 0 { return result; }
+        let mut result: Vec<(u64, Vec<Value>)> =
+            Vec::with_capacity(total_rows.min(max_results).min(65536));
+        if max_results == 0 {
+            return result;
+        }
         let segs = self.segments_snapshot();
 
         // For small result sets (≤8 rows expected), use lazy projection:
@@ -430,81 +463,147 @@ impl ColSegmentStore {
             // Descending index order within a segment: rows are appended old→new,
             // so iterating n→0 visits the newest (largest index) version of a key
             // first. Combined with `seen`, this keeps the newest version.
-            let order: Vec<usize> = if need_dedup { (0..n).rev().collect() } else { (0..n).collect() };
+            let order: Vec<usize> = if need_dedup {
+                (0..n).rev().collect()
+            } else {
+                (0..n).collect()
+            };
 
             // Pre-decode filter column (once per segment).
             let fcol_fixed = filter_col.and_then(|fc| {
                 if fc < seg.sst.column_tags.len() && seg.sst.column_tags[fc].is_fixed() {
                     seg.sst.read_fixed_i64(fc).ok()
-                } else { None }
+                } else {
+                    None
+                }
             });
             let fcol_text = filter_col.and_then(|fc| {
                 if fc < seg.sst.column_tags.len() && !seg.sst.column_tags[fc].is_fixed() {
                     seg.sst.read_text(fc).ok()
-                } else { None }
+                } else {
+                    None
+                }
             });
             let fcol_type = filter_col.and_then(|fc| self.col_types.get(fc));
 
             // Pre-intern filter Text column into ArcString vec to avoid per-row
             // String allocation in the predicate (WHERE/LIKE on text cols).
             let fcol_text_interned: Vec<Option<Value>> = if let Some(ref t) = fcol_text {
-                (0..n).map(|i| {
-                    if t.is_null(i) { return None; }
-                    t.get_str(i).map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
-                }).collect()
-            } else { Vec::new() };
+                (0..n)
+                    .map(|i| {
+                        if t.is_null(i) {
+                            return None;
+                        }
+                        t.get_str(i)
+                            .map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             // Pre-decode project columns (once per segment) — unless lazy mode
             // (small result set): then we decode only for matched rows below.
-            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = if !lazy_project {
-                project_cols.iter().map(|&pc| {
-                    if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
-                        seg.sst.read_fixed_i64(pc).ok()
-                    } else { None }
-                }).collect()
-            } else { Vec::new() };
+            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = if !lazy_project
+            {
+                project_cols
+                    .iter()
+                    .map(|&pc| {
+                        if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
+                            seg.sst.read_fixed_i64(pc).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let ptext: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = if !lazy_project {
-                project_cols.iter().map(|&pc| {
-                    if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed() {
-                        seg.sst.read_text(pc).ok()
-                    } else { None }
-                }).collect()
-            } else { Vec::new() };
+                project_cols
+                    .iter()
+                    .map(|&pc| {
+                        if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed() {
+                            seg.sst.read_text(pc).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let n_seg = seg.sst.num_rows;
             let pvector: Vec<Vec<Option<Vec<f32>>>> = if !lazy_project {
-                project_cols.iter().map(|&pc| {
-                    if pc < seg.sst.column_tags.len()
-                        && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Vector) {
-                        let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
-                        let mut per = vec![None; n_seg];
-                        let mut di = 0usize;
-                        for i in 0..n_seg {
-                            if seg.sst.row_map.is_deleted(i) { continue; }
-                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                            if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                project_cols
+                    .iter()
+                    .map(|&pc| {
+                        if pc < seg.sst.column_tags.len()
+                            && matches!(
+                                seg.sst.column_tags[pc],
+                                crate::storage::lsm::columnar::ColumnTypeTag::Vector
+                            )
+                        {
+                            let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
+                            let mut per = vec![None; n_seg];
+                            let mut di = 0usize;
+                            for i in 0..n_seg {
+                                if seg.sst.row_map.is_deleted(i) {
+                                    continue;
+                                }
+                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                                while di < decoded.len() && decoded[di].0 != ek {
+                                    di += 1;
+                                }
+                                if di < decoded.len() {
+                                    per[i] = Some(decoded[di].1.clone());
+                                    di += 1;
+                                }
+                            }
+                            per
+                        } else {
+                            Vec::new()
                         }
-                        per
-                    } else { Vec::new() }
-                }).collect()
-            } else { Vec::new() };
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let pspatial: Vec<Vec<Option<crate::types::Geometry>>> = if !lazy_project {
-                project_cols.iter().map(|&pc| {
-                    if pc < seg.sst.column_tags.len()
-                        && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Spatial) {
-                        let decoded = seg.sst.read_spatial(pc).unwrap_or_default();
-                        let mut per = vec![None; n_seg];
-                        let mut di = 0usize;
-                        for i in 0..n_seg {
-                            if seg.sst.row_map.is_deleted(i) { continue; }
-                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                            if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                project_cols
+                    .iter()
+                    .map(|&pc| {
+                        if pc < seg.sst.column_tags.len()
+                            && matches!(
+                                seg.sst.column_tags[pc],
+                                crate::storage::lsm::columnar::ColumnTypeTag::Spatial
+                            )
+                        {
+                            let decoded = seg.sst.read_spatial(pc).unwrap_or_default();
+                            let mut per = vec![None; n_seg];
+                            let mut di = 0usize;
+                            for i in 0..n_seg {
+                                if seg.sst.row_map.is_deleted(i) {
+                                    continue;
+                                }
+                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                                while di < decoded.len() && decoded[di].0 != ek {
+                                    di += 1;
+                                }
+                                if di < decoded.len() {
+                                    per[i] = Some(decoded[di].1.clone());
+                                    di += 1;
+                                }
+                            }
+                            per
+                        } else {
+                            Vec::new()
                         }
-                        per
-                    } else { Vec::new() }
-                }).collect()
-            } else { Vec::new() };
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let ptext_interned: Vec<Vec<Option<Value>>> = Vec::new();
 
@@ -513,8 +612,12 @@ impl ColSegmentStore {
                 // Newest-version-wins dedup: skip if a newer version of this key
                 // was already emitted. Mark seen BEFORE the deleted check so a
                 // tombstone in a newer version suppresses older live rows.
-                if need_dedup && !seen.insert(key) { continue; }
-                if seg.sst.row_map.is_deleted(i) { continue; }
+                if need_dedup && !seen.insert(key) {
+                    continue;
+                }
+                if seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
 
                 // Decode filter value only (cheap: single column lookup).
                 let fval: Option<Value> = if filter_col.is_some() {
@@ -529,11 +632,17 @@ impl ColSegmentStore {
                         fcol_text_interned.get(i).cloned().flatten()
                     } else if let Some(ref t) = fcol_text {
                         t.get_str(i).map(|s| Value::Text(s.into()))
-                    } else { None };
+                    } else {
+                        None
+                    };
                     v
-                } else { None };
+                } else {
+                    None
+                };
 
-                if !predicate(fval.as_ref()) { continue; }
+                if !predicate(fval.as_ref()) {
+                    continue;
+                }
 
                 // Decode output columns for matching row only.
                 let mut row = Vec::with_capacity(project_cols.len());
@@ -543,51 +652,98 @@ impl ColSegmentStore {
                         let v = if pc < self.col_types.len() && pc < seg.sst.column_tags.len() {
                             if seg.sst.column_tags[pc].is_fixed() {
                                 match self.col_types[pc] {
-                                    ColumnType::Integer => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_i64(i)).map(Value::Integer),
-                                    ColumnType::Float => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_f64(i)).map(Value::Float),
-                                    ColumnType::Boolean => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_bool(i)).map(Value::Bool),
-                                    _ => seg.sst.read_fixed_i64(pc).ok().and_then(|f| f.get_i64(i)).map(Value::Integer),
+                                    ColumnType::Integer => seg
+                                        .sst
+                                        .read_fixed_i64(pc)
+                                        .ok()
+                                        .and_then(|f| f.get_i64(i))
+                                        .map(Value::Integer),
+                                    ColumnType::Float => seg
+                                        .sst
+                                        .read_fixed_i64(pc)
+                                        .ok()
+                                        .and_then(|f| f.get_f64(i))
+                                        .map(Value::Float),
+                                    ColumnType::Boolean => seg
+                                        .sst
+                                        .read_fixed_i64(pc)
+                                        .ok()
+                                        .and_then(|f| f.get_bool(i))
+                                        .map(Value::Bool),
+                                    _ => seg
+                                        .sst
+                                        .read_fixed_i64(pc)
+                                        .ok()
+                                        .and_then(|f| f.get_i64(i))
+                                        .map(Value::Integer),
                                 }
                             } else {
-                                match seg.sst.read_text(pc).ok().and_then(|t| t.get_str(i).map(|s| s.to_string())) {
+                                match seg
+                                    .sst
+                                    .read_text(pc)
+                                    .ok()
+                                    .and_then(|t| t.get_str(i).map(|s| s.to_string()))
+                                {
                                     Some(s) => Some(Value::Text(s.into())),
                                     None => Some(Value::Null),
                                 }
                             }
-                        } else { Some(Value::Null) };
+                        } else {
+                            Some(Value::Null)
+                        };
                         row.push(v.unwrap_or(Value::Null));
                     }
                 } else {
-                for (pi, &pc) in project_cols.iter().enumerate() {
-                    let v = if pc < self.col_types.len() {
-                        match (&pfixed.get(pi), &ptext.get(pi), &self.col_types[pc]) {
-                            (Some(Some(f)), _, ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
-                            (Some(Some(f)), _, ColumnType::Float) => f.get_f64(i).map(Value::Float),
-                            (Some(Some(f)), _, ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
-                            (_, _, ColumnType::Spatial) => {
-                                pspatial.get(pi).and_then(|p| p.get(i)).cloned().flatten()
-                                    .map(|g| Value::Spatial(std::boxed::Box::new(g)))
-                            }
-                            (_, _, ColumnType::Tensor(_)) => {
-                                pvector.get(pi).and_then(|p| p.get(i)).cloned().flatten()
-                                    .map(|v| Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v))))
-                            }
-                            (_, Some(Some(t)), ColumnType::Text) => {
-                                if !ptext_interned.is_empty() {
-                                    ptext_interned.get(pi).and_then(|v| v.get(i)).cloned().flatten()
-                                } else {
-                                    t.get_str(i).map(|s| Value::Text(s.into()))
+                    for (pi, &pc) in project_cols.iter().enumerate() {
+                        let v = if pc < self.col_types.len() {
+                            match (&pfixed.get(pi), &ptext.get(pi), &self.col_types[pc]) {
+                                (Some(Some(f)), _, ColumnType::Integer) => {
+                                    f.get_i64(i).map(Value::Integer)
                                 }
+                                (Some(Some(f)), _, ColumnType::Float) => {
+                                    f.get_f64(i).map(Value::Float)
+                                }
+                                (Some(Some(f)), _, ColumnType::Boolean) => {
+                                    f.get_bool(i).map(Value::Bool)
+                                }
+                                (_, _, ColumnType::Spatial) => pspatial
+                                    .get(pi)
+                                    .and_then(|p| p.get(i))
+                                    .cloned()
+                                    .flatten()
+                                    .map(|g| Value::Spatial(std::boxed::Box::new(g))),
+                                (_, _, ColumnType::Tensor(_)) => pvector
+                                    .get(pi)
+                                    .and_then(|p| p.get(i))
+                                    .cloned()
+                                    .flatten()
+                                    .map(|v| {
+                                        Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v)))
+                                    }),
+                                (_, Some(Some(t)), ColumnType::Text) => {
+                                    if !ptext_interned.is_empty() {
+                                        ptext_interned
+                                            .get(pi)
+                                            .and_then(|v| v.get(i))
+                                            .cloned()
+                                            .flatten()
+                                    } else {
+                                        t.get_str(i).map(|s| Value::Text(s.into()))
+                                    }
+                                }
+                                _ => Some(Value::Null),
                             }
-                            _ => Some(Value::Null),
-                        }
-                    } else { Some(Value::Null) };
-                    row.push(v.unwrap_or(Value::Null));
-                }
+                        } else {
+                            Some(Value::Null)
+                        };
+                        row.push(v.unwrap_or(Value::Null));
+                    }
                 } // end else (non-lazy)
                 result.push((key, row));
                 // 🚀 LIMIT early-termination: stop scanning once we have enough rows.
-                if result.len() >= max_results { return result; }
+                if result.len() >= max_results {
+                    return result;
+                }
             }
         }
         result
@@ -622,7 +778,9 @@ impl ColSegmentStore {
         limit: usize,
     ) -> Option<Vec<usize>> {
         let segs = self.segments_snapshot();
-        if segs.len() != 1 { return None; }
+        if segs.len() != 1 {
+            return None;
+        }
         let seg = &segs[0];
         let n = seg.sst.num_rows;
         let cap = if limit == usize::MAX { n } else { limit };
@@ -638,20 +796,30 @@ impl ColSegmentStore {
                     let s = tseg.get_str_fast(i);
                     if str_predicate(Some(s)) {
                         indices.push(i);
-                        if indices.len() >= limit { break; }
+                        if indices.len() >= limit {
+                            break;
+                        }
                     }
                 }
             } else {
                 for i in 0..n {
-                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let matches = if has_nulls {
-                        str_predicate(if tseg.is_null(i) { None } else { tseg.get_str(i) })
+                        str_predicate(if tseg.is_null(i) {
+                            None
+                        } else {
+                            tseg.get_str(i)
+                        })
                     } else {
                         str_predicate(Some(tseg.get_str_fast(i)))
                     };
                     if matches {
                         indices.push(i);
-                        if indices.len() >= limit { break; }
+                        if indices.len() >= limit {
+                            break;
+                        }
                     }
                 }
             }
@@ -693,25 +861,35 @@ impl ColSegmentStore {
                 for i in 0..n {
                     if !single_seg {
                         let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) { continue; }
+                        if !seen.insert(key) {
+                            continue;
+                        }
                     }
                     let s = ftext.get_str_fast(i);
                     if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
                         indices.push((sidx, i));
-                        if indices.len() >= limit { return Some(indices); }
+                        if indices.len() >= limit {
+                            return Some(indices);
+                        }
                     }
                 }
             } else {
                 for i in 0..n {
                     if !single_seg {
                         let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) { continue; }
+                        if !seen.insert(key) {
+                            continue;
+                        }
                     }
-                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     if let Some(s) = ftext.get_str(i) {
                         if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
                             indices.push((sidx, i));
-                            if indices.len() >= limit { return Some(indices); }
+                            if indices.len() >= limit {
+                                return Some(indices);
+                            }
                         }
                     }
                 }
@@ -728,7 +906,9 @@ impl ColSegmentStore {
         limit: usize,
     ) -> Option<Vec<usize>> {
         let segs = self.segments_snapshot();
-        if segs.len() != 1 { return None; }
+        if segs.len() != 1 {
+            return None;
+        }
         let seg = &segs[0];
         let n = seg.sst.num_rows;
         let cap = if limit == usize::MAX { n } else { limit };
@@ -746,30 +926,40 @@ impl ColSegmentStore {
                 let s = ftext.get_str_fast(i);
                 if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
                     indices.push(i);
-                    if indices.len() >= limit { break; }
+                    if indices.len() >= limit {
+                        break;
+                    }
                 }
             }
         } else {
-        for i in 0..n {
-            if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
-            if has_nulls && ftext.is_null(i) { continue; }
-            // Direct byte comparison: get the string's raw bytes and check
-            // if the first `plen` bytes match the prefix.
-            if has_nulls {
-                if let Some(s) = ftext.get_str(i) {
+            for i in 0..n {
+                if has_deletions && seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
+                if has_nulls && ftext.is_null(i) {
+                    continue;
+                }
+                // Direct byte comparison: get the string's raw bytes and check
+                // if the first `plen` bytes match the prefix.
+                if has_nulls {
+                    if let Some(s) = ftext.get_str(i) {
+                        if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
+                            indices.push(i);
+                            if indices.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let s = ftext.get_str_fast(i);
                     if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
                         indices.push(i);
-                        if indices.len() >= limit { break; }
+                        if indices.len() >= limit {
+                            break;
+                        }
                     }
                 }
-            } else {
-                let s = ftext.get_str_fast(i);
-                if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
-                    indices.push(i);
-                    if indices.len() >= limit { break; }
-                }
             }
-        }
         }
         Some(indices)
     }
@@ -807,17 +997,32 @@ impl ColSegmentStore {
 
             // Pre-read output columns (same segment, one-time cost per column).
             // This is O(cols) not O(rows) — much faster than per-row lazy decode.
-            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
-                    seg.sst.read_fixed_i64(pc).ok()
-                } else { None }
-            }).collect();
-            let ptext_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols.iter().map(|&pc| {
-                if pc < seg.sst.column_tags.len() && !seg.sst.column_tags[pc].is_fixed()
-                    && !matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Spatial) {
-                    seg.sst.read_text(pc).ok()
-                } else { None }
-            }).collect();
+            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols
+                .iter()
+                .map(|&pc| {
+                    if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
+                        seg.sst.read_fixed_i64(pc).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let ptext_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols
+                .iter()
+                .map(|&pc| {
+                    if pc < seg.sst.column_tags.len()
+                        && !seg.sst.column_tags[pc].is_fixed()
+                        && !matches!(
+                            seg.sst.column_tags[pc],
+                            crate::storage::lsm::columnar::ColumnTypeTag::Spatial
+                        )
+                    {
+                        seg.sst.read_text(pc).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             // Inner row-processing macro — shared between natural & sorted order.
             macro_rules! process_row {
@@ -827,21 +1032,31 @@ impl ColSegmentStore {
                     // Mark key as seen BEFORE checking deleted, so tombstones suppress
                     // older versions of the same key in earlier segments.
                     if let Some(ref mut s) = seen {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
 
                     // Filter: pass raw &str to predicate (zero Value allocation).
-                    let fval = ftext.as_ref().and_then(|t| {
-                        if t.is_null(i) { None } else { t.get_str(i) }
-                    });
-                    if !str_predicate(fval) { continue; }
+                    let fval =
+                        ftext
+                            .as_ref()
+                            .and_then(|t| if t.is_null(i) { None } else { t.get_str(i) });
+                    if !str_predicate(fval) {
+                        continue;
+                    }
 
                     // Decode output columns from pre-read segments (O(1) per row).
                     let mut row = Vec::with_capacity(project_cols.len());
                     for (pi, &pc) in project_cols.iter().enumerate() {
                         let v = if pc < self.col_types.len() {
-                            if matches!(self.col_types[pc], ColumnType::Spatial | ColumnType::Tensor(_)) {
+                            if matches!(
+                                self.col_types[pc],
+                                ColumnType::Spatial | ColumnType::Tensor(_)
+                            ) {
                                 Some(Value::Null)
                             } else if let Some(Some(ref f)) = pfixed.get(pi) {
                                 match self.col_types[pc] {
@@ -852,14 +1067,20 @@ impl ColSegmentStore {
                                 }
                             } else if let Some(Some(ref t)) = ptext_cols.get(pi) {
                                 t.get_str(i).map(|s| Value::Text(s.into()))
-                            } else { None }
-                        } else { None };
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                         row.push(v.unwrap_or(Value::Null));
                     }
                     result.push((key, row));
 
                     // 🔥 Early exit: stop scanning once we have `limit` matches.
-                    if result.len() >= limit { break 'outer; }
+                    if result.len() >= limit {
+                        break 'outer;
+                    }
                 }};
             }
 
@@ -897,26 +1118,40 @@ impl ColSegmentStore {
         limit: usize,
     ) -> Option<Vec<Vec<Value>>> {
         let segs = self.segments_snapshot();
-        if segs.len() != 1 { return None; }
+        if segs.len() != 1 {
+            return None;
+        }
         let seg = &segs[0];
         let n = seg.sst.num_rows;
         let ftext = seg.sst.read_text(filter_col).ok()?;
 
         // Pre-read output columns.
         let ncols = project_cols.len();
-        let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols.iter()
+        let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols
+            .iter()
             .map(|&pc| {
                 if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
                     seg.sst.read_fixed_i64(pc).ok()
-                } else { None }
-            }).collect();
-        let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols.iter()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols
+            .iter()
             .map(|&pc| {
                 if pc < seg.sst.column_tags.len()
-                    && matches!(seg.sst.column_tags[pc], crate::storage::lsm::columnar::ColumnTypeTag::Text) {
+                    && matches!(
+                        seg.sst.column_tags[pc],
+                        crate::storage::lsm::columnar::ColumnTypeTag::Text
+                    )
+                {
                     seg.sst.read_text(pc).ok()
-                } else { None }
-            }).collect();
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // String pool for text output columns.
         let mut str_pool: std::collections::HashMap<&str, std::sync::Arc<str>> =
@@ -949,7 +1184,9 @@ impl ColSegmentStore {
                             t.get_str(i).map(|s| {
                                 let arc = str_pool.get(s).cloned().unwrap_or_else(|| {
                                     let a: std::sync::Arc<str> = std::sync::Arc::from(s);
-                                    if str_pool.len() < 10000 { str_pool.insert(s, a.clone()); }
+                                    if str_pool.len() < 10000 {
+                                        str_pool.insert(s, a.clone());
+                                    }
                                     a
                                 });
                                 Value::Text(ArcString(arc))
@@ -960,15 +1197,25 @@ impl ColSegmentStore {
                         row.push(v.unwrap_or(Value::Null));
                     }
                     result.push(row);
-                    if result.len() >= limit { break; }
+                    if result.len() >= limit {
+                        break;
+                    }
                 }
             }
         } else {
             // Slow path with null/deletion checks.
             for i in 0..n {
-                if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
-                let s = if has_nulls { ftext.get_str(i) } else { Some(ftext.get_str_fast(i)) };
-                if s != Some(filter_val) { continue; }
+                if has_deletions && seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
+                let s = if has_nulls {
+                    ftext.get_str(i)
+                } else {
+                    Some(ftext.get_str_fast(i))
+                };
+                if s != Some(filter_val) {
+                    continue;
+                }
                 let mut row = Vec::with_capacity(ncols);
                 for (pi, &pc) in project_cols.iter().enumerate() {
                     let v = if let Some(Some(ref f)) = fixed_cols.get(pi) {
@@ -982,7 +1229,9 @@ impl ColSegmentStore {
                         t.get_str(i).map(|s| {
                             let arc = str_pool.get(s).cloned().unwrap_or_else(|| {
                                 let a: std::sync::Arc<str> = std::sync::Arc::from(s);
-                                if str_pool.len() < 10000 { str_pool.insert(s, a.clone()); }
+                                if str_pool.len() < 10000 {
+                                    str_pool.insert(s, a.clone());
+                                }
                                 a
                             });
                             Value::Text(ArcString(arc))
@@ -993,7 +1242,9 @@ impl ColSegmentStore {
                     row.push(v.unwrap_or(Value::Null));
                 }
                 result.push(row);
-                if result.len() >= limit { break; }
+                if result.len() >= limit {
+                    break;
+                }
             }
         }
 
@@ -1006,12 +1257,7 @@ impl ColSegmentStore {
     ///
     /// For ORDER BY amount DESC LIMIT 10: reads only the amount column (1 col),
     /// keeps top 10 in a heap, then the caller fetches only those 10 full rows.
-    pub fn topk_keys_by_fixed_col(
-        &self,
-        sort_col: usize,
-        k: usize,
-        ascending: bool,
-    ) -> Vec<u64> {
+    pub fn topk_keys_by_fixed_col(&self, sort_col: usize, k: usize, ascending: bool) -> Vec<u64> {
         use std::collections::BinaryHeap;
 
         let segs = self.segments_snapshot();
@@ -1026,10 +1272,24 @@ impl ColSegmentStore {
         // Wrap f64 for total ordering (NaN-safe).
         #[derive(Clone)]
         struct OrdF64(f64);
-        impl PartialEq for OrdF64 { fn eq(&self, o: &Self) -> bool { self.0 == o.0 } }
+        impl PartialEq for OrdF64 {
+            fn eq(&self, o: &Self) -> bool {
+                self.0 == o.0
+            }
+        }
         impl Eq for OrdF64 {}
-        impl PartialOrd for OrdF64 { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
-        impl Ord for OrdF64 { fn cmp(&self, o: &Self) -> std::cmp::Ordering { self.0.partial_cmp(&o.0).unwrap_or(std::cmp::Ordering::Equal) } }
+        impl PartialOrd for OrdF64 {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for OrdF64 {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.0
+                    .partial_cmp(&o.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
 
         // BinaryHeap is a max-heap. To keep the K LARGEST (descending), we need
         // a min-heap so the smallest is evicted → wrap in Reverse.
@@ -1044,10 +1304,17 @@ impl ColSegmentStore {
             for i in 0..n {
                 let key = seg.sst.row_map.key(i);
                 if let Some(ref mut s) = seen {
-                    if !s.insert(key) { continue; }
+                    if !s.insert(key) {
+                        continue;
+                    }
                 }
-                if seg.sst.row_map.is_deleted(i) { continue; }
-                if let Some(v) = fseg.get_f64(i).or_else(|| fseg.get_i64(i).map(|x| x as f64)) {
+                if seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
+                if let Some(v) = fseg
+                    .get_f64(i)
+                    .or_else(|| fseg.get_i64(i).map(|x| x as f64))
+                {
                     let entry = if ascending {
                         (OrdF64(v), key)
                     } else {
@@ -1055,12 +1322,15 @@ impl ColSegmentStore {
                         (OrdF64(-v), key)
                     };
                     heap.push(entry);
-                    if heap.len() > k { heap.pop(); }
+                    if heap.len() > k {
+                        heap.pop();
+                    }
                 }
             }
         }
 
-        let mut result: Vec<(f64, u64)> = heap.into_iter()
+        let mut result: Vec<(f64, u64)> = heap
+            .into_iter()
             .map(|(of, key)| {
                 let v = if ascending { of.0 } else { -of.0 };
                 (v, key)
@@ -1099,7 +1369,9 @@ impl ColSegmentStore {
     /// `columnar_sstables: DashMap<String, Arc<ColumnarSSTable>>`; this lets them
     /// observe the same SSTable without cloning (Arc shared). Returns None if
     /// the store has no segments.
-    pub fn latest_segment_sst(&self) -> Option<Arc<crate::storage::lsm::columnar::ColumnarSSTable>> {
+    pub fn latest_segment_sst(
+        &self,
+    ) -> Option<Arc<crate::storage::lsm::columnar::ColumnarSSTable>> {
         self.segments.read().back().map(|seg| Arc::clone(&seg.sst))
     }
 
@@ -1139,7 +1411,6 @@ impl ColSegmentStore {
         op: &crate::sql::ast::BinaryOperator,
         target: &Value,
     ) -> usize {
-
         // 🔑 Flush buffered writes (INSERT/UPDATE/DELETE) so they're visible to
         // the segment scan. Without this, count_filtered only sees persisted
         // segments and misses buffered updates.
@@ -1157,32 +1428,68 @@ impl ColSegmentStore {
         };
 
         // Pre-extract target comparison value (avoids re-matching per row).
-        let target_i = if let Value::Integer(v) = target { Some(*v) } else { None };
-        let mut target_f = if let Value::Float(v) = target { Some(*v) } else { None };
+        let target_i = if let Value::Integer(v) = target {
+            Some(*v)
+        } else {
+            None
+        };
+        let mut target_f = if let Value::Float(v) = target {
+            Some(*v)
+        } else {
+            None
+        };
         // 🔑 Cross-type: if the literal was parsed as Integer but the column is
         // Float, convert it so the comparison works (WHERE score > 50 parses
         // as Integer(50), but score is a FLOAT column).
         if target_f.is_none() {
-            if let Some(i) = target_i { target_f = Some(i as f64); }
+            if let Some(i) = target_i {
+                target_f = Some(i as f64);
+            }
         }
-        let target_s: Option<&str> = if let Value::Text(t) = target { Some(t.as_str()) } else { None };
-        let target_b = if let Value::Bool(v) = target { Some(*v) } else { None };
+        let target_s: Option<&str> = if let Value::Text(t) = target {
+            Some(t.as_str())
+        } else {
+            None
+        };
+        let target_b = if let Value::Bool(v) = target {
+            Some(*v)
+        } else {
+            None
+        };
 
         let mut count = 0usize;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
-            if filter_col >= seg.sst.column_tags.len() { continue; }
+            if filter_col >= seg.sst.column_tags.len() {
+                continue;
+            }
             let tag = seg.sst.column_tags[filter_col];
 
             // Pre-decode the filter column once per segment.
-            let fcol_fixed = if tag.is_fixed() { seg.sst.read_fixed_i64(filter_col).ok() } else { None };
-            let fcol_text = if matches!(tag, ColumnTypeTag::Text) { seg.sst.read_text(filter_col).ok() } else { None };
+            let fcol_fixed = if tag.is_fixed() {
+                seg.sst.read_fixed_i64(filter_col).ok()
+            } else {
+                None
+            };
+            let fcol_text = if matches!(tag, ColumnTypeTag::Text) {
+                seg.sst.read_text(filter_col).ok()
+            } else {
+                None
+            };
 
-            let order: Vec<usize> = if need_dedup { (0..n).rev().collect() } else { (0..n).collect() };
+            let order: Vec<usize> = if need_dedup {
+                (0..n).rev().collect()
+            } else {
+                (0..n).collect()
+            };
             for &i in &order {
                 let key = seg.sst.row_map.key(i);
-                if need_dedup && !seen.insert(key) { continue; }
-                if seg.sst.row_map.is_deleted(i) { continue; }
+                if need_dedup && !seen.insert(key) {
+                    continue;
+                }
+                if seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
 
                 let matches = if let Some(ref f) = fcol_fixed {
                     // Fixed-width: compare raw i64/f64 bits, no Value alloc.
@@ -1207,9 +1514,13 @@ impl ColSegmentStore {
                         Some(s) => cmp_str(Some(s), target_s, op),
                         None => false, // NULL never matches
                     }
-                } else { false };
+                } else {
+                    false
+                };
 
-                if matches { count += 1; }
+                if matches {
+                    count += 1;
+                }
             }
         }
         drop(buf);
@@ -1241,40 +1552,76 @@ impl ColSegmentStore {
             std::collections::HashSet::new()
         };
         // Pre-extract filter target for comparison.
-        let target_i = if let Value::Integer(v) = target { Some(*v) } else { None };
-        let target_f = if let Value::Float(v) = target { Some(*v) } else { None };
-        let target_s: Option<&str> = if let Value::Text(t) = target { Some(t.as_str()) } else { None };
+        let target_i = if let Value::Integer(v) = target {
+            Some(*v)
+        } else {
+            None
+        };
+        let target_f = if let Value::Float(v) = target {
+            Some(*v)
+        } else {
+            None
+        };
+        let target_s: Option<&str> = if let Value::Text(t) = target {
+            Some(t.as_str())
+        } else {
+            None
+        };
         let no_filter = filter_col.is_none();
         let fc = filter_col.unwrap_or(0);
 
         let mut result = AggregateResult::default();
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
-            if agg_col >= seg.sst.column_tags.len() { continue; }
+            if agg_col >= seg.sst.column_tags.len() {
+                continue;
+            }
             // Pre-decode filter + aggregate columns once per segment.
-            let fcol_fixed = if !no_filter && fc < seg.sst.column_tags.len() && seg.sst.column_tags[fc].is_fixed() {
+            let fcol_fixed = if !no_filter
+                && fc < seg.sst.column_tags.len()
+                && seg.sst.column_tags[fc].is_fixed()
+            {
                 seg.sst.read_fixed_i64(fc).ok()
-            } else { None };
-            let fcol_text = if !no_filter && fc < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[fc], ColumnTypeTag::Text) {
+            } else {
+                None
+            };
+            let fcol_text = if !no_filter
+                && fc < seg.sst.column_tags.len()
+                && matches!(seg.sst.column_tags[fc], ColumnTypeTag::Text)
+            {
                 seg.sst.read_text(fc).ok()
-            } else { None };
+            } else {
+                None
+            };
             let agg_fixed = if seg.sst.column_tags[agg_col].is_fixed() {
                 seg.sst.read_fixed_i64(agg_col).ok()
-            } else { None };
+            } else {
+                None
+            };
             let agg_is_float = matches!(self.col_types.get(agg_col), Some(ColumnType::Float));
 
-            let order: Vec<usize> = if need_dedup { (0..n).rev().collect() } else { (0..n).collect() };
+            let order: Vec<usize> = if need_dedup {
+                (0..n).rev().collect()
+            } else {
+                (0..n).collect()
+            };
             for &i in &order {
                 let key = seg.sst.row_map.key(i);
-                if need_dedup && !seen.insert(key) { continue; }
-                if seg.sst.row_map.is_deleted(i) { continue; }
+                if need_dedup && !seen.insert(key) {
+                    continue;
+                }
+                if seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
 
                 // Apply filter predicate (zero-alloc, same as count_filtered).
                 let passes = if no_filter {
                     true
                 } else if let Some(ref f) = fcol_fixed {
                     match seg.sst.column_tags[fc] {
-                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => cmp_opt(f.get_i64(i), target_i, op),
+                        ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                            cmp_opt(f.get_i64(i), target_i, op)
+                        }
                         ColumnTypeTag::Float => cmp_opt_f64(f.get_f64(i), target_f, op),
                         ColumnTypeTag::Bool => {
                             let tb = target_i.map(|i| i != 0);
@@ -1284,9 +1631,13 @@ impl ColSegmentStore {
                     }
                 } else if let Some(ref t) = fcol_text {
                     cmp_str(t.get_str(i), target_s, op)
-                } else { false };
+                } else {
+                    false
+                };
 
-                if !passes { continue; }
+                if !passes {
+                    continue;
+                }
 
                 // Fold aggregate value directly (no Value construction).
                 // 🔑 COUNT(col)/SUM/AVG/MIN/MAX all skip NULLs — only count
@@ -1298,28 +1649,43 @@ impl ColSegmentStore {
                                 result.count += 1;
                                 result.float_sum += v;
                                 result.has_float = true;
-                                if result.count == 1 { result.min_float = v; result.max_float = v; }
-                                else { result.min_float = result.min_float.min(v); result.max_float = result.max_float.max(v); }
+                                if result.count == 1 {
+                                    result.min_float = v;
+                                    result.max_float = v;
+                                } else {
+                                    result.min_float = result.min_float.min(v);
+                                    result.max_float = result.max_float.max(v);
+                                }
                             }
-                            None => { result.null_count += 1; }
+                            None => {
+                                result.null_count += 1;
+                            }
                         }
                     } else {
                         match af.get_i64(i) {
                             Some(v) => {
                                 result.count += 1;
                                 result.int_sum = result.int_sum.wrapping_add(v);
-                                if result.count == 1 { result.min_int = v; result.max_int = v; }
-                                else { result.min_int = result.min_int.min(v); result.max_int = result.max_int.max(v); }
+                                if result.count == 1 {
+                                    result.min_int = v;
+                                    result.max_int = v;
+                                } else {
+                                    result.min_int = result.min_int.min(v);
+                                    result.max_int = result.max_int.max(v);
+                                }
                             }
-                            None => { result.null_count += 1; }
+                            None => {
+                                result.null_count += 1;
+                            }
                         }
                     }
                 } else {
                     // Variable-width column (TEXT/Vector/Spatial): COUNT(col) counts
                     // non-NULL rows. Use the column's null_flags to determine NULL.
-                    let is_null = self.col_types.get(agg_col)
-                        .map(|_| seg.sst.read_text(agg_col).ok())
-                        .flatten()
+                    let is_null = self
+                        .col_types
+                        .get(agg_col)
+                        .and_then(|_| seg.sst.read_text(agg_col).ok())
                         .map(|t| t.is_null(i))
                         .unwrap_or(true);
                     if is_null {
@@ -1348,7 +1714,9 @@ impl ColSegmentStore {
             // (O(n) scan of the row_map, no HashMap allocation).
             let mut count = 0usize;
             for i in 0..seg.sst.num_rows {
-                if !seg.sst.row_map.is_deleted(i) { count += 1; }
+                if !seg.sst.row_map.is_deleted(i) {
+                    count += 1;
+                }
             }
             return count;
         }
@@ -1364,7 +1732,9 @@ impl ColSegmentStore {
         for seg in segs.iter().rev() {
             for i in (0..seg.sst.num_rows).rev() {
                 let key = seg.sst.row_map.key(i);
-                if liveness.contains_key(&key) { continue; }
+                if liveness.contains_key(&key) {
+                    continue;
+                }
                 liveness.insert(key, seg.sst.row_map.is_deleted(i));
             }
         }
@@ -1375,7 +1745,12 @@ impl ColSegmentStore {
     /// Count + Sum with a text filter: iterate filter col (TextSegment) + sum col
     /// (FixedSegment) directly. Returns (count, sum). Zero Vec<Value> allocation.
     /// Optimized for SELECT COUNT(*), SUM(col) WHERE text_col = 'val'.
-    pub fn count_sum_text_filter(&self, filter_col: usize, filter_val: &str, sum_col: usize) -> (i64, f64) {
+    pub fn count_sum_text_filter(
+        &self,
+        filter_col: usize,
+        filter_val: &str,
+        sum_col: usize,
+    ) -> (i64, f64) {
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
         let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
@@ -1393,14 +1768,21 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = seen {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     if tseg.get_str(i) == Some(filter_val) {
                         count += 1;
                         if let Some(ref f) = fsum {
-                            if let Some(v) = f.get_f64(i) { sum += v; }
-                            else if let Some(v) = f.get_i64(i) { sum += v as f64; }
+                            if let Some(v) = f.get_f64(i) {
+                                sum += v;
+                            } else if let Some(v) = f.get_i64(i) {
+                                sum += v as f64;
+                            }
                         }
                     }
                 }
@@ -1410,7 +1792,12 @@ impl ColSegmentStore {
     }
 
     /// Count + Min + Max with a text filter. Returns (count, min, max).
-    pub fn count_min_max_text_filter(&self, filter_col: usize, filter_val: &str, agg_col: usize) -> (i64, f64, f64) {
+    pub fn count_min_max_text_filter(
+        &self,
+        filter_col: usize,
+        filter_val: &str,
+        agg_col: usize,
+    ) -> (i64, f64, f64) {
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
         let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
@@ -1429,13 +1816,19 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = seen {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     if tseg.get_str(i) == Some(filter_val) {
                         count += 1;
                         if let Some(ref f) = fagg {
-                            let v = f.get_f64(i).unwrap_or_else(|| f.get_i64(i).map(|i| i as f64).unwrap_or(0.0));
+                            let v = f
+                                .get_f64(i)
+                                .unwrap_or_else(|| f.get_i64(i).map(|i| i as f64).unwrap_or(0.0));
                             min = min.min(v);
                             max = max.max(v);
                         }
@@ -1474,17 +1867,26 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = seen {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     if tseg.get_str(i) == Some(filter_val) {
                         count += 1;
                         if let Some(ref f) = fagg {
-                            let v = f.get_f64(i)
+                            let v = f
+                                .get_f64(i)
                                 .unwrap_or_else(|| f.get_i64(i).map(|i| i as f64).unwrap_or(0.0));
                             sum += v;
-                            if v < min { min = v; }
-                            if v > max { max = v; }
+                            if v < min {
+                                min = v;
+                            }
+                            if v > max {
+                                max = v;
+                            }
                         }
                     }
                 }
@@ -1510,38 +1912,50 @@ impl ColSegmentStore {
     /// output columns for just those K rows — not all N.
     /// 🔑 Batch-decodes each output column ONCE per segment (not per row),
     /// avoiding K× redundant column segment decompressions.
-    pub fn decode_rows_at(&self, indices: &[(usize, usize)], out_cols: &[usize]) -> Vec<Vec<Value>> {
-        if indices.is_empty() { return Vec::new(); }
+    pub fn decode_rows_at(
+        &self,
+        indices: &[(usize, usize)],
+        out_cols: &[usize],
+    ) -> Vec<Vec<Value>> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
         let segs = self.segments_snapshot();
         let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
         // Pre-decode columns per segment lazily (cached in a local map).
         // For small K this is much cheaper than N full-row decode.
         for &(seg_idx, row_idx) in indices {
-            let Some(seg) = segs.get(seg_idx) else { continue };
-            if row_idx >= seg.sst.num_rows { continue; }
-            if seg.sst.row_map.has_any_deleted() && seg.sst.row_map.is_deleted(row_idx) { continue; }
+            let Some(seg) = segs.get(seg_idx) else {
+                continue;
+            };
+            if row_idx >= seg.sst.num_rows {
+                continue;
+            }
+            if seg.sst.row_map.has_any_deleted() && seg.sst.row_map.is_deleted(row_idx) {
+                continue;
+            }
             let mut row = Vec::with_capacity(out_cols.len());
             for &ci in out_cols {
                 let tag = seg.sst.column_tags.get(ci).copied();
-                let v = match tag {
-                    Some(t) if t.is_fixed() => {
-                        seg.sst.read_fixed_i64(ci).ok().and_then(|f| {
+                let v =
+                    match tag {
+                        Some(t) if t.is_fixed() => seg.sst.read_fixed_i64(ci).ok().and_then(|f| {
                             match self.col_types.get(ci) {
                                 Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
                                 Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
                                 Some(ColumnType::Boolean) => f.get_bool(row_idx).map(Value::Bool),
-                                Some(ColumnType::Timestamp) => f.get_i64(row_idx)
-                                    .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
+                                Some(ColumnType::Timestamp) => f.get_i64(row_idx).map(|v| {
+                                    Value::Timestamp(crate::types::Timestamp::from_micros(v))
+                                }),
                                 _ => None,
                             }
-                        })
-                    }
-                    Some(ColumnTypeTag::Text) => {
-                        seg.sst.read_text(ci).ok().and_then(|t| t.get_str(row_idx)
-                            .map(|s| Value::Text(ArcString(std::sync::Arc::from(s)))))
-                    }
-                    _ => None,
-                };
+                        }),
+                        Some(ColumnTypeTag::Text) => seg.sst.read_text(ci).ok().and_then(|t| {
+                            t.get_str(row_idx)
+                                .map(|s| Value::Text(ArcString(std::sync::Arc::from(s))))
+                        }),
+                        _ => None,
+                    };
                 row.push(v.unwrap_or(Value::Null));
             }
             result.push(row);
@@ -1549,12 +1963,7 @@ impl ColSegmentStore {
         result
     }
 
-    pub fn top_k_row_indices(
-        &self,
-        order_col: usize,
-        k: usize,
-        desc: bool,
-    ) -> Vec<(usize, usize)> {
+    pub fn top_k_row_indices(&self, order_col: usize, k: usize, desc: bool) -> Vec<(usize, usize)> {
         // Delegates to the type-aware variant, assuming an Integer column.
         // Callers that know the column is Float should use top_k_row_indices_typed.
         self.top_k_row_indices_typed(order_col, k, desc, false)
@@ -1569,12 +1978,16 @@ impl ColSegmentStore {
         desc: bool,
         is_float: bool,
     ) -> Vec<(usize, usize)> {
-        if k == 0 { return Vec::new(); }
+        if k == 0 {
+            return Vec::new();
+        }
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
         let mut dedup: Option<std::collections::HashSet<u64>> = if single_seg {
             None
-        } else { Some(std::collections::HashSet::new()) };
+        } else {
+            Some(std::collections::HashSet::new())
+        };
         // Convert f64 to a totally-ordered u64 key (NaN-safe total order) so it
         // works with BinaryHeap (which requires Ord). For DESC keep a MIN-heap
         // of the largest K (store !bits so the max-heap evicts the smallest);
@@ -1583,14 +1996,22 @@ impl ColSegmentStore {
             // IEEE 754 total-order bits: flip sign bit for normal ordering, flip
             // all bits for negative numbers.
             let bits = v.to_bits();
-            if bits & (1u64 << 63) != 0 { !bits } else { bits ^ (1u64 << 63) }
+            if bits & (1u64 << 63) != 0 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            }
         };
         let mut heap: std::collections::BinaryHeap<(u64, usize, usize)> =
             std::collections::BinaryHeap::with_capacity(k + 1);
         let push_capped = |heap: &mut std::collections::BinaryHeap<(u64, usize, usize)>,
-                           ord_key: u64, seg_idx: usize, ri: usize| {
+                           ord_key: u64,
+                           seg_idx: usize,
+                           ri: usize| {
             heap.push((ord_key, seg_idx, ri));
-            if heap.len() > k { heap.pop(); }
+            if heap.len() > k {
+                heap.pop();
+            }
         };
         for (sidx, seg) in segs.iter().enumerate() {
             let n = seg.sst.num_rows;
@@ -1602,11 +2023,19 @@ impl ColSegmentStore {
                     for i in 0..n {
                         let key = seg.sst.row_map.key(i);
                         if let Some(ref mut s) = dedup {
-                            if !s.insert(key) { continue; }
+                            if !s.insert(key) {
+                                continue;
+                            }
                         }
-                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                        if has_deletions && seg.sst.row_map.is_deleted(i) {
+                            continue;
+                        }
                         let v = fseg.get_f64(i).unwrap_or(f64::NAN);
-                        let ord_key = if desc { u64::MAX - to_ord(v) } else { to_ord(v) };
+                        let ord_key = if desc {
+                            u64::MAX - to_ord(v)
+                        } else {
+                            to_ord(v)
+                        };
                         push_capped(&mut heap, ord_key, sidx, i);
                     }
                 }
@@ -1614,12 +2043,20 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = dedup {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let v = fseg.get_i64(i).unwrap_or(i64::MIN) as f64;
                     // DESC (largest K): invert ord so heap is a min-heap on true value.
-                    let ord_key = if desc { u64::MAX - to_ord(v) } else { to_ord(v) };
+                    let ord_key = if desc {
+                        u64::MAX - to_ord(v)
+                    } else {
+                        to_ord(v)
+                    };
                     push_capped(&mut heap, ord_key, sidx, i);
                 }
             }
@@ -1662,12 +2099,18 @@ impl ColSegmentStore {
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
-            if group_col >= seg.sst.column_tags.len() { continue; }
+            if group_col >= seg.sst.column_tags.len() {
+                continue;
+            }
             if let Ok(tseg) = seg.sst.read_text(group_col) {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
-                    if need_dedup && !seen.insert(key) { continue; }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if need_dedup && !seen.insert(key) {
+                        continue;
+                    }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let s = tseg.get_str(i).unwrap_or("");
                     // Fast path: key exists → increment without allocation.
                     if let Some(c) = groups.get_mut(s) {
@@ -1679,8 +2122,12 @@ impl ColSegmentStore {
             } else if let Ok(fseg) = seg.sst.read_fixed_i64(group_col) {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
-                    if need_dedup && !seen.insert(key) { continue; }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if need_dedup && !seen.insert(key) {
+                        continue;
+                    }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let v = fseg.get_i64(i).unwrap_or(0);
                     let buf = v.to_string();
                     if let Some(c) = groups.get_mut(buf.as_str()) {
@@ -1724,20 +2171,29 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = dedup {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
                     if has_deletions && seg.sst.row_map.is_deleted(i) {
                         rows_since_new += 1;
                         continue;
                     }
                     let s = if has_deletions {
-                        match tseg.get_str(i) { Some(s) => s, None => { continue; } }
+                        match tseg.get_str(i) {
+                            Some(s) => s,
+                            None => {
+                                continue;
+                            }
+                        }
                     } else {
                         tseg.get_str_fast(i)
                     };
                     if seen.insert(s.to_string()) {
                         rows_since_new = 0;
-                        if seen.len() >= max_values { break 'outer; }
+                        if seen.len() >= max_values {
+                            break 'outer;
+                        }
                     } else {
                         rows_since_new += 1;
                         if !seen.is_empty() && rows_since_new >= stable_window {
@@ -1749,7 +2205,9 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = dedup {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
                     if has_deletions && seg.sst.row_map.is_deleted(i) {
                         rows_since_new += 1;
@@ -1758,7 +2216,9 @@ impl ColSegmentStore {
                     let v = fseg.get_i64(i).unwrap_or(0).to_string();
                     if seen.insert(v) {
                         rows_since_new = 0;
-                        if seen.len() >= max_values { break 'outer; }
+                        if seen.len() >= max_values {
+                            break 'outer;
+                        }
                     } else {
                         rows_since_new += 1;
                         if !seen.is_empty() && rows_since_new >= stable_window {
@@ -1793,11 +2253,7 @@ impl ColSegmentStore {
     /// GROUP BY with COUNT + SUM aggregation in a single pass.
     /// Returns (group_value, count, sum) tuples. Reads only the group column
     /// and the aggregate column — no full-row decode.
-    pub fn group_by_count_sum(
-        &self,
-        group_col: usize,
-        agg_col: usize,
-    ) -> Vec<(String, i64, f64)> {
+    pub fn group_by_count_sum(&self, group_col: usize, agg_col: usize) -> Vec<(String, i64, f64)> {
         // Check the group-by cache first (avoids re-scanning on repeated calls).
         // Cache key: (group_col, agg_col) — invalidated on writes via clear_cache().
         {
@@ -1850,22 +2306,28 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = seen {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let gval = if has_nulls {
                         tseg.get_str(i).unwrap_or("")
                     } else {
                         tseg.get_str_fast(i)
                     };
-                    let av = afix.as_ref().and_then(|f| {
-                        f.get_f64(i).or_else(|| f.get_i64(i).map(|x| x as f64))
-                    });
+                    let av = afix
+                        .as_ref()
+                        .and_then(|f| f.get_f64(i).or_else(|| f.get_i64(i).map(|x| x as f64)));
 
                     // Fast path: entry exists → update count+sum (no String alloc).
                     if let Some(entry) = groups.get_mut(gval) {
                         entry.0 += 1;
-                        if let Some(v) = av { entry.1 += v; }
+                        if let Some(v) = av {
+                            entry.1 += v;
+                        }
                     } else {
                         groups.insert(gval.to_string(), (1, av.unwrap_or(0.0)));
                     }
@@ -1882,7 +2344,8 @@ impl ColSegmentStore {
         group_col: usize,
         agg_col: usize,
     ) -> Vec<(i64, i64, f64)> {
-        let mut groups: std::collections::HashMap<i64, (i64, f64)> = std::collections::HashMap::new();
+        let mut groups: std::collections::HashMap<i64, (i64, f64)> =
+            std::collections::HashMap::new();
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
         let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
@@ -1899,14 +2362,19 @@ impl ColSegmentStore {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
                     if let Some(ref mut s) = seen {
-                        if !s.insert(key) { continue; }
+                        if !s.insert(key) {
+                            continue;
+                        }
                     }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     if let Some(gval) = gseg.get_i64(i) {
                         let entry = groups.entry(gval).or_insert((0, 0.0));
                         entry.0 += 1;
                         if let Some(ref f) = afix {
-                            if let Some(v) = f.get_f64(i).or_else(|| f.get_i64(i).map(|x| x as f64)) {
+                            if let Some(v) = f.get_f64(i).or_else(|| f.get_i64(i).map(|x| x as f64))
+                            {
                                 entry.1 += v;
                             }
                         }
@@ -2006,7 +2474,9 @@ impl ColSegmentStore {
     pub fn force_compact_all(&self) -> Result<()> {
         let old_segs: Vec<Arc<Segment>> = {
             let segs = self.segments.read();
-            if segs.len() < 2 { return Ok(()); }
+            if segs.len() < 2 {
+                return Ok(());
+            }
             segs.iter().cloned().collect()
         };
         self.merge_segments(old_segs)
@@ -2032,7 +2502,9 @@ impl ColSegmentStore {
     /// Shared merge logic: merge `old_segs` into one new segment, dedup keys
     /// (newest version wins), drop tombstones, update manifest + GC old files.
     fn merge_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
-        if old_segs.is_empty() { return Ok(()); }
+        if old_segs.is_empty() {
+            return Ok(());
+        }
         // Serialize with flush_buffer: wait for any in-progress flush to
         // complete before merging, and hold the lock so no new flush can
         // create a segment that this merge would miss.
@@ -2050,8 +2522,12 @@ impl ColSegmentStore {
         // Boolean is fixed-width but only 1 byte, so it must go through the
         // mixed path (which reads via the type-correct accessor); including it
         // here would write 8 bytes per Boolean row and corrupt the segment.
-        let all_fixed = self.col_types.iter().all(|ct| matches!(ct,
-            ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp));
+        let all_fixed = self.col_types.iter().all(|ct| {
+            matches!(
+                ct,
+                ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp
+            )
+        });
 
         if all_fixed {
             // Column-direct compaction: extract raw i64 bytes per row, no Value.
@@ -2065,23 +2541,41 @@ impl ColSegmentStore {
             let mut collected: Vec<(u64, u64, Vec<[u8; 8]>, Vec<bool>)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
-                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
-                    (0..ncols).map(|ci| {
+                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
+                    ..ncols)
+                    .map(|ci| {
                         if ci < seg.sst.column_tags.len() && seg.sst.column_tags[ci].is_fixed() {
                             seg.sst.read_fixed_i64(ci).ok()
-                        } else { None }
-                    }).collect();
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
-                    if !seen.insert(key) { continue; }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let ts = seg.sst.row_map.timestamp(i);
                     let mut col_vals: Vec<[u8; 8]> = Vec::with_capacity(ncols);
                     let mut col_nulls: Vec<bool> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
-                        match fixed_cols.get(ci).and_then(|x| x.as_ref()).and_then(|f| f.get_i64(i)) {
-                            Some(v) => { col_vals.push(v.to_le_bytes()); col_nulls.push(false); }
-                            None => { col_vals.push(0i64.to_le_bytes()); col_nulls.push(true); }
+                        match fixed_cols
+                            .get(ci)
+                            .and_then(|x| x.as_ref())
+                            .and_then(|f| f.get_i64(i))
+                        {
+                            Some(v) => {
+                                col_vals.push(v.to_le_bytes());
+                                col_nulls.push(false);
+                            }
+                            None => {
+                                col_vals.push(0i64.to_le_bytes());
+                                col_nulls.push(true);
+                            }
                         }
                     }
                     collected.push((key, ts, col_vals, col_nulls));
@@ -2089,7 +2583,9 @@ impl ColSegmentStore {
             }
             // Single-segment data is already sorted (sequential insert); skip the
             // sort for that case to avoid the O(N log N) overhead.
-            if !single_seg { collected.sort_unstable_by_key(|(k, _, _, _)| *k); }
+            if !single_seg {
+                collected.sort_unstable_by_key(|(k, _, _, _)| *k);
+            }
             for (key, ts, col_vals, col_nulls) in collected {
                 let col_bytes: Vec<&[u8]> = col_vals.iter().map(|b| b.as_slice()).collect();
                 builder.add_values_raw_with_nulls(key, ts, false, &col_bytes, &col_nulls)?;
@@ -2108,74 +2604,131 @@ impl ColSegmentStore {
             let mut collected: Vec<(u64, u64, Vec<Vec<u8>>, Vec<bool>)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
-                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
-                    (0..ncols).map(|ci| {
+                let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
+                    ..ncols)
+                    .map(|ci| {
                         if ci < seg.sst.column_tags.len() && seg.sst.column_tags[ci].is_fixed() {
                             seg.sst.read_fixed_i64(ci).ok()
-                        } else { None }
-                    }).collect();
-                let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> =
-                    (0..ncols).map(|ci| {
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let text_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = (0..ncols)
+                    .map(|ci| {
                         if ci < seg.sst.column_tags.len()
-                            && matches!(seg.sst.column_tags[ci],
-                                crate::storage::lsm::columnar::ColumnTypeTag::Text) {
+                            && matches!(
+                                seg.sst.column_tags[ci],
+                                crate::storage::lsm::columnar::ColumnTypeTag::Text
+                            )
+                        {
                             seg.sst.read_text(ci).ok()
-                        } else { None }
-                    }).collect();
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 // Pre-decode Vector columns into per-idx option vecs.
-                let vec_cols: Vec<Vec<Option<Vec<f32>>>> = (0..ncols).map(|ci| {
-                    if ci < seg.sst.column_tags.len()
-                        && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector) {
-                        let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
-                        let mut per_row = vec![None; n];
-                        let mut di = 0usize;
-                        for i in 0..n {
-                            if seg.sst.row_map.is_deleted(i) { continue; }
-                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                            if di < decoded.len() { per_row[i] = Some(decoded[di].1.clone()); di += 1; }
+                let vec_cols: Vec<Vec<Option<Vec<f32>>>> = (0..ncols)
+                    .map(|ci| {
+                        if ci < seg.sst.column_tags.len()
+                            && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector)
+                        {
+                            let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
+                            let mut per_row = vec![None; n];
+                            let mut di = 0usize;
+                            for i in 0..n {
+                                if seg.sst.row_map.is_deleted(i) {
+                                    continue;
+                                }
+                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                                while di < decoded.len() && decoded[di].0 != ek {
+                                    di += 1;
+                                }
+                                if di < decoded.len() {
+                                    per_row[i] = Some(decoded[di].1.clone());
+                                    di += 1;
+                                }
+                            }
+                            per_row
+                        } else {
+                            Vec::new()
                         }
-                        per_row
-                    } else { Vec::new() }
-                }).collect();
+                    })
+                    .collect();
                 // Pre-decode Spatial columns into per-idx option vecs.
-                let spatial_cols: Vec<Vec<Option<crate::types::Geometry>>> = (0..ncols).map(|ci| {
-                    if ci < seg.sst.column_tags.len()
-                        && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial) {
-                        let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
-                        let mut per_row = vec![None; n];
-                        let mut di = 0usize;
-                        for i in 0..n {
-                            if seg.sst.row_map.is_deleted(i) { continue; }
-                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                            while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                            if di < decoded.len() { per_row[i] = Some(decoded[di].1.clone()); di += 1; }
+                let spatial_cols: Vec<Vec<Option<crate::types::Geometry>>> = (0..ncols)
+                    .map(|ci| {
+                        if ci < seg.sst.column_tags.len()
+                            && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial)
+                        {
+                            let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
+                            let mut per_row = vec![None; n];
+                            let mut di = 0usize;
+                            for i in 0..n {
+                                if seg.sst.row_map.is_deleted(i) {
+                                    continue;
+                                }
+                                let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                                while di < decoded.len() && decoded[di].0 != ek {
+                                    di += 1;
+                                }
+                                if di < decoded.len() {
+                                    per_row[i] = Some(decoded[di].1.clone());
+                                    di += 1;
+                                }
+                            }
+                            per_row
+                        } else {
+                            Vec::new()
                         }
-                        per_row
-                    } else { Vec::new() }
-                }).collect();
+                    })
+                    .collect();
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
-                    if !seen.insert(key) { continue; }
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let ts = seg.sst.row_map.timestamp(i);
                     let mut row_bytes: Vec<Vec<u8>> = Vec::with_capacity(ncols);
                     let mut row_nulls: Vec<bool> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
                         let mut buf = Vec::new();
                         let tag = seg.sst.column_tags.get(ci).copied();
-                        if matches!(tag, Some(crate::storage::lsm::columnar::ColumnTypeTag::Bool)) {
+                        if matches!(
+                            tag,
+                            Some(crate::storage::lsm::columnar::ColumnTypeTag::Bool)
+                        ) {
                             // Boolean: 1-byte fixed. Read via get_bool, write 1 byte.
-                            match fixed_cols.get(ci).and_then(|x| x.as_ref()).and_then(|f| f.get_bool(i)) {
-                                Some(b) => { buf.push(if b { 1u8 } else { 0u8 }); row_nulls.push(false); }
-                                None => { buf.push(0u8); row_nulls.push(true); }
+                            match fixed_cols
+                                .get(ci)
+                                .and_then(|x| x.as_ref())
+                                .and_then(|f| f.get_bool(i))
+                            {
+                                Some(b) => {
+                                    buf.push(if b { 1u8 } else { 0u8 });
+                                    row_nulls.push(false);
+                                }
+                                None => {
+                                    buf.push(0u8);
+                                    row_nulls.push(true);
+                                }
                             }
-                        } else if let Some(ref f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
+                        } else if let Some(f) = fixed_cols.get(ci).and_then(|x| x.as_ref()) {
                             match f.get_i64(i) {
-                                Some(v) => { buf.extend_from_slice(&v.to_le_bytes()); row_nulls.push(false); }
-                                None => { buf.extend_from_slice(&0i64.to_le_bytes()); row_nulls.push(true); }
+                                Some(v) => {
+                                    buf.extend_from_slice(&v.to_le_bytes());
+                                    row_nulls.push(false);
+                                }
+                                None => {
+                                    buf.extend_from_slice(&0i64.to_le_bytes());
+                                    row_nulls.push(true);
+                                }
                             }
-                        } else if let Some(ref t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
+                        } else if let Some(t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
                             match t.get_str(i) {
                                 Some(s) => {
                                     let len = s.len().min(65535) as u16;
@@ -2183,13 +2736,18 @@ impl ColSegmentStore {
                                     buf.extend_from_slice(&s.as_bytes()[..len as usize]);
                                     row_nulls.push(false);
                                 }
-                                None => { buf.extend_from_slice(&0u16.to_le_bytes()); row_nulls.push(true); }
+                                None => {
+                                    buf.extend_from_slice(&0u16.to_le_bytes());
+                                    row_nulls.push(true);
+                                }
                             }
                         } else if ci < vec_cols.len() && !vec_cols[ci].is_empty() {
                             // Vector: re-encode [dim:u16][f32×dim] (NULL → dim=0).
                             if let Some(ref v) = vec_cols[ci][i] {
                                 buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
-                                for x in v { buf.extend_from_slice(&x.to_le_bytes()); }
+                                for x in v {
+                                    buf.extend_from_slice(&x.to_le_bytes());
+                                }
                                 row_nulls.push(false);
                             } else {
                                 buf.extend_from_slice(&0u16.to_le_bytes());
@@ -2215,7 +2773,9 @@ impl ColSegmentStore {
                     collected.push((key, ts, row_bytes, row_nulls));
                 }
             }
-            if !single_seg { collected.sort_unstable_by_key(|(k, _, _, _)| *k); }
+            if !single_seg {
+                collected.sort_unstable_by_key(|(k, _, _, _)| *k);
+            }
             for (key, ts, row_bytes, row_nulls) in collected {
                 let col_slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();
                 builder.add_values_raw_with_nulls(key, ts, false, &col_slices, &row_nulls)?;
@@ -2230,7 +2790,8 @@ impl ColSegmentStore {
         {
             let mut segs = self.segments.write();
             let old_set: std::collections::HashSet<u64> = old_ids.iter().copied().collect();
-            let new_list: VecDeque<Arc<Segment>> = segs.iter()
+            let new_list: VecDeque<Arc<Segment>> = segs
+                .iter()
                 .filter(|s| !old_set.contains(&s.id))
                 .cloned()
                 .collect();

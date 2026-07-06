@@ -74,7 +74,6 @@ impl BitWriter {
         }
         self.buffer
     }
-
 }
 
 /// Bit-level reader. Reads bits from a byte slice.
@@ -537,7 +536,11 @@ mod tests {
         // Regular intervals should compress very well: ~1 bit/timestamp + 8B header
         // 1000 timestamps * 1 bit = 125 bytes + overhead
         let ratio = encoded.len() as f64 / (timestamps.len() * 8) as f64;
-        assert!(ratio < 0.05, "Compression ratio should be <5%, got {:.1}%", ratio * 100.0);
+        assert!(
+            ratio < 0.05,
+            "Compression ratio should be <5%, got {:.1}%",
+            ratio * 100.0
+        );
     }
 
     #[test]
@@ -582,7 +585,11 @@ mod tests {
         assert_eq!(decoded, timestamps);
 
         let ratio = encoded.len() as f64 / (timestamps.len() * 8) as f64;
-        assert!(ratio < 0.02, "Should compress to <2%, got {:.1}%", ratio * 100.0);
+        assert!(
+            ratio < 0.02,
+            "Should compress to <2%, got {:.1}%",
+            ratio * 100.0
+        );
     }
 
     // --- XOR Float Encoding ---
@@ -601,11 +608,13 @@ mod tests {
         // Simulating sensor data: small perturbations around 25.0°C
         // Uses a simple LCG for reproducibility — round-trip must be exact.
         let mut state: u64 = 42;
-        let values: Vec<f64> = (0..1000).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let delta = ((state >> 48) as f64 - 32768.0) / 32768.0 * 0.01;
-            25.0 + delta
-        }).collect();
+        let values: Vec<f64> = (0..1000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let delta = ((state >> 48) as f64 - 32768.0) / 32768.0 * 0.01;
+                25.0 + delta
+            })
+            .collect();
         let encoded = encode_floats(&values);
         let decoded = decode_floats(&encoded, values.len());
         assert_eq!(decoded, values);
@@ -613,7 +622,11 @@ mod tests {
         // Any compression at all is sufficient — the real Gorilla advantage
         // shows with constant values (1 bit/value) tested separately.
         let ratio = encoded.len() as f64 / (values.len() * 8) as f64;
-        assert!(ratio < 1.0, "Should compress at all, got {:.1}%", ratio * 100.0);
+        assert!(
+            ratio < 1.0,
+            "Should compress at all, got {:.1}%",
+            ratio * 100.0
+        );
     }
 
     #[test]
@@ -630,13 +643,22 @@ mod tests {
     #[test]
     fn test_floats_random() {
         // Random floats — less compressible, but must round-trip
-        let values: Vec<f64> = (0..10).map(|i| ((i * 7919) % 10000) as f64 / 100.0).collect();
+        let values: Vec<f64> = (0..10)
+            .map(|i| ((i * 7919) % 10000) as f64 / 100.0)
+            .collect();
         let encoded = encode_floats(&values);
         let decoded = decode_floats(&encoded, values.len());
         for i in 0..values.len() {
             if decoded[i] != values[i] {
-                eprintln!("Mismatch at {}: expected {:?} got {:?}", i, values[i], decoded[i]);
-                eprintln!("  bits: expected {:064b} got {:064b}", values[i].to_bits(), decoded[i].to_bits());
+                eprintln!(
+                    "Mismatch at {}: expected {:?} got {:?}",
+                    i, values[i], decoded[i]
+                );
+                eprintln!(
+                    "  bits: expected {:064b} got {:064b}",
+                    values[i].to_bits(),
+                    decoded[i].to_bits()
+                );
             }
         }
         assert_eq!(decoded, values);

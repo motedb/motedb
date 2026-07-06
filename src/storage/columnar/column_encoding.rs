@@ -265,7 +265,13 @@ mod tests {
     #[test]
     fn test_string_raw_roundtrip() {
         let values: Vec<Option<String>> = (0..1000)
-            .map(|i| if i % 10 == 0 { None } else { Some(format!("val_{}", i)) })
+            .map(|i| {
+                if i % 10 == 0 {
+                    None
+                } else {
+                    Some(format!("val_{}", i))
+                }
+            })
             .collect();
         let (encoded, enc_type) = encode_strings(&values);
         // With 900 unique strings, should use dictionary

@@ -7,12 +7,12 @@
 //! - vector: Vector similarity search with DiskANN
 //! - ioctree: i-Octree 3D point cloud for embodied intelligence
 
-pub mod timestamp;
 pub mod column;
-pub mod text;
-pub mod vector;
 pub mod ioctree;
+pub mod text;
+pub mod timestamp;
+pub mod vector;
 
 // Re-export for convenience
-pub use timestamp::{QueryProfile, MemTableScanProfile};
+pub use timestamp::{MemTableScanProfile, QueryProfile};
 pub use vector::VectorIndexStats;

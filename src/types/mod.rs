@@ -1,18 +1,18 @@
 //! Multi-modal data types for MoteDB
 
-mod tensor;
 mod spatial;
+mod table;
+mod tensor;
 mod text;
 mod timestamp;
-mod table;
 
+pub use spatial::{BoundingBox, BoundingBox3D, Geometry, Point, Point3D};
+pub use table::{ColumnDef, ColumnType, IndexDef, IndexType, TTLDuration, TableSchema, TableType};
 pub use tensor::Tensor;
-pub use spatial::{Geometry, Point, Point3D, BoundingBox, BoundingBox3D};
 pub use text::{Text, TextDoc};
 pub use timestamp::Timestamp;
-pub use table::{TableSchema, ColumnDef, ColumnType, IndexDef, IndexType, TableType, TTLDuration};
 
-use serde::{Deserialize, Serialize, Deserializer, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 
 /// Wrapper for Arc<Vec<f32>> with custom serde implementation
@@ -210,7 +210,9 @@ impl PartialOrd for Value {
             (Value::Integer(a), Value::Timestamp(b)) => a.partial_cmp(&b.as_micros()),
             // Timestamp vs Float: compare timestamp micros to float value
             (Value::Timestamp(a), Value::Float(b)) => int_float_cmp(a.as_micros(), *b),
-            (Value::Float(a), Value::Timestamp(b)) => int_float_cmp(b.as_micros(), *a).map(|o| o.reverse()),
+            (Value::Float(a), Value::Timestamp(b)) => {
+                int_float_cmp(b.as_micros(), *a).map(|o| o.reverse())
+            }
             _ => None,
         }
     }
@@ -218,15 +220,23 @@ impl PartialOrd for Value {
 
 /// Total equality for f64: NaN == NaN, -0.0 == 0.0, otherwise bit-equality.
 fn float_eq(a: f64, b: f64) -> bool {
-    if a.is_nan() && b.is_nan() { return true; }
-    if a == 0.0 && b == 0.0 { return true; }
+    if a.is_nan() && b.is_nan() {
+        return true;
+    }
+    if a == 0.0 && b == 0.0 {
+        return true;
+    }
     a.to_bits() == b.to_bits()
 }
 
 /// Canonical f64 bits for hashing: normalizes NaN to a single representation, -0.0 → 0.0.
 fn canonical_float_bits(f: f64) -> u64 {
-    if f.is_nan() { return u64::MAX; }
-    if f == 0.0 { return 0.0f64.to_bits(); }
+    if f.is_nan() {
+        return u64::MAX;
+    }
+    if f == 0.0 {
+        return 0.0f64.to_bits();
+    }
     f.to_bits()
 }
 

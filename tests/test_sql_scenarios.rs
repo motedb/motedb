@@ -2,8 +2,8 @@
 //! Focuses on correctness (no bugs) for: batch operations, WHERE edge cases,
 //! data-type roundtrips, DDL lifecycle, and transaction recovery.
 
-use motedb::{Database, DBConfig, QueryResult};
 use motedb::types::Value;
+use motedb::{DBConfig, Database, QueryResult};
 use tempfile::TempDir;
 
 fn make_db() -> (TempDir, Database) {
@@ -38,8 +38,10 @@ fn count(db: &Database, table: &str) -> i64 {
 #[test]
 fn test_multi_value_insert() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
     assert_eq!(count(&db, "t"), 3, "multi-value insert adds 3 rows");
     let rows = select_rows(&db, "SELECT v FROM t ORDER BY id");
     assert_eq!(rows[0][0], Value::Integer(10));
@@ -49,10 +51,12 @@ fn test_multi_value_insert() {
 #[test]
 fn test_batch_insert_preserves_order() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     for batch_start in (0..100).step_by(25) {
         let vals: Vec<String> = (0..25).map(|i| format!("({})", batch_start + i)).collect();
-        db.execute(&format!("INSERT INTO t (v) VALUES {}", vals.join(","))).unwrap();
+        db.execute(&format!("INSERT INTO t (v) VALUES {}", vals.join(",")))
+            .unwrap();
     }
     assert_eq!(count(&db, "t"), 100);
     let rows = select_rows(&db, "SELECT v FROM t ORDER BY id");
@@ -68,7 +72,8 @@ fn test_batch_insert_preserves_order() {
 #[test]
 fn test_where_empty_result() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let rows = select_rows(&db, "SELECT * FROM t WHERE id = 999");
     assert!(rows.is_empty(), "no match returns empty");
@@ -77,7 +82,8 @@ fn test_where_empty_result() {
 #[test]
 fn test_where_all_match() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT)")
+        .unwrap();
     for _ in 0..5 {
         db.execute("INSERT INTO t (cat) VALUES ('x')").unwrap();
     }
@@ -88,24 +94,32 @@ fn test_where_all_match() {
 #[test]
 fn test_where_multiple_conditions_and() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, a INT, b INT)")
+        .unwrap();
     let data = [(10, 1), (20, 2), (30, 1), (40, 3), (50, 1)];
     for (a, b) in &data {
-        db.execute(&format!("INSERT INTO t (a, b) VALUES ({}, {})", a, b)).unwrap();
+        db.execute(&format!("INSERT INTO t (a, b) VALUES ({}, {})", a, b))
+            .unwrap();
     }
     let rows = select_rows(&db, "SELECT * FROM t WHERE a > 15 AND b = 1");
-    let matched: Vec<i64> = rows.iter().filter_map(|r| match r.get(1) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let matched: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.get(1) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(matched, vec![30, 50], "a>15 AND b=1 matches id 3 and 5");
 }
 
 #[test]
 fn test_where_multiple_conditions_or() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     for v in [1, 5, 10, 15, 20] {
-        db.execute(&format!("INSERT INTO t (v) VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t (v) VALUES ({})", v))
+            .unwrap();
     }
     let rows = select_rows(&db, "SELECT * FROM t WHERE v = 5 OR v = 15");
     assert_eq!(rows.len(), 2);
@@ -118,38 +132,53 @@ fn test_where_multiple_conditions_or() {
 #[test]
 fn test_integer_extremes_roundtrip() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, -1)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (3, {})", i64::MAX)).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (3, {})", i64::MAX))
+        .unwrap();
     // NOTE: i64::MIN is reserved as the NULL sentinel in columnar storage, so it
     // cannot be stored as a real value (round-trips as NULL). Use MIN+1.
-    db.execute(&format!("INSERT INTO t VALUES (4, {})", i64::MIN + 1)).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (4, {})", i64::MIN + 1))
+        .unwrap();
     let rows = select_rows(&db, "SELECT v FROM t ORDER BY id");
     assert_eq!(rows[0][0], Value::Integer(0));
     assert_eq!(rows[1][0], Value::Integer(-1));
     assert_eq!(rows[2][0], Value::Integer(i64::MAX));
-    assert_eq!(rows[3][0], Value::Integer(i64::MIN + 1), "MIN+1 round-trips");
+    assert_eq!(
+        rows[3][0],
+        Value::Integer(i64::MIN + 1),
+        "MIN+1 round-trips"
+    );
 }
 
 #[test]
 fn test_text_with_special_chars() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'hello world')").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello world')")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (2, '')").unwrap();
-    db.execute("INSERT INTO t VALUES (3, '  spaces  ')").unwrap();
+    db.execute("INSERT INTO t VALUES (3, '  spaces  ')")
+        .unwrap();
     let rows = select_rows(&db, "SELECT s FROM t ORDER BY id");
     assert_eq!(rows[0][0], Value::text("hello world".to_string()));
     // NOTE: empty string "" is stored as NULL in columnar (sentinel conflict) —
     // a known limitation. We verify the non-empty cases round-trip.
-    assert_eq!(rows[2][0], Value::text("  spaces  ".to_string()), "surrounding spaces preserved");
+    assert_eq!(
+        rows[2][0],
+        Value::text("  spaces  ".to_string()),
+        "surrounding spaces preserved"
+    );
 }
 
 #[test]
 fn test_boolean_storage() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, active BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, active BOOLEAN)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, TRUE)").unwrap();
     db.execute("INSERT INTO t VALUES (2, FALSE)").unwrap();
     let rows = select_rows(&db, "SELECT active FROM t ORDER BY id");
@@ -167,10 +196,12 @@ fn test_boolean_storage() {
 #[test]
 fn test_create_drop_recreate_same_table() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     db.execute("DROP TABLE t").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'reborn')").unwrap();
     assert_eq!(count(&db, "t"), 1, "dropped table data must not linger");
     let rows = select_rows(&db, "SELECT v FROM t");
@@ -180,21 +211,35 @@ fn test_create_drop_recreate_same_table() {
 #[test]
 fn test_create_index_query_drop_index_consistency() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT, v INT)")
+        .unwrap();
     for i in 0..20 {
-        let cat = match i % 2 { 0 => "even", _ => "odd" };
-        db.execute(&format!("INSERT INTO t (cat, v) VALUES ('{}', {})", cat, i)).unwrap();
+        let cat = match i % 2 {
+            0 => "even",
+            _ => "odd",
+        };
+        db.execute(&format!("INSERT INTO t (cat, v) VALUES ('{}', {})", cat, i))
+            .unwrap();
     }
     // Query before index
     let before = select_rows(&db, "SELECT * FROM t WHERE cat = 'even'");
     // Create index, query
-    db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN")
+        .unwrap();
     let with_idx = select_rows(&db, "SELECT * FROM t WHERE cat = 'even'");
-    assert_eq!(before.len(), with_idx.len(), "index doesn't change result count");
+    assert_eq!(
+        before.len(),
+        with_idx.len(),
+        "index doesn't change result count"
+    );
     // Drop index, query again
     db.execute("DROP INDEX idx_cat").unwrap();
     let after = select_rows(&db, "SELECT * FROM t WHERE cat = 'even'");
-    assert_eq!(after.len(), with_idx.len(), "drop index preserves result count");
+    assert_eq!(
+        after.len(),
+        with_idx.len(),
+        "drop index preserves result count"
+    );
 }
 
 /// Multiple indexes on one table. The first index (a) works correctly. The
@@ -203,16 +248,24 @@ fn test_create_index_query_drop_index_consistency() {
 #[test]
 fn test_multiple_indexes_same_table() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, a TEXT, b TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, a TEXT, b TEXT)")
+        .unwrap();
     for i in 0..30 {
         let a = if i % 3 == 0 { "x" } else { "y" };
         let b = if i % 2 == 0 { "p" } else { "q" };
-        db.execute(&format!("INSERT INTO t (a, b) VALUES ('{}', '{}')", a, b)).unwrap();
+        db.execute(&format!("INSERT INTO t (a, b) VALUES ('{}', '{}')", a, b))
+            .unwrap();
     }
-    db.execute("CREATE INDEX idx_a ON t (a) USING COLUMN").unwrap();
-    db.execute("CREATE INDEX idx_b ON t (b) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_a ON t (a) USING COLUMN")
+        .unwrap();
+    db.execute("CREATE INDEX idx_b ON t (b) USING COLUMN")
+        .unwrap();
     // First index query
-    assert_eq!(select_rows(&db, "SELECT * FROM t WHERE a = 'x'").len(), 10, "first index works");
+    assert_eq!(
+        select_rows(&db, "SELECT * FROM t WHERE a = 'x'").len(),
+        10,
+        "first index works"
+    );
     // Table integrity: both indexes don't corrupt the base data
     assert_eq!(count(&db, "t"), 30, "all rows intact");
 }
@@ -224,10 +277,12 @@ fn test_multiple_indexes_same_table() {
 #[test]
 fn test_transaction_commit_persists() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("BEGIN").unwrap();
     for i in 1..=5 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
     }
     db.execute("COMMIT").unwrap();
     assert_eq!(count(&db, "t"), 5, "committed data persists");
@@ -236,7 +291,8 @@ fn test_transaction_commit_persists() {
 #[test]
 fn test_transaction_rollback_discards() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("BEGIN").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
@@ -251,7 +307,8 @@ fn test_transaction_rollback_discards() {
 #[test]
 fn test_aggregate_on_empty_table() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     let rows = select_rows(&db, "SELECT COUNT(*), MIN(v), MAX(v) FROM t");
     // COUNT=0, MIN/MAX should be NULL
     assert_eq!(rows[0][0], Value::Integer(0), "COUNT on empty = 0");
@@ -260,8 +317,12 @@ fn test_aggregate_on_empty_table() {
 #[test]
 fn test_count_with_where_no_match() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
-    for i in 0..10 { db.execute(&format!("INSERT INTO t (v) VALUES ({})", i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO t (v) VALUES ({})", i))
+            .unwrap();
+    }
     let rows = select_rows(&db, "SELECT COUNT(*) FROM t WHERE v > 100");
     assert_eq!(rows[0][0], Value::Integer(0), "no match → COUNT 0");
 }
@@ -269,7 +330,8 @@ fn test_count_with_where_no_match() {
 #[test]
 fn test_min_max_extremes() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (5)").unwrap();
     db.execute("INSERT INTO t (v) VALUES (100)").unwrap();
     db.execute("INSERT INTO t (v) VALUES (42)").unwrap();
@@ -297,25 +359,37 @@ fn test_min_max_extremes() {
 #[test]
 fn test_order_by_asc_with_limit() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     for v in [50, 10, 40, 20, 30] {
-        db.execute(&format!("INSERT INTO t (v) VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t (v) VALUES ({})", v))
+            .unwrap();
     }
     let rows = select_rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 3");
     assert_eq!(rows.len(), 3, "LIMIT 3 returns 3 rows");
     // Verify monotonic (ASC): each subsequent >= previous.
-    let vals: Vec<i64> = rows.iter().filter_map(|r| match r.first() {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     for i in 1..vals.len() {
-        assert!(vals[i] >= vals[i-1], "ORDER BY ASC not monotonic: {} < {}", vals[i], vals[i-1]);
+        assert!(
+            vals[i] >= vals[i - 1],
+            "ORDER BY ASC not monotonic: {} < {}",
+            vals[i],
+            vals[i - 1]
+        );
     }
 }
 
 #[test]
 fn test_limit_larger_than_table() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (1)").unwrap();
     db.execute("INSERT INTO t (v) VALUES (2)").unwrap();
     let rows = select_rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 100");
@@ -325,8 +399,12 @@ fn test_limit_larger_than_table() {
 #[test]
 fn test_offset_pagination() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
-    for i in 1..=10 { db.execute(&format!("INSERT INTO t (v) VALUES ({})", i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO t (v) VALUES ({})", i))
+            .unwrap();
+    }
     let page1 = select_rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 3 OFFSET 0");
     let page2 = select_rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 3 OFFSET 3");
     assert_eq!(page1[0][0], Value::Integer(1), "page 1 starts at 1");
@@ -340,8 +418,12 @@ fn test_offset_pagination() {
 #[test]
 fn test_delete_all_rows() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
-    for i in 0..5 { db.execute(&format!("INSERT INTO t (v) VALUES ({})", i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
+    for i in 0..5 {
+        db.execute(&format!("INSERT INTO t (v) VALUES ({})", i))
+            .unwrap();
+    }
     db.execute("DELETE FROM t").unwrap();
     assert_eq!(count(&db, "t"), 0, "all rows deleted");
     assert!(select_rows(&db, "SELECT * FROM t").is_empty());
@@ -350,7 +432,8 @@ fn test_delete_all_rows() {
 #[test]
 fn test_delete_then_insert_cycle() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES (1)").unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
     db.execute("INSERT INTO t (v) VALUES (2)").unwrap();
@@ -366,20 +449,29 @@ fn test_delete_then_insert_cycle() {
 #[test]
 fn test_update_nonexistent_row() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     // Update a row that doesn't exist — should not error, no change
     db.execute("UPDATE t SET v = 999 WHERE id = 100").unwrap();
     assert_eq!(count(&db, "t"), 1);
     let rows = select_rows(&db, "SELECT v FROM t");
-    assert_eq!(rows[0][0], Value::Integer(10), "no change when updating non-existent");
+    assert_eq!(
+        rows[0][0],
+        Value::Integer(10),
+        "no change when updating non-existent"
+    );
 }
 
 #[test]
 fn test_update_all_rows() {
     let (_dir, db) = make_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
-    for i in 0..5 { db.execute(&format!("INSERT INTO t (v) VALUES ({})", i)).unwrap(); }
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
+    for i in 0..5 {
+        db.execute(&format!("INSERT INTO t (v) VALUES ({})", i))
+            .unwrap();
+    }
     db.execute("UPDATE t SET v = 999").unwrap();
     let rows = select_rows(&db, "SELECT v FROM t");
     for row in &rows {

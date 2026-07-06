@@ -3,11 +3,11 @@
 //!
 //! Run: cargo test --test bench_concurrent --release -- --nocapture --test-threads=1
 
-use motedb::{Database, DBConfig};
-use tempfile::TempDir;
+use motedb::{DBConfig, Database};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn is_ci() -> bool {
     std::env::var("CI").is_ok()
@@ -18,12 +18,23 @@ fn edge_config() -> DBConfig {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 fn print_result(name: &str, ops: usize, elapsed_ms: u64) {
-    let per_op_us = if ops > 0 { (elapsed_ms as f64 * 1000.0) / ops as f64 } else { 0.0 };
-    let throughput = if elapsed_ms > 0 { ops as f64 / (elapsed_ms as f64 / 1000.0) } else { f64::INFINITY };
+    let per_op_us = if ops > 0 {
+        (elapsed_ms as f64 * 1000.0) / ops as f64
+    } else {
+        0.0
+    };
+    let throughput = if elapsed_ms > 0 {
+        ops as f64 / (elapsed_ms as f64 / 1000.0)
+    } else {
+        f64::INFINITY
+    };
     println!(
         "  {:<60} | {:>7} ops | {:>8.1} ms | {:>8.1} µs/op | {:>10.0} ops/s",
         name, ops, elapsed_ms as f64, per_op_us, throughput
@@ -42,11 +53,17 @@ fn print_separator() {
 fn bench_read_heavy_concurrent() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
-    exec(&db, "CREATE TABLE rh (id INT PRIMARY KEY, data TEXT, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE rh (id INT PRIMARY KEY, data TEXT, val INT)",
+    );
 
     let seed: usize = if is_ci() { 2_000 } else { 10_000 };
     for i in 1..=seed as i64 {
-        exec(&db, &format!("INSERT INTO rh VALUES ({}, 'data_{}', {})", i, i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO rh VALUES ({}, 'data_{}', {})", i, i, i * 10),
+        );
     }
 
     print_separator();
@@ -65,7 +82,11 @@ fn bench_read_heavy_concurrent() {
                 for i in 0..reads_per_thread {
                     let id = ((t * reads_per_thread + i) % seed) as i64 + 1;
                     let sql = format!("SELECT * FROM rh WHERE id = {}", id);
-                    db_clone.execute(&sql).expect("select").materialize().expect("mat");
+                    db_clone
+                        .execute(&sql)
+                        .expect("select")
+                        .materialize()
+                        .expect("mat");
                     ops += 1;
                 }
                 ops
@@ -75,15 +96,24 @@ fn bench_read_heavy_concurrent() {
         let total_ops: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
-            &format!("Read-heavy {} threads × {} reads", n_threads, reads_per_thread),
-            total_ops, elapsed,
+            &format!(
+                "Read-heavy {} threads × {} reads",
+                n_threads, reads_per_thread
+            ),
+            total_ops,
+            elapsed,
         );
         elapsed
     };
 
     let throughput = total_reads as f64 / (ms as f64 / 1000.0);
-    println!("  -> {} threads reading concurrently: {:.0} reads/s", n_threads, throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    println!(
+        "  -> {} threads reading concurrently: {:.0} reads/s",
+        n_threads, throughput
+    );
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -94,11 +124,22 @@ fn bench_read_heavy_concurrent() {
 fn bench_mixed_read_write_concurrent() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
-    exec(&db, "CREATE TABLE mix (id INT PRIMARY KEY, val TEXT, score FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE mix (id INT PRIMARY KEY, val TEXT, score FLOAT)",
+    );
 
     let seed: usize = if is_ci() { 1_000 } else { 5_000 };
     for i in 1..=seed as i64 {
-        exec(&db, &format!("INSERT INTO mix VALUES ({}, 'v_{}', {})", i, i, i as f64 * 1.5));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO mix VALUES ({}, 'v_{}', {})",
+                i,
+                i,
+                i as f64 * 1.5
+            ),
+        );
     }
 
     print_separator();
@@ -121,17 +162,32 @@ fn bench_mixed_read_write_concurrent() {
                         // 70% reads
                         let id = (i % seed) as i64 + 1;
                         let sql = format!("SELECT * FROM mix WHERE id = {}", id);
-                        db_clone.execute(&sql).expect("select").materialize().expect("mat");
+                        db_clone
+                            .execute(&sql)
+                            .expect("select")
+                            .materialize()
+                            .expect("mat");
                     } else if i % 10 < 9 {
                         // 20% inserts
                         let id = base_id + i as i64;
-                        let sql = format!("INSERT INTO mix VALUES ({}, 'new_{}', {})", id, i, id as f64);
-                        db_clone.execute(&sql).expect("insert").materialize().expect("mat");
+                        let sql = format!(
+                            "INSERT INTO mix VALUES ({}, 'new_{}', {})",
+                            id, i, id as f64
+                        );
+                        db_clone
+                            .execute(&sql)
+                            .expect("insert")
+                            .materialize()
+                            .expect("mat");
                     } else {
                         // 10% updates
                         let id = (i % seed) as i64 + 1;
                         let sql = format!("UPDATE mix SET score = score + 1 WHERE id = {}", id);
-                        db_clone.execute(&sql).expect("update").materialize().expect("mat");
+                        db_clone
+                            .execute(&sql)
+                            .expect("update")
+                            .materialize()
+                            .expect("mat");
                     }
                     ops += 1;
                 }
@@ -142,15 +198,21 @@ fn bench_mixed_read_write_concurrent() {
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
-            &format!("Mixed R/W {} threads × {} ops (70R/20W/10U)", n_threads, ops_per_thread),
-            total, elapsed,
+            &format!(
+                "Mixed R/W {} threads × {} ops (70R/20W/10U)",
+                n_threads, ops_per_thread
+            ),
+            total,
+            elapsed,
         );
         elapsed
     };
 
     let throughput = total_ops as f64 / (ms as f64 / 1000.0);
     println!("  -> Mixed workload throughput: {:.0} ops/s", throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -165,7 +227,10 @@ fn bench_concurrent_transactions() {
 
     // Seed
     for i in 1..=100i64 {
-        exec(&db, &format!("INSERT INTO txn_data VALUES ({}, {})", i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO txn_data VALUES ({}, {})", i, i * 10),
+        );
     }
 
     print_separator();
@@ -189,7 +254,9 @@ fn bench_concurrent_transactions() {
                         motedb::types::Value::Integer(id as i64),
                         motedb::types::Value::Integer(id as i64 * 10),
                     ];
-                    db_clone.insert_row_with_txn("txn_data", tx, row).expect("insert with txn");
+                    db_clone
+                        .insert_row_with_txn("txn_data", tx, row)
+                        .expect("insert with txn");
 
                     if i % 5 == 0 {
                         db_clone.rollback_transaction(tx).expect("rollback");
@@ -203,24 +270,34 @@ fn bench_concurrent_transactions() {
             }));
         }
 
-        let (total_committed, total_rolled_back): (usize, usize) = handles.into_iter()
+        let (total_committed, total_rolled_back): (usize, usize) = handles
+            .into_iter()
             .map(|h| h.join().unwrap())
             .fold((0, 0), |(c, r), (tc, tr)| (c + tc, r + tr));
 
         let elapsed = start.elapsed().as_millis() as u64;
         let total_ops = total_committed + total_rolled_back;
         print_result(
-            &format!("Concurrent txn {} threads × {} (commit/rollback)", n_threads, txns_per_thread),
-            total_ops, elapsed,
+            &format!(
+                "Concurrent txn {} threads × {} (commit/rollback)",
+                n_threads, txns_per_thread
+            ),
+            total_ops,
+            elapsed,
         );
-        println!("  -> Committed: {}, Rolled back: {}", total_committed, total_rolled_back);
+        println!(
+            "  -> Committed: {}, Rolled back: {}",
+            total_committed, total_rolled_back
+        );
         elapsed
     };
 
     let total = n_threads * txns_per_thread;
     let throughput = total as f64 / (ms as f64 / 1000.0);
     println!("  -> Transaction throughput: {:.0} txns/s", throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -231,7 +308,10 @@ fn bench_concurrent_transactions() {
 fn bench_concurrent_inserts() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
-    exec(&db, "CREATE TABLE ci (id INT PRIMARY KEY, payload TEXT, ts INT)");
+    exec(
+        &db,
+        "CREATE TABLE ci (id INT PRIMARY KEY, payload TEXT, ts INT)",
+    );
 
     print_separator();
 
@@ -249,8 +329,18 @@ fn bench_concurrent_inserts() {
                 let mut ops = 0;
                 for i in 0..inserts_per_thread {
                     let id = (base + i + 1) as i64;
-                    let sql = format!("INSERT INTO ci VALUES ({}, 'payload_{}_{}', {})", id, t, i, 1700000000 + id);
-                    db_clone.execute(&sql).expect("insert").materialize().expect("mat");
+                    let sql = format!(
+                        "INSERT INTO ci VALUES ({}, 'payload_{}_{}', {})",
+                        id,
+                        t,
+                        i,
+                        1700000000 + id
+                    );
+                    db_clone
+                        .execute(&sql)
+                        .expect("insert")
+                        .materialize()
+                        .expect("mat");
                     ops += 1;
                 }
                 ops
@@ -260,8 +350,12 @@ fn bench_concurrent_inserts() {
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
-            &format!("Concurrent INSERT {} threads × {}", n_threads, inserts_per_thread),
-            total, elapsed,
+            &format!(
+                "Concurrent INSERT {} threads × {}",
+                n_threads, inserts_per_thread
+            ),
+            total,
+            elapsed,
         );
         elapsed
     };
@@ -271,13 +365,18 @@ fn bench_concurrent_inserts() {
     if let motedb::sql::QueryResult::Select { rows, .. } = result {
         if let Some(motedb::types::Value::Integer(count)) = rows.first().and_then(|r| r.first()) {
             println!("  -> Total rows after concurrent inserts: {}", count);
-            assert_eq!(*count, total_inserts as i64, "All concurrent inserts should succeed");
+            assert_eq!(
+                *count, total_inserts as i64,
+                "All concurrent inserts should succeed"
+            );
         }
     }
 
     let throughput = total_inserts as f64 / (ms as f64 / 1000.0);
     println!("  -> Concurrent insert throughput: {:.0} ops/s", throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -294,7 +393,10 @@ fn bench_concurrent_row_api() {
     let seed: usize = if is_ci() { 500 } else { 2000 };
     let mut row_ids = Vec::new();
     for i in 1..=seed as i64 {
-        let row = vec![motedb::types::Value::Integer(i), motedb::types::Value::text(format!("v_{}", i))];
+        let row = vec![
+            motedb::types::Value::Integer(i),
+            motedb::types::Value::text(format!("v_{}", i)),
+        ];
         let rid = db.insert_row("row_api", row).expect("insert_row");
         row_ids.push(rid);
     }
@@ -317,7 +419,9 @@ fn bench_concurrent_row_api() {
                 let mut ops = 0;
                 for i in 0..reads_per_thread {
                     let idx = i % ids_clone.len();
-                    let _ = db_clone.get_row("row_api", ids_clone[idx]).expect("get_row");
+                    let _ = db_clone
+                        .get_row("row_api", ids_clone[idx])
+                        .expect("get_row");
                     ops += 1;
                 }
                 ops
@@ -328,8 +432,12 @@ fn bench_concurrent_row_api() {
         let elapsed = start.elapsed().as_millis() as u64;
         let _total_reads = n_threads * reads_per_thread;
         print_result(
-            &format!("Concurrent get_row {} threads × {} reads", n_threads, reads_per_thread),
-            total, elapsed,
+            &format!(
+                "Concurrent get_row {} threads × {} reads",
+                n_threads, reads_per_thread
+            ),
+            total,
+            elapsed,
         );
         elapsed
     };
@@ -346,7 +454,10 @@ fn bench_concurrent_row_api() {
                 let mut ops = 0;
                 for i in 0..insert_per_thread {
                     let id = (seed + t * insert_per_thread + i + 1) as i64;
-                    let row = vec![motedb::types::Value::Integer(id), motedb::types::Value::text(format!("new_{}", id))];
+                    let row = vec![
+                        motedb::types::Value::Integer(id),
+                        motedb::types::Value::text(format!("new_{}", id)),
+                    ];
                     db_clone.insert_row("row_api", row).expect("insert_row");
                     ops += 1;
                 }
@@ -357,16 +468,25 @@ fn bench_concurrent_row_api() {
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
-            &format!("Concurrent insert_row {} threads × {} inserts", n_threads, insert_per_thread),
-            total, elapsed,
+            &format!(
+                "Concurrent insert_row {} threads × {} inserts",
+                n_threads, insert_per_thread
+            ),
+            total,
+            elapsed,
         );
         elapsed
     };
 
     let read_throughput = (n_threads * reads_per_thread) as f64 / (read_ms as f64 / 1000.0);
     let insert_throughput = (n_threads * insert_per_thread) as f64 / (insert_ms as f64 / 1000.0);
-    println!("  -> get_row: {:.0} ops/s, insert_row: {:.0} ops/s", read_throughput, insert_throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    println!(
+        "  -> get_row: {:.0} ops/s, insert_row: {:.0} ops/s",
+        read_throughput, insert_throughput
+    );
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -379,11 +499,17 @@ fn bench_concurrent_prepared() {
 
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
-    exec(&db, "CREATE TABLE cp (id INT PRIMARY KEY, name TEXT, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE cp (id INT PRIMARY KEY, name TEXT, val INT)",
+    );
 
     let seed: usize = if is_ci() { 1_000 } else { 5_000 };
     for i in 1..=seed as i64 {
-        exec(&db, &format!("INSERT INTO cp VALUES ({}, 'name_{}', {})", i, i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO cp VALUES ({}, 'name_{}', {})", i, i, i * 10),
+        );
     }
 
     print_separator();
@@ -403,16 +529,20 @@ fn bench_concurrent_prepared() {
                     let id = (i % seed) as i64 + 1;
                     if i % 10 < 7 {
                         // Read
-                        let _ = db_clone.execute_prepared(
-                            "SELECT * FROM cp WHERE id = ?",
-                            vec![Value::Integer(id)],
-                        ).expect("prepared select");
+                        let _ = db_clone
+                            .execute_prepared(
+                                "SELECT * FROM cp WHERE id = ?",
+                                vec![Value::Integer(id)],
+                            )
+                            .expect("prepared select");
                     } else {
                         // Update
-                        let _ = db_clone.execute_prepared(
-                            "UPDATE cp SET val = val + 1 WHERE id = ?",
-                            vec![Value::Integer(id)],
-                        ).expect("prepared update");
+                        let _ = db_clone
+                            .execute_prepared(
+                                "UPDATE cp SET val = val + 1 WHERE id = ?",
+                                vec![Value::Integer(id)],
+                            )
+                            .expect("prepared update");
                     }
                     ops += 1;
                 }
@@ -423,16 +553,25 @@ fn bench_concurrent_prepared() {
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
-            &format!("Concurrent prepared {} threads × {} ops", n_threads, ops_per_thread),
-            total, elapsed,
+            &format!(
+                "Concurrent prepared {} threads × {} ops",
+                n_threads, ops_per_thread
+            ),
+            total,
+            elapsed,
         );
         elapsed
     };
 
     let total = n_threads * ops_per_thread;
     let throughput = total as f64 / (ms as f64 / 1000.0);
-    println!("  -> Concurrent prepared throughput: {:.0} ops/s", throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    println!(
+        "  -> Concurrent prepared throughput: {:.0} ops/s",
+        throughput
+    );
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -468,7 +607,11 @@ fn bench_concurrent_delete() {
                 let mut ops = 0;
                 for id in start_id..=end_id {
                     let sql = format!("DELETE FROM cd WHERE id = {}", id);
-                    db_clone.execute(&sql).expect("delete").materialize().expect("mat");
+                    db_clone
+                        .execute(&sql)
+                        .expect("delete")
+                        .materialize()
+                        .expect("mat");
                     ops += 1;
                 }
                 ops
@@ -478,8 +621,12 @@ fn bench_concurrent_delete() {
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
-            &format!("Concurrent DELETE {} threads × {} rows", n_threads, deletes_per_thread),
-            total, elapsed,
+            &format!(
+                "Concurrent DELETE {} threads × {} rows",
+                n_threads, deletes_per_thread
+            ),
+            total,
+            elapsed,
         );
         elapsed
     };
@@ -495,7 +642,9 @@ fn bench_concurrent_delete() {
             println!("  -> Rows remaining after deletes: {}", count);
         }
     }
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -527,7 +676,11 @@ fn bench_concurrent_write_read_consistency() {
                 for i in 0..rows_per_writer {
                     let id = (base + i + 1) as i64;
                     let sql = format!("INSERT INTO wrc VALUES ({}, {})", id, id * 10);
-                    db_clone.execute(&sql).expect("insert").materialize().expect("mat");
+                    db_clone
+                        .execute(&sql)
+                        .expect("insert")
+                        .materialize()
+                        .expect("mat");
                     ops += 1;
                 }
                 ops
@@ -553,7 +706,8 @@ fn bench_concurrent_write_read_consistency() {
         let total_ops: usize = results.iter().sum();
         print_result(
             &format!("Write+Read concurrent ({}W + {}R)", n_writers, n_readers),
-            total_ops, elapsed,
+            total_ops,
+            elapsed,
         );
         elapsed
     };
@@ -561,5 +715,7 @@ fn bench_concurrent_write_read_consistency() {
     let total = (n_writers + n_readers) * rows_per_writer;
     let throughput = total as f64 / (ms as f64 / 1000.0);
     println!("  -> Combined throughput: {:.0} ops/s", throughput);
-    if let Ok(db) = Arc::try_unwrap(db) { db.close().ok(); }
+    if let Ok(db) = Arc::try_unwrap(db) {
+        db.close().ok();
+    }
 }

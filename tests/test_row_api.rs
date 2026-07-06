@@ -2,13 +2,14 @@
 //! get_row_map, insert_row_map, batch_insert, batch_insert_map,
 //! insert_row_with_txn, get_table_schema
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn setup() -> (Database, TempDir) {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, score FLOAT)")
+        .unwrap();
     (db, dir)
 }
 
@@ -17,7 +18,11 @@ fn setup() -> (Database, TempDir) {
 #[test]
 fn test_insert_and_get_row() {
     let (db, _dir) = setup();
-    let row = vec![Value::Integer(1), Value::text("Alice".to_string()), Value::Float(95.5)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("Alice".to_string()),
+        Value::Float(95.5),
+    ];
     let row_id = db.insert_row("users", row).unwrap();
     // RowId may be 0-based or 1-based depending on implementation
 
@@ -31,15 +36,25 @@ fn test_insert_and_get_row() {
 fn test_get_row_nonexistent() {
     let (db, _dir) = setup();
     let result = db.get_row("users", 99999).unwrap();
-    assert!(result.is_none(), "get_row for nonexistent should return None");
+    assert!(
+        result.is_none(),
+        "get_row for nonexistent should return None"
+    );
 }
 
 #[test]
 fn test_insert_row_wrong_table() {
     let (db, _dir) = setup();
-    let row = vec![Value::Integer(1), Value::text("test".to_string()), Value::Float(1.0)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("test".to_string()),
+        Value::Float(1.0),
+    ];
     let result = db.insert_row("nonexistent", row);
-    assert!(result.is_err(), "insert_row to nonexistent table should error");
+    assert!(
+        result.is_err(),
+        "insert_row to nonexistent table should error"
+    );
 }
 
 // === update_row ===
@@ -47,14 +62,24 @@ fn test_insert_row_wrong_table() {
 #[test]
 fn test_update_row() {
     let (db, _dir) = setup();
-    let row = vec![Value::Integer(1), Value::text("Alice".to_string()), Value::Float(90.0)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("Alice".to_string()),
+        Value::Float(90.0),
+    ];
     let row_id = db.insert_row("users", row).unwrap();
 
-    let new_row = vec![Value::Integer(1), Value::text("Bob".to_string()), Value::Float(95.0)];
+    let new_row = vec![
+        Value::Integer(1),
+        Value::text("Bob".to_string()),
+        Value::Float(95.0),
+    ];
     db.update_row("users", row_id, new_row).unwrap();
 
     // Verify via SQL
-    let result = db.execute("SELECT name, score FROM users WHERE id = 1").unwrap();
+    let result = db
+        .execute("SELECT name, score FROM users WHERE id = 1")
+        .unwrap();
     let r = match result.materialize().unwrap() {
         motedb::QueryResult::Select { rows, .. } => rows,
         _ => panic!("Expected Select"),
@@ -66,7 +91,11 @@ fn test_update_row() {
 #[test]
 fn test_update_row_nonexistent() {
     let (db, _dir) = setup();
-    let new_row = vec![Value::Integer(99), Value::text("Ghost".to_string()), Value::Float(0.0)];
+    let new_row = vec![
+        Value::Integer(99),
+        Value::text("Ghost".to_string()),
+        Value::Float(0.0),
+    ];
     let result = db.update_row("users", 99999, new_row);
     assert!(result.is_err(), "update_row nonexistent should error");
 }
@@ -76,7 +105,11 @@ fn test_update_row_nonexistent() {
 #[test]
 fn test_delete_row() {
     let (db, _dir) = setup();
-    let row = vec![Value::Integer(1), Value::text("Alice".to_string()), Value::Float(90.0)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("Alice".to_string()),
+        Value::Float(90.0),
+    ];
     let row_id = db.insert_row("users", row).unwrap();
 
     db.delete_row("users", row_id).unwrap();
@@ -127,7 +160,10 @@ fn test_insert_row_map_partial() {
         motedb::QueryResult::Select { rows, .. } => rows,
         _ => panic!("Expected Select"),
     };
-    assert!(matches!(&r[0][0], Value::Null), "Omitted column should be NULL");
+    assert!(
+        matches!(&r[0][0], Value::Null),
+        "Omitted column should be NULL"
+    );
 }
 
 // === batch_insert ===
@@ -180,7 +216,11 @@ fn test_insert_row_with_txn_commit() {
     let (db, _dir) = setup();
     let tx = db.begin_transaction().unwrap();
 
-    let row = vec![Value::Integer(1), Value::text("txn_user".to_string()), Value::Float(77.7)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("txn_user".to_string()),
+        Value::Float(77.7),
+    ];
     let _row_id = db.insert_row_with_txn("users", tx, row).unwrap();
 
     db.commit_transaction(tx).unwrap();
@@ -200,7 +240,11 @@ fn test_insert_row_with_txn_rollback() {
     let (db, _dir) = setup();
     let tx = db.begin_transaction().unwrap();
 
-    let row = vec![Value::Integer(1), Value::text("rollback_user".to_string()), Value::Float(0.0)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("rollback_user".to_string()),
+        Value::Float(0.0),
+    ];
     db.insert_row_with_txn("users", tx, row).unwrap();
 
     db.rollback_transaction(tx).unwrap();
@@ -230,7 +274,11 @@ fn test_full_crud_cycle() {
     let (db, _dir) = setup();
 
     // Create
-    let row = vec![Value::Integer(1), Value::text("original".to_string()), Value::Float(50.0)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("original".to_string()),
+        Value::Float(50.0),
+    ];
     let row_id = db.insert_row("users", row).unwrap();
 
     // Read
@@ -238,7 +286,11 @@ fn test_full_crud_cycle() {
     assert_eq!(got.len(), 3);
 
     // Update
-    let updated = vec![Value::Integer(1), Value::text("updated".to_string()), Value::Float(99.0)];
+    let updated = vec![
+        Value::Integer(1),
+        Value::text("updated".to_string()),
+        Value::Float(99.0),
+    ];
     db.update_row("users", row_id, updated).unwrap();
 
     // Verify update via get_row_map
@@ -263,7 +315,8 @@ fn test_concurrent_row_inserts() {
 
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let mut handles = vec![];
     for t in 0..4 {

@@ -35,7 +35,7 @@ impl Timestamp {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        
+
         Self {
             micros: duration.as_micros() as i64,
         }
@@ -62,7 +62,7 @@ impl Timestamp {
     pub fn as_secs(&self) -> i64 {
         self.micros / 1_000_000
     }
-    
+
     /// Get raw value (microseconds) - used for generic access
     pub fn value(&self) -> i64 {
         self.micros
@@ -96,7 +96,7 @@ mod tests {
     fn test_timestamp_ordering() {
         let ts1 = Timestamp::from_secs(100);
         let ts2 = Timestamp::from_secs(200);
-        
+
         assert!(ts1 < ts2);
         assert!(ts2 > ts1);
     }
@@ -107,7 +107,7 @@ mod tests {
         let end = Timestamp::from_secs(200);
         let middle = Timestamp::from_secs(150);
         let before = Timestamp::from_secs(50);
-        
+
         assert!(middle.in_range(start, end));
         assert!(!before.in_range(start, end));
     }

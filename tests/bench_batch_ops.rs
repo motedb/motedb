@@ -3,10 +3,10 @@
 //!
 //! Run: cargo test --test bench_batch_ops --release -- --nocapture --test-threads=1
 
-use motedb::{Database, DBConfig, types::Value};
 use motedb::types::Tensor;
-use tempfile::TempDir;
+use motedb::{types::Value, DBConfig, Database};
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn is_ci() -> bool {
     std::env::var("CI").is_ok()
@@ -17,12 +17,23 @@ fn edge_config() -> DBConfig {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 fn print_result(name: &str, ops: usize, elapsed_ms: u64) {
-    let per_op_us = if ops > 0 { (elapsed_ms as f64 * 1000.0) / ops as f64 } else { 0.0 };
-    let throughput = if elapsed_ms > 0 { ops as f64 / (elapsed_ms as f64 / 1000.0) } else { f64::INFINITY };
+    let per_op_us = if ops > 0 {
+        (elapsed_ms as f64 * 1000.0) / ops as f64
+    } else {
+        0.0
+    };
+    let throughput = if elapsed_ms > 0 {
+        ops as f64 / (elapsed_ms as f64 / 1000.0)
+    } else {
+        f64::INFINITY
+    };
     println!(
         "  {:<60} | {:>7} ops | {:>8.1} ms | {:>8.1} µs/op | {:>10.0} ops/s",
         name, ops, elapsed_ms as f64, per_op_us, throughput
@@ -41,7 +52,10 @@ fn print_separator() {
 fn bench_batch_insert_sizes() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-    exec(&db, "CREATE TABLE batch_sizes (id INT PRIMARY KEY, name TEXT, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE batch_sizes (id INT PRIMARY KEY, name TEXT, val INT)",
+    );
 
     print_separator();
 
@@ -81,9 +95,13 @@ fn bench_batch_insert_sizes() {
         let per_row = total_ms as f64 * 1000.0 / total_rows as f64;
         print_result(
             &format!("batch_insert({}) × {} batches", batch_size, num_batches),
-            total_rows, total_ms,
+            total_rows,
+            total_ms,
         );
-        println!("    -> Per batch: {:.1}ms, Per row: {:.1}µs", per_batch, per_row);
+        println!(
+            "    -> Per batch: {:.1}ms, Per row: {:.1}µs",
+            per_batch, per_row
+        );
     }
 
     db.close().ok();
@@ -105,7 +123,10 @@ fn bench_batch_insert_vs_map() {
     // batch_insert (Vec<Value>)
     let vec_ms = {
         let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-        exec(&db, "CREATE TABLE vec_table (id INT PRIMARY KEY, name TEXT, score FLOAT)");
+        exec(
+            &db,
+            "CREATE TABLE vec_table (id INT PRIMARY KEY, name TEXT, score FLOAT)",
+        );
 
         let start = Instant::now();
         let mut total_rows = 0;
@@ -125,7 +146,8 @@ fn bench_batch_insert_vs_map() {
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
             &format!("batch_insert (Vec) {} rows", total_rows),
-            total_rows, elapsed,
+            total_rows,
+            elapsed,
         );
         db.close().ok();
         elapsed
@@ -135,7 +157,10 @@ fn bench_batch_insert_vs_map() {
     let map_ms = {
         let dir2 = TempDir::new().expect("temp dir");
         let db = Database::create_with_config(dir2.path(), edge_config()).expect("create db");
-        exec(&db, "CREATE TABLE map_table (id INT PRIMARY KEY, name TEXT, score FLOAT)");
+        exec(
+            &db,
+            "CREATE TABLE map_table (id INT PRIMARY KEY, name TEXT, score FLOAT)",
+        );
 
         let start = Instant::now();
         let mut total_rows = 0;
@@ -149,13 +174,16 @@ fn bench_batch_insert_vs_map() {
                 map.insert("score".to_string(), Value::Float(id as f64 * 1.5));
                 batch.push(map);
             }
-            let ids = db.batch_insert_map("map_table", batch).expect("batch insert map");
+            let ids = db
+                .batch_insert_map("map_table", batch)
+                .expect("batch insert map");
             total_rows += ids.len();
         }
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(
             &format!("batch_insert_map (HashMap) {} rows", total_rows),
-            total_rows, elapsed,
+            total_rows,
+            elapsed,
         );
         db.close().ok();
         elapsed
@@ -163,8 +191,16 @@ fn bench_batch_insert_vs_map() {
 
     let vec_per = vec_ms as f64 * 1000.0 / (batch_size * num_batches) as f64;
     let map_per = map_ms as f64 * 1000.0 / (batch_size * num_batches) as f64;
-    println!("  -> Vec: {:.1}µs/row, HashMap: {:.1}µs/row, Ratio: {:.2}x",
-        vec_per, map_per, if vec_per > 0.0 { map_per / vec_per } else { 0.0 });
+    println!(
+        "  -> Vec: {:.1}µs/row, HashMap: {:.1}µs/row, Ratio: {:.2}x",
+        vec_per,
+        map_per,
+        if vec_per > 0.0 {
+            map_per / vec_per
+        } else {
+            0.0
+        }
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -175,7 +211,10 @@ fn bench_batch_insert_vs_map() {
 fn bench_batch_insert_vectors() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-    exec(&db, "CREATE TABLE vec_batch (id INT PRIMARY KEY, embedding VECTOR(16), metadata TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE vec_batch (id INT PRIMARY KEY, embedding VECTOR(16), metadata TEXT)",
+    );
 
     print_separator();
 
@@ -197,15 +236,24 @@ fn bench_batch_insert_vectors() {
                     Value::text(format!("meta_{}", id)),
                 ]);
             }
-            let ids = db.batch_insert("vec_batch", batch).expect("batch insert vectors");
+            let ids = db
+                .batch_insert("vec_batch", batch)
+                .expect("batch insert vectors");
             total += ids.len();
         }
         (start.elapsed().as_millis() as u64, total)
     };
 
-    print_result(&format!("batch_insert vectors ({}-dim) {} rows", dim, total_rows), total_rows, total_ms);
+    print_result(
+        &format!("batch_insert vectors ({}-dim) {} rows", dim, total_rows),
+        total_rows,
+        total_ms,
+    );
     let per_row = total_ms as f64 * 1000.0 / total_rows as f64;
-    println!("  -> Per row: {:.1}µs (including {}-dim tensor)", per_row, dim);
+    println!(
+        "  -> Per row: {:.1}µs (including {}-dim tensor)",
+        per_row, dim
+    );
 
     db.close().ok();
 }
@@ -225,11 +273,22 @@ fn bench_row_api_vs_sql_insert() {
     // SQL INSERT
     let sql_ms = {
         let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-        exec(&db, "CREATE TABLE sql_ins (id INT PRIMARY KEY, name TEXT, val INT)");
+        exec(
+            &db,
+            "CREATE TABLE sql_ins (id INT PRIMARY KEY, name TEXT, val INT)",
+        );
 
         let start = Instant::now();
         for i in 1..=n as i64 {
-            exec(&db, &format!("INSERT INTO sql_ins VALUES ({}, 'name_{}', {})", i, i, i * 10));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO sql_ins VALUES ({}, 'name_{}', {})",
+                    i,
+                    i,
+                    i * 10
+                ),
+            );
         }
         let elapsed = start.elapsed().as_millis() as u64;
         print_result(&format!("SQL INSERT {} rows", n), n, elapsed);
@@ -241,7 +300,10 @@ fn bench_row_api_vs_sql_insert() {
     let row_api_ms = {
         let dir2 = TempDir::new().expect("temp dir");
         let db = Database::create_with_config(dir2.path(), edge_config()).expect("create db");
-        exec(&db, "CREATE TABLE row_ins (id INT PRIMARY KEY, name TEXT, val INT)");
+        exec(
+            &db,
+            "CREATE TABLE row_ins (id INT PRIMARY KEY, name TEXT, val INT)",
+        );
 
         let start = Instant::now();
         for i in 1..=n as i64 {
@@ -262,7 +324,10 @@ fn bench_row_api_vs_sql_insert() {
     let batch_ms = {
         let dir3 = TempDir::new().expect("temp dir");
         let db = Database::create_with_config(dir3.path(), edge_config()).expect("create db");
-        exec(&db, "CREATE TABLE batch_ins (id INT PRIMARY KEY, name TEXT, val INT)");
+        exec(
+            &db,
+            "CREATE TABLE batch_ins (id INT PRIMARY KEY, name TEXT, val INT)",
+        );
 
         let chunk_size = 100;
         let start = Instant::now();
@@ -286,11 +351,23 @@ fn bench_row_api_vs_sql_insert() {
     let sql_per = sql_ms as f64 * 1000.0 / n as f64;
     let row_per = row_api_ms as f64 * 1000.0 / n as f64;
     let batch_per = batch_ms as f64 * 1000.0 / n as f64;
-    println!("  -> SQL: {:.1}µs/row, Row API: {:.1}µs/row, Batch: {:.1}µs/row",
-        sql_per, row_per, batch_per);
-    println!("  -> Row API vs SQL: {:.2}x, Batch vs SQL: {:.2}x",
-        if sql_per > 0.0 { sql_per / row_per } else { 0.0 },
-        if sql_per > 0.0 { sql_per / batch_per } else { 0.0 });
+    println!(
+        "  -> SQL: {:.1}µs/row, Row API: {:.1}µs/row, Batch: {:.1}µs/row",
+        sql_per, row_per, batch_per
+    );
+    println!(
+        "  -> Row API vs SQL: {:.2}x, Batch vs SQL: {:.2}x",
+        if sql_per > 0.0 {
+            sql_per / row_per
+        } else {
+            0.0
+        },
+        if sql_per > 0.0 {
+            sql_per / batch_per
+        } else {
+            0.0
+        }
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -301,7 +378,10 @@ fn bench_row_api_vs_sql_insert() {
 fn batch_read_sequential() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-    exec(&db, "CREATE TABLE seq_read (id INT PRIMARY KEY, name TEXT, score FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE seq_read (id INT PRIMARY KEY, name TEXT, score FLOAT)",
+    );
 
     let n: usize = if is_ci() { 2_000 } else { 10_000 };
 
@@ -328,7 +408,9 @@ fn batch_read_sequential() {
     let get_ms = {
         let start = Instant::now();
         for i in 0..q {
-            let _ = db.get_row("seq_read", row_ids[i % row_ids.len()]).expect("get_row");
+            let _ = db
+                .get_row("seq_read", row_ids[i % row_ids.len()])
+                .expect("get_row");
         }
         start.elapsed().as_millis() as u64
     };
@@ -350,7 +432,9 @@ fn batch_read_sequential() {
     let map_ms = {
         let start = Instant::now();
         for i in 0..q {
-            let _ = db.get_row_map("seq_read", row_ids[i % row_ids.len()]).expect("get_row_map");
+            let _ = db
+                .get_row_map("seq_read", row_ids[i % row_ids.len()])
+                .expect("get_row_map");
         }
         start.elapsed().as_millis() as u64
     };
@@ -358,7 +442,10 @@ fn batch_read_sequential() {
 
     let get_per = get_ms as f64 * 1000.0 / q as f64;
     let map_per = map_ms as f64 * 1000.0 / q as f64;
-    println!("  -> get_row: {:.1}µs/op, get_row_map: {:.1}µs/op", get_per, map_per);
+    println!(
+        "  -> get_row: {:.1}µs/op, get_row_map: {:.1}µs/op",
+        get_per, map_per
+    );
     db.close().ok();
 }
 
@@ -370,14 +457,21 @@ fn batch_read_sequential() {
 fn bench_batch_update_delete() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-    exec(&db, "CREATE TABLE bud (id INT PRIMARY KEY, name TEXT, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE bud (id INT PRIMARY KEY, name TEXT, val INT)",
+    );
 
     let n: usize = if is_ci() { 1_000 } else { 5_000 };
 
     // Seed
     let mut row_ids = Vec::with_capacity(n);
     for i in 1..=n as i64 {
-        let row = vec![Value::Integer(i), Value::text(format!("v_{}", i)), Value::Integer(i * 10)];
+        let row = vec![
+            Value::Integer(i),
+            Value::text(format!("v_{}", i)),
+            Value::Integer(i * 10),
+        ];
         let rid = db.insert_row("bud", row).expect("insert_row");
         row_ids.push(rid);
     }
@@ -395,7 +489,8 @@ fn bench_batch_update_delete() {
                 Value::text(format!("updated_{}", id)),
                 Value::Integer(id * 20),
             ];
-            db.update_row("bud", row_ids[i], new_row).expect("update_row");
+            db.update_row("bud", row_ids[i], new_row)
+                .expect("update_row");
         }
         start.elapsed().as_millis() as u64
     };
@@ -406,7 +501,8 @@ fn bench_batch_update_delete() {
     let del_ms = {
         let start = Instant::now();
         for i in 0..del_count {
-            db.delete_row("bud", row_ids[upd_count + i]).expect("delete_row");
+            db.delete_row("bud", row_ids[upd_count + i])
+                .expect("delete_row");
         }
         start.elapsed().as_millis() as u64
     };
@@ -422,7 +518,10 @@ fn bench_batch_update_delete() {
 
     let upd_per = upd_ms as f64 * 1000.0 / upd_count as f64;
     let del_per = del_ms as f64 * 1000.0 / del_count as f64;
-    println!("  -> update_row: {:.1}µs/op, delete_row: {:.1}µs/op", upd_per, del_per);
+    println!(
+        "  -> update_row: {:.1}µs/op, delete_row: {:.1}µs/op",
+        upd_per, del_per
+    );
     db.close().ok();
 }
 
@@ -434,7 +533,10 @@ fn bench_batch_update_delete() {
 fn bench_large_text() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
-    exec(&db, "CREATE TABLE big_text (id INT PRIMARY KEY, content TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE big_text (id INT PRIMARY KEY, content TEXT)",
+    );
 
     print_separator();
 
@@ -457,7 +559,11 @@ fn bench_large_text() {
             }
             start.elapsed().as_millis() as u64
         };
-        print_result(&format!("Insert {} rows with {}-byte text", n, text_size), n, insert_ms);
+        print_result(
+            &format!("Insert {} rows with {}-byte text", n, text_size),
+            n,
+            insert_ms,
+        );
 
         // Read back
         let read_ms = {
@@ -467,13 +573,19 @@ fn bench_large_text() {
             }
             start.elapsed().as_millis() as u64
         };
-        print_result(&format!("Read {} rows with {}-byte text", n, text_size), n, read_ms);
+        print_result(
+            &format!("Read {} rows with {}-byte text", n, text_size),
+            n,
+            read_ms,
+        );
 
         let _ = db.execute("DELETE FROM big_text");
         let ins_per = insert_ms as f64 * 1000.0 / n as f64;
         let read_per = read_ms as f64 * 1000.0 / n as f64;
-        println!("    -> Insert: {:.1}µs/row, Read: {:.1}µs/row at {} bytes",
-            ins_per, read_per, text_size);
+        println!(
+            "    -> Insert: {:.1}µs/row, Read: {:.1}µs/row at {} bytes",
+            ins_per, read_per, text_size
+        );
     }
 
     db.close().ok();
@@ -503,7 +615,10 @@ fn bench_wide_table() {
         for c in 0..n_cols {
             col_defs.push(format!("c{} INT", c));
         }
-        exec(&db, &format!("CREATE TABLE {} ({})", table_name, col_defs.join(", ")));
+        exec(
+            &db,
+            &format!("CREATE TABLE {} ({})", table_name, col_defs.join(", ")),
+        );
 
         let n_rows: usize = if is_ci() { 500 } else { 2000 };
 
@@ -519,7 +634,11 @@ fn bench_wide_table() {
             }
             start.elapsed().as_millis() as u64
         };
-        print_result(&format!("Insert {} rows × {} cols", n_rows, n_cols + 1), n_rows, insert_ms);
+        print_result(
+            &format!("Insert {} rows × {} cols", n_rows, n_cols + 1),
+            n_rows,
+            insert_ms,
+        );
 
         // SELECT all columns
         let select_ms = {
@@ -529,12 +648,20 @@ fn bench_wide_table() {
             }
             start.elapsed().as_millis() as u64
         };
-        print_result(&format!("SELECT * ({} cols) × 50", n_cols + 1), 50, select_ms);
+        print_result(
+            &format!("SELECT * ({} cols) × 50", n_cols + 1),
+            50,
+            select_ms,
+        );
 
         let ins_per = insert_ms as f64 * 1000.0 / n_rows as f64;
         let sel_per = select_ms as f64 * 1000.0 / 50.0;
-        println!("    -> Insert: {:.1}µs/row, Select: {:.1}µs/query at {} cols",
-            ins_per, sel_per, n_cols + 1);
+        println!(
+            "    -> Insert: {:.1}µs/row, Select: {:.1}µs/query at {} cols",
+            ins_per,
+            sel_per,
+            n_cols + 1
+        );
 
         let _ = db.execute(&format!("DROP TABLE {}", table_name));
     }

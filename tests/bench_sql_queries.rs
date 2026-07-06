@@ -3,9 +3,9 @@
 //!
 //! Run: cargo test --test bench_sql_queries --release -- --nocapture --test-threads=1
 
-use motedb::{Database, DBConfig};
-use tempfile::TempDir;
+use motedb::{DBConfig, Database};
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn is_ci() -> bool {
     std::env::var("CI").is_ok()
@@ -22,12 +22,23 @@ fn create_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 fn print_result(name: &str, ops: usize, elapsed_ms: u64) {
-    let per_op_us = if ops > 0 { (elapsed_ms as f64 * 1000.0) / ops as f64 } else { 0.0 };
-    let throughput = if elapsed_ms > 0 { ops as f64 / (elapsed_ms as f64 / 1000.0) } else { f64::INFINITY };
+    let per_op_us = if ops > 0 {
+        (elapsed_ms as f64 * 1000.0) / ops as f64
+    } else {
+        0.0
+    };
+    let throughput = if elapsed_ms > 0 {
+        ops as f64 / (elapsed_ms as f64 / 1000.0)
+    } else {
+        f64::INFINITY
+    };
     println!(
         "  {:<60} | {:>7} ops | {:>8.1} ms | {:>8.1} µs/op | {:>10.0} ops/s",
         name, ops, elapsed_ms as f64, per_op_us, throughput
@@ -43,7 +54,13 @@ fn seed_sales(db: &Database, n: usize) {
     exec(db, "CREATE TABLE sales (id INT PRIMARY KEY, customer TEXT, product TEXT, amount FLOAT, qty INT, region TEXT, ts INT)");
 
     let customers = ["Alice", "Bob", "Charlie", "Diana", "Eve"];
-    let products = ["Widget", "Gadget", "Doohickey", "Thingamajig", "Whatchamacallit"];
+    let products = [
+        "Widget",
+        "Gadget",
+        "Doohickey",
+        "Thingamajig",
+        "Whatchamacallit",
+    ];
     let regions = ["US", "EU", "APAC", "LATAM"];
 
     for i in 1..=n as i64 {
@@ -53,10 +70,13 @@ fn seed_sales(db: &Database, n: usize) {
         let amount = 10.0 + (i as f64 % 990.0);
         let qty = 1 + (i % 100);
         let ts = 1700000000 + i * 3600;
-        exec(db, &format!(
-            "INSERT INTO sales VALUES ({}, '{}', '{}', {:.1}, {}, '{}', {})",
-            i, c, p, amount, qty, r, ts
-        ));
+        exec(
+            db,
+            &format!(
+                "INSERT INTO sales VALUES ({}, '{}', '{}', {:.1}, {}, '{}', {})",
+                i, c, p, amount, qty, r, ts
+            ),
+        );
     }
 }
 
@@ -78,7 +98,10 @@ fn bench_group_by_aggregates() {
     let gb1_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT customer, COUNT(*) FROM sales GROUP BY customer");
+            exec(
+                &db,
+                "SELECT customer, COUNT(*) FROM sales GROUP BY customer",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -98,7 +121,10 @@ fn bench_group_by_aggregates() {
     let gb3_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT customer, product, SUM(amount) FROM sales GROUP BY customer, product");
+            exec(
+                &db,
+                "SELECT customer, product, SUM(amount) FROM sales GROUP BY customer, product",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -106,7 +132,10 @@ fn bench_group_by_aggregates() {
 
     let gb1_per = gb1_ms as f64 * 1000.0 / q as f64;
     let gb3_per = gb3_ms as f64 * 1000.0 / q as f64;
-    println!("  -> Single-col: {:.1}µs, Multi-col: {:.1}µs", gb1_per, gb3_per);
+    println!(
+        "  -> Single-col: {:.1}µs, Multi-col: {:.1}µs",
+        gb1_per, gb3_per
+    );
     db.close().ok();
 }
 
@@ -128,7 +157,10 @@ fn bench_having() {
     let h1_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT customer, COUNT(*) FROM sales GROUP BY customer HAVING COUNT(*) > 100");
+            exec(
+                &db,
+                "SELECT customer, COUNT(*) FROM sales GROUP BY customer HAVING COUNT(*) > 100",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -156,7 +188,10 @@ fn bench_having() {
 
     let h1_per = h1_ms as f64 * 1000.0 / q as f64;
     let h3_per = h3_ms as f64 * 1000.0 / q as f64;
-    println!("  -> HAVING only: {:.1}µs, WHERE+HAVING: {:.1}µs", h1_per, h3_per);
+    println!(
+        "  -> HAVING only: {:.1}µs, WHERE+HAVING: {:.1}µs",
+        h1_per, h3_per
+    );
     db.close().ok();
 }
 
@@ -198,7 +233,10 @@ fn bench_order_by_limit() {
     let lim_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT id, amount FROM sales ORDER BY amount DESC LIMIT 10");
+            exec(
+                &db,
+                "SELECT id, amount FROM sales ORDER BY amount DESC LIMIT 10",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -209,7 +247,13 @@ fn bench_order_by_limit() {
         let start = Instant::now();
         for p in 0..q {
             let offset = p * 10;
-            exec(&db, &format!("SELECT id, amount FROM sales ORDER BY id LIMIT 10 OFFSET {}", offset));
+            exec(
+                &db,
+                &format!(
+                    "SELECT id, amount FROM sales ORDER BY id LIMIT 10 OFFSET {}",
+                    offset
+                ),
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -217,7 +261,10 @@ fn bench_order_by_limit() {
 
     let ob_per = ob1_ms as f64 * 1000.0 / q as f64;
     let lim_per = lim_ms as f64 * 1000.0 / q as f64;
-    println!("  -> Full sort: {:.1}µs, Sort+LIMIT: {:.1}µs", ob_per, lim_per);
+    println!(
+        "  -> Full sort: {:.1}µs, Sort+LIMIT: {:.1}µs",
+        ob_per, lim_per
+    );
     db.close().ok();
 }
 
@@ -319,7 +366,10 @@ fn bench_where_patterns() {
     let in_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT id FROM sales WHERE customer IN ('Alice', 'Bob', 'Charlie')");
+            exec(
+                &db,
+                "SELECT id FROM sales WHERE customer IN ('Alice', 'Bob', 'Charlie')",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -338,7 +388,10 @@ fn bench_where_patterns() {
     let like_per = like_ms as f64 * 1000.0 / q as f64;
     let between_per = between_ms as f64 * 1000.0 / q as f64;
     let in_per = in_ms as f64 * 1000.0 / q as f64;
-    println!("  -> LIKE: {:.1}µs, BETWEEN: {:.1}µs, IN: {:.1}µs", like_per, between_per, in_per);
+    println!(
+        "  -> LIKE: {:.1}µs, BETWEEN: {:.1}µs, IN: {:.1}µs",
+        like_per, between_per, in_per
+    );
     db.close().ok();
 }
 
@@ -390,7 +443,10 @@ fn bench_arithmetic_expressions() {
     let func_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT id, ROUND(amount), ABS(qty - 50), LOWER(customer) FROM sales");
+            exec(
+                &db,
+                "SELECT id, ROUND(amount), ABS(qty - 50), LOWER(customer) FROM sales",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -398,7 +454,10 @@ fn bench_arithmetic_expressions() {
 
     let expr1_per = expr1_ms as f64 * 1000.0 / q as f64;
     let func_per = func_ms as f64 * 1000.0 / q as f64;
-    println!("  -> Expr: {:.1}µs, Func+Expr: {:.1}µs", expr1_per, func_per);
+    println!(
+        "  -> Expr: {:.1}µs, Func+Expr: {:.1}µs",
+        expr1_per, func_per
+    );
     db.close().ok();
 }
 
@@ -420,7 +479,10 @@ fn bench_subquery() {
     let sub1_ms = {
         let start = Instant::now();
         for _ in 0..q {
-            exec(&db, "SELECT id FROM sales WHERE amount > (SELECT AVG(amount) FROM sales)");
+            exec(
+                &db,
+                "SELECT id FROM sales WHERE amount > (SELECT AVG(amount) FROM sales)",
+            );
         }
         start.elapsed().as_millis() as u64
     };
@@ -451,16 +513,30 @@ fn bench_subquery() {
 #[test]
 fn bench_null_handling() {
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE nullable (id INT PRIMARY KEY, val INT, name TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE nullable (id INT PRIMARY KEY, val INT, name TEXT)",
+    );
 
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
 
     // 50% NULLs
     for i in 1..=n as i64 {
         if i % 2 == 0 {
-            exec(&db, &format!("INSERT INTO nullable VALUES ({}, NULL, NULL)", i));
+            exec(
+                &db,
+                &format!("INSERT INTO nullable VALUES ({}, NULL, NULL)", i),
+            );
         } else {
-            exec(&db, &format!("INSERT INTO nullable VALUES ({}, {}, 'name_{}')", i, i * 10, i));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO nullable VALUES ({}, {}, 'name_{}')",
+                    i,
+                    i * 10,
+                    i
+                ),
+            );
         }
     }
 
@@ -500,7 +576,10 @@ fn bench_null_handling() {
 
     let is_null_per = is_null_ms as f64 * 1000.0 / q as f64;
     let coal_per = coal_ms as f64 * 1000.0 / q as f64;
-    println!("  -> IS NULL: {:.1}µs, COALESCE: {:.1}µs", is_null_per, coal_per);
+    println!(
+        "  -> IS NULL: {:.1}µs, COALESCE: {:.1}µs",
+        is_null_per, coal_per
+    );
     db.close().ok();
 }
 
@@ -513,7 +592,10 @@ fn bench_prepared_statements() {
     use motedb::types::Value;
 
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE prep (id INT PRIMARY KEY, name TEXT, score FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE prep (id INT PRIMARY KEY, name TEXT, score FLOAT)",
+    );
 
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
 
@@ -522,8 +604,13 @@ fn bench_prepared_statements() {
     for i in 1..=n as i64 {
         db.execute_prepared(
             insert_sql,
-            vec![Value::Integer(i), Value::text(format!("user_{}", i)), Value::Float(i as f64 * 1.5)],
-        ).expect("prepared insert");
+            vec![
+                Value::Integer(i),
+                Value::text(format!("user_{}", i)),
+                Value::Float(i as f64 * 1.5),
+            ],
+        )
+        .expect("prepared insert");
     }
 
     print_separator();
@@ -535,7 +622,8 @@ fn bench_prepared_statements() {
     let sel_ms = {
         let start = Instant::now();
         for i in 1..=q as i64 {
-            db.execute_prepared(sel_sql, vec![Value::Integer(i)]).expect("prepared select");
+            db.execute_prepared(sel_sql, vec![Value::Integer(i)])
+                .expect("prepared select");
         }
         start.elapsed().as_millis() as u64
     };
@@ -547,11 +635,19 @@ fn bench_prepared_statements() {
     let upd_ms = {
         let start = Instant::now();
         for i in 1..=upd_count as i64 {
-            db.execute_prepared(upd_sql, vec![Value::Float(i as f64 * 2.0), Value::Integer(i)]).expect("prepared update");
+            db.execute_prepared(
+                upd_sql,
+                vec![Value::Float(i as f64 * 2.0), Value::Integer(i)],
+            )
+            .expect("prepared update");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Prepared UPDATE × {}", upd_count), upd_count, upd_ms);
+    print_result(
+        &format!("Prepared UPDATE × {}", upd_count),
+        upd_count,
+        upd_ms,
+    );
 
     // Prepared DELETE + re-insert cycle
     let del_sql = "DELETE FROM prep WHERE id = ?";
@@ -559,19 +655,32 @@ fn bench_prepared_statements() {
     let cycle_ms = {
         let start = Instant::now();
         for i in 1..=cycle_count as i64 {
-            db.execute_prepared(del_sql, vec![Value::Integer(i)]).expect("prepared delete");
+            db.execute_prepared(del_sql, vec![Value::Integer(i)])
+                .expect("prepared delete");
             db.execute_prepared(
                 insert_sql,
-                vec![Value::Integer(i), Value::text(format!("re_{}", i)), Value::Float(i as f64)],
-            ).expect("prepared re-insert");
+                vec![
+                    Value::Integer(i),
+                    Value::text(format!("re_{}", i)),
+                    Value::Float(i as f64),
+                ],
+            )
+            .expect("prepared re-insert");
         }
         start.elapsed().as_millis() as u64
     };
-    print_result(&format!("Prepared DELETE+INSERT cycle × {}", cycle_count), cycle_count * 2, cycle_ms);
+    print_result(
+        &format!("Prepared DELETE+INSERT cycle × {}", cycle_count),
+        cycle_count * 2,
+        cycle_ms,
+    );
 
     let sel_per = sel_ms as f64 * 1000.0 / q as f64;
     let upd_per = upd_ms as f64 * 1000.0 / upd_count as f64;
-    println!("  -> SELECT: {:.1}µs/op, UPDATE: {:.1}µs/op", sel_per, upd_per);
+    println!(
+        "  -> SELECT: {:.1}µs/op, UPDATE: {:.1}µs/op",
+        sel_per, upd_per
+    );
     db.close().ok();
 }
 
@@ -585,13 +694,38 @@ fn bench_multi_table() {
 
     let n: usize = if is_ci() { 3_000 } else { 15_000 };
 
-    exec(&db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, region TEXT)");
-    exec(&db, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, product TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, region TEXT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, product TEXT)",
+    );
 
     for i in 1..=n as i64 {
-        let region = match i % 3 { 0 => "US", 1 => "EU", _ => "APAC" };
-        exec(&db, &format!("INSERT INTO users VALUES ({}, 'user_{}', '{}')", i, i, region));
-        exec(&db, &format!("INSERT INTO orders VALUES ({}, {}, {:.1}, 'prod_{}')", i, i, 10.0 + (i as f64 % 990.0), i % 5));
+        let region = match i % 3 {
+            0 => "US",
+            1 => "EU",
+            _ => "APAC",
+        };
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO users VALUES ({}, 'user_{}', '{}')",
+                i, i, region
+            ),
+        );
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO orders VALUES ({}, {}, {:.1}, 'prod_{}')",
+                i,
+                i,
+                10.0 + (i as f64 % 990.0),
+                i % 5
+            ),
+        );
     }
 
     print_separator();
@@ -624,7 +758,10 @@ fn bench_multi_table() {
         let start = Instant::now();
         for _ in 0..q {
             exec(&db, "SELECT region, COUNT(*) FROM users GROUP BY region");
-            exec(&db, "SELECT product, SUM(amount) FROM orders GROUP BY product");
+            exec(
+                &db,
+                "SELECT product, SUM(amount) FROM orders GROUP BY product",
+            );
         }
         start.elapsed().as_millis() as u64
     };

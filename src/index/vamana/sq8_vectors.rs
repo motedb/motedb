@@ -72,14 +72,20 @@ impl SQ8Vectors {
 
         // Create empty data file with count=0
         let mut file = File::create(&file_path).map_err(StorageError::Io)?;
-        file.write_all(&0u64.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&0u64.to_le_bytes())
+            .map_err(StorageError::Io)?;
 
         // Create empty index file with count=0
         let mut idx_file = File::create(&idx_path).map_err(StorageError::Io)?;
-        idx_file.write_all(&0u64.to_le_bytes()).map_err(StorageError::Io)?;
+        idx_file
+            .write_all(&0u64.to_le_bytes())
+            .map_err(StorageError::Io)?;
 
         let read_file = File::open(&file_path).map_err(StorageError::Io)?;
-        let write_file = OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?;
+        let write_file = OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .map_err(StorageError::Io)?;
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
         Ok(Self {
@@ -120,7 +126,9 @@ impl SQ8Vectors {
         let idx_path = data_dir.join("vectors_sq8.idx");
 
         if !file_path.exists() {
-            return Err(StorageError::InvalidData("SQ8 vectors file not found".to_string()));
+            return Err(StorageError::InvalidData(
+                "SQ8 vectors file not found".to_string(),
+            ));
         }
 
         // Build sidecar index from data file (or load existing sidecar)
@@ -131,12 +139,15 @@ impl SQ8Vectors {
             u64::from_le_bytes(buf)
         } else {
             // Build sidecar from scratch by scanning data file
-            
+
             Self::build_sidecar_index(&file_path, &idx_path, entry_size)?
         };
 
         let read_file = File::open(&file_path).map_err(StorageError::Io)?;
-        let write_file = OpenOptions::new().append(true).open(&file_path).map_err(StorageError::Io)?;
+        let write_file = OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .map_err(StorageError::Io)?;
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
         // mmap data and sidecar for zero-syscall reads
@@ -173,7 +184,8 @@ impl SQ8Vectors {
     fn build_sidecar_index(data_path: &Path, idx_path: &Path, entry_size: usize) -> Result<u64> {
         let mut data = File::open(data_path).map_err(StorageError::Io)?;
         let mut count_bytes = [0u8; 8];
-        data.read_exact(&mut count_bytes).map_err(StorageError::Io)?;
+        data.read_exact(&mut count_bytes)
+            .map_err(StorageError::Io)?;
         let count = u64::from_le_bytes(count_bytes);
 
         // Read all (row_id, offset) pairs
@@ -181,11 +193,13 @@ impl SQ8Vectors {
         let mut offset = 8u64;
         for _ in 0..count {
             let mut row_id_bytes = [0u8; 8];
-            data.read_exact(&mut row_id_bytes).map_err(StorageError::Io)?;
+            data.read_exact(&mut row_id_bytes)
+                .map_err(StorageError::Io)?;
             let row_id = u64::from_le_bytes(row_id_bytes);
             entries.push((row_id, offset));
             offset += entry_size as u64;
-            data.seek(SeekFrom::Current((entry_size - 8) as i64)).map_err(StorageError::Io)?;
+            data.seek(SeekFrom::Current((entry_size - 8) as i64))
+                .map_err(StorageError::Io)?;
         }
 
         // Sort by row_id for binary search
@@ -193,10 +207,16 @@ impl SQ8Vectors {
 
         // Write sidecar index
         let mut idx_file = File::create(idx_path).map_err(StorageError::Io)?;
-        idx_file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+        idx_file
+            .write_all(&count.to_le_bytes())
+            .map_err(StorageError::Io)?;
         for (row_id, off) in &entries {
-            idx_file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
-            idx_file.write_all(&off.to_le_bytes()).map_err(StorageError::Io)?;
+            idx_file
+                .write_all(&row_id.to_le_bytes())
+                .map_err(StorageError::Io)?;
+            idx_file
+                .write_all(&off.to_le_bytes())
+                .map_err(StorageError::Io)?;
         }
         idx_file.sync_all().map_err(StorageError::Io)?;
 
@@ -230,9 +250,11 @@ impl SQ8Vectors {
                 while lo <= hi {
                     let mid = lo + (hi - lo) / 2;
                     let off = 8 + mid as usize * entry_size;
-                    if off + 16 > mmap.len() { break; }
-                    let mid_id = u64::from_le_bytes(mmap[off..off+8].try_into().ok()?);
-                    let mid_offset = u64::from_le_bytes(mmap[off+8..off+16].try_into().ok()?);
+                    if off + 16 > mmap.len() {
+                        break;
+                    }
+                    let mid_id = u64::from_le_bytes(mmap[off..off + 8].try_into().ok()?);
+                    let mid_offset = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().ok()?);
 
                     match mid_id.cmp(&row_id) {
                         std::cmp::Ordering::Equal => {
@@ -332,7 +354,10 @@ impl SQ8Vectors {
 
         // Check if already exists (LRU lookup + sidecar)
         if self.lookup_offset(row_id).is_some() {
-            return Err(StorageError::InvalidData(format!("Vector {} already exists", row_id)));
+            return Err(StorageError::InvalidData(format!(
+                "Vector {} already exists",
+                row_id
+            )));
         }
 
         let qvec = self.quantizer.quantize(&vector)?;
@@ -420,10 +445,13 @@ impl SQ8Vectors {
 
         // Update data file header with current count
         {
-            let mut file = OpenOptions::new().write(true)
-                .open(&self.file_path).map_err(StorageError::Io)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&self.file_path)
+                .map_err(StorageError::Io)?;
             file.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
-            file.write_all(&count.to_le_bytes()).map_err(StorageError::Io)?;
+            file.write_all(&count.to_le_bytes())
+                .map_err(StorageError::Io)?;
             file.sync_all().map_err(StorageError::Io)?;
         }
 
@@ -481,7 +509,9 @@ impl SQ8Vectors {
     }
 
     pub fn disk_usage(&self) -> usize {
-        std::fs::metadata(&self.file_path).map(|m| m.len() as usize).unwrap_or(0)
+        std::fs::metadata(&self.file_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0)
     }
 
     // ==================== Private Helpers ====================
@@ -495,9 +525,9 @@ impl SQ8Vectors {
                 let off = offset as usize + 8; // skip row_id
                 let end = off + 8 + self.dimension;
                 if end <= mmap.len() {
-                    let min = f32::from_le_bytes(mmap[off..off+4].try_into().unwrap());
-                    let max = f32::from_le_bytes(mmap[off+4..off+8].try_into().unwrap());
-                    let codes = mmap[off+8..off+8+self.dimension].to_vec();
+                    let min = f32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
+                    let max = f32::from_le_bytes(mmap[off + 4..off + 8].try_into().unwrap());
+                    let codes = mmap[off + 8..off + 8 + self.dimension].to_vec();
                     return Ok(QuantizedVector { codes, min, max });
                 }
                 // mmap out of bounds — stale mmap after append, fall through to seek+read
@@ -506,7 +536,8 @@ impl SQ8Vectors {
 
         // Fallback: seek+read
         let mut file = self.read_file.write();
-        file.seek(SeekFrom::Start(offset + 8)).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(offset + 8))
+            .map_err(StorageError::Io)?;
 
         let mut min_bytes = [0u8; 4];
         let mut max_bytes = [0u8; 4];
@@ -526,9 +557,12 @@ impl SQ8Vectors {
         let mut file = self.write_file.write();
         let offset = file.metadata().map_err(StorageError::Io)?.len();
 
-        file.write_all(&row_id.to_le_bytes()).map_err(StorageError::Io)?;
-        file.write_all(&qvec.min.to_le_bytes()).map_err(StorageError::Io)?;
-        file.write_all(&qvec.max.to_le_bytes()).map_err(StorageError::Io)?;
+        file.write_all(&row_id.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&qvec.min.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&qvec.max.to_le_bytes())
+            .map_err(StorageError::Io)?;
         file.write_all(&qvec.codes).map_err(StorageError::Io)?;
 
         Ok(offset)

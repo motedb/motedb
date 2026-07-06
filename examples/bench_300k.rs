@@ -1,13 +1,19 @@
-use motedb::{Database, DBConfig};
-use tempfile::TempDir;
+use motedb::{DBConfig, Database};
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn get_rss_kb() -> u64 {
     let pid = std::process::id();
     std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output().ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         .unwrap_or(0)
 }
 
@@ -29,15 +35,21 @@ fn setup_db(n: usize) -> (Database, TempDir, u128, u128) {
             batch.push_str(&format!("({},{:.2},{}),", customer, amount, region));
         }
         batch.truncate(batch.len() - 1);
-        db.execute(&format!("INSERT INTO sales (customer, amount, region) VALUES {}", batch)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO sales (customer, amount, region) VALUES {}",
+            batch
+        ))
+        .unwrap();
     }
     let insert_ms = t_insert.elapsed().as_millis();
     // Create column indexes for benchmarked WHERE columns.
     // The optimizer uses these to generate PointQuery plans for
     // low-selectivity queries (estimated_rows < 5% of total).
     let t_index = Instant::now();
-    db.execute("CREATE INDEX idx_region ON sales (region) USING COLUMN").unwrap();
-    db.execute("CREATE INDEX idx_customer ON sales (customer) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_region ON sales (region) USING COLUMN")
+        .unwrap();
+    db.execute("CREATE INDEX idx_customer ON sales (customer) USING COLUMN")
+        .unwrap();
     let index_ms = t_index.elapsed().as_millis();
     (db, dir, insert_ms, index_ms)
 }
@@ -46,7 +58,9 @@ fn bench<F: FnMut()>(_label: &str, mut f: F) -> u64 {
     f(); // warmup
     let start = Instant::now();
     let iters = 10;
-    for _ in 0..iters { f(); }
+    for _ in 0..iters {
+        f();
+    }
     start.elapsed().as_micros() as u64 / iters as u64
 }
 
@@ -64,14 +78,23 @@ fn main() {
     let n = 300_000;
     println!("\n  MoteDB 300K Row Benchmark");
     println!("  {}", "=".repeat(70));
-    
+
     let (db, _dir, insert_ms, index_ms) = setup_db(n);
     let rss = get_rss_kb();
     let total_ms = insert_ms + index_ms;
-    println!("  Insert {} rows: {}ms ({} rows/sec)", n, insert_ms, (n as u64 * 1000) / (insert_ms as u64).max(1));
+    println!(
+        "  Insert {} rows: {}ms ({} rows/sec)",
+        n,
+        insert_ms,
+        (n as u64 * 1000) / (insert_ms as u64).max(1)
+    );
     println!("  Create 2 indexes: {}ms", index_ms);
     println!("  Total setup: {}ms", total_ms);
-    println!("  RSS after insert: {} KB ({} B/row)", rss, rss * 1024 / n as u64);
+    println!(
+        "  RSS after insert: {} KB ({} B/row)",
+        rss,
+        rss * 1024 / n as u64
+    );
     println!();
 
     let pk_select_sql = format!("SELECT * FROM sales WHERE id = {}", n / 2);
@@ -92,33 +115,63 @@ fn main() {
         ("PK DELETE + re-insert", "DELETE FROM sales WHERE id = 1"),
     ];
 
-    println!("  {:45} | {:>8} us | {:>10} rows/ms", "Operation", "us/op", "throughput");
+    println!(
+        "  {:45} | {:>8} us | {:>10} rows/ms",
+        "Operation", "us/op", "throughput"
+    );
     println!("  {}", "-".repeat(70));
-    
+
     let mut results = Vec::new();
     for (label, sql) in &queries {
-        let us = bench(label, &mut || { rows(&db, sql); });
+        let us = bench(label, &mut || {
+            rows(&db, sql);
+        });
         let row_count = rows(&db, sql);
-        let throughput = if us > 0 { n as u64 * 1000 / us } else { 999999999 };
-        println!("  {:45} | {:>8} us | {:>10} rows/ms | {} rows", label, us, throughput, row_count);
+        let throughput = if us > 0 {
+            n as u64 * 1000 / us
+        } else {
+            999999999
+        };
+        println!(
+            "  {:45} | {:>8} us | {:>10} rows/ms | {} rows",
+            label, us, throughput, row_count
+        );
         results.push((label, us));
     }
 
     // Memory after all queries
     let rss_after = get_rss_kb();
-    println!("\n  RSS after queries: {} KB (Δ {} KB)", rss_after, rss_after as i64 - rss as i64);
+    println!(
+        "\n  RSS after queries: {} KB (Δ {} KB)",
+        rss_after,
+        rss_after as i64 - rss as i64
+    );
 
     // Linearity check: compare 100K vs 300K
     println!("\n  Linearity (100K → 300K, expect ~3x):");
     let baseline_100k: Vec<(&str, u64)> = vec![
-        ("scan", 23016), ("WHERE", 24021), ("GROUP BY", 22446),
-        ("ORDER BY", 22632), ("DISTINCT", 20320), ("IN subquery", 55803), ("LIKE", 22961),
+        ("scan", 23016),
+        ("WHERE", 24021),
+        ("GROUP BY", 22446),
+        ("ORDER BY", 22632),
+        ("DISTINCT", 20320),
+        ("IN subquery", 55803),
+        ("LIKE", 22961),
     ];
     for (label, t100) in &baseline_100k {
         if let Some((_, t300)) = results.iter().find(|(l, _)| l.contains(label)) {
             let ratio = *t300 as f64 / *t100 as f64;
-            let verdict = if ratio <= 3.5 { "OK (linear)" } else if ratio <= 5.0 { "WARN" } else { "BAD" };
-            println!("    {:20} {:.1}x  ({} us → {} us)  {}", label, ratio, t100, t300, verdict);
+            let verdict = if ratio <= 3.5 {
+                "OK (linear)"
+            } else if ratio <= 5.0 {
+                "WARN"
+            } else {
+                "BAD"
+            };
+            println!(
+                "    {:20} {:.1}x  ({} us → {} us)  {}",
+                label, ratio, t100, t300, verdict
+            );
         }
     }
 }

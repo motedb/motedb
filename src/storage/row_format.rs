@@ -50,11 +50,17 @@ const DEFAULT_MAX_CARDINALITY: usize = 4096;
 
 impl StringPool {
     pub fn new() -> Self {
-        Self { strings: HashSet::new(), max_cardinality: DEFAULT_MAX_CARDINALITY }
+        Self {
+            strings: HashSet::new(),
+            max_cardinality: DEFAULT_MAX_CARDINALITY,
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self { strings: HashSet::with_capacity(cap), max_cardinality: DEFAULT_MAX_CARDINALITY }
+        Self {
+            strings: HashSet::with_capacity(cap),
+            max_cardinality: DEFAULT_MAX_CARDINALITY,
+        }
     }
 
     /// Return a shared `Arc<str>` for `s`.
@@ -154,22 +160,30 @@ impl SchemaDecodeContext {
         for (i, ct) in col_types.iter().enumerate() {
             match ct {
                 ColumnType::Integer => {
-                    if i < 64 { fixed_idx_map[i] = fixed_count as u8; }
+                    if i < 64 {
+                        fixed_idx_map[i] = fixed_count as u8;
+                    }
                     fixed_count += 1;
                     col_decoders.push(ColDecoder::FixedInteger);
                 }
                 ColumnType::Float => {
-                    if i < 64 { fixed_idx_map[i] = fixed_count as u8; }
+                    if i < 64 {
+                        fixed_idx_map[i] = fixed_count as u8;
+                    }
                     fixed_count += 1;
                     col_decoders.push(ColDecoder::FixedFloat);
                 }
                 ColumnType::Boolean => {
-                    if i < 64 { fixed_idx_map[i] = fixed_count as u8; }
+                    if i < 64 {
+                        fixed_idx_map[i] = fixed_count as u8;
+                    }
                     fixed_count += 1;
                     col_decoders.push(ColDecoder::FixedBool);
                 }
                 ColumnType::Timestamp => {
-                    if i < 64 { fixed_idx_map[i] = fixed_count as u8; }
+                    if i < 64 {
+                        fixed_idx_map[i] = fixed_count as u8;
+                    }
                     fixed_count += 1;
                     col_decoders.push(ColDecoder::FixedTimestamp);
                 }
@@ -230,15 +244,16 @@ impl SchemaDecodeContext {
         // Read null bitmap (skip when all columns are NOT NULL — no nulls possible)
         let null_bitmap = if self.has_nullable_columns {
             u64::from_le_bytes([
-                data[4], data[5], data[6], data[7],
-                data[8], data[9], data[10], data[11],
+                data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
             ])
         } else {
             0 // All columns are NOT NULL — no bits set
         };
 
         let var_section_start = self.var_section_start;
-        let (var_data_start, var_entries, var_entry_count) = if self.var_col_count > 0 && var_section_start + 2 <= data.len() {
+        let (var_data_start, var_entries, var_entry_count) = if self.var_col_count > 0
+            && var_section_start + 2 <= data.len()
+        {
             // Use schema var_col_count when data is known-good (skip_magic_check set).
             // Saves reading 2 bytes + eliminates the min(16) branch per row.
             let var_count: usize = if self.skip_magic_check {
@@ -252,9 +267,18 @@ impl SchemaDecodeContext {
             let mut count = 0usize;
             for i in 0..var_count.min(16) {
                 let off = var_header_start + i * 10 + 2;
-                if off + 8 > data.len() { break; }
-                let v_off = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
-                let v_len = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) as usize;
+                if off + 8 > data.len() {
+                    break;
+                }
+                let v_off =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                let v_len = u32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]) as usize;
                 entries[count] = (v_off, v_len);
                 count += 1;
             }
@@ -300,7 +324,9 @@ impl SchemaDecodeContext {
                     let off = HEADER_SIZE + self.fixed_idx_map[i] as usize * FIXED_COL_SIZE;
                     let val = unsafe {
                         let ptr = data.as_ptr().add(off);
-                        Value::Timestamp(Timestamp::from_micros(i64::from_le(std::ptr::read_unaligned(ptr as *const i64))))
+                        Value::Timestamp(Timestamp::from_micros(i64::from_le(
+                            std::ptr::read_unaligned(ptr as *const i64),
+                        )))
                     };
                     out.push(val);
                 }
@@ -314,12 +340,17 @@ impl SchemaDecodeContext {
                             let s = if self.trust_utf8 {
                                 unsafe { std::str::from_utf8_unchecked(bytes) }
                             } else {
-                                std::str::from_utf8(bytes)
-                                    .map_err(|_| StorageError::InvalidData("Invalid UTF-8 in Text column".into()))?
+                                std::str::from_utf8(bytes).map_err(|_| {
+                                    StorageError::InvalidData("Invalid UTF-8 in Text column".into())
+                                })?
                             };
                             out.push(Value::Text(ArcString(self.pool.intern(s))));
-                        } else { out.push(Value::Null); }
-                    } else { out.push(Value::Null); }
+                        } else {
+                            out.push(Value::Null);
+                        }
+                    } else {
+                        out.push(Value::Null);
+                    }
                 }
                 ColDecoder::VarGeneric => {
                     if var_idx < var_entry_count {
@@ -330,8 +361,12 @@ impl SchemaDecodeContext {
                             let var_data = &data[abs_off..abs_off + v_len];
                             let val = Self::decode_var_generic(var_data)?;
                             out.push(val);
-                        } else { out.push(Value::Null); }
-                    } else { out.push(Value::Null); }
+                        } else {
+                            out.push(Value::Null);
+                        }
+                    } else {
+                        out.push(Value::Null);
+                    }
                 }
             }
         }
@@ -355,9 +390,16 @@ impl SchemaDecodeContext {
                 let mut vec = Vec::with_capacity(dim);
                 for j in 0..dim {
                     let o = 2 + j * 4;
-                    vec.push(f32::from_le_bytes([var_data[o], var_data[o+1], var_data[o+2], var_data[o+3]]));
+                    vec.push(f32::from_le_bytes([
+                        var_data[o],
+                        var_data[o + 1],
+                        var_data[o + 2],
+                        var_data[o + 3],
+                    ]));
                 }
-                return Ok(Value::Vector(crate::types::ArcVec(std::sync::Arc::new(vec))));
+                return Ok(Value::Vector(crate::types::ArcVec(std::sync::Arc::new(
+                    vec,
+                ))));
             }
         }
         // 3. Fallback: plain bincode
@@ -380,8 +422,7 @@ impl SchemaDecodeContext {
 
         let null_bitmap = if self.has_nullable_columns {
             u64::from_le_bytes([
-                data[4], data[5], data[6], data[7],
-                data[8], data[9], data[10], data[11],
+                data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
             ])
         } else {
             0 // All columns are NOT NULL — no bits set
@@ -390,7 +431,9 @@ impl SchemaDecodeContext {
         // Parse var entries using stack array (no heap allocation).
         // Sequential forward read — ascending col_idx guaranteed by encoder.
         let var_section_start = self.var_section_start;
-        let (var_data_start, var_entries, var_entry_count) = if self.var_col_count > 0 && var_section_start + 2 <= data.len() {
+        let (var_data_start, var_entries, var_entry_count) = if self.var_col_count > 0
+            && var_section_start + 2 <= data.len()
+        {
             let var_count: usize = if self.skip_magic_check {
                 self.var_col_count
             } else {
@@ -402,9 +445,18 @@ impl SchemaDecodeContext {
             let mut count = 0usize;
             for i in 0..var_count.min(16) {
                 let off = var_header_start + i * 10 + 2; // skip 2-byte col_idx
-                if off + 8 > data.len() { break; }
-                let v_off = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
-                let v_len = u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) as usize;
+                if off + 8 > data.len() {
+                    break;
+                }
+                let v_off =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                        as usize;
+                let v_len = u32::from_le_bytes([
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]) as usize;
                 entries[count] = (v_off, v_len);
                 count += 1;
             }
@@ -437,7 +489,9 @@ impl SchemaDecodeContext {
                     let off = HEADER_SIZE + self.fixed_idx_map[i] as usize * FIXED_COL_SIZE;
                     let val = unsafe {
                         let ptr = data.as_ptr().add(off);
-                        Value::Float(f64::from_bits(u64::from_le(std::ptr::read_unaligned(ptr as *const u64))))
+                        Value::Float(f64::from_bits(u64::from_le(std::ptr::read_unaligned(
+                            ptr as *const u64,
+                        ))))
                     };
                     self.row_buf.push(val);
                 }
@@ -449,7 +503,9 @@ impl SchemaDecodeContext {
                     let off = HEADER_SIZE + self.fixed_idx_map[i] as usize * FIXED_COL_SIZE;
                     let val = unsafe {
                         let ptr = data.as_ptr().add(off);
-                        Value::Timestamp(Timestamp::from_micros(i64::from_le(std::ptr::read_unaligned(ptr as *const i64))))
+                        Value::Timestamp(Timestamp::from_micros(i64::from_le(
+                            std::ptr::read_unaligned(ptr as *const i64),
+                        )))
                     };
                     self.row_buf.push(val);
                 }
@@ -466,10 +522,12 @@ impl SchemaDecodeContext {
                             let s = if self.trust_utf8 {
                                 unsafe { std::str::from_utf8_unchecked(bytes) }
                             } else {
-                                std::str::from_utf8(bytes)
-                                    .map_err(|_| StorageError::InvalidData("Invalid UTF-8 in Text column".into()))?
+                                std::str::from_utf8(bytes).map_err(|_| {
+                                    StorageError::InvalidData("Invalid UTF-8 in Text column".into())
+                                })?
                             };
-                            self.row_buf.push(Value::Text(ArcString(self.pool.intern(s))));
+                            self.row_buf
+                                .push(Value::Text(ArcString(self.pool.intern(s))));
                         } else {
                             self.row_buf.push(Value::Null);
                         }
@@ -519,7 +577,7 @@ pub enum ColumnArray {
     Integers(Vec<i64>),
     Floats(Vec<f64>),
     Texts(Vec<Arc<str>>),
-    Timestamps(Vec<i64>),  // microseconds since epoch
+    Timestamps(Vec<i64>), // microseconds since epoch
     Bools(Vec<bool>),
     /// Fallback: stores Values as-is (for complex types like Vector/Spatial/Tensor)
     Values(Vec<Value>),
@@ -566,15 +624,22 @@ pub struct ColumnarRowSet {
 impl ColumnarRowSet {
     /// Create an empty columnar result with the given column names and types.
     pub fn new(columns: Vec<String>, col_types: &[ColumnType]) -> Self {
-        let data: Vec<ColumnArray> = col_types.iter().map(|ct| match ct {
-            ColumnType::Integer => ColumnArray::Integers(Vec::new()),
-            ColumnType::Float => ColumnArray::Floats(Vec::new()),
-            ColumnType::Text => ColumnArray::Texts(Vec::new()),
-            ColumnType::Timestamp => ColumnArray::Timestamps(Vec::new()),
-            ColumnType::Boolean => ColumnArray::Bools(Vec::new()),
-            ColumnType::Tensor(_) | ColumnType::Spatial => ColumnArray::Values(Vec::new()),
-        }).collect();
-        Self { columns, data, num_rows: 0 }
+        let data: Vec<ColumnArray> = col_types
+            .iter()
+            .map(|ct| match ct {
+                ColumnType::Integer => ColumnArray::Integers(Vec::new()),
+                ColumnType::Float => ColumnArray::Floats(Vec::new()),
+                ColumnType::Text => ColumnArray::Texts(Vec::new()),
+                ColumnType::Timestamp => ColumnArray::Timestamps(Vec::new()),
+                ColumnType::Boolean => ColumnArray::Bools(Vec::new()),
+                ColumnType::Tensor(_) | ColumnType::Spatial => ColumnArray::Values(Vec::new()),
+            })
+            .collect();
+        Self {
+            columns,
+            data,
+            num_rows: 0,
+        }
     }
 
     /// Return the number of rows.
@@ -664,8 +729,7 @@ pub fn decode_row_into_columns(
 
     let null_bitmap = if ctx.has_nullable_columns {
         u64::from_le_bytes([
-            data[4], data[5], data[6], data[7],
-            data[8], data[9], data[10], data[11],
+            data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
         ])
     } else {
         0 // All columns are NOT NULL — no bits set
@@ -673,7 +737,9 @@ pub fn decode_row_into_columns(
 
     // Parse var entries using stack array
     let var_section_start = ctx.var_section_start;
-    let (var_data_start, var_entries, var_entry_count) = if ctx.var_col_count > 0 && var_section_start + 2 <= data.len() {
+    let (var_data_start, var_entries, var_entry_count) = if ctx.var_col_count > 0
+        && var_section_start + 2 <= data.len()
+    {
         let var_count: usize = if ctx.skip_magic_check {
             ctx.var_col_count
         } else {
@@ -685,9 +751,14 @@ pub fn decode_row_into_columns(
         let mut count = 0usize;
         for i in 0..var_count.min(16) {
             let off = var_header_start + i * 10 + 2;
-            if off + 8 > data.len() { break; }
-            let v_off = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-            let v_len = u32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]) as usize;
+            if off + 8 > data.len() {
+                break;
+            }
+            let v_off = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                as usize;
+            let v_len =
+                u32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
+                    as usize;
             entries[count] = (v_off, v_len);
             count += 1;
         }
@@ -798,7 +869,8 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
     if row.len() != col_types.len() {
         return Err(StorageError::InvalidData(format!(
             "Row column count ({}) doesn't match schema ({})",
-            row.len(), col_types.len()
+            row.len(),
+            col_types.len()
         )));
     }
     if row.len() > 64 {
@@ -848,9 +920,11 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
             }
             (Value::Vector(v), _) => {
                 if v.len() > u16::MAX as usize {
-                    return Err(StorageError::InvalidData(
-                        format!("Vector dimension {} exceeds maximum {}", v.len(), u16::MAX)
-                    ));
+                    return Err(StorageError::InvalidData(format!(
+                        "Vector dimension {} exceeds maximum {}",
+                        v.len(),
+                        u16::MAX
+                    )));
                 }
                 let dim = v.len() as u16;
                 let mut encoded = Vec::with_capacity(2 + v.len() * 4);
@@ -862,8 +936,10 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
             }
             (value, _) => {
                 let mut encoded = vec![0xFF];
-                encoded.extend_from_slice(&bincode::serialize(value)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?);
+                encoded.extend_from_slice(
+                    &bincode::serialize(value)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                );
                 var_entries.push((i, encoded));
             }
         }
@@ -898,7 +974,8 @@ pub fn encode_into(row: &[Value], col_types: &[ColumnType], buf: &mut Vec<u8>) -
     if row.len() != col_types.len() {
         return Err(StorageError::InvalidData(format!(
             "Row column count ({}) doesn't match schema ({})",
-            row.len(), col_types.len()
+            row.len(),
+            col_types.len()
         )));
     }
     if row.len() > 64 {
@@ -948,9 +1025,11 @@ pub fn encode_into(row: &[Value], col_types: &[ColumnType], buf: &mut Vec<u8>) -
             }
             (Value::Vector(v), _) => {
                 if v.len() > u16::MAX as usize {
-                    return Err(StorageError::InvalidData(
-                        format!("Vector dimension {} exceeds maximum {}", v.len(), u16::MAX)
-                    ));
+                    return Err(StorageError::InvalidData(format!(
+                        "Vector dimension {} exceeds maximum {}",
+                        v.len(),
+                        u16::MAX
+                    )));
                 }
                 let dim = v.len() as u16;
                 let mut encoded = Vec::with_capacity(2 + v.len() * 4);
@@ -962,8 +1041,10 @@ pub fn encode_into(row: &[Value], col_types: &[ColumnType], buf: &mut Vec<u8>) -
             }
             (value, _) => {
                 let mut encoded = vec![0xFF];
-                encoded.extend_from_slice(&bincode::serialize(value)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?);
+                encoded.extend_from_slice(
+                    &bincode::serialize(value)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                );
                 var_entries.push((i, encoded));
             }
         }
@@ -995,8 +1076,7 @@ pub fn encode_into(row: &[Value], col_types: &[ColumnType], buf: &mut Vec<u8>) -
 /// Decode bytes into a Row. Falls back to bincode for old-format data.
 pub fn decode(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
     if !is_rawrow(data) {
-        return bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()));
+        return bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()));
     }
     decode_raw(data, col_types)
 }
@@ -1004,17 +1084,21 @@ pub fn decode(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
 /// Fast decode with pre-computed fixed_count (avoids per-row O(C) scan).
 pub fn decode_fast(data: &[u8], col_types: &[ColumnType], fixed_count: usize) -> Result<Row> {
     if !is_rawrow(data) {
-        return bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()));
+        return bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()));
     }
     decode_raw_fast(data, col_types, fixed_count)
 }
 
 /// Reusable-buffer version of decode_fast — avoids per-row Vec allocation.
-pub fn decode_fast_into(data: &[u8], col_types: &[ColumnType], fixed_count: usize, buf: &mut Vec<Value>) -> Result<()> {
+pub fn decode_fast_into(
+    data: &[u8],
+    col_types: &[ColumnType],
+    fixed_count: usize,
+    buf: &mut Vec<Value>,
+) -> Result<()> {
     if !is_rawrow(data) {
-        *buf = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        *buf =
+            bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
         return Ok(());
     }
     decode_raw_fast_into(data, col_types, fixed_count, buf)
@@ -1022,10 +1106,16 @@ pub fn decode_fast_into(data: &[u8], col_types: &[ColumnType], fixed_count: usiz
 
 /// Like `decode_fast_into` but with optional `StringPool` for Text column interning.
 /// Pass `&mut pool` to deduplicate Arc<str> allocations across rows.
-pub fn decode_fast_into_with_pool(data: &[u8], col_types: &[ColumnType], fixed_count: usize, buf: &mut Vec<Value>, pool: Option<&mut StringPool>) -> Result<()> {
+pub fn decode_fast_into_with_pool(
+    data: &[u8],
+    col_types: &[ColumnType],
+    fixed_count: usize,
+    buf: &mut Vec<Value>,
+    pool: Option<&mut StringPool>,
+) -> Result<()> {
     if !is_rawrow(data) {
-        *buf = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        *buf =
+            bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
         return Ok(());
     }
     decode_raw_fast_into_with_pool(data, col_types, fixed_count, buf, pool)
@@ -1062,15 +1152,16 @@ impl RowParseContext {
         }
 
         let null_bitmap = u64::from_le_bytes([
-            data[4], data[5], data[6], data[7],
-            data[8], data[9], data[10], data[11],
+            data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
         ]);
 
         // Pre-compute col_idx -> fixed_idx mapping (one pass, O(C) not O(C²))
         let mut fixed_idx_map = [0u8; 64];
         let mut next_fixed = 0u8;
         for (i, ct) in col_types.iter().enumerate() {
-            if i >= 64 { break; }
+            if i >= 64 {
+                break;
+            }
             if is_fixed(ct) {
                 fixed_idx_map[i] = next_fixed;
                 next_fixed += 1;
@@ -1081,23 +1172,44 @@ impl RowParseContext {
         let mut var_offsets = [(0usize, 0usize); 64];
         let var_data_start;
         if var_section_start + 2 <= data.len() {
-            let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+            let var_count =
+                u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
             let var_header_start = var_section_start + 2;
             var_data_start = var_header_start + var_count * 10;
             for i in 0..var_count {
                 let off = var_header_start + i * 10;
-                if off + 10 > data.len() { break; }
+                if off + 10 > data.len() {
+                    break;
+                }
                 let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
-                if col_idx >= 64 { break; }
-                let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
-                let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+                if col_idx >= 64 {
+                    break;
+                }
+                let v_off = u32::from_le_bytes([
+                    data[off + 2],
+                    data[off + 3],
+                    data[off + 4],
+                    data[off + 5],
+                ]) as usize;
+                let v_len = u32::from_le_bytes([
+                    data[off + 6],
+                    data[off + 7],
+                    data[off + 8],
+                    data[off + 9],
+                ]) as usize;
                 var_offsets[col_idx] = (v_off, v_len);
             }
         } else {
             var_data_start = data.len();
         }
 
-        Some(Self { null_bitmap, fixed_count, var_offsets, var_data_start, fixed_idx_map })
+        Some(Self {
+            null_bitmap,
+            fixed_count,
+            var_offsets,
+            var_data_start,
+            fixed_idx_map,
+        })
     }
 
     /// Parse row header using pre-computed FixedColumnOffsets (avoids per-row O(C) scan).
@@ -1118,24 +1230,38 @@ impl RowParseContext {
         }
 
         let null_bitmap = u64::from_le_bytes([
-            data[4], data[5], data[6], data[7],
-            data[8], data[9], data[10], data[11],
+            data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
         ]);
 
         let var_section_start = HEADER_SIZE + offsets.fixed_count * FIXED_COL_SIZE;
         let mut var_offsets = [(0usize, 0usize); 64];
         let var_data_start;
         if var_section_start + 2 <= data.len() {
-            let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+            let var_count =
+                u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
             let var_header_start = var_section_start + 2;
             var_data_start = var_header_start + var_count * 10;
             for i in 0..var_count {
                 let off = var_header_start + i * 10;
-                if off + 10 > data.len() { break; }
+                if off + 10 > data.len() {
+                    break;
+                }
                 let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
-                if col_idx >= 64 { break; }
-                let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
-                let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+                if col_idx >= 64 {
+                    break;
+                }
+                let v_off = u32::from_le_bytes([
+                    data[off + 2],
+                    data[off + 3],
+                    data[off + 4],
+                    data[off + 5],
+                ]) as usize;
+                let v_len = u32::from_le_bytes([
+                    data[off + 6],
+                    data[off + 7],
+                    data[off + 8],
+                    data[off + 9],
+                ]) as usize;
                 var_offsets[col_idx] = (v_off, v_len);
             }
         } else {
@@ -1206,8 +1332,7 @@ impl RowParseContext {
 /// Tries RawRow first (with generic type inference), falls back to bincode.
 pub fn decode_any(data: &[u8]) -> Result<Row> {
     if !is_rawrow(data) {
-        return bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()));
+        return bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()));
     }
     // For RawRow without schema, try to decode with best-effort column type inference
     decode_raw_any(data)
@@ -1216,8 +1341,7 @@ pub fn decode_any(data: &[u8]) -> Result<Row> {
 /// Like `decode_any` but with optional `StringPool` for Text column interning.
 pub fn decode_any_with_pool(data: &[u8], pool: Option<&mut StringPool>) -> Result<Row> {
     if !is_rawrow(data) {
-        return bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()));
+        return bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()));
     }
     decode_raw_any_with_pool(data, pool)
 }
@@ -1225,8 +1349,8 @@ pub fn decode_any_with_pool(data: &[u8], pool: Option<&mut StringPool>) -> Resul
 /// Get a single column value without deserializing the whole row.
 pub fn get_column(data: &[u8], col_types: &[ColumnType], col_idx: usize) -> Result<Value> {
     if !is_rawrow(data) {
-        let row: Row = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let row: Row =
+            bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
         return Ok(row.get(col_idx).cloned().unwrap_or(Value::Null));
     }
 
@@ -1235,8 +1359,7 @@ pub fn get_column(data: &[u8], col_types: &[ColumnType], col_idx: usize) -> Resu
     }
 
     let null_bitmap = u64::from_le_bytes([
-        data[4], data[5], data[6], data[7],
-        data[8], data[9], data[10], data[11],
+        data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
     if null_bitmap & (1u64 << col_idx) != 0 {
@@ -1261,17 +1384,24 @@ pub fn get_column(data: &[u8], col_types: &[ColumnType], col_idx: usize) -> Resu
         return Ok(Value::Null);
     }
 
-    let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+    let var_count =
+        u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
     let var_header_start = var_section_start + 2;
     let var_data_start = var_header_start + var_count * 10;
 
     for i in 0..var_count {
         let off = var_header_start + i * 10;
-        if off + 10 > data.len() { break; }
+        if off + 10 > data.len() {
+            break;
+        }
         let entry_col = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
         if entry_col == col_idx {
-            let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
-            let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+            let v_off =
+                u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]])
+                    as usize;
+            let v_len =
+                u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]])
+                    as usize;
             let abs_off = var_data_start + v_off;
             if abs_off + v_len > data.len() {
                 return Ok(Value::Null);
@@ -1288,7 +1418,10 @@ fn is_rawrow(data: &[u8]) -> bool {
 }
 
 fn is_fixed(col_type: &ColumnType) -> bool {
-    matches!(col_type, ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp)
+    matches!(
+        col_type,
+        ColumnType::Integer | ColumnType::Float | ColumnType::Boolean | ColumnType::Timestamp
+    )
 }
 
 /// Pre-computed byte offsets for fixed-width columns in RawRow format.
@@ -1337,7 +1470,12 @@ impl FixedColumnOffsets {
         if fixed_columns.is_empty() {
             None
         } else {
-            Some(Self { col_to_offset, fixed_columns, fixed_idx_map, fixed_count })
+            Some(Self {
+                col_to_offset,
+                fixed_columns,
+                fixed_idx_map,
+                fixed_count,
+            })
         }
     }
 
@@ -1363,56 +1501,104 @@ impl FixedColumnOffsets {
     #[inline]
     pub fn read_i64(&self, raw: &[u8], col_idx: usize) -> Option<i64> {
         let off = self.offset(col_idx)?;
-        if off + 8 > raw.len() { return None; }
+        if off + 8 > raw.len() {
+            return None;
+        }
         // Check null_bitmap
         if raw.len() >= HEADER_SIZE {
-            let null_bitmap = u64::from_le_bytes([raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]]);
+            let null_bitmap = u64::from_le_bytes([
+                raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+            ]);
             if (null_bitmap >> col_idx) & 1 == 1 {
                 return None; // NULL
             }
         }
-        Some(i64::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3], raw[off+4], raw[off+5], raw[off+6], raw[off+7]]))
+        Some(i64::from_le_bytes([
+            raw[off],
+            raw[off + 1],
+            raw[off + 2],
+            raw[off + 3],
+            raw[off + 4],
+            raw[off + 5],
+            raw[off + 6],
+            raw[off + 7],
+        ]))
     }
 
     /// Extract an f64 value from a RawRow byte slice at a fixed column offset.
     #[inline]
     pub fn read_f64(&self, raw: &[u8], col_idx: usize) -> Option<f64> {
         let off = self.offset(col_idx)?;
-        if off + 8 > raw.len() { return None; }
+        if off + 8 > raw.len() {
+            return None;
+        }
         if raw.len() >= HEADER_SIZE {
-            let null_bitmap = u64::from_le_bytes([raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]]);
+            let null_bitmap = u64::from_le_bytes([
+                raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+            ]);
             if (null_bitmap >> col_idx) & 1 == 1 {
                 return None;
             }
         }
-        Some(f64::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3], raw[off+4], raw[off+5], raw[off+6], raw[off+7]]))
+        Some(f64::from_le_bytes([
+            raw[off],
+            raw[off + 1],
+            raw[off + 2],
+            raw[off + 3],
+            raw[off + 4],
+            raw[off + 5],
+            raw[off + 6],
+            raw[off + 7],
+        ]))
     }
 
     /// Read a fixed column value as a Value enum.
     #[inline]
     pub fn read_value(&self, raw: &[u8], col_idx: usize, col_type: &ColumnType) -> Value {
         if raw.len() >= HEADER_SIZE {
-            let null_bitmap = u64::from_le_bytes([raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]]);
+            let null_bitmap = u64::from_le_bytes([
+                raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
+            ]);
             if (null_bitmap >> col_idx) & 1 == 1 {
                 return Value::Null;
             }
         }
         let off = self.offset(col_idx).unwrap_or(0);
-        if off + 8 > raw.len() { return Value::Null; }
+        if off + 8 > raw.len() {
+            return Value::Null;
+        }
         match col_type {
             ColumnType::Integer => Value::Integer(i64::from_le_bytes([
-                raw[off], raw[off+1], raw[off+2], raw[off+3],
-                raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+                raw[off],
+                raw[off + 1],
+                raw[off + 2],
+                raw[off + 3],
+                raw[off + 4],
+                raw[off + 5],
+                raw[off + 6],
+                raw[off + 7],
             ])),
             ColumnType::Float => Value::Float(f64::from_le_bytes([
-                raw[off], raw[off+1], raw[off+2], raw[off+3],
-                raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+                raw[off],
+                raw[off + 1],
+                raw[off + 2],
+                raw[off + 3],
+                raw[off + 4],
+                raw[off + 5],
+                raw[off + 6],
+                raw[off + 7],
             ])),
             ColumnType::Boolean => Value::Bool(raw[off] != 0),
             ColumnType::Timestamp => {
                 let micros = i64::from_le_bytes([
-                    raw[off], raw[off+1], raw[off+2], raw[off+3],
-                    raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+                    raw[off],
+                    raw[off + 1],
+                    raw[off + 2],
+                    raw[off + 3],
+                    raw[off + 4],
+                    raw[off + 5],
+                    raw[off + 6],
+                    raw[off + 7],
                 ]);
                 Value::Timestamp(crate::types::Timestamp::from_micros(micros))
             }
@@ -1433,14 +1619,12 @@ fn decode_raw(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
 
     let col_count = u16::from_le_bytes([data[2], data[3]]) as usize;
     let null_bitmap = u64::from_le_bytes([
-        data[4], data[5], data[6], data[7],
-        data[8], data[9], data[10], data[11],
+        data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
     if col_count != col_types.len() {
         // Schema mismatch — fall back to bincode
-        return bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()));
+        return bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()));
     }
 
     let fixed_count = col_types.iter().filter(|t| is_fixed(t)).count();
@@ -1450,16 +1634,25 @@ fn decode_raw(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
     let mut var_offsets: [(usize, usize); 64] = [(0, 0); 64];
     let var_data_start;
     if var_section_start + 2 <= data.len() {
-        let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+        let var_count =
+            u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
         let var_header_start = var_section_start + 2;
         var_data_start = var_header_start + var_count * 10;
         for i in 0..var_count {
             let off = var_header_start + i * 10;
-            if off + 10 > data.len() { break; }
+            if off + 10 > data.len() {
+                break;
+            }
             let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
-            if col_idx >= 64 { break; }
-            let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
-            let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+            if col_idx >= 64 {
+                break;
+            }
+            let v_off =
+                u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]])
+                    as usize;
+            let v_len =
+                u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]])
+                    as usize;
             var_offsets[col_idx] = (v_off, v_len);
         }
     } else {
@@ -1472,7 +1665,9 @@ fn decode_raw(data: &[u8], col_types: &[ColumnType]) -> Result<Row> {
     for (i, col_type) in col_types.iter().enumerate() {
         if null_bitmap & (1u64 << i) != 0 {
             row.push(Value::Null);
-            if is_fixed(col_type) { fixed_idx += 1; }
+            if is_fixed(col_type) {
+                fixed_idx += 1;
+            }
             continue;
         }
 
@@ -1515,9 +1710,10 @@ pub fn decode_fast_partial_into(
     buf: &mut Vec<Value>,
 ) -> Result<()> {
     if !is_rawrow(data) {
-        *buf = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let projected: Vec<Value> = col_positions.iter()
+        *buf =
+            bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let projected: Vec<Value> = col_positions
+            .iter()
             .map(|&p| buf.get(p).cloned().unwrap_or(Value::Null))
             .collect();
         *buf = projected;
@@ -1536,9 +1732,10 @@ pub fn decode_fast_partial_into_with_pool(
     pool: Option<&mut StringPool>,
 ) -> Result<()> {
     if !is_rawrow(data) {
-        *buf = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let projected: Vec<Value> = col_positions.iter()
+        *buf =
+            bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let projected: Vec<Value> = col_positions
+            .iter()
             .map(|&p| buf.get(p).cloned().unwrap_or(Value::Null))
             .collect();
         *buf = projected;
@@ -1547,25 +1744,35 @@ pub fn decode_fast_partial_into_with_pool(
     decode_raw_fast_partial_into_with_pool(data, col_types, fixed_count, col_positions, buf, pool)
 }
 
-fn decode_raw_fast_into(data: &[u8], col_types: &[ColumnType], fixed_count: usize, row: &mut Vec<Value>) -> Result<()> {
+fn decode_raw_fast_into(
+    data: &[u8],
+    col_types: &[ColumnType],
+    fixed_count: usize,
+    row: &mut Vec<Value>,
+) -> Result<()> {
     decode_raw_fast_into_with_pool(data, col_types, fixed_count, row, None)
 }
 
 /// Pool-aware version: when `pool` is Some, Text columns go through interning.
-fn decode_raw_fast_into_with_pool(data: &[u8], col_types: &[ColumnType], fixed_count: usize, row: &mut Vec<Value>, mut pool: Option<&mut StringPool>) -> Result<()> {
+fn decode_raw_fast_into_with_pool(
+    data: &[u8],
+    col_types: &[ColumnType],
+    fixed_count: usize,
+    row: &mut Vec<Value>,
+    mut pool: Option<&mut StringPool>,
+) -> Result<()> {
     if data.len() < HEADER_SIZE {
         return Err(StorageError::InvalidData("RawRow data too small".into()));
     }
 
     let col_count = u16::from_le_bytes([data[2], data[3]]) as usize;
     let null_bitmap = u64::from_le_bytes([
-        data[4], data[5], data[6], data[7],
-        data[8], data[9], data[10], data[11],
+        data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
     if col_count != col_types.len() {
-        *row = bincode::deserialize(data)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        *row =
+            bincode::deserialize(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
         return Ok(());
     }
 
@@ -1574,16 +1781,25 @@ fn decode_raw_fast_into_with_pool(data: &[u8], col_types: &[ColumnType], fixed_c
     let mut var_offsets: [(usize, usize); 64] = [(0, 0); 64];
     let var_data_start;
     if var_section_start + 2 <= data.len() {
-        let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+        let var_count =
+            u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
         let var_header_start = var_section_start + 2;
         var_data_start = var_header_start + var_count * 10;
         for i in 0..var_count {
             let off = var_header_start + i * 10;
-            if off + 10 > data.len() { break; }
+            if off + 10 > data.len() {
+                break;
+            }
             let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
-            if col_idx >= 64 { break; }
-            let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
-            let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+            if col_idx >= 64 {
+                break;
+            }
+            let v_off =
+                u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]])
+                    as usize;
+            let v_len =
+                u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]])
+                    as usize;
             var_offsets[col_idx] = (v_off, v_len);
         }
     } else {
@@ -1600,7 +1816,9 @@ fn decode_raw_fast_into_with_pool(data: &[u8], col_types: &[ColumnType], fixed_c
     for (i, col_type) in col_types.iter().enumerate() {
         if null_bitmap & (1u64 << i) != 0 {
             row.push(Value::Null);
-            if is_fixed(col_type) { fixed_idx += 1; }
+            if is_fixed(col_type) {
+                fixed_idx += 1;
+            }
             continue;
         }
 
@@ -1618,7 +1836,11 @@ fn decode_raw_fast_into_with_pool(data: &[u8], col_types: &[ColumnType], fixed_c
             if abs_off + v_len > data.len() {
                 row.push(Value::Null);
             } else {
-                row.push(decode_var_with_pool(&data[abs_off..abs_off + v_len], col_type, pool.as_mut().map(|p| &mut **p))?);
+                row.push(decode_var_with_pool(
+                    &data[abs_off..abs_off + v_len],
+                    col_type,
+                    pool.as_deref_mut(),
+                )?);
             }
         }
     }
@@ -1655,8 +1877,9 @@ fn decode_raw_fast_partial_into_with_pool(
     let col_count = u16::from_le_bytes([data[2], data[3]]) as usize;
     if col_count != col_types.len() {
         // Fall back to full decode + project
-        decode_raw_fast_into_with_pool(data, col_types, fixed_count, out, pool.as_mut().map(|p| &mut **p))?;
-        let projected: Vec<Value> = col_positions.iter()
+        decode_raw_fast_into_with_pool(data, col_types, fixed_count, out, pool.as_deref_mut())?;
+        let projected: Vec<Value> = col_positions
+            .iter()
             .map(|&p| out.get(p).cloned().unwrap_or(Value::Null))
             .collect();
         *out = projected;
@@ -1664,28 +1887,32 @@ fn decode_raw_fast_partial_into_with_pool(
     }
 
     let null_bitmap = u64::from_le_bytes([
-        data[4], data[5], data[6], data[7],
-        data[8], data[9], data[10], data[11],
+        data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
     let var_section_start = HEADER_SIZE + fixed_count * FIXED_COL_SIZE;
     let mut var_offsets: [(usize, usize); 64] = [(0, 0); 64];
     let var_data_start;
     if var_section_start + 2 <= data.len() {
-        let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+        let var_count =
+            u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
         let var_header_start = var_section_start + 2;
         var_data_start = var_header_start + var_count * 10;
         for i in 0..var_count {
             let off = var_header_start + i * 10;
-            if off + 10 > data.len() { break; }
+            if off + 10 > data.len() {
+                break;
+            }
             let col_idx = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
-            if col_idx >= 64 { break; }
-            let v_off = u32::from_le_bytes([
-                data[off + 2], data[off + 3], data[off + 4], data[off + 5],
-            ]) as usize;
-            let v_len = u32::from_le_bytes([
-                data[off + 6], data[off + 7], data[off + 8], data[off + 9],
-            ]) as usize;
+            if col_idx >= 64 {
+                break;
+            }
+            let v_off =
+                u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]])
+                    as usize;
+            let v_len =
+                u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]])
+                    as usize;
             var_offsets[col_idx] = (v_off, v_len);
         }
     } else {
@@ -1719,7 +1946,11 @@ fn decode_raw_fast_partial_into_with_pool(
             } else {
                 // Empty variable-length values (v_len==0) are valid:
                 // empty string = "", empty vector = []. They are NOT NULL.
-                out.push(decode_var_with_pool(&data[abs_off..abs_off + v_len], col_type, pool.as_mut().map(|p| &mut **p))?);
+                out.push(decode_var_with_pool(
+                    &data[abs_off..abs_off + v_len],
+                    col_type,
+                    pool.as_deref_mut(),
+                )?);
             }
         }
     }
@@ -1741,8 +1972,7 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
 
     let col_count = u16::from_le_bytes([data[2], data[3]]) as usize;
     let null_bitmap = u64::from_le_bytes([
-        data[4], data[5], data[6], data[7],
-        data[8], data[9], data[10], data[11],
+        data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
     ]);
 
     // Parse var section — stack arrays (max 64 columns)
@@ -1751,13 +1981,20 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
     // We'll try the var section at various offsets. The fixed_count can be 0..col_count.
     for fixed_count in (0..=col_count).rev() {
         let var_section_start = HEADER_SIZE + fixed_count * FIXED_COL_SIZE;
-        if var_section_start + 2 > data.len() { continue; }
+        if var_section_start + 2 > data.len() {
+            continue;
+        }
 
-        let var_count = u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
+        let var_count =
+            u16::from_le_bytes([data[var_section_start], data[var_section_start + 1]]) as usize;
         let var_header_end = var_section_start + 2 + var_count * 10;
 
-        if var_count + fixed_count > col_count { continue; }
-        if var_header_end > data.len() { continue; }
+        if var_count + fixed_count > col_count {
+            continue;
+        }
+        if var_header_end > data.len() {
+            continue;
+        }
 
         // Check that all col_idx values are valid and distinct
         let mut valid = true;
@@ -1775,8 +2012,12 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
                 break;
             }
             seen_bitmap |= 1u64 << col_idx;
-            let v_off = u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]]) as usize;
-            let v_len = u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]]) as usize;
+            let v_off =
+                u32::from_le_bytes([data[off + 2], data[off + 3], data[off + 4], data[off + 5]])
+                    as usize;
+            let v_len =
+                u32::from_le_bytes([data[off + 6], data[off + 7], data[off + 8], data[off + 9]])
+                    as usize;
             if var_data_start + v_off + v_len > data.len() {
                 valid = false;
                 break;
@@ -1806,8 +2047,14 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
                         // Check for tagged bincode value (0xFF prefix)
                         if !var_data.is_empty() && var_data[0] == 0xFF {
                             match bincode::deserialize::<Value>(&var_data[1..]) {
-                                Ok(v) => { row.push(v); continue; }
-                                Err(_) => { row.push(Value::Null); continue; }
+                                Ok(v) => {
+                                    row.push(v);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    row.push(Value::Null);
+                                    continue;
+                                }
                             }
                         }
                         // Try vector first: [dim: u16] + f32 array
@@ -1818,7 +2065,12 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
                                 let mut vec = Vec::with_capacity(dim);
                                 for j in 0..dim {
                                     let o = 2 + j * 4;
-                                    vec.push(f32::from_le_bytes([var_data[o], var_data[o+1], var_data[o+2], var_data[o+3]]));
+                                    vec.push(f32::from_le_bytes([
+                                        var_data[o],
+                                        var_data[o + 1],
+                                        var_data[o + 2],
+                                        var_data[o + 3],
+                                    ]));
                                 }
                                 row.push(Value::Vector(ArcVec(std::sync::Arc::new(vec))));
                                 continue;
@@ -1845,7 +2097,7 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
                     if off + FIXED_COL_SIZE > data.len() {
                         row.push(Value::Null);
                     } else {
-                        let arr: [u8; 8] = data[off..off+8].try_into().unwrap_or([0; 8]);
+                        let arr: [u8; 8] = data[off..off + 8].try_into().unwrap_or([0; 8]);
                         row.push(Value::Integer(i64::from_le_bytes(arr)));
                     }
                     fixed_idx += 1;
@@ -1878,7 +2130,11 @@ fn decode_var(bytes: &[u8], col_type: &ColumnType) -> Result<Value> {
 
 /// Core decode: when `pool` is Some and the column is Text, intern the Arc<str>
 /// through the pool to deduplicate allocations across rows.
-fn decode_var_with_pool(bytes: &[u8], col_type: &ColumnType, pool: Option<&mut StringPool>) -> Result<Value> {
+fn decode_var_with_pool(
+    bytes: &[u8],
+    col_type: &ColumnType,
+    pool: Option<&mut StringPool>,
+) -> Result<Value> {
     match col_type {
         ColumnType::Text => {
             let s = std::str::from_utf8(bytes)
@@ -1903,14 +2159,18 @@ fn decode_var_with_pool(bytes: &[u8], col_type: &ColumnType, pool: Option<&mut S
                     let mut vec = Vec::with_capacity(dim);
                     for i in 0..dim {
                         let off = 2 + i * 4;
-                        vec.push(f32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]));
+                        vec.push(f32::from_le_bytes([
+                            bytes[off],
+                            bytes[off + 1],
+                            bytes[off + 2],
+                            bytes[off + 3],
+                        ]));
                     }
                     return Ok(Value::Vector(ArcVec(std::sync::Arc::new(vec))));
                 }
             }
             // Fallback: bincode
-            bincode::deserialize(bytes)
-                .map_err(|e| StorageError::Serialization(e.to_string()))
+            bincode::deserialize(bytes).map_err(|e| StorageError::Serialization(e.to_string()))
         }
     }
 }
@@ -1947,7 +2207,10 @@ mod tests {
         let decoded = decode(&encoded, &schema).unwrap();
 
         assert_eq!(decoded.len(), 5);
-        assert_eq!(decoded[0], Value::Timestamp(Timestamp::from_micros(1700000000_000_000)));
+        assert_eq!(
+            decoded[0],
+            Value::Timestamp(Timestamp::from_micros(1700000000_000_000))
+        );
         assert_eq!(decoded[1], Value::Float(23.5));
         assert_eq!(decoded[2], Value::Float(45.2));
         assert_eq!(decoded[3], Value::Integer(42));
@@ -1978,9 +2241,18 @@ mod tests {
         let schema = sensor_schema();
         let encoded = encode(&row, &schema).unwrap();
 
-        assert_eq!(get_column(&encoded, &schema, 1).unwrap(), Value::Float(23.5));
-        assert_eq!(get_column(&encoded, &schema, 3).unwrap(), Value::Integer(42));
-        assert_eq!(get_column(&encoded, &schema, 4).unwrap(), Value::text("sensor_01".to_string()));
+        assert_eq!(
+            get_column(&encoded, &schema, 1).unwrap(),
+            Value::Float(23.5)
+        );
+        assert_eq!(
+            get_column(&encoded, &schema, 3).unwrap(),
+            Value::Integer(42)
+        );
+        assert_eq!(
+            get_column(&encoded, &schema, 4).unwrap(),
+            Value::text("sensor_01".to_string())
+        );
     }
 
     #[test]
@@ -2002,7 +2274,12 @@ mod tests {
         let bincode_size = bincode::serialize(&row).unwrap().len();
         let rawrow_size = encode(&row, &schema).unwrap().len();
 
-        assert!(rawrow_size < bincode_size, "RawRow {} should be < bincode {}", rawrow_size, bincode_size);
+        assert!(
+            rawrow_size < bincode_size,
+            "RawRow {} should be < bincode {}",
+            rawrow_size,
+            bincode_size
+        );
     }
 
     #[test]
@@ -2040,7 +2317,7 @@ mod tests {
                     assert_eq!(p.y, 2.0);
                 }
                 other => panic!("Expected Point, got {:?}", other),
-            }
+            },
             _ => panic!("Expected Spatial Point, got {:?}", decoded[1]),
         }
 
@@ -2054,8 +2331,11 @@ mod tests {
                     assert_eq!(p.y, 2.0);
                 }
                 other => panic!("decode_any: Expected Point, got {:?}", other),
-            }
-            _ => panic!("decode_any: Expected Spatial Point, got {:?}", decoded_any[1]),
+            },
+            _ => panic!(
+                "decode_any: Expected Spatial Point, got {:?}",
+                decoded_any[1]
+            ),
         }
     }
 
@@ -2063,11 +2343,19 @@ mod tests {
     fn test_spatial_3col_roundtrip() {
         use crate::types::{Geometry, Point, Point3D};
         // Same schema as the 2d_3d_coexistence test
-        let schema = vec![ColumnType::Integer, ColumnType::Spatial, ColumnType::Spatial];
+        let schema = vec![
+            ColumnType::Integer,
+            ColumnType::Spatial,
+            ColumnType::Spatial,
+        ];
         let row = vec![
             Value::Integer(1),
             Value::Spatial(Box::new(Geometry::Point(Point::new(1.0, 1.0)))),
-            Value::Spatial(Box::new(Geometry::Point3D(Point3D { x: 2.0, y: 2.0, z: 2.0 }))),
+            Value::Spatial(Box::new(Geometry::Point3D(Point3D {
+                x: 2.0,
+                y: 2.0,
+                z: 2.0,
+            }))),
         ];
 
         let encoded = encode(&row, &schema).unwrap();
@@ -2081,7 +2369,7 @@ mod tests {
                     assert_eq!(p.x, 1.0);
                 }
                 other => panic!("Expected Point at col 1, got {:?}", other),
-            }
+            },
             _ => panic!("Expected Spatial Point at col 1, got {:?}", decoded[1]),
         }
         match &decoded[2] {
@@ -2090,7 +2378,7 @@ mod tests {
                     assert_eq!(p.x, 2.0);
                 }
                 other => panic!("Expected Point3D at col 2, got {:?}", other),
-            }
+            },
             _ => panic!("Expected Spatial Point3D at col 2, got {:?}", decoded[2]),
         }
 
@@ -2111,8 +2399,18 @@ mod tests {
 
     #[test]
     fn test_partial_decode_select_columns() {
-        let col_types = vec![ColumnType::Integer, ColumnType::Float, ColumnType::Text, ColumnType::Boolean];
-        let row = vec![Value::Integer(42), Value::Float(3.14), Value::Text("hello".into()), Value::Bool(true)];
+        let col_types = vec![
+            ColumnType::Integer,
+            ColumnType::Float,
+            ColumnType::Text,
+            ColumnType::Boolean,
+        ];
+        let row = vec![
+            Value::Integer(42),
+            Value::Float(3.14),
+            Value::Text("hello".into()),
+            Value::Bool(true),
+        ];
         let fixed_count = compute_fixed_count(&col_types);
         let encoded = encode(&row, &col_types).unwrap();
 
@@ -2128,7 +2426,11 @@ mod tests {
     #[test]
     fn test_partial_decode_reordered() {
         let col_types = vec![ColumnType::Integer, ColumnType::Float, ColumnType::Text];
-        let row = vec![Value::Integer(1), Value::Float(2.5), Value::Text("abc".into())];
+        let row = vec![
+            Value::Integer(1),
+            Value::Float(2.5),
+            Value::Text("abc".into()),
+        ];
         let fixed_count = compute_fixed_count(&col_types);
         let encoded = encode(&row, &col_types).unwrap();
 
@@ -2144,8 +2446,18 @@ mod tests {
 
     #[test]
     fn test_partial_decode_with_nulls() {
-        let col_types = vec![ColumnType::Integer, ColumnType::Text, ColumnType::Float, ColumnType::Boolean];
-        let row = vec![Value::Integer(10), Value::Null, Value::Float(1.5), Value::Null];
+        let col_types = vec![
+            ColumnType::Integer,
+            ColumnType::Text,
+            ColumnType::Float,
+            ColumnType::Boolean,
+        ];
+        let row = vec![
+            Value::Integer(10),
+            Value::Null,
+            Value::Float(1.5),
+            Value::Null,
+        ];
         let fixed_count = compute_fixed_count(&col_types);
         let encoded = encode(&row, &col_types).unwrap();
 
@@ -2204,7 +2516,10 @@ mod tests {
         let row_with_null = vec![Value::Null, Value::text("".to_string())];
         let encoded = encode(&row_with_null, &col_types).unwrap();
         let decoded = decode(&encoded, &col_types).unwrap();
-        assert!(matches!(decoded[0], Value::Null), "NULL should decode as Null");
+        assert!(
+            matches!(decoded[0], Value::Null),
+            "NULL should decode as Null"
+        );
         match &decoded[1] {
             Value::Text(s) => assert_eq!(s.as_ref() as &str, ""),
             other => panic!("expected Text(''), got {:?}", other),

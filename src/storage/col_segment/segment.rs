@@ -1,8 +1,8 @@
-use crate::storage::lsm::columnar::{ColumnarSSTable, FixedSegment, TextSegment, ColumnTypeTag};
+use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTable, FixedSegment, TextSegment};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 /// Cached decoded column segment (fixed or text).
 enum CachedCol {
@@ -97,16 +97,30 @@ impl Segment {
     }
 }
 
-fn decode_cached_value(cached: &CachedCol, idx: usize, ct: &crate::types::ColumnType) -> crate::types::Value {
+fn decode_cached_value(
+    cached: &CachedCol,
+    idx: usize,
+    ct: &crate::types::ColumnType,
+) -> crate::types::Value {
     use crate::types::{ColumnType, Value};
     match (cached, ct) {
-        (CachedCol::Fixed(f), ColumnType::Integer) => f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null),
-        (CachedCol::Fixed(f), ColumnType::Float) => f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null),
-        (CachedCol::Fixed(f), ColumnType::Boolean) => f.get_bool(idx).map(Value::Bool).unwrap_or(Value::Null),
-        (CachedCol::Fixed(f), ColumnType::Timestamp) => f.get_i64(idx)
-            .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))).unwrap_or(Value::Null),
-        (CachedCol::Text(t), ColumnType::Text) => t.get_str(idx)
-            .map(|s| Value::Text(s.into())).unwrap_or(Value::Null),
+        (CachedCol::Fixed(f), ColumnType::Integer) => {
+            f.get_i64(idx).map(Value::Integer).unwrap_or(Value::Null)
+        }
+        (CachedCol::Fixed(f), ColumnType::Float) => {
+            f.get_f64(idx).map(Value::Float).unwrap_or(Value::Null)
+        }
+        (CachedCol::Fixed(f), ColumnType::Boolean) => {
+            f.get_bool(idx).map(Value::Bool).unwrap_or(Value::Null)
+        }
+        (CachedCol::Fixed(f), ColumnType::Timestamp) => f
+            .get_i64(idx)
+            .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v)))
+            .unwrap_or(Value::Null),
+        (CachedCol::Text(t), ColumnType::Text) => t
+            .get_str(idx)
+            .map(|s| Value::Text(s.into()))
+            .unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }

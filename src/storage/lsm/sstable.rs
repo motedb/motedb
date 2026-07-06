@@ -18,10 +18,10 @@
 //! - Compression: 2.5-3:1 ratio (Snappy on 64KB blocks)
 //! - Block size: 64KB
 
-use super::{Key, Value, BloomFilter, LSMConfig, ValueData, BlobRef, CompressionAlgorithm};
+use super::{BlobRef, BloomFilter, CompressionAlgorithm, Key, LSMConfig, Value, ValueData};
 use crate::{Result, StorageError};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom, BufWriter, BufReader};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -115,9 +115,7 @@ impl SSTable {
     /// Used during startup to discover existing SSTables with correct key ranges.
     pub fn read_metadata_with_keys<P: AsRef<Path>>(path: P) -> Result<(u64, u64, u64, Key, Key)> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().read(true).open(path)?;
         let footer = Self::read_footer(&mut file)?;
         let file_size = file.metadata()?.len();
 
@@ -136,16 +134,20 @@ impl SSTable {
             0u64
         };
 
-        Ok((footer.num_entries, footer.min_timestamp, file_size, min_key, max_key))
+        Ok((
+            footer.num_entries,
+            footer.min_timestamp,
+            file_size,
+            min_key,
+            max_key,
+        ))
     }
 
     /// Read only metadata from an SSTable file (without loading index/bloom)
     /// Used during startup to discover existing SSTables.
     pub fn read_metadata<P: AsRef<Path>>(path: P) -> Result<(u64, u64, u64)> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().read(true).open(path)?;
         let footer = Self::read_footer(&mut file)?;
         let file_size = file.metadata()?.len();
         Ok((footer.num_entries, footer.min_timestamp, file_size))
@@ -154,9 +156,7 @@ impl SSTable {
     /// Open an existing SSTable
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().read(true).open(&path)?;
 
         // Read footer
         let footer = Self::read_footer(&mut file)?;
@@ -214,7 +214,7 @@ impl SSTable {
             footer,
         })
     }
-    
+
     /// Get a reference to the bloom filter for lock-free pre-checking
     pub fn bloom_filter(&self) -> &BloomFilter {
         &self.bloom
@@ -241,17 +241,21 @@ impl SSTable {
     /// Uses mmap when available (zero syscall), falls back to seek+read.
     fn read_block(&self, offset: u64, size: u32) -> Result<Vec<u8>> {
         if size < 4 {
-            return Err(crate::StorageError::InvalidData(
-                format!("Block too small at offset {}: {} bytes", offset, size)
-            ));
+            return Err(crate::StorageError::InvalidData(format!(
+                "Block too small at offset {}: {} bytes",
+                offset, size
+            )));
         }
 
         let buf: &[u8] = if let Some(ref mmap) = self.mmap {
             let end = offset as usize + size as usize;
             if end > mmap.len() {
-                return Err(crate::StorageError::InvalidData(
-                    format!("Block extends beyond mmap: offset {} + size {} > {}", offset, size, mmap.len())
-                ));
+                return Err(crate::StorageError::InvalidData(format!(
+                    "Block extends beyond mmap: offset {} + size {} > {}",
+                    offset,
+                    size,
+                    mmap.len()
+                )));
             }
             &mmap[offset as usize..end]
         } else {
@@ -262,14 +266,19 @@ impl SSTable {
         // Split data and CRC
         let data_len = buf.len() - 4;
         let data = &buf[..data_len];
-        let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+        let stored_crc = u32::from_le_bytes([
+            buf[data_len],
+            buf[data_len + 1],
+            buf[data_len + 2],
+            buf[data_len + 3],
+        ]);
 
         let computed_crc = crc32fast::hash(data);
         if stored_crc != computed_crc {
-            return Err(crate::StorageError::InvalidData(
-                format!("CRC32 mismatch at offset {}: expected {:08x}, got {:08x}. Data may be corrupted!",
-                    offset, stored_crc, computed_crc)
-            ));
+            return Err(crate::StorageError::InvalidData(format!(
+                "CRC32 mismatch at offset {}: expected {:08x}, got {:08x}. Data may be corrupted!",
+                offset, stored_crc, computed_crc
+            )));
         }
 
         Ok(data.to_vec())
@@ -284,14 +293,19 @@ impl SSTable {
 
         let data_len = buf.len() - 4;
         let data = &buf[..data_len];
-        let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+        let stored_crc = u32::from_le_bytes([
+            buf[data_len],
+            buf[data_len + 1],
+            buf[data_len + 2],
+            buf[data_len + 3],
+        ]);
 
         let computed_crc = crc32fast::hash(data);
         if stored_crc != computed_crc {
-            return Err(crate::StorageError::InvalidData(
-                format!("CRC32 mismatch at offset {}: expected {:08x}, got {:08x}. Data may be corrupted!",
-                    offset, stored_crc, computed_crc)
-            ));
+            return Err(crate::StorageError::InvalidData(format!(
+                "CRC32 mismatch at offset {}: expected {:08x}, got {:08x}. Data may be corrupted!",
+                offset, stored_crc, computed_crc
+            )));
         }
 
         Ok(data.to_vec())
@@ -331,18 +345,23 @@ impl SSTable {
             1 => {
                 // Snappy
                 let mut decoder = snap::raw::Decoder::new();
-                uncompressed = decoder.decompress_vec(&data[1..])
-                    .map_err(|e| crate::StorageError::Io(std::io::Error::other(
-                        format!("Snappy decompression failed: {}", e)
-                    )))?;
+                uncompressed = decoder.decompress_vec(&data[1..]).map_err(|e| {
+                    crate::StorageError::Io(std::io::Error::other(format!(
+                        "Snappy decompression failed: {}",
+                        e
+                    )))
+                })?;
                 &uncompressed
             }
             2 => {
                 // Zstd
-                uncompressed = zstd::bulk::decompress(&data[1..], 4 * 1024 * 1024)
-                    .map_err(|e| crate::StorageError::Io(std::io::Error::other(
-                        format!("Zstd decompression failed: {}", e)
-                    )))?;
+                uncompressed =
+                    zstd::bulk::decompress(&data[1..], 4 * 1024 * 1024).map_err(|e| {
+                        crate::StorageError::Io(std::io::Error::other(format!(
+                            "Zstd decompression failed: {}",
+                            e
+                        )))
+                    })?;
                 &uncompressed
             }
             _ => &data[1..],
@@ -354,8 +373,14 @@ impl SSTable {
         let num_entries = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
 
         let target_key = u64::from_be_bytes([
-            key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
-            key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
+            key_bytes[0],
+            key_bytes[1],
+            key_bytes[2],
+            key_bytes[3],
+            key_bytes[4],
+            key_bytes[5],
+            key_bytes[6],
+            key_bytes[7],
         ]);
 
         // Heap-allocated key-offset pairs (a 64KB block can hold ~2800 entries
@@ -369,10 +394,18 @@ impl SSTable {
         let mut off = 4usize;
 
         for _ in 0..num_entries {
-            if off + 8 > buf.len() { break; }
+            if off + 8 > buf.len() {
+                break;
+            }
             let k = u64::from_be_bytes([
-                buf[off], buf[off+1], buf[off+2], buf[off+3],
-                buf[off+4], buf[off+5], buf[off+6], buf[off+7],
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+                buf[off + 4],
+                buf[off + 5],
+                buf[off + 6],
+                buf[off + 7],
             ]);
 
             key_offsets.push((k, off));
@@ -380,16 +413,26 @@ impl SSTable {
 
             // Skip timestamp (8) + deleted (1) + value_type (1)
             off += 10;
-            if off > buf.len() { break; }
+            if off > buf.len() {
+                break;
+            }
             let value_type = buf[off - 1];
             match value_type {
                 0 => {
-                    if off + 4 > buf.len() { break; }
-                    let vlen = u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]) as usize;
+                    if off + 4 > buf.len() {
+                        break;
+                    }
+                    let vlen =
+                        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                            as usize;
                     off += 4 + vlen;
                 }
-                1 => { off += 16; }
-                _ => { break; }
+                1 => {
+                    off += 16;
+                }
+                _ => {
+                    break;
+                }
             }
         }
 
@@ -399,10 +442,18 @@ impl SSTable {
             Ok(idx) => {
                 let entry_off = key_offsets[idx].1;
                 let mut pos = entry_off + 8;
-                if pos + 10 > buf.len() { return Ok(None); }
+                if pos + 10 > buf.len() {
+                    return Ok(None);
+                }
                 let timestamp = u64::from_le_bytes([
-                    buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-                    buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                    buf[pos],
+                    buf[pos + 1],
+                    buf[pos + 2],
+                    buf[pos + 3],
+                    buf[pos + 4],
+                    buf[pos + 5],
+                    buf[pos + 6],
+                    buf[pos + 7],
                 ]);
                 pos += 8;
                 let deleted = buf[pos] != 0;
@@ -412,44 +463,79 @@ impl SSTable {
 
                 let value_data = match value_type {
                     0 => {
-                        if pos + 4 > buf.len() { return Ok(None); }
-                        let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                        if pos + 4 > buf.len() {
+                            return Ok(None);
+                        }
+                        let vlen = u32::from_le_bytes([
+                            buf[pos],
+                            buf[pos + 1],
+                            buf[pos + 2],
+                            buf[pos + 3],
+                        ]) as usize;
                         pos += 4;
-                        if pos + vlen > buf.len() { return Ok(None); }
-                        ValueData::Inline(std::sync::Arc::new(buf[pos..pos+vlen].to_vec()))
+                        if pos + vlen > buf.len() {
+                            return Ok(None);
+                        }
+                        ValueData::Inline(std::sync::Arc::new(buf[pos..pos + vlen].to_vec()))
                     }
                     1 => {
-                        if pos + 16 > buf.len() { return Ok(None); }
-                        let file_id = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                        if pos + 16 > buf.len() {
+                            return Ok(None);
+                        }
+                        let file_id = u32::from_le_bytes([
+                            buf[pos],
+                            buf[pos + 1],
+                            buf[pos + 2],
+                            buf[pos + 3],
+                        ]);
                         pos += 4;
                         let blob_offset = u64::from_le_bytes([
-                            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-                            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                            buf[pos],
+                            buf[pos + 1],
+                            buf[pos + 2],
+                            buf[pos + 3],
+                            buf[pos + 4],
+                            buf[pos + 5],
+                            buf[pos + 6],
+                            buf[pos + 7],
                         ]);
                         pos += 8;
-                        let size = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
-                        ValueData::Blob(BlobRef { file_id, offset: blob_offset, size })
+                        let size = u32::from_le_bytes([
+                            buf[pos],
+                            buf[pos + 1],
+                            buf[pos + 2],
+                            buf[pos + 3],
+                        ]);
+                        ValueData::Blob(BlobRef {
+                            file_id,
+                            offset: blob_offset,
+                            size,
+                        })
                     }
                     _ => return Ok(None),
                 };
 
-                Ok(Some(Value { data: value_data, timestamp, deleted }))
+                Ok(Some(Value {
+                    data: value_data,
+                    timestamp,
+                    deleted,
+                }))
             }
             Err(_) => Ok(None),
         }
     }
-    
+
     /// 🚀 P3: 批量查询（使用批量 Bloom Filter 检查）
-    /// 
+    ///
     /// ## 关键优化
     /// - **批量 Bloom Filter 检查**：减少函数调用开销
     /// - **预过滤**：快速排除不存在的 keys（~99% 过滤率）
     /// - **批量块读取**：减少磁盘 I/O 次数
-    /// 
+    ///
     /// ## 性能提升
     /// - 单个查询：~50 ns/key
     /// - 批量查询：**~20 ns/key**（**2.5x 提速** 🚀）
-    /// 
+    ///
     /// ## Example
     /// ```ignore
     /// let keys = vec![key1, key2, key3];
@@ -457,12 +543,12 @@ impl SSTable {
     /// ```
     pub fn batch_get(&self, keys: &[Key]) -> Result<Vec<Option<Value>>> {
         let mut results = vec![None; keys.len()];
-        
+
         // Step 1: 🚀 批量 Bloom Filter 检查（快速过滤）
         let key_bytes: Vec<[u8; 8]> = keys.iter().map(|k| k.to_be_bytes()).collect();
         let key_refs: Vec<&[u8]> = key_bytes.iter().map(|b| b.as_slice()).collect();
         let bloom_results = self.bloom.may_contain_batch(&key_refs);
-        
+
         // Step 2: 只查询可能存在的 keys
         let mut candidates: Vec<(usize, Key)> = Vec::new();
         for (i, &may_exist) in bloom_results.iter().enumerate() {
@@ -470,47 +556,51 @@ impl SSTable {
                 candidates.push((i, keys[i]));
             }
         }
-        
+
         // Step 3: 批量查询候选 keys
         // 🔧 优化：按 block 分组，减少磁盘 I/O
         for (idx, key) in candidates {
             let key_bytes = key.to_be_bytes();
-            
+
             // Binary search in index
             let block_entry = match self.index.find_block(&key_bytes) {
                 Some(entry) => entry,
                 None => continue,
             };
-            
+
             // Read and search block (with CRC verification)
             let block_buf = self.read_block(block_entry.offset, block_entry.size)?;
 
             let block = DataBlock::deserialize(&block_buf)?;
             results[idx] = block.get(&key_bytes);
         }
-        
+
         Ok(results)
     }
-    
+
     /// Scan a range [start, end)
     pub fn scan(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
         // 🚀 P3 优化：预分配容量（估算范围大小）
         let estimated_size = ((end - start) as usize).min(1000);
         let mut results = Vec::with_capacity(estimated_size);
-        
+
         let start_bytes = start.to_be_bytes();
-        
+
         // Find starting block
         let start_idx = self.index.find_block_index(&start_bytes);
-        
+
         // Scan blocks with zone map skip
         for i in start_idx..self.index.entries.len() {
             let entry = &self.index.entries[i];
 
             // Zone map skip: block entirely before our range
-            if entry.last_key < start { continue; }
+            if entry.last_key < start {
+                continue;
+            }
             // Zone map skip: block entirely past our range
-            if entry.first_key >= end { break; }
+            if entry.first_key >= end {
+                break;
+            }
 
             let block_buf = self.read_block(entry.offset, entry.size)?;
             let block = DataBlock::deserialize(&block_buf)?;
@@ -525,12 +615,12 @@ impl SSTable {
                 }
             }
         }
-        
+
         Ok(results)
     }
-    
+
     /// 🆕 Scan all entries in SSTable
-    /// 
+    ///
     /// Used by scan_prefix() to scan entire table and filter by prefix
     pub fn scan_all(&mut self) -> Result<Vec<(Key, Value)>> {
         // Estimate capacity based on footer
@@ -538,46 +628,47 @@ impl SSTable {
         let mut results = Vec::with_capacity(estimated_size);
 
         // Scan all blocks (collect offsets to avoid borrow conflict)
-        let block_entries: Vec<_> = self.index.entries.iter()
+        let block_entries: Vec<_> = self
+            .index
+            .entries
+            .iter()
             .map(|e| (e.offset, e.size))
             .collect();
 
         for (offset, size) in block_entries {
             let block_buf = self.read_block(offset, size)?;
             let block = DataBlock::deserialize(&block_buf)?;
-            
+
             // Add all entries from this block
             for (k, v) in block.entries.iter() {
                 results.push((*k, v.clone()));
             }
         }
-        
+
         Ok(results)
     }
-    
+
     /// Get file path
     pub fn path(&self) -> &Path {
         &self.path
     }
-    
+
     /// Iterate over all entries in this SSTable
     pub fn iter(&mut self) -> Result<SSTableIterator> {
         SSTableIterator::new(self)
     }
-    
+
     /// Get statistics
     pub fn stats(&self) -> SSTableStats {
         SSTableStats {
             num_entries: self.footer.num_entries,
-            file_size: std::fs::metadata(&self.path)
-                .map(|m| m.len())
-                .unwrap_or(0),
+            file_size: std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
             num_blocks: self.index.entries.len(),
             min_timestamp: self.footer.min_timestamp,
             max_timestamp: self.footer.max_timestamp,
         }
     }
-    
+
     // Internal helper
     fn read_footer(file: &mut File) -> Result<Footer> {
         let file_size = file.metadata()?.len();
@@ -597,10 +688,10 @@ impl SSTable {
         let index_end = footer.index_offset + footer.index_size as u64;
         let bloom_end = footer.bloom_offset + footer.bloom_size as u64;
         if index_end > data_end || bloom_end > data_end {
-            return Err(StorageError::InvalidData(
-                format!("SSTable footer points beyond file: index_end={}, bloom_end={}, data_end={}",
-                        index_end, bloom_end, data_end)
-            ));
+            return Err(StorageError::InvalidData(format!(
+                "SSTable footer points beyond file: index_end={}, bloom_end={}, data_end={}",
+                index_end, bloom_end, data_end
+            )));
         }
 
         Ok(footer)
@@ -611,31 +702,31 @@ impl SSTable {
 pub struct SSTableBuilder {
     /// Output file
     writer: BufWriter<File>,
-    
+
     /// File path (store separately)
     path: PathBuf,
-    
+
     /// Current block
     current_block: DataBlock,
-    
+
     /// Block index being built
     index: BlockIndex,
-    
+
     /// Bloom filter
     bloom: BloomFilter,
-    
+
     /// Configuration
     config: LSMConfig,
-    
+
     /// Statistics
     num_entries: u64,
     min_timestamp: u64,
     max_timestamp: u64,
-    
+
     /// 🔧 Key range tracking
     min_key: Option<Key>,
     max_key: Option<Key>,
-    
+
     /// Current file offset
     offset: u64,
 }
@@ -674,34 +765,34 @@ impl SSTableBuilder {
             offset: 0,
         })
     }
-    
+
     /// Add a key-value pair (must be in sorted order)
     pub fn add(&mut self, key: Key, value: Value) -> Result<()> {
         // Update bloom filter (convert u64 to bytes)
         self.bloom.insert(&key.to_be_bytes());
-        
+
         // Update statistics
         self.num_entries += 1;
         self.min_timestamp = self.min_timestamp.min(value.timestamp);
         self.max_timestamp = self.max_timestamp.max(value.timestamp);
-        
+
         // 🔧 Track min/max keys
         if self.min_key.is_none() {
             self.min_key = Some(key);
         }
         self.max_key = Some(key);
-        
+
         // Add to current block
         self.current_block.add(key, value)?;
-        
+
         // Flush block if full
         if self.current_block.size() >= self.config.block_size {
             self.flush_block()?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Finish building and write footer
     ///
     /// Atomically renames the temp file to the final path after fsync,
@@ -739,7 +830,11 @@ impl SSTableBuilder {
             bloom_offset,
             bloom_size,
             num_entries: self.num_entries,
-            min_timestamp: if self.min_timestamp == u64::MAX { 0 } else { self.min_timestamp },
+            min_timestamp: if self.min_timestamp == u64::MAX {
+                0
+            } else {
+                self.min_timestamp
+            },
             max_timestamp: self.max_timestamp,
             max_key: self.max_key.unwrap_or(u64::MAX),
         };
@@ -767,22 +862,32 @@ impl SSTableBuilder {
             num_entries: self.num_entries,
             min_key,
             max_key,
-            min_timestamp: if self.min_timestamp == u64::MAX { 0 } else { self.min_timestamp },
+            min_timestamp: if self.min_timestamp == u64::MAX {
+                0
+            } else {
+                self.min_timestamp
+            },
             max_timestamp: self.max_timestamp,
             bloom_filter: Some(Arc::new(self.bloom)),
         })
     }
-    
+
     // Internal helper
     fn flush_block(&mut self) -> Result<()> {
         if self.current_block.is_empty() {
             return Ok(());
         }
-        
-        let first_key = self.current_block.entries.first()
-            .map(|(k, _)| *k)  // ✅ u64 copy is cheap, no clone()
+
+        let first_key = self
+            .current_block
+            .entries
+            .first()
+            .map(|(k, _)| *k) // ✅ u64 copy is cheap, no clone()
             .ok_or_else(|| StorageError::InvalidData("Empty block".into()))?;
-        let last_key = self.current_block.entries.last()
+        let last_key = self
+            .current_block
+            .entries
+            .last()
             .map(|(k, _)| *k)
             .ok_or_else(|| StorageError::InvalidData("Empty block".into()))?;
 
@@ -795,7 +900,10 @@ impl SSTableBuilder {
 
         // Record in index with zone map (first_key + last_key for block skipping)
         self.index.entries.push(BlockIndexEntry {
-            first_key, offset: self.offset, size: block_size + 4, last_key,
+            first_key,
+            offset: self.offset,
+            size: block_size + 4,
+            last_key,
         });
 
         // Write to file: block_data + CRC32
@@ -803,10 +911,10 @@ impl SSTableBuilder {
         let crc = crc32fast::hash(&block_data);
         self.writer.write_all(&crc.to_le_bytes())?;
         self.offset += block_size as u64 + 4;
-        
+
         // Reset block
         self.current_block = DataBlock::new();
-        
+
         Ok(())
     }
 }
@@ -822,53 +930,61 @@ impl DataBlock {
             entries: Vec::new(),
         }
     }
-    
+
     fn add(&mut self, key: Key, value: Value) -> Result<()> {
         self.entries.push((key, value));
         Ok(())
     }
-    
+
     fn get(&self, key_bytes: &[u8]) -> Option<Value> {
         // Convert bytes back to u64 for comparison
         if key_bytes.len() != 8 {
             return None;
         }
         let key = u64::from_be_bytes([
-            key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
-            key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
+            key_bytes[0],
+            key_bytes[1],
+            key_bytes[2],
+            key_bytes[3],
+            key_bytes[4],
+            key_bytes[5],
+            key_bytes[6],
+            key_bytes[7],
         ]);
-        
+
         // Binary search
-        self.entries.binary_search_by_key(&key, |(k, _)| *k)
+        self.entries
+            .binary_search_by_key(&key, |(k, _)| *k)
             .ok()
             .map(|idx| self.entries[idx].1.clone())
     }
-    
+
     fn size(&self) -> usize {
-        self.entries.iter()
-            .map(|(_, v)| 8 + v.data.len() + 24)  // u64 key is always 8 bytes
+        self.entries
+            .iter()
+            .map(|(_, v)| 8 + v.data.len() + 24) // u64 key is always 8 bytes
             .sum()
     }
-    
+
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    
+
     fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        
+
         // Number of entries
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        
+
         // Entries
         for (key, value) in &self.entries {
             // Key as u64 (8 bytes, BIG-ENDIAN for ordering)
             buf.extend_from_slice(&key.to_be_bytes());
-            
+
             // Value metadata
             buf.extend_from_slice(&value.timestamp.to_le_bytes());
             buf.extend_from_slice(&[if value.deleted { 1 } else { 0 }]);
-            
+
             // Value data (inline or blob ref)
             match &value.data {
                 ValueData::Inline(data) => {
@@ -886,11 +1002,15 @@ impl DataBlock {
                 }
             }
         }
-        
+
         Ok(buf)
     }
-    
-    fn serialize_compressed(&self, enable_compression: bool, algorithm: CompressionAlgorithm) -> Result<Vec<u8>> {
+
+    fn serialize_compressed(
+        &self,
+        enable_compression: bool,
+        algorithm: CompressionAlgorithm,
+    ) -> Result<Vec<u8>> {
         let uncompressed = self.serialize()?;
 
         if !enable_compression || uncompressed.len() < 1024 {
@@ -902,10 +1022,12 @@ impl DataBlock {
         match algorithm {
             CompressionAlgorithm::Zstd => {
                 let level = 1; // fast level
-                let compressed = zstd::bulk::compress(&uncompressed, level)
-                    .map_err(|e| StorageError::Io(std::io::Error::other(
-                        format!("Zstd compression failed: {}", e)
-                    )))?;
+                let compressed = zstd::bulk::compress(&uncompressed, level).map_err(|e| {
+                    StorageError::Io(std::io::Error::other(format!(
+                        "Zstd compression failed: {}",
+                        e
+                    )))
+                })?;
 
                 if compressed.len() < uncompressed.len() {
                     let mut result = vec![2u8]; // flag 2 = zstd
@@ -919,10 +1041,12 @@ impl DataBlock {
             }
             CompressionAlgorithm::Snappy => {
                 let mut encoder = snap::raw::Encoder::new();
-                let compressed = encoder.compress_vec(&uncompressed)
-                    .map_err(|e| StorageError::Io(std::io::Error::other(
-                        format!("Snappy compression failed: {}", e)
-                    )))?;
+                let compressed = encoder.compress_vec(&uncompressed).map_err(|e| {
+                    StorageError::Io(std::io::Error::other(format!(
+                        "Snappy compression failed: {}",
+                        e
+                    )))
+                })?;
 
                 if compressed.len() < uncompressed.len() {
                     let mut result = vec![1u8]; // flag 1 = snappy
@@ -941,74 +1065,95 @@ impl DataBlock {
             }
         }
     }
-    
+
     fn deserialize(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(StorageError::InvalidData("Empty block data".into()));
         }
-        
+
         // Check compression flag (first byte)
         let compression_flag = data[0];
         let actual_data = &data[1..];
-        
+
         let uncompressed = match compression_flag {
             0 => actual_data.to_vec(),
             1 => {
                 // Snappy
                 let mut decoder = snap::raw::Decoder::new();
-                decoder.decompress_vec(actual_data)
-                    .map_err(|e| StorageError::Io(std::io::Error::other(
-                        format!("Snappy decompression failed: {}", e)
-                    )))?
+                decoder.decompress_vec(actual_data).map_err(|e| {
+                    StorageError::Io(std::io::Error::other(format!(
+                        "Snappy decompression failed: {}",
+                        e
+                    )))
+                })?
             }
             2 => {
                 // Zstd — use generous max output size (block size + overhead)
-                zstd::bulk::decompress(actual_data, 4 * 1024 * 1024)
-                    .map_err(|e| StorageError::Io(std::io::Error::other(
-                        format!("Zstd decompression failed: {}", e)
-                    )))?
+                zstd::bulk::decompress(actual_data, 4 * 1024 * 1024).map_err(|e| {
+                    StorageError::Io(std::io::Error::other(format!(
+                        "Zstd decompression failed: {}",
+                        e
+                    )))
+                })?
             }
             _ => {
-                return Err(StorageError::InvalidData(
-                    format!("Unknown compression flag: {}", compression_flag)
-                ));
+                return Err(StorageError::InvalidData(format!(
+                    "Unknown compression flag: {}",
+                    compression_flag
+                )));
             }
         };
-        
+
         // Now deserialize the uncompressed data
         Self::deserialize_raw(&uncompressed)
     }
-    
+
     fn deserialize_raw(data: &[u8]) -> Result<Self> {
         let mut offset = 0;
-        
+
         // Read number of entries
         if data.len() < 4 {
             return Err(StorageError::InvalidData("Block too small".into()));
         }
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         offset += 4;
-        
+
         let mut entries = Vec::with_capacity(num_entries);
-        
+
         for _ in 0..num_entries {
             // Read key as u64 (8 bytes, BIG-ENDIAN)
             if offset + 8 > data.len() {
-                return Err(StorageError::InvalidData("Insufficient data for key".into()));
+                return Err(StorageError::InvalidData(
+                    "Insufficient data for key".into(),
+                ));
             }
             let key = u64::from_be_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
             ]);
             offset += 8;
-            
+
             // Read value metadata
             if offset + 10 > data.len() {
-                return Err(StorageError::InvalidData("Insufficient data for value metadata".into()));
+                return Err(StorageError::InvalidData(
+                    "Insufficient data for value metadata".into(),
+                ));
             }
             let timestamp = u64::from_le_bytes([
-                data[offset], data[offset+1], data[offset+2], data[offset+3],
-                data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
             ]);
             offset += 8;
             let deleted = data[offset] != 0;
@@ -1022,37 +1167,58 @@ impl DataBlock {
                 0 => {
                     // Inline
                     if offset + 4 > data.len() {
-                        return Err(StorageError::InvalidData("Insufficient data for value length".into()));
+                        return Err(StorageError::InvalidData(
+                            "Insufficient data for value length".into(),
+                        ));
                     }
                     let value_len = u32::from_le_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3]
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]) as usize;
                     offset += 4;
                     if offset + value_len > data.len() {
-                        return Err(StorageError::InvalidData(
-                            format!("Value data exceeds block: need {} bytes, have {}", value_len, data.len() - offset)
-                        ));
+                        return Err(StorageError::InvalidData(format!(
+                            "Value data exceeds block: need {} bytes, have {}",
+                            value_len,
+                            data.len() - offset
+                        )));
                     }
-                    let inline_data = data[offset..offset+value_len].to_vec();
+                    let inline_data = data[offset..offset + value_len].to_vec();
                     offset += value_len;
                     ValueData::Inline(std::sync::Arc::new(inline_data))
                 }
                 1 => {
                     // Blob reference
                     if offset + 16 > data.len() {
-                        return Err(StorageError::InvalidData("Insufficient data for blob reference".into()));
+                        return Err(StorageError::InvalidData(
+                            "Insufficient data for blob reference".into(),
+                        ));
                     }
                     let file_id = u32::from_le_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3]
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     offset += 4;
                     let blob_offset = u64::from_le_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3],
-                        data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
+                        data[offset + 4],
+                        data[offset + 5],
+                        data[offset + 6],
+                        data[offset + 7],
                     ]);
                     offset += 8;
                     let size = u32::from_le_bytes([
-                        data[offset], data[offset+1], data[offset+2], data[offset+3]
+                        data[offset],
+                        data[offset + 1],
+                        data[offset + 2],
+                        data[offset + 3],
                     ]);
                     offset += 4;
                     ValueData::Blob(BlobRef {
@@ -1062,17 +1228,23 @@ impl DataBlock {
                     })
                 }
                 _ => {
-                    return Err(StorageError::InvalidData(format!("Unknown value type: {}", value_type)));
+                    return Err(StorageError::InvalidData(format!(
+                        "Unknown value type: {}",
+                        value_type
+                    )));
                 }
             };
-            
-            entries.push((key, Value {
-                data: value_data,
-                timestamp,
-                deleted,
-            }));
+
+            entries.push((
+                key,
+                Value {
+                    data: value_data,
+                    timestamp,
+                    deleted,
+                },
+            ));
         }
-        
+
         Ok(Self { entries })
     }
 }
@@ -1089,20 +1261,23 @@ fn decompress_block(data: &[u8]) -> Result<Vec<u8>> {
         0 => Ok(actual_data.to_vec()),
         1 => {
             let mut decoder = snap::raw::Decoder::new();
-            decoder.decompress_vec(actual_data)
-                .map_err(|e| StorageError::Io(std::io::Error::other(
-                    format!("Snappy decompression failed: {}", e)
+            decoder.decompress_vec(actual_data).map_err(|e| {
+                StorageError::Io(std::io::Error::other(format!(
+                    "Snappy decompression failed: {}",
+                    e
                 )))
+            })
         }
-        2 => {
-            zstd::bulk::decompress(actual_data, 4 * 1024 * 1024)
-                .map_err(|e| StorageError::Io(std::io::Error::other(
-                    format!("Zstd decompression failed: {}", e)
-                )))
-        }
-        _ => Err(StorageError::InvalidData(
-            format!("Unknown compression flag: {}", compression_flag)
-        )),
+        2 => zstd::bulk::decompress(actual_data, 4 * 1024 * 1024).map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "Zstd decompression failed: {}",
+                e
+            )))
+        }),
+        _ => Err(StorageError::InvalidData(format!(
+            "Unknown compression flag: {}",
+            compression_flag
+        ))),
     }
 }
 
@@ -1134,7 +1309,9 @@ impl LazyEntryCursor {
     /// Create a cursor from decompressed block bytes (Arc for zero-copy sharing).
     fn new(data: Arc<Vec<u8>>) -> Result<Self> {
         if data.len() < 4 {
-            return Err(StorageError::InvalidData("Block too small for header".into()));
+            return Err(StorageError::InvalidData(
+                "Block too small for header".into(),
+            ));
         }
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         // Sanity cap against corrupted data (minimum ~22 bytes per entry)
@@ -1151,8 +1328,12 @@ impl LazyEntryCursor {
     /// Peek at the next entry's key without advancing the cursor.
     /// Zero allocation — just reads 8 bytes from current position.
     fn peek_key(&self) -> Option<Key> {
-        if self.entries_consumed >= self.num_entries { return None; }
-        if self.pos + 8 > self.data.len() { return None; }
+        if self.entries_consumed >= self.num_entries {
+            return None;
+        }
+        if self.pos + 8 > self.data.len() {
+            return None;
+        }
         let key = u64::from_be_bytes([
             self.data[self.pos],
             self.data[self.pos + 1],
@@ -1192,9 +1373,12 @@ impl LazyEntryCursor {
             0 => {
                 // Inline: skip [data_len: u32] + [data: bytes]
                 if pos + 4 > buf.len() {
-                    return Err(StorageError::InvalidData("Truncated inline length in skip".into()));
+                    return Err(StorageError::InvalidData(
+                        "Truncated inline length in skip".into(),
+                    ));
                 }
-                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+                    as usize;
                 pos += 4 + vlen;
             }
             1 => {
@@ -1202,9 +1386,10 @@ impl LazyEntryCursor {
                 pos += 16;
             }
             _ => {
-                return Err(StorageError::InvalidData(
-                    format!("Unknown value type in skip: {}", value_type)
-                ));
+                return Err(StorageError::InvalidData(format!(
+                    "Unknown value type in skip: {}",
+                    value_type
+                )));
             }
         }
 
@@ -1228,8 +1413,14 @@ impl LazyEntryCursor {
             return Err(StorageError::InvalidData("Truncated key".into()));
         }
         let key = u64::from_be_bytes([
-            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         pos += 8;
 
@@ -1238,8 +1429,14 @@ impl LazyEntryCursor {
             return Err(StorageError::InvalidData("Truncated value metadata".into()));
         }
         let timestamp = u64::from_le_bytes([
-            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         pos += 8;
         let deleted = buf[pos] != 0;
@@ -1253,14 +1450,16 @@ impl LazyEntryCursor {
                 if pos + 4 > buf.len() {
                     return Err(StorageError::InvalidData("Truncated inline length".into()));
                 }
-                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+                    as usize;
                 pos += 4;
                 if pos + vlen > buf.len() {
-                    return Err(StorageError::InvalidData(
-                        format!("Inline data exceeds block: need {} bytes at pos {}", vlen, pos)
-                    ));
+                    return Err(StorageError::InvalidData(format!(
+                        "Inline data exceeds block: need {} bytes at pos {}",
+                        vlen, pos
+                    )));
                 }
-                let inline_data = buf[pos..pos+vlen].to_vec();
+                let inline_data = buf[pos..pos + vlen].to_vec();
                 pos += vlen;
                 ValueData::Inline(std::sync::Arc::new(inline_data))
             }
@@ -1269,27 +1468,46 @@ impl LazyEntryCursor {
                 if pos + 16 > buf.len() {
                     return Err(StorageError::InvalidData("Truncated blob reference".into()));
                 }
-                let file_id = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                let file_id =
+                    u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
                 pos += 4;
                 let blob_offset = u64::from_le_bytes([
-                    buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-                    buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+                    buf[pos],
+                    buf[pos + 1],
+                    buf[pos + 2],
+                    buf[pos + 3],
+                    buf[pos + 4],
+                    buf[pos + 5],
+                    buf[pos + 6],
+                    buf[pos + 7],
                 ]);
                 pos += 8;
-                let size = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+                let size = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
                 pos += 4;
-                ValueData::Blob(BlobRef { file_id, offset: blob_offset, size })
+                ValueData::Blob(BlobRef {
+                    file_id,
+                    offset: blob_offset,
+                    size,
+                })
             }
             _ => {
-                return Err(StorageError::InvalidData(
-                    format!("Unknown value type: {}", value_type)
-                ));
+                return Err(StorageError::InvalidData(format!(
+                    "Unknown value type: {}",
+                    value_type
+                )));
             }
         };
 
         self.pos = pos;
         self.entries_consumed += 1;
-        Ok(Some((key, Value { data: value_data, timestamp, deleted })))
+        Ok(Some((
+            key,
+            Value {
+                data: value_data,
+                timestamp,
+                deleted,
+            },
+        )))
     }
 
     /// Zero-copy entry parse: returns value bytes as a slice into the block buffer.
@@ -1309,8 +1527,14 @@ impl LazyEntryCursor {
             return Err(StorageError::InvalidData("Truncated key".into()));
         }
         let key = u64::from_be_bytes([
-            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         pos += 8;
 
@@ -1319,8 +1543,14 @@ impl LazyEntryCursor {
             return Err(StorageError::InvalidData("Truncated value metadata".into()));
         }
         let timestamp = u64::from_le_bytes([
-            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         pos += 8;
         let deleted = buf[pos] != 0;
@@ -1333,19 +1563,29 @@ impl LazyEntryCursor {
                 if pos + 4 > buf.len() {
                     return Err(StorageError::InvalidData("Truncated inline len".into()));
                 }
-                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+                    as usize;
                 pos += 4;
                 if pos + vlen > buf.len() {
-                    return Err(StorageError::InvalidData(
-                        format!("Inline data exceeds block: need {} bytes at pos {}", vlen, pos)
-                    ));
+                    return Err(StorageError::InvalidData(format!(
+                        "Inline data exceeds block: need {} bytes at pos {}",
+                        vlen, pos
+                    )));
                 }
                 let start = pos;
                 pos += vlen;
                 start
             }
-            1 => { pos += 16; pos }
-            _ => return Err(StorageError::InvalidData(format!("Unknown value type: {}", value_type))),
+            1 => {
+                pos += 16;
+                pos
+            }
+            _ => {
+                return Err(StorageError::InvalidData(format!(
+                    "Unknown value type: {}",
+                    value_type
+                )))
+            }
         };
 
         let value_len = pos - value_start;
@@ -1371,8 +1611,14 @@ impl LazyEntryCursor {
             return Err(StorageError::InvalidData("Truncated key".into()));
         }
         let key = u64::from_be_bytes([
-            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         pos += 8;
 
@@ -1381,8 +1627,14 @@ impl LazyEntryCursor {
             return Err(StorageError::InvalidData("Truncated value metadata".into()));
         }
         let timestamp = u64::from_le_bytes([
-            buf[pos], buf[pos+1], buf[pos+2], buf[pos+3],
-            buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7],
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+            buf[pos + 4],
+            buf[pos + 5],
+            buf[pos + 6],
+            buf[pos + 7],
         ]);
         pos += 8;
         let deleted = buf[pos] != 0;
@@ -1396,12 +1648,14 @@ impl LazyEntryCursor {
                 if pos + 4 > buf.len() {
                     return Err(StorageError::InvalidData("Truncated inline length".into()));
                 }
-                let vlen = u32::from_le_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]) as usize;
+                let vlen = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+                    as usize;
                 pos += 4;
                 if pos + vlen > buf.len() {
-                    return Err(StorageError::InvalidData(
-                        format!("Inline data exceeds block: need {} bytes at pos {}", vlen, pos)
-                    ));
+                    return Err(StorageError::InvalidData(format!(
+                        "Inline data exceeds block: need {} bytes at pos {}",
+                        vlen, pos
+                    )));
                 }
                 let start = pos;
                 pos += vlen;
@@ -1413,9 +1667,10 @@ impl LazyEntryCursor {
                 pos // empty
             }
             _ => {
-                return Err(StorageError::InvalidData(
-                    format!("Unknown value type: {}", value_type)
-                ));
+                return Err(StorageError::InvalidData(format!(
+                    "Unknown value type: {}",
+                    value_type
+                )));
             }
         };
 
@@ -1425,7 +1680,14 @@ impl LazyEntryCursor {
 
         // Clone the block Arc (~2ns refcount bump) — entries share the block's memory
         let block = Arc::clone(&self.data);
-        Ok(Some((key, timestamp, deleted, block, value_start, value_len)))
+        Ok(Some((
+            key,
+            timestamp,
+            deleted,
+            block,
+            value_start,
+            value_len,
+        )))
     }
 }
 
@@ -1443,8 +1705,14 @@ impl BlockIndex {
 
         // Convert bytes to u64 for comparison
         let key = u64::from_be_bytes([
-            key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
-            key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
+            key_bytes[0],
+            key_bytes[1],
+            key_bytes[2],
+            key_bytes[3],
+            key_bytes[4],
+            key_bytes[5],
+            key_bytes[6],
+            key_bytes[7],
         ]);
 
         // Binary search for the block that might contain this key
@@ -1466,13 +1734,25 @@ impl BlockIndex {
         }
 
         let key = u64::from_be_bytes([
-            key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
-            key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7],
+            key_bytes[0],
+            key_bytes[1],
+            key_bytes[2],
+            key_bytes[3],
+            key_bytes[4],
+            key_bytes[5],
+            key_bytes[6],
+            key_bytes[7],
         ]);
 
         match self.entries.binary_search_by(|e| e.first_key.cmp(&key)) {
             Ok(idx) => idx,
-            Err(idx) => if idx == 0 { 0 } else { idx - 1 },
+            Err(idx) => {
+                if idx == 0 {
+                    0
+                } else {
+                    idx - 1
+                }
+            }
         }
     }
 
@@ -1513,9 +1793,12 @@ impl BlockIndex {
             // Legacy format without last_key — reconstruct from block data
             Self::deserialize_v1(data, num_entries)
         } else {
-            Err(StorageError::InvalidData(
-                format!("BlockIndex truncated: expected {} (or {} legacy) bytes, got {}", new_size, old_size, data.len())
-            ))
+            Err(StorageError::InvalidData(format!(
+                "BlockIndex truncated: expected {} (or {} legacy) bytes, got {}",
+                new_size,
+                old_size,
+                data.len()
+            )))
         }
     }
 
@@ -1526,29 +1809,51 @@ impl BlockIndex {
 
         for _ in 0..num_entries {
             let first_key = u64::from_be_bytes([
-                data[off], data[off+1], data[off+2], data[off+3],
-                data[off+4], data[off+5], data[off+6], data[off+7],
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
             ]);
             off += 8;
 
             let block_offset = u64::from_le_bytes([
-                data[off], data[off+1], data[off+2], data[off+3],
-                data[off+4], data[off+5], data[off+6], data[off+7],
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
             ]);
             off += 8;
 
-            let block_size = u32::from_le_bytes([
-                data[off], data[off+1], data[off+2], data[off+3]
-            ]);
+            let block_size =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             off += 4;
 
             let last_key = u64::from_be_bytes([
-                data[off], data[off+1], data[off+2], data[off+3],
-                data[off+4], data[off+5], data[off+6], data[off+7],
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
             ]);
             off += 8;
 
-            entries.push(BlockIndexEntry { first_key, offset: block_offset, size: block_size, last_key });
+            entries.push(BlockIndexEntry {
+                first_key,
+                offset: block_offset,
+                size: block_size,
+                last_key,
+            });
         }
 
         Ok(Self { entries })
@@ -1561,20 +1866,31 @@ impl BlockIndex {
 
         for i in 0..num_entries {
             let first_key = u64::from_be_bytes([
-                data[off], data[off+1], data[off+2], data[off+3],
-                data[off+4], data[off+5], data[off+6], data[off+7],
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
             ]);
             off += 8;
 
             let block_offset = u64::from_le_bytes([
-                data[off], data[off+1], data[off+2], data[off+3],
-                data[off+4], data[off+5], data[off+6], data[off+7],
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
             ]);
             off += 8;
 
-            let block_size = u32::from_le_bytes([
-                data[off], data[off+1], data[off+2], data[off+3]
-            ]);
+            let block_size =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             off += 4;
 
             // Legacy: last_key is unknown — use first_key as approximation.
@@ -1582,15 +1898,26 @@ impl BlockIndex {
             let last_key = if i + 1 < num_entries {
                 // Use next block's first_key - 1 as upper bound
                 let next_first = u64::from_be_bytes([
-                    data[off], data[off+1], data[off+2], data[off+3],
-                    data[off+4], data[off+5], data[off+6], data[off+7],
+                    data[off],
+                    data[off + 1],
+                    data[off + 2],
+                    data[off + 3],
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
                 ]);
                 next_first.saturating_sub(1)
             } else {
                 u64::MAX // Last block: assume it covers everything up to max
             };
 
-            entries.push(BlockIndexEntry { first_key, offset: block_offset, size: block_size, last_key });
+            entries.push(BlockIndexEntry {
+                first_key,
+                offset: block_offset,
+                size: block_size,
+                last_key,
+            });
         }
 
         Ok(Self { entries })
@@ -1606,95 +1933,146 @@ impl Footer {
     fn serialize(&self) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; 64];
         let mut offset = 0;
-        
-        buf[offset..offset+4].copy_from_slice(&self.magic.to_le_bytes());
+
+        buf[offset..offset + 4].copy_from_slice(&self.magic.to_le_bytes());
         offset += 4;
-        buf[offset..offset+4].copy_from_slice(&self.version.to_le_bytes());
+        buf[offset..offset + 4].copy_from_slice(&self.version.to_le_bytes());
         offset += 4;
-        buf[offset..offset+8].copy_from_slice(&self.index_offset.to_le_bytes());
+        buf[offset..offset + 8].copy_from_slice(&self.index_offset.to_le_bytes());
         offset += 8;
-        buf[offset..offset+4].copy_from_slice(&self.index_size.to_le_bytes());
+        buf[offset..offset + 4].copy_from_slice(&self.index_size.to_le_bytes());
         offset += 4;
-        buf[offset..offset+8].copy_from_slice(&self.bloom_offset.to_le_bytes());
+        buf[offset..offset + 8].copy_from_slice(&self.bloom_offset.to_le_bytes());
         offset += 8;
-        buf[offset..offset+4].copy_from_slice(&self.bloom_size.to_le_bytes());
+        buf[offset..offset + 4].copy_from_slice(&self.bloom_size.to_le_bytes());
         offset += 4;
-        buf[offset..offset+8].copy_from_slice(&self.num_entries.to_le_bytes());
+        buf[offset..offset + 8].copy_from_slice(&self.num_entries.to_le_bytes());
         offset += 8;
-        buf[offset..offset+8].copy_from_slice(&self.min_timestamp.to_le_bytes());
+        buf[offset..offset + 8].copy_from_slice(&self.min_timestamp.to_le_bytes());
         offset += 8;
-        buf[offset..offset+8].copy_from_slice(&self.max_timestamp.to_le_bytes());
+        buf[offset..offset + 8].copy_from_slice(&self.max_timestamp.to_le_bytes());
         offset += 8;
-        buf[offset..offset+8].copy_from_slice(&self.max_key.to_le_bytes());
+        buf[offset..offset + 8].copy_from_slice(&self.max_key.to_le_bytes());
 
         Ok(buf)
     }
-    
+
     fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 64 {
             return Err(StorageError::InvalidData("Footer too small".into()));
         }
-        
+
         let mut offset = 0;
-        
+
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         offset += 4;
-        
+
         if magic != SSTABLE_MAGIC {
             return Err(StorageError::InvalidData("Invalid SSTable magic".into()));
         }
-        
-        let version = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+
+        let version = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
         offset += 4;
-        
+
         let index_offset = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
-        
+
         let index_size = u32::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3]
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
-        
+
         let bloom_offset = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
-        
+
         let bloom_size = u32::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3]
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
-        
+
         let num_entries = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
-        
+
         let min_timestamp = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
-        
+
         let max_timestamp = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
 
         let max_key = u64::from_le_bytes([
-            data[offset], data[offset+1], data[offset+2], data[offset+3],
-            data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
 
         // Backward compat: old SSTables have max_key=0 in the last 8 bytes.
         // If entries exist but max_key is 0, use u64::MAX (conservative).
-        let max_key = if max_key == 0 && num_entries > 0 { u64::MAX } else { max_key };
+        let max_key = if max_key == 0 && num_entries > 0 {
+            u64::MAX
+        } else {
+            max_key
+        };
 
         Ok(Self {
             magic,
@@ -1752,13 +2130,19 @@ impl SSTableIterator {
 
     /// Create an iterator over entries in [start_key, end_key).
     /// Uses shared mmap (zero-syscall) when available, falls back to seek+read.
-    pub fn with_range(sstable: &SSTable, start_key: Option<Key>, end_key: Option<Key>) -> Result<Self> {
+    pub fn with_range(
+        sstable: &SSTable,
+        start_key: Option<Key>,
+        end_key: Option<Key>,
+    ) -> Result<Self> {
         let mmap = sstable.shared_mmap();
         let index_entries = sstable.shared_index_entries();
         let start_block_idx = if let Some(start) = start_key {
             let start_bytes = start.to_be_bytes();
             sstable.index.find_block_index(&start_bytes)
-        } else { 0 };
+        } else {
+            0
+        };
 
         // Only open file handle if mmap is unavailable
         let (file, path) = if mmap.is_none() {
@@ -1769,10 +2153,14 @@ impl SSTableIterator {
         };
 
         Ok(Self {
-            mmap, index_entries, file, path,
+            mmap,
+            index_entries,
+            file,
+            path,
             current_block_idx: start_block_idx,
             current_cursor: None,
-            start_key, end_key,
+            start_key,
+            end_key,
             verify_crc: true, // Default: verify CRC on point lookups
         })
     }
@@ -1807,7 +2195,9 @@ impl SSTableIterator {
         let size = self.index_entries[self.current_block_idx].size;
 
         if size < 4 {
-            return Err(crate::StorageError::InvalidData("Block too small for CRC".into()));
+            return Err(crate::StorageError::InvalidData(
+                "Block too small for CRC".into(),
+            ));
         }
 
         // Unified read path: get raw block bytes, optionally verify CRC, decompress, create lazy cursor.
@@ -1816,16 +2206,21 @@ impl SSTableIterator {
             let start = offset as usize;
             let end = start + size as usize;
             if end > mmap.len() {
-                return Err(crate::StorageError::InvalidData(
-                    format!("Block extends beyond mmap: offset {} + size {} > {}", offset, size, mmap.len())
-                ));
+                return Err(crate::StorageError::InvalidData(format!(
+                    "Block extends beyond mmap: offset {} + size {} > {}",
+                    offset,
+                    size,
+                    mmap.len()
+                )));
             }
             let data_len = size as usize - 4;
             if self.verify_crc {
                 // Verify CRC32 (last 4 bytes)
                 let stored_crc = u32::from_le_bytes([
-                    mmap[start + data_len], mmap[start + data_len + 1],
-                    mmap[start + data_len + 2], mmap[start + data_len + 3]
+                    mmap[start + data_len],
+                    mmap[start + data_len + 1],
+                    mmap[start + data_len + 2],
+                    mmap[start + data_len + 3],
                 ]);
                 let computed_crc = crc32fast::hash(&mmap[start..start + data_len]);
                 if stored_crc != computed_crc {
@@ -1844,7 +2239,12 @@ impl SSTableIterator {
 
             let data_len = buf.len() - 4;
             if self.verify_crc {
-                let stored_crc = u32::from_le_bytes([buf[data_len], buf[data_len+1], buf[data_len+2], buf[data_len+3]]);
+                let stored_crc = u32::from_le_bytes([
+                    buf[data_len],
+                    buf[data_len + 1],
+                    buf[data_len + 2],
+                    buf[data_len + 3],
+                ]);
                 let computed_crc = crc32fast::hash(&buf[..data_len]);
                 if stored_crc != computed_crc {
                     return Err(crate::StorageError::InvalidData(
@@ -1874,7 +2274,9 @@ impl SSTableIterator {
                 if let Some(key) = cursor.peek_key() {
                     if let Some(start) = self.start_key {
                         if key < start {
-                            if cursor.skip_entry().is_err() { return None; }
+                            if cursor.skip_entry().is_err() {
+                                return None;
+                            }
                             continue;
                         }
                     }
@@ -1904,7 +2306,10 @@ impl SSTableIterator {
                 Ok(true) => continue,
                 Ok(false) => return None,
                 Err(e) => {
-                    eprintln!("[MoteDB] SSTableIterator::next_raw: block load error: {}", e);
+                    eprintln!(
+                        "[MoteDB] SSTableIterator::next_raw: block load error: {}",
+                        e
+                    );
                     return None;
                 }
             }
@@ -1923,7 +2328,9 @@ impl Iterator for SSTableIterator {
                     // Range check: skip entries below start_key (zero-alloc skip)
                     if let Some(start) = self.start_key {
                         if key < start {
-                            if cursor.skip_entry().is_err() { return None; }
+                            if cursor.skip_entry().is_err() {
+                                return None;
+                            }
                             continue;
                         }
                     }
@@ -1962,40 +2369,42 @@ impl Iterator for SSTableIterator {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    
+
     #[test]
     fn test_sstable_basic() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.sst");
-        
+
         // Build SSTable
         {
             let mut builder = SSTableBuilder::new(&path, LSMConfig::default(), 100).unwrap();
-            
+
             for i in 0..100 {
-                let key = i as u64;  // ✅ u64 key
+                let key = i as u64; // ✅ u64 key
                 let value = Value::new(format!("value_{}", i).into_bytes(), i as u64);
                 builder.add(key, value).unwrap();
             }
-            
+
             builder.finish().unwrap();
         }
-        
+
         // Read SSTable
         {
             let sst = SSTable::open(&path).unwrap();
-            
+
             // Test get
-            let key = 50u64;  // ✅ u64 key
+            let key = 50u64; // ✅ u64 key
             let value = sst.get(key).unwrap().unwrap();
-            assert_eq!(value.data, ValueData::Inline(std::sync::Arc::new(b"value_50".to_vec())));
+            assert_eq!(
+                value.data,
+                ValueData::Inline(std::sync::Arc::new(b"value_50".to_vec()))
+            );
             assert_eq!(value.timestamp, 50);
-            
+
             // Test non-existent key
             let result = sst.get(999u64).unwrap();
             assert!(result.is_none());

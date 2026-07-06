@@ -1,7 +1,7 @@
 //! Checksum 验证模块
 //!
 //! 提供统一的数据完整性校验，防止数据损坏和静默错误。
-//! 
+//!
 //! ## 使用场景
 //! - Superblock 元数据校验
 //! - LSM 文件数据块校验
@@ -27,8 +27,7 @@ use crc32fast::Hasher;
 use std::io::{self, Write};
 
 /// Checksum 类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChecksumType {
     /// CRC32C (硬件加速，SSE4.2)
     #[default]
@@ -36,7 +35,6 @@ pub enum ChecksumType {
     /// 无校验（仅测试用）
     None,
 }
-
 
 /// Checksum 计算器
 pub struct Checksum;
@@ -126,16 +124,16 @@ impl Checksum {
     pub fn encode_with_checksum(checksum_type: ChecksumType, data: &[u8]) -> Vec<u8> {
         let checksum = Self::compute(checksum_type, data);
         let mut encoded = Vec::with_capacity(4 + data.len() + 4);
-        
+
         // Data length
         encoded.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        
+
         // Data
         encoded.extend_from_slice(data);
-        
+
         // Checksum
         encoded.extend_from_slice(&checksum.to_le_bytes());
-        
+
         encoded
     }
 
@@ -158,8 +156,9 @@ impl Checksum {
         }
 
         // Parse data length
-        let data_len = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
-        
+        let data_len =
+            u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]) as usize;
+
         if encoded.len() != 4 + data_len + 4 {
             return Err(ChecksumError::InvalidFormat(format!(
                 "Expected {} bytes, got {}",
@@ -197,9 +196,7 @@ impl ChecksumBuilder {
             ChecksumType::None => None,
         };
 
-        Self {
-            hasher,
-        }
+        Self { hasher }
     }
 
     /// 更新数据
@@ -232,7 +229,9 @@ impl Write for ChecksumBuilder {
 /// Checksum 错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum ChecksumError {
-    #[error("Checksum mismatch: expected {expected:#010x}, got {actual:#010x} (data_len={data_len})")]
+    #[error(
+        "Checksum mismatch: expected {expected:#010x}, got {actual:#010x} (data_len={data_len})"
+    )]
     Mismatch {
         expected: u32,
         actual: u32,
@@ -254,13 +253,13 @@ mod tests {
     fn test_checksum_basic() {
         let data = b"Hello, MoteDB!";
         let checksum = Checksum::compute(ChecksumType::CRC32C, data);
-        
+
         // 验证成功
         assert!(Checksum::verify(ChecksumType::CRC32C, data, checksum).is_ok());
-        
+
         // 验证失败（错误的 checksum）
         assert!(Checksum::verify(ChecksumType::CRC32C, data, checksum + 1).is_err());
-        
+
         // 验证失败（数据被篡改）
         let corrupted = b"Hello, MoteDB?";
         assert!(Checksum::verify(ChecksumType::CRC32C, corrupted, checksum).is_err());
@@ -271,7 +270,7 @@ mod tests {
         let data = b"Hello, MoteDB!";
         let checksum = Checksum::compute(ChecksumType::None, data);
         assert_eq!(checksum, 0);
-        
+
         // None 类型总是验证通过
         assert!(Checksum::verify(ChecksumType::None, data, 12345).is_ok());
     }
@@ -280,16 +279,16 @@ mod tests {
     fn test_checksum_builder() {
         let data1 = b"Hello, ";
         let data2 = b"MoteDB!";
-        
+
         // 增量计算
         let mut builder = Checksum::builder(ChecksumType::CRC32C);
         builder.update(data1);
         builder.update(data2);
         let checksum1 = builder.finalize();
-        
+
         // 一次性计算
         let checksum2 = Checksum::compute(ChecksumType::CRC32C, b"Hello, MoteDB!");
-        
+
         // 两种方式结果相同
         assert_eq!(checksum1, checksum2);
     }
@@ -297,13 +296,13 @@ mod tests {
     #[test]
     fn test_checksum_encode_decode() {
         let data = b"Hello, MoteDB! This is a test message.";
-        
+
         // 编码
         let encoded = Checksum::encode_with_checksum(ChecksumType::CRC32C, data);
-        
+
         // 解码
         let decoded = Checksum::decode_with_checksum(ChecksumType::CRC32C, &encoded).unwrap();
-        
+
         assert_eq!(data, decoded.as_slice());
     }
 
@@ -311,14 +310,17 @@ mod tests {
     fn test_checksum_decode_corrupted() {
         let data = b"Hello, MoteDB!";
         let mut encoded = Checksum::encode_with_checksum(ChecksumType::CRC32C, data);
-        
+
         // 篡改数据
         encoded[10] ^= 0xFF;
-        
+
         // 解码失败
         let result = Checksum::decode_with_checksum(ChecksumType::CRC32C, &encoded);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ChecksumError::Mismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ChecksumError::Mismatch { .. }
+        ));
     }
 
     #[test]
@@ -327,7 +329,7 @@ mod tests {
         let short_data = b"abc";
         let result = Checksum::decode_with_checksum(ChecksumType::CRC32C, short_data);
         assert!(result.is_err());
-        
+
         // 长度不匹配
         let mut invalid = vec![0u8; 20];
         invalid[0] = 100; // 声称有 100 字节数据，但实际只有 20 字节
@@ -338,12 +340,12 @@ mod tests {
     #[test]
     fn test_checksum_deterministic() {
         let data = b"Deterministic test";
-        
+
         // 多次计算应该得到相同结果
         let checksum1 = Checksum::compute(ChecksumType::CRC32C, data);
         let checksum2 = Checksum::compute(ChecksumType::CRC32C, data);
         let checksum3 = Checksum::compute(ChecksumType::CRC32C, data);
-        
+
         assert_eq!(checksum1, checksum2);
         assert_eq!(checksum2, checksum3);
     }
@@ -352,7 +354,7 @@ mod tests {
     fn test_checksum_empty_data() {
         let data = b"";
         let checksum = Checksum::compute(ChecksumType::CRC32C, data);
-        
+
         // CRC32 对空数据返回 0（这是正确的行为）
         assert_eq!(checksum, 0);
         assert!(Checksum::verify(ChecksumType::CRC32C, data, checksum).is_ok());
@@ -361,16 +363,16 @@ mod tests {
     #[test]
     fn test_checksum_builder_write_trait() {
         use std::io::Write;
-        
+
         let mut builder = Checksum::builder(ChecksumType::CRC32C);
-        
+
         // 使用 Write trait
         builder.write_all(b"Hello, ").unwrap();
         builder.write_all(b"MoteDB!").unwrap();
         builder.flush().unwrap();
-        
+
         let checksum = builder.finalize();
-        
+
         // 验证结果
         let expected = Checksum::compute(ChecksumType::CRC32C, b"Hello, MoteDB!");
         assert_eq!(checksum, expected);

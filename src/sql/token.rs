@@ -118,67 +118,67 @@ pub enum TokenType {
     Full,
     Outer,
     On,
-    Primary,  // PRIMARY
-    Key,      // KEY
-    Using,    // USING (for CREATE INDEX ... USING type)
-    Array,    // ARRAY (for array literals)
-    Show,     // SHOW
-    Describe, // DESCRIBE or DESC
-    Tables,   // TABLES
-    Alter,    // ALTER
+    Primary,       // PRIMARY
+    Key,           // KEY
+    Using,         // USING (for CREATE INDEX ... USING type)
+    Array,         // ARRAY (for array literals)
+    Show,          // SHOW
+    Describe,      // DESCRIBE or DESC
+    Tables,        // TABLES
+    Alter,         // ALTER
     AutoIncrement, // AUTO_INCREMENT
-    Timeseries, // TIMESERIES
-    Ttl,       // TTL
-    Begin,     // BEGIN
-    Commit,    // COMMIT
-    Rollback,  // ROLLBACK
-    
+    Timeseries,    // TIMESERIES
+    Ttl,           // TTL
+    Begin,         // BEGIN
+    Commit,        // COMMIT
+    Rollback,      // ROLLBACK
+
     // Data types
     Integer,
-    BigInt,   // 🚀 Phase 4: BIGINT type (i64)
+    BigInt, // 🚀 Phase 4: BIGINT type (i64)
     Float,
     Text,
     Timestamp,
     Vector,
     Geometry,
     Boolean,
-    
+
     // Operators
-    Eq,           // =
-    Ne,           // != or <>
-    Lt,           // <
-    Gt,           // >
-    Le,           // <=
-    Ge,           // >=
-    Plus,         // +
-    Minus,        // -
-    Star,         // *
-    Slash,        // /
-    Percent,      // %
-    
+    Eq,      // =
+    Ne,      // != or <>
+    Lt,      // <
+    Gt,      // >
+    Le,      // <=
+    Ge,      // >=
+    Plus,    // +
+    Minus,   // -
+    Star,    // *
+    Slash,   // /
+    Percent, // %
+
     // E-SQL Vector Distance Operators
-    L2Distance,      // <-> (Euclidean distance)
-    CosineDistance,  // <=> (Cosine distance)
-    DotProduct,      // <#> (Inner product)
-    
+    L2Distance,     // <-> (Euclidean distance)
+    CosineDistance, // <=> (Cosine distance)
+    DotProduct,     // <#> (Inner product)
+
     // Delimiters
-    LParen,       // (
-    RParen,       // )
-    LBracket,     // [
-    RBracket,     // ]
-    Comma,        // ,
-    Semicolon,    // ;
-    Dot,          // .
-    
+    LParen,    // (
+    RParen,    // )
+    LBracket,  // [
+    RBracket,  // ]
+    Comma,     // ,
+    Semicolon, // ;
+    Dot,       // .
+
     // Literals
     Number(f64),
     String(String),
     Identifier(String),
     True,
     False,
-    
+
     // Special
-    Parameter(usize),  // ? or ?1, ?2, ... (bind variable)
+    Parameter(usize), // ? or ?1, ?2, ... (bind variable)
     Eof,
 }
 
@@ -191,7 +191,11 @@ pub struct Token {
 
 impl Token {
     pub fn new(token_type: TokenType, line: usize, column: usize) -> Self {
-        Self { token_type, line, column }
+        Self {
+            token_type,
+            line,
+            column,
+        }
     }
 }
 
@@ -213,4 +217,3 @@ impl TokenType {
         KEYWORDS.get(lower).cloned()
     }
 }
-

@@ -73,7 +73,6 @@ impl ColumnarConfig {
             bloom_filter_bits_per_key: 8,
         }
     }
-
 }
 
 #[cfg(test)]

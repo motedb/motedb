@@ -36,12 +36,16 @@ impl TTLDuration {
 
     /// Create from hours
     pub fn from_hours(hours: u64) -> Self {
-        Self { seconds: hours * 3600 }
+        Self {
+            seconds: hours * 3600,
+        }
     }
 
     /// Create from days
     pub fn from_days(days: u64) -> Self {
-        Self { seconds: days * 86400 }
+        Self {
+            seconds: days * 86400,
+        }
     }
 
     /// Get duration as seconds
@@ -95,7 +99,7 @@ pub struct ColumnDef {
     /// Whether this column is nullable
     pub nullable: bool,
     /// 🚀 AUTO_INCREMENT flag (only for primary key)
-    /// 
+    ///
     /// When true:
     /// - INSERT ignores user-provided value, uses row_id instead
     /// - SELECT can skip column index (value == row_id)
@@ -123,13 +127,13 @@ impl ColumnDef {
         self.nullable = false;
         self
     }
-    
+
     /// 🚀 Mark this column as AUTO_INCREMENT
     pub fn auto_increment(mut self) -> Self {
         self.auto_increment = true;
         self
     }
-    
+
     /// 🚀 Phase 4: Set AUTO_INCREMENT starting value
     pub fn auto_increment_with_start(mut self, start: i64) -> Self {
         self.auto_increment = true;
@@ -230,13 +234,22 @@ impl TableSchema {
         let mut column_map = HashMap::new();
         for col in &columns {
             if column_map.contains_key(&col.name) {
-                eprintln!("[WARN] Duplicate column name '{}' in table '{}', using last definition", col.name, name);
+                eprintln!(
+                    "[WARN] Duplicate column name '{}' in table '{}', using last definition",
+                    col.name, name
+                );
             }
             column_map.insert(col.name.clone(), col.position);
         }
 
-        let cached_col_types: Vec<ColumnType> = columns.iter().map(|c| c.col_type.clone()).collect();
-        let column_names_cache = Arc::new(columns.iter().map(|c| c.name.clone()).collect::<Vec<String>>());
+        let cached_col_types: Vec<ColumnType> =
+            columns.iter().map(|c| c.col_type.clone()).collect();
+        let column_names_cache = Arc::new(
+            columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<String>>(),
+        );
 
         Self {
             name,
@@ -269,13 +282,13 @@ impl TableSchema {
         }
         self.columns.iter().map(|c| c.name.clone()).collect()
     }
-    
+
     /// Create a new table schema with primary key
     pub fn with_primary_key(mut self, pk_column: String) -> Self {
         self.primary_key_column = Some(pk_column);
         self
     }
-    
+
     /// 🚀 Mark primary key as AUTO_INCREMENT
     pub fn with_auto_increment(mut self) -> Self {
         self.primary_key_auto_increment = true;
@@ -302,12 +315,12 @@ impl TableSchema {
         self.ttl = Some(ttl);
         self
     }
-    
+
     /// 🚀 Phase 4: Mark primary key as AUTO_INCREMENT with custom start value
     pub fn with_auto_increment_start(mut self, start: i64) -> Self {
         self.primary_key_auto_increment = true;
         self.auto_increment_start = Some(start);
-        
+
         // Also mark the column itself
         if let Some(pk_col_name) = &self.primary_key_column {
             if let Some(col) = self.columns.iter_mut().find(|c| &c.name == pk_col_name) {
@@ -315,20 +328,20 @@ impl TableSchema {
                 col.auto_increment_start = Some(start);
             }
         }
-        
+
         self
     }
-    
+
     /// 🚀 Phase 4: Get AUTO_INCREMENT starting value
     pub fn get_auto_increment_start(&self) -> i64 {
         self.auto_increment_start.unwrap_or(1)
     }
-    
+
     /// Get primary key column name
     pub fn primary_key(&self) -> Option<&str> {
         self.primary_key_column.as_deref()
     }
-    
+
     /// 🚀 Check if primary key is AUTO_INCREMENT
     pub fn is_primary_key_auto_increment(&self) -> bool {
         self.primary_key_auto_increment
@@ -384,7 +397,7 @@ impl TableSchema {
 
         for (i, col) in self.columns.iter().enumerate() {
             let value = &row[i];
-            
+
             // Check null constraint (skip AUTO_INCREMENT — system fills value)
             if !col.nullable && !col.auto_increment && matches!(value, crate::types::Value::Null) {
                 return Err(format!("Column '{}' cannot be null", col.name));
@@ -402,16 +415,16 @@ impl TableSchema {
                 (ColumnType::Boolean, crate::types::Value::Bool(_)) => true,
                 (ColumnType::Text, crate::types::Value::Text(_)) => true,
                 (ColumnType::Spatial, crate::types::Value::Spatial(_)) => true,
-                
+
                 // Legacy types
                 (ColumnType::Timestamp, crate::types::Value::Timestamp(_)) => true,
                 (ColumnType::Tensor(dim), crate::types::Value::Tensor(t)) => t.dimension() == *dim,
                 (ColumnType::Tensor(dim), crate::types::Value::Vector(v)) => v.len() == *dim,
-                
+
                 // Backward compatibility
                 (ColumnType::Integer, crate::types::Value::Timestamp(_)) => true,
                 (ColumnType::Float, crate::types::Value::Tensor(t)) if t.dimension() == 1 => true, // Single float can be stored as 1D tensor
-                
+
                 _ => false,
             };
 
@@ -430,7 +443,7 @@ impl TableSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Timestamp, Value, ArcString};
+    use crate::types::{ArcString, Timestamp, Value};
     use std::sync::Arc;
 
     #[test]
@@ -454,7 +467,7 @@ mod tests {
 
         assert_eq!(schema.column_count(), 3);
         assert_eq!(schema.get_column_position("name"), Some(1));
-        
+
         // Add index
         schema.add_index(IndexDef::new(
             "users_name_idx".into(),
@@ -462,7 +475,7 @@ mod tests {
             "name".into(),
             IndexType::FullText,
         ));
-        
+
         assert_eq!(schema.indexes.len(), 1);
     }
 

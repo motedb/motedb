@@ -11,41 +11,41 @@
 //! - Calculation: bytes_written / bytes_inserted
 //! - 优化: 减少层数、提高level_multiplier
 
-use super::{SSTable, SSTableBuilder, LSMConfig, Key};
 use super::bloom::BloomFilter;
+use super::{Key, LSMConfig, SSTable, SSTableBuilder};
 use crate::{Result, StorageError};
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Compaction statistics
 #[derive(Clone, Debug, Default)]
 pub struct CompactionStats {
     /// Total bytes read
     pub bytes_read: u64,
-    
+
     /// Total bytes written
     pub bytes_written: u64,
-    
+
     /// Number of compactions
     pub num_compactions: u64,
-    
+
     /// Write amplification factor
     pub write_amplification: f64,
-    
+
     /// ✨ P2 Phase 3: Enhanced statistics
     /// L0 tiered compactions (L0.x → L0.y)
     pub tiered_compactions: u64,
-    
+
     /// L0 → L1 full compactions
     pub l0_to_l1_compactions: u64,
-    
+
     /// L1+ compactions
     pub levelplus_compactions: u64,
-    
+
     /// Bytes saved by tiered strategy
     pub bytes_saved: u64,
 }
@@ -55,23 +55,23 @@ pub struct CompactionStats {
 pub struct Level {
     /// Level number (0-6)
     pub level: usize,
-    
+
     /// SSTable files in this level
     pub sstables: Vec<SSTableMeta>,
-    
+
     /// Total size in bytes
     pub total_size: u64,
-    
+
     /// Size threshold for compaction
     pub size_threshold: u64,
-    
+
     /// L0 sublevel structure (for tiered compaction)
     /// Only used for level 0, None for L1+
     pub sublevels: Option<Vec<TieredSublevel>>,
 }
 
 /// L0 Tiered sublevel for reducing write amplification
-/// 
+///
 /// ## Strategy
 /// - L0.0: 0-2 files (newest data, from MemTable flush)
 /// - L0.1: 3-5 files (intermediate tier)
@@ -80,10 +80,10 @@ pub struct Level {
 pub struct TieredSublevel {
     /// Sublevel index (0, 1, 2)
     pub sublevel: usize,
-    
+
     /// SSTables in this sublevel
     pub sstables: Vec<SSTableMeta>,
-    
+
     /// Max files before compacting to next sublevel
     pub max_files: usize,
 }
@@ -127,18 +127,30 @@ impl Level {
         } else {
             base_size * config.level_multiplier.pow(level as u32 - 1)
         } as u64;
-        
+
         // Initialize L0 sublevels for tiered compaction
         let sublevels = if level == 0 {
             Some(vec![
-                TieredSublevel { sublevel: 0, sstables: Vec::new(), max_files: 2 },  // L0.0
-                TieredSublevel { sublevel: 1, sstables: Vec::new(), max_files: 3 },  // L0.1
-                TieredSublevel { sublevel: 2, sstables: Vec::new(), max_files: 3 },  // L0.2
+                TieredSublevel {
+                    sublevel: 0,
+                    sstables: Vec::new(),
+                    max_files: 2,
+                }, // L0.0
+                TieredSublevel {
+                    sublevel: 1,
+                    sstables: Vec::new(),
+                    max_files: 3,
+                }, // L0.1
+                TieredSublevel {
+                    sublevel: 2,
+                    sstables: Vec::new(),
+                    max_files: 3,
+                }, // L0.2
             ])
         } else {
             None
         };
-        
+
         Self {
             level,
             sstables: Vec::new(),
@@ -147,27 +159,27 @@ impl Level {
             sublevels,
         }
     }
-    
+
     /// Add an SSTable to this level
     pub fn add_sstable(&mut self, meta: SSTableMeta) {
         self.total_size += meta.size;
-        
+
         // For L0 with tiered compaction, add to sublevel 0
         if self.level == 0 && self.sublevels.is_some() {
             if let Some(ref mut sublevels) = self.sublevels {
                 sublevels[0].sstables.push(meta.clone());
             }
         }
-        
+
         // Also add to main sstables list for query (legacy compatibility)
         self.sstables.push(meta);
-        
+
         // Sort by min_key for L1+ (L0 can overlap)
         if self.level > 0 {
             self.sstables.sort_by(|a, b| a.min_key.cmp(&b.min_key));
         }
     }
-    
+
     /// Remove an SSTable
     pub fn remove_sstable(&mut self, path: &Path) {
         if let Some(idx) = self.sstables.iter().position(|s| s.path == path) {
@@ -185,9 +197,9 @@ impl Level {
             }
         }
     }
-    
+
     /// Check if compaction is needed
-    /// 
+    ///
     /// 🚀 P1 优化：更激进的 L0 compaction 触发策略
     /// - L0: 2 个文件就触发（原 4 个）
     /// - 目标：将 L0 SSTable 数量从 425 降低到 < 10
@@ -197,27 +209,28 @@ impl Level {
             if let Some(ref sublevels) = self.sublevels {
                 // 🔥 P1: 降低 sublevel 阈值
                 for sublevel in sublevels {
-                    if sublevel.sstables.len() >= 2 {  // 🚀 降低：max_files → 2
+                    if sublevel.sstables.len() >= 2 {
+                        // 🚀 降低：max_files → 2
                         return true;
                     }
                 }
                 return false;
             }
-            
+
             // Fallback: L0 trigger by file count (legacy)
-            self.sstables.len() >= 2  // 🚀 P1: 降低阈值 4 → 2
+            self.sstables.len() >= 2 // 🚀 P1: 降低阈值 4 → 2
         } else {
             // L1+: trigger by total size
             self.total_size > self.size_threshold
         }
     }
-    
+
     /// Check which L0 sublevel needs compaction
     pub fn get_sublevel_to_compact(&self) -> Option<usize> {
         if self.level != 0 {
             return None;
         }
-        
+
         if let Some(ref sublevels) = self.sublevels {
             // Check sublevels in order (0 → 1 → 2)
             for sublevel in sublevels {
@@ -226,10 +239,10 @@ impl Level {
                 }
             }
         }
-        
+
         None
     }
-    
+
     /// Select SSTables for compaction
     pub fn select_for_compaction(&self, config: &LSMConfig) -> Vec<SSTableMeta> {
         if self.level == 0 {
@@ -244,27 +257,27 @@ impl Level {
             candidates
         }
     }
-    
+
     /// Get overlapping SSTables in next level
     /// 🚀 P3 优化：预分配容量
     pub fn get_overlapping(&self, next_level: &Level, sources: &[SSTableMeta]) -> Vec<SSTableMeta> {
         if sources.is_empty() {
             return Vec::new();
         }
-        
+
         let min_key = sources.iter().map(|s| &s.min_key).min().unwrap();
         let max_key = sources.iter().map(|s| &s.max_key).max().unwrap();
-        
+
         // 🚀 预分配容量（估算重叠数量）
         let mut overlapping = Vec::with_capacity(next_level.sstables.len() / 2);
-        
+
         for sst in &next_level.sstables {
             // Check if [min_key, max_key] overlaps with [sst.min_key, sst.max_key]
             if &sst.min_key <= max_key && &sst.max_key >= min_key {
                 overlapping.push(sst.clone());
             }
         }
-        
+
         overlapping
     }
 }
@@ -334,13 +347,17 @@ impl CompactionWorker {
 
         // Discover existing SSTables on disk
         if let Err(e) = worker.discover_sstables() {
-            debug_log!("[CompactionWorker] Warning: failed to discover SSTables: {:?}", e);
+            debug_log!(
+                "[CompactionWorker] Warning: failed to discover SSTables: {:?}",
+                e
+            );
         }
 
         // Recover num_compactions from existing SSTable file IDs to prevent
         // filename collisions after restart.
         if let Ok(levels) = worker.levels.lock() {
-            let max_id: u64 = levels.iter()
+            let max_id: u64 = levels
+                .iter()
                 .flat_map(|l| l.sstables.iter())
                 .filter_map(|m| {
                     let stem = m.path.file_stem()?.to_str()?;
@@ -372,7 +389,8 @@ impl CompactionWorker {
                 // Parse level from filename: "l{level}_*.sst"
                 let file_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
                 let level = if let Some(rest) = file_name.strip_prefix('l') {
-                    rest.split('_').next()
+                    rest.split('_')
+                        .next()
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(0)
                 } else {
@@ -409,7 +427,8 @@ impl CompactionWorker {
                                     max_timestamp: min_timestamp,
                                     bloom_filter: None,
                                 };
-                                discovered.push((level.min(self.config.lsm_config.num_levels - 1), meta));
+                                discovered
+                                    .push((level.min(self.config.lsm_config.num_levels - 1), meta));
                             }
                             Err(e2) => {
                                 debug_log!("[CompactionWorker] Warning: skipping corrupt SSTable {:?}: {:?}", path, e2);
@@ -421,8 +440,13 @@ impl CompactionWorker {
         }
 
         if !discovered.is_empty() {
-            debug_log!("[CompactionWorker] Discovered {} existing SSTables", discovered.len());
-            let mut levels = self.levels.lock()
+            debug_log!(
+                "[CompactionWorker] Discovered {} existing SSTables",
+                discovered.len()
+            );
+            let mut levels = self
+                .levels
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
             for (level, meta) in discovered {
@@ -455,14 +479,22 @@ impl CompactionWorker {
     /// last cycle have finished by now.
     pub fn flush_pending_deletions(&self) {
         let pending = {
-            let mut guard = self.pending_deletions.lock()
+            let mut guard = self
+                .pending_deletions
+                .lock()
                 .unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *guard)
         };
         for path in &pending {
             if let Err(e) = fs::remove_file(path) {
-                debug_log!("[compaction] Failed to delete SST {:?}: {}, will retry next cycle", path, e);
-                let mut guard = self.pending_deletions.lock()
+                debug_log!(
+                    "[compaction] Failed to delete SST {:?}: {}, will retry next cycle",
+                    path,
+                    e
+                );
+                let mut guard = self
+                    .pending_deletions
+                    .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 guard.push(path.clone());
             }
@@ -471,14 +503,18 @@ impl CompactionWorker {
 
     /// Defer file deletion to the next compaction cycle instead of deleting now.
     fn defer_deletion(&self, path: PathBuf) {
-        let mut guard = self.pending_deletions.lock()
+        let mut guard = self
+            .pending_deletions
+            .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.push(path);
     }
-    
+
     /// Register a new SSTable (from MemTable flush)
     pub fn register_sstable(&self, meta: SSTableMeta) -> Result<()> {
-        let mut levels = self.levels.lock()
+        let mut levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
         // Always add to L0
@@ -489,10 +525,12 @@ impl CompactionWorker {
 
         Ok(())
     }
-    
+
     /// Check if compaction is needed
     pub fn needs_compaction(&self) -> Result<bool> {
-        let levels = self.levels.lock()
+        let levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
         Ok(levels.iter().any(|level| level.needs_compaction()))
@@ -516,7 +554,9 @@ impl CompactionWorker {
 
         // Collect all SSTables
         let all_sources = {
-            let levels = self.levels.lock()
+            let levels = self
+                .levels
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             let mut all = Vec::new();
             for level in levels.iter() {
@@ -533,12 +573,15 @@ impl CompactionWorker {
                     merged_paths.insert(meta.path.clone());
                     all_inputs.push(sstable);
                 }
-                Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(StorageError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    continue
+                }
                 Err(e) => return Err(e),
             }
         }
 
-        let mut iters: Vec<_> = all_inputs.into_iter()
+        let mut iters: Vec<_> = all_inputs
+            .into_iter()
             .filter_map(|mut sst| sst.iter().ok())
             .collect();
 
@@ -548,7 +591,9 @@ impl CompactionWorker {
 
         // Generate output path
         let output_path = {
-            let mut stats = self.stats.lock()
+            let mut stats = self
+                .stats
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             let output_id = stats.num_compactions;
             stats.num_compactions += 1;
@@ -573,7 +618,9 @@ impl CompactionWorker {
         }
         impl Ord for MergeEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.key.cmp(&self.key)
+                other
+                    .key
+                    .cmp(&self.key)
                     .then_with(|| other.iter_idx.cmp(&self.iter_idx))
             }
         }
@@ -586,7 +633,11 @@ impl CompactionWorker {
         let mut heap = BinaryHeap::new();
         for (idx, iter) in iters.iter_mut().enumerate() {
             if let Some((key, value)) = iter.next() {
-                heap.push(MergeEntry { key, value, iter_idx: idx });
+                heap.push(MergeEntry {
+                    key,
+                    value,
+                    iter_idx: idx,
+                });
             }
         }
 
@@ -617,7 +668,11 @@ impl CompactionWorker {
             }
 
             if let Some((key, value)) = iters[entry.iter_idx].next() {
-                heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
+                heap.push(MergeEntry {
+                    key,
+                    value,
+                    iter_idx: entry.iter_idx,
+                });
             }
         }
 
@@ -635,7 +690,11 @@ impl CompactionWorker {
 
         builder.finish()?;
 
-        debug_log!("[compact_to_columnar] Wrote {} rows to {:?}", count, output_path);
+        debug_log!(
+            "[compact_to_columnar] Wrote {} rows to {:?}",
+            count,
+            output_path
+        );
 
         let col_sst = super::columnar::ColumnarSSTable::open(&output_path)?;
         let paths: Vec<PathBuf> = merged_paths.into_iter().collect();
@@ -650,7 +709,9 @@ impl CompactionWorker {
 
         // Collect all SSTables from all levels
         let (all_sources, last_level) = {
-            let levels = self.levels.lock()
+            let levels = self
+                .levels
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             let mut all = Vec::new();
             for level in levels.iter() {
@@ -682,15 +743,19 @@ impl CompactionWorker {
 
         // Generate unique output path
         let output_path = {
-            let mut stats = self.stats.lock()
+            let mut stats = self
+                .stats
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             let output_id = stats.num_compactions;
             stats.num_compactions += 1;
-            self.storage_dir.join(format!("l{}_{:06}.sst", last_level, output_id))
+            self.storage_dir
+                .join(format!("l{}_{:06}.sst", last_level, output_id))
         };
 
         // Create iterators
-        let mut iters: Vec<_> = all_inputs.into_iter()
+        let mut iters: Vec<_> = all_inputs
+            .into_iter()
             .filter_map(|mut sst| sst.iter().ok())
             .collect();
 
@@ -699,7 +764,8 @@ impl CompactionWorker {
         }
 
         let estimated_size = all_sources.iter().map(|s| s.num_entries).sum::<u64>() as usize;
-        let mut builder = SSTableBuilder::new(&output_path, self.config.lsm_config.clone(), estimated_size)?;
+        let mut builder =
+            SSTableBuilder::new(&output_path, self.config.lsm_config.clone(), estimated_size)?;
 
         // Multi-way merge (same logic as merge_sstables)
         use std::collections::BinaryHeap;
@@ -720,7 +786,9 @@ impl CompactionWorker {
 
         impl Ord for MergeEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.key.cmp(&self.key)
+                other
+                    .key
+                    .cmp(&self.key)
                     .then_with(|| other.iter_idx.cmp(&self.iter_idx))
             }
         }
@@ -734,7 +802,11 @@ impl CompactionWorker {
         let mut heap = BinaryHeap::new();
         for (idx, iter) in iters.iter_mut().enumerate() {
             if let Some((key, value)) = iter.next() {
-                heap.push(MergeEntry { key, value, iter_idx: idx });
+                heap.push(MergeEntry {
+                    key,
+                    value,
+                    iter_idx: idx,
+                });
             }
         }
 
@@ -761,7 +833,11 @@ impl CompactionWorker {
             }
 
             if let Some((key, value)) = iters[entry.iter_idx].next() {
-                heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
+                heap.push(MergeEntry {
+                    key,
+                    value,
+                    iter_idx: entry.iter_idx,
+                });
             }
         }
 
@@ -776,7 +852,9 @@ impl CompactionWorker {
 
         // Update levels: remove all old SSTables, add new one
         self.invalidate_snapshot();
-        let mut levels = self.levels.lock()
+        let mut levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
         // Defer deletion of all old SSTable files
@@ -799,18 +877,21 @@ impl CompactionWorker {
 
         // Update stats
         {
-            let mut stats = self.stats.lock()
+            let mut stats = self
+                .stats
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             stats.bytes_written += 0; // approximate
         }
 
         self.invalidate_snapshot();
-        self.compaction_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.compaction_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.invoke_post_compaction(&removed_paths);
 
         Ok(())
     }
-    
+
     /// Get all SSTables across all levels (for query)
     ///
     /// 🚀 Returns Arc clone (O(1)) instead of cloning the entire Vec.
@@ -825,7 +906,9 @@ impl CompactionWorker {
         }
 
         // Slow path: build snapshot from levels and cache it
-        let levels = self.levels.lock()
+        let levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
         let mut all_sstables = Vec::new();
@@ -848,7 +931,7 @@ impl CompactionWorker {
         let mut snap = self.sstable_snapshot.write();
         *snap = None;
     }
-    
+
     /// Access the compaction epoch (for scan consistency checks)
     pub fn compaction_epoch(&self) -> &Arc<std::sync::atomic::AtomicU64> {
         &self.compaction_epoch
@@ -859,9 +942,11 @@ impl CompactionWorker {
         // Flush deferred deletions from previous compaction cycle
         self.flush_pending_deletions();
 
-        let levels = self.levels.lock()
+        let levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
+
         // Find first level that needs compaction
         let level_idx = match levels.iter().position(|l| l.needs_compaction()) {
             Some(idx) => idx,
@@ -869,7 +954,7 @@ impl CompactionWorker {
         };
 
         if level_idx >= levels.len() - 1 {
-            return Ok(());  // Last level, can't compact further
+            return Ok(()); // Last level, can't compact further
         }
 
         let is_last_level = level_idx + 1 >= levels.len() - 1;
@@ -879,42 +964,53 @@ impl CompactionWorker {
         let overlapping = levels[level_idx].get_overlapping(&levels[level_idx + 1], &sources);
 
         drop(levels); // Release lock during I/O
-        
+
         // ✅ 检查文件是否存在
-        let valid_sources: Vec<_> = sources.iter()
+        let valid_sources: Vec<_> = sources
+            .iter()
             .filter(|s| s.path.exists())
             .cloned()
             .collect();
-        let valid_overlapping: Vec<_> = overlapping.iter()
+        let valid_overlapping: Vec<_> = overlapping
+            .iter()
             .filter(|s| s.path.exists())
             .cloned()
             .collect();
-        
+
         if valid_sources.is_empty() && valid_overlapping.is_empty() {
             // 所有源文件都不存在（可能被并发compaction删除），跳过这次compaction
             // 清理元数据中的记录
-            let mut levels = self.levels.lock()
+            let mut levels = self
+                .levels
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-            
+
             for source in &sources {
                 levels[level_idx].remove_sstable(&source.path);
             }
             for overlap in &overlapping {
                 levels[level_idx + 1].remove_sstable(&overlap.path);
             }
-            
+
             return Ok(());
         }
-        
+
         // Merge SSTables — returns output plus the set of paths that were actually
         // merged (files that survived the TOCTOU window between exists() and open()).
-        let (output_meta, merged_paths) = self.merge_sstables(level_idx + 1, is_last_level, &valid_sources, &valid_overlapping)?;
+        let (output_meta, merged_paths) = self.merge_sstables(
+            level_idx + 1,
+            is_last_level,
+            &valid_sources,
+            &valid_overlapping,
+        )?;
 
         // Update levels
         // Invalidate snapshot BEFORE modifying levels so that concurrent scans
         // don't get a stale cached snapshot with removed SSTables.
         self.invalidate_snapshot();
-        let mut levels = self.levels.lock()
+        let mut levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
         // Collect all removed SSTable paths for selective cache eviction
@@ -960,7 +1056,9 @@ impl CompactionWorker {
         levels[level_idx + 1].add_sstable(output_meta);
 
         // Update stats (num_compactions already incremented at ID allocation time)
-        let mut stats = self.stats.lock()
+        let mut stats = self
+            .stats
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
 
         let bytes_read: u64 = valid_sources.iter().map(|s| s.size).sum::<u64>()
@@ -979,14 +1077,15 @@ impl CompactionWorker {
         self.invalidate_snapshot();
 
         // Bump compaction epoch so in-flight scans detect SSTable changes
-        self.compaction_epoch.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.compaction_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
 
         // Selectively evict only removed SSTables from cache (not a full clear)
         self.invoke_post_compaction(&removed_paths);
 
         Ok(())
     }
-    
+
     /// Merge multiple SSTables into one
     ///
     /// Returns the merged output SSTableMeta and a HashSet of paths that were
@@ -999,7 +1098,11 @@ impl CompactionWorker {
         sources: &[SSTableMeta],
         overlapping: &[SSTableMeta],
     ) -> Result<(SSTableMeta, HashSet<PathBuf>)> {
-        let rate_limit = self.config.lsm_config.compaction_rate_limit.unwrap_or(u64::MAX);
+        let rate_limit = self
+            .config
+            .lsm_config
+            .compaction_rate_limit
+            .unwrap_or(u64::MAX);
         let yield_interval = self.config.lsm_config.compaction_yield_every_n_blocks;
 
         // Open ALL input SSTables. Track which paths were actually opened
@@ -1024,32 +1127,40 @@ impl CompactionWorker {
 
         if all_inputs.is_empty() {
             return Err(StorageError::Index(
-                "All input SSTables disappeared during compaction".into()
+                "All input SSTables disappeared during compaction".into(),
             ));
         }
 
         // Generate output file path — eagerly increment num_compactions so
         // concurrent compaction rounds get unique output IDs.
         let output_path = {
-            let mut stats = self.stats.lock()
+            let mut stats = self
+                .stats
+                .lock()
                 .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
             let output_id = stats.num_compactions;
-            stats.num_compactions += 1;  // Eager: reserve the ID now
-            let path = self.storage_dir.join(format!("l{}_{:06}.sst", output_level, output_id));
+            stats.num_compactions += 1; // Eager: reserve the ID now
+            let path = self
+                .storage_dir
+                .join(format!("l{}_{:06}.sst", output_level, output_id));
             path
         };
 
         // Streaming merge
-        let mut iters: Vec<_> = all_inputs.into_iter()
+        let mut iters: Vec<_> = all_inputs
+            .into_iter()
             .filter_map(|mut sst| sst.iter().ok())
             .collect();
 
         if iters.is_empty() {
-            return Err(StorageError::Index("No valid iterators for compaction".into()));
+            return Err(StorageError::Index(
+                "No valid iterators for compaction".into(),
+            ));
         }
 
         let estimated_size = sources.len() + overlapping.len() * 1000;
-        let mut builder = SSTableBuilder::new(&output_path, self.config.lsm_config.clone(), estimated_size)?;
+        let mut builder =
+            SSTableBuilder::new(&output_path, self.config.lsm_config.clone(), estimated_size)?;
 
         // Multi-way merge-sort with priority queue
         use std::collections::BinaryHeap;
@@ -1070,7 +1181,9 @@ impl CompactionWorker {
 
         impl Ord for MergeEntry {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.key.cmp(&self.key) // min-heap
+                other
+                    .key
+                    .cmp(&self.key) // min-heap
                     .then_with(|| other.iter_idx.cmp(&self.iter_idx)) // break ties: prefer earlier iterator
             }
         }
@@ -1084,7 +1197,11 @@ impl CompactionWorker {
         let mut heap = BinaryHeap::new();
         for (idx, iter) in iters.iter_mut().enumerate() {
             if let Some((key, value)) = iter.next() {
-                heap.push(MergeEntry { key, value, iter_idx: idx });
+                heap.push(MergeEntry {
+                    key,
+                    value,
+                    iter_idx: idx,
+                });
             }
         }
 
@@ -1112,7 +1229,10 @@ impl CompactionWorker {
                     // Keep live entries. Keep tombstones unless we're in the last level AND they're expired.
                     // Dropping tombstones at intermediate levels risks resurrecting keys that have
                     // live copies in deeper levels not included in this compaction.
-                    if !value.deleted || !is_last_level || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
+                    if !value.deleted
+                        || !is_last_level
+                        || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros)
+                    {
                         builder.add(key, value)?;
                         entries_written += 1;
 
@@ -1123,7 +1243,9 @@ impl CompactionWorker {
                             let elapsed = merge_start.elapsed().as_secs_f64();
                             let expected = _bytes_written as f64 / rate_limit as f64;
                             if elapsed < expected {
-                                std::thread::sleep(std::time::Duration::from_secs_f64(expected - elapsed));
+                                std::thread::sleep(std::time::Duration::from_secs_f64(
+                                    expected - elapsed,
+                                ));
                             }
                             // Cooperative yield every yield_interval * 100 entries
                             if (entries_written / 100).is_multiple_of(yield_interval as u64) {
@@ -1138,20 +1260,29 @@ impl CompactionWorker {
             }
 
             if let Some((key, value)) = iters[entry.iter_idx].next() {
-                heap.push(MergeEntry { key, value, iter_idx: entry.iter_idx });
+                heap.push(MergeEntry {
+                    key,
+                    value,
+                    iter_idx: entry.iter_idx,
+                });
             }
         }
 
         // Write final key
         if let (Some(key), Some(value)) = (last_key, last_value) {
-            if !value.deleted || !is_last_level || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros) {
+            if !value.deleted
+                || !is_last_level
+                || (now_micros.saturating_sub(value.timestamp) < tombstone_ttl_micros)
+            {
                 builder.add(key, value)?;
             }
         }
 
         let output_meta = builder.finish()?;
 
-        let mut stats = self.stats.lock()
+        let mut stats = self
+            .stats
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         stats.bytes_written += output_meta.size;
         if stats.bytes_read > 0 {
@@ -1163,16 +1294,23 @@ impl CompactionWorker {
 
     /// Get compaction statistics
     pub fn stats(&self) -> Result<CompactionStats> {
-        let stats = self.stats.lock()
+        let stats = self
+            .stats
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
         Ok(stats.clone())
     }
-    
+
     /// Get level statistics
     pub fn level_stats(&self) -> Result<Vec<(usize, usize, u64)>> {
-        let levels = self.levels.lock()
+        let levels = self
+            .levels
+            .lock()
             .map_err(|_| StorageError::Lock("Lock poisoned".into()))?;
-        
-        Ok(levels.iter().map(|l| (l.level, l.sstables.len(), l.total_size)).collect())
+
+        Ok(levels
+            .iter()
+            .map(|l| (l.level, l.sstables.len(), l.total_size))
+            .collect())
     }
 }

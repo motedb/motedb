@@ -13,10 +13,10 @@
 //! Usage:
 //!   cargo run --release --example bench_vs_sqlite
 
-use motedb::{Database, DBConfig, QueryResult};
+use motedb::{DBConfig, Database, QueryResult};
 use rusqlite::Connection;
-use tempfile::TempDir;
 use std::time::Instant;
+use tempfile::TempDir;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -24,14 +24,22 @@ fn get_rss_kb() -> u64 {
     let pid = std::process::id();
     std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output().ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         .unwrap_or(0)
 }
 
 /// Run a closure N times, return median microseconds.
 fn bench_us<F: FnMut()>(mut f: F, warmup: usize, iters: usize) -> u64 {
-    for _ in 0..warmup { f(); }
+    for _ in 0..warmup {
+        f();
+    }
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
@@ -83,7 +91,12 @@ impl MoteDBBench {
                 batch.push_str(&format!("('{}',{:.2},'{}'),", customer, amount, region));
             }
             batch.truncate(batch.len() - 1);
-            self.db.execute(&format!("INSERT INTO sales (customer, amount, region) VALUES {}", batch)).unwrap();
+            self.db
+                .execute(&format!(
+                    "INSERT INTO sales (customer, amount, region) VALUES {}",
+                    batch
+                ))
+                .unwrap();
         }
         t.elapsed().as_millis()
     }
@@ -95,14 +108,17 @@ impl MoteDBBench {
         use motedb::types::Value;
         let t = Instant::now();
         for chunk in data.chunks(5000) {
-            let rows: Vec<Vec<Value>> = chunk.iter().map(|(c, a, r)| {
-                vec![
-                    Value::Integer(0), // PK placeholder (auto-increment overwrites)
-                    Value::text(c.clone()),
-                    Value::Float(*a),
-                    Value::text(r.to_string()),
-                ]
-            }).collect();
+            let rows: Vec<Vec<Value>> = chunk
+                .iter()
+                .map(|(c, a, r)| {
+                    vec![
+                        Value::Integer(0), // PK placeholder (auto-increment overwrites)
+                        Value::text(c.clone()),
+                        Value::Float(*a),
+                        Value::text(r.to_string()),
+                    ]
+                })
+                .collect();
             let _ = self.db.batch_insert("sales", rows);
         }
         t.elapsed().as_millis()
@@ -110,8 +126,12 @@ impl MoteDBBench {
 
     fn create_indexes(&self) -> u128 {
         let t = Instant::now();
-        self.db.execute("CREATE INDEX idx_region ON sales (region) USING COLUMN").unwrap();
-        self.db.execute("CREATE INDEX idx_customer ON sales (customer) USING COLUMN").unwrap();
+        self.db
+            .execute("CREATE INDEX idx_region ON sales (region) USING COLUMN")
+            .unwrap();
+        self.db
+            .execute("CREATE INDEX idx_customer ON sales (customer) USING COLUMN")
+            .unwrap();
         t.elapsed().as_millis()
     }
 
@@ -125,14 +145,18 @@ impl MoteDBBench {
     /// Uses O(1) row_count() for columnar results — no materialization overhead.
     fn query(&self, sql: &str) -> (usize, u64) {
         let mut row_count = 0;
-        let us = bench_us(|| {
-            let result = self.db.execute(sql).unwrap();
-            row_count = result.row_count();
-            // Fallback: if streaming result, materialize for accurate count
-            if row_count == 0 {
-                row_count = result.materialize().unwrap().row_count();
-            }
-        }, 2, 10);
+        let us = bench_us(
+            || {
+                let result = self.db.execute(sql).unwrap();
+                row_count = result.row_count();
+                // Fallback: if streaming result, materialize for accurate count
+                if row_count == 0 {
+                    row_count = result.materialize().unwrap().row_count();
+                }
+            },
+            2,
+            10,
+        );
         (row_count, us)
     }
 
@@ -141,7 +165,10 @@ impl MoteDBBench {
     }
 
     fn pk_update(&self, id: usize) -> (usize, u64) {
-        self.query(&format!("UPDATE sales SET amount = 999.99 WHERE id = {}", id))
+        self.query(&format!(
+            "UPDATE sales SET amount = 999.99 WHERE id = {}",
+            id
+        ))
     }
 }
 
@@ -160,15 +187,18 @@ impl SQLiteBench {
         let db_path = dir.path().join("sqlite_bench.db");
         let conn = Connection::open(&db_path).unwrap();
         let _ = dir; // keep alive
-        // Maximum performance configuration
-        conn.execute_batch("
+                     // Maximum performance configuration
+        conn.execute_batch(
+            "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;  -- 64MB cache
             PRAGMA temp_store = MEMORY;
             PRAGMA mmap_size = 268435456;  -- 256MB mmap
             PRAGMA page_size = 4096;
-        ").unwrap();
+        ",
+        )
+        .unwrap();
         conn.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT, amount REAL, region TEXT)", []).unwrap();
         Self { conn, n }
     }
@@ -180,11 +210,13 @@ impl SQLiteBench {
             // Explicit transaction per batch for max throughput
             self.conn.execute_batch("BEGIN TRANSACTION").unwrap();
             {
-                let mut stmt = self.conn.prepare(
-                    "INSERT INTO sales (customer, amount, region) VALUES (?1, ?2, ?3)"
-                ).unwrap();
+                let mut stmt = self
+                    .conn
+                    .prepare("INSERT INTO sales (customer, amount, region) VALUES (?1, ?2, ?3)")
+                    .unwrap();
                 for (customer, amount, region) in chunk {
-                    stmt.execute(rusqlite::params![customer, *amount, region]).unwrap();
+                    stmt.execute(rusqlite::params![customer, *amount, region])
+                        .unwrap();
                 }
             }
             self.conn.execute_batch("COMMIT").unwrap();
@@ -194,37 +226,49 @@ impl SQLiteBench {
 
     fn create_indexes(&self) -> u128 {
         let t = Instant::now();
-        self.conn.execute("CREATE INDEX idx_region ON sales (region)", []).unwrap();
-        self.conn.execute("CREATE INDEX idx_customer ON sales (customer)", []).unwrap();
+        self.conn
+            .execute("CREATE INDEX idx_region ON sales (region)", [])
+            .unwrap();
+        self.conn
+            .execute("CREATE INDEX idx_customer ON sales (customer)", [])
+            .unwrap();
         t.elapsed().as_millis()
     }
 
     /// Execute a query, return (row_count, median_us)
     fn query(&self, sql: &str) -> (usize, u64) {
         let mut row_count = 0;
-        let us = bench_us(|| {
-            let mut stmt = self.conn.prepare(sql).unwrap();
-            let mut rows = stmt.query([]).unwrap();
-            let mut count = 0;
-            while let Some(_) = rows.next().unwrap() {
-                count += 1;
-            }
-            row_count = count;
-        }, 2, 10);
+        let us = bench_us(
+            || {
+                let mut stmt = self.conn.prepare(sql).unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                let mut count = 0;
+                while let Some(_) = rows.next().unwrap() {
+                    count += 1;
+                }
+                row_count = count;
+            },
+            2,
+            10,
+        );
         (row_count, us)
     }
 
     fn query_prepared(&self, sql: &str) -> (usize, u64) {
         let mut stmt = self.conn.prepare(sql).unwrap();
         let mut row_count = 0;
-        let us = bench_us(|| {
-            let mut rows = stmt.query([]).unwrap();
-            let mut count = 0;
-            while let Some(_) = rows.next().unwrap() {
-                count += 1;
-            }
-            row_count = count;
-        }, 2, 10);
+        let us = bench_us(
+            || {
+                let mut rows = stmt.query([]).unwrap();
+                let mut count = 0;
+                while let Some(_) = rows.next().unwrap() {
+                    count += 1;
+                }
+                row_count = count;
+            },
+            2,
+            10,
+        );
         (row_count, us)
     }
 
@@ -236,10 +280,14 @@ impl SQLiteBench {
     fn pk_update(&self, id: usize) -> (usize, u64) {
         let sql = format!("UPDATE sales SET amount = 999.99 WHERE id = {}", id);
         let mut row_count = 0;
-        let us = bench_us(|| {
-            self.conn.execute(&sql, []).unwrap();
-            row_count = 1;
-        }, 2, 10);
+        let us = bench_us(
+            || {
+                self.conn.execute(&sql, []).unwrap();
+                row_count = 1;
+            },
+            2,
+            10,
+        );
         (row_count, us)
     }
 }
@@ -253,7 +301,10 @@ fn main() {
     println!();
     println!("  ╔══════════════════════════════════════════════════════════════════╗");
     println!("  ║       MoteDB vs SQLite — Embedded Database Benchmark           ║");
-    println!("  ║       {} rows × 4 columns (id, customer, amount, region)       ║", n);
+    println!(
+        "  ║       {} rows × 4 columns (id, customer, amount, region)       ║",
+        n
+    );
     println!("  ╚══════════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -285,30 +336,54 @@ fn main() {
     println!("  │");
     println!("  │  {:30} {:>12} {:>12}", "", "MoteDB", "SQLite");
     println!("  │  {}", "-".repeat(58));
-    println!("  │  {:30} {:>9} ms   {:>9} ms",
-        "INSERT {} (SQL)".replace("{}", &n.to_string()), mote_insert, sqlite_insert);
-    println!("  │  {:30} {:>9} ms   {:>9} ms",
-        "INSERT {} (batch API)".replace("{}", &n.to_string()), mote_insert_batch, sqlite_insert);
-    println!("  │  {:30} {:>9} ms   {:>9} ms",
-        "CREATE 2 indexes", mote_index, sqlite_index);
-    println!("  │  {:30} {:>9} ms   {:>12}",
-        "Vacuum/compact", mote_vacuum, "n/a");
+    println!(
+        "  │  {:30} {:>9} ms   {:>9} ms",
+        "INSERT {} (SQL)".replace("{}", &n.to_string()),
+        mote_insert,
+        sqlite_insert
+    );
+    println!(
+        "  │  {:30} {:>9} ms   {:>9} ms",
+        "INSERT {} (batch API)".replace("{}", &n.to_string()),
+        mote_insert_batch,
+        sqlite_insert
+    );
+    println!(
+        "  │  {:30} {:>9} ms   {:>9} ms",
+        "CREATE 2 indexes", mote_index, sqlite_index
+    );
+    println!(
+        "  │  {:30} {:>9} ms   {:>12}",
+        "Vacuum/compact", mote_vacuum, "n/a"
+    );
     println!("  │  {}", "-".repeat(58));
     let mote_ins_rps = n as f64 / mote_insert_batch as f64 * 1000.0;
     let sqlite_ins_rps = n as f64 / sqlite_insert as f64 * 1000.0;
-    println!("  │  {:30} {:>9}/s   {:>9}/s",
-        "INSERT throughput (batch)", format!("{:.0}", mote_ins_rps), format!("{:.0}", sqlite_ins_rps));
+    println!(
+        "  │  {:30} {:>9}/s   {:>9}/s",
+        "INSERT throughput (batch)",
+        format!("{:.0}", mote_ins_rps),
+        format!("{:.0}", sqlite_ins_rps)
+    );
     let mote_idx_rps = (n as f64 * 2.0) / mote_index as f64 * 1000.0;
     let sqlite_idx_rps = (n as f64 * 2.0) / sqlite_index as f64 * 1000.0;
-    println!("  │  {:30} {:>9}/s   {:>9}/s",
-        "INDEX throughput", format!("{:.0}", mote_idx_rps), format!("{:.0}", sqlite_idx_rps));
+    println!(
+        "  │  {:30} {:>9}/s   {:>9}/s",
+        "INDEX throughput",
+        format!("{:.0}", mote_idx_rps),
+        format!("{:.0}", sqlite_idx_rps)
+    );
     println!("  │");
-    println!("  │  {:30} {:>9} KB  {:>9} KB",
-        "RSS after setup", rss_after_mote, rss_after_sqlite);
-    println!("  │  {:30} {:>9} B   {:>9} B",
+    println!(
+        "  │  {:30} {:>9} KB  {:>9} KB",
+        "RSS after setup", rss_after_mote, rss_after_sqlite
+    );
+    println!(
+        "  │  {:30} {:>9} B   {:>9} B",
         "Memory per row",
         rss_after_mote * 1024 / n as u64,
-        rss_after_sqlite * 1024 / n as u64);
+        rss_after_sqlite * 1024 / n as u64
+    );
     println!("  └────────────────────────────────────────────────────────────────┘");
     println!();
 
@@ -316,7 +391,10 @@ fn main() {
 
     println!("  ┌─ Query Benchmarks (median of 10 runs) ─────────────────────────┐");
     println!("  │");
-    println!("  │  {:36} {:>10} {:>10} {:>6}", "Operation", "MoteDB", "SQLite", "Ratio");
+    println!(
+        "  │  {:36} {:>10} {:>10} {:>6}",
+        "Operation", "MoteDB", "SQLite", "Ratio"
+    );
     println!("  │  {}", "-".repeat(66));
 
     let queries: Vec<(&str, &str)> = vec![
@@ -339,11 +417,21 @@ fn main() {
         let (mote_rows, mote_us) = mote.query(sql);
         let (sqlite_rows, sqlite_us) = sqlite.query(sql);
         let ratio = mote_us as f64 / sqlite_us as f64;
-        let winner = if mote_us < sqlite_us { "⚡ MoteDB" } else { "🏆 SQLite" };
-        if mote_us <= sqlite_us { mote_wins += 1; } else { sqlite_wins += 1; }
+        let winner = if mote_us < sqlite_us {
+            "⚡ MoteDB"
+        } else {
+            "🏆 SQLite"
+        };
+        if mote_us <= sqlite_us {
+            mote_wins += 1;
+        } else {
+            sqlite_wins += 1;
+        }
 
-        println!("  │  {:36} {:>7} μs  {:>7} μs  {:>5.2}x  {}",
-            label, mote_us, sqlite_us, ratio, winner);
+        println!(
+            "  │  {:36} {:>7} μs  {:>7} μs  {:>5.2}x  {}",
+            label, mote_us, sqlite_us, ratio, winner
+        );
         results.push((*label, mote_us, sqlite_us, mote_rows, sqlite_rows));
     }
 
@@ -352,18 +440,44 @@ fn main() {
     let (mote_rows, mote_us) = mote.pk_select(mid);
     let (sqlite_rows, sqlite_us) = sqlite.pk_select(mid);
     let ratio = mote_us as f64 / sqlite_us as f64;
-    if mote_us <= sqlite_us { mote_wins += 1; } else { sqlite_wins += 1; }
-    println!("  │  {:36} {:>7} μs  {:>7} μs  {:>5.2}x  {}",
-        "PK point SELECT", mote_us, sqlite_us, ratio,
-        if mote_us <= sqlite_us { "⚡ MoteDB" } else { "🏆 SQLite" });
+    if mote_us <= sqlite_us {
+        mote_wins += 1;
+    } else {
+        sqlite_wins += 1;
+    }
+    println!(
+        "  │  {:36} {:>7} μs  {:>7} μs  {:>5.2}x  {}",
+        "PK point SELECT",
+        mote_us,
+        sqlite_us,
+        ratio,
+        if mote_us <= sqlite_us {
+            "⚡ MoteDB"
+        } else {
+            "🏆 SQLite"
+        }
+    );
 
     let (mote_rows, mote_us) = mote.pk_update(mid);
     let (sqlite_rows, sqlite_us) = sqlite.pk_update(mid);
     let ratio = mote_us as f64 / sqlite_us as f64;
-    if mote_us <= sqlite_us { mote_wins += 1; } else { sqlite_wins += 1; }
-    println!("  │  {:36} {:>7} μs  {:>7} μs  {:>5.2}x  {}",
-        "PK point UPDATE", mote_us, sqlite_us, ratio,
-        if mote_us <= sqlite_us { "⚡ MoteDB" } else { "🏆 SQLite" });
+    if mote_us <= sqlite_us {
+        mote_wins += 1;
+    } else {
+        sqlite_wins += 1;
+    }
+    println!(
+        "  │  {:36} {:>7} μs  {:>7} μs  {:>5.2}x  {}",
+        "PK point UPDATE",
+        mote_us,
+        sqlite_us,
+        ratio,
+        if mote_us <= sqlite_us {
+            "⚡ MoteDB"
+        } else {
+            "🏆 SQLite"
+        }
+    );
 
     // Row count verification
     println!("  │");
@@ -374,7 +488,12 @@ fn main() {
     }
 
     println!("  │");
-    println!("  │  Summary: MoteDB wins {} / SQLite wins {} (of {} tests)", mote_wins, sqlite_wins, mote_wins + sqlite_wins);
+    println!(
+        "  │  Summary: MoteDB wins {} / SQLite wins {} (of {} tests)",
+        mote_wins,
+        sqlite_wins,
+        mote_wins + sqlite_wins
+    );
     println!("  └────────────────────────────────────────────────────────────────┘");
 
     // ── Phase 3: Throughput Summary ─────────────────────────────────────
@@ -386,8 +505,16 @@ fn main() {
     println!("  │  {}", "-".repeat(62));
 
     for (label, mote_us, sqlite_us, _, _) in &results {
-        let mote_rps = if *mote_us > 0 { n as u64 * 1_000_000 / mote_us } else { 0 };
-        let sqlite_rps = if *sqlite_us > 0 { n as u64 * 1_000_000 / sqlite_us } else { 0 };
+        let mote_rps = if *mote_us > 0 {
+            n as u64 * 1_000_000 / mote_us
+        } else {
+            0
+        };
+        let sqlite_rps = if *sqlite_us > 0 {
+            n as u64 * 1_000_000 / sqlite_us
+        } else {
+            0
+        };
         let mote_str = format_thru(mote_rps);
         let sqlite_str = format_thru(sqlite_rps);
         println!("  │  {:36} {:>12} {:>12}", label, mote_str, sqlite_str);

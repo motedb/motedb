@@ -1,15 +1,21 @@
 //! Memory leak detection test: verify RSS doesn't grow under sustained query workload
 
-use motedb::{Database, DBConfig, QueryResult};
-use tempfile::TempDir;
+use motedb::{DBConfig, Database, QueryResult};
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn get_rss_kb() -> u64 {
     let pid = std::process::id();
     std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output().ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         .unwrap_or(0)
 }
 
@@ -18,7 +24,10 @@ fn setup_db(n: usize) -> (Database, TempDir) {
     let mut config = DBConfig::for_edge();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).expect("create db");
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, val FLOAT, tag TEXT)").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, val FLOAT, tag TEXT)",
+    )
+    .unwrap();
 
     let mut batch = String::with_capacity(n * 60);
     for i in 0..n {
@@ -28,7 +37,8 @@ fn setup_db(n: usize) -> (Database, TempDir) {
         batch.push_str(&format!("({},{:.2},{}),", name, val, tag));
         if batch.len() > 500_000 || i == n - 1 {
             batch.truncate(batch.len() - 1);
-            db.execute(&format!("INSERT INTO t (name, val, tag) VALUES {}", batch)).unwrap();
+            db.execute(&format!("INSERT INTO t (name, val, tag) VALUES {}", batch))
+                .unwrap();
             batch.clear();
         }
     }
@@ -62,7 +72,10 @@ fn test_no_memory_leak_under_load() {
 
     // Measure baseline RSS after warmup
     let rss_baseline = get_rss_kb();
-    println!("\n  MEMORY LEAK TEST (50K rows, {} queries/round)", queries.len());
+    println!(
+        "\n  MEMORY LEAK TEST (50K rows, {} queries/round)",
+        queries.len()
+    );
     println!("  {}", "=".repeat(60));
     println!("  Baseline RSS: {} KB", rss_baseline);
 
@@ -84,9 +97,20 @@ fn test_no_memory_leak_under_load() {
 
         if round % 10 == 9 {
             let delta_kb = rss as i64 - rss_baseline as i64;
-            let pct = if rss_baseline > 0 { delta_kb as f64 / rss_baseline as f64 * 100.0 } else { 0.0 };
-            println!("  Round {:>3}/{} | RSS {:>8} KB | Δ {:+>6} KB ({:+.1}%) | Latency {:>6} us",
-                round + 1, rounds, rss, delta_kb, pct, elapsed_us);
+            let pct = if rss_baseline > 0 {
+                delta_kb as f64 / rss_baseline as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "  Round {:>3}/{} | RSS {:>8} KB | Δ {:+>6} KB ({:+.1}%) | Latency {:>6} us",
+                round + 1,
+                rounds,
+                rss,
+                delta_kb,
+                pct,
+                elapsed_us
+            );
         }
     }
 
@@ -99,46 +123,69 @@ fn test_no_memory_leak_under_load() {
     let lat_first = latencies[0];
     let lat_last = *latencies.last().unwrap();
     let lat_avg_first5: u64 = latencies[..5].iter().sum::<u64>() / 5;
-    let lat_avg_last5: u64 = latencies[latencies.len()-5..].iter().sum::<u64>() / 5;
-    let lat_growth_pct = (lat_avg_last5 as f64 - lat_avg_first5 as f64) / lat_avg_first5 as f64 * 100.0;
+    let lat_avg_last5: u64 = latencies[latencies.len() - 5..].iter().sum::<u64>() / 5;
+    let lat_growth_pct =
+        (lat_avg_last5 as f64 - lat_avg_first5 as f64) / lat_avg_first5 as f64 * 100.0;
 
     println!("\n  {}", "-".repeat(60));
-    println!("  RSS:  first {} KB → last {} KB → max {} KB | growth {:+.1}%",
-        rss_first, rss_last, rss_max, rss_growth_pct);
-    println!("  Lat:  avg(first 5) {} us → avg(last 5) {} us | growth {:+.1}%",
-        lat_avg_first5, lat_avg_last5, lat_growth_pct);
+    println!(
+        "  RSS:  first {} KB → last {} KB → max {} KB | growth {:+.1}%",
+        rss_first, rss_last, rss_max, rss_growth_pct
+    );
+    println!(
+        "  Lat:  avg(first 5) {} us → avg(last 5) {} us | growth {:+.1}%",
+        lat_avg_first5, lat_avg_last5, lat_growth_pct
+    );
 
     // Verdict
-    let rss_ok = rss_growth_pct < 30.0;  // < 30% growth over 50 rounds = no leak
-    let lat_ok = lat_growth_pct < 50.0;  // < 50% latency growth = no degradation
+    let rss_ok = rss_growth_pct < 30.0; // < 30% growth over 50 rounds = no leak
+    let lat_ok = lat_growth_pct < 50.0; // < 50% latency growth = no degradation
 
     println!();
     if rss_ok && lat_ok {
         println!("  ✅ PASS: No memory leak or latency degradation detected");
     } else {
         if !rss_ok {
-            println!("  ❌ FAIL: RSS grew {:+.1}% — possible memory leak", rss_growth_pct);
+            println!(
+                "  ❌ FAIL: RSS grew {:+.1}% — possible memory leak",
+                rss_growth_pct
+            );
         }
         if !lat_ok {
-            println!("  ❌ FAIL: Latency grew {:+.1}% — possible degradation", lat_growth_pct);
+            println!(
+                "  ❌ FAIL: Latency grew {:+.1}% — possible degradation",
+                lat_growth_pct
+            );
         }
     }
 
-    assert!(rss_ok, "RSS grew {:+.1}% over {} rounds — possible memory leak", rss_growth_pct, rounds);
-    assert!(lat_ok, "Latency grew {:+.1}% over {} rounds — possible degradation", lat_growth_pct, rounds);
+    assert!(
+        rss_ok,
+        "RSS grew {:+.1}% over {} rounds — possible memory leak",
+        rss_growth_pct, rounds
+    );
+    assert!(
+        lat_ok,
+        "Latency grew {:+.1}% over {} rounds — possible degradation",
+        lat_growth_pct, rounds
+    );
 }
 
 /// Test that streaming (for_each) uses O(1) memory vs materialize which uses O(N).
 /// Compare RSS growth between materialize() and for_each() on a large result set.
 #[test]
 fn test_streaming_vs_materialize_memory() {
-    use motedb::{StreamingControl, ForEachResult};
+    use motedb::{ForEachResult, StreamingControl};
 
     let (db, _dir) = setup_db(100_000);
 
     // Materialize: loads all rows into memory
     let rss_before = get_rss_kb();
-    let mat_result = db.execute("SELECT * FROM t").unwrap().materialize().unwrap();
+    let mat_result = db
+        .execute("SELECT * FROM t")
+        .unwrap()
+        .materialize()
+        .unwrap();
     let rss_after_mat = get_rss_kb();
     let mat_rows = match &mat_result {
         QueryResult::Select { rows, .. } => rows.len(),
@@ -149,26 +196,47 @@ fn test_streaming_vs_materialize_memory() {
 
     println!("\n  STREAMING vs MATERIALIZE (100K rows)");
     println!("  {}", "=".repeat(50));
-    println!("  Materialize: {} rows, RSS Δ = {:+} KB", mat_rows, mat_rss_delta);
+    println!(
+        "  Materialize: {} rows, RSS Δ = {:+} KB",
+        mat_rows, mat_rss_delta
+    );
 
     // for_each: processes rows one at a time
     let rss_before = get_rss_kb();
     let mut count = 0usize;
-    let for_each_result: ForEachResult = db.execute("SELECT * FROM t").unwrap()
-        .for_each(|_cols, _row| {
-            count += 1;
-            Ok(StreamingControl::Continue)
-        }, None).unwrap();
+    let for_each_result: ForEachResult = db
+        .execute("SELECT * FROM t")
+        .unwrap()
+        .for_each(
+            |_cols, _row| {
+                count += 1;
+                Ok(StreamingControl::Continue)
+            },
+            None,
+        )
+        .unwrap();
     let rss_after_stream = get_rss_kb();
     let stream_rss_delta = rss_after_stream as i64 - rss_before as i64;
 
-    println!("  for_each:    {} rows, RSS Δ = {:+} KB", count, stream_rss_delta);
-    println!("  Ratio:       materialize uses {:.1}x more RSS than streaming",
-        if stream_rss_delta > 0 { mat_rss_delta as f64 / stream_rss_delta as f64 } else { f64::INFINITY });
+    println!(
+        "  for_each:    {} rows, RSS Δ = {:+} KB",
+        count, stream_rss_delta
+    );
+    println!(
+        "  Ratio:       materialize uses {:.1}x more RSS than streaming",
+        if stream_rss_delta > 0 {
+            mat_rss_delta as f64 / stream_rss_delta as f64
+        } else {
+            f64::INFINITY
+        }
+    );
 
     // Streaming should use significantly less memory
-    assert!(stream_rss_delta < mat_rss_delta,
+    assert!(
+        stream_rss_delta < mat_rss_delta,
         "Streaming RSS delta ({}) should be less than materialize ({})",
-        stream_rss_delta, mat_rss_delta);
+        stream_rss_delta,
+        mat_rss_delta
+    );
     assert_eq!(count, 100_000, "for_each should process all 100K rows");
 }

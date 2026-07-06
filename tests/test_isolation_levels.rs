@@ -7,7 +7,7 @@
 //! - Transaction stats tracking
 //! - Sequential transactions
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -23,7 +23,8 @@ fn test_auto_commit_writes_durable() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
 
     let result = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
@@ -37,7 +38,8 @@ fn test_savepoint_rollback() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
@@ -58,7 +60,8 @@ fn test_nested_savepoints() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 'root')").unwrap();
@@ -81,7 +84,8 @@ fn test_release_savepoint() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.savepoint(tx, "sp1").unwrap();
@@ -100,7 +104,8 @@ fn test_rollback_transaction() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     let tx = db.begin_transaction().unwrap();
@@ -119,11 +124,13 @@ fn test_sequential_transactions() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     for i in 0..5 {
         let tx = db.begin_transaction().unwrap();
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
         db.commit_transaction(tx).unwrap();
     }
 
@@ -156,7 +163,8 @@ fn test_crash_recovery_committed_survives() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'committed')").unwrap();
         db.checkpoint().unwrap();
         db.close().unwrap();

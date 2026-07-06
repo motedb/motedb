@@ -25,10 +25,10 @@ impl Default for VamanaConfig {
     fn default() -> Self {
         Self {
             max_degree: 64,
-            search_list_size: 180,  // 🔧 折中: 128 → 180 (介于128和256之间)
+            search_list_size: 180, // 🔧 折中: 128 → 180 (介于128和256之间)
             alpha: 1.2,
-            beam_width: 48,         // 🔧 折中: 32 → 48 (介于32和64之间)
-            metric: DistanceKind::Euclidean,  // 默认 L2（和 SQL <-> 一致）
+            beam_width: 48,                  // 🔧 折中: 32 → 48 (介于32和64之间)
+            metric: DistanceKind::Euclidean, // 默认 L2（和 SQL <-> 一致）
         }
     }
 }
@@ -88,7 +88,7 @@ mod tests {
     fn test_default_config() {
         let config = VamanaConfig::default();
         assert_eq!(config.max_degree, 64);
-        assert_eq!(config.search_list_size, 180);  // Updated to match actual default
+        assert_eq!(config.search_list_size, 180); // Updated to match actual default
         assert!((config.alpha - 1.2).abs() < 0.001);
     }
 

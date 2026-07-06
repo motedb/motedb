@@ -4,11 +4,13 @@
 //!
 //! Run: cargo test --test bench_resource --release -- --nocapture --test-threads=1
 
-use motedb::{Database, DBConfig};
-use tempfile::TempDir;
+use motedb::{DBConfig, Database};
 use std::time::Instant;
+use tempfile::TempDir;
 
-fn is_ci() -> bool { std::env::var("CI").is_ok() }
+fn is_ci() -> bool {
+    std::env::var("CI").is_ok()
+}
 
 fn edge_config() -> DBConfig {
     DBConfig::for_edge()
@@ -21,7 +23,10 @@ fn create_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 // ============================================================================
@@ -58,8 +63,14 @@ fn get_process_memory_kb() -> (usize, usize) {
 
 fn print_memory(label: &str) -> (usize, usize) {
     let (rss, vms) = get_process_memory_kb();
-    println!("  {:<50} | RSS: {:>8} KB ({:>5.1} MB) | VMS: {:>8} KB ({:>5.1} MB)",
-        label, rss, rss as f64 / 1024.0, vms, vms as f64 / 1024.0);
+    println!(
+        "  {:<50} | RSS: {:>8} KB ({:>5.1} MB) | VMS: {:>8} KB ({:>5.1} MB)",
+        label,
+        rss,
+        rss as f64 / 1024.0,
+        vms,
+        vms as f64 / 1024.0
+    );
     (rss, vms)
 }
 
@@ -105,9 +116,9 @@ fn bench_memory_footprint() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let rows_small: i64  = if ci {  1_000 } else {  3_000 };
-    let rows_medium: i64 = if ci {  2_000 } else { 10_000 };
-    let rows_large: i64  = if ci {  5_000 } else { 20_000 };
+    let rows_small: i64 = if ci { 1_000 } else { 3_000 };
+    let rows_medium: i64 = if ci { 2_000 } else { 10_000 };
+    let rows_large: i64 = if ci { 5_000 } else { 20_000 };
 
     let (rss_baseline, _) = print_memory("Baseline (empty DB)");
 
@@ -116,14 +127,29 @@ fn bench_memory_footprint() {
         let (db, _dir) = create_db();
         exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, value INTEGER)");
         for i in 1..=rows_small {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
-                i, i, i as f64 * 1.5, i % 10, i * 10));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
+                    i,
+                    i,
+                    i as f64 * 1.5,
+                    i % 10,
+                    i * 10
+                ),
+            );
         }
-        let (rss_small, _) = print_memory(&format!("After INSERT {} rows (5 cols, MemTable)", rows_small));
-        println!("  → ΔRSS: {} KB ({:.1} MB) for {} rows = {:.1} bytes/row",
-            rss_small - rss_baseline, (rss_small - rss_baseline) as f64 / 1024.0,
+        let (rss_small, _) = print_memory(&format!(
+            "After INSERT {} rows (5 cols, MemTable)",
+            rows_small
+        ));
+        println!(
+            "  → ΔRSS: {} KB ({:.1} MB) for {} rows = {:.1} bytes/row",
+            rss_small - rss_baseline,
+            (rss_small - rss_baseline) as f64 / 1024.0,
             rows_small,
-            (rss_small - rss_baseline) as f64 * 1024.0 / rows_small as f64);
+            (rss_small - rss_baseline) as f64 * 1024.0 / rows_small as f64
+        );
     }
 
     // Medium batch
@@ -131,21 +157,39 @@ fn bench_memory_footprint() {
         let (db, _dir) = create_db();
         exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, value INTEGER)");
         for i in 1..=rows_medium {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
-                i, i, i as f64 * 1.5, i % 10, i * 10));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
+                    i,
+                    i,
+                    i as f64 * 1.5,
+                    i % 10,
+                    i * 10
+                ),
+            );
         }
-        let (rss_medium, _) = print_memory(&format!("After INSERT {} rows (5 cols, MemTable)", rows_medium));
+        let (rss_medium, _) = print_memory(&format!(
+            "After INSERT {} rows (5 cols, MemTable)",
+            rows_medium
+        ));
 
         // Flush to SSTable
         db.flush().expect("flush");
         db.wait_for_indexes_ready();
         let (rss_medium_sst, _) = print_memory(&format!("After flush {} → SSTable", rows_medium));
-        println!("  → ΔRSS MemTable: {} KB ({:.1} MB) = {:.1} bytes/row",
-            rss_medium - rss_baseline, (rss_medium - rss_baseline) as f64 / 1024.0,
-            (rss_medium - rss_baseline) as f64 * 1024.0 / rows_medium as f64);
-        println!("  → ΔRSS SSTable:  {} KB ({:.1} MB) = {:.1} bytes/row",
-            rss_medium_sst - rss_baseline, (rss_medium_sst - rss_baseline) as f64 / 1024.0,
-            (rss_medium_sst - rss_baseline) as f64 * 1024.0 / rows_medium as f64);
+        println!(
+            "  → ΔRSS MemTable: {} KB ({:.1} MB) = {:.1} bytes/row",
+            rss_medium - rss_baseline,
+            (rss_medium - rss_baseline) as f64 / 1024.0,
+            (rss_medium - rss_baseline) as f64 * 1024.0 / rows_medium as f64
+        );
+        println!(
+            "  → ΔRSS SSTable:  {} KB ({:.1} MB) = {:.1} bytes/row",
+            rss_medium_sst - rss_baseline,
+            (rss_medium_sst - rss_baseline) as f64 / 1024.0,
+            (rss_medium_sst - rss_baseline) as f64 * 1024.0 / rows_medium as f64
+        );
 
         // Checkpoint + drop
         db.checkpoint().expect("checkpoint");
@@ -159,15 +203,31 @@ fn bench_memory_footprint() {
         exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, value INTEGER)");
         let start = Instant::now();
         for i in 1..=rows_large {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
-                i, i, i as f64 * 1.5, i % 10, i * 10));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
+                    i,
+                    i,
+                    i as f64 * 1.5,
+                    i % 10,
+                    i * 10
+                ),
+            );
         }
         let insert_ms = start.elapsed().as_millis();
         let (rss_large, _) = print_memory(&format!("After INSERT {} rows (MemTable)", rows_large));
-        println!("  → Insert: {}ms, {:.0} ops/s", insert_ms, rows_large as f64 / (insert_ms as f64 / 1000.0));
-        println!("  → ΔRSS: {} KB ({:.1} MB) = {:.1} bytes/row",
-            rss_large - rss_baseline, (rss_large - rss_baseline) as f64 / 1024.0,
-            (rss_large - rss_baseline) as f64 * 1024.0 / rows_large as f64);
+        println!(
+            "  → Insert: {}ms, {:.0} ops/s",
+            insert_ms,
+            rows_large as f64 / (insert_ms as f64 / 1000.0)
+        );
+        println!(
+            "  → ΔRSS: {} KB ({:.1} MB) = {:.1} bytes/row",
+            rss_large - rss_baseline,
+            (rss_large - rss_baseline) as f64 / 1024.0,
+            (rss_large - rss_baseline) as f64 * 1024.0 / rows_large as f64
+        );
     }
 }
 
@@ -182,21 +242,36 @@ fn bench_query_latency() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let seed_rows: i64   = if ci {  2_000 } else { 10_000 };
-    let pk_queries: i64  = if ci {  1_000 } else {  5_000 };
-    let idx_queries: usize = if ci {    100 } else {    500 };
-    let scan_queries: usize = if ci {     10 } else {     50 };
+    let seed_rows: i64 = if ci { 2_000 } else { 10_000 };
+    let pk_queries: i64 = if ci { 1_000 } else { 5_000 };
+    let idx_queries: usize = if ci { 100 } else { 500 };
+    let scan_queries: usize = if ci { 10 } else { 50 };
 
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, value INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, tag TEXT, value INTEGER)",
+    );
 
     // Seed rows
     for i in 1..=seed_rows {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
-            i, i, i as f64 * 1.5, i % 10, i * 10));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, 'name_{}', {:.1}, 'tag_{}', {})",
+                i,
+                i,
+                i as f64 * 1.5,
+                i % 10,
+                i * 10
+            ),
+        );
     }
 
-    println!("\n  --- Phase 1: PK Point Query (MemTable, {} rows) ---", seed_rows);
+    println!(
+        "\n  --- Phase 1: PK Point Query (MemTable, {} rows) ---",
+        seed_rows
+    );
     print_separator();
 
     // PK queries — latency per operation
@@ -206,7 +281,10 @@ fn bench_query_latency() {
         exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
         pk_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("PK SELECT * (MemTable, {} queries)", pk_queries), &pk_latencies);
+    print_latency_distribution(
+        &format!("PK SELECT * (MemTable, {} queries)", pk_queries),
+        &pk_latencies,
+    );
 
     // PK queries with specific columns
     let mut pk_proj_latencies: Vec<u64> = Vec::with_capacity(pk_queries as usize);
@@ -215,13 +293,19 @@ fn bench_query_latency() {
         exec(&db, &format!("SELECT name, score FROM t WHERE id = {}", i));
         pk_proj_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("PK SELECT 2/5 cols (MemTable, {} queries)", pk_queries), &pk_proj_latencies);
+    print_latency_distribution(
+        &format!("PK SELECT 2/5 cols (MemTable, {} queries)", pk_queries),
+        &pk_proj_latencies,
+    );
 
     // Flush to SSTable
     db.flush().expect("flush");
     db.wait_for_indexes_ready();
 
-    println!("\n  --- Phase 2: PK Point Query (SSTable, {} rows) ---", seed_rows);
+    println!(
+        "\n  --- Phase 2: PK Point Query (SSTable, {} rows) ---",
+        seed_rows
+    );
     print_separator();
 
     let mut pk_sst_latencies: Vec<u64> = Vec::with_capacity(pk_queries as usize);
@@ -230,7 +314,10 @@ fn bench_query_latency() {
         exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
         pk_sst_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("PK SELECT * (SSTable cold, {} queries)", pk_queries), &pk_sst_latencies);
+    print_latency_distribution(
+        &format!("PK SELECT * (SSTable cold, {} queries)", pk_queries),
+        &pk_sst_latencies,
+    );
 
     // Warm cache pass
     let mut pk_warm_latencies: Vec<u64> = Vec::with_capacity(pk_queries as usize);
@@ -239,7 +326,10 @@ fn bench_query_latency() {
         exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
         pk_warm_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("PK SELECT * (SSTable warm, {} queries)", pk_queries), &pk_warm_latencies);
+    print_latency_distribution(
+        &format!("PK SELECT * (SSTable warm, {} queries)", pk_queries),
+        &pk_warm_latencies,
+    );
 
     println!("\n  --- Phase 3: Column Index Scan ---");
     print_separator();
@@ -253,15 +343,28 @@ fn bench_query_latency() {
         exec(&db, "SELECT * FROM t WHERE tag = 'tag_3'");
         idx_eq_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("Column eq (tag='tag_3', ~{} rows, {} queries)", seed_rows / 10, idx_queries), &idx_eq_latencies);
+    print_latency_distribution(
+        &format!(
+            "Column eq (tag='tag_3', ~{} rows, {} queries)",
+            seed_rows / 10,
+            idx_queries
+        ),
+        &idx_eq_latencies,
+    );
 
     let mut idx_range_latencies: Vec<u64> = Vec::with_capacity(idx_queries);
     for _ in 0..idx_queries {
         let start = Instant::now();
-        exec(&db, "SELECT * FROM t WHERE score > 20000.0 AND score < 30000.0");
+        exec(
+            &db,
+            "SELECT * FROM t WHERE score > 20000.0 AND score < 30000.0",
+        );
         idx_range_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("Column range (score 20K-30K, {} queries)", idx_queries), &idx_range_latencies);
+    print_latency_distribution(
+        &format!("Column range (score 20K-30K, {} queries)", idx_queries),
+        &idx_range_latencies,
+    );
 
     println!("\n  --- Phase 4: Full Table Scan ---");
     print_separator();
@@ -272,7 +375,10 @@ fn bench_query_latency() {
         exec(&db, "SELECT * FROM t");
         scan_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("SELECT * {} rows ({} queries)", seed_rows, scan_queries), &scan_latencies);
+    print_latency_distribution(
+        &format!("SELECT * {} rows ({} queries)", seed_rows, scan_queries),
+        &scan_latencies,
+    );
 
     let mut count_latencies: Vec<u64> = Vec::with_capacity(scan_queries);
     for _ in 0..scan_queries {
@@ -280,7 +386,10 @@ fn bench_query_latency() {
         exec(&db, "SELECT COUNT(*) AS cnt FROM t");
         count_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("COUNT(*) ({} queries)", scan_queries), &count_latencies);
+    print_latency_distribution(
+        &format!("COUNT(*) ({} queries)", scan_queries),
+        &count_latencies,
+    );
 }
 
 // ============================================================================
@@ -294,13 +403,16 @@ fn bench_write_latency_cpu() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let insert_latency_rows: i64 = if ci {  1_000 } else {  3_000 };
+    let insert_latency_rows: i64 = if ci { 1_000 } else { 3_000 };
     let insert_throughput_rows: i64 = if ci { 2_000 } else { 10_000 };
     let update_rows: i64 = if ci { 1_000 } else { 5_000 };
-    let delete_rows: i64 = if ci {   500 } else { 3_000 };
+    let delete_rows: i64 = if ci { 500 } else { 3_000 };
 
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, status TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, status TEXT)",
+    );
 
     // INSERT latency
     println!("\n  --- INSERT Latency ---");
@@ -309,25 +421,44 @@ fn bench_write_latency_cpu() {
     let mut insert_latencies: Vec<u64> = Vec::with_capacity(insert_latency_rows as usize);
     for i in 1..=insert_latency_rows {
         let start = Instant::now();
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'user_{}', {:.1}, 'active')",
-            i, i, i as f64 * 2.0));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, 'user_{}', {:.1}, 'active')",
+                i,
+                i,
+                i as f64 * 2.0
+            ),
+        );
         insert_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("INSERT ({} rows, 4 cols)", insert_latency_rows), &insert_latencies);
+    print_latency_distribution(
+        &format!("INSERT ({} rows, 4 cols)", insert_latency_rows),
+        &insert_latencies,
+    );
 
     // INSERT throughput (no latency measurement overhead)
     let throughput_start = Instant::now();
     let throughput_base = insert_latency_rows + 1;
     for i in 0..insert_throughput_rows {
         let id = throughput_base + i;
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'user_{}', {:.1}, 'active')",
-            id, id, id as f64 * 2.0));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, 'user_{}', {:.1}, 'active')",
+                id,
+                id,
+                id as f64 * 2.0
+            ),
+        );
     }
     let throughput_ms = throughput_start.elapsed().as_millis();
-    println!("  INSERT throughput ({} rows): {:.0} ops/s ({:.1} µs/op)",
+    println!(
+        "  INSERT throughput ({} rows): {:.0} ops/s ({:.1} µs/op)",
         insert_throughput_rows,
         insert_throughput_rows as f64 / (throughput_ms as f64 / 1000.0),
-        throughput_ms as f64 * 1000.0 / insert_throughput_rows as f64);
+        throughput_ms as f64 * 1000.0 / insert_throughput_rows as f64
+    );
 
     // UPDATE latency
     println!("\n  --- UPDATE Latency ---");
@@ -336,10 +467,19 @@ fn bench_write_latency_cpu() {
     let mut update_latencies: Vec<u64> = Vec::with_capacity(update_rows as usize);
     for i in 1..=update_rows {
         let start = Instant::now();
-        exec(&db, &format!("UPDATE t SET score = score + 100, status = 'updated' WHERE id = {}", i));
+        exec(
+            &db,
+            &format!(
+                "UPDATE t SET score = score + 100, status = 'updated' WHERE id = {}",
+                i
+            ),
+        );
         update_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("UPDATE by PK ({} rows)", update_rows), &update_latencies);
+    print_latency_distribution(
+        &format!("UPDATE by PK ({} rows)", update_rows),
+        &update_latencies,
+    );
 
     // DELETE latency
     println!("\n  --- DELETE Latency ---");
@@ -351,13 +491,19 @@ fn bench_write_latency_cpu() {
         exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
         delete_latencies.push(start.elapsed().as_micros() as u64);
     }
-    print_latency_distribution(&format!("DELETE by PK ({} rows)", delete_rows), &delete_latencies);
+    print_latency_distribution(
+        &format!("DELETE by PK ({} rows)", delete_rows),
+        &delete_latencies,
+    );
 
     // Memory after writes
     println!("\n  --- Memory After Writes ---");
     print_separator();
     let total_inserts = insert_latency_rows + insert_throughput_rows;
-    print_memory(&format!("After {} INSERT + {} UPDATE + {} DELETE", total_inserts, update_rows, delete_rows));
+    print_memory(&format!(
+        "After {} INSERT + {} UPDATE + {} DELETE",
+        total_inserts, update_rows, delete_rows
+    ));
 }
 
 // ============================================================================
@@ -374,27 +520,36 @@ fn bench_concurrent_cpu() {
     println!("{}", "=".repeat(130));
 
     let ci = is_ci();
-    let seed_rows: i64      = if ci {  2_000 } else { 10_000 };
-    let read_threads: usize  = if ci {      4 } else {      8 };
-    let read_ops: usize      = if ci {  2_000 } else { 10_000 };
-    let write_threads: usize = if ci {      2 } else {      4 };
-    let write_ops: usize     = if ci {  1_000 } else {  5_000 };
-    let mixed_read_threads: usize  = if ci { 1 } else { 2 };
+    let seed_rows: i64 = if ci { 2_000 } else { 10_000 };
+    let read_threads: usize = if ci { 4 } else { 8 };
+    let read_ops: usize = if ci { 2_000 } else { 10_000 };
+    let write_threads: usize = if ci { 2 } else { 4 };
+    let write_ops: usize = if ci { 1_000 } else { 5_000 };
+    let mixed_read_threads: usize = if ci { 1 } else { 2 };
     let mixed_write_threads: usize = if ci { 1 } else { 2 };
-    let mixed_ops: usize          = if ci { 1_000 } else { 5_000 };
+    let mixed_ops: usize = if ci { 1_000 } else { 5_000 };
 
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT, value INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT, value INTEGER)",
+    );
 
     // Seed
     for i in 1..=seed_rows {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'data_{}', {})", i, i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'data_{}', {})", i, i, i * 10),
+        );
     }
 
     let db = Arc::new(db);
 
     // Test 1: Read-heavy
-    println!("\n  --- {} Read Threads ({} ops each) ---", read_threads, read_ops);
+    println!(
+        "\n  --- {} Read Threads ({} ops each) ---",
+        read_threads, read_ops
+    );
     let read_start = Instant::now();
     let mut handles = vec![];
     for t in 0..read_threads {
@@ -411,13 +566,19 @@ fn bench_concurrent_cpu() {
     }
     let read_total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
     let read_elapsed = read_start.elapsed();
-    println!("  {} reads in {:.0}ms → {:.0} ops/s ({:.1} µs/op)",
-        read_total, read_elapsed.as_millis(),
+    println!(
+        "  {} reads in {:.0}ms → {:.0} ops/s ({:.1} µs/op)",
+        read_total,
+        read_elapsed.as_millis(),
         read_total as f64 / read_elapsed.as_secs_f64(),
-        read_elapsed.as_micros() as f64 / read_total as f64);
+        read_elapsed.as_micros() as f64 / read_total as f64
+    );
 
     // Test 2: Write-heavy
-    println!("\n  --- {} Write Threads ({} INSERT each) ---", write_threads, write_ops);
+    println!(
+        "\n  --- {} Write Threads ({} INSERT each) ---",
+        write_threads, write_ops
+    );
     let write_start = Instant::now();
     let mut handles = vec![];
     for t in 0..write_threads {
@@ -429,7 +590,11 @@ fn bench_concurrent_cpu() {
                 let id = base_id + i as i64;
                 let _ = db_clone.execute(&format!(
                     "INSERT INTO t VALUES ({}, 'thread_{}_{}', {})",
-                    id, t, i, id * 10));
+                    id,
+                    t,
+                    i,
+                    id * 10
+                ));
                 count += 1;
             }
             count
@@ -437,13 +602,19 @@ fn bench_concurrent_cpu() {
     }
     let write_total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
     let write_elapsed = write_start.elapsed();
-    println!("  {} writes in {:.0}ms → {:.0} ops/s ({:.1} µs/op)",
-        write_total, write_elapsed.as_millis(),
+    println!(
+        "  {} writes in {:.0}ms → {:.0} ops/s ({:.1} µs/op)",
+        write_total,
+        write_elapsed.as_millis(),
         write_total as f64 / write_elapsed.as_secs_f64(),
-        write_elapsed.as_micros() as f64 / write_total as f64);
+        write_elapsed.as_micros() as f64 / write_total as f64
+    );
 
     // Test 3: Mixed
-    println!("\n  --- Mixed ({} read + {} write threads) ---", mixed_read_threads, mixed_write_threads);
+    println!(
+        "\n  --- Mixed ({} read + {} write threads) ---",
+        mixed_read_threads, mixed_write_threads
+    );
     let mixed_start = Instant::now();
     let mut handles = vec![];
 
@@ -476,7 +647,11 @@ fn bench_concurrent_cpu() {
                 let id = base + i as i64;
                 let _ = db_clone.execute(&format!(
                     "INSERT INTO t VALUES ({}, 'mixed_{}_{}', {})",
-                    id, t, i, id * 10));
+                    id,
+                    t,
+                    i,
+                    id * 10
+                ));
                 count += 1;
             }
             count
@@ -486,10 +661,13 @@ fn bench_concurrent_cpu() {
     let results: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let mixed_total: usize = results.iter().sum();
     let mixed_elapsed = mixed_start.elapsed();
-    println!("  {} ops in {:.0}ms → {:.0} ops/s ({:.1} µs/op)",
-        mixed_total, mixed_elapsed.as_millis(),
+    println!(
+        "  {} ops in {:.0}ms → {:.0} ops/s ({:.1} µs/op)",
+        mixed_total,
+        mixed_elapsed.as_millis(),
         mixed_total as f64 / mixed_elapsed.as_secs_f64(),
-        mixed_elapsed.as_micros() as f64 / mixed_total as f64);
+        mixed_elapsed.as_micros() as f64 / mixed_total as f64
+    );
 
     // Memory check
     print_memory("After concurrent test");

@@ -14,7 +14,9 @@ fn test_btree_insert_flush_verify_100k() {
 
     let n = 100_000u64;
     for i in 0..n {
-        if i % 10000 == 0 { eprintln!("  insert {}...", i); }
+        if i % 10000 == 0 {
+            eprintln!("  insert {}...", i);
+        }
         btree.insert(i, i.to_le_bytes().to_vec()).unwrap();
     }
 
@@ -25,7 +27,12 @@ fn test_btree_insert_flush_verify_100k() {
     for i in 0..n {
         let val = btree.get(&i).unwrap();
         assert!(val.is_some(), "key {} not found after flush", i);
-        assert_eq!(val.unwrap(), i.to_le_bytes().to_vec(), "wrong value for key {}", i);
+        assert_eq!(
+            val.unwrap(),
+            i.to_le_bytes().to_vec(),
+            "wrong value for key {}",
+            i
+        );
     }
     eprintln!("  OK: all {} entries verified", n);
 }
@@ -41,7 +48,9 @@ fn test_btree_insert_and_query_interleaved() {
     for round in 0..20 {
         let base = round * batch;
         for i in 0..batch {
-            btree.insert((base + i) as u64, vec![(i % 256) as u8]).unwrap();
+            btree
+                .insert((base + i) as u64, vec![(i % 256) as u8])
+                .unwrap();
         }
         // verify all previously inserted keys
         for i in 0..=(base + batch - 1) {
@@ -73,27 +82,47 @@ fn test_btree_delete_and_reinsert() {
     // Verify odd keys exist, even keys gone
     for i in 0..1000u64 {
         if i % 2 == 0 {
-            assert!(btree.get(&i).unwrap().is_none(), "even key {} should be deleted", i);
+            assert!(
+                btree.get(&i).unwrap().is_none(),
+                "even key {} should be deleted",
+                i
+            );
         } else {
-            assert!(btree.get(&i).unwrap().is_some(), "odd key {} should exist", i);
+            assert!(
+                btree.get(&i).unwrap().is_some(),
+                "odd key {} should exist",
+                i
+            );
         }
     }
 
     // Re-insert even keys with new value
     for i in (0..1000u64).step_by(2) {
         let old = btree.insert(i, (i * 10).to_le_bytes().to_vec()).unwrap();
-        assert!(old.is_none(), "re-insert should not return old value for deleted key {}", i);
+        assert!(
+            old.is_none(),
+            "re-insert should not return old value for deleted key {}",
+            i
+        );
     }
 
     // All keys exist again
     for i in 0..1000u64 {
-        assert!(btree.get(&i).unwrap().is_some(), "key {} should exist after re-insert", i);
+        assert!(
+            btree.get(&i).unwrap().is_some(),
+            "key {} should exist after re-insert",
+            i
+        );
     }
 
     // Flush and re-verify
     btree.flush().unwrap();
     for i in 0..1000u64 {
-        assert!(btree.get(&i).unwrap().is_some(), "key {} should exist after flush", i);
+        assert!(
+            btree.get(&i).unwrap().is_some(),
+            "key {} should exist after flush",
+            i
+        );
     }
     eprintln!("  OK: delete+reinsert verified");
 }

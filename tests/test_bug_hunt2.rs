@@ -2,7 +2,7 @@
 //! Focus: expression projection, DROP+recreate stale cache, prepared stmt edge cases,
 //! arithmetic in SELECT, unary minus, COUNT(col) NULLs, complex WHERE, DDL correctness
 
-use motedb::{Database, types::Value, sql::QueryResult};
+use motedb::{sql::QueryResult, types::Value, Database};
 use tempfile::TempDir;
 
 fn setup_db(dir: &std::path::Path) -> Database {
@@ -32,7 +32,8 @@ fn query_single(db: &Database, sql: &str) -> Option<Vec<Value>> {
 fn test_select_arithmetic_expression() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 3)").unwrap();
 
     let row = query_single(&db, "SELECT a + b FROM t WHERE id = 1").unwrap();
@@ -52,7 +53,8 @@ fn test_select_arithmetic_expression() {
 fn test_select_arithmetic_with_literal() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     let row = query_single(&db, "SELECT v * 2 + 1 FROM t WHERE id = 1").unwrap();
@@ -63,7 +65,8 @@ fn test_select_arithmetic_with_literal() {
 fn test_select_unary_minus() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
 
     // -v should negate the value
@@ -82,7 +85,8 @@ fn test_select_unary_minus() {
 fn test_select_is_null_expression() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
 
@@ -103,7 +107,8 @@ fn test_select_is_null_expression() {
 fn test_where_arithmetic_comparison() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, price INT, qty INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, price INT, qty INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 5)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 5, 2)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 1, 100)").unwrap();
@@ -117,7 +122,8 @@ fn test_where_arithmetic_comparison() {
 fn test_where_with_nested_and_or() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1, 0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 0, 1)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 0, 0)").unwrap();
@@ -138,7 +144,8 @@ fn test_where_with_nested_and_or() {
 fn test_count_col_skips_nulls() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
@@ -162,12 +169,14 @@ fn test_drop_recreate_different_column_count() {
     let db = setup_db(dir.path());
 
     // Create table with 2 columns
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     db.execute("DROP TABLE t").unwrap();
 
     // Recreate with 3 columns
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 1");
@@ -183,11 +192,13 @@ fn test_drop_recreate_different_types() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
     db.execute("DROP TABLE t").unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     let row = query_single(&db, "SELECT v FROM t WHERE id = 1").unwrap();
@@ -202,15 +213,25 @@ fn test_drop_recreate_different_types() {
 fn test_insert_many_then_select_with_conditions() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT, v INT)")
+        .unwrap();
 
     for i in 1..=20 {
         let status = if i % 3 == 0 { "active" } else { "inactive" };
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}', {})", i, status, i * 10)).unwrap();
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({}, '{}', {})",
+            i,
+            status,
+            i * 10
+        ))
+        .unwrap();
     }
 
     // WHERE status = 'active' AND v > 100
-    let rows = query_rows(&db, "SELECT * FROM t WHERE status = 'active' AND v > 100 ORDER BY id");
+    let rows = query_rows(
+        &db,
+        "SELECT * FROM t WHERE status = 'active' AND v > 100 ORDER BY id",
+    );
     assert!(rows.len() > 0, "Should find active rows with v > 100");
     for row in &rows {
         assert_eq!(row[1], Value::text("active".to_string()));
@@ -225,8 +246,10 @@ fn test_insert_many_then_select_with_conditions() {
 fn test_select_star_from_table_with_many_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c INT, d FLOAT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10, 'hello', 30, 3.14)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c INT, d FLOAT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 'hello', 30, 3.14)")
+        .unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t");
     assert_eq!(rows.len(), 1);
@@ -241,7 +264,8 @@ fn test_select_star_from_table_with_many_columns() {
 fn test_select_specific_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 20, 30)").unwrap();
 
     let row = query_single(&db, "SELECT a, c FROM t WHERE id = 1").unwrap();
@@ -258,10 +282,12 @@ fn test_select_specific_columns() {
 fn test_update_multiple_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 20, 30)").unwrap();
 
-    db.execute("UPDATE t SET a = 100, b = 200, c = 300 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET a = 100, b = 200, c = 300 WHERE id = 1")
+        .unwrap();
 
     let row = query_single(&db, "SELECT a, b, c FROM t WHERE id = 1").unwrap();
     assert_eq!(row[0], Value::Integer(100));
@@ -273,7 +299,8 @@ fn test_update_multiple_columns() {
 fn test_update_with_null_value() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
 
     db.execute("UPDATE t SET v = NULL WHERE id = 1").unwrap();
@@ -286,7 +313,8 @@ fn test_update_with_null_value() {
 fn test_update_set_to_expression() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5, 3)").unwrap();
 
     db.execute("UPDATE t SET a = a + b WHERE id = 1").unwrap();
@@ -299,11 +327,13 @@ fn test_update_set_to_expression() {
 fn test_update_swap_three_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1, 2, 3)").unwrap();
 
     // Rotate: a→b, b→c, c→a
-    db.execute("UPDATE t SET a = c, b = a, c = b WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET a = c, b = a, c = b WHERE id = 1")
+        .unwrap();
 
     let row = query_single(&db, "SELECT a, b, c FROM t WHERE id = 1").unwrap();
     assert_eq!(row[0], Value::Integer(3), "a should be old c=3");
@@ -319,20 +349,26 @@ fn test_update_swap_three_columns() {
 fn test_delete_with_complex_where() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
 
-    db.execute("DELETE FROM t WHERE v >= 50 AND v <= 80").unwrap();
+    db.execute("DELETE FROM t WHERE v >= 50 AND v <= 80")
+        .unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(rows.len(), 6, "Should delete v=50,60,70,80 (4 rows)");
 
-    let remaining: Vec<i64> = rows.iter().filter_map(|r| match &r[1] {
-        Value::Integer(v) => Some(*v),
-        _ => None,
-    }).collect();
+    let remaining: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[1] {
+            Value::Integer(v) => Some(*v),
+            _ => None,
+        })
+        .collect();
     assert_eq!(remaining, vec![10, 20, 30, 40, 90, 100]);
 }
 
@@ -340,9 +376,11 @@ fn test_delete_with_complex_where() {
 fn test_delete_with_or_condition() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=5 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
     }
 
     db.execute("DELETE FROM t WHERE v = 1 OR v = 5").unwrap();
@@ -359,14 +397,23 @@ fn test_delete_with_or_condition() {
 fn test_prepared_different_params_sequential() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'two')").unwrap();
 
     // Execute same prepared query with different params
     let sql = "SELECT v FROM t WHERE id = ?";
-    let r1 = db.execute_prepared(sql, vec![Value::Integer(1)]).unwrap().materialize().unwrap();
-    let r2 = db.execute_prepared(sql, vec![Value::Integer(2)]).unwrap().materialize().unwrap();
+    let r1 = db
+        .execute_prepared(sql, vec![Value::Integer(1)])
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let r2 = db
+        .execute_prepared(sql, vec![Value::Integer(2)])
+        .unwrap()
+        .materialize()
+        .unwrap();
 
     if let QueryResult::Select { rows: rows1, .. } = r1 {
         assert_eq!(rows1[0][0], Value::text("one".to_string()));
@@ -384,21 +431,31 @@ fn test_prepared_different_params_sequential() {
 fn test_prepared_insert_and_query() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+        .unwrap();
 
     // Insert via prepared
     for i in 1..=5 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::text(format!("user{}", i)), Value::Integer(20 + i)],
-        ).unwrap();
+            vec![
+                Value::Integer(i),
+                Value::text(format!("user{}", i)),
+                Value::Integer(20 + i),
+            ],
+        )
+        .unwrap();
     }
 
     // Query via prepared
-    let result = db.execute_prepared(
-        "SELECT name, age FROM t WHERE id = ?",
-        vec![Value::Integer(3)],
-    ).unwrap().materialize().unwrap();
+    let result = db
+        .execute_prepared(
+            "SELECT name, age FROM t WHERE id = ?",
+            vec![Value::Integer(3)],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
 
     if let QueryResult::Select { rows, .. } = result {
         assert_eq!(rows.len(), 1);
@@ -433,8 +490,10 @@ fn test_select_null_literal() {
 fn test_select_upper_lower() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'Hello World')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'Hello World')")
+        .unwrap();
 
     let row = query_single(&db, "SELECT UPPER(name) FROM t WHERE id = 1").unwrap();
     match &row[0] {
@@ -453,7 +512,8 @@ fn test_select_upper_lower() {
 fn test_select_length() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     let row = query_single(&db, "SELECT LENGTH(name) FROM t WHERE id = 1").unwrap();
@@ -468,10 +528,12 @@ fn test_select_length() {
 fn test_insert_100_rows_then_query() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
 
     for i in 1..=100 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * i))
+            .unwrap();
     }
 
     let row = query_single(&db, "SELECT COUNT(*) FROM t").unwrap();
@@ -480,13 +542,20 @@ fn test_insert_100_rows_then_query() {
     // Test simple range query first
     let rows = query_rows(&db, "SELECT * FROM t WHERE v > 9000");
     // 96^2=9216, 97^2=9409, 98^2=9604, 99^2=9801, 100^2=10000 → 5 rows
-    assert!(rows.len() >= 4, "Should find rows with v > 9000, got {} rows", rows.len());
+    assert!(
+        rows.len() >= 4,
+        "Should find rows with v > 9000, got {} rows",
+        rows.len()
+    );
 
     // Verify the actual values
-    let ids: Vec<i64> = rows.iter().filter_map(|r| match &r[0] {
-        Value::Integer(id) => Some(*id),
-        _ => None,
-    }).collect();
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            Value::Integer(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
     for id in &ids {
         assert!(*id >= 95, "All results should have id >= 95, got {}", id);
     }
@@ -503,7 +572,8 @@ fn test_reopen_preserves_all_data() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
         db.execute("INSERT INTO t VALUES (2, 'world')").unwrap();
         db.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
@@ -525,7 +595,8 @@ fn test_reopen_preserves_updates_and_deletes() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
@@ -549,7 +620,8 @@ fn test_reopen_preserves_updates_and_deletes() {
 fn test_auto_increment_ids() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)")
+        .unwrap();
 
     db.execute("INSERT INTO t (v) VALUES ('a')").unwrap();
     db.execute("INSERT INTO t (v) VALUES ('b')").unwrap();
@@ -566,10 +638,12 @@ fn test_auto_increment_ids() {
 fn test_auto_increment_with_explicit_id() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)")
+        .unwrap();
 
     db.execute("INSERT INTO t (v) VALUES ('a')").unwrap();
-    db.execute("INSERT INTO t (id, v) VALUES (100, 'b')").unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'b')")
+        .unwrap();
     db.execute("INSERT INTO t (v) VALUES ('c')").unwrap();
 
     let rows = query_rows(&db, "SELECT id, v FROM t ORDER BY id");
@@ -590,7 +664,8 @@ fn test_auto_increment_with_explicit_id() {
 fn test_bad_insert_column_count() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
 
     // Too many values
     let result = db.execute("INSERT INTO t VALUES (1, 2, 3)");
@@ -605,7 +680,8 @@ fn test_bad_insert_column_count() {
 fn test_duplicate_pk_rejected() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     let result = db.execute("INSERT INTO t VALUES (1, 20)");
@@ -625,7 +701,8 @@ fn test_select_nonexistent_table() {
 fn test_insert_wrong_type() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
 
     let result = db.execute("INSERT INTO t VALUES (1, 'not_a_number')");
     assert!(result.is_err(), "Should reject wrong type");
@@ -639,13 +716,21 @@ fn test_insert_wrong_type() {
 fn test_where_in_with_and() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, status TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10, 'active')").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 20, 'inactive')").unwrap();
-    db.execute("INSERT INTO t VALUES (3, 30, 'active')").unwrap();
-    db.execute("INSERT INTO t VALUES (4, 40, 'inactive')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, status TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 'active')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 20, 'inactive')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (3, 30, 'active')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (4, 40, 'inactive')")
+        .unwrap();
 
-    let rows = query_rows(&db, "SELECT * FROM t WHERE v IN (10, 30) AND status = 'active' ORDER BY id");
+    let rows = query_rows(
+        &db,
+        "SELECT * FROM t WHERE v IN (10, 30) AND status = 'active' ORDER BY id",
+    );
     assert_eq!(rows.len(), 2, "Should match rows 1 and 3");
 }
 
@@ -653,9 +738,11 @@ fn test_where_in_with_and() {
 fn test_where_not_in() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     for i in 1..=5 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE v NOT IN (20, 40) ORDER BY id");

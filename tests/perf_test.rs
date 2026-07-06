@@ -3,8 +3,8 @@
 //! Tests: INSERT, SELECT by PK, SELECT * (full scan), UPDATE, DELETE, durability
 
 use motedb::Database;
-use tempfile::TempDir;
 use std::time::Instant;
+use tempfile::TempDir;
 
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
@@ -13,7 +13,10 @@ fn create_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 fn count_rows(db: &Database, table: &str) -> i64 {
@@ -54,8 +57,16 @@ where
     F: FnOnce() -> u64,
 {
     let elapsed_ms = f();
-    let per_row_us = if ops > 0 { (elapsed_ms as f64 * 1000.0) / ops as f64 } else { 0.0 };
-    let throughput = if elapsed_ms > 0 { ops as f64 / (elapsed_ms as f64 / 1000.0) } else { f64::INFINITY };
+    let per_row_us = if ops > 0 {
+        (elapsed_ms as f64 * 1000.0) / ops as f64
+    } else {
+        0.0
+    };
+    let throughput = if elapsed_ms > 0 {
+        ops as f64 / (elapsed_ms as f64 / 1000.0)
+    } else {
+        f64::INFINITY
+    };
     BenchResult {
         name: name.to_string(),
         rows: ops,
@@ -70,17 +81,25 @@ where
 #[test]
 fn test_perf_insert_10k() {
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT)",
+    );
 
     const N: usize = 10_000;
 
     let r = bench("INSERT (10K rows, single-stmt)", N, || {
         let start = Instant::now();
         for i in 1..=N as i64 {
-            exec(&db, &format!(
-                "INSERT INTO t VALUES ({}, 'user_{}', {})",
-                i, i, i as f64 * 1.5
-            ));
+            exec(
+                &db,
+                &format!(
+                    "INSERT INTO t VALUES ({}, 'user_{}', {})",
+                    i,
+                    i,
+                    i as f64 * 1.5
+                ),
+            );
         }
         start.elapsed().as_millis() as u64
     });
@@ -95,7 +114,10 @@ fn test_perf_insert_10k() {
             break;
         }
         if attempt >= 10 {
-            eprintln!("Warning: row count after flush: {} (expected {}), attempt {}", cnt, N, attempt);
+            eprintln!(
+                "Warning: row count after flush: {} (expected {}), attempt {}",
+                cnt, N, attempt
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -105,22 +127,32 @@ fn test_perf_insert_10k() {
 #[test]
 fn test_perf_select_pk() {
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score FLOAT)",
+    );
 
     const N: usize = 5_000;
 
     // Seed
     for i in 1..=N as i64 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'v{}', {})", i, i, i as f64));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'v{}', {})", i, i, i as f64),
+        );
     }
 
-    let r = bench(&format!("SELECT by PK ({} queries, MemTable)", N), N, || {
-        let start = Instant::now();
-        for i in 1..=N as i64 {
-            exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
-        }
-        start.elapsed().as_millis() as u64
-    });
+    let r = bench(
+        &format!("SELECT by PK ({} queries, MemTable)", N),
+        N,
+        || {
+            let start = Instant::now();
+            for i in 1..=N as i64 {
+                exec(&db, &format!("SELECT * FROM t WHERE id = {}", i));
+            }
+            start.elapsed().as_millis() as u64
+        },
+    );
     println!("{}", r);
 
     // After flush
@@ -139,37 +171,54 @@ fn test_perf_select_pk() {
 #[test]
 fn test_perf_full_scan() {
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)",
+    );
 
     const N: usize = 5_000;
 
     for i in 1..=N as i64 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'row_{}', {})", i, i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'row_{}', {})", i, i, i * 10),
+        );
     }
 
     // Scan from MemTable
-    let r = bench(&format!("SELECT * full scan ({} rows, MemTable)", N), N, || {
-        let start = Instant::now();
-        exec(&db, "SELECT * FROM t");
-        start.elapsed().as_millis() as u64
-    });
+    let r = bench(
+        &format!("SELECT * full scan ({} rows, MemTable)", N),
+        N,
+        || {
+            let start = Instant::now();
+            exec(&db, "SELECT * FROM t");
+            start.elapsed().as_millis() as u64
+        },
+    );
     println!("{}", r);
 
     // Scan from SSTable
     db.flush().expect("flush");
 
-    let r2 = bench(&format!("SELECT * full scan ({} rows, SSTable)", N), N, || {
-        let start = Instant::now();
-        exec(&db, "SELECT * FROM t");
-        start.elapsed().as_millis() as u64
-    });
+    let r2 = bench(
+        &format!("SELECT * full scan ({} rows, SSTable)", N),
+        N,
+        || {
+            let start = Instant::now();
+            exec(&db, "SELECT * FROM t");
+            start.elapsed().as_millis() as u64
+        },
+    );
     println!("{}", r2);
 }
 
 #[test]
 fn test_perf_update() {
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, counter INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, counter INTEGER)",
+    );
 
     const N: usize = 5_000;
 
@@ -180,7 +229,10 @@ fn test_perf_update() {
     let r = bench(&format!("UPDATE counter ({} rows)", N), N, || {
         let start = Instant::now();
         for i in 1..=N as i64 {
-            exec(&db, &format!("UPDATE t SET counter = {} WHERE id = {}", i, i));
+            exec(
+                &db,
+                &format!("UPDATE t SET counter = {} WHERE id = {}", i, i),
+            );
         }
         start.elapsed().as_millis() as u64
     });
@@ -205,13 +257,17 @@ fn test_perf_delete() {
     }
 
     let delete_count = N / 2;
-    let r = bench(&format!("DELETE ({} rows from {})", delete_count, N), delete_count, || {
-        let start = Instant::now();
-        for i in (1..=N as i64).step_by(2) {
-            exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
-        }
-        start.elapsed().as_millis() as u64
-    });
+    let r = bench(
+        &format!("DELETE ({} rows from {})", delete_count, N),
+        delete_count,
+        || {
+            let start = Instant::now();
+            for i in (1..=N as i64).step_by(2) {
+                exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
+            }
+            start.elapsed().as_millis() as u64
+        },
+    );
     println!("{}", r);
 
     // Verify odd rows deleted
@@ -235,11 +291,17 @@ fn test_perf_durability() {
     // Phase 1: Write
     let _write_ms = {
         let db = Database::create(&db_path).expect("create db");
-        exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, num INTEGER)");
+        exec(
+            &db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, num INTEGER)",
+        );
 
         let start = Instant::now();
         for i in 1..=N as i64 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'v{}', {})", i, i, i * 10));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'v{}', {})", i, i, i * 10),
+            );
         }
         let write_ms = start.elapsed().as_millis() as u64;
 
@@ -274,7 +336,11 @@ fn test_perf_durability() {
             rows: 1,
             total_ms: read_ms,
             per_row_us: read_ms as f64 * 1000.0,
-            throughput: if read_ms > 0 { 1000.0 / read_ms as f64 } else { f64::INFINITY },
+            throughput: if read_ms > 0 {
+                1000.0 / read_ms as f64
+            } else {
+                f64::INFINITY
+            },
         };
         println!("{}", r);
 
@@ -283,7 +349,13 @@ fn test_perf_durability() {
         let result = exec(&db, "SELECT * FROM t");
         let scan_ms = start.elapsed().as_millis() as u64;
         if let motedb::sql::QueryResult::Select { rows, .. } = result {
-            assert_eq!(rows.len(), N, "Expected {} rows after restart, got {}", N, rows.len());
+            assert_eq!(
+                rows.len(),
+                N,
+                "Expected {} rows after restart, got {}",
+                N,
+                rows.len()
+            );
         }
 
         let r = BenchResult {
@@ -300,7 +372,10 @@ fn test_perf_durability() {
 #[test]
 fn test_perf_mixed_crud() {
     let (db, _dir) = create_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)",
+    );
 
     const N: usize = 5_000;
 
@@ -309,7 +384,10 @@ fn test_perf_mixed_crud() {
 
         // Insert
         for i in 1..=N as i64 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'v{}', {})", i, i, i));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'v{}', {})", i, i, i),
+            );
         }
 
         // Update every 3rd

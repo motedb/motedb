@@ -1,2 +1,8 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# NOTE: `target-cpu=native` is intentionally NOT set globally. When placed in
+# [build] rustflags it would be inherited by:
+#   - downstream crates that depend on motedb (forcing their builds to a CPU
+#     they may not target),
+#   - cross-compilation (aarch64-linux etc.), producing non-portable binaries,
+#   - `cargo publish` consumers.
+# For local benchmarking that wants native CPU, build with:
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release --example bench_300k

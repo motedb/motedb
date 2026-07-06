@@ -1,7 +1,7 @@
 //! Version 和文件元数据管理
 
-use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// 文件类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -53,7 +53,7 @@ impl FileMetadata {
         if !self.path.is_empty() {
             return self.path.clone();
         }
-        
+
         // 旧格式兼容
         match self.file_type {
             FileType::LSMData => format!("lsm_{:05}.sst", self.file_id),
@@ -85,7 +85,7 @@ impl Version {
             files: HashMap::new(),
         }
     }
-    
+
     /// 添加文件
     pub fn add_file(&mut self, meta: FileMetadata) {
         self.files
@@ -93,14 +93,14 @@ impl Version {
             .or_default()
             .push(meta);
     }
-    
+
     /// 删除文件
     pub fn delete_file(&mut self, file_id: u64, file_type: &FileType) {
         if let Some(files) = self.files.get_mut(file_type) {
             files.retain(|f| f.file_id != file_id);
         }
     }
-    
+
     /// 获取所有文件的文件名集合
     pub fn all_file_names(&self) -> HashSet<String> {
         self.files
@@ -126,17 +126,17 @@ impl VersionEdit {
             delete_files: Vec::new(),
         }
     }
-    
+
     /// 添加文件
     pub fn add_file(&mut self, meta: FileMetadata) {
         self.add_files.push(meta);
     }
-    
+
     /// 删除文件
     pub fn delete_file(&mut self, file_id: u64, file_type: FileType) {
         self.delete_files.push((file_id, file_type));
     }
-    
+
     /// 检查是否为空
     pub fn is_empty(&self) -> bool {
         self.add_files.is_empty() && self.delete_files.is_empty()

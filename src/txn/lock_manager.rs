@@ -51,11 +51,13 @@ impl LockEntry {
     /// Check if a lock can be granted
     fn can_grant(&self, mode: LockMode, txn_id: TransactionId) -> bool {
         let holders = self.holders.read();
-        
+
         match mode {
             LockMode::Shared => {
                 // Shared lock: OK if no exclusive locks held (except by self)
-                !holders.iter().any(|(tid, m)| *m == LockMode::Exclusive && *tid != txn_id)
+                !holders
+                    .iter()
+                    .any(|(tid, m)| *m == LockMode::Exclusive && *tid != txn_id)
             }
             LockMode::Exclusive => {
                 // Exclusive lock: OK if no locks held, or only held by self
@@ -81,7 +83,8 @@ impl LockEntry {
     /// Check if transaction holds any lock
     fn holds_lock(&self, txn_id: TransactionId) -> Option<LockMode> {
         let holders = self.holders.read();
-        holders.iter()
+        holders
+            .iter()
             .find(|(tid, _)| *tid == txn_id)
             .map(|(_, mode)| *mode)
     }
@@ -91,13 +94,13 @@ impl LockEntry {
 pub struct LockManager {
     /// Row locks: row_id -> LockEntry
     locks: DashMap<RowId, Arc<LockEntry>>,
-    
+
     /// Transaction lock tracking: txn_id -> set of locked row_ids
     txn_locks: Arc<Mutex<HashMap<TransactionId, HashSet<RowId>>>>,
-    
+
     /// Wait-for graph for deadlock detection: txn_id -> waiting for txn_ids
     wait_for: Arc<Mutex<HashMap<TransactionId, HashSet<TransactionId>>>>,
-    
+
     /// Deadlock detection timeout
     _deadlock_timeout: Duration,
 }
@@ -130,14 +133,11 @@ impl LockManager {
     }
 
     /// Internal lock acquisition with deadlock detection
-    fn acquire_lock(
-        &self,
-        txn_id: TransactionId,
-        row_id: RowId,
-        mode: LockMode,
-    ) -> Result<()> {
+    fn acquire_lock(&self, txn_id: TransactionId, row_id: RowId, mode: LockMode) -> Result<()> {
         // Get or create lock entry
-        let entry = self.locks.entry(row_id)
+        let entry = self
+            .locks
+            .entry(row_id)
             .or_insert_with(|| Arc::new(LockEntry::new()))
             .clone();
 
@@ -155,14 +155,14 @@ impl LockManager {
         // Try to acquire lock immediately
         if entry.can_grant(mode, txn_id) {
             entry.grant(txn_id, mode);
-            
+
             // Track lock
             let mut txn_locks = self.txn_locks.lock();
             txn_locks.entry(txn_id).or_default().insert(row_id);
-            
+
             return Ok(());
         }
-        
+
         // Cannot acquire immediately — retry with bounded exponential backoff
         for attempt in 0..MAX_LOCK_RETRIES {
             match attempt {
@@ -186,14 +186,19 @@ impl LockManager {
     }
 
     /// Upgrade a shared lock to exclusive
-    fn upgrade_lock(&self, txn_id: TransactionId, row_id: RowId, entry: Arc<LockEntry>) -> Result<()> {
+    fn upgrade_lock(
+        &self,
+        txn_id: TransactionId,
+        row_id: RowId,
+        entry: Arc<LockEntry>,
+    ) -> Result<()> {
         // Check if we can upgrade immediately (we must be the only holder)
         if entry.can_grant(LockMode::Exclusive, txn_id) {
             // Atomically upgrade
             entry.grant(txn_id, LockMode::Exclusive);
             return Ok(());
         }
-        
+
         // Cannot upgrade - other transactions hold locks
         Err(StorageError::Transaction(format!(
             "Cannot upgrade lock: txn {} on row {}, other transactions hold locks",
@@ -205,7 +210,7 @@ impl LockManager {
     pub fn release_locks(&self, txn_id: TransactionId) -> Result<()> {
         // Remove from wait-for graph
         self.remove_wait_for(txn_id);
-        
+
         // Get locked rows for this transaction
         let locked_rows = {
             let mut txn_locks = self.txn_locks.lock();
@@ -229,7 +234,7 @@ impl LockManager {
     /// Get statistics
     pub fn stats(&self) -> LockManagerStats {
         let txn_locks = self.txn_locks.lock();
-        
+
         LockManagerStats {
             total_locks: self.locks.len() as u64,
             active_transactions: txn_locks.len() as u64,
@@ -261,12 +266,12 @@ mod tests {
     #[test]
     fn test_shared_lock_compatibility() {
         let lm = LockManager::new();
-        
+
         // Multiple transactions can hold shared locks
         lm.acquire_shared(1, 100).unwrap();
         lm.acquire_shared(2, 100).unwrap();
         lm.acquire_shared(3, 100).unwrap();
-        
+
         let stats = lm.stats();
         assert_eq!(stats.active_transactions, 3);
     }
@@ -274,10 +279,10 @@ mod tests {
     #[test]
     fn test_exclusive_lock_blocks() {
         let lm = LockManager::new();
-        
+
         // T1 acquires exclusive lock
         lm.acquire_exclusive(1, 100).unwrap();
-        
+
         // T2 cannot acquire any lock on same row
         assert!(lm.acquire_shared(2, 100).is_err());
         assert!(lm.acquire_exclusive(2, 100).is_err());
@@ -286,10 +291,10 @@ mod tests {
     #[test]
     fn test_exclusive_blocks_shared() {
         let lm = LockManager::new();
-        
+
         // T1 acquires exclusive lock
         lm.acquire_exclusive(1, 100).unwrap();
-        
+
         // T2 cannot acquire shared lock
         assert!(lm.acquire_shared(2, 100).is_err());
     }
@@ -297,10 +302,10 @@ mod tests {
     #[test]
     fn test_shared_blocks_exclusive() {
         let lm = LockManager::new();
-        
+
         // T1 acquires shared lock
         lm.acquire_shared(1, 100).unwrap();
-        
+
         // T2 cannot acquire exclusive lock
         assert!(lm.acquire_exclusive(2, 100).is_err());
     }
@@ -308,13 +313,13 @@ mod tests {
     #[test]
     fn test_lock_release() {
         let lm = LockManager::new();
-        
+
         // T1 acquires exclusive lock
         lm.acquire_exclusive(1, 100).unwrap();
-        
+
         // Release locks
         lm.release_locks(1).unwrap();
-        
+
         // Now T2 can acquire lock
         lm.acquire_exclusive(2, 100).unwrap();
     }
@@ -322,33 +327,33 @@ mod tests {
     #[test]
     fn test_lock_upgrade() {
         let lm = LockManager::new();
-        
+
         // T1 acquires shared lock
         lm.acquire_shared(1, 100).unwrap();
-        
+
         // Release to allow upgrade test
         lm.release_locks(1).unwrap();
-        
+
         // Acquire again and try upgrade
         lm.acquire_shared(1, 100).unwrap();
-        lm.acquire_exclusive(1, 100).unwrap();  // Upgrade
+        lm.acquire_exclusive(1, 100).unwrap(); // Upgrade
     }
 
     #[test]
     fn test_multiple_row_locks() {
         let lm = LockManager::new();
-        
+
         // T1 locks multiple rows
         lm.acquire_exclusive(1, 100).unwrap();
         lm.acquire_exclusive(1, 200).unwrap();
         lm.acquire_exclusive(1, 300).unwrap();
-        
+
         let stats = lm.stats();
         assert_eq!(stats.total_locked_rows, 3);
-        
+
         // Release all
         lm.release_locks(1).unwrap();
-        
+
         let stats = lm.stats();
         assert_eq!(stats.active_transactions, 0);
     }
@@ -357,7 +362,7 @@ mod tests {
     fn test_concurrent_shared_locks() {
         let lm = Arc::new(LockManager::new());
         let mut handles = vec![];
-        
+
         for i in 0..5 {
             let lm = lm.clone();
             let handle = thread::spawn(move || {
@@ -367,11 +372,11 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         for handle in handles {
             handle.join().unwrap();
         }
-        
+
         // All should succeed
         let stats = lm.stats();
         assert_eq!(stats.active_transactions, 0);
@@ -380,11 +385,11 @@ mod tests {
     #[test]
     fn test_lock_statistics() {
         let lm = LockManager::new();
-        
+
         lm.acquire_exclusive(1, 100).unwrap();
         lm.acquire_exclusive(2, 200).unwrap();
         lm.acquire_shared(3, 300).unwrap();
-        
+
         let stats = lm.stats();
         assert_eq!(stats.active_transactions, 3);
         assert_eq!(stats.total_locked_rows, 3);

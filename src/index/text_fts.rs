@@ -7,22 +7,22 @@
 //! - MemTable → Flush → B-Tree (simple data flow)
 //! - No compaction needed (B+Tree handles updates in-place)
 
-use crate::{Result, StorageError};
-use crate::index::text_types::{
-    TermId, DocId, PostingList, PostingListFormat, Position,
-    Tokenizer, WhitespaceTokenizer, BM25Config, FieldNormTable,
-};
-use crate::index::text_dictionary::ChunkedDictionary;
 use crate::index::btree_generic::{GenericBTree, GenericBTreeConfig};
+use crate::index::text_dictionary::ChunkedDictionary;
+use crate::index::text_types::{
+    BM25Config, DocId, FieldNormTable, Position, PostingList, PostingListFormat, TermId, Tokenizer,
+    WhitespaceTokenizer,
+};
+use crate::{Result, StorageError};
 use lru::LruCache;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use serde::{Serialize, Deserialize};
 
 /// Document ID type
 pub type DocumentId = u64;
@@ -31,7 +31,7 @@ pub type DocumentId = u64;
 type DocLengthCache = Arc<RwLock<Option<Arc<HashMap<DocId, u8>>>>>;
 
 /// 🔥 Text FTS Index (Real B+Tree Implementation)
-/// 
+///
 /// Design Philosophy:
 /// - Real B+Tree using `GenericBTree<u32>` (zero-copy, no fragmentation)
 /// - Varint/Delta encoding for space efficiency
@@ -40,34 +40,34 @@ type DocLengthCache = Arc<RwLock<Option<Arc<HashMap<DocId, u8>>>>>;
 pub struct TextFTSIndex {
     /// Storage directory
     storage_dir: PathBuf,
-    
+
     /// Real B+Tree database (term_id → posting_list_bytes)
     btree: Arc<RwLock<GenericBTree<u32>>>,
-    
+
     /// Chunked token dictionary (memory efficient)
     dictionary: Arc<ChunkedDictionary>,
-    
+
     /// Pending posting lists (batched updates, flushed to B-Tree)
     pending_posting_lists: Arc<RwLock<HashMap<TermId, PostingList>>>,
-    
+
     /// Shard counters per term (track next shard_idx to avoid scanning)
     /// Bounded by LRU capacity to cap memory usage
     shard_counters: Arc<RwLock<LruCache<TermId, u32>>>,
-    
+
     /// Tokenizer
     tokenizer: Arc<dyn Tokenizer>,
-    
+
     /// BM25 configuration
     bm25_config: BM25Config,
-    
+
     /// Enable position indexing
     enable_positions: bool,
-    
+
     /// BM25 statistics (lightweight)
     total_docs: u64,
     total_tokens: u64,
     avg_doc_length: f32,
-    
+
     /// Pending doc_lengths (accumulated in memory, flushed together)
     pending_doc_lengths: Arc<RwLock<HashMap<DocId, u32>>>,
 
@@ -129,7 +129,11 @@ impl TermCursorData {
     }
 
     fn current_tf(&self) -> u16 {
-        if self.pos >= self.entries.len() { 0 } else { self.entries[self.pos].1 }
+        if self.pos >= self.entries.len() {
+            0
+        } else {
+            self.entries[self.pos].1
+        }
     }
 
     fn is_exhausted(&self) -> bool {
@@ -142,8 +146,12 @@ impl TermCursorData {
 
     fn seek(&mut self, target: u32) {
         // Binary search for first entry >= target
-        if self.is_exhausted() { return; }
-        if self.entries[self.pos].0 >= target { return; }
+        if self.is_exhausted() {
+            return;
+        }
+        if self.entries[self.pos].0 >= target {
+            return;
+        }
         match self.entries[self.pos..].binary_search_by_key(&target, |&(d, _)| d) {
             Ok(idx) => self.pos += idx,
             Err(idx) => self.pos += idx,
@@ -157,11 +165,11 @@ impl TextFTSIndex {
         Self::with_config(
             storage_path,
             Arc::new(WhitespaceTokenizer::default()),
-            true,   // enable positions for phrase query support
+            true, // enable positions for phrase query support
             4,
         )
     }
-    
+
     /// Create with custom configuration
     pub fn with_config(
         storage_path: PathBuf,
@@ -189,33 +197,35 @@ impl TextFTSIndex {
         // Create storage directory
         let storage_dir = storage_path.with_extension("fts.d");
         std::fs::create_dir_all(&storage_dir)?;
-        
+
         // Create or open chunked dictionary
         let dict_dir = storage_path.with_extension("dict.d");
         let dictionary = ChunkedDictionary::new(dict_dir, dict_cache_size)?;
-        
+
         // Create or open B+Tree for posting lists
         let btree_path = storage_dir.join("postings.gbtree");
         let btree_config = GenericBTreeConfig {
-            cache_size: 128,  // 🚀 P0: 降低到128 pages (1MB)，原192页(1.5MB)
-                              // Trade-off: -25% cache for strict memory constraint
+            cache_size: 128, // 🚀 P0: 降低到128 pages (1MB)，原192页(1.5MB)
+            // Trade-off: -25% cache for strict memory constraint
             unique_keys: false,
             allow_updates: true,
             immediate_sync: false,
         };
         let btree = GenericBTree::<u32>::with_config(btree_path, btree_config)?;
-        
+
         // Load statistics metadata
         let meta_path = storage_dir.join("index_meta.bin");
-        let (total_docs, total_tokens, avg_doc_length, deleted_docs_vec, deleted_term_docs_vec) = if meta_path.exists() {
-            Self::load_metadata(&meta_path)?
-        } else {
-            (0, 0, 0.0, Vec::new(), Vec::new())
-        };
+        let (total_docs, total_tokens, avg_doc_length, deleted_docs_vec, deleted_term_docs_vec) =
+            if meta_path.exists() {
+                Self::load_metadata(&meta_path)?
+            } else {
+                (0, 0, 0.0, Vec::new(), Vec::new())
+            };
 
         // Convert deleted_docs from Vec to HashSet
         let deleted_docs: HashSet<DocId> = deleted_docs_vec.into_iter().collect();
-        let deleted_term_docs: HashSet<(TermId, DocId)> = deleted_term_docs_vec.into_iter().collect();
+        let deleted_term_docs: HashSet<(TermId, DocId)> =
+            deleted_term_docs_vec.into_iter().collect();
 
         Ok(Self {
             storage_dir,
@@ -233,13 +243,17 @@ impl TextFTSIndex {
             doc_length_cache: Arc::new(RwLock::new(None)),
             deleted_docs: Arc::new(RwLock::new(deleted_docs)),
             deleted_term_docs: Arc::new(RwLock::new(deleted_term_docs)),
-            posting_cache: Arc::new(RwLock::new(LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
-            topk_cache: Arc::new(RwLock::new(LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
+            posting_cache: Arc::new(RwLock::new(LruCache::new(
+                std::num::NonZeroUsize::new(256).unwrap(),
+            ))),
+            topk_cache: Arc::new(RwLock::new(LruCache::new(
+                std::num::NonZeroUsize::new(128).unwrap(),
+            ))),
         })
     }
-    
+
     /// Batch insert documents (accumulate in pending buffer)
-    /// 
+    ///
     /// ⚡ Strategy: Accumulate in memory with incremental flush
     /// - Check pending size BEFORE accumulating each batch
     /// - Flush proactively to keep memory under control
@@ -266,18 +280,20 @@ impl TextFTSIndex {
             let pending_terms = self.pending_posting_lists.read().len();
             let pending_docs = self.pending_doc_lengths.read().len();
 
-            if pending_terms >= AUTO_FLUSH_THRESHOLD_TERMS || pending_docs >= AUTO_FLUSH_THRESHOLD_DOCS {
+            if pending_terms >= AUTO_FLUSH_THRESHOLD_TERMS
+                || pending_docs >= AUTO_FLUSH_THRESHOLD_DOCS
+            {
                 self.flush()?;
                 self.cleanup_shard_counters();
             }
         }
-        
+
         let _batch_start = Instant::now();
 
         // 1. Tokenization phase
         let _t1 = Instant::now();
         let mut batch_token_count = 0u64;
-        
+
         // Build per-term doc lists (lightweight intermediate structure)
         let mut term_docs: HashMap<TermId, Vec<(DocId, Option<Position>)>> = HashMap::new();
         let mut doc_lengths_batch = HashMap::new();
@@ -289,7 +305,11 @@ impl TextFTSIndex {
 
             for token in tokens {
                 let term_id = self.dictionary.get_or_insert(&token.text);
-                let pos = if self.enable_positions { Some(token.position) } else { None };
+                let pos = if self.enable_positions {
+                    Some(token.position)
+                } else {
+                    None
+                };
                 term_docs.entry(term_id).or_default().push((doc_id, pos));
             }
         }
@@ -298,19 +318,19 @@ impl TextFTSIndex {
         let mut pending = self.pending_posting_lists.write();
 
         for (term_id, doc_entries) in term_docs {
-            let posting = pending.entry(term_id).or_insert_with(|| {
-                PostingList::new_without_positions(!self.enable_positions)
-            });
+            let posting = pending
+                .entry(term_id)
+                .or_insert_with(|| PostingList::new_without_positions(!self.enable_positions));
 
             for (doc_id, pos) in doc_entries {
                 posting.add(doc_id, pos);
             }
         }
-        
+
         // 🚀 P0 CRITICAL FIX: 检查是否需要自动flush（防止内存无限增长）
         let should_auto_flush = pending.len() >= 5000;
         drop(pending);
-        
+
         // Accumulate doc_lengths in memory
         let mut pending_doc_lens = self.pending_doc_lengths.write();
         pending_doc_lens.extend(doc_lengths_batch);
@@ -329,24 +349,24 @@ impl TextFTSIndex {
         // Invalidate doc length cache
         *self.doc_length_cache.write() = None;
         self.topk_cache.write().clear();
-        
+
         // ✅ 自动flush（每5000个term触发一次）
         if should_auto_flush {
             self.flush()?;
         }
-        
+
         // debug_log disabled for Phase A optimization
-        
+
         Ok(())
     }
-    
+
     /// Insert a single document
     pub fn insert(&mut self, doc_id: DocumentId, text: &str) -> Result<()> {
         self.batch_insert(&[(doc_id, text)])
     }
-    
+
     /// Delete a document from the index
-    /// 
+    ///
     /// Strategy: Physical deletion from posting lists
     /// - Mark as deleted for search filtering
     /// - Remove from pending posting lists
@@ -362,7 +382,7 @@ impl TextFTSIndex {
 
         // Tokenize to get all terms for this doc
         let tokens = self.tokenizer.tokenize(text);
-        
+
         // Remove doc_id from pending posting lists
         {
             let mut pending = self.pending_posting_lists.write();
@@ -379,23 +399,23 @@ impl TextFTSIndex {
                 }
             }
         }
-        
+
         // Update statistics
         if self.total_docs > 0 {
             self.total_docs -= 1;
         }
-        
+
         // Get doc length to update total_tokens
         let doc_len = {
             let pending_doc_lens = self.pending_doc_lengths.read();
             pending_doc_lens.get(&doc_id).copied()
         };
-        
+
         if let Some(len) = doc_len {
             if self.total_tokens >= len as u64 {
                 self.total_tokens -= len as u64;
             }
-            
+
             // Remove from pending doc_lengths
             self.pending_doc_lengths.write().remove(&doc_id);
         } else {
@@ -407,7 +427,7 @@ impl TextFTSIndex {
                 }
             }
         }
-        
+
         // Recalculate average doc length
         if self.total_docs > 0 {
             self.avg_doc_length = self.total_tokens as f32 / self.total_docs as f32;
@@ -423,23 +443,23 @@ impl TextFTSIndex {
     }
 
     /// Update a document in the index
-    /// 
+    ///
     /// Strategy: Remove old terms from posting lists + add new terms
     /// Note: Does NOT mark document as deleted (only changes indexed terms)
     pub fn update(&mut self, doc_id: DocumentId, old_text: &str, new_text: &str) -> Result<()> {
         // 1. Remove old terms from pending posting lists and mark as deleted
         let old_tokens = self.tokenizer.tokenize(old_text);
         let old_token_count = old_tokens.len() as u64;
-        
+
         {
             let mut pending = self.pending_posting_lists.write();
             let mut deleted_term_docs = self.deleted_term_docs.write();
-            
+
             for token in &old_tokens {
                 if let Some(term_id) = self.dictionary.get(&token.text) {
                     // Mark (term_id, doc_id) as deleted (for B-Tree entries)
                     deleted_term_docs.insert((term_id, doc_id));
-                    
+
                     // Also remove from pending if exists
                     if let Some(posting) = pending.get_mut(&term_id) {
                         posting.remove(doc_id);
@@ -451,49 +471,49 @@ impl TextFTSIndex {
                 }
             }
         }
-        
+
         // 2. Insert new terms
         let new_tokens = self.tokenizer.tokenize(new_text);
         let new_token_count = new_tokens.len() as u64;
-        
+
         // Build per-term doc lists
         let mut term_docs: HashMap<TermId, Vec<DocId>> = HashMap::new();
         for token in new_tokens {
             let term_id = self.dictionary.get_or_insert(&token.text);
             term_docs.entry(term_id).or_default().push(doc_id);
         }
-        
+
         // Update pending posting lists
         {
             let mut pending = self.pending_posting_lists.write();
             let mut deleted_term_docs = self.deleted_term_docs.write();
-            
+
             for (term_id, doc_ids) in term_docs {
                 // Remove from deleted set if re-adding the same term
                 deleted_term_docs.remove(&(term_id, doc_id));
-                
-                let posting = pending.entry(term_id).or_insert_with(|| {
-                    PostingList::new_without_positions(!self.enable_positions)
-                });
+
+                let posting = pending
+                    .entry(term_id)
+                    .or_insert_with(|| PostingList::new_without_positions(!self.enable_positions));
                 for doc_id in doc_ids {
                     posting.add(doc_id, None);
                 }
             }
         }
-        
+
         // 3. Update doc_lengths
         {
             let mut pending_doc_lens = self.pending_doc_lengths.write();
             pending_doc_lens.insert(doc_id, new_token_count as u32);
         }
-        
+
         // 4. Update statistics
         // Adjust total_tokens (remove old, add new)
         if self.total_tokens >= old_token_count {
             self.total_tokens -= old_token_count;
         }
         self.total_tokens += new_token_count;
-        
+
         // Recalculate average doc length
         if self.total_docs > 0 {
             self.avg_doc_length = self.total_tokens as f32 / self.total_docs as f32;
@@ -507,7 +527,11 @@ impl TextFTSIndex {
     }
 
     /// Load posting list from all shards (helper function)
-    fn load_posting_list_sharded(&self, term_id: TermId, btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>) -> Result<Option<PostingList>> {
+    fn load_posting_list_sharded(
+        &self,
+        term_id: TermId,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<Option<PostingList>> {
         let mut merged = PostingList::new_without_positions(true);
         let mut found_any = false;
 
@@ -522,7 +546,7 @@ impl TextFTSIndex {
                 count
             } else {
                 drop(counters);
-                let count = self.discover_shard_count(term_id, &*btree)?;
+                let count = self.discover_shard_count(term_id, btree)?;
                 let mut counters = self.shard_counters.write();
                 counters.put(term_id, count);
                 count
@@ -567,7 +591,11 @@ impl TextFTSIndex {
 
     /// Load posting list with positions (for phrase queries).
     /// Loads the regular posting list then fetches positions from shard 0xFE.
-    fn load_posting_list_with_positions(&self, term_id: TermId, btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>) -> Result<Option<PostingList>> {
+    fn load_posting_list_with_positions(
+        &self,
+        term_id: TermId,
+        btree: &parking_lot::RwLockReadGuard<GenericBTree<u32>>,
+    ) -> Result<Option<PostingList>> {
         let mut posting = match self.load_posting_list_sharded(term_id, btree)? {
             Some(p) => p,
             None => return Ok(None),
@@ -585,11 +613,7 @@ impl TextFTSIndex {
     /// Scans keys in range [base_term_id, (0xFE << 24) | base_term_id] and
     /// counts how many distinct shard indices exist (shard 0..0xFE, excluding
     /// the position key at shard 0xFE).
-    fn discover_shard_count(
-        &self,
-        term_id: TermId,
-        btree: &GenericBTree<u32>,
-    ) -> Result<u32> {
+    fn discover_shard_count(&self, term_id: TermId, btree: &GenericBTree<u32>) -> Result<u32> {
         let base_term_id = term_id & 0x00FFFFFF;
         let range_start = base_term_id; // shard 0 key
         let range_end = (0xFEu32 << 24) | base_term_id; // position shard key (inclusive bound)
@@ -607,14 +631,14 @@ impl TextFTSIndex {
 
         Ok(max_shard_idx)
     }
-    
+
     /// Search for documents containing query terms
     pub fn search(&self, query: &str) -> Result<Vec<DocumentId>> {
         let tokens = self.tokenizer.tokenize(query);
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         let pending = self.pending_posting_lists.read();
         let btree = self.btree.read();
         let deleted = self.deleted_docs.read();
@@ -656,7 +680,7 @@ impl TextFTSIndex {
 
         Ok(results.unwrap_or_default())
     }
-    
+
     /// Search for documents containing an exact phrase (consecutive token positions).
     ///
     /// E.g., search_phrase("machine learning") returns only docs where "machine"
@@ -711,7 +735,10 @@ impl TextFTSIndex {
                 continue;
             }
             // Check if any term's association with this doc was deleted
-            if postings.iter().any(|(tid, _)| deleted_term_docs.contains(&(*tid, doc_id))) {
+            if postings
+                .iter()
+                .any(|(tid, _)| deleted_term_docs.contains(&(*tid, doc_id)))
+            {
                 continue;
             }
 
@@ -763,7 +790,11 @@ impl TextFTSIndex {
         };
 
         let doc_lengths = self.get_doc_lengths_cached()?;
-        let avg_dl = if self.avg_doc_length > 0.0 { self.avg_doc_length } else { 1.0 };
+        let avg_dl = if self.avg_doc_length > 0.0 {
+            self.avg_doc_length
+        } else {
+            1.0
+        };
         let k1 = self.bm25_config.k1;
         let b = self.bm25_config.b;
         let total_docs = self.total_docs as f32;
@@ -800,7 +831,9 @@ impl TextFTSIndex {
             }
         }
 
-        if df == 0 { return Ok(Vec::new()); }
+        if df == 0 {
+            return Ok(Vec::new());
+        }
 
         let idf = ((total_docs - df as f32 + 0.5) / (df as f32 + 0.5) + 1.0).ln();
 
@@ -813,11 +846,17 @@ impl TextFTSIndex {
         let mut scored: Vec<(DocumentId, f32)> = Vec::with_capacity(pairs.len());
 
         for (doc_id_u32, tf) in pairs {
-            if tf == 0 { continue; }
+            if tf == 0 {
+                continue;
+            }
             let doc_id = doc_id_u32 as DocumentId;
             if !deleted_empty {
-                if deleted.contains(&doc_id) { continue; }
-                if deleted_td.contains(&(term_id, doc_id)) { continue; }
+                if deleted.contains(&doc_id) {
+                    continue;
+                }
+                if deleted_td.contains(&(term_id, doc_id)) {
+                    continue;
+                }
             }
             let dl = doc_lengths.get(&doc_id).copied().unwrap_or(1) as f32;
             let norm = 1.0 - b + b * (dl / avg_dl);
@@ -856,7 +895,11 @@ impl TextFTSIndex {
         }
 
         let doc_lengths = self.get_doc_lengths_cached()?;
-        let avg_dl = if self.avg_doc_length > 0.0 { self.avg_doc_length } else { 1.0 };
+        let avg_dl = if self.avg_doc_length > 0.0 {
+            self.avg_doc_length
+        } else {
+            1.0
+        };
 
         let pending = self.pending_posting_lists.read();
         let btree = self.btree.read();
@@ -892,7 +935,9 @@ impl TextFTSIndex {
             };
 
             let df = posting.doc_count() as f32;
-            if df == 0.0 { continue; }
+            if df == 0.0 {
+                continue;
+            }
             // BM25 IDF: non-negative variant (Lucene-compatible). The +1 ensures
             // terms appearing in every document still get a small positive weight.
             let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
@@ -918,9 +963,15 @@ impl TextFTSIndex {
                 let mut e: Vec<(u32, u16)> = Vec::with_capacity(pairs.len());
                 for (doc_id_u32, tf) in pairs {
                     let doc_id = doc_id_u32 as DocId;
-                    if deleted.contains(&doc_id) { continue; }
-                    if deleted_term_docs.contains(&(term_id, doc_id)) { continue; }
-                    if tf > 0 { e.push((doc_id_u32, tf)); }
+                    if deleted.contains(&doc_id) {
+                        continue;
+                    }
+                    if deleted_term_docs.contains(&(term_id, doc_id)) {
+                        continue;
+                    }
+                    if tf > 0 {
+                        e.push((doc_id_u32, tf));
+                    }
                 }
                 e
             };
@@ -952,11 +1003,15 @@ impl TextFTSIndex {
         struct OrdF32(f32);
         impl Eq for OrdF32 {}
         impl PartialOrd for OrdF32 {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
         }
         impl Ord for OrdF32 {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+                self.0
+                    .partial_cmp(&other.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }
         }
 
@@ -979,7 +1034,9 @@ impl TextFTSIndex {
             let mut prefix_sum = 0.0f32;
             let mut pivot_idx = None;
             for (i, cursor) in cursors.iter().enumerate() {
-                if cursor.is_exhausted() { continue; }
+                if cursor.is_exhausted() {
+                    continue;
+                }
                 prefix_sum += cursor.upper_bound;
                 if prefix_sum >= threshold {
                     pivot_idx = Some(i);
@@ -997,7 +1054,9 @@ impl TextFTSIndex {
             // Check if all cursors up to pivot are at pivot_doc
             let mut all_at_pivot = true;
             for cursor in &mut cursors[..=pivot_idx] {
-                if cursor.is_exhausted() { continue; }
+                if cursor.is_exhausted() {
+                    continue;
+                }
                 if cursor.current_doc() < pivot_doc {
                     cursor.seek(pivot_doc);
                 }
@@ -1028,12 +1087,12 @@ impl TextFTSIndex {
             if heap.len() < top_k {
                 heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
                 if heap.len() == top_k {
-                    threshold = heap.peek().map(|h| h.0.0.0).unwrap_or(0.0);
+                    threshold = heap.peek().map(|h| h.0 .0 .0).unwrap_or(0.0);
                 }
             } else if score > threshold {
                 heap.pop();
                 heap.push(std::cmp::Reverse((OrdF32(score), pivot_doc)));
-                threshold = heap.peek().map(|h| h.0.0.0).unwrap_or(0.0);
+                threshold = heap.peek().map(|h| h.0 .0 .0).unwrap_or(0.0);
             }
 
             // Advance all cursors at pivot_doc
@@ -1050,7 +1109,8 @@ impl TextFTSIndex {
         }
 
         // Extract results
-        let mut results: Vec<(DocumentId, f32)> = heap.into_iter()
+        let mut results: Vec<(DocumentId, f32)> = heap
+            .into_iter()
             .map(|std::cmp::Reverse((OrdF32(score), doc))| (doc as DocId, score))
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -1074,8 +1134,13 @@ impl TextFTSIndex {
             doc_lengths.extend(pending_dl.iter().map(|(&k, &v)| (k, v)));
         }
 
-        let avg_dl = if self.avg_doc_length > 0.0 { self.avg_doc_length } else { 1.0 };
-        let encoded: HashMap<DocId, u8> = doc_lengths.into_iter()
+        let avg_dl = if self.avg_doc_length > 0.0 {
+            self.avg_doc_length
+        } else {
+            1.0
+        };
+        let encoded: HashMap<DocId, u8> = doc_lengths
+            .into_iter()
             .map(|(k, v)| (k, FieldNormTable::encode(v, avg_dl)))
             .collect();
 
@@ -1083,32 +1148,32 @@ impl TextFTSIndex {
         *self.doc_length_cache.write() = Some(arc.clone());
         Ok(arc)
     }
-    
+
     /// Flush index to disk (write pending buffer to BTree)
     pub fn flush(&mut self) -> Result<()> {
         use std::time::Instant;
         let flush_start = Instant::now();
-        
+
         // 1. Get pending posting lists (use take to avoid clone)
         let _t1 = Instant::now();
         let mut pending = self.pending_posting_lists.write();
         let is_empty = pending.is_empty();
-        
+
         if is_empty {
             drop(pending);
-            
+
             // Even if pending is empty, still need to flush doc_lengths if accumulated
             self.flush_doc_lengths_if_needed(true)?;
-            
+
             self.dictionary.flush()?;
             self.save_metadata()?;
             return Ok(());
         }
-        
+
         // 🔧 OPTIMIZATION: Use std::mem::take instead of clone (saves ~600KB copy)
         let pending_data = std::mem::take(&mut *pending);
         drop(pending);
-        
+
         // 2. Write to BTree using block format
         let t2 = Instant::now();
         let mut btree = self.btree.write();
@@ -1123,8 +1188,7 @@ impl TextFTSIndex {
             let next_shard_idx = match shard_counters.get(term_id) {
                 Some(idx) => *idx,
                 None => {
-                    let discovered = self.discover_shard_count(
-                        *term_id, &*btree).unwrap_or(0);
+                    let discovered = self.discover_shard_count(*term_id, &btree).unwrap_or(0);
                     shard_counters.put(*term_id, discovered);
                     discovered
                 }
@@ -1136,16 +1200,23 @@ impl TextFTSIndex {
             let mut clean_tfs: Vec<u16> = Vec::new();
             for &doc_id_u64 in &doc_ids {
                 let doc_id = doc_id_u64 as DocId;
-                if deleted.contains(&doc_id) { continue; }
-                if deleted_term_docs.contains(&(*term_id, doc_id)) { continue; }
+                if deleted.contains(&doc_id) {
+                    continue;
+                }
+                if deleted_term_docs.contains(&(*term_id, doc_id)) {
+                    continue;
+                }
                 clean_ids.push(doc_id_u64 as u32);
                 clean_tfs.push(posting.term_frequency(doc_id));
             }
 
-            if clean_ids.is_empty() { continue; }
+            if clean_ids.is_empty() {
+                continue;
+            }
 
             // Encode as block format
-            let block_list = super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
+            let block_list =
+                super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
             let bytes = block_list.as_bytes();
 
             // Append-only: write as a new shard (no merge with existing shards)
@@ -1164,36 +1235,42 @@ impl TextFTSIndex {
 
             // Lazy consolidation: merge shards when count exceeds threshold
             if next_shard_idx + 1 >= 5 {
-                if let Err(e) = self.consolidate_shards_for_term(&mut btree, &mut shard_counters, *term_id) {
-                    debug_log!("[FTS] Shard consolidation failed for term {}: {}", term_id, e);
+                if let Err(e) =
+                    self.consolidate_shards_for_term(&mut btree, &mut shard_counters, *term_id)
+                {
+                    debug_log!(
+                        "[FTS] Shard consolidation failed for term {}: {}",
+                        term_id,
+                        e
+                    );
                 }
             }
         }
 
         drop(deleted);
         drop(deleted_term_docs);
-        
+
         drop(shard_counters);
         let _t2_elapsed = t2.elapsed();
-        
+
         // 3. Flush BTree
         let t3 = Instant::now();
         btree.flush()?;
         drop(btree);
         let _t3_elapsed = t3.elapsed();
-        
+
         // 4. ✅ P0 CRITICAL FIX: 完全清空所有内存buffer（释放capacity）
         let t4 = Instant::now();
-        
+
         // pending_data will be dropped here
         drop(pending_data);
-        
+
         // 🔥 P0 FIX: 强制清空所有HashMap，释放capacity
         {
             let mut pending = self.pending_posting_lists.write();
-            *pending = HashMap::new();  // 完全替换（capacity归零）
+            *pending = HashMap::new(); // 完全替换（capacity归零）
         }
-        
+
         {
             // NOTE: Do NOT clear shard_counters! They are needed for
             // load_posting_list_sharded() to know how many shards exist per term.
@@ -1201,41 +1278,41 @@ impl TextFTSIndex {
             // LRU automatically evicts cold entries when capacity is exceeded.
             let _counters = self.shard_counters.write();
         }
-        
+
         {
             let mut doc_lens = self.pending_doc_lengths.write();
             doc_lens.clear();
-            doc_lens.shrink_to_fit();  // 释放capacity
+            doc_lens.shrink_to_fit(); // 释放capacity
         }
-        
+
         let _t4_elapsed = t4.elapsed();
-        
+
         // 5. Write doc_lengths (batched - only every N flushes to reduce I/O)
         let t5 = Instant::now();
         self.flush_doc_lengths_if_needed(false)?;
         let _t5_elapsed = t5.elapsed();
-        
+
         // 6. Save dictionary
         let t6 = Instant::now();
         self.dictionary.flush()?;
         let _t6_elapsed = t6.elapsed();
-        
+
         // 7. Save metadata
         let t7 = Instant::now();
         self.save_metadata()?;
         let _t7_elapsed = t7.elapsed();
-        
-        let _total_elapsed = flush_start.elapsed();// debug_log disabled for Phase A optimization
-        
+
+        let _total_elapsed = flush_start.elapsed(); // debug_log disabled for Phase A optimization
+
         Ok(())
     }
-    
+
     /// No-op now that shard_counters is bounded by LRU capacity.
     /// Kept as a stub for call-site compatibility.
     fn cleanup_shard_counters(&self) {
         // LRU handles eviction automatically; no manual cleanup needed.
     }
-    
+
     /// Save metadata to disk (prunes deleted_term_docs for fully-deleted docs)
     fn save_metadata(&self) -> Result<()> {
         // Prune: remove deleted_term_docs entries whose doc is already in deleted_docs
@@ -1260,9 +1337,10 @@ impl TextFTSIndex {
             .create(true)
             .truncate(true)
             .open(&tmp_path)?;
-        
+
         let deleted_docs: Vec<DocId> = self.deleted_docs.read().iter().copied().collect();
-        let deleted_term_docs: Vec<(TermId, DocId)> = self.deleted_term_docs.read().iter().copied().collect();
+        let deleted_term_docs: Vec<(TermId, DocId)> =
+            self.deleted_term_docs.read().iter().copied().collect();
 
         let metadata = TextFTSMetadata {
             total_docs: self.total_docs,
@@ -1272,10 +1350,10 @@ impl TextFTSIndex {
             deleted_docs,
             deleted_term_docs,
         };
-        
+
         let serialized = bincode::serialize(&metadata)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        
+
         file.write_all(&serialized)?;
         file.sync_all()?;
         drop(file);
@@ -1285,10 +1363,12 @@ impl TextFTSIndex {
 
         Ok(())
     }
-    
+
     /// Load metadata from disk
     #[allow(clippy::type_complexity)]
-    fn load_metadata(stats_path: &PathBuf) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>)> {
+    fn load_metadata(
+        stats_path: &PathBuf,
+    ) -> Result<(u64, u64, f32, Vec<DocId>, Vec<(TermId, DocId)>)> {
         let mut file = File::open(stats_path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
@@ -1297,9 +1377,8 @@ impl TextFTSIndex {
             return Ok((0, 0, 0.0, Vec::new(), Vec::new()));
         }
 
-        let metadata: TextFTSMetadata =
-            bincode::deserialize(&buffer)
-                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let metadata: TextFTSMetadata = bincode::deserialize(&buffer)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         Ok((
             metadata.total_docs,
@@ -1309,27 +1388,27 @@ impl TextFTSIndex {
             metadata.deleted_term_docs,
         ))
     }
-    
+
     /// Load doc_lengths from disk (on demand for BM25)
     fn load_doc_lengths(&self) -> Result<HashMap<DocId, u32>> {
         let lengths_path = self.storage_dir.join("doclengths.bin");
         let incremental_path = self.storage_dir.join("doclengths.incremental.bin");
-        
+
         let mut all_lengths = HashMap::new();
-        
+
         // Load main file
         if lengths_path.exists() {
             let mut file = File::open(&lengths_path)?;
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
-            
+
             if !buffer.is_empty() {
                 let map: DocLengthMap = bincode::deserialize(&buffer)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                 all_lengths = map.lengths;
             }
         }
-        
+
         // Merge incremental file if exists
         // Format: repeated [len:u32 LE][bincode(HashMap<DocId, u32>)]
         if incremental_path.exists() {
@@ -1350,26 +1429,31 @@ impl TextFTSIndex {
                     if end > buffer.len() {
                         break;
                     }
-                    if let Ok(block) = bincode::deserialize::<HashMap<DocId, u32>>(&buffer[start..end]) {
+                    if let Ok(block) =
+                        bincode::deserialize::<HashMap<DocId, u32>>(&buffer[start..end])
+                    {
                         all_lengths.extend(block);
                     }
                     cursor.set_position(end as u64);
                 }
             }
         }
-        
+
         Ok(all_lengths)
     }
-    
+
     /// Flush doc_lengths if threshold reached or force flush
-    /// 
+    ///
     /// 🔥 P0 CRITICAL FIX: Use append-only incremental writes to avoid memory explosion
     /// Old approach: load ALL 680K entries (8+ MB) on every flush → OOM
     /// New approach: append new entries to incremental file → O(pending size) memory
     /// Merge all shards for a term into a single shard (lazy consolidation)
     fn consolidate_shards_for_term(
         &self,
-        btree: &mut parking_lot::RwLockWriteGuard<'_, crate::index::btree_generic::GenericBTree<u32>>,
+        btree: &mut parking_lot::RwLockWriteGuard<
+            '_,
+            crate::index::btree_generic::GenericBTree<u32>,
+        >,
         shard_counters: &mut parking_lot::RwLockWriteGuard<'_, LruCache<TermId, u32>>,
         term_id: TermId,
     ) -> Result<()> {
@@ -1405,10 +1489,16 @@ impl TextFTSIndex {
             if let Ok(Some(bytes)) = btree.get(&shard_key) {
                 if !bytes.is_empty() {
                     if super::text_types::BlockPostingList::is_block_format(&bytes) {
-                        if let Ok(block_list) = super::text_types::BlockPostingList::deserialize(&bytes) {
+                        if let Ok(block_list) =
+                            super::text_types::BlockPostingList::deserialize(&bytes)
+                        {
                             let mut cursor = block_list.cursor();
                             while cursor.is_valid() {
-                                merged.add_with_freq(cursor.current_doc() as u64, None, cursor.current_tf());
+                                merged.add_with_freq(
+                                    cursor.current_doc() as u64,
+                                    None,
+                                    cursor.current_tf(),
+                                );
                                 cursor.advance();
                             }
                         }
@@ -1427,8 +1517,12 @@ impl TextFTSIndex {
         let mut clean_tfs: Vec<u16> = Vec::new();
         for &doc_id_u64 in &doc_ids {
             let doc_id = doc_id_u64 as DocId;
-            if deleted.contains(&doc_id) { continue; }
-            if deleted_term_docs.contains(&(term_id, doc_id)) { continue; }
+            if deleted.contains(&doc_id) {
+                continue;
+            }
+            if deleted_term_docs.contains(&(term_id, doc_id)) {
+                continue;
+            }
             clean_ids.push(doc_id_u64 as u32);
             clean_tfs.push(merged.term_frequency(doc_id));
         }
@@ -1445,7 +1539,8 @@ impl TextFTSIndex {
         }
 
         // Write consolidated as shard 0
-        let block_list = super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
+        let block_list =
+            super::text_types::BlockPostingList::from_sorted_pairs(&clean_ids, &clean_tfs);
         let bytes = block_list.as_bytes();
         btree.insert(base_term_id, bytes.to_vec())?;
 
@@ -1465,36 +1560,38 @@ impl TextFTSIndex {
         if pending_doc_lens.is_empty() {
             return Ok(());
         }
-        
+
         // 🚀 P0 NEW: Append to incremental file instead of rewriting main file
         let incremental_path = self.storage_dir.join("doclengths.incremental.bin");
-        
+
         // Serialize only the pending entries
-        let pending_map = DocLengthMap { lengths: pending_doc_lens.drain().collect() };
+        let pending_map = DocLengthMap {
+            lengths: pending_doc_lens.drain().collect(),
+        };
         let serialized = bincode::serialize(&pending_map)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        
+
         // Append to incremental file
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&incremental_path)?;
-        
+
         use std::io::Write;
         // Write length prefix + data
         let len_bytes = (serialized.len() as u32).to_le_bytes();
         file.write_all(&len_bytes)?;
         file.write_all(&serialized)?;
         file.sync_all()?;
-        
+
         // 🚀 P0 FIX: 释放HashMap capacity
         if pending_doc_lens.capacity() > 1024 {
             pending_doc_lens.shrink_to_fit();
         }
-        
+
         Ok(())
     }
-    
+
     /// Get statistics
     pub fn stats(&self) -> TextFTSStats {
         TextFTSStats {
@@ -1520,44 +1617,44 @@ pub struct TextFTSStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    
+
     #[test]
     fn test_basic_insert_search() {
         let temp_dir = TempDir::new().unwrap();
         let mut index = TextFTSIndex::new(temp_dir.path().join("test")).unwrap();
-        
+
         index.insert(1, "The quick brown fox").unwrap();
         index.insert(2, "jumps over the lazy dog").unwrap();
         index.insert(3, "The lazy cat").unwrap();
-        
+
         let results = index.search("lazy").unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.contains(&2));
         assert!(results.contains(&3));
     }
-    
+
     #[test]
     fn test_batch_insert() {
         let temp_dir = TempDir::new().unwrap();
         let mut index = TextFTSIndex::new(temp_dir.path().join("test")).unwrap();
-        
+
         let docs: Vec<(u64, &str)> = vec![
             (1, "document one"),
             (2, "document two"),
             (3, "document three"),
         ];
-        
+
         index.batch_insert(&docs).unwrap();
-        
+
         let results = index.search("document").unwrap();
         assert_eq!(results.len(), 3);
     }
-    
+
     #[test]
     fn test_persistence() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("persistent");
-        
+
         // Create and populate
         {
             let mut index = TextFTSIndex::new(path.clone()).unwrap();
@@ -1565,7 +1662,7 @@ mod tests {
             index.insert(2, "banana cherry").unwrap();
             index.flush().unwrap();
         }
-        
+
         // Reopen and verify
         {
             let index = TextFTSIndex::new(path).unwrap();
@@ -1573,16 +1670,16 @@ mod tests {
             assert_eq!(stats.total_docs, 2);
         }
     }
-    
+
     #[test]
     fn test_bm25_ranking() {
         let temp_dir = TempDir::new().unwrap();
         let mut index = TextFTSIndex::new(temp_dir.path().join("test")).unwrap();
-        
+
         index.insert(1, "rust programming").unwrap();
         index.insert(2, "rust compiler").unwrap();
         index.insert(3, "programming language").unwrap();
-        
+
         let results = index.search_ranked("rust", 10).unwrap();
         assert_eq!(results.len(), 2);
         // Both doc 1 and doc 2 should be in results
@@ -1608,24 +1705,28 @@ mod tests {
 
         // Double-delete: should NOT decrement again
         index.delete(1, "apple").unwrap();
-        assert_eq!(index.stats().total_docs, 1, "double-delete should not underflow total_docs");
+        assert_eq!(
+            index.stats().total_docs,
+            1,
+            "double-delete should not underflow total_docs"
+        );
     }
 }
 
 // ==================== 🚀 Batch Index Builder Implementation ====================
 
-use crate::index::builder::{IndexBuilder, BuildStats};
-use crate::types::{Row, Value, RowId};
+use crate::index::builder::{BuildStats, IndexBuilder};
+use crate::types::{Row, RowId, Value};
 
 impl IndexBuilder for TextFTSIndex {
     /// 批量构建文本索引（从MemTable flush时调用）
     fn build_from_memtable(&mut self, rows: &[(RowId, Row)]) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
-        
+
         // 🚀 Phase 1: 批量收集所有文本文档
         let mut documents: Vec<(u64, String)> = Vec::with_capacity(rows.len());
-        
+
         for (row_id, row) in rows {
             // 遍历row中的所有列，找到Text/TextDoc类型
             for value in row.iter() {
@@ -1642,49 +1743,53 @@ impl IndexBuilder for TextFTSIndex {
                 }
             }
         }
-        
+
         if documents.is_empty() {
             return Ok(());
         }
-        
-        debug_log!("[TextFTSIndex] Batch building {} documents", documents.len());
-        
+
+        debug_log!(
+            "[TextFTSIndex] Batch building {} documents",
+            documents.len()
+        );
+
         // 🔥 Phase 2: 使用已有的batch_insert方法（高效）
-        let doc_refs: Vec<(u64, &str)> = documents.iter()
+        let doc_refs: Vec<(u64, &str)> = documents
+            .iter()
             .map(|(id, text)| (*id, text.as_str()))
             .collect();
-        
+
         self.batch_insert(&doc_refs)?;
-        
+
         let duration = start.elapsed();
         debug_log!("[TextFTSIndex] Batch build complete in {:?}", duration);
-        
+
         Ok(())
     }
-    
+
     /// 持久化索引到磁盘
     fn persist(&mut self) -> Result<()> {
         use std::time::Instant;
         let start = Instant::now();
-        
+
         // Flush pending posting lists到B-Tree
         self.flush()?;
-        
+
         let duration = start.elapsed();
         debug_log!("[TextFTSIndex] Persist complete in {:?}", duration);
-        
+
         Ok(())
     }
-    
+
     /// 获取索引名称
     fn name(&self) -> &str {
         "TextFTSIndex"
     }
-    
+
     /// 获取构建统计信息
     fn stats(&self) -> BuildStats {
         let stats = self.stats();
-        
+
         BuildStats {
             rows_processed: stats.total_docs as usize,
             build_time_ms: 0,

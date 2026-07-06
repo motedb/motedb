@@ -3,7 +3,9 @@
 //! Manages write buffers, segment managers, and provides the public API
 //! for ingest, query, and GC operations.
 
-use super::column_encoding::{decode_bools, decode_strings, encode_bools, encode_strings, StringEncoding};
+use super::column_encoding::{
+    decode_bools, decode_strings, encode_bools, encode_strings, StringEncoding,
+};
 use super::config::ColumnarConfig;
 use super::segment::{ColumnBlock, ColumnEncoding, SegmentBuilder};
 use super::segment_manager::SegmentManager;
@@ -81,14 +83,23 @@ impl ColumnarStore {
     }
 
     /// Replay a single row into the columnar buffer (used during WAL recovery).
-    pub fn replay_row(&self, table_name: &str, row_id: RowId, row: crate::types::Row) -> Result<()> {
-        let table_id = self.table_registry.get_table_id(table_name)
+    pub fn replay_row(
+        &self,
+        table_name: &str,
+        row_id: RowId,
+        row: crate::types::Row,
+    ) -> Result<()> {
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
-        let buffer_entry = self.buffers.get(&table_id)
-            .ok_or_else(|| StorageError::Columnar(format!(
-                "No write buffer for table '{}' (id={})", table_name, table_id
-            )))?;
+        let buffer_entry = self.buffers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!(
+                "No write buffer for table '{}' (id={})",
+                table_name, table_id
+            ))
+        })?;
         let mut buffer = buffer_entry.lock().unwrap();
         let decision = buffer.append(row_id, &row);
         if decision == FlushDecision::Flush {
@@ -101,11 +112,19 @@ impl ColumnarStore {
     }
 
     /// Ingest rows into a TimeSeries table.
-    pub fn ingest(&self, table_name: &str, rows: Vec<crate::types::Row>) -> Result<ColumnarIngestResult> {
-        let table_id = self.table_registry.get_table_id(table_name)
+    pub fn ingest(
+        &self,
+        table_name: &str,
+        rows: Vec<crate::types::Row>,
+    ) -> Result<ColumnarIngestResult> {
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
-        let schema = self.schemas.get(&table_id)
+        let schema = self
+            .schemas
+            .get(&table_id)
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?
             .clone();
 
@@ -118,7 +137,9 @@ impl ColumnarStore {
 
         // Batch allocate row IDs
         let num_rows = rows.len();
-        let start_id = self.next_row_id.fetch_add(num_rows as u64, Ordering::Relaxed);
+        let start_id = self
+            .next_row_id
+            .fetch_add(num_rows as u64, Ordering::Relaxed);
         let row_ids: Vec<RowId> = (start_id..start_id + num_rows as u64).collect();
 
         // P0: Write to WAL first (durability)
@@ -142,10 +163,12 @@ impl ColumnarStore {
 
         // Append to write buffer
         let mut segments_created = 0;
-        let buffer_entry = self.buffers.get(&table_id)
-            .ok_or_else(|| StorageError::Columnar(format!(
-                "No write buffer for table '{}' (id={})", table_name, table_id
-            )))?;
+        let buffer_entry = self.buffers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!(
+                "No write buffer for table '{}' (id={})",
+                table_name, table_id
+            ))
+        })?;
         let mut buffer = buffer_entry.lock().unwrap();
 
         for (i, row) in rows.into_iter().enumerate() {
@@ -167,7 +190,11 @@ impl ColumnarStore {
             if let Some(mgr) = self.managers.get(&table_id) {
                 if mgr.segment_count() >= self.config.merge_threshold_segments {
                     if let Err(e) = self.try_merge_segments(table_id, &schema) {
-                        debug_log!("[Columnar] Segment merge failed for table '{}': {:?}", table_name, e);
+                        debug_log!(
+                            "[Columnar] Segment merge failed for table '{}': {:?}",
+                            table_name,
+                            e
+                        );
                     }
                 }
             }
@@ -184,10 +211,9 @@ impl ColumnarStore {
     /// Selects the smallest segments (by row_count) whose total rows fit within
     /// `segment_target_rows`, reads + decodes them, and writes a single merged segment.
     fn try_merge_segments(&self, table_id: u32, schema: &TableSchema) -> Result<()> {
-        let manager = self.managers.get(&table_id)
-            .ok_or_else(|| StorageError::Columnar(format!(
-                "No segment manager for table_id={}", table_id
-            )))?;
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table_id={}", table_id))
+        })?;
 
         // Find small segments (sorted smallest first)
         let small = manager.small_segments(self.config.segment_target_rows);
@@ -213,12 +239,16 @@ impl ColumnarStore {
 
         debug_log!(
             "[Columnar] Merging {} segments ({} rows) for table_id={}",
-            to_merge.len(), total_rows, table_id
+            to_merge.len(),
+            total_rows,
+            table_id
         );
 
         // Read all columns from each segment + row_id column
         let column_count = schema.columns.len() as u16;
-        let mut merged_columns: Vec<ColumnBuffer> = schema.columns.iter()
+        let mut merged_columns: Vec<ColumnBuffer> = schema
+            .columns
+            .iter()
             .map(|c| ColumnBuffer::new(&c.col_type))
             .collect();
         let mut merged_row_ids: Vec<i64> = Vec::new();
@@ -279,9 +309,10 @@ impl ColumnarStore {
         let mut builder = SegmentBuilder::new(&path, table_id, column_count)?;
 
         // Sort merged data by timestamp if enabled
-        let ts_col_idx = schema.timeseries_column.as_ref().and_then(|ts_col| {
-            schema.columns.iter().position(|c| c.name == *ts_col)
-        });
+        let ts_col_idx = schema
+            .timeseries_column
+            .as_ref()
+            .and_then(|ts_col| schema.columns.iter().position(|c| c.name == *ts_col));
         let is_sorted = ts_col_idx.is_some() && self.config.enable_timestamp_sort && total_rows > 1;
         if is_sorted {
             // Build a temporary batch for sorting
@@ -314,7 +345,9 @@ impl ColumnarStore {
 
         // Write column statistics for merged segment
         if self.config.enable_column_stats {
-            let stats: Vec<super::segment::ColumnStatistics> = merged_columns.iter().enumerate()
+            let stats: Vec<super::segment::ColumnStatistics> = merged_columns
+                .iter()
+                .enumerate()
                 .filter_map(|(i, col)| col.compute_statistics(i as u16))
                 .collect();
             if !stats.is_empty() {
@@ -324,14 +357,22 @@ impl ColumnarStore {
 
         // Build bloom filters for merged segment
         if self.config.enable_bloom_filters {
-            let filters = merged_columns.iter().enumerate()
+            let filters = merged_columns
+                .iter()
+                .enumerate()
                 .filter_map(|(col_id, col)| {
                     if let ColumnBuffer::Text(vals) = col {
                         use crate::storage::lsm::BloomFilter;
-                        let non_null: Vec<&String> = vals.iter().filter_map(|v| v.as_ref()).collect();
-                        if non_null.is_empty() { return None; }
-                        let mut bloom = BloomFilter::new(non_null.len(), self.config.bloom_filter_bits_per_key);
-                        for s in &non_null { bloom.insert(s.as_bytes()); }
+                        let non_null: Vec<&String> =
+                            vals.iter().filter_map(|v| v.as_ref()).collect();
+                        if non_null.is_empty() {
+                            return None;
+                        }
+                        let mut bloom =
+                            BloomFilter::new(non_null.len(), self.config.bloom_filter_bits_per_key);
+                        for s in &non_null {
+                            bloom.insert(s.as_bytes());
+                        }
                         Some((col_id as u16, bloom.to_bytes()))
                     } else {
                         None
@@ -358,7 +399,9 @@ impl ColumnarStore {
 
         debug_log!(
             "[Columnar] Merged {} segments → 1 ({} rows) for table_id={}",
-            to_merge.len(), total_rows, table_id
+            to_merge.len(),
+            total_rows,
+            table_id
         );
 
         Ok(())
@@ -376,19 +419,37 @@ impl ColumnarStore {
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 let non_null: Vec<i64> = vals.iter().filter_map(|v| *v).collect();
                 let data = gorilla::encode_timestamps(&non_null);
-                builder.write_column(col_id, ColumnEncoding::GorillaTimestamp, &data, (vals.len() * 8) as u32, null_count)?;
+                builder.write_column(
+                    col_id,
+                    ColumnEncoding::GorillaTimestamp,
+                    &data,
+                    (vals.len() * 8) as u32,
+                    null_count,
+                )?;
             }
             ColumnBuffer::Integer(vals) => {
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 let non_null: Vec<i64> = vals.iter().filter_map(|v| *v).collect();
                 let data = gorilla::encode_integers(&non_null);
-                builder.write_column(col_id, ColumnEncoding::DeltaVarint, &data, (vals.len() * 8) as u32, null_count)?;
+                builder.write_column(
+                    col_id,
+                    ColumnEncoding::DeltaVarint,
+                    &data,
+                    (vals.len() * 8) as u32,
+                    null_count,
+                )?;
             }
             ColumnBuffer::Float(vals) => {
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
                 let non_null: Vec<f64> = vals.iter().filter_map(|v| *v).collect();
                 let data = gorilla::encode_floats(&non_null);
-                builder.write_column(col_id, ColumnEncoding::GorillaXorFloat, &data, (vals.len() * 8) as u32, null_count)?;
+                builder.write_column(
+                    col_id,
+                    ColumnEncoding::GorillaXorFloat,
+                    &data,
+                    (vals.len() * 8) as u32,
+                    null_count,
+                )?;
             }
             ColumnBuffer::Bool(vals) => {
                 let (packed, null_bm) = encode_bools(vals);
@@ -402,7 +463,13 @@ impl ColumnarStore {
                 }
                 data.extend_from_slice(&packed);
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
-                builder.write_column(col_id, ColumnEncoding::BoolPacked, &data, vals.len() as u32, null_count)?;
+                builder.write_column(
+                    col_id,
+                    ColumnEncoding::BoolPacked,
+                    &data,
+                    vals.len() as u32,
+                    null_count,
+                )?;
             }
             ColumnBuffer::Text(vals) => {
                 let (data, enc_type) = encode_strings(vals);
@@ -412,7 +479,15 @@ impl ColumnarStore {
                     ColumnEncoding::Raw
                 };
                 let null_count = vals.iter().filter(|v| v.is_none()).count() as u32;
-                builder.write_column(col_id, encoding, &data, vals.iter().map(|v| v.as_ref().map_or(1, |s| s.len() + 4)).sum::<usize>() as u32, null_count)?;
+                builder.write_column(
+                    col_id,
+                    encoding,
+                    &data,
+                    vals.iter()
+                        .map(|v| v.as_ref().map_or(1, |s| s.len() + 4))
+                        .sum::<usize>() as u32,
+                    null_count,
+                )?;
             }
             ColumnBuffer::Other(vals) => {
                 let data = bincode::serialize(vals)
@@ -424,34 +499,33 @@ impl ColumnarStore {
     }
 
     /// Decode a single column block into Values.
-    fn decode_single_column(&self, block: &ColumnBlock, col_type: &ColumnType, row_count: usize) -> Result<Vec<Value>> {
+    fn decode_single_column(
+        &self,
+        block: &ColumnBlock,
+        col_type: &ColumnType,
+        row_count: usize,
+    ) -> Result<Vec<Value>> {
         Ok(match block.encoding {
-            ColumnEncoding::GorillaTimestamp => {
-                gorilla::decode_timestamps(&block.data, row_count)
-                    .into_iter()
-                    .map(|micros| Value::Timestamp(crate::types::Timestamp::from_micros(micros)))
-                    .collect()
-            }
-            ColumnEncoding::DeltaVarint => {
-                gorilla::decode_integers(&block.data, row_count)
-                    .into_iter()
-                    .map(Value::Integer)
-                    .collect()
-            }
-            ColumnEncoding::GorillaXorFloat => {
-                gorilla::decode_floats(&block.data, row_count)
-                    .into_iter()
-                    .map(Value::Float)
-                    .collect()
-            }
+            ColumnEncoding::GorillaTimestamp => gorilla::decode_timestamps(&block.data, row_count)
+                .into_iter()
+                .map(|micros| Value::Timestamp(crate::types::Timestamp::from_micros(micros)))
+                .collect(),
+            ColumnEncoding::DeltaVarint => gorilla::decode_integers(&block.data, row_count)
+                .into_iter()
+                .map(Value::Integer)
+                .collect(),
+            ColumnEncoding::GorillaXorFloat => gorilla::decode_floats(&block.data, row_count)
+                .into_iter()
+                .map(Value::Float)
+                .collect(),
             ColumnEncoding::BoolPacked => {
                 let mut cursor = 0usize;
                 let has_null_bm = block.data[cursor] != 0;
                 cursor += 1;
                 let null_bm = if has_null_bm {
-                    let bm_len = u32::from_le_bytes(
-                        block.data[cursor..cursor + 4].try_into().unwrap()
-                    ) as usize;
+                    let bm_len =
+                        u32::from_le_bytes(block.data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                     cursor += 4;
                     let bm = block.data[cursor..cursor + bm_len].to_vec();
                     cursor += bm_len;
@@ -465,25 +539,21 @@ impl ColumnarStore {
                     .map(|v| v.map_or(Value::Null, Value::Bool))
                     .collect()
             }
-            ColumnEncoding::Dictionary | ColumnEncoding::Raw => {
-                match col_type {
-                    ColumnType::Text => {
-                        let enc = if block.encoding == ColumnEncoding::Dictionary {
-                            StringEncoding::Dictionary
-                        } else {
-                            StringEncoding::Raw
-                        };
-                        decode_strings(&block.data, row_count, enc)
-                            .into_iter()
-                            .map(|v| v.map_or(Value::Null, |s| Value::text(s)))
-                            .collect()
-                    }
-                    _ => {
-                        bincode::deserialize(&block.data)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?
-                    }
+            ColumnEncoding::Dictionary | ColumnEncoding::Raw => match col_type {
+                ColumnType::Text => {
+                    let enc = if block.encoding == ColumnEncoding::Dictionary {
+                        StringEncoding::Dictionary
+                    } else {
+                        StringEncoding::Raw
+                    };
+                    decode_strings(&block.data, row_count, enc)
+                        .into_iter()
+                        .map(|v| v.map_or(Value::Null, Value::text))
+                        .collect()
                 }
-            }
+                _ => bincode::deserialize(&block.data)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            },
         })
     }
 
@@ -494,10 +564,7 @@ impl ColumnarStore {
         std::fs::create_dir_all(&dir).map_err(StorageError::Io)?;
 
         let seg_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "seg_{:020}.mcdb",
-            seg_id
-        ));
+        let path = dir.join(format!("seg_{:020}.mcdb", seg_id));
 
         let column_count = batch.columns.len() as u16;
 
@@ -581,7 +648,9 @@ impl ColumnarStore {
                         col_id as u16,
                         encoding,
                         &data,
-                        vals.iter().map(|v| v.as_ref().map_or(1, |s| s.len() + 4)).sum::<usize>() as u32,
+                        vals.iter()
+                            .map(|v| v.as_ref().map_or(1, |s| s.len() + 4))
+                            .sum::<usize>() as u32,
                         null_count,
                     )?;
                 }
@@ -607,7 +676,11 @@ impl ColumnarStore {
         // This stores exact row_ids in the segment for accurate retrieval.
         if column_count > 0 {
             let row_id_data = gorilla::encode_integers(
-                &batch.row_ids.iter().map(|&id| id as i64).collect::<Vec<_>>()
+                &batch
+                    .row_ids
+                    .iter()
+                    .map(|&id| id as i64)
+                    .collect::<Vec<_>>(),
             );
             builder.write_column(
                 column_count, // column_id = column_count (one past last schema column)
@@ -619,9 +692,13 @@ impl ColumnarStore {
         }
 
         // Step 3: Compute and write column statistics (zone maps)
-        let is_sorted = ts_col_idx.is_some() && self.config.enable_timestamp_sort && batch.row_count > 1;
+        let is_sorted =
+            ts_col_idx.is_some() && self.config.enable_timestamp_sort && batch.row_count > 1;
         if self.config.enable_column_stats && !batch.columns.is_empty() {
-            let stats: Vec<super::segment::ColumnStatistics> = batch.columns.iter().enumerate()
+            let stats: Vec<super::segment::ColumnStatistics> = batch
+                .columns
+                .iter()
+                .enumerate()
                 .filter_map(|(i, col)| col.compute_statistics(i as u16))
                 .collect();
             if !stats.is_empty() {
@@ -664,29 +741,41 @@ impl ColumnarStore {
         conditions: &[super::segment_manager::ColumnCondition],
         column_names: &[String],
     ) -> Result<Vec<(RowId, SqlRow)>> {
-        let table_id = self.table_registry.get_table_id(table_name)
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
-        let schema = self.schemas.get(&table_id)
+        let schema = self
+            .schemas
+            .get(&table_id)
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?
             .clone();
 
-        let manager = self.managers.get(&table_id)
-            .ok_or_else(|| StorageError::Columnar(format!(
-                "No segment manager for table '{}'", table_name
-            )))?;
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
+        })?;
 
         // Resolve column names to IDs
         let column_ids: Vec<(u16, String)> = if column_names.is_empty() {
-            schema.columns.iter().enumerate()
+            schema
+                .columns
+                .iter()
+                .enumerate()
                 .map(|(i, c)| (i as u16, c.name.clone()))
                 .collect()
         } else {
-            column_names.iter().map(|name| {
-                let idx = schema.columns.iter().position(|c| c.name == *name)
-                    .ok_or_else(|| StorageError::ColumnNotFound(name.clone()))?;
-                Ok((idx as u16, name.clone()))
-            }).collect::<Result<Vec<_>>>()?
+            column_names
+                .iter()
+                .map(|name| {
+                    let idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .ok_or_else(|| StorageError::ColumnNotFound(name.clone()))?;
+                    Ok((idx as u16, name.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?
         };
 
         // Segment pruning with conditions
@@ -707,13 +796,16 @@ impl ColumnarStore {
 
             let blocks = manager.read_columns(segment, &col_ids)?;
 
-            let schema_blocks: Vec<&ColumnBlock> = blocks.iter()
+            let schema_blocks: Vec<&ColumnBlock> = blocks
+                .iter()
                 .filter(|b| b.column_id < segment.column_count)
                 .collect();
-            let decoded = self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
+            let decoded =
+                self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
 
             let exact_row_ids: Option<Vec<RowId>> = if segment.has_row_id_column {
-                blocks.iter()
+                blocks
+                    .iter()
                     .find(|b| b.column_id == row_id_col)
                     .map(|block| {
                         gorilla::decode_integers(&block.data, segment.row_count as usize)
@@ -725,13 +817,18 @@ impl ColumnarStore {
                 None
             };
 
-            let ts_col_idx = schema.timeseries_column.as_ref().and_then(|ts_col| {
-                column_ids.iter().position(|(_, name)| name == ts_col)
-            });
+            let ts_col_idx = schema
+                .timeseries_column
+                .as_ref()
+                .and_then(|ts_col| column_ids.iter().position(|(_, name)| name == ts_col));
 
             let (row_start, row_end) = if segment.is_timestamp_sorted {
                 self.binary_search_timestamp_range(
-                    &decoded, &column_ids, ts_col_idx, start_ts, end_ts,
+                    &decoded,
+                    &column_ids,
+                    ts_col_idx,
+                    start_ts,
+                    end_ts,
                 )
             } else {
                 (0, segment.row_count as usize)
@@ -768,7 +865,9 @@ impl ColumnarStore {
                 }
 
                 let row_id = if let Some(ref ids) = exact_row_ids {
-                    ids.get(row_idx).copied().unwrap_or(segment.min_row_id + row_idx as u64)
+                    ids.get(row_idx)
+                        .copied()
+                        .unwrap_or(segment.min_row_id + row_idx as u64)
                 } else {
                     segment.min_row_id + row_idx as u64
                 };
@@ -814,7 +913,11 @@ impl ColumnarStore {
                         return false;
                     }
                 }
-                ColumnCondition::Range { column_idx, low, high } => {
+                ColumnCondition::Range {
+                    column_idx,
+                    low,
+                    high,
+                } => {
                     let idx = *column_idx;
                     if idx >= row.len() {
                         continue;
@@ -840,7 +943,8 @@ impl ColumnarStore {
         for cond in conditions {
             match cond {
                 ColumnCondition::Equals { column_idx, value } => {
-                    let Some((_, col_name)) = column_ids.iter()
+                    let Some((_, col_name)) = column_ids
+                        .iter()
                         .find(|(id, _)| *id as usize == *column_idx)
                     else {
                         continue;
@@ -851,8 +955,13 @@ impl ColumnarStore {
                         }
                     }
                 }
-                ColumnCondition::Range { column_idx, low, high } => {
-                    let Some((_, col_name)) = column_ids.iter()
+                ColumnCondition::Range {
+                    column_idx,
+                    low,
+                    high,
+                } => {
+                    let Some((_, col_name)) = column_ids
+                        .iter()
                         .find(|(id, _)| *id as usize == *column_idx)
                     else {
                         continue;
@@ -871,9 +980,10 @@ impl ColumnarStore {
     /// Find the timestamp column index for a table.
     fn find_timestamp_column(&self, table_id: u32) -> Option<usize> {
         self.schemas.get(&table_id).and_then(|schema| {
-            schema.timeseries_column.as_ref().and_then(|ts_col| {
-                schema.columns.iter().position(|c| c.name == *ts_col)
-            })
+            schema
+                .timeseries_column
+                .as_ref()
+                .and_then(|ts_col| schema.columns.iter().position(|c| c.name == *ts_col))
         })
     }
 
@@ -908,30 +1018,42 @@ impl ColumnarStore {
         end_ts: i64,
         column_names: &[String],
     ) -> Result<Vec<(RowId, SqlRow)>> {
-        let table_id = self.table_registry.get_table_id(table_name)
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
-        let schema = self.schemas.get(&table_id)
+        let schema = self
+            .schemas
+            .get(&table_id)
             .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?
             .clone();
 
-        let manager = self.managers.get(&table_id)
-            .ok_or_else(|| StorageError::Columnar(format!(
-                "No segment manager for table '{}'", table_name
-            )))?;
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
+        })?;
 
         // Resolve column names to IDs
         let column_ids: Vec<(u16, String)> = if column_names.is_empty() {
             // All columns
-            schema.columns.iter().enumerate()
+            schema
+                .columns
+                .iter()
+                .enumerate()
                 .map(|(i, c)| (i as u16, c.name.clone()))
                 .collect()
         } else {
-            column_names.iter().map(|name| {
-                let idx = schema.columns.iter().position(|c| c.name == *name)
-                    .ok_or_else(|| StorageError::ColumnNotFound(name.clone()))?;
-                Ok((idx as u16, name.clone()))
-            }).collect::<Result<Vec<_>>>()?
+            column_names
+                .iter()
+                .map(|name| {
+                    let idx = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .ok_or_else(|| StorageError::ColumnNotFound(name.clone()))?;
+                    Ok((idx as u16, name.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?
         };
 
         // Segment pruning
@@ -951,21 +1073,40 @@ impl ColumnarStore {
             // P2: Predicate pushdown — decode timestamp column first to find matching rows
             let ts_block = blocks.iter().find(|b| {
                 column_ids.iter().any(|(id, name)| {
-                    *id == b.column_id && schema.timeseries_column.as_ref().map(|t| t == name).unwrap_or(false)
+                    *id == b.column_id
+                        && schema
+                            .timeseries_column
+                            .as_ref()
+                            .map(|t| t == name)
+                            .unwrap_or(false)
                 })
             });
 
             let matching_rows: Vec<usize> = if let Some(ts_blk) = ts_block {
                 if ts_blk.encoding == ColumnEncoding::GorillaTimestamp {
-                    let ts_micros = gorilla::decode_timestamps(&ts_blk.data, segment.row_count as usize);
+                    let ts_micros =
+                        gorilla::decode_timestamps(&ts_blk.data, segment.row_count as usize);
 
                     if segment.is_timestamp_sorted {
-                        let start = ts_micros.iter().position(|&m| m >= start_ts).unwrap_or(ts_micros.len());
-                        let end = ts_micros.iter().rposition(|&m| m <= end_ts).map(|i| i + 1).unwrap_or(0);
-                        if start >= end { continue; }
-                        (start..end).filter(|&i| ts_micros[i] >= start_ts && ts_micros[i] <= end_ts).collect()
+                        let start = ts_micros
+                            .iter()
+                            .position(|&m| m >= start_ts)
+                            .unwrap_or(ts_micros.len());
+                        let end = ts_micros
+                            .iter()
+                            .rposition(|&m| m <= end_ts)
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        if start >= end {
+                            continue;
+                        }
+                        (start..end)
+                            .filter(|&i| ts_micros[i] >= start_ts && ts_micros[i] <= end_ts)
+                            .collect()
                     } else {
-                        ts_micros.iter().enumerate()
+                        ts_micros
+                            .iter()
+                            .enumerate()
                             .filter(|(_, &m)| m >= start_ts && m <= end_ts)
                             .map(|(i, _)| i)
                             .collect()
@@ -983,14 +1124,17 @@ impl ColumnarStore {
             }
 
             // Now decode only needed columns for matching rows
-            let schema_blocks: Vec<&ColumnBlock> = blocks.iter()
+            let schema_blocks: Vec<&ColumnBlock> = blocks
+                .iter()
                 .filter(|b| b.column_id < segment.column_count)
                 .collect();
-            let decoded = self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
+            let decoded =
+                self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
 
             // P1: Decode row_id column for accurate row IDs
             let exact_row_ids: Option<Vec<RowId>> = if segment.has_row_id_column {
-                blocks.iter()
+                blocks
+                    .iter()
                     .find(|b| b.column_id == row_id_col)
                     .map(|block| {
                         gorilla::decode_integers(&block.data, segment.row_count as usize)
@@ -1017,7 +1161,9 @@ impl ColumnarStore {
                 }
 
                 let row_id = if let Some(ref ids) = exact_row_ids {
-                    ids.get(row_idx).copied().unwrap_or(segment.min_row_id + row_idx as u64)
+                    ids.get(row_idx)
+                        .copied()
+                        .unwrap_or(segment.min_row_id + row_idx as u64)
                 } else {
                     segment.min_row_id + row_idx as u64
                 };
@@ -1059,7 +1205,9 @@ impl ColumnarStore {
                 ColumnEncoding::GorillaTimestamp => {
                     let ts = gorilla::decode_timestamps(&block.data, row_count);
                     ts.into_iter()
-                        .map(|micros| Value::Timestamp(crate::types::Timestamp::from_micros(micros)))
+                        .map(|micros| {
+                            Value::Timestamp(crate::types::Timestamp::from_micros(micros))
+                        })
                         .collect()
                 }
                 ColumnEncoding::DeltaVarint => {
@@ -1075,9 +1223,9 @@ impl ColumnarStore {
                     let has_null_bm = block.data[cursor] != 0;
                     cursor += 1;
                     let null_bm = if has_null_bm {
-                        let bm_len = u32::from_le_bytes(
-                            block.data[cursor..cursor + 4].try_into().unwrap()
-                        ) as usize;
+                        let bm_len =
+                            u32::from_le_bytes(block.data[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
                         cursor += 4;
                         let bm = block.data[cursor..cursor + bm_len].to_vec();
                         cursor += bm_len;
@@ -1102,7 +1250,7 @@ impl ColumnarStore {
                             };
                             decode_strings(&block.data, row_count, enc)
                                 .into_iter()
-                                .map(|v| v.map_or(Value::Null, |s| Value::text(s)))
+                                .map(|v| v.map_or(Value::Null, Value::text))
                                 .collect()
                         }
                         _ => {
@@ -1151,16 +1299,30 @@ impl ColumnarStore {
 
         // Extract timestamps as i64 for binary search
         let get_ts = |row_idx: usize| -> i64 {
-            decoded.get(row_idx)
+            decoded
+                .get(row_idx)
                 .and_then(|row| row.get(col_idx))
-                .and_then(|v| if let Value::Timestamp(ts) = v { Some(ts.as_micros()) } else { None })
+                .and_then(|v| {
+                    if let Value::Timestamp(ts) = v {
+                        Some(ts.as_micros())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(i64::MIN)
         };
 
         // Find first row with ts >= start_ts
         let row_start = match decoded.binary_search_by(|row| {
-            let ts = row.get(col_idx)
-                .and_then(|v| if let Value::Timestamp(t) = v { Some(t.as_micros()) } else { None })
+            let ts = row
+                .get(col_idx)
+                .and_then(|v| {
+                    if let Value::Timestamp(t) = v {
+                        Some(t.as_micros())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(i64::MIN);
             ts.cmp(&start_ts)
         }) {
@@ -1170,10 +1332,17 @@ impl ColumnarStore {
 
         // Find first row with ts > end_ts
         let row_end = match decoded.binary_search_by(|row| {
-            let ts = row.get(col_idx)
-                .and_then(|v| if let Value::Timestamp(t) = v { Some(t.as_micros()) } else { None })
+            let ts = row
+                .get(col_idx)
+                .and_then(|v| {
+                    if let Value::Timestamp(t) = v {
+                        Some(t.as_micros())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(i64::MIN);
-            ts.cmp(&end_ts.saturating_add(1))  // search for end_ts+1 to get exclusive upper bound
+            ts.cmp(&end_ts.saturating_add(1)) // search for end_ts+1 to get exclusive upper bound
         }) {
             Ok(idx) => idx,
             Err(idx) => idx.min(n),
@@ -1185,20 +1354,23 @@ impl ColumnarStore {
 
     /// Delete expired segments for a table. Returns count deleted.
     pub fn gc_expired(&self, table_name: &str, cutoff_ts: i64) -> Result<usize> {
-        let table_id = self.table_registry.get_table_id(table_name)
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
-        let manager = self.managers.get(&table_id)
-            .ok_or_else(|| StorageError::Columnar(format!(
-                "No segment manager for table '{}'", table_name
-            )))?;
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
+        })?;
 
         manager.delete_expired(cutoff_ts)
     }
 
     /// Drop all data for a table (used by DROP TABLE).
     pub fn drop_table(&self, table_name: &str) -> Result<usize> {
-        let table_id = self.table_registry.get_table_id(table_name)
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
         // Remove buffer
@@ -1246,7 +1418,9 @@ impl ColumnarStore {
     /// Get segment count for a table.
     pub fn segment_count(&self, table_name: &str) -> usize {
         if let Ok(table_id) = self.table_registry.get_table_id(table_name) {
-            self.managers.get(&table_id).map_or(0, |m| m.segment_count())
+            self.managers
+                .get(&table_id)
+                .map_or(0, |m| m.segment_count())
         } else {
             0
         }
@@ -1288,7 +1462,8 @@ mod tests {
             ColumnarConfig::default(),
             Arc::new(AtomicU64::new(0)),
             registry,
-        ).unwrap();
+        )
+        .unwrap();
 
         store.register_table(table_id, &schema).unwrap();
 
@@ -1310,12 +1485,14 @@ mod tests {
         assert_eq!(store.segment_count("sensors"), 1);
 
         // Query time range [20_000, 50_000]
-        let results = store.query_time_range(
-            "sensors",
-            20_000,
-            50_000,
-            &["ts".to_string(), "temp".to_string()],
-        ).unwrap();
+        let results = store
+            .query_time_range(
+                "sensors",
+                20_000,
+                50_000,
+                &["ts".to_string(), "temp".to_string()],
+            )
+            .unwrap();
 
         // Should get rows with ts 20000..50000 (indices 20..50)
         assert_eq!(results.len(), 31); // 20, 21, ..., 50
@@ -1335,7 +1512,8 @@ mod tests {
             config,
             Arc::new(AtomicU64::new(0)),
             registry,
-        ).unwrap();
+        )
+        .unwrap();
 
         store.register_table(table_id, &schema).unwrap();
 
@@ -1373,7 +1551,8 @@ mod tests {
             ColumnarConfig::default(),
             Arc::new(AtomicU64::new(0)),
             registry,
-        ).unwrap();
+        )
+        .unwrap();
 
         store.register_table(table_id, &schema).unwrap();
 
@@ -1403,7 +1582,8 @@ mod tests {
             ColumnarConfig::default(),
             Arc::new(AtomicU64::new(0)),
             registry,
-        ).unwrap();
+        )
+        .unwrap();
 
         store.register_table(table_id, &schema).unwrap();
 
@@ -1428,21 +1608,15 @@ mod tests {
         store.ingest("sensors", rows).unwrap();
 
         // Query without flush — should still return data from buffer
-        let results = store.query_time_range(
-            "sensors",
-            0,
-            5000,
-            &[],
-        ).unwrap();
-        assert_eq!(results.len(), 3, "Buffer data should be queryable without flush");
+        let results = store.query_time_range("sensors", 0, 5000, &[]).unwrap();
+        assert_eq!(
+            results.len(),
+            3,
+            "Buffer data should be queryable without flush"
+        );
 
         // Query with time range filter
-        let filtered = store.query_time_range(
-            "sensors",
-            1500,
-            2500,
-            &[],
-        ).unwrap();
+        let filtered = store.query_time_range("sensors", 1500, 2500, &[]).unwrap();
         assert_eq!(filtered.len(), 1, "Should filter buffer data by time range");
     }
 
@@ -1463,7 +1637,8 @@ mod tests {
             config,
             Arc::new(AtomicU64::new(0)),
             registry,
-        ).unwrap();
+        )
+        .unwrap();
 
         store.register_table(table_id, &schema).unwrap();
 
@@ -1486,15 +1661,19 @@ mod tests {
         // (the merge triggers after each flush if segment_count >= threshold).
         // The key test: verify data integrity after any merges.
         let count_before = store.segment_count("sensors");
-        assert!(count_before >= 1, "Should have at least 1 segment, got {}", count_before);
+        assert!(
+            count_before >= 1,
+            "Should have at least 1 segment, got {}",
+            count_before
+        );
 
         // Verify data integrity — query full range
-        let results = store.query_time_range(
-            "sensors",
-            0,
-            600_000,
-            &[],
-        ).unwrap();
-        assert_eq!(results.len(), 50, "All 50 rows should be queryable, got {}", results.len());
+        let results = store.query_time_range("sensors", 0, 600_000, &[]).unwrap();
+        assert_eq!(
+            results.len(),
+            50,
+            "All 50 rows should be queryable, got {}",
+            results.len()
+        );
     }
 }

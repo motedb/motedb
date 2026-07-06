@@ -2,7 +2,7 @@
 //! UPDATE PK duplicate, UPDATE nonexistent column, NULL in indexed column,
 //! float range queries, modulo on floats, division by zero, double DROP TABLE
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -27,7 +27,8 @@ fn test_update_pk_to_duplicate_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
 
@@ -47,7 +48,8 @@ fn test_update_pk_to_new_value_works() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
 
     // UPDATE PK to a new unique value should succeed
@@ -74,11 +76,15 @@ fn test_update_nonexistent_column_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
 
     let result = db.execute("UPDATE t SET nonexistent = 'oops' WHERE id = 1");
-    assert!(result.is_err(), "UPDATE with nonexistent column should be rejected");
+    assert!(
+        result.is_err(),
+        "UPDATE with nonexistent column should be rejected"
+    );
 
     // Original data should be unchanged
     let r = rows(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
@@ -93,7 +99,8 @@ fn test_delete_row_with_null_in_indexed_column() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_name ON t (name)").unwrap();
 
     // Insert rows: one with NULL name, one with non-NULL name
@@ -121,27 +128,38 @@ fn test_float_range_queries_negative_positive() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
 
     // Insert negative, zero, and positive floats
     let values = [-10.0, -5.0, 0.0, 5.0, 10.0];
     for (i, v) in values.iter().enumerate() {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i + 1, v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i + 1, v))
+            .unwrap();
     }
 
     // Range query: val BETWEEN -5.0 AND 5.0
-    let r = rows(db.execute("SELECT id FROM t WHERE val BETWEEN -5.0 AND 5.0 ORDER BY id").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM t WHERE val BETWEEN -5.0 AND 5.0 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 3, "BETWEEN -5.0 AND 5.0 should return 3 rows");
     assert_eq!(&r[0][0], &Value::Integer(2)); // -5.0
     assert_eq!(&r[1][0], &Value::Integer(3)); // 0.0
     assert_eq!(&r[2][0], &Value::Integer(4)); // 5.0
 
     // Range query: val >= 0.0
-    let r2 = rows(db.execute("SELECT id FROM t WHERE val >= 0.0 ORDER BY id").unwrap());
+    let r2 = rows(
+        db.execute("SELECT id FROM t WHERE val >= 0.0 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(r2.len(), 3, "val >= 0.0 should return 3 rows");
 
     // Range query: val < 0.0
-    let r3 = rows(db.execute("SELECT id FROM t WHERE val < 0.0 ORDER BY id").unwrap());
+    let r3 = rows(
+        db.execute("SELECT id FROM t WHERE val < 0.0 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(r3.len(), 2, "val < 0.0 should return 2 rows");
 }
 
@@ -152,7 +170,8 @@ fn test_modulo_on_floats() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10.5)").unwrap();
 
     // Integer % Integer should work
@@ -167,7 +186,11 @@ fn test_modulo_on_floats() {
         Ok(r) => {
             let r = rows(r);
             if let Value::Float(f) = &r[0][0] {
-                assert!((f - 1.5).abs() < 0.01, "10.5 % 3.0 should be 1.5, got {}", f);
+                assert!(
+                    (f - 1.5).abs() < 0.01,
+                    "10.5 % 3.0 should be 1.5, got {}",
+                    f
+                );
             }
         }
         Err(_) => {
@@ -213,7 +236,10 @@ fn test_select_float_division_by_zero() {
     db.execute("INSERT INTO t VALUES (1)").unwrap();
 
     let result = db.execute("SELECT 10.0 / 0.0");
-    assert!(result.is_err(), "Float division by zero should return error");
+    assert!(
+        result.is_err(),
+        "Float division by zero should return error"
+    );
 }
 
 // === Test #9: DROP TABLE edge cases ===
@@ -246,26 +272,34 @@ fn test_count_after_delete_reinsert() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     // Insert 100 rows
     for i in 1..=100 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
     }
 
     // Delete half
     for i in 1..=50 {
-        db.execute(&format!("DELETE FROM t WHERE id = {}", i)).unwrap();
+        db.execute(&format!("DELETE FROM t WHERE id = {}", i))
+            .unwrap();
     }
 
     // Re-insert deleted rows
     for i in 1..=50 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
 
     // COUNT(*) should be 100
     let r = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
-    assert_eq!(&r[0][0], &Value::Integer(100), "COUNT(*) should be 100 after delete + re-insert");
+    assert_eq!(
+        &r[0][0],
+        &Value::Integer(100),
+        "COUNT(*) should be 100 after delete + re-insert"
+    );
 }
 
 // === Additional edge case tests ===
@@ -276,7 +310,8 @@ fn test_insert_null_into_non_null_column() {
     let db = Database::create(dir.path()).unwrap();
 
     // Create table without explicit NOT NULL — NULL is allowed
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 
     let r = rows(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
@@ -302,16 +337,24 @@ fn test_inverted_range_returns_empty() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
     }
 
     // BETWEEN 10 AND 1 is inverted — should return empty
-    let r = rows(db.execute("SELECT * FROM t WHERE val BETWEEN 10 AND 1").unwrap());
+    let r = rows(
+        db.execute("SELECT * FROM t WHERE val BETWEEN 10 AND 1")
+            .unwrap(),
+    );
     // SQL BETWEEN with inverted range should return empty
     // (but some DBs treat BETWEEN 10 AND 1 as no rows since 10 > 1)
-    assert!(r.len() <= 10, "Inverted range should return 0 rows or be handled gracefully");
+    assert!(
+        r.len() <= 10,
+        "Inverted range should return 0 rows or be handled gracefully"
+    );
 }
 
 #[test]
@@ -319,10 +362,12 @@ fn test_update_with_expression_arithmetic() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
-    db.execute("UPDATE t SET val = val * 2 + 1 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET val = val * 2 + 1 WHERE id = 1")
+        .unwrap();
 
     let r = rows(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
     assert_eq!(&r[0][0], &Value::Integer(21), "val should be 10*2+1 = 21");
@@ -333,7 +378,8 @@ fn test_delete_from_empty_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     // DELETE from empty table should succeed with 0 affected
     let result = db.execute("DELETE FROM t WHERE id = 999");

@@ -49,7 +49,10 @@ impl LeafStore {
     pub fn open(dir: &Path, cache_capacity: usize) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("leaf_data.bin");
-        let exists = path.exists() && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
+        let exists = path.exists()
+            && std::fs::metadata(&path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
 
         let file = OpenOptions::new()
             .read(true)
@@ -96,8 +99,10 @@ impl LeafStore {
     fn write_header(file: &File) -> Result<()> {
         let mut f = file.try_clone().map_err(StorageError::Io)?;
         f.seek(SeekFrom::Start(0)).map_err(StorageError::Io)?;
-        f.write_all(&LEAF_MAGIC.to_le_bytes()).map_err(StorageError::Io)?;
-        f.write_all(&LEAF_VERSION.to_le_bytes()).map_err(StorageError::Io)?;
+        f.write_all(&LEAF_MAGIC.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        f.write_all(&LEAF_VERSION.to_le_bytes())
+            .map_err(StorageError::Io)?;
         f.write_all(&0u32.to_le_bytes()).map_err(StorageError::Io)?; // slot_count
         f.write_all(&0u32.to_le_bytes()).map_err(StorageError::Io)?; // reserved
         f.flush().map_err(StorageError::Io)?;
@@ -108,12 +113,21 @@ impl LeafStore {
     pub fn create_leaf(&self, points: Vec<IndexedPoint3D>) -> Result<u64> {
         let leaf_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
         self.evict_if_needed(&mut inner)?;
 
         // Update slot count in header
-        inner.file.seek(SeekFrom::Start(8)).map_err(StorageError::Io)?;
-        inner.file.write_all(&((leaf_id + 1) as u32).to_le_bytes()).map_err(StorageError::Io)?;
+        inner
+            .file
+            .seek(SeekFrom::Start(8))
+            .map_err(StorageError::Io)?;
+        inner
+            .file
+            .write_all(&((leaf_id + 1) as u32).to_le_bytes())
+            .map_err(StorageError::Io)?;
 
         Self::write_slot(&mut inner.file, leaf_id, &points)?;
         inner.cache.put(leaf_id, LeafEntry { points });
@@ -123,7 +137,10 @@ impl LeafStore {
 
     /// Get all points for a leaf (from cache or disk)
     pub fn get_points(&self, leaf_id: u64) -> Result<Vec<IndexedPoint3D>> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if let Some(entry) = inner.cache.get(&leaf_id) {
             return Ok(entry.points.clone());
@@ -131,13 +148,21 @@ impl LeafStore {
 
         self.evict_if_needed(&mut inner)?;
         let points = Self::read_slot(&mut inner.file, leaf_id)?;
-        inner.cache.put(leaf_id, LeafEntry { points: points.clone() });
+        inner.cache.put(
+            leaf_id,
+            LeafEntry {
+                points: points.clone(),
+            },
+        );
         Ok(points)
     }
 
     /// Add a point to a leaf
     pub fn add_point(&self, leaf_id: u64, point: IndexedPoint3D) -> Result<bool> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if inner.cache.get(&leaf_id).is_none() {
             self.evict_if_needed(&mut inner)?;
@@ -157,7 +182,10 @@ impl LeafStore {
 
     /// Remove a point by row_id, returns true if found
     pub fn remove_point(&self, leaf_id: u64, row_id: u64) -> Result<bool> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if inner.cache.get(&leaf_id).is_none() {
             self.evict_if_needed(&mut inner)?;
@@ -177,7 +205,10 @@ impl LeafStore {
 
     /// Get point count for a leaf (from cache or read header from disk)
     pub fn point_count(&self, leaf_id: u64) -> Result<usize> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if let Some(entry) = inner.cache.get(&leaf_id) {
             return Ok(entry.points.len());
@@ -185,7 +216,10 @@ impl LeafStore {
 
         // Read just the count from disk (first 2 bytes of slot)
         let offset = FILE_HEADER_SIZE as u64 + leaf_id * SLOT_SIZE as u64;
-        inner.file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
+        inner
+            .file
+            .seek(SeekFrom::Start(offset))
+            .map_err(StorageError::Io)?;
         let mut buf = [0u8; 2];
         inner.file.read_exact(&mut buf).map_err(StorageError::Io)?;
         Ok(u16::from_le_bytes(buf) as usize)
@@ -193,7 +227,10 @@ impl LeafStore {
 
     /// Replace all points in a leaf
     pub fn set_points(&self, leaf_id: u64, points: Vec<IndexedPoint3D>) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if let Some(entry) = inner.cache.get_mut(&leaf_id) {
             entry.points = points;
@@ -206,8 +243,15 @@ impl LeafStore {
     }
 
     /// Filter points in a leaf, keeping only those matching predicate
-    pub fn retain_points(&self, leaf_id: u64, f: impl FnMut(&IndexedPoint3D) -> bool) -> Result<usize> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+    pub fn retain_points(
+        &self,
+        leaf_id: u64,
+        f: impl FnMut(&IndexedPoint3D) -> bool,
+    ) -> Result<usize> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if inner.cache.get(&leaf_id).is_none() {
             self.evict_if_needed(&mut inner)?;
@@ -230,7 +274,10 @@ impl LeafStore {
 
     /// Clear all points in a leaf, returns count of removed
     pub fn clear_leaf(&self, leaf_id: u64) -> Result<usize> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         if let Some(entry) = inner.cache.get_mut(&leaf_id) {
             let count = entry.points.len();
@@ -250,7 +297,10 @@ impl LeafStore {
 
     /// Free a leaf slot
     pub fn free_leaf(&self, leaf_id: u64) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
         inner.cache.pop(&leaf_id);
         inner.dirty.remove(&leaf_id);
         // Overwrite slot with empty data
@@ -260,10 +310,14 @@ impl LeafStore {
 
     /// Flush all dirty entries to disk
     pub fn flush(&self) -> Result<()> {
-        let mut inner = self.inner.lock().map_err(|e| StorageError::Lock(e.to_string()))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Lock(e.to_string()))?;
 
         let dirty_ids: Vec<u64> = inner.dirty.iter().copied().collect();
-        let dirty_data: Vec<(u64, Vec<IndexedPoint3D>)> = dirty_ids.iter()
+        let dirty_data: Vec<(u64, Vec<IndexedPoint3D>)> = dirty_ids
+            .iter()
             .filter_map(|id| inner.cache.get(id).map(|e| (*id, e.points.clone())))
             .collect();
 
@@ -298,7 +352,8 @@ impl LeafStore {
 
     fn read_slot(file: &mut File, leaf_id: u64) -> Result<Vec<IndexedPoint3D>> {
         let offset = Self::slot_offset(leaf_id);
-        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(StorageError::Io)?;
 
         let mut buf = [0u8; SLOT_SIZE];
         file.read_exact(&mut buf).map_err(StorageError::Io)?;
@@ -309,20 +364,44 @@ impl LeafStore {
             let base = SLOT_HEADER_SIZE + i * POINT_SIZE;
             points.push(IndexedPoint3D {
                 x: f64::from_le_bytes([
-                    buf[base], buf[base + 1], buf[base + 2], buf[base + 3],
-                    buf[base + 4], buf[base + 5], buf[base + 6], buf[base + 7],
+                    buf[base],
+                    buf[base + 1],
+                    buf[base + 2],
+                    buf[base + 3],
+                    buf[base + 4],
+                    buf[base + 5],
+                    buf[base + 6],
+                    buf[base + 7],
                 ]),
                 y: f64::from_le_bytes([
-                    buf[base + 8], buf[base + 9], buf[base + 10], buf[base + 11],
-                    buf[base + 12], buf[base + 13], buf[base + 14], buf[base + 15],
+                    buf[base + 8],
+                    buf[base + 9],
+                    buf[base + 10],
+                    buf[base + 11],
+                    buf[base + 12],
+                    buf[base + 13],
+                    buf[base + 14],
+                    buf[base + 15],
                 ]),
                 z: f64::from_le_bytes([
-                    buf[base + 16], buf[base + 17], buf[base + 18], buf[base + 19],
-                    buf[base + 20], buf[base + 21], buf[base + 22], buf[base + 23],
+                    buf[base + 16],
+                    buf[base + 17],
+                    buf[base + 18],
+                    buf[base + 19],
+                    buf[base + 20],
+                    buf[base + 21],
+                    buf[base + 22],
+                    buf[base + 23],
                 ]),
                 row_id: u64::from_le_bytes([
-                    buf[base + 24], buf[base + 25], buf[base + 26], buf[base + 27],
-                    buf[base + 28], buf[base + 29], buf[base + 30], buf[base + 31],
+                    buf[base + 24],
+                    buf[base + 25],
+                    buf[base + 26],
+                    buf[base + 27],
+                    buf[base + 28],
+                    buf[base + 29],
+                    buf[base + 30],
+                    buf[base + 31],
                 ]),
             });
         }
@@ -331,7 +410,8 @@ impl LeafStore {
 
     fn write_slot(file: &mut File, leaf_id: u64, points: &[IndexedPoint3D]) -> Result<()> {
         let offset = Self::slot_offset(leaf_id);
-        file.seek(SeekFrom::Start(offset)).map_err(StorageError::Io)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(StorageError::Io)?;
 
         let mut buf = [0u8; SLOT_SIZE];
         let count = points.len().min(MAX_POINTS_PER_SLOT);

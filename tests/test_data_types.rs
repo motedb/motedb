@@ -1,8 +1,8 @@
 //! Tests for data types: INT, FLOAT, TEXT, BOOL, TIMESTAMP, VECTOR, BLOB,
 //! NULL handling, type coercion, edge values
 
-use motedb::{Database, types::Value};
 use motedb::types::Tensor;
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -25,8 +25,10 @@ fn row(result: motedb::StreamingQueryResult) -> Vec<Value> {
 fn test_large_integers() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 9999999999999)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9999999999999)")
+        .unwrap();
 
     let r = row(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
     assert_eq!(&r[0], &Value::Integer(9999999999999i64));
@@ -36,7 +38,8 @@ fn test_large_integers() {
 fn test_zero_and_negative() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 0)").unwrap();
     db.execute("INSERT INTO t VALUES (2, -1)").unwrap();
     db.execute("INSERT INTO t VALUES (3, -999)").unwrap();
@@ -53,8 +56,10 @@ fn test_zero_and_negative() {
 fn test_float_precision() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 3.14159265358979)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 3.14159265358979)")
+        .unwrap();
 
     let r = row(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
     match &r[0] {
@@ -67,7 +72,8 @@ fn test_float_precision() {
 fn test_float_zero() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 0.0)").unwrap();
 
     let r = row(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
@@ -83,7 +89,8 @@ fn test_float_zero() {
 fn test_unicode_text() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '你好世界')").unwrap();
     db.execute("INSERT INTO t VALUES (2, '🎉🚀💻')").unwrap();
 
@@ -95,9 +102,11 @@ fn test_unicode_text() {
 fn test_long_text() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     let long_str = "x".repeat(10000);
-    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", long_str)).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", long_str))
+        .unwrap();
 
     let r = row(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
     match &r[0] {
@@ -110,9 +119,11 @@ fn test_long_text() {
 fn test_text_with_special_chars() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     // Test with escaped single quotes
-    db.execute("INSERT INTO t VALUES (1, 'it''s a test')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'it''s a test')")
+        .unwrap();
 
     let r = row(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
     match &r[0] {
@@ -127,16 +138,23 @@ fn test_text_with_special_chars() {
 fn test_boolean_operations() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE flags (id INT PRIMARY KEY, active BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE flags (id INT PRIMARY KEY, active BOOLEAN)")
+        .unwrap();
     db.execute("INSERT INTO flags VALUES (1, TRUE)").unwrap();
     db.execute("INSERT INTO flags VALUES (2, FALSE)").unwrap();
     db.execute("INSERT INTO flags VALUES (3, NULL)").unwrap();
 
-    let r = rows(db.execute("SELECT id FROM flags WHERE active = TRUE ORDER BY id").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM flags WHERE active = TRUE ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(&r[0][0], &Value::Integer(1));
 
-    let r = rows(db.execute("SELECT id FROM flags WHERE active IS NULL").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM flags WHERE active IS NULL")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(&r[0][0], &Value::Integer(3));
 }
@@ -147,8 +165,10 @@ fn test_boolean_operations() {
 fn test_null_in_all_columns() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, NULL, NULL, NULL)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL, NULL, NULL)")
+        .unwrap();
 
     let r = row(db.execute("SELECT a, b, c FROM t WHERE id = 1").unwrap());
     assert!(matches!(&r[0], Value::Null));
@@ -160,7 +180,8 @@ fn test_null_in_all_columns() {
 fn test_null_arithmetic() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 
     let r = row(db.execute("SELECT val + 10 FROM t WHERE id = 1").unwrap());
@@ -171,7 +192,8 @@ fn test_null_arithmetic() {
 fn test_null_comparison() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 42)").unwrap();
 
@@ -184,7 +206,10 @@ fn test_null_comparison() {
     assert_eq!(r.len(), 1);
 
     // val IS NOT NULL should match row 2
-    let r = rows(db.execute("SELECT id FROM t WHERE val IS NOT NULL").unwrap());
+    let r = rows(
+        db.execute("SELECT id FROM t WHERE val IS NOT NULL")
+            .unwrap(),
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(&r[0][0], &Value::Integer(2));
 }
@@ -195,7 +220,8 @@ fn test_null_comparison() {
 fn test_vector_insert_retrieve() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, emb VECTOR(3))").unwrap();
+    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, emb VECTOR(3))")
+        .unwrap();
 
     let row = vec![
         Value::Integer(1),
@@ -219,7 +245,8 @@ fn test_vector_insert_retrieve() {
 fn test_vector_null() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, emb VECTOR(3))").unwrap();
+    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, emb VECTOR(3))")
+        .unwrap();
 
     let vals = vec![Value::Integer(1), Value::Null];
     db.insert_row("vecs", vals).unwrap();
@@ -234,7 +261,8 @@ fn test_vector_null() {
 fn test_timestamp_insert_retrieve() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
 
     let row = vec![
         Value::Integer(1),
@@ -258,10 +286,14 @@ fn test_timestamp_insert_retrieve() {
 fn test_all_types_in_one_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE mixed (id INT PRIMARY KEY, i INT, f FLOAT, t TEXT, b BOOLEAN)").unwrap();
-    db.execute("INSERT INTO mixed VALUES (1, 42, 3.14, 'hello', TRUE)").unwrap();
+    db.execute("CREATE TABLE mixed (id INT PRIMARY KEY, i INT, f FLOAT, t TEXT, b BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO mixed VALUES (1, 42, 3.14, 'hello', TRUE)")
+        .unwrap();
 
-    let r = row(db.execute("SELECT i, f, t, b FROM mixed WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT i, f, t, b FROM mixed WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::Integer(42));
     match &r[1] {
         Value::Float(f) => assert!((f - 3.14).abs() < 0.01),
@@ -280,7 +312,8 @@ fn test_all_types_in_one_table() {
 fn test_int_float_comparison() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10.0)").unwrap();
 
     // Compare float column with integer literal
@@ -298,8 +331,10 @@ fn test_multiple_tables_isolation() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val TEXT)").unwrap();
-    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO a VALUES (1, 'text')").unwrap();
     db.execute("INSERT INTO b VALUES (1, 42)").unwrap();
 
@@ -317,9 +352,12 @@ fn test_wide_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.execute("CREATE TABLE wide (id INT PRIMARY KEY, c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, c8 INT, c9 INT, c10 INT)").unwrap();
-    db.execute("INSERT INTO wide VALUES (1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)").unwrap();
+    db.execute("INSERT INTO wide VALUES (1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)")
+        .unwrap();
 
-    let r = row(db.execute("SELECT c1, c5, c10 FROM wide WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT c1, c5, c10 FROM wide WHERE id = 1")
+        .unwrap());
     assert_eq!(&r[0], &Value::Integer(1));
     assert_eq!(&r[1], &Value::Integer(5));
     assert_eq!(&r[2], &Value::Integer(10));

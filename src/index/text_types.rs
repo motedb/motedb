@@ -8,8 +8,8 @@
 
 use crate::{Result, StorageError};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 /// Term ID (32-bit, supports 4B unique tokens)
 pub type TermId = u32;
@@ -35,7 +35,7 @@ pub struct Token {
 pub trait Tokenizer: Send + Sync {
     /// Tokenize text into a list of tokens
     fn tokenize(&self, text: &str) -> Vec<Token>;
-    
+
     /// Get tokenizer name
     fn name(&self) -> &str;
 }
@@ -83,7 +83,7 @@ impl Tokenizer for WhitespaceTokenizer {
             })
             .collect()
     }
-    
+
     fn name(&self) -> &str {
         "whitespace"
     }
@@ -112,7 +112,7 @@ impl Tokenizer for NgramTokenizer {
         } else {
             text.to_lowercase()
         };
-        
+
         let chars: Vec<char> = normalized.chars().collect();
         if chars.is_empty() {
             return vec![];
@@ -124,7 +124,7 @@ impl Tokenizer for NgramTokenizer {
                 position: 0,
             }];
         }
-        
+
         chars
             .windows(self.n)
             .enumerate()
@@ -134,7 +134,7 @@ impl Tokenizer for NgramTokenizer {
             })
             .collect()
     }
-    
+
     fn name(&self) -> &str {
         "ngram"
     }
@@ -149,17 +149,14 @@ impl Tokenizer for NgramTokenizer {
 pub struct BM25Config {
     /// Term frequency saturation parameter (typically 1.2-2.0)
     pub k1: f32,
-    
+
     /// Length normalization parameter (typically 0.75)
     pub b: f32,
 }
 
 impl Default for BM25Config {
     fn default() -> Self {
-        Self {
-            k1: 1.5,
-            b: 0.75,
-        }
+        Self { k1: 1.5, b: 0.75 }
     }
 }
 
@@ -205,7 +202,7 @@ impl Serialize for PostingList {
     {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("PostingList", 3)?;
-        
+
         // Serialize roaring bitmap as vec of u32
         let doc_ids: Vec<u32> = self.doc_ids.iter().collect();
         state.serialize_field("doc_ids", &doc_ids)?;
@@ -226,10 +223,10 @@ impl<'de> Deserialize<'de> for PostingList {
             doc_freqs: Vec<u16>,
             positions: Option<HashMap<DocId, Vec<Position>>>,
         }
-        
+
         let helper = Helper::deserialize(deserializer)?;
         let doc_ids = RoaringBitmap::from_iter(helper.doc_ids);
-        
+
         Ok(PostingList {
             doc_ids,
             doc_freqs: helper.doc_freqs,
@@ -254,105 +251,126 @@ impl PostingList {
             cached_pairs: parking_lot::Mutex::new(None),
         }
     }
-    
+
     /// Create PostingList without positions map (memory optimization)
-    /// 
+    ///
     /// When positions are disabled, we don't need the HashMap at all.
     /// This saves ~50% memory and eliminates HashMap lookup overhead!
     pub fn new_without_positions(disable_positions: bool) -> Self {
         Self {
             doc_ids: RoaringBitmap::new(),
             doc_freqs: Vec::new(),
-            positions: if disable_positions { None } else { Some(HashMap::new()) },
+            positions: if disable_positions {
+                None
+            } else {
+                Some(HashMap::new())
+            },
             cached_pairs: parking_lot::Mutex::new(None),
         }
     }
-    
+
     /// Compact serialization for disk persistence (85% space saving)
-    /// 
+    ///
     /// Format:
     /// - [roaring_bitmap_bytes] (variable, ~2-4KB for 2000 docs)
     /// - [doc_freqs_count: u32] (4 bytes)
     /// - [doc_freqs: u16...] (2 * count bytes)
-    /// 
+    ///
     /// Total: ~6-8KB (vs 50-70KB with bincode)
     pub fn serialize_compact(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        
+
         // 1. Serialize RoaringBitmap (highly compressed)
-        self.doc_ids.serialize_into(&mut buf)
-            .map_err(|e| StorageError::Serialization(format!("RoaringBitmap serialize error: {}", e)))?;
-        
+        self.doc_ids.serialize_into(&mut buf).map_err(|e| {
+            StorageError::Serialization(format!("RoaringBitmap serialize error: {}", e))
+        })?;
+
         // 2. Calculate and serialize doc_freqs from positions
         let doc_freqs: Vec<u16> = if let Some(ref pos_map) = self.positions {
-            self.doc_ids.iter()
-                .map(|id| pos_map.get(&(id as u64)).map(|v| v.len() as u16).unwrap_or(1))
+            self.doc_ids
+                .iter()
+                .map(|id| {
+                    pos_map
+                        .get(&(id as u64))
+                        .map(|v| v.len() as u16)
+                        .unwrap_or(1)
+                })
                 .collect()
         } else {
             // No positions tracked, assume frequency=1 for all docs
             vec![1u16; self.doc_ids.len() as usize]
         };
-        
+
         buf.extend_from_slice(&(doc_freqs.len() as u32).to_le_bytes());
         for &freq in &doc_freqs {
             buf.extend_from_slice(&freq.to_le_bytes());
         }
-        
+
         // Note: positions are not serialized (stored separately if needed)
-        
+
         Ok(buf)
     }
-    
+
     /// Deserialize from compact format
     pub fn deserialize_compact(buf: &[u8]) -> Result<Self> {
         use std::io::Cursor;
-        
+
         if buf.is_empty() {
             return Err(StorageError::InvalidData("Empty buffer".into()));
         }
-        
+
         let mut cursor = Cursor::new(buf);
-        
+
         // 1. Deserialize RoaringBitmap
-        let doc_ids = RoaringBitmap::deserialize_from(&mut cursor)
-            .map_err(|e| StorageError::Serialization(
-                format!("RoaringBitmap deserialize error (buf_len={}): {}", buf.len(), e)
-            ))?;
-        
+        let doc_ids = RoaringBitmap::deserialize_from(&mut cursor).map_err(|e| {
+            StorageError::Serialization(format!(
+                "RoaringBitmap deserialize error (buf_len={}): {}",
+                buf.len(),
+                e
+            ))
+        })?;
+
         let offset = cursor.position() as usize;
-        
+
         // 2. Deserialize doc_freqs
         if offset + 4 > buf.len() {
-            return Err(StorageError::InvalidData(
-                format!("Buffer too small for doc_freqs count: offset={}, buf_len={}", offset, buf.len())
-            ));
+            return Err(StorageError::InvalidData(format!(
+                "Buffer too small for doc_freqs count: offset={}, buf_len={}",
+                offset,
+                buf.len()
+            )));
         }
-        
+
         let count = u32::from_le_bytes([
-            buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
         ]) as usize;
-        
+
         let mut offset = offset + 4;
         let mut doc_freqs = Vec::with_capacity(count);
-        
+
         for _ in 0..count {
             if offset + 2 > buf.len() {
-                return Err(StorageError::InvalidData("Buffer too small for doc_freqs".into()));
+                return Err(StorageError::InvalidData(
+                    "Buffer too small for doc_freqs".into(),
+                ));
             }
-            
-            let freq = u16::from_le_bytes([buf[offset], buf[offset+1]]);
+
+            let freq = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
             doc_freqs.push(freq);
             offset += 2;
         }
-        
+
         Ok(PostingList {
             doc_ids,
             doc_freqs,
-            positions: None,  // Positions not stored in compact format
+            positions: None, // Positions not stored in compact format
             cached_pairs: parking_lot::Mutex::new(None),
         })
     }
-    
+
     /// Add a document occurrence (optimized for sequential inserts)
     pub fn add(&mut self, doc_id: DocId, position: Option<Position>) {
         // Invalidate cached pairs on mutation.
@@ -391,56 +409,66 @@ impl PostingList {
             self.doc_freqs.push(tf);
         }
     }
-    
+
     /// Rebuild doc_freqs array after doc_ids change (maintains parallel structure)
     fn rebuild_doc_freqs_array(&mut self) {
-        let old_freqs_map: HashMap<u64, u16> = self.doc_ids.iter()
+        let old_freqs_map: HashMap<u64, u16> = self
+            .doc_ids
+            .iter()
             .zip(self.doc_freqs.iter())
             .map(|(id, &freq)| (id as u64, freq))
             .collect();
-        
-        self.doc_freqs = self.doc_ids.iter()
+
+        self.doc_freqs = self
+            .doc_ids
+            .iter()
             .map(|id| *old_freqs_map.get(&(id as u64)).unwrap_or(&0))
             .collect();
     }
-    
+
     /// Merge another posting list into this one
     pub fn merge(&mut self, other: &PostingList) {
         // Build temporary HashMap for easier merging
-        let mut freq_map: HashMap<u64, u16> = self.doc_ids.iter()
+        let mut freq_map: HashMap<u64, u16> = self
+            .doc_ids
+            .iter()
             .zip(self.doc_freqs.iter())
             .map(|(id, &freq)| (id as u64, freq))
             .collect();
-        
+
         // Merge other's frequencies
         for (id, &freq) in other.doc_ids.iter().zip(other.doc_freqs.iter()) {
             *freq_map.entry(id as u64).or_insert(0) += freq;
         }
-        
+
         // Merge doc_ids
         self.doc_ids |= &other.doc_ids;
-        
+
         // Rebuild parallel array (default TF=1 for any doc missing from freq_map)
-        self.doc_freqs = self.doc_ids.iter()
+        self.doc_freqs = self
+            .doc_ids
+            .iter()
             .map(|id| *freq_map.get(&(id as u64)).unwrap_or(&1))
             .collect();
-        
+
         // Merge positions
-        if let (Some(ref mut self_pos), Some(ref other_pos)) = (&mut self.positions, &other.positions) {
+        if let (Some(ref mut self_pos), Some(ref other_pos)) =
+            (&mut self.positions, &other.positions)
+        {
             for (doc_id, positions) in other_pos {
                 self_pos.entry(*doc_id).or_default().extend(positions);
             }
         }
     }
-    
+
     pub fn doc_ids(&self) -> Vec<DocId> {
         self.doc_ids.iter().map(|id| id as DocId).collect()
     }
-    
+
     pub fn doc_count(&self) -> u64 {
         self.doc_ids.len()
     }
-    
+
     pub fn term_frequency(&self, doc_id: DocId) -> u16 {
         if !self.doc_ids.contains(doc_id as u32) {
             return 0;
@@ -461,7 +489,7 @@ impl PostingList {
         // Fallback: doc_freqs out of sync, default to 1
         1
     }
-    
+
     /// Return the maximum term frequency across all documents.
     /// Used for WAND upper bound computation.
     pub fn max_tf(&self) -> u16 {
@@ -472,7 +500,9 @@ impl PostingList {
         } else {
             // doc_freqs out of sync, iterate doc_ids
             let count = self.doc_ids.len();
-            if count == 0 { return 0; }
+            if count == 0 {
+                return 0;
+            }
             1 // fallback: assume tf=1 for all
         }
     }
@@ -482,11 +512,22 @@ impl PostingList {
     pub fn iter_doc_tf(&self) -> Vec<(u32, u16)> {
         let doc_count = self.doc_ids.len() as usize;
         if let Some(ref pos_map) = self.positions {
-            self.doc_ids.iter()
-                .map(|id| (id, pos_map.get(&(id as u64)).map(|v| v.len() as u16).unwrap_or(0)))
+            self.doc_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id,
+                        pos_map
+                            .get(&(id as u64))
+                            .map(|v| v.len() as u16)
+                            .unwrap_or(0),
+                    )
+                })
                 .collect()
         } else if self.doc_freqs.len() == doc_count {
-            let result: Vec<(u32, u16)> = self.doc_ids.iter()
+            let result: Vec<(u32, u16)> = self
+                .doc_ids
+                .iter()
                 .zip(self.doc_freqs.iter())
                 .map(|(id, &tf)| (id, tf))
                 .collect();
@@ -508,29 +549,29 @@ impl PostingList {
         // Return clone — fast since pairs are small (6 bytes each).
         guard.as_ref().unwrap().clone()
     }
-    
+
     pub fn get_positions(&self, doc_id: DocId) -> Option<&[Position]> {
         self.positions.as_ref()?.get(&doc_id).map(|v| v.as_slice())
     }
-    
+
     /// Remove a document from the posting list
     pub fn remove(&mut self, doc_id: DocId) {
         if !self.doc_ids.contains(doc_id as u32) {
             return;
         }
-        
+
         // Remove from doc_ids bitmap
         self.doc_ids.remove(doc_id as u32);
-        
+
         // Remove from positions if present
         if let Some(ref mut pos_map) = self.positions {
             pos_map.remove(&doc_id);
         }
-        
+
         // Rebuild doc_freqs array to maintain parallel structure
         self.rebuild_doc_freqs_array();
     }
-    
+
     /// Check if posting list is empty
     pub fn is_empty(&self) -> bool {
         self.doc_ids.is_empty()
@@ -563,14 +604,22 @@ impl PostingList {
         }
 
         buf[0..4].copy_from_slice(&count.to_le_bytes());
-        if count > 0 { Some(buf) } else { None }
+        if count > 0 {
+            Some(buf)
+        } else {
+            None
+        }
     }
 
     /// Load positions from serialized bytes into this posting list.
     pub fn load_positions(&mut self, data: &[u8]) {
-        if data.len() < 4 { return; }
+        if data.len() < 4 {
+            return;
+        }
         let num_docs = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if num_docs == 0 { return; }
+        if num_docs == 0 {
+            return;
+        }
         if self.positions.is_none() {
             self.positions = Some(HashMap::new());
         }
@@ -579,18 +628,32 @@ impl PostingList {
         let mut offset = 4;
         let mut prev_doc_id = 0u32;
         for _ in 0..num_docs {
-            if offset + 6 > data.len() { break; }
-            let delta = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+            if offset + 6 > data.len() {
+                break;
+            }
+            let delta = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
             let doc_id = prev_doc_id + delta;
             prev_doc_id = doc_id;
             offset += 4;
-            let num_pos = u16::from_le_bytes([data[offset], data[offset+1]]) as usize;
+            let num_pos = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2;
             let mut pos_list = Vec::with_capacity(num_pos);
             let mut prev_pos = 0u32;
             for _ in 0..num_pos {
-                if offset + 4 > data.len() { break; }
-                let pd = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                if offset + 4 > data.len() {
+                    break;
+                }
+                let pd = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
                 let pos = prev_pos + pd;
                 prev_pos = pos;
                 pos_list.push(pos);
@@ -620,9 +683,13 @@ impl FieldNormTable {
     /// Encode a document length to a 1-byte fieldnorm value.
     /// Maps length relative to avg_dl into 0..255.
     pub fn encode(length: u32, avg_dl: f32) -> u8 {
-        if length == 0 || avg_dl <= 0.0 { return 0; }
+        if length == 0 || avg_dl <= 0.0 {
+            return 0;
+        }
         let ratio = (length as f64) / (avg_dl as f64);
-        if ratio <= 0.0 { return 0; }
+        if ratio <= 0.0 {
+            return 0;
+        }
 
         // Use log2-based encoding for dynamic range
         // fieldnorm = clamp(round(log2(ratio) * 16 + 128), 0, 255)
@@ -633,7 +700,9 @@ impl FieldNormTable {
 
     /// Decode a 1-byte fieldnorm back to approximate document length.
     pub fn decode(fieldnorm: u8, avg_dl: f32) -> f32 {
-        if fieldnorm == 0 || avg_dl <= 0.0 { return 0.0; }
+        if fieldnorm == 0 || avg_dl <= 0.0 {
+            return 0.0;
+        }
         let log_val = (fieldnorm as f64 - 128.0) / 16.0;
         let ratio = 2.0_f64.powf(log_val);
         (ratio * avg_dl as f64) as f32
@@ -764,7 +833,11 @@ impl BlockPostingList {
             data.push(*min_fieldnorm);
         }
 
-        Self { data, num_docs, num_blocks: num_blocks as u16 }
+        Self {
+            data,
+            num_docs,
+            num_blocks: num_blocks as u16,
+        }
     }
 
     /// Create a block posting list from a legacy PostingList.
@@ -785,7 +858,9 @@ impl BlockPostingList {
     /// Deserialize from raw bytes.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         if data.len() < 12 {
-            return Err(StorageError::InvalidData("Block posting list too short".into()));
+            return Err(StorageError::InvalidData(
+                "Block posting list too short".into(),
+            ));
         }
         if data[0] != BLOCK_MAGIC[0] || data[1] != BLOCK_MAGIC[1] {
             return Err(StorageError::InvalidData("Invalid block magic".into()));
@@ -820,17 +895,13 @@ impl BlockPostingList {
         if block_idx >= self.num_blocks {
             return (0, 0);
         }
-        let skip_offset = u32::from_le_bytes([
-            self.data[8], self.data[9], self.data[10], self.data[11]
-        ]) as usize;
+        let skip_offset =
+            u32::from_le_bytes([self.data[8], self.data[9], self.data[10], self.data[11]]) as usize;
         let entry_offset = skip_offset + block_idx as usize * 3;
         if entry_offset + 3 > self.data.len() {
             return (0, 0);
         }
-        let max_tf = u16::from_le_bytes([
-            self.data[entry_offset],
-            self.data[entry_offset + 1],
-        ]);
+        let max_tf = u16::from_le_bytes([self.data[entry_offset], self.data[entry_offset + 1]]);
         let min_fn = self.data[entry_offset + 2];
         (max_tf, min_fn)
     }
@@ -865,9 +936,7 @@ impl BlockPostingList {
 
         // Decode delta doc IDs
         let delta_bytes = (doc_count * bits_per_docid as usize).div_ceil(8);
-        let deltas = crate::index::text_encoding::bitunpack(
-            data, pos, doc_count, bits_per_docid,
-        );
+        let deltas = crate::index::text_encoding::bitunpack(data, pos, doc_count, bits_per_docid);
 
         // Reconstruct doc IDs from deltas
         let mut doc_ids = Vec::with_capacity(doc_count);
@@ -882,9 +951,7 @@ impl BlockPostingList {
 
         // Decode TFs
         let tf_bytes = (doc_count * bits_per_tf as usize).div_ceil(8);
-        let tf_u32 = crate::index::text_encoding::bitunpack(
-            data, pos, doc_count, bits_per_tf,
-        );
+        let tf_u32 = crate::index::text_encoding::bitunpack(data, pos, doc_count, bits_per_tf);
         let tfs: Vec<u16> = tf_u32.iter().map(|&v| v as u16).collect();
 
         let block_total = 3 + delta_bytes + tf_bytes;
@@ -898,13 +965,15 @@ impl<'a> BlockCursor<'a> {
         // Find block offset by skipping previous blocks
         let mut offset = self.blocks_offset;
         for _ in 0..block_idx {
-            if offset >= self.data.len() { return; }
+            if offset >= self.data.len() {
+                return;
+            }
             let doc_count = self.data[offset] as usize;
             let bits_per_docid = self.data[offset + 1] as usize;
             let bits_per_tf = self.data[offset + 2] as usize;
-            let block_size = 3 +
-                (doc_count * bits_per_docid).div_ceil(8) +
-                (doc_count * bits_per_tf).div_ceil(8);
+            let block_size = 3
+                + (doc_count * bits_per_docid).div_ceil(8)
+                + (doc_count * bits_per_tf).div_ceil(8);
             offset += block_size;
         }
         let (docs, tfs, _next_offset) = BlockPostingList::decode_block_data(self.data, offset);
@@ -939,11 +1008,12 @@ impl<'a> BlockCursor<'a> {
     /// Max TF in the current block (from skip metadata).
     pub fn block_max_tf(&self) -> u16 {
         // Re-read from skip table
-        let skip_offset = u32::from_le_bytes([
-            self.data[8], self.data[9], self.data[10], self.data[11]
-        ]) as usize;
+        let skip_offset =
+            u32::from_le_bytes([self.data[8], self.data[9], self.data[10], self.data[11]]) as usize;
         let entry_offset = skip_offset + self.current_block as usize * 3;
-        if entry_offset + 2 > self.data.len() { return 0; }
+        if entry_offset + 2 > self.data.len() {
+            return 0;
+        }
         u16::from_le_bytes([self.data[entry_offset], self.data[entry_offset + 1]])
     }
 
@@ -1021,9 +1091,13 @@ impl PostingListFormat {
     /// Deserialize from raw bytes, auto-detecting format.
     pub fn deserialize(data: &[u8]) -> Result<Self> {
         if BlockPostingList::is_block_format(data) {
-            Ok(PostingListFormat::Block(BlockPostingList::deserialize(data)?))
+            Ok(PostingListFormat::Block(BlockPostingList::deserialize(
+                data,
+            )?))
         } else {
-            Ok(PostingListFormat::Legacy(PostingList::deserialize_compact(data)?))
+            Ok(PostingListFormat::Legacy(PostingList::deserialize_compact(
+                data,
+            )?))
         }
     }
 
@@ -1039,7 +1113,7 @@ impl PostingListFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_whitespace_tokenizer() {
         let tokenizer = WhitespaceTokenizer::default();
@@ -1048,7 +1122,7 @@ mod tests {
         assert_eq!(tokens[0].text, "hello");
         assert_eq!(tokens[1].text, "world");
     }
-    
+
     #[test]
     fn test_ngram_tokenizer() {
         let tokenizer = NgramTokenizer::new(2);
@@ -1058,14 +1132,14 @@ mod tests {
         assert_eq!(tokens[1].text, "us");
         assert_eq!(tokens[2].text, "st");
     }
-    
+
     #[test]
     fn test_posting_list() {
         let mut posting = PostingList::new();
         posting.add(1, Some(0));
         posting.add(1, Some(5));
         posting.add(2, Some(3));
-        
+
         assert_eq!(posting.doc_count(), 2);
         assert_eq!(posting.term_frequency(1), 2);
         assert_eq!(posting.term_frequency(2), 1);
@@ -1178,7 +1252,12 @@ mod tests {
         let mut buf = Vec::new();
         posting.doc_ids.serialize_into(&mut buf).unwrap();
         buf.extend_from_slice(&(50u32).to_le_bytes());
-        buf.extend_from_slice(&[1u16; 50].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        buf.extend_from_slice(
+            &[1u16; 50]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
 
         // Re-serialize to get correct doc_freqs
         let serialized = posting.serialize_compact().unwrap();
@@ -1201,7 +1280,11 @@ mod tests {
         // Before fix: positions had gaps from filtered tokens (punctuation).
         // "hello--world" would give positions [0, 3] instead of [0, 1].
         // After fix: positions are sequential [0, 1].
-        let tokenizer = WhitespaceTokenizer { case_sensitive: false, min_len: 1, max_len: 100 };
+        let tokenizer = WhitespaceTokenizer {
+            case_sensitive: false,
+            min_len: 1,
+            max_len: 100,
+        };
         let tokens = tokenizer.tokenize("hello--world");
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].text, "hello");
@@ -1212,7 +1295,11 @@ mod tests {
 
     #[test]
     fn test_whitespace_tokenizer_mixed_delimiters() {
-        let tokenizer = WhitespaceTokenizer { case_sensitive: false, min_len: 1, max_len: 100 };
+        let tokenizer = WhitespaceTokenizer {
+            case_sensitive: false,
+            min_len: 1,
+            max_len: 100,
+        };
         let tokens = tokenizer.tokenize("foo  bar\tbaz");
         assert_eq!(tokens.len(), 3);
         assert_eq!(tokens[0].position, 0);

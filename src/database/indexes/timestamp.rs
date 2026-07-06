@@ -57,10 +57,13 @@ impl MoteDB {
                         if matches!(col_def.col_type, crate::types::ColumnType::Timestamp) {
                             if let Ok(seg) = col_sst.read_fixed_i64(col_def.position) {
                                 for i in 0..col_sst.num_rows {
-                                    if col_sst.row_map.is_deleted(i) { continue; }
+                                    if col_sst.row_map.is_deleted(i) {
+                                        continue;
+                                    }
                                     if let Some(ts_micros) = seg.get_i64(i) {
                                         if ts_micros as u64 > max_indexed_ts {
-                                            let row_id = (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                                            let row_id =
+                                                (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
                                             entries_to_index.push((ts_micros as u64, row_id));
                                         }
                                     }
@@ -116,12 +119,16 @@ impl MoteDB {
             for (timestamp, row_id) in entries_to_index {
                 ts_index.insert(timestamp, row_id)?;
             }
-            debug_log!("[rebuild_timestamp_index] Added {} entries in {:?}", count, start.elapsed());
+            debug_log!(
+                "[rebuild_timestamp_index] Added {} entries in {:?}",
+                count,
+                start.elapsed()
+            );
         }
 
         Ok(())
     }
-    
+
     /// Query by timestamp range
     ///
     /// # Example
@@ -130,55 +137,77 @@ impl MoteDB {
     /// ```
     pub fn query_timestamp_range(&self, start: i64, end: i64) -> Result<Vec<RowId>> {
         ensure_open!(self);
-        self.query_timestamp_range_inner(start, end, None).map(|(ids, _)| ids)
+        self.query_timestamp_range_inner(start, end, None)
+            .map(|(ids, _)| ids)
     }
 
     /// Query by timestamp range with a limit (stops scanning early)
-    pub fn query_timestamp_range_with_limit(&self, start: i64, end: i64, limit: usize) -> Result<Vec<RowId>> {
+    pub fn query_timestamp_range_with_limit(
+        &self,
+        start: i64,
+        end: i64,
+        limit: usize,
+    ) -> Result<Vec<RowId>> {
         ensure_open!(self);
-        self.query_timestamp_range_inner(start, end, Some(limit)).map(|(ids, _)| ids)
+        self.query_timestamp_range_inner(start, end, Some(limit))
+            .map(|(ids, _)| ids)
     }
 
     /// Query by timestamp range with performance profiling
-    pub fn query_timestamp_range_with_profile(&self, start: i64, end: i64) -> Result<(Vec<RowId>, QueryProfile)> {
+    pub fn query_timestamp_range_with_profile(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<(Vec<RowId>, QueryProfile)> {
         ensure_open!(self);
         self.query_timestamp_range_inner(start, end, None)
     }
 
     /// Inner implementation shared by range query variants
-    fn query_timestamp_range_inner(&self, start: i64, end: i64, limit: Option<usize>) -> Result<(Vec<RowId>, QueryProfile)> {
+    fn query_timestamp_range_inner(
+        &self,
+        start: i64,
+        end: i64,
+        limit: Option<usize>,
+    ) -> Result<(Vec<RowId>, QueryProfile)> {
         let total_start = std::time::Instant::now();
-        
+
         // 1. Query from persisted index (flushed data)
         let index_start = std::time::Instant::now();
         let start_u64 = start as u64;
         let end_u64 = end as u64;
         let index_results = if let Some(lim) = limit {
-            self.timestamp_index.read().range_with_limit(&start_u64, &end_u64, lim)?
+            self.timestamp_index
+                .read()
+                .range_with_limit(&start_u64, &end_u64, lim)?
         } else {
             self.timestamp_index.read().range(&start_u64, &end_u64)?
         };
-        let mut result_ids: Vec<RowId> = index_results.into_iter().map(|(_, row_id)| row_id).collect();
+        let mut result_ids: Vec<RowId> = index_results
+            .into_iter()
+            .map(|(_, row_id)| row_id)
+            .collect();
         let index_duration = index_start.elapsed();
-        
+
         // 2. Query from LSM MemTable (unflushed data)
         let memtable_start = std::time::Instant::now();
-        let (lsm_row_ids, memtable_profile) = self.scan_memtable_by_timestamp_with_profile(start, end)?;
+        let (lsm_row_ids, memtable_profile) =
+            self.scan_memtable_by_timestamp_with_profile(start, end)?;
         let memtable_duration = memtable_start.elapsed();
-        
+
         // 3. Merge and deduplicate
         let merge_start = std::time::Instant::now();
-        
+
         let index_count = result_ids.len();
         let memtable_count = lsm_row_ids.len();
-        
+
         result_ids.extend(lsm_row_ids);
         result_ids.sort_unstable();
         result_ids.dedup();
-        
+
         let merge_duration = merge_start.elapsed();
         let total_duration = total_start.elapsed();
-        
+
         let profile = QueryProfile {
             index_time_us: index_duration.as_micros() as u64,
             memtable_time_us: memtable_duration.as_micros() as u64,
@@ -191,24 +220,28 @@ impl MoteDB {
             memtable_results: memtable_count,
             total_results: result_ids.len(),
         };
-        
+
         Ok((result_ids, profile))
     }
-    
+
     /// Scan LSM MemTable with profiling
-    fn scan_memtable_by_timestamp_with_profile(&self, start: i64, end: i64) -> Result<(Vec<RowId>, MemTableScanProfile)> {
+    fn scan_memtable_by_timestamp_with_profile(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> Result<(Vec<RowId>, MemTableScanProfile)> {
         let total_start = std::time::Instant::now();
-        
+
         // 1. Load incremental MemTable data
         let load_start = std::time::Instant::now();
         let memtable_entries = self.lsm_engine.scan_memtable_incremental()?;
         let load_duration = load_start.elapsed();
         let memtable_size = memtable_entries.len();
-        
+
         // 2. Scan and filter
         let scan_start = std::time::Instant::now();
         let mut row_ids = Vec::with_capacity(memtable_entries.len() / 10);
-        
+
         for (composite_key, value_bytes) in memtable_entries {
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
 
@@ -226,9 +259,9 @@ impl MoteDB {
             }
         }
         let scan_duration = scan_start.elapsed();
-        
+
         let total_duration = total_start.elapsed();
-        
+
         let profile = MemTableScanProfile {
             load_time_us: load_duration.as_micros() as u64,
             scan_time_us: scan_duration.as_micros() as u64,
@@ -236,10 +269,10 @@ impl MoteDB {
             memtable_size,
             matched_results: row_ids.len(),
         };
-        
+
         Ok((row_ids, profile))
     }
-    
+
     /// Get timestamp index statistics
     pub fn timestamp_index_stats(&self) -> crate::index::btree::BTreeStats {
         self.timestamp_index.read().stats()

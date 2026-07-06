@@ -18,13 +18,13 @@
 //!   gc_expired() → delete segment files with max_ts < cutoff (O(1))
 //! ```
 
+pub mod column_encoding;
 pub mod config;
 pub mod gorilla;
-pub mod column_encoding;
-pub mod write_buffer;
 pub mod segment;
 pub mod segment_manager;
 pub mod store;
+pub mod write_buffer;
 
 pub use config::ColumnarConfig;
 pub use store::ColumnarStore;

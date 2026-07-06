@@ -5,25 +5,25 @@
 //! - Read: O(log n), ~1μs
 //! - Capacity: 4MB (50K entries)
 
-use super::{Key, Value, LSMConfig};
+use super::{Key, LSMConfig, Value};
 use crate::Result;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// In-memory write buffer
 pub struct MemTable {
     /// Sorted key-value map (using BTreeMap as Skip List)
     /// Using BTreeMap for now (consider Skip List for better concurrent performance in future)
     data: Arc<RwLock<BTreeMap<Key, Value>>>,
-    
+
     /// Current size in bytes
     size: AtomicUsize,
-    
+
     /// Maximum size before flush
     max_size: usize,
-    
+
     /// Sequence number (for ordering)
     next_seq: AtomicUsize,
 }
@@ -38,13 +38,13 @@ impl MemTable {
             next_seq: AtomicUsize::new(0),
         }
     }
-    
+
     /// Insert a key-value pair
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let key_size = 8; // u64 is always 8 bytes
         let value_size = value.data.len() + 16; // data + metadata
         let entry_size = key_size + value_size;
-        
+
         let mut data = self.data.write();
 
         // Update size
@@ -52,21 +52,21 @@ impl MemTable {
             let old_size = key_size + old_value.data.len() + 16;
             self.size.fetch_sub(old_size, Ordering::Relaxed);
         }
-        
+
         data.insert(key, value);
         self.size.fetch_add(entry_size, Ordering::Relaxed);
         self.next_seq.fetch_add(1, Ordering::Relaxed);
-        
+
         Ok(())
     }
-    
+
     /// 🚀 P2 优化：批量插入（一次加锁，减少锁竞争）
-    /// 
+    ///
     /// ## 性能优化
     /// - 单次加锁插入所有 KV 对
     /// - 批量更新 size 计数器
     /// - 减少锁竞争和原子操作次数
-    /// 
+    ///
     /// ## 预期效果
     /// - 1000 条插入：1000 次加锁 → 1 次加锁
     /// - 性能提升：3-5 倍
@@ -74,86 +74,86 @@ impl MemTable {
         if kvs.is_empty() {
             return Ok(());
         }
-        
+
         let mut data = self.data.write();
 
         let mut total_size_change: i64 = 0;
-        
+
         for (key, value) in kvs {
             let key_size = 8;
             let value_size = value.data.len() + 16;
             let entry_size = key_size + value_size;
-            
+
             // Calculate size change
             if let Some(old_value) = data.get(key) {
                 let old_size = key_size + old_value.data.len() + 16;
                 total_size_change -= old_size as i64;
             }
-            
+
             data.insert(*key, value.clone());
             total_size_change += entry_size as i64;
         }
-        
+
         // Batch update size (single atomic operation)
         if total_size_change > 0 {
-            self.size.fetch_add(total_size_change as usize, Ordering::Relaxed);
+            self.size
+                .fetch_add(total_size_change as usize, Ordering::Relaxed);
         } else if total_size_change < 0 {
-            self.size.fetch_sub((-total_size_change) as usize, Ordering::Relaxed);
+            self.size
+                .fetch_sub((-total_size_change) as usize, Ordering::Relaxed);
         }
-        
+
         self.next_seq.fetch_add(kvs.len(), Ordering::Relaxed);
-        
+
         Ok(())
     }
-    
+
     /// Get a value by key
     pub fn get(&self, key: Key) -> Result<Option<Value>> {
         let data = self.data.read();
 
         Ok(data.get(&key).cloned())
     }
-    
+
     /// Delete a key (insert tombstone)
     pub fn delete(&self, key: Key, timestamp: u64) -> Result<()> {
         self.put(key, Value::tombstone(timestamp))
     }
-    
+
     /// Check if MemTable should be flushed
     pub fn should_flush(&self) -> bool {
         self.size.load(Ordering::Relaxed) >= self.max_size
     }
-    
+
     /// Get current size in bytes
     pub fn size(&self) -> usize {
         self.size.load(Ordering::Relaxed)
     }
-    
+
     /// Get number of entries
     pub fn len(&self) -> usize {
         self.data.read().len()
     }
-    
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    
+
     /// Iterate over all entries (for flushing to SSTable)
     /// OPTIMIZED: O(n) instead of O(n²)
     pub fn iter(&self) -> MemTableIteratorOptimized {
         MemTableIteratorOptimized::new(self.data.clone())
     }
-    
+
     /// Get snapshot of all data (for testing)
     pub fn snapshot(&self) -> Vec<(Key, Value)> {
         let data = self.data.read();
-        data.iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
+        data.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
-    
+
     /// Scan a range of keys [start, end) - Zero-copy with callback
-    /// 
+    ///
     /// ✅ Zero-copy optimization: No Vec allocation, processes items in-place
     pub fn scan_with<F>(&self, start: Key, end: Key, mut f: F) -> Result<()>
     where
@@ -163,23 +163,20 @@ impl MemTable {
 
         // Use BTreeMap's range() for efficient range query: O(log n + k)
         use std::ops::Bound;
-        let range = data.range((
-            Bound::Included(&start), 
-            Bound::Excluded(&end)
-        ));
-        
+        let range = data.range((Bound::Included(&start), Bound::Excluded(&end)));
+
         for (k, v) in range {
             // Skip tombstones (deleted entries)
             if !v.deleted {
-                f(*k, v)?;  // ✅ Zero-copy: pass reference to Value
+                f(*k, v)?; // ✅ Zero-copy: pass reference to Value
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Scan a range of keys [start, end) - Legacy API (allocates Vec)
-    /// 
+    ///
     /// ⚠️ Prefer scan_with() for zero-copy iteration
     pub fn scan(&self, start: Key, end: Key) -> Result<Vec<(Key, Value)>> {
         // 🚀 P3 优化：预分配容量（估算范围大小）
@@ -191,9 +188,9 @@ impl MemTable {
         })?;
         Ok(results)
     }
-    
+
     /// Scan all entries with callback - Zero-copy
-    /// 
+    ///
     /// ✅ Zero-copy optimization: No Vec allocation
     pub fn scan_all_with<F>(&self, mut f: F) -> Result<()>
     where
@@ -203,15 +200,15 @@ impl MemTable {
 
         for (k, v) in data.iter() {
             if !v.deleted {
-                f(*k, v)?;  // ✅ Zero-copy: pass reference
+                f(*k, v)?; // ✅ Zero-copy: pass reference
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get all entries (for full table scan) - Legacy API
-    /// 
+    ///
     /// ⚠️ Prefer scan_all_with() for zero-copy iteration
     pub fn scan_all(&self) -> Result<Vec<(Key, Value)>> {
         // 🚀 P3 优化：预分配容量
@@ -232,8 +229,9 @@ pub struct MemTableIteratorOptimized {
 impl MemTableIteratorOptimized {
     pub fn new(data: Arc<RwLock<BTreeMap<Key, Value>>>) -> Self {
         let data = data.read();
-        let entries: Vec<(Key, Value)> = data.iter()
-            .map(|(k, v)| (*k, v.clone()))  // ✅ u64 copy is cheap, no clone()
+        let entries: Vec<(Key, Value)> = data
+            .iter()
+            .map(|(k, v)| (*k, v.clone())) // ✅ u64 copy is cheap, no clone()
             .collect();
         Self {
             entries: entries.into_iter(),
@@ -243,7 +241,7 @@ impl MemTableIteratorOptimized {
 
 impl Iterator for MemTableIteratorOptimized {
     type Item = (Key, Value);
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         self.entries.next()
     }
@@ -252,20 +250,20 @@ impl Iterator for MemTableIteratorOptimized {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn create_memtable() -> MemTable {
         MemTable::new(&LSMConfig::default())
     }
-    
+
     #[test]
     fn test_put_get() {
         let memtable = create_memtable();
-        
-        let key = 12345u64;  // ✅ u64 key
+
+        let key = 12345u64; // ✅ u64 key
         let value = Value::new(b"test_value".to_vec(), 1);
-        
+
         memtable.put(key, value.clone()).unwrap();
-        
+
         let retrieved = memtable.get(key).unwrap().unwrap();
         assert_eq!(retrieved.data, value.data);
         assert_eq!(retrieved.timestamp, 1);
@@ -276,7 +274,7 @@ mod tests {
     fn test_delete() {
         let memtable = create_memtable();
 
-        let key = 12345u64;  // ✅ u64 key
+        let key = 12345u64; // ✅ u64 key
         memtable.put(key, Value::new(b"value".to_vec(), 1)).unwrap();
         memtable.delete(key, 2).unwrap();
 
@@ -284,17 +282,17 @@ mod tests {
         assert!(retrieved.deleted);
         assert_eq!(retrieved.timestamp, 2);
     }
-    
+
     #[test]
     fn test_size_tracking() {
         let memtable = create_memtable();
-        
+
         assert_eq!(memtable.size(), 0);
-        
-        let key = 123u64;  // ✅ u64 key
+
+        let key = 123u64; // ✅ u64 key
         let value = Value::new(b"value".to_vec(), 1);
         memtable.put(key, value).unwrap();
-        
+
         assert!(memtable.size() > 0);
 
         // Update should replace old value
@@ -303,10 +301,13 @@ mod tests {
 
         assert!(memtable.size() > 0);
     }
-    
+
     #[test]
     fn test_should_flush() {
-        let config = LSMConfig { memtable_size: 100, ..Default::default() };
+        let config = LSMConfig {
+            memtable_size: 100,
+            ..Default::default()
+        };
         let memtable = MemTable::new(&config);
 
         assert!(!memtable.should_flush());
@@ -319,22 +320,22 @@ mod tests {
 
         assert!(memtable.should_flush());
     }
-    
+
     #[test]
     fn test_iterator() {
         let memtable = create_memtable();
-        
+
         // Insert data
         for i in 0..5 {
-            let key = i as u64;  // ✅ u64 key (naturally sorted)
+            let key = i as u64; // ✅ u64 key (naturally sorted)
             let value = Value::new(format!("value_{}", i).into_bytes(), i as u64);
             memtable.put(key, value).unwrap();
         }
-        
+
         // Iterate and verify order
         let items: Vec<_> = memtable.iter().collect();
         assert_eq!(items.len(), 5);
-        
+
         // BTreeMap should maintain sorted order
         for (i, (key, _)) in items.iter().enumerate() {
             let expected_key = i as u64;

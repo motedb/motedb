@@ -7,7 +7,7 @@
 //! - Crash-recovery verification
 //! - Timing/latency measurement
 
-use motedb::{Database, DBConfig, QueryResult};
+use motedb::{DBConfig, Database, QueryResult};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -75,7 +75,10 @@ pub fn insert_test_rows_from(db: &Database, n: usize, start_id: usize) {
             sql.push_str(&format!("({}, {:.1}, '{}'),", id, id as f64, tag));
         }
         sql.truncate(sql.len() - 1);
-        exec(db, &format!("INSERT INTO bench (id, val, tag) VALUES {}", sql));
+        exec(
+            db,
+            &format!("INSERT INTO bench (id, val, tag) VALUES {}", sql),
+        );
     }
 }
 
@@ -93,7 +96,12 @@ pub fn get_rss_kb() -> u64 {
         .args(["-o", "rss=", "-p", &pid.to_string()])
         .output()
         .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         .unwrap_or(0)
 }
 
@@ -123,6 +131,9 @@ pub fn assert_within_pct(actual: f64, expected: f64, pct: f64, label: &str) {
     assert!(
         (actual - expected).abs() <= tolerance.max(1.0),
         "{}: {:.1} not within {:.1}% of {:.1}",
-        label, actual, pct, expected
+        label,
+        actual,
+        pct,
+        expected
     );
 }

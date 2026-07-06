@@ -9,12 +9,18 @@ use common::*;
 #[test]
 fn test_empty_table_all_queries() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)",
+    );
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 0);
     assert_eq!(count_rows(&db, "SELECT * FROM t WHERE name = 'x'"), 0);
     assert_eq!(count_rows(&db, "SELECT DISTINCT name FROM t"), 0);
     assert_eq!(count_rows(&db, "SELECT * FROM t LIMIT 10"), 0);
-    assert_eq!(count_rows(&db, "SELECT * FROM t ORDER BY val DESC LIMIT 5"), 0);
+    assert_eq!(
+        count_rows(&db, "SELECT * FROM t ORDER BY val DESC LIMIT 5"),
+        0
+    );
 }
 
 #[test]
@@ -31,7 +37,10 @@ fn test_single_row_table() {
 #[test]
 fn test_null_values() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val FLOAT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, NULL, NULL)");
     exec(&db, "INSERT INTO t VALUES (2, 'hello', 3.14)");
     exec(&db, "INSERT INTO t VALUES (3, NULL, 42.0)");
@@ -100,7 +109,10 @@ fn test_unicode_text() {
     exec(&db, "INSERT INTO t VALUES (2, '🌱🌍⚡')");
     exec(&db, "INSERT INTO t VALUES (3, 'Mixed混合emoji😀')");
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 3);
-    assert_eq!(count_rows(&db, "SELECT * FROM t WHERE name = '你好世界'"), 1);
+    assert_eq!(
+        count_rows(&db, "SELECT * FROM t WHERE name = '你好世界'"),
+        1
+    );
 }
 
 #[test]
@@ -110,7 +122,10 @@ fn test_special_characters_in_text() {
     // These should work with proper escaping (doubled quotes).
     exec(&db, "INSERT INTO t VALUES (1, 'has ''quotes''')");
     exec(&db, "INSERT INTO t VALUES (2, 'has spaces')");
-    exec(&db, "INSERT INTO t VALUES (3, 'has-dashes_and.underscores')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (3, 'has-dashes_and.underscores')",
+    );
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 3);
 }
 
@@ -192,7 +207,9 @@ fn test_batch_insert_consistency() {
     // Insert 100 rows via single batch SQL
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=100 {
-        if i > 1 { sql.push(','); }
+        if i > 1 {
+            sql.push(',');
+        }
         sql.push_str(&format!("({}, {})", i, i * 2));
     }
     exec(&db, &sql);

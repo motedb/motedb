@@ -1,6 +1,6 @@
 //! Tests for SQL error handling and edge cases
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -38,7 +38,10 @@ fn test_select_from_nonexistent_table() {
     let db = Database::create(dir.path()).unwrap();
 
     let result = db.execute("SELECT * FROM ghost");
-    assert!(result.is_err(), "SELECT from nonexistent table should error");
+    assert!(
+        result.is_err(),
+        "SELECT from nonexistent table should error"
+    );
 }
 
 #[test]
@@ -46,10 +49,14 @@ fn test_insert_wrong_column_count() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
 
     let result = db.execute("INSERT INTO t VALUES (1, 'a', 'extra')");
-    assert!(result.is_err(), "INSERT with wrong column count should error");
+    assert!(
+        result.is_err(),
+        "INSERT with wrong column count should error"
+    );
 }
 
 #[test]
@@ -90,7 +97,8 @@ fn test_update_nonexistent_column() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     let result = db.execute("UPDATE t SET ghost = 5 WHERE id = 1");
@@ -132,7 +140,8 @@ fn test_drop_nonexistent_index() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     let result = db.execute("DROP INDEX nonexistent_idx ON t");
     assert!(result.is_err(), "Dropping nonexistent index should error");
 }
@@ -144,7 +153,8 @@ fn test_empty_string() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, '')").unwrap();
 
     let result = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
@@ -157,7 +167,8 @@ fn test_null_operations() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 42)").unwrap();
 
@@ -177,7 +188,8 @@ fn test_update_no_match() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     // UPDATE that matches nothing is OK (no error)
@@ -185,7 +197,11 @@ fn test_update_no_match() {
 
     let result = db.execute("SELECT val FROM t").unwrap();
     let r = rows(result);
-    assert_eq!(&r[0][0], &Value::Integer(10), "Unmatched UPDATE should not change data");
+    assert_eq!(
+        &r[0][0],
+        &Value::Integer(10),
+        "Unmatched UPDATE should not change data"
+    );
 }
 
 #[test]
@@ -211,10 +227,13 @@ fn test_limit_offset() {
 
     db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", i))
+            .unwrap();
     }
 
-    let result = db.execute("SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 2").unwrap();
+    let result = db
+        .execute("SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 2")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 3);
     // ids 3, 4, 5
@@ -229,7 +248,8 @@ fn test_limit_only() {
 
     db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", i))
+            .unwrap();
     }
 
     let result = db.execute("SELECT id FROM t ORDER BY id LIMIT 3").unwrap();
@@ -256,7 +276,8 @@ fn test_order_by_desc() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 30)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 20)").unwrap();
@@ -273,12 +294,15 @@ fn test_distinct() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'a')").unwrap();
 
-    let result = db.execute("SELECT DISTINCT cat FROM t ORDER BY cat").unwrap();
+    let result = db
+        .execute("SELECT DISTINCT cat FROM t ORDER BY cat")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 2, "DISTINCT should deduplicate");
 }
@@ -288,20 +312,27 @@ fn test_like_patterns() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'Alexander')").unwrap();
 
-    let result = db.execute("SELECT name FROM t WHERE name LIKE 'A%' ORDER BY name").unwrap();
+    let result = db
+        .execute("SELECT name FROM t WHERE name LIKE 'A%' ORDER BY name")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 2); // Alice, Alexander
 
-    let result = db.execute("SELECT name FROM t WHERE name LIKE '%e'").unwrap();
+    let result = db
+        .execute("SELECT name FROM t WHERE name LIKE '%e'")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 1); // Alice
 
-    let result = db.execute("SELECT name FROM t WHERE name LIKE '_ob'").unwrap();
+    let result = db
+        .execute("SELECT name FROM t WHERE name LIKE '_ob'")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 1); // Bob
 }
@@ -311,12 +342,15 @@ fn test_between() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-    let result = db.execute("SELECT val FROM t WHERE val BETWEEN 15 AND 25 ORDER BY val").unwrap();
+    let result = db
+        .execute("SELECT val FROM t WHERE val BETWEEN 15 AND 25 ORDER BY val")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 1);
     assert_eq!(&r[0][0], &Value::Integer(20));
@@ -327,12 +361,15 @@ fn test_in_list() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-    let result = db.execute("SELECT val FROM t WHERE val IN (10, 30) ORDER BY val").unwrap();
+    let result = db
+        .execute("SELECT val FROM t WHERE val IN (10, 30) ORDER BY val")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 2);
     assert_eq!(&r[0][0], &Value::Integer(10));
@@ -344,12 +381,15 @@ fn test_not_in() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-    let result = db.execute("SELECT val FROM t WHERE val NOT IN (20) ORDER BY val").unwrap();
+    let result = db
+        .execute("SELECT val FROM t WHERE val NOT IN (20) ORDER BY val")
+        .unwrap();
     let r = rows(result);
     assert_eq!(r.len(), 2);
 }
@@ -359,10 +399,13 @@ fn test_arithmetic_in_select() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, 3)").unwrap();
 
-    let result = db.execute("SELECT a + b, a - b, a * b, a / b FROM t").unwrap();
+    let result = db
+        .execute("SELECT a + b, a - b, a * b, a / b FROM t")
+        .unwrap();
     let r = rows(result);
     assert_eq!(&r[0][0], &Value::Integer(13));
     assert_eq!(&r[0][1], &Value::Integer(7));
@@ -376,10 +419,14 @@ fn test_string_functions() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'Hello World')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'Hello World')")
+        .unwrap();
 
-    let result = db.execute("SELECT UPPER(name), LOWER(name), LENGTH(name) FROM t").unwrap();
+    let result = db
+        .execute("SELECT UPPER(name), LOWER(name), LENGTH(name) FROM t")
+        .unwrap();
     let r = rows(result);
     assert_eq!(&r[0][0], &Value::text("HELLO WORLD".to_string()));
     assert_eq!(&r[0][1], &Value::text("hello world".to_string()));
@@ -391,10 +438,14 @@ fn test_concat() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, first TEXT, last TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'John', 'Doe')").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, first TEXT, last TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'John', 'Doe')")
+        .unwrap();
 
-    let result = db.execute("SELECT CONCAT(first, ' ', last) FROM t").unwrap();
+    let result = db
+        .execute("SELECT CONCAT(first, ' ', last) FROM t")
+        .unwrap();
     let r = rows(result);
     assert_eq!(&r[0][0], &Value::text("John Doe".to_string()));
 }
@@ -404,17 +455,27 @@ fn test_coalesce() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 42)").unwrap();
 
-    let result = db.execute("SELECT COALESCE(val, 0) FROM t ORDER BY id").unwrap();
+    let result = db
+        .execute("SELECT COALESCE(val, 0) FROM t ORDER BY id")
+        .unwrap();
     let r = rows(result);
     // COALESCE(NULL, 0) should return 0 (may be Integer or Bool depending on type coercion)
-    assert!(!matches!(&r[0][0], Value::Null), "COALESCE(NULL, 0) should not return NULL");
+    assert!(
+        !matches!(&r[0][0], Value::Null),
+        "COALESCE(NULL, 0) should not return NULL"
+    );
     let second = &r[1][0];
     // COALESCE(42, 0) should return 42, but may return Integer or Bool depending on coercion
-    assert!(!matches!(second, Value::Null), "COALESCE(42, 0) should not return NULL, got {:?}", second);
+    assert!(
+        !matches!(second, Value::Null),
+        "COALESCE(42, 0) should not return NULL, got {:?}",
+        second
+    );
 }
 
 #[test]
@@ -424,8 +485,10 @@ fn test_reopen_data_persistence() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'persistent')").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'persistent')")
+            .unwrap();
         db.checkpoint().unwrap();
         db.close().unwrap();
     }

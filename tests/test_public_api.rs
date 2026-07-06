@@ -2,7 +2,7 @@
 //! query_by_column_range, query_by_column_between, release_savepoint,
 //! vector_index_stats, transaction_stats, close + operations-after-close
 
-use motedb::{Database, types::Value};
+use motedb::{types::Value, Database};
 use tempfile::TempDir;
 
 fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
@@ -20,19 +20,26 @@ fn test_query_by_column_range() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, price FLOAT)").unwrap();
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY, price FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO items VALUES (1, 10.0)").unwrap();
     db.execute("INSERT INTO items VALUES (2, 20.0)").unwrap();
     db.execute("INSERT INTO items VALUES (3, 30.0)").unwrap();
     db.execute("INSERT INTO items VALUES (4, 40.0)").unwrap();
     db.execute("INSERT INTO items VALUES (5, 50.0)").unwrap();
-    db.execute("CREATE INDEX idx_price ON items(price) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_price ON items(price) USING COLUMN")
+        .unwrap();
 
-    let row_ids = db.query_by_column_range("items", "price", &Value::Float(20.0), &Value::Float(40.0)).unwrap();
+    let row_ids = db
+        .query_by_column_range("items", "price", &Value::Float(20.0), &Value::Float(40.0))
+        .unwrap();
 
     // Column index range query may return 0 results due to flush/btree interaction
     // This tests that the API exists and doesn't panic
-    assert!(row_ids.len() <= 5, "Range query should return at most 5 results");
+    assert!(
+        row_ids.len() <= 5,
+        "Range query should return at most 5 results"
+    );
 }
 
 #[test]
@@ -40,12 +47,20 @@ fn test_query_by_column_range_empty() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-    db.execute("CREATE INDEX idx ON t(val) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx ON t(val) USING COLUMN")
+        .unwrap();
 
-    let row_ids = db.query_by_column_range("t", "val", &Value::Integer(100), &Value::Integer(200)).unwrap();
-    assert_eq!(row_ids.len(), 0, "Range with no matches should return empty");
+    let row_ids = db
+        .query_by_column_range("t", "val", &Value::Integer(100), &Value::Integer(200))
+        .unwrap();
+    assert_eq!(
+        row_ids.len(),
+        0,
+        "Range with no matches should return empty"
+    );
 }
 
 // === query_by_column_between (returns Vec<RowId>) ===
@@ -55,29 +70,67 @@ fn test_query_by_column_between() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)")
+        .unwrap();
     db.execute("INSERT INTO scores VALUES (1, 50)").unwrap();
     db.execute("INSERT INTO scores VALUES (2, 60)").unwrap();
     db.execute("INSERT INTO scores VALUES (3, 70)").unwrap();
     db.execute("INSERT INTO scores VALUES (4, 80)").unwrap();
     db.execute("INSERT INTO scores VALUES (5, 90)").unwrap();
-    db.execute("CREATE INDEX idx_score ON scores(score) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_score ON scores(score) USING COLUMN")
+        .unwrap();
 
     // Inclusive both ends [60, 80]
-    let r = db.query_by_column_between("scores", "score", &Value::Integer(60), true, &Value::Integer(80), true).unwrap();
+    let r = db
+        .query_by_column_between(
+            "scores",
+            "score",
+            &Value::Integer(60),
+            true,
+            &Value::Integer(80),
+            true,
+        )
+        .unwrap();
     // Column index between query may return 0 results due to flush/btree interaction
     assert!(r.len() <= 5, "Inclusive both [60,80]: at most 5");
 
     // Exclusive start, inclusive end (60, 80]
-    let r = db.query_by_column_between("scores", "score", &Value::Integer(60), false, &Value::Integer(80), true).unwrap();
+    let r = db
+        .query_by_column_between(
+            "scores",
+            "score",
+            &Value::Integer(60),
+            false,
+            &Value::Integer(80),
+            true,
+        )
+        .unwrap();
     assert!(r.len() <= 5, "(60,80]: at most 5");
 
     // Inclusive start, exclusive end [60, 80)
-    let r = db.query_by_column_between("scores", "score", &Value::Integer(60), true, &Value::Integer(80), false).unwrap();
+    let r = db
+        .query_by_column_between(
+            "scores",
+            "score",
+            &Value::Integer(60),
+            true,
+            &Value::Integer(80),
+            false,
+        )
+        .unwrap();
     assert!(r.len() <= 5, "[60,80): at most 5");
 
     // Exclusive both (60, 80)
-    let r = db.query_by_column_between("scores", "score", &Value::Integer(60), false, &Value::Integer(80), false).unwrap();
+    let r = db
+        .query_by_column_between(
+            "scores",
+            "score",
+            &Value::Integer(60),
+            false,
+            &Value::Integer(80),
+            false,
+        )
+        .unwrap();
     assert!(r.len() <= 5, "(60,80): at most 5");
 }
 
@@ -88,7 +141,8 @@ fn test_savepoint_release() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
@@ -120,7 +174,8 @@ fn test_savepoint_basic_rollback() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     let tx = db.begin_transaction().unwrap();
     db.savepoint(tx, "sp1").unwrap();
@@ -139,7 +194,8 @@ fn test_vector_index_stats() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, embedding VECTOR(3))").unwrap();
+    db.execute("CREATE TABLE vecs (id INT PRIMARY KEY, embedding VECTOR(3))")
+        .unwrap();
     // Use insert_row with Tensor value
     use motedb::types::Tensor;
     for i in 0..5 {
@@ -149,7 +205,8 @@ fn test_vector_index_stats() {
         ];
         db.insert_row("vecs", row).unwrap();
     }
-    db.execute("CREATE VECTOR INDEX idx_vec ON vecs(embedding)").unwrap();
+    db.execute("CREATE VECTOR INDEX idx_vec ON vecs(embedding)")
+        .unwrap();
     db.wait_for_indexes_ready();
 
     let stats = db.vector_index_stats("idx_vec");
@@ -174,8 +231,10 @@ fn test_transaction_stats() {
     db.commit_transaction(tx).unwrap();
 
     let stats_after = db.transaction_stats();
-    assert!(stats_after.total_committed >= stats_before.total_committed + 1,
-        "committed count should increase");
+    assert!(
+        stats_after.total_committed >= stats_before.total_committed + 1,
+        "committed count should increase"
+    );
 }
 
 // === Close + operations after close ===
@@ -207,13 +266,17 @@ fn test_query_by_column_text() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
     db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
     db.execute("INSERT INTO users VALUES (3, 'Alice')").unwrap();
-    db.execute("CREATE INDEX idx_name ON users(name) USING COLUMN").unwrap();
+    db.execute("CREATE INDEX idx_name ON users(name) USING COLUMN")
+        .unwrap();
 
-    let row_ids = db.query_by_column("users", "name", &Value::text("Alice".to_string())).unwrap();
+    let row_ids = db
+        .query_by_column("users", "name", &Value::text("Alice".to_string()))
+        .unwrap();
     // Column index text query may return 0 results due to flush/btree interaction
     assert!(row_ids.len() <= 3, "Should find at most 3 rows");
 }
@@ -225,9 +288,11 @@ fn test_checkpoint_and_flush() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     for i in 0..100 {
-        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
 
     db.flush().unwrap();
@@ -245,12 +310,25 @@ fn test_batch_insert() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)")
+        .unwrap();
 
     let data = vec![
-        vec![Value::Integer(1), Value::text("a".to_string()), Value::Float(1.1)],
-        vec![Value::Integer(2), Value::text("b".to_string()), Value::Float(2.2)],
-        vec![Value::Integer(3), Value::text("c".to_string()), Value::Float(3.3)],
+        vec![
+            Value::Integer(1),
+            Value::text("a".to_string()),
+            Value::Float(1.1),
+        ],
+        vec![
+            Value::Integer(2),
+            Value::text("b".to_string()),
+            Value::Float(2.2),
+        ],
+        vec![
+            Value::Integer(3),
+            Value::text("c".to_string()),
+            Value::Float(3.3),
+        ],
     ];
     let row_ids = db.batch_insert("t", data).unwrap();
 
@@ -268,7 +346,8 @@ fn test_insert_row_map() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
 
     let mut map = std::collections::HashMap::new();
     map.insert("id".to_string(), Value::Integer(1));
@@ -289,14 +368,22 @@ fn test_get_row_map() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
 
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val INT)")
+        .unwrap();
 
     // Use insert_row to get the actual RowId back
-    let row = vec![Value::Integer(1), Value::text("hello".to_string()), Value::Integer(42)];
+    let row = vec![
+        Value::Integer(1),
+        Value::text("hello".to_string()),
+        Value::Integer(42),
+    ];
     let row_id = db.insert_row("t", row).unwrap();
 
     let result = db.get_row_map("t", row_id).unwrap();
-    assert!(result.is_some(), "get_row_map should find row by returned RowId");
+    assert!(
+        result.is_some(),
+        "get_row_map should find row by returned RowId"
+    );
     let map = result.unwrap();
     assert_eq!(map.get("id"), Some(&Value::Integer(1)));
     assert_eq!(map.get("val"), Some(&Value::Integer(42)));

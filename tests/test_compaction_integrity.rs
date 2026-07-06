@@ -8,14 +8,17 @@
 //!   cargo test --test test_compaction_integrity -- --test-threads=1
 //!   cargo test --test test_compaction_integrity --profile release-test -- --test-threads=1
 
-use motedb::{Database, DBConfig};
 use motedb::types::Value;
+use motedb::{DBConfig, Database};
 use tempfile::TempDir;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).expect("execute SQL").materialize().expect("materialize")
+    db.execute(sql)
+        .expect("execute SQL")
+        .materialize()
+        .expect("materialize")
 }
 
 fn count_rows(db: &Database) -> usize {
@@ -57,7 +60,10 @@ fn make_db() -> (TempDir, Database) {
 }
 
 fn create_table(db: &Database) {
-    exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT, amount FLOAT)");
+    exec(
+        db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT, amount FLOAT)",
+    );
 }
 
 fn lsm_dir_for(dir: &TempDir) -> std::path::PathBuf {
@@ -75,7 +81,8 @@ fn count_sst_files(dir: &TempDir) -> usize {
             let p = entry.path();
             if p.is_dir() {
                 if let Ok(rd2) = std::fs::read_dir(&p) {
-                    count += rd2.flatten()
+                    count += rd2
+                        .flatten()
                         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sst"))
                         .count();
                 }
@@ -97,7 +104,10 @@ fn test_compaction_preserves_all_rows() {
         let start = batch * 2000 + 1;
         let end = start + 2000;
         for i in start..end {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'v_{}', 0.0)", i, i));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'v_{}', 0.0)", i, i),
+            );
         }
         db.flush().unwrap();
     }
@@ -105,7 +115,11 @@ fn test_compaction_preserves_all_rows() {
     wait_for_compaction();
 
     let count = count_rows(&db);
-    assert_eq!(count, 10000, "After compaction: expected 10000 rows, got {}", count);
+    assert_eq!(
+        count, 10000,
+        "After compaction: expected 10000 rows, got {}",
+        count
+    );
 
     // PK spot-check: every 100th row
     for i in (1..=10000).step_by(100) {
@@ -121,7 +135,10 @@ fn test_compaction_with_overlapping_keys() {
 
     // Round 1: INSERT 100 rows
     for i in 1..=100i64 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'initial', 0.0)", i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'initial', 0.0)", i),
+        );
     }
     db.flush().unwrap();
 
@@ -152,26 +169,45 @@ fn test_compaction_with_overlapping_keys() {
         }
         let mut all_correct = true;
         for i in 1..=25i64 {
-            if get_val(&db, i) != "v2" { all_correct = false; break; }
+            if get_val(&db, i) != "v2" {
+                all_correct = false;
+                break;
+            }
         }
         if all_correct {
             for i in 26..=50i64 {
-                if get_val(&db, i) != "v1" { all_correct = false; break; }
+                if get_val(&db, i) != "v1" {
+                    all_correct = false;
+                    break;
+                }
             }
         }
         if all_correct {
             for i in 51..=100i64 {
-                if get_val(&db, i) != "initial" { all_correct = false; break; }
+                if get_val(&db, i) != "initial" {
+                    all_correct = false;
+                    break;
+                }
             }
         }
-        if all_correct { ok = true; break; }
+        if all_correct {
+            ok = true;
+            break;
+        }
         eprintln!("Attempt {}: values not yet correct, waiting...", attempt);
         std::thread::sleep(std::time::Duration::from_secs(3));
         db.flush().unwrap();
     }
 
-    assert!(ok, "Compaction did not settle with correct values after 8 attempts");
-    assert_eq!(count_rows(&db), 100, "Should have 100 rows after compaction");
+    assert!(
+        ok,
+        "Compaction did not settle with correct values after 8 attempts"
+    );
+    assert_eq!(
+        count_rows(&db),
+        100,
+        "Should have 100 rows after compaction"
+    );
 }
 
 #[test]
@@ -180,7 +216,10 @@ fn test_compaction_after_delete() {
     create_table(&db);
 
     for i in 1..=500i64 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'active', {})", i, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'active', {})", i, i),
+        );
     }
     db.flush().unwrap();
 
@@ -192,9 +231,16 @@ fn test_compaction_after_delete() {
 
     wait_for_compaction();
 
-    assert_eq!(count_rows(&db), 250, "Should have 250 rows after delete + compaction");
+    assert_eq!(
+        count_rows(&db),
+        250,
+        "Should have 250 rows after delete + compaction"
+    );
     assert!(get_row(&db, 1).is_none(), "Deleted row 1 should be gone");
-    assert!(get_row(&db, 250).is_none(), "Deleted row 250 should be gone");
+    assert!(
+        get_row(&db, 250).is_none(),
+        "Deleted row 250 should be gone"
+    );
     assert!(get_row(&db, 251).is_some(), "Row 251 should exist");
     assert!(get_row(&db, 500).is_some(), "Row 500 should exist");
 }
@@ -215,7 +261,10 @@ fn test_compaction_tombstone_propagation() {
 
     wait_for_compaction();
 
-    assert!(get_row(&db, 42).is_none(), "Row should be gone after tombstone compaction");
+    assert!(
+        get_row(&db, 42).is_none(),
+        "Row should be gone after tombstone compaction"
+    );
     assert_eq!(count_rows(&db), 0, "Table should be empty");
 }
 
@@ -229,7 +278,10 @@ fn test_multi_level_compaction() {
         let start = batch * 2000 + 1;
         let end = start + 2000;
         for i in start..end {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'data', {:.1})", i, i as f64));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'data', {:.1})", i, i as f64),
+            );
         }
         db.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -238,7 +290,11 @@ fn test_multi_level_compaction() {
     wait_for_compaction();
 
     let count = count_rows(&db);
-    assert_eq!(count, 10000, "All 10000 rows should survive multi-level compaction, got {}", count);
+    assert_eq!(
+        count, 10000,
+        "All 10000 rows should survive multi-level compaction, got {}",
+        count
+    );
 
     // Spot-check
     for i in (1..=10000).step_by(200) {
@@ -289,7 +345,11 @@ fn test_concurrent_writes_and_scan() {
 
     // Final count should be 3000
     let final_count = count_rows(&db);
-    assert_eq!(final_count, 3000, "Final count should be 3000, got {}", final_count);
+    assert_eq!(
+        final_count, 3000,
+        "Final count should be 3000, got {}",
+        final_count
+    );
 }
 
 #[test]
@@ -315,7 +375,11 @@ fn test_concurrent_flush_and_scan() {
     assert!(min_count >= 3000, "Min scan count {} < 3000", min_count);
 
     let final_count = count_rows(&db);
-    assert_eq!(final_count, 3000, "Final count should be 3000, got {}", final_count);
+    assert_eq!(
+        final_count, 3000,
+        "Final count should be 3000, got {}",
+        final_count
+    );
 }
 
 #[test]
@@ -325,21 +389,31 @@ fn test_concurrent_compaction_and_point_get() {
 
     // Insert 5000 rows, flush to create SSTables and trigger compaction
     for i in 1..=5000i64 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'val_{}', {:.2})", i, i, i as f64 * 1.5));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, 'val_{}', {:.2})",
+                i,
+                i,
+                i as f64 * 1.5
+            ),
+        );
     }
     db.flush().unwrap();
 
     // PK lookups while compaction may be running
     for i in (1..=5000).step_by(50) {
-        let row = get_row(&db, i).unwrap_or_else(|| {
-            panic!("Row {} should exist during compaction", i)
-        });
+        let row =
+            get_row(&db, i).unwrap_or_else(|| panic!("Row {} should exist during compaction", i));
         assert_eq!(row[0], Value::Integer(i), "Row {} has wrong id", i);
     }
 
     // Trigger another flush for more compaction
     for i in 1..=100i64 {
-        exec(&db, &format!("UPDATE t SET status = 'updated' WHERE id = {}", i));
+        exec(
+            &db,
+            &format!("UPDATE t SET status = 'updated' WHERE id = {}", i),
+        );
     }
     db.flush().unwrap();
 
@@ -348,7 +422,12 @@ fn test_concurrent_compaction_and_point_get() {
         assert_eq!(get_val(&db, i), "updated", "Row {} should be updated", i);
     }
     for i in (101..=5000).step_by(100) {
-        assert_eq!(get_val(&db, i), format!("val_{}", i), "Row {} should be original", i);
+        assert_eq!(
+            get_val(&db, i),
+            format!("val_{}", i),
+            "Row {} should be original",
+            i
+        );
     }
 
     assert_eq!(count_rows(&db), 5000, "All 5000 rows should be present");
@@ -373,7 +452,12 @@ fn test_many_small_sstables() {
 
     wait_for_compaction();
 
-    assert_eq!(count_rows(&db), 200, "Should have 200 rows across 20 SSTables, got {}", count_rows(&db));
+    assert_eq!(
+        count_rows(&db),
+        200,
+        "Should have 200 rows across 20 SSTables, got {}",
+        count_rows(&db)
+    );
 
     // Verify every row
     for round in 0..20i64 {
@@ -393,7 +477,11 @@ fn test_empty_table_scan() {
     assert_eq!(count_rows(&db), 0, "Empty table should have 0 rows");
 
     db.flush().unwrap();
-    assert_eq!(count_rows(&db), 0, "Empty table after flush should have 0 rows");
+    assert_eq!(
+        count_rows(&db),
+        0,
+        "Empty table after flush should have 0 rows"
+    );
 }
 
 #[test]
@@ -439,14 +527,21 @@ fn test_large_dataset_compaction() {
         let start = batch * 5000 + 1;
         let end = start + 5000;
         for i in start..end {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'v_{}', {:.2})", i, i, i as f64));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'v_{}', {:.2})", i, i, i as f64),
+            );
         }
         db.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
     wait_for_compaction();
-    assert_eq!(count_rows(&db), 20000, "Should have 20000 rows after compaction");
+    assert_eq!(
+        count_rows(&db),
+        20000,
+        "Should have 20000 rows after compaction"
+    );
 
     // Spot-check
     for i in (1..=20000).step_by(500) {
@@ -455,7 +550,10 @@ fn test_large_dataset_compaction() {
 
     // UPDATE first 2K rows
     for i in 1..=2000i64 {
-        exec(&db, &format!("UPDATE t SET status = 'final' WHERE id = {}", i));
+        exec(
+            &db,
+            &format!("UPDATE t SET status = 'final' WHERE id = {}", i),
+        );
     }
     db.flush().unwrap();
     wait_for_compaction();
@@ -488,19 +586,32 @@ fn test_update_then_scan_preserves_all() {
 
     // INSERT 5K
     for i in 1..=5000i64 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'pending', {:.2})", i, i as f64 * 10.0));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, 'pending', {:.2})",
+                i,
+                i as f64 * 10.0
+            ),
+        );
     }
     db.flush().unwrap();
 
     // UPDATE 1-2500
     for i in 1..=2500i64 {
-        exec(&db, &format!("UPDATE t SET status = 'completed' WHERE id = {}", i));
+        exec(
+            &db,
+            &format!("UPDATE t SET status = 'completed' WHERE id = {}", i),
+        );
     }
     db.flush().unwrap();
 
     // UPDATE 1-1000 again
     for i in 1..=1000i64 {
-        exec(&db, &format!("UPDATE t SET status = 'final' WHERE id = {}", i));
+        exec(
+            &db,
+            &format!("UPDATE t SET status = 'final' WHERE id = {}", i),
+        );
     }
     db.flush().unwrap();
 
@@ -520,7 +631,11 @@ fn test_update_then_scan_preserves_all() {
         let mut pending_count = 0u64;
         // materialize() handles all StreamingQueryResult variants (the columnar
         // store returns SelectColumnar/SelectReady, not SelectStreaming).
-        let result = db.execute("SELECT id, status FROM t").unwrap().materialize().unwrap();
+        let result = db
+            .execute("SELECT id, status FROM t")
+            .unwrap()
+            .materialize()
+            .unwrap();
         if let motedb::sql::QueryResult::Select { rows, .. } = result {
             for row in &rows {
                 match &row[1] {
@@ -536,7 +651,10 @@ fn test_update_then_scan_preserves_all() {
             ok = true;
             break;
         }
-        eprintln!("Attempt {}: final={}, completed={}, pending={}", attempt, final_count, completed_count, pending_count);
+        eprintln!(
+            "Attempt {}: final={}, completed={}, pending={}",
+            attempt, final_count, completed_count, pending_count
+        );
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
 
@@ -560,7 +678,10 @@ fn test_deferred_deletion_keeps_files_alive() {
         exec(&db, &format!("INSERT INTO t VALUES ({}, 'a', 0.0)", i));
     }
     db.flush().unwrap();
-    assert!(count_sst_files(&dir) >= 1, "Batch 1: expected >= 1 segment file");
+    assert!(
+        count_sst_files(&dir) >= 1,
+        "Batch 1: expected >= 1 segment file"
+    );
 
     // Batch 2: creates segment B → may trigger compaction (A+B merge)
     for i in 501..=1000i64 {
@@ -579,7 +700,11 @@ fn test_deferred_deletion_keeps_files_alive() {
     db.flush().unwrap();
     wait_for_compaction();
 
-    assert_eq!(count_rows(&db), 1500, "All 1500 rows should be present after compaction cycles");
+    assert_eq!(
+        count_rows(&db),
+        1500,
+        "All 1500 rows should be present after compaction cycles"
+    );
 }
 
 #[test]
@@ -607,7 +732,10 @@ fn test_orphan_cleanup_on_open() {
     // Phase 2: Reopen — orphan should be cleaned up
     {
         let db = Database::open_with_config(&path, DBConfig::for_edge()).unwrap();
-        assert!(!orphan.exists(), "Orphan SSTable should be cleaned up on open");
+        assert!(
+            !orphan.exists(),
+            "Orphan SSTable should be cleaned up on open"
+        );
 
         let count = count_rows_via(&db, "SELECT id FROM t");
         assert_eq!(count, 100, "Original data should survive reopen");
@@ -645,7 +773,11 @@ fn test_data_survives_restart() {
     {
         let db = Database::open_with_config(&path, DBConfig::for_edge()).unwrap();
         let count = count_rows_via(&db, "SELECT id FROM t");
-        assert_eq!(count, 5000, "All rows should survive restart, got {}", count);
+        assert_eq!(
+            count, 5000,
+            "All rows should survive restart, got {}",
+            count
+        );
 
         // Spot-check values
         for i in (1..=5000).step_by(100) {
@@ -653,10 +785,16 @@ fn test_data_survives_restart() {
             let result = exec(&db, &sql);
             match result {
                 motedb::sql::QueryResult::Select { rows, .. } => {
-                    let row = rows.into_iter().next()
+                    let row = rows
+                        .into_iter()
+                        .next()
                         .unwrap_or_else(|| panic!("Row {} missing after restart", i));
-                    assert_eq!(row[1], Value::text(format!("val_{}", i)),
-                        "Row {} value mismatch after restart", i);
+                    assert_eq!(
+                        row[1],
+                        Value::text(format!("val_{}", i)),
+                        "Row {} value mismatch after restart",
+                        i
+                    );
                 }
                 _ => panic!("Expected Select result for row {}", i),
             }
@@ -690,14 +828,22 @@ fn test_compaction_result_survives_restart() {
     {
         let db = Database::open_with_config(&path, DBConfig::for_edge()).unwrap();
         let count = count_rows_via(&db, "SELECT id FROM t");
-        assert_eq!(count, 10000, "All 10000 rows should survive compaction + restart, got {}", count);
+        assert_eq!(
+            count, 10000,
+            "All 10000 rows should survive compaction + restart, got {}",
+            count
+        );
 
         for i in (1..=10000).step_by(200) {
             let sql = format!("SELECT * FROM t WHERE id = {}", i);
             let result = exec(&db, &sql);
             match result {
                 motedb::sql::QueryResult::Select { rows, .. } => {
-                    assert!(rows.into_iter().next().is_some(), "Row {} missing after restart", i);
+                    assert!(
+                        rows.into_iter().next().is_some(),
+                        "Row {} missing after restart",
+                        i
+                    );
                 }
                 _ => panic!("Expected Select result for row {}", i),
             }
@@ -752,7 +898,10 @@ fn test_tombstone_not_dropped_at_intermediate_level() {
     for batch in 0..3i64 {
         let start = 2000 + batch * 100 + 1;
         for i in 0..50i64 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'padding')", start + i));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'padding')", start + i),
+            );
         }
         db.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -764,15 +913,20 @@ fn test_tombstone_not_dropped_at_intermediate_level() {
     std::thread::sleep(std::time::Duration::from_secs(3));
 
     // Deleted rows must NOT reappear (tombstone was not prematurely dropped)
-    assert_eq!(count_rows(&db), 650,
-        "Should have 500 (survivors) + 150 (padding) = 650 rows");
+    assert_eq!(
+        count_rows(&db),
+        650,
+        "Should have 500 (survivors) + 150 (padding) = 650 rows"
+    );
 
     for i in 1..=500i64 {
-        assert!(get_row(&db, i).is_none(),
-            "Deleted row {} should NOT be resurrected", i);
+        assert!(
+            get_row(&db, i).is_none(),
+            "Deleted row {} should NOT be resurrected",
+            i
+        );
     }
     for i in 501..=1000i64 {
-        assert!(get_row(&db, i).is_some(),
-            "Row {} should still exist", i);
+        assert!(get_row(&db, i).is_some(), "Row {} should still exist", i);
     }
 }

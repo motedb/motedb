@@ -11,7 +11,7 @@
 //! Cache values are wrapped in Arc to avoid expensive cloning on cache hits.
 //! This reduces memory allocation by 90%+ in high-QPS scenarios.
 
-use crate::types::{Value, RowId};
+use crate::types::{RowId, Value};
 use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::{Hash, Hasher};
@@ -27,12 +27,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 enum FastKey {
     Integer(i64),
-    Float(u64),         // f64 bits
+    Float(u64), // f64 bits
     Bool(bool),
     Text(Arc<str>),
     Timestamp(u64),
     Null,
-    Complex(u8),        // tag for vector/tensor/spatial/textdoc (not looked up)
+    Complex(u8), // tag for vector/tensor/spatial/textdoc (not looked up)
 }
 
 impl Hash for FastKey {
@@ -55,7 +55,7 @@ impl PartialEq for FastKey {
             (FastKey::Integer(a), FastKey::Integer(b)) => a == b,
             (FastKey::Float(a), FastKey::Float(b)) => a == b,
             (FastKey::Bool(a), FastKey::Bool(b)) => a == b,
-            (FastKey::Text(a), FastKey::Text(b)) => a == b,  // full string comparison
+            (FastKey::Text(a), FastKey::Text(b)) => a == b, // full string comparison
             (FastKey::Timestamp(a), FastKey::Timestamp(b)) => a == b,
             (FastKey::Null, FastKey::Null) => true,
             (FastKey::Complex(a), FastKey::Complex(b)) => a == b,
@@ -72,13 +72,13 @@ impl FastKey {
             Value::Integer(i) => FastKey::Integer(*i),
             Value::Float(f) => FastKey::Float(f.to_bits()),
             Value::Bool(b) => FastKey::Bool(*b),
-            Value::Text(s) => FastKey::Text(Arc::clone(&s.0)),  // unwrap ArcString -> Arc<str>
+            Value::Text(s) => FastKey::Text(Arc::clone(&s.0)), // unwrap ArcString -> Arc<str>
             Value::Timestamp(ts) => FastKey::Timestamp(ts.as_micros_u64()),
             Value::Null => FastKey::Null,
-            Value::Vector(_)   => FastKey::Complex(7),
-            Value::Tensor(_)   => FastKey::Complex(8),
-            Value::Spatial(_)  => FastKey::Complex(9),
-            Value::TextDoc(_)  => FastKey::Complex(10),
+            Value::Vector(_) => FastKey::Complex(7),
+            Value::Tensor(_) => FastKey::Complex(8),
+            Value::Spatial(_) => FastKey::Complex(9),
+            Value::TextDoc(_) => FastKey::Complex(10),
         }
     }
 }
@@ -187,7 +187,6 @@ impl CachedIndex {
         let mut cache = self.cache.write();
         cache.clear();
     }
-
 }
 
 /// Cache statistics
@@ -291,7 +290,10 @@ mod tests {
         let cache = CachedIndex::new(100);
 
         cache.put(Value::text("hello".to_string()), vec![1, 2]);
-        assert_eq!(*cache.get(&Value::text("hello".to_string())).unwrap(), vec![1, 2]);
+        assert_eq!(
+            *cache.get(&Value::text("hello".to_string())).unwrap(),
+            vec![1, 2]
+        );
         assert_eq!(cache.get(&Value::text("world".to_string())), None);
     }
 
@@ -304,8 +306,14 @@ mod tests {
         cache.put(Value::text("alpha".to_string()), vec![1]);
         cache.put(Value::text("beta".to_string()), vec![2]);
 
-        assert_eq!(*cache.get(&Value::text("alpha".to_string())).unwrap(), vec![1]);
-        assert_eq!(*cache.get(&Value::text("beta".to_string())).unwrap(), vec![2]);
+        assert_eq!(
+            *cache.get(&Value::text("alpha".to_string())).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            *cache.get(&Value::text("beta".to_string())).unwrap(),
+            vec![2]
+        );
         assert_eq!(cache.get(&Value::text("gamma".to_string())), None);
     }
 

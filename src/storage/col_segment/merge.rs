@@ -9,7 +9,7 @@
 //! - Memory: heap size = S (bounded by MAX_SEGMENTS), independent of table size.
 
 use super::segment::Segment;
-use crate::storage::lsm::columnar::{ColumnarSSTable, ColumnTypeTag, FixedSegment, TextSegment};
+use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTable, FixedSegment, TextSegment};
 use crate::types::{ColumnType, Value};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -65,32 +65,52 @@ impl SegmentCursor {
                     Ok(seg_data) => ColData::Fixed(seg_data),
                     Err(_) => ColData::Opaque,
                 }
-            } else if ci < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Text) {
+            } else if ci < seg.sst.column_tags.len()
+                && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Text)
+            {
                 match seg.sst.read_text(ci) {
                     Ok(seg_data) => ColData::Text(seg_data),
                     Err(_) => ColData::Opaque,
                 }
-            } else if ci < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector) {
+            } else if ci < seg.sst.column_tags.len()
+                && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Vector)
+            {
                 // Map read_vectors (row_id, vec) pairs to per-row-index options.
                 let decoded = seg.sst.read_vectors(ci).unwrap_or_default();
                 let mut per = vec![None; n];
                 let mut di = 0usize;
                 for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                    while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                    if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                    while di < decoded.len() && decoded[di].0 != ek {
+                        di += 1;
+                    }
+                    if di < decoded.len() {
+                        per[i] = Some(decoded[di].1.clone());
+                        di += 1;
+                    }
                 }
                 ColData::Vector(per)
-            } else if ci < seg.sst.column_tags.len() && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial) {
+            } else if ci < seg.sst.column_tags.len()
+                && matches!(seg.sst.column_tags[ci], ColumnTypeTag::Spatial)
+            {
                 let decoded = seg.sst.read_spatial(ci).unwrap_or_default();
                 let mut per = vec![None; n];
                 let mut di = 0usize;
                 for i in 0..n {
-                    if seg.sst.row_map.is_deleted(i) { continue; }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
-                    while di < decoded.len() && decoded[di].0 != ek { di += 1; }
-                    if di < decoded.len() { per[i] = Some(decoded[di].1.clone()); di += 1; }
+                    while di < decoded.len() && decoded[di].0 != ek {
+                        di += 1;
+                    }
+                    if di < decoded.len() {
+                        per[i] = Some(decoded[di].1.clone());
+                        di += 1;
+                    }
                 }
                 ColData::Spatial(per)
             } else {
@@ -139,15 +159,21 @@ impl SegmentCursor {
                     ColumnType::Integer => f.get_i64(i).map(Value::Integer),
                     ColumnType::Float => f.get_f64(i).map(Value::Float),
                     ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
-                    ColumnType::Timestamp => {
-                        f.get_i64(i).map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v)))
-                    }
+                    ColumnType::Timestamp => f
+                        .get_i64(i)
+                        .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
                     _ => None,
                 },
                 Some(ColData::Text(t)) => t.get_str(i).map(|s| Value::Text(s.into())),
-                Some(ColData::Vector(cols)) => cols.get(i).cloned().flatten()
+                Some(ColData::Vector(cols)) => cols
+                    .get(i)
+                    .cloned()
+                    .flatten()
                     .map(|v| Value::Vector(crate::types::ArcVec(Arc::new(v)))),
-                Some(ColData::Spatial(cols)) => cols.get(i).cloned().flatten()
+                Some(ColData::Spatial(cols)) => cols
+                    .get(i)
+                    .cloned()
+                    .flatten()
                     .map(|g| Value::Spatial(std::boxed::Box::new(g))),
                 _ => None,
             }

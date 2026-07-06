@@ -3,10 +3,12 @@
 //! Run: cargo test --test bench_multimodal --release -- --nocapture --test-threads=1
 
 use motedb::Database;
-use tempfile::TempDir;
 use std::time::Instant;
+use tempfile::TempDir;
 
-fn is_ci() -> bool { std::env::var("CI").is_ok() }
+fn is_ci() -> bool {
+    std::env::var("CI").is_ok()
+}
 
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().expect("temp dir");
@@ -15,14 +17,18 @@ fn create_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) -> motedb::sql::QueryResult {
-    db.execute(sql).unwrap_or_else(|_| panic!("SQL: {}", sql)).materialize().expect("materialize")
+    db.execute(sql)
+        .unwrap_or_else(|_| panic!("SQL: {}", sql))
+        .materialize()
+        .expect("materialize")
 }
 
 fn get_rss_mb() -> f64 {
     let pid = std::process::id();
     let output = std::process::Command::new("ps")
         .args(["-o", "rss", "-p", &pid.to_string()])
-        .output().ok();
+        .output()
+        .ok();
     if let Some(out) = output {
         let stdout = String::from_utf8_lossy(&out.stdout);
         for line in stdout.lines().skip(1) {
@@ -35,7 +41,9 @@ fn get_rss_mb() -> f64 {
 }
 
 fn print_latency(label: &str, latencies_us: &[u64]) {
-    if latencies_us.is_empty() { return; }
+    if latencies_us.is_empty() {
+        return;
+    }
     let mut s = latencies_us.to_vec();
     s.sort_unstable();
     let n = s.len();
@@ -43,22 +51,31 @@ fn print_latency(label: &str, latencies_us: &[u64]) {
     let p95 = s[n * 95 / 100];
     let p99 = s[n * 99 / 100];
     let avg: u64 = s.iter().sum::<u64>() / n as u64;
-    println!("  {:<60} | p50={:>7}µs  p95={:>7}µs  p99={:>7}µs  avg={:>7}µs", label, p50, p95, p99, avg);
+    println!(
+        "  {:<60} | p50={:>7}µs  p95={:>7}µs  p99={:>7}µs  avg={:>7}µs",
+        label, p50, p95, p99, avg
+    );
 }
 
-fn sep() { println!("  {}", "─".repeat(105)); }
+fn sep() {
+    println!("  {}", "─".repeat(105));
+}
 
 // Simple deterministic random
 static mut RNG: u64 = 42;
 fn rand_f32() -> f32 {
     unsafe {
-        RNG = RNG.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        RNG = RNG
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((RNG >> 33) as f32) / (u32::MAX as f32) - 0.5
     }
 }
 fn rand_f64() -> f64 {
     unsafe {
-        RNG = RNG.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        RNG = RNG
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (RNG >> 33) as f64 / (1u64 << 31) as f64
     }
 }
@@ -76,7 +93,10 @@ fn bench_vector() {
     let (db, _dir) = create_db();
     let rss0 = get_rss_mb();
 
-    exec(&db, "CREATE TABLE items (id INTEGER PRIMARY KEY, cat TEXT, emb VECTOR(128))");
+    exec(
+        &db,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, cat TEXT, emb VECTOR(128))",
+    );
     exec(&db, "CREATE VECTOR INDEX items_emb ON items(emb)");
 
     let n = if is_ci() { 500 } else { 2_000 };
@@ -86,15 +106,24 @@ fn bench_vector() {
     for i in 1..=n as i64 {
         let mut v = String::from('[');
         for d in 0..128 {
-            if d > 0 { v.push_str(", "); }
+            if d > 0 {
+                v.push_str(", ");
+            }
             v.push_str(&format!("{:.3}", rand_f32()));
         }
         v.push(']');
-        exec(&db, &format!("INSERT INTO items VALUES ({}, 'c{}', {})", i, i % 5, v));
+        exec(
+            &db,
+            &format!("INSERT INTO items VALUES ({}, 'c{}', {})", i, i % 5, v),
+        );
     }
     let insert_ms = t0.elapsed().as_millis();
-    println!("  INSERT: {}ms ({:.0} ops/s, {:.0} µs/op)", insert_ms,
-        n as f64 / (insert_ms as f64 / 1000.0), insert_ms as f64 * 1000.0 / n as f64);
+    println!(
+        "  INSERT: {}ms ({:.0} ops/s, {:.0} µs/op)",
+        insert_ms,
+        n as f64 / (insert_ms as f64 / 1000.0),
+        insert_ms as f64 * 1000.0 / n as f64
+    );
 
     // Flush to build DiskANN index
     println!("  Flushing + checkpoint...");
@@ -103,7 +132,11 @@ fn bench_vector() {
     db.checkpoint().expect("checkpoint");
     db.wait_for_indexes_ready();
     println!("  Flush: {}ms", t0.elapsed().as_millis());
-    println!("  Memory: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss0);
+    println!(
+        "  Memory: {:.1} MB (Δ = {:.1} MB)",
+        get_rss_mb(),
+        get_rss_mb() - rss0
+    );
 
     // ANN search via API
     println!("\n  --- ANN Search (top-10, API) ---");
@@ -113,13 +146,21 @@ fn bench_vector() {
     for _ in 0..n_queries {
         let q: Vec<f32> = (0..128).map(|_| rand_f32()).collect();
         let t = Instant::now();
-        let res = db.vector_search("items_emb", &q, 10).expect("vector search");
+        let res = db
+            .vector_search("items_emb", &q, 10)
+            .expect("vector search");
         ann_lat.push(t.elapsed().as_micros() as u64);
         if ann_lat.len() == 1 {
             println!("  Sample: {} results", res.len());
         }
     }
-    print_latency(&format!("ANN search ({} vecs, 128-dim, top-10, {} queries)", n, n_queries), &ann_lat);
+    print_latency(
+        &format!(
+            "ANN search ({} vecs, 128-dim, top-10, {} queries)",
+            n, n_queries
+        ),
+        &ann_lat,
+    );
 
     // SQL vector search
     println!("\n  --- SQL ORDER BY embedding <-> query ---");
@@ -129,7 +170,9 @@ fn bench_vector() {
     for _ in 0..sql_queries {
         let mut q = String::from('[');
         for d in 0..128 {
-            if d > 0 { q.push_str(", "); }
+            if d > 0 {
+                q.push_str(", ");
+            }
             q.push_str(&format!("{:.3}", rand_f32()));
         }
         q.push(']');
@@ -156,7 +199,10 @@ fn bench_spatial() {
     let (db, _dir) = create_db();
     let rss0 = get_rss_mb();
 
-    exec(&db, "CREATE TABLE locs (id INTEGER PRIMARY KEY, name TEXT, coords GEOMETRY)");
+    exec(
+        &db,
+        "CREATE TABLE locs (id INTEGER PRIMARY KEY, name TEXT, coords GEOMETRY)",
+    );
     exec(&db, "CREATE SPATIAL INDEX loc_coords ON locs(coords)");
 
     let n = if is_ci() { 2_000 } else { 10_000 };
@@ -166,15 +212,29 @@ fn bench_spatial() {
     for i in 1..=n as i64 {
         let x = 116.0 + (i as f64 % 10000.0) / 10000.0;
         let y = 39.5 + (i as f64 % 10000.0) / 20000.0 + 0.5;
-        exec(&db, &format!("INSERT INTO locs VALUES ({}, 'p{}', POINT({}, {}))", i, i, x, y));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO locs VALUES ({}, 'p{}', POINT({}, {}))",
+                i, i, x, y
+            ),
+        );
     }
     let insert_ms = t0.elapsed().as_millis();
-    println!("  INSERT: {}ms ({:.0} ops/s)", insert_ms, n as f64 / (insert_ms as f64 / 1000.0));
+    println!(
+        "  INSERT: {}ms ({:.0} ops/s)",
+        insert_ms,
+        n as f64 / (insert_ms as f64 / 1000.0)
+    );
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
     db.wait_for_indexes_ready();
-    println!("  Memory: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss0);
+    println!(
+        "  Memory: {:.1} MB (Δ = {:.1} MB)",
+        get_rss_mb(),
+        get_rss_mb() - rss0
+    );
 
     // ST_WITHIN range query
     println!("\n  --- ST_WITHIN Range Query ---");
@@ -186,13 +246,19 @@ fn bench_spatial() {
         let cy = 39.5 + rand_f64() * 0.5 + 0.5;
         let sql = format!(
             "SELECT * FROM locs WHERE ST_WITHIN(coords, {:.4}, {:.4}, {:.4}, {:.4})",
-            cx - 0.02, cy - 0.02, cx + 0.02, cy + 0.02
+            cx - 0.02,
+            cy - 0.02,
+            cx + 0.02,
+            cy + 0.02
         );
         let t = Instant::now();
         let _ = exec(&db, &sql);
         range_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency(&format!("ST_WITHIN (bbox ~0.04° × 0.04°, {} queries)", n_range), &range_lat);
+    print_latency(
+        &format!("ST_WITHIN (bbox ~0.04° × 0.04°, {} queries)", n_range),
+        &range_lat,
+    );
 
     // ST_DISTANCE + ORDER BY
     println!("\n  --- ST_DISTANCE + ORDER BY LIMIT 10 ---");
@@ -205,7 +271,10 @@ fn bench_spatial() {
         let _ = exec(&db, sql);
         dist_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency(&format!("ST_DISTANCE ORDER BY LIMIT 10 ({} queries)", n_dist), &dist_lat);
+    print_latency(
+        &format!("ST_DISTANCE ORDER BY LIMIT 10 ({} queries)", n_dist),
+        &dist_lat,
+    );
 
     // ST_KNN
     println!("\n  --- ST_KNN Nearest Neighbor ---");
@@ -215,7 +284,10 @@ fn bench_spatial() {
     for _ in 0..n_knn {
         let cx = 116.0 + rand_f64() * 0.9;
         let cy = 39.5 + rand_f64() * 0.5 + 0.5;
-        let sql = format!("SELECT * FROM locs WHERE ST_KNN(coords, {:.4}, {:.4}, 10)", cx, cy);
+        let sql = format!(
+            "SELECT * FROM locs WHERE ST_KNN(coords, {:.4}, {:.4}, 10)",
+            cx, cy
+        );
         let t = Instant::now();
         let _ = exec(&db, &sql);
         knn_lat.push(t.elapsed().as_micros() as u64);
@@ -238,14 +310,37 @@ fn bench_text_search() {
     let (db, _dir) = create_db();
     let rss0 = get_rss_mb();
 
-    exec(&db, "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)",
+    );
     exec(&db, "CREATE TEXT INDEX docs_body ON docs(body)");
 
     let words = [
-        "database", "vector", "search", "index", "query", "performance",
-        "embedding", "model", "neural", "network", "machine", "learning",
-        "spatial", "geometry", "point", "distance", "algorithm", "graph",
-        "rust", "memory", "thread", "concurrent", "benchmark", "latency",
+        "database",
+        "vector",
+        "search",
+        "index",
+        "query",
+        "performance",
+        "embedding",
+        "model",
+        "neural",
+        "network",
+        "machine",
+        "learning",
+        "spatial",
+        "geometry",
+        "point",
+        "distance",
+        "algorithm",
+        "graph",
+        "rust",
+        "memory",
+        "thread",
+        "concurrent",
+        "benchmark",
+        "latency",
     ];
 
     let n = if is_ci() { 2_000 } else { 10_000 };
@@ -254,17 +349,30 @@ fn bench_text_search() {
     let t0 = Instant::now();
     for i in 1..=n as i64 {
         let wc = 5 + (i % 11) as usize;
-        let body: Vec<&str> = (0..wc).map(|w| words[(i as usize + w * 7) % words.len()]).collect();
+        let body: Vec<&str> = (0..wc)
+            .map(|w| words[(i as usize + w * 7) % words.len()])
+            .collect();
         let body_s = body.join(" ").replace("'", "''");
-        exec(&db, &format!("INSERT INTO docs VALUES ({}, 'Doc {}', '{}')", i, i, body_s));
+        exec(
+            &db,
+            &format!("INSERT INTO docs VALUES ({}, 'Doc {}', '{}')", i, i, body_s),
+        );
     }
     let insert_ms = t0.elapsed().as_millis();
-    println!("  INSERT: {}ms ({:.0} ops/s)", insert_ms, n as f64 / (insert_ms as f64 / 1000.0));
+    println!(
+        "  INSERT: {}ms ({:.0} ops/s)",
+        insert_ms,
+        n as f64 / (insert_ms as f64 / 1000.0)
+    );
 
     db.flush().expect("flush");
     db.checkpoint().expect("checkpoint");
     db.wait_for_indexes_ready();
-    println!("  Memory: {:.1} MB (Δ = {:.1} MB)", get_rss_mb(), get_rss_mb() - rss0);
+    println!(
+        "  Memory: {:.1} MB (Δ = {:.1} MB)",
+        get_rss_mb(),
+        get_rss_mb() - rss0
+    );
 
     // MATCH AGAINST
     println!("\n  --- MATCH AGAINST (BM25) ---");
@@ -303,7 +411,10 @@ fn bench_text_search() {
         let _ = db.text_search_ranked("docs_body", "database index", 10);
         api_lat.push(t.elapsed().as_micros() as u64);
     }
-    print_latency(&format!("text_search_ranked() top-10 ({} queries)", n_text_queries), &api_lat);
+    print_latency(
+        &format!("text_search_ranked() top-10 ({} queries)", n_text_queries),
+        &api_lat,
+    );
 
     println!("\n  Memory after text benchmark: {:.1} MB", get_rss_mb());
 }
@@ -323,8 +434,14 @@ fn bench_multimodal_memory() {
     println!("  Baseline: {:.1} MB", rss0);
 
     // Create tables + indexes
-    exec(&db, "CREATE TABLE vecs (id INTEGER PRIMARY KEY, emb VECTOR(64))");
-    exec(&db, "CREATE TABLE pts (id INTEGER PRIMARY KEY, loc GEOMETRY)");
+    exec(
+        &db,
+        "CREATE TABLE vecs (id INTEGER PRIMARY KEY, emb VECTOR(64))",
+    );
+    exec(
+        &db,
+        "CREATE TABLE pts (id INTEGER PRIMARY KEY, loc GEOMETRY)",
+    );
     exec(&db, "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)");
 
     exec(&db, "CREATE VECTOR INDEX vecs_emb ON vecs(emb)");
@@ -345,7 +462,9 @@ fn bench_multimodal_memory() {
             // Vector (64-dim)
             let mut v = String::from('[');
             for d in 0..64 {
-                if d > 0 { v.push_str(", "); }
+                if d > 0 {
+                    v.push_str(", ");
+                }
                 v.push_str(&format!("{:.3}", ((i * 17 + d * 31) as f64).sin()));
             }
             v.push(']');
@@ -354,18 +473,31 @@ fn bench_multimodal_memory() {
             // Spatial point
             let x = 116.0 + (i as f64 % 10000.0) / 10000.0;
             let y = 39.0 + (i as f64 % 10000.0) / 20000.0 + 0.5;
-            exec(&db, &format!("INSERT INTO pts VALUES ({}, POINT({}, {}))", i, x, y));
+            exec(
+                &db,
+                &format!("INSERT INTO pts VALUES ({}, POINT({}, {}))", i, x, y),
+            );
 
             // Text
-            let body: Vec<&str> = (0..8).map(|w| words[(i as usize + w) % words.len()]).collect();
-            exec(&db, &format!("INSERT INTO docs VALUES ({}, '{}')", i, body.join(" ")));
+            let body: Vec<&str> = (0..8)
+                .map(|w| words[(i as usize + w) % words.len()])
+                .collect();
+            exec(
+                &db,
+                &format!("INSERT INTO docs VALUES ({}, '{}')", i, body.join(" ")),
+            );
         }
 
         db.flush().expect("flush");
         let rss = get_rss_mb();
         let total = round * rows_per_round;
-        println!("  Round {} ({}K rows × 3 tables): {:.1} MB (Δ = {:.1} MB)",
-            round, total / 1000, rss, rss - rss0);
+        println!(
+            "  Round {} ({}K rows × 3 tables): {:.1} MB (Δ = {:.1} MB)",
+            round,
+            total / 1000,
+            rss,
+            rss - rss0
+        );
     }
 
     // Final checkpoint
@@ -384,12 +516,20 @@ fn bench_multimodal_memory() {
         let q: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
         let _ = db.vector_search("vecs_emb", &q, 10);
     }
-    println!("  After {} vector searches: {:.1} MB (Δ = {:.1} MB)", n_q, get_rss_mb(), get_rss_mb() - rss_q0);
+    println!(
+        "  After {} vector searches: {:.1} MB (Δ = {:.1} MB)",
+        n_q,
+        get_rss_mb(),
+        get_rss_mb() - rss_q0
+    );
 
     // Spatial queries
     for i in 0..n_q {
         let t = std::time::Instant::now();
-        let _ = exec(&db, "SELECT * FROM pts WHERE ST_WITHIN(loc, 116.0, 39.5, 117.0, 40.5)");
+        let _ = exec(
+            &db,
+            "SELECT * FROM pts WHERE ST_WITHIN(loc, 116.0, 39.5, 117.0, 40.5)",
+        );
         if i < 3 || i == 49 {
             println!("  Spatial query {}: {:?}", i + 1, t.elapsed());
         }
@@ -398,10 +538,18 @@ fn bench_multimodal_memory() {
 
     // Text searches
     for _ in 0..n_q {
-        let _ = exec(&db, "SELECT * FROM docs WHERE MATCH(body) AGAINST('vector search') LIMIT 10");
+        let _ = exec(
+            &db,
+            "SELECT * FROM docs WHERE MATCH(body) AGAINST('vector search') LIMIT 10",
+        );
     }
     println!("  After {} text searches: {:.1} MB", n_q, get_rss_mb());
 
     let total_rows = n_rounds * rows_per_round;
-    println!("\n  Final: {:.1} MB (total Δ = {:.1} MB for {}K rows × 3 modalities)", get_rss_mb(), get_rss_mb() - rss0, total_rows / 1000);
+    println!(
+        "\n  Final: {:.1} MB (total Δ = {:.1} MB for {}K rows × 3 modalities)",
+        get_rss_mb(),
+        get_rss_mb() - rss0,
+        total_rows / 1000
+    );
 }
