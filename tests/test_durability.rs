@@ -55,7 +55,8 @@ fn test_batch_insert_survives_crash() {
     }
     let db = open_db_at(&path);
     assert_eq!(count_rows(&db, "SELECT * FROM bench"), 1000);
-    assert_eq!(count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"), 334);
+    // insert_test_rows marks 'US' when id % 3 == 0 (id=3,6,9,...,999) → 333 rows.
+    assert_eq!(count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"), 333);
 }
 
 #[test]
@@ -298,7 +299,7 @@ fn test_large_batch_durability() {
     config2.wal_config.durability_level = motedb::DurabilityLevel::Synchronous;
     let db = Database::open_with_config(&path, config2).unwrap();
     assert_eq!(count_rows(&db, "SELECT * FROM bench"), 10_000);
-    assert_eq!(count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"), 3_334);
+    assert_eq!(count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'"), 3_333);
 }
 
 #[test]

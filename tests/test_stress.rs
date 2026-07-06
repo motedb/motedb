@@ -14,8 +14,7 @@ fn test_10k_insert_consistency() {
 
     // Exact count verification
     assert_eq!(count_rows(&db, "SELECT * FROM bench"), 10_000);
-    // Distribution: every 3rd row is 'US' (0, 3, 6, ...)
-    // 10_000 / 3 = 3333 + 1 (id 0) = 3334
+    // Distribution: insert_test_rows marks 'US' when id % 3 == 0 (id=3,6,9,...,9999) → 3333 rows.
     let us_count = count_rows(&db, "SELECT * FROM bench WHERE tag = 'US'");
     assert!(us_count > 3000 && us_count < 4000, "US count {} unexpected", us_count);
     let eu_count = count_rows(&db, "SELECT * FROM bench WHERE tag = 'EU'");
