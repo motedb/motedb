@@ -67,6 +67,15 @@ serde_json = "1.0"  # JSON for manifest and metadata
 # Error handling (used throughout)
 thiserror = "1.0"
 
+# Structured logging facade. We emit via `log::debug!`/`warn!`/`info!`/`error!`
+# from our `debug_log!`/`warn_log!`/`info_log!`/`error_log!` macros. The library
+# itself installs NO sink (a library must not write to stderr unconditionally);
+# applications plug in `env_logger`, `tracing-log`, or any `log` subscriber and
+# control verbosity via `RUST_LOG=motedb=info`. This replaces the old hand-rolled
+# `eprintln!`/`MOTEDB_LOG` macros, which produced no output at all in release
+# builds (the "zero observability" problem).
+log = "0.4"
+
 # System calls for durability (used by: btree, diskann, manifest, WAL)
 libc = "0.2"
 
@@ -99,6 +108,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Temporary directories for testing
 tempfile = "3.0"
+
+# Logger backend for the `logging` example (the library itself only depends on
+# the `log` facade; applications bring their own subscriber).
+env_logger = "0.11"
 
 # Memory profiling with jemalloc
 tikv-jemallocator = "0.5"

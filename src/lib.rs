@@ -91,47 +91,42 @@ pub fn purge_memory_to_os() {
     }
 }
 
-/// Debug-only logging macro
-/// Only prints in debug builds, silenced in release builds
+// ── Logging ─────────────────────────────────────────────────────────────
+// The crate emits log records via the `log` crate facade (our
+// `debug_log!`/`info_log!`/`warn_log!`/`error_log!` macros delegate to
+// `log::debug!`/`info!`/`warn!`/`error!`). The library installs NO global
+// logger — that is the application's responsibility (e.g. `env_logger::init()`
+// or a `tracing` subscriber). With no logger installed, all logging is
+// compiled to a no-op (zero runtime cost). With one installed, the app
+// controls verbosity, e.g. `RUST_LOG=motedb=info`.
+//
+// This replaces the prior hand-rolled macros that unconditionally `eprintln!`'d
+// to stderr (`warn_log!`) or produced nothing in release builds (`debug_log!`),
+// which gave production deployments zero useful observability.
+
+/// Debug-level log. Compiled in but a no-op unless a logger is installed and
+/// debug level is enabled for the `motedb` target.
 #[macro_export]
 macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        #[cfg(debug_assertions)]
-        {
-            println!($($arg)*);
-        }
-        // In release builds this is a true no-op. The arguments are still
-        // type-checked because the debug branch references them, but they are
-        // not evaluated at runtime in release.
-        #[cfg(not(debug_assertions))]
-        {
-            // Expand (but don't evaluate) the args so they remain part of the
-            // syntax tree; `format_args!` is const-evaluated away to nothing.
-            // Wrapped in a block (not `let _ = || ...`) to avoid clippy's
-            // non-binding-lock-on-sync false positive.
-            if false {
-                let _ = format_args!($($arg)*);
-            }
-        }
-    };
+    ($($arg:tt)*) => { ::log::debug!($($arg)*) };
 }
 
-/// Always-on warning log — prints to stderr in all builds
-#[macro_export]
-macro_rules! warn_log {
-    ($($arg:tt)*) => {
-        eprintln!("[MoteDB WARN] {}", format_args!($($arg)*));
-    };
-}
-
-/// Info log — prints to stderr when MOTEDB_LOG env var is set
+/// Info-level log (e.g. lifecycle events: open/close/checkpoint).
 #[macro_export]
 macro_rules! info_log {
-    ($($arg:tt)*) => {
-        if std::env::var("MOTEDB_LOG").is_ok() {
-            eprintln!("[MoteDB] {}", format_args!($($arg)*));
-        }
-    };
+    ($($arg:tt)*) => { ::log::info!($($arg)*) };
+}
+
+/// Warn-level log (degraded-but-functional conditions, retries, fallbacks).
+#[macro_export]
+macro_rules! warn_log {
+    ($($arg:tt)*) => { ::log::warn!($($arg)*) };
+}
+
+/// Error-level log (operation failed; the calling path returns an error too).
+#[macro_export]
+macro_rules! error_log {
+    ($($arg:tt)*) => { ::log::error!($($arg)*) };
 }
 
 pub mod catalog;

@@ -2058,7 +2058,7 @@ impl WALManager {
     /// Idempotent: safe to call multiple times (sets stop flags; threads exit
     /// their loops on the next wake).
     pub fn shutdown(&self) {
-        eprintln!(
+        info_log!(
             "[WAL] shutdown: gc={} flush={}",
             self.group_commit.is_some(),
             self.flush_thread.is_some()
@@ -2075,7 +2075,11 @@ impl WALManager {
         // Final sync on all partitions (flush buffered writes to disk).
         for entry in self.partitions.iter() {
             let mut wal = entry.value().lock();
-            let _ = wal.sync_flush();
+            if let Err(e) = wal.sync_flush() {
+                // A failed final sync means buffered writes may be lost on
+                // crash. This is the most important durability event to log.
+                error_log!("[WAL] shutdown: final sync_flush failed: {:?}", e);
+            }
         }
     }
 }

@@ -1672,7 +1672,7 @@ impl MoteDB {
                         Ok(false) | Err(_) => {
                             // Panic or disconnected: continue (don't let thread die)
                             if result.is_err() {
-                                eprintln!("[MoteDB] Index builder thread panicked, restarting...");
+                                error_log!("[MoteDB] Index builder thread panicked, restarting...");
                                 std::thread::sleep(std::time::Duration::from_millis(100));
                             } else {
                                 break;
@@ -1803,7 +1803,7 @@ impl MoteDB {
                             if result.is_ok() {
                                 break;
                             } // disconnected
-                            eprintln!("[MoteDB] Auto-flush thread panicked, restarting...");
+                            error_log!("[MoteDB] Auto-flush thread panicked, restarting...");
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     }

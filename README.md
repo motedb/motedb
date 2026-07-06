@@ -94,6 +94,34 @@ Benchmark: 300K rows × 4 columns on Apple Silicon M-series vs SQLite 3.x WAL mo
 - **Read Path**: SelectColumnar (zero-materialization), typed array access, predicate pushdown
 - **Transactions**: VersionStore MVCC with snapshot isolation and conflict detection
 
+## Logging
+
+MoteDB emits lifecycle and durability events (WAL flush, checkpoint, background
+thread errors) through the standard [`log`](https://docs.rs/log) facade. The
+library installs **no logger itself** — your application chooses one (e.g.
+`env_logger`, `tracing`, `slog`) and controls verbosity:
+
+```rust
+fn main() {
+    // Install a logger (env_logger reads RUST_LOG).
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("off")
+    ).try_init();
+
+    let db = motedb::Database::create("my_data").unwrap();
+    // ...
+}
+```
+
+```bash
+RUST_LOG=motedb=info  ./your_app   # lifecycle events (open/close/checkpoint)
+RUST_LOG=motedb=warn  ./your_app   # degraded conditions only
+RUST_LOG=motedb=debug ./your_app   # verbose hot-path detail
+```
+
+With no logger installed, all logging compiles to a no-op (zero runtime cost).
+See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
+
 ## Features
 
 ### Multimodal
