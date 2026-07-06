@@ -584,6 +584,49 @@ impl DBConfig {
         }
     }
 
+    /// Embodied AI preset: optimized for vision-language models, sensor fusion,
+    /// and real-time control loops on edge devices (Jetson Orin, Raspberry Pi 5).
+    ///
+    /// Targets: Vector KNN (128-768 dim), spatial queries, high-frequency sensor
+    /// ingestion (100Hz-1kHz), with aggressive memory bounds.
+    /// Memory: ~30MB typical, ~80MB peak.
+    ///
+    /// - WAL: Periodic 10ms (real-time control loop priority)
+    /// - LSM: 2MB memtable, 1 partition (minimal threads)
+    /// - Row cache: 200 rows (for recent sensor lookups)
+    /// - Auto-checkpoint: 4MB WAL trigger, 30s interval
+    /// - Index strategy: BatchOnly (highest throughput)
+    /// - Compression: disabled (CPU > storage for edge)
+    pub fn for_embodied() -> Self {
+        Self {
+            wal_config: WALConfig {
+                durability_level: DurabilityLevel::Periodic { interval_ms: 10 },
+                max_wal_size: 16 * 1024 * 1024, // 16MB
+                enable_compression: false,
+                ..Default::default()
+            },
+            num_partitions: 1, // Single partition = minimal thread overhead
+            lsm_config: LSMConfig {
+                memtable_size_limit: 2 * 1024 * 1024, // 2MB
+                sstable_cache_size: Some(8),
+                sstable_cache_memory_limit_mb: Some(10),
+                block_size: Some(16 * 1024), // 16KB — smaller blocks for edge I/O
+                enable_compression: Some(false),
+                ..Default::default()
+            },
+            row_cache_size: Some(200),
+            max_result_rows: Some(10_000),
+            pk_lookup_capacity: 5_000,
+            auto_checkpoint: Some(AutoCheckpointConfig {
+                max_wal_size_bytes: 4 * 1024 * 1024, // 4MB
+                min_interval_secs: 30,
+            }),
+            index_update_strategy: IndexUpdateStrategy::BatchOnly,
+            columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
+            ..Default::default()
+        }
+    }
+
     pub fn validate(&self) -> crate::Result<()> {
         if self.num_partitions == 0 {
             return Err(crate::StorageError::InvalidData(

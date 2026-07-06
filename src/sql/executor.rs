@@ -2196,6 +2196,22 @@ impl QueryExecutor {
                 return self.materialize_as_streaming(stmt);
             }
         }
+
+        // 🚀 FAST PATH: Vector KNN (KNN_SEARCH) — single index lookup.
+        // `WHERE KNN_SEARCH(col, [...], k)` is the highest-value query for
+        // embodied AI/robotics. Without this path it falls through to the
+        // ColSegmentStore scan, which cannot evaluate KnnSearch (eval_expr_on_row
+        // can't do index lookups) and silently returns 0 rows, or — when routed
+        // to the materialized path — brute-force scans the whole table calling
+        // vector_search per row (~50ms on 10K rows). Detect the bare pattern and
+        // push it down to a single vector_search call + batch row fetch.
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let Some(QueryResult::Select { columns, rows }) =
+                self.try_vector_knn_fast_path(stmt, where_clause)?
+            {
+                return Ok(StreamingQueryResult::SelectReady { columns, rows });
+            }
+        }
         if let Some(ref order_by) = stmt.order_by {
             if order_by.iter().any(|ob| Self::expr_is_or_aliases_st_distance(&ob.expr, &stmt.columns)) {
                 if let Some(QueryResult::Select { columns, rows }) = self.try_optimize_spatial_order_by(stmt)? {
@@ -13337,6 +13353,87 @@ impl QueryExecutor {
             columns: column_names,
             rows: result_rows,
         }))
+    }
+
+    // ==================== Vector KNN Fast Path ====================
+
+    /// 🚀 FAST PATH: detect `WHERE KNN_SEARCH(col, [...], k)` and push it down
+    /// to a single `vector_search` index lookup + batch row fetch.
+    ///
+    /// Only triggers when the WHERE clause is *exactly* a bare `KnnSearch`
+    /// (no AND/OR combinators), a vector index exists for the column, and the
+    /// target table uses ColSegmentStore. Falls through (returns `None`)
+    /// otherwise so the query keeps its current semantics.
+    fn try_vector_knn_fast_path(
+        &self,
+        stmt: &SelectStmt,
+        where_clause: &Expr,
+    ) -> Result<Option<QueryResult>> {
+        // Must be a bare KNN_SEARCH predicate (no AND/OR wrapping).
+        let (column, query_vector, k) = match where_clause {
+            Expr::KnnSearch { column, query_vector, k } => (column, query_vector, k),
+            _ => return Ok(None),
+        };
+
+        // LIMIT 1 from SELECT * or table from FROM clause.
+        let table_name = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name.as_str(),
+            _ => return Ok(None),
+        };
+
+        // Only enable on ColSegmentStore-backed tables (matches the S9 path
+        // this replaces). Keeps row-fetch semantics consistent.
+        if !self.db.has_col_segment_store(table_name) {
+            return Ok(None);
+        }
+
+        self.execute_vector_knn_fast(stmt, table_name, column, query_vector.as_slice(), *k)
+    }
+
+    /// Execute `WHERE KNN_SEARCH(col, [...], k)` using the vector index directly.
+    /// Mirrors `execute_ioctree_knn_fast` but for vector similarity search.
+    fn execute_vector_knn_fast(
+        &self,
+        stmt: &SelectStmt,
+        table_name: &str,
+        column: &str,
+        query_vector: &[f32],
+        k: usize,
+    ) -> Result<Option<QueryResult>> {
+        // Resolve the (possibly user-named) vector index for this column.
+        let index_name = match self.db.index_registry.find_by_column(
+            table_name,
+            column,
+            crate::database::index_metadata::IndexType::Vector,
+        ) {
+            Some(name) => name,
+            None => return Ok(None), // No index → fall back to default path.
+        };
+
+        if !self.db.has_vector_index(&index_name) {
+            return Ok(None);
+        }
+
+        debug_log!(
+            "[Executor] ✅ vector KNN fast path: index={}, k={}, dims={}",
+            index_name, k, query_vector.len()
+        );
+
+        // Single index lookup → sorted (row_id, distance) pairs.
+        let results = match self.db.vector_search(&index_name, query_vector, k) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+
+        if results.is_empty() {
+            let schema = self.db.get_table_schema(table_name)?;
+            let columns = self.build_select_columns(&stmt.columns, &schema).unwrap_or_default();
+            return Ok(Some(QueryResult::Select { columns, rows: vec![] }));
+        }
+
+        let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
+        // load_and_project_spatial_rows takes care of batch fetching + projection.
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, None, false)
     }
 
     // ==================== 3D Spatial Fast Paths (i-Octree) ====================
