@@ -1,18 +1,48 @@
-//! MoteDB Storage Engine
+//! # MoteDB
 //!
-//! 面向嵌入式具身智能的高性能多模态数据库存储引擎
-//! 
-//! ## 核心特性
-//! - 支持 TENSOR/SPATIAL/TEXT/TIMESTAMP 多模态数据
-//! - 查询延迟 P99 ≤50ms
-//! - 写入吞吐 ≥200 rows/sec
-//! - 内存占用 ≤35MB
+//! AI-native embedded multimodal database for embodied intelligence (robots,
+//! AR glasses, industrial arms). A single embedded Rust library providing
+//! columnar storage with ACID transactions, vector search, full-text search,
+//! and spatial indexing.
 //!
-//! ## 架构
-//! - 存储层: WAL + Fragmented Column Store (5K rows/fragment)
-//! - 索引层: Vamana (vector) + i-Octree (spatial) + Inverted (text) + B+Tree (timestamp)
-//! - 查询层: Cost-based optimizer + streaming executor
-//! - 事务层: MVCC + Write-Ahead Logging
+//! ## Status
+//!
+//! Pre-1.0. The [`Database`] embedding API and the storage/transaction engine
+//! are stable and heavily tested. The SQL surface and the FFI bindings
+//! ([`ffi`], [`tokenizers`]) are still evolving — see the crate README for the
+//! supported SQL subset. The internal modules ([`storage`], [`index`], [`txn`],
+//! [`database`]) are exposed for advanced/embedded use but their exact types
+//! are **not** part of the stable API yet.
+//!
+//! ## Quick start
+//!
+//! ```no_run
+//! use motedb::{Database, QueryResult};
+//!
+//! let db = Database::create("my_data")?;
+//! db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")?;
+//! db.execute("INSERT INTO t VALUES (1, 100)")?;
+//! let r = db.execute("SELECT * FROM t")?;
+//! if let QueryResult::Select { rows, .. } = r.materialize()? {
+//!     println!("{:?}", rows);
+//! }
+//! # Ok::<(), motedb::StorageError>(())
+//! ```
+//!
+//! ## Architecture
+//!
+//! - **Storage:** append-only columnar segments (source of truth) + WAL for
+//!   durability, with Snappy/Zstd compression and mmap zero-copy reads.
+//! - **Indexes:** DiskANN/Vamana (vector) + i-Octree (spatial) + inverted
+//!   index (text) + B+Tree (column/timestamp).
+//! - **Transactions:** MVCC version store with snapshot isolation and
+//!   write-ahead logging for crash recovery.
+//!
+//! ## Performance (indicative, Apple Silicon)
+//!
+//! On a 300K-row × 4-column workload vs SQLite WAL: COUNT/SUM under WHERE
+//! ~5×, ORDER BY + LIMIT ~2.5×, PK point lookup sub-microsecond. See
+//! `BENCHMARK.md` and the docs for methodology and full numbers.
 
 // 🧠 jemalloc: background thread returns freed memory to OS (RSS plateaus instead of growing forever)
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
@@ -89,7 +119,13 @@ pub mod types;
 pub mod distance;
 pub mod catalog;
 pub mod sql;
-pub mod ffi;  // FFI 接口，用于 C/Python/Node.js
+
+// ⚠️ EXPERIMENTAL: the C ABI in `ffi` is incomplete (no open_with_config,
+// no transaction/batch APIs, no error reporting, execute() returns a Debug
+// string). There is no C header file and no versioned symbol scheme yet.
+// Do not rely on it for production bindings until it stabilizes — it will
+// change without a SemVer bump. Tracked as a pre-1.0 limitation.
+pub mod ffi;
 pub mod cache;  // 🚀 P1: Row cache for performance
 
 // 🔄 Modular database module (refactored from database_legacy.rs)

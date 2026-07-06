@@ -90,7 +90,9 @@ jobs:
           fi
 
       - name: Package check
-        run: cargo package --allow-dirty
+        # No --allow-dirty: the package must be clean so we never publish
+        # uncommitted changes or stray working files to crates.io.
+        run: cargo package
 
       - name: Publish to crates.io
         env:
@@ -99,4 +101,4 @@ jobs:
           if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
             echo "CARGO_TOKEN is not set in repository secrets. Aborting."; exit 1;
           fi
-          cargo publish --allow-dirty
+          cargo publish

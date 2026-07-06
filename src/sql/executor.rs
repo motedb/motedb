@@ -98,7 +98,13 @@ pub enum ColumnarSeg {
 }
 
 /// Query result
+///
+/// `#[non_exhaustive]`: new variants (e.g. `Explain`, `BatchResult`) may be
+/// added in future minor versions. Out-of-crate callers must include a `_`
+/// arm in their `match`; the `materialize()` helper and `affected_rows()`
+/// accessor cover the common cases without exhaustively matching.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum QueryResult {
     /// SELECT result
     Select {
@@ -163,9 +169,13 @@ pub struct ForEachResult {
 }
 
 /// 🚀 流式查询结果（方案 C：零内存开销）
-/// 
+///
 /// 返回迭代器而不是 Vec，实现真正的流式查询。
-/// 
+///
+/// `#[non_exhaustive]`: new variants may be added in future minor versions.
+/// Prefer `materialize()` / `for_each()` / `row_count()` over matching the
+/// enum directly — those accessors are stable across versions.
+///
 /// # 示例
 /// ```ignore
 /// // 新 API：流式迭代
@@ -175,6 +185,7 @@ pub struct ForEachResult {
 ///     Ok(())
 /// })?;
 /// ```
+#[non_exhaustive]
 pub enum StreamingQueryResult {
     /// SELECT 流式结果
     SelectStreaming {

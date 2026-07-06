@@ -207,6 +207,8 @@ fn display_result(result: sql::QueryResult) {
         QueryResult::Select { columns, rows } => {
             display_table(&columns, &rows);
         }
+        // QueryResult is #[non_exhaustive]: future variants are handled here.
+        _ => {}
     }
 }
 

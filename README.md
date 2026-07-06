@@ -3,43 +3,54 @@
 **AI-native embedded multimodal database for embodied intelligence.**
 Columnar storage engine with ACID transactions, vector search, full-text search, and spatial indexing — in a single embedded library.
 
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.74+-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/motedb.svg)](https://crates.io/crates/motedb)
+
+> **Status: pre-1.0.** The Rust embedding API and storage engine are stable and
+> heavily tested; the SQL surface and multi-language FFI are still evolving.
+> See [Supported SQL](#sql-support) for the current feature set.
 
 ## Quick Start
 
-```rust
-use motedb::{Database, DBConfig};
-
-// Create or open an embedded database
-let db = Database::create("my_data")?;
-
-// SQL with multimodal support
-db.execute("CREATE TABLE products (
-    id INT PRIMARY KEY AUTO_INCREMENT,
-    name TEXT,
-    price FLOAT,
-    embedding VECTOR(128)
-)")?;
-
-// Fast batch insert
-db.batch_insert("products", rows)?;
-
-// Point query
-let result = db.execute("SELECT * FROM products WHERE id = 42")?;
-
-// Full-text search
-db.execute("CREATE TEXT INDEX idx_name ON products(name)")?;
-let results = db.execute("SELECT * FROM products WHERE MATCH(name) AGAINST('wireless')")?;
-
-// Vector similarity search
-db.execute("CREATE VECTOR INDEX idx_vec ON products(embedding)")?;
-let neighbors = db.vector_search("idx_vec", &query_vector, 10)?;
-
-// Spatial KNN (3D point cloud)
-db.execute("CREATE SPATIAL INDEX idx_pos ON products(position)")?;
-let nearby = db.ioctree_knn_query("idx_pos", &point, 5)?;
+```bash
+cargo add motedb
 ```
+
+A minimal, runnable example (`examples/hello_world.rs`):
+
+```rust
+use motedb::{Database, QueryResult};
+
+fn main() -> motedb::Result<()> {
+    // Create or open an embedded database (single file + WAL sidecars).
+    let db = Database::create("hello.mote")?;
+
+    // Standard SQL: CREATE / INSERT / SELECT
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")?;
+    db.execute("INSERT INTO users VALUES (1, 'Ada', 36)")?;
+    db.execute("INSERT INTO users VALUES (2, 'Linus', 54)")?;
+
+    // Query — materialize results
+    let result = db.execute("SELECT name, age FROM users WHERE age > 40")?;
+    if let QueryResult::Select { rows, .. } = result.materialize()? {
+        for row in &rows {
+            println!("{:?}", row);
+        }
+    }
+
+    Ok(())
+}
+```
+
+Run it with:
+
+```bash
+cargo run --example hello_world
+```
+
+For the multimodal features (vector / full-text / spatial search), see
+[`examples/crud.rs`](examples/crud.rs) and the [indexes overview](docs/06-indexes-overview.md).
 
 ## Performance
 
@@ -118,29 +129,59 @@ cargo add motedb
 Or in `Cargo.toml`:
 ```toml
 [dependencies]
-motedb = "0.3"
+motedb = "0.5"
+```
+
+For minimal edge builds (no tokenizer, no parallelism), disable default features:
+```toml
+[dependencies]
+motedb = { version = "0.5", default-features = false, features = ["jemalloc"] }
 ```
 
 ## Configuration
 
-```rust
-use motedb::DBConfig;
+Pick a preset that matches your device, or start from one and override fields:
 
-// Edge device (low memory, periodic fsync)
+```rust
+use motedb::{Database, DBConfig};
+
+// Edge device (low memory, periodic fsync, single write partition)
 let config = DBConfig::for_edge();
 
-// Robotics (fast writes, vector support)
+// Robotics (fast sensor ingestion, vector support)
 let config = DBConfig::for_robotics();
 
-// Custom
-let config = DBConfig {
-    wal_config: WALConfig { durability_level: DurabilityLevel::GroupCommit { max_interval_ms: 10 }, .. },
-    lsm_config: LSMConfig { memtable_size: 1 * 1024 * 1024, .. },
-    ..DBConfig::for_edge()
-};
+// Embodied AI (vision-language models, real-time control loops)
+let config = DBConfig::for_embodied();
+
 let db = Database::create_with_config("my_data", config)?;
 ```
 
+See [`docs/`](docs/) for the full configuration reference and per-field docs.
+
+## SQL Support
+
+**Supported:** `CREATE TABLE` / `CREATE INDEX` (column, vector, text, spatial),
+`DROP TABLE [IF EXISTS]`, `INSERT`, `UPDATE`, `DELETE`, `SELECT` with
+`WHERE`, `JOIN` (INNER/LEFT/RIGHT/FULL), `GROUP BY`, `ORDER BY`, `LIMIT/OFFSET`,
+`DISTINCT`, aggregates (`COUNT`, `SUM`, `MIN`, `MAX`), and transactions
+(`BEGIN`/`COMMIT`/`ROLLBACK`).
+
+**Not yet supported:** `WITH`/CTE/recursive queries, `COUNT(DISTINCT ...)`,
+multi-column `GROUP BY`, `DECIMAL`/`DATE`/`BLOB` types, and full-text search
+predicate functions (the FTS index builds, but `MATCH ... AGAINST` is incomplete).
+
+## Documentation
+
+Full guides live in [`docs/`](docs/):
+
+- [Quick start](docs/01-quick-start.md) · [Installation & config](docs/02-installation.md) · [SQL operations](docs/03-sql-operations.md)
+- [Batch operations](docs/04-batch-operations.md) · [Transactions](docs/05-transactions.md)
+- Indexes: [overview](docs/06-indexes-overview.md) · [column](docs/07-column-index.md) · [vector](docs/08-vector-index.md) · [text](docs/09-text-index.md) · [spatial](docs/10-spatial-index.md) · [timestamp](docs/11-timestamp-index.md)
+- [Performance tuning](docs/12-performance.md) · [Data types](docs/13-data-types.md) · [API reference](docs/14-api-reference.md) · [Best practices](docs/15-best-practices.md) · [FAQ](docs/16-faq.md)
+
+API docs: <https://docs.rs/motedb>
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

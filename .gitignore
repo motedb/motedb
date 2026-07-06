@@ -9,3 +9,9 @@
 .idea/
 worktrees/
 motedb_data.mote/
+
+# Agent/automation working docs (not user-facing, excluded from publishes)
+docs/superpowers/
+docs/benchmark_report_*
+docs/optimization*
+

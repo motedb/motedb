@@ -2,16 +2,33 @@
 name = "motedb"
 version = "0.5.1"
 edition = "2021"
+rust-version = "1.74"
 description = "AI-native embedded multimodal database for embodied intelligence (robots, AR glasses, industrial arms)."
 license = "MIT"
 repository = "https://github.com/motedb/motedb"
 homepage = "https://github.com/motedb/motedb"
 documentation = "https://docs.rs/motedb"
-readme = "docs/README.md"
+readme = "README.md"
 keywords = ["database", "embedded", "vector", "multimodal"]
 categories = ["database", "embedded", "algorithms"]
 authors = ["motedb <motedb@126.com>"]
 publish = true
+# Exclude non-publish artifacts from the crates.io package: agent working
+# docs, runtime residue, and ad-hoc benchmark/report notes. Keeps the
+# published crate lean and free of internal noise.
+exclude = [
+    "docs/superpowers/",
+    "docs/benchmark_report_*",
+    "docs/optimization*",
+    "motedb_data.mote/",
+    "BENCHMARK.md",
+    "BENCHMARK_REPORT.md",
+    "PERFORMANCE_REPORT.md",
+    "SCALING.md",
+    "COMPETITIVE_ANALYSIS.md",
+    "MULTIMODAL_COMPETITIVE_ANALYSIS.md",
+    "RELEASE-v0.2.0.md",
+]
 
 [lib]
 name = "motedb"
