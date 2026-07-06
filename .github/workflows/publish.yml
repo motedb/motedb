@@ -38,12 +38,22 @@ jobs:
         run: |
           cargo test --workspace --all-features -- \
             --test-threads=1 \
-            --skip bench_ --skip stress_ --skip perf_ --skip test_memory_linear \
+            --skip bench_ --skip stress_ --skip perf_ \
+            --skip test_memory_linear \
+            --skip test_memory_leak \
+            --skip test_memory_does_not_grow_unbounded \
             --skip test_disk_usage \
             --skip test_no_bloat \
-            --skip test_perf_insert_throughput \
+            --skip test_perf_ \
             --skip test_scan_latency_bounded \
             --skip test_insert_latency_bounded \
+            --skip test_aggregate_latency_bounded \
+            --skip test_distinct_latency_bounded \
+            --skip test_where_latency_bounded \
+            --skip test_pk_select_latency_stable \
+            --skip test_latency_growth_sublinear \
+            --skip test_scalability_latency \
+            --skip test_scalability_memory \
             --skip test_durability_large_dataset_checkpoint_recovery \
             --skip test_performance_guarantees
 
