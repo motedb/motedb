@@ -2,7 +2,7 @@
 //!
 //! Run: cargo test --release --test bench_vs_sqlite_v05 -- --nocapture --test-threads=1
 
-use motedb::{sql::QueryResult, types::Value, Database};
+use motedb::Database;
 use rusqlite;
 use std::time::Instant;
 

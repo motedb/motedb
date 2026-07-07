@@ -10,7 +10,7 @@
 //! 7. Crash recovery for multimodal data
 //! 8. Concurrent multimodal access
 
-use motedb::{types::Value, DBConfig, Database, QueryResult};
+use motedb::{DBConfig, Database, QueryResult};
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -244,7 +244,7 @@ fn test_mixed_vector_plus_text_plus_scalar() {
     );
     let r = db.execute(&sql).unwrap().materialize().unwrap();
     if let QueryResult::Select { rows, .. } = r {
-        for row in &rows {
+        for _row in &rows {
             // All results should be in-stock and under $100
         }
         assert!(!rows.is_empty(), "should find matching products");
@@ -538,7 +538,7 @@ fn test_memory_does_not_grow_unbounded() {
             let v: Vec<String> = (0..16)
                 .map(|d| format!("{:.3}", ((i + d) as f64 * 0.01).sin()))
                 .collect();
-            let region = if i % 3 == 0 { "US" } else { "EU" };
+            let _region = if i % 3 == 0 { "US" } else { "EU" };
             sql.push_str(&format!(
                 "([{}],POINT({:.1},{:.1}),'cat_{}',{:.1})",
                 v.join(","),

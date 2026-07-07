@@ -13,13 +13,6 @@ fn rows(result: motedb::StreamingQueryResult) -> Vec<Vec<Value>> {
     }
 }
 
-fn msg(result: motedb::StreamingQueryResult) -> String {
-    match result {
-        motedb::StreamingQueryResult::Definition { message } => message,
-        _ => panic!("Expected Definition"),
-    }
-}
-
 // === Fix #1: UPDATE PK to duplicate value ===
 
 #[test]

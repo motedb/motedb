@@ -1,7 +1,7 @@
 //! Round 5: Advanced hunt — concurrent writes, B-tree boundaries,
 //! AUTO_INCREMENT edge cases, WAL truncation, and schema operations.
 
-use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
+use motedb::{sql::QueryResult, types::Value, Database};
 use std::sync::Arc;
 use std::thread;
 use tempfile::TempDir;

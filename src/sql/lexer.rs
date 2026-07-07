@@ -238,7 +238,7 @@ impl<'a> Lexer<'a> {
         let rest = &self.bytes[self.position..];
         match std::str::from_utf8(rest) {
             Ok(s) => s.chars().next().unwrap_or('\0'),
-            Err(e) => {
+            Err(_) => {
                 // `rest` starts with invalid UTF-8. If the first byte is a
                 // leading byte of a valid sequence that's simply truncated,
                 // decode just that byte's expected length; otherwise treat the

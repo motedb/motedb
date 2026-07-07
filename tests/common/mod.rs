@@ -7,8 +7,19 @@
 //! - Crash-recovery verification
 //! - Timing/latency measurement
 
+// These helpers are shared across many test binaries via
+// `#[path = "common/mod.rs"] mod common;`. Any single test file uses only a
+// subset, so the rest appear "never used" to that file's compilation unit.
+// They are genuinely used by other files — silence the dead-code lint for the
+// whole module rather than annotating each helper.
+#![allow(dead_code)]
+
+//! - RSS memory measurement
+//! - Crash-recovery verification
+//! - Timing/latency measurement
+
 use motedb::{DBConfig, Database, QueryResult};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tempfile::TempDir;
 
 // ─── Database Setup ─────────────────────────────────────────────────────

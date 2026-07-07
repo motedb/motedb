@@ -8,18 +8,12 @@
 //!   - GROUP BY with NULL values
 //!   - COUNT(*) recovery from ColSegmentStore after reopen
 
-use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
+use motedb::{sql::QueryResult, types::Value, Database};
 use tempfile::TempDir;
 
 fn create_db() -> (Database, TempDir) {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    (db, dir)
-}
-
-fn create_db_edge() -> (Database, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let db = Database::create_with_config(dir.path(), DBConfig::for_edge()).unwrap();
     (db, dir)
 }
 
@@ -42,18 +36,6 @@ fn count(db: &Database, sql: &str) -> i64 {
             }
         })
         .unwrap_or(-1)
-}
-
-fn prepared_count(db: &Database, sql: &str, params: Vec<Value>) -> i64 {
-    let r = db
-        .execute_prepared(sql, params)
-        .unwrap()
-        .materialize()
-        .unwrap();
-    match r {
-        QueryResult::Select { rows, .. } => rows.len() as i64,
-        _ => -1,
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -597,7 +579,7 @@ fn test_checkpoint_excludes_uncommitted_transaction() {
     db.execute("BEGIN TRANSACTION").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     // Data visible within txn (transactional read sees own writes).
-    let cnt_in_txn = count(&db, "SELECT COUNT(*) FROM t");
+    let _cnt_in_txn = count(&db, "SELECT COUNT(*) FROM t");
     // After rollback (via ROLLBACK SQL), uncommitted row should be gone.
     db.execute("ROLLBACK").unwrap();
     let cnt_after = count(&db, "SELECT COUNT(*) FROM t");

@@ -2,7 +2,7 @@
 //! Measures: INSERT throughput, PK point lookup, full scan, aggregate, range filter.
 //! Fast (~15s) — designed for iteration during optimization.
 
-use motedb::{sql::QueryResult, types::Value, Database};
+use motedb::Database;
 use std::time::Instant;
 
 fn setup(name: &str) -> Database {

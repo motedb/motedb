@@ -120,8 +120,8 @@ fn test_no_memory_leak_under_load() {
     let rss_max = *rss_samples.iter().max().unwrap();
     let rss_growth_pct = (rss_last as f64 - rss_first as f64) / rss_first as f64 * 100.0;
 
-    let lat_first = latencies[0];
-    let lat_last = *latencies.last().unwrap();
+    let _lat_first = latencies[0];
+    let _lat_last = *latencies.last().unwrap();
     let lat_avg_first5: u64 = latencies[..5].iter().sum::<u64>() / 5;
     let lat_avg_last5: u64 = latencies[latencies.len() - 5..].iter().sum::<u64>() / 5;
     let lat_growth_pct =
@@ -204,7 +204,7 @@ fn test_streaming_vs_materialize_memory() {
     // for_each: processes rows one at a time
     let rss_before = get_rss_kb();
     let mut count = 0usize;
-    let for_each_result: ForEachResult = db
+    let _for_each_result: ForEachResult = db
         .execute("SELECT * FROM t")
         .unwrap()
         .for_each(

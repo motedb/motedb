@@ -16,10 +16,6 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
-fn count_rows(db: &Database, sql: &str) -> usize {
-    rows(db, sql).len()
-}
-
 // ============================================================
 // G1: GROUP BY with LIMIT/OFFSET was silently ignored in positional fast path
 // ============================================================

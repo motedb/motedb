@@ -6,7 +6,7 @@
 //!
 //! Run: cargo test --release --features jemalloc --test bench_multimodal_full -- --nocapture --test-threads=1
 
-use motedb::{DBConfig, Database, QueryResult};
+use motedb::{DBConfig, Database};
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -210,7 +210,7 @@ fn bench_spatial_10k() {
     // Population filter + spatial
     timed("Spatial + population > 500000 (x5)", || {
         for _ in 0..5 {
-            let r = db.execute("SELECT id FROM places WHERE population > 500000 ORDER BY ST_DISTANCE(location, -100.0, 40.0) LIMIT 10")
+            let _r = db.execute("SELECT id FROM places WHERE population > 500000 ORDER BY ST_DISTANCE(location, -100.0, 40.0) LIMIT 10")
                 .unwrap().materialize().unwrap();
         }
     });
@@ -276,7 +276,7 @@ fn bench_text_fts_10k() {
 
     timed("FTS 'database' top-10 (x10)", || {
         for _ in 0..10 {
-            let r = db
+            let _r = db
                 .execute("SELECT id FROM docs WHERE MATCH(body, 'database') LIMIT 10")
                 .unwrap()
                 .materialize()
@@ -286,14 +286,14 @@ fn bench_text_fts_10k() {
 
     timed("FTS + category filter (x5)", || {
         for _ in 0..5 {
-            let r = db.execute("SELECT id FROM docs WHERE MATCH(body, 'sensor') AND category = 'tech' LIMIT 10")
+            let _r = db.execute("SELECT id FROM docs WHERE MATCH(body, 'sensor') AND category = 'tech' LIMIT 10")
                 .unwrap().materialize().unwrap();
         }
     });
 
     timed("LIKE prefix scan 'robot%' (x5)", || {
         for _ in 0..5 {
-            let r = db
+            let _r = db
                 .execute("SELECT id FROM docs WHERE title LIKE 'robot%' LIMIT 10")
                 .unwrap()
                 .materialize()
@@ -370,7 +370,7 @@ fn bench_mixed_multimodal_10k() {
                 "SELECT id FROM items WHERE KNN_SEARCH(emb, [{}], 10) AND price > 500",
                 qvec.join(",")
             );
-            let r = db.execute(&sql).unwrap().materialize().unwrap();
+            let _r = db.execute(&sql).unwrap().materialize().unwrap();
         }
     });
 

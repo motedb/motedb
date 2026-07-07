@@ -2,7 +2,7 @@
 //! Covers: prepared statements, range queries, multi-column WHERE,
 //! index interactions, data type round-trips, WAL recovery, compound keys.
 
-use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
+use motedb::{sql::QueryResult, types::Value, Database};
 use tempfile::TempDir;
 
 fn mk() -> (Database, TempDir) {

@@ -66,10 +66,6 @@ fn create_table(db: &Database) {
     );
 }
 
-fn lsm_dir_for(dir: &TempDir) -> std::path::PathBuf {
-    dir.path().with_extension("mote").join("lsm")
-}
-
 /// Count segment files in the columnar multi-segment store (the source of
 /// truth since v0.3.0). Data lives in `<db>.mote/columnar_ms/<table>/*.sst`,
 /// NOT in the legacy `lsm/` dir.

@@ -1,7 +1,7 @@
 //! Round 4: Untouched subsystems — MVCC, transaction isolation, WAL recovery,
 //! vector/spatial index interactions, and data integrity edge cases.
 
-use motedb::{sql::QueryResult, types::Value, DBConfig, Database};
+use motedb::{sql::QueryResult, types::Value, Database};
 use tempfile::TempDir;
 
 fn mk() -> (Database, TempDir) {
