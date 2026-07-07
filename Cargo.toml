@@ -55,7 +55,7 @@ crc32fast = "1.4"
 parking_lot = "0.12"
 
 # LRU cache (used by: btree, spatial, text_dictionary, cached_index, row_cache)
-lru = "0.12"
+lru = "0.16"
 
 # Roaring Bitmap for text index posting lists (used by: text_types)
 roaring = "0.10"

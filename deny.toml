@@ -1,0 +1,83 @@
+# cargo-deny configuration — supply-chain safety for MoteDB.
+#
+# Run locally:   cargo deny check
+# Checks: advisories (RustSec vulnerabilities), licenses (compatibility with MIT),
+#          bans (duplicate/unused deps — advisory here), sources.
+#
+# MoteDB is MIT-licensed, so we allow the standard MIT-compatible licenses.
+
+[advisories]
+# Cargo-deny fails on ANY un-ignored advisory in the RustSec DB. To treat a
+# known issue as non-blocking (e.g. unmaintained dep with no fix yet), add its
+# RUSTSEC-YYYY-NNNN id to `ignore` with a reason. The default (empty ignore) is
+# strict: every NEW vulnerability/unsoundness blocks the check — only the four
+# known-and-accepted items below are ignored, each with a tracked reason.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # bincode 1.x — our direct dependency for index/row serialization. Marked
+    # unmaintained (RUSTSEC-2025-0141): the official crate halted 1.x and 2.0 is
+    # an API redesign requiring a large migration. No soundness/vuln issue, just
+    # no new releases. Tracked: migrate to bincode 2.0 or postcard before 1.0.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; migrate to 2.0 tracked for pre-1.0" },
+
+    # fxhash — pulled in transitively ONLY via jieba-rs (the optional Chinese
+    # tokenizer, feature tokenizer-jieba). Unmaintained but no soundness issue.
+    # Disabled entirely by `default-features = false` (the edge profile).
+    { id = "RUSTSEC-2025-0057", reason = "fxhash via optional jieba-rs only; not in edge builds" },
+
+    # paste — proc-macro, pulled in via tikv-jemalloc-ctl. Unmaintained, no
+    # soundness issue. Removed if jemalloc feature is disabled.
+    { id = "RUSTSEC-2024-0436", reason = "paste via tikv-jemalloc-ctl; cosmetic proc-macro, no soundness issue" },
+
+    # proc-macro-error2 — pulled in via include-flate -> jieba-rs (optional).
+    # Fork of the unmaintained proc-macro-error; itself flagged unmaintained
+    # (RUSTSEC-2026-0173). Build-time only (proc-macro), never in the runtime
+    # artifact. Removed when the tokenizer-jieba feature is off.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 via optional jieba-rs; build-time only" },
+]
+
+[licenses]
+# Allow all permissive licenses compatible with MIT. GPL/AGPL/copyleft are NOT
+# listed, so a copyleft dep would fail the check (correct — we'd need to review).
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",        # Mozilla — file-level copyleft, MIT-compatible as a dep
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[[licenses.clarify]]
+# ring has a special license situation (ISC + custom OpenSSL-style exemption);
+# clarify to avoid false positives if it appears transitively.
+name = "ring"
+version = "*"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+# Duplicate-dep and unused-dep checks are advisory for now (MoteDB has some
+# intentional version duplication from optional features). Warn, don't block.
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Only allow crates from crates.io (no git/path deps in the published graph).
+# Prevents accidental supply-chain injection via a custom registry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

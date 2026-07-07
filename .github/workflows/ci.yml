@@ -33,6 +33,20 @@ jobs:
         run: cargo clippy --all-targets --all-features --no-deps
         continue-on-error: true
 
+  # ── Supply-chain: vulnerability + license gate (cargo-deny) ──────────────
+  # Fails on any NEW RustSec advisory (vulnerability/unsound). Four known
+  # unmaintained-dep advisories are explicitly ignored in deny.toml with
+  # tracked reasons (bincode 1.x, and three via the optional jieba-rs). A new
+  # advisory with no ignore entry blocks the build until reviewed.
+  supply-chain:
+    name: cargo-deny (advisories + licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace check advisories licenses sources
+
   # ── Unit tests (HARD gate, fast): library in-crate tests only ────────────
   # `cargo test --lib` compiles a SINGLE binary (the lib's inline tests, 428
   # of them) and runs in seconds — a fast, deterministic gate that catches
