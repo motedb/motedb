@@ -43,9 +43,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          arguments: --workspace check advisories licenses sources
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check advisories licenses sources
 
   # ── Unit tests (HARD gate, fast): library in-crate tests only ────────────
   # `cargo test --lib` compiles a SINGLE binary (the lib's inline tests, 428
