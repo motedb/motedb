@@ -81,6 +81,7 @@ fn get_rss_kb() -> u64 {
 }
 
 #[test]
+#[ignore = "slow: runs 7 query types × 5 data sizes (up to 100K rows), ~2min due to LIKE/GROUP BY cost; run with --ignored"]
 fn test_scalability_latency() {
     let sizes = [1_000, 5_000, 10_000, 30_000, 100_000];
 

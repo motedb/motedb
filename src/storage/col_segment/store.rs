@@ -858,19 +858,20 @@ impl ColSegmentStore {
             let has_nulls = ftext.has_any_null();
             let has_deletions = seg.sst.row_map.has_any_deleted();
             if !has_nulls && !has_deletions {
-                for i in 0..n {
+                // 🔑 Fast path (single OR multi segment): use the batch
+                // prefix_match_indices which walks raw offsets in one pass
+                // (no per-row slice() calls). Works for any segment count.
+                let matched = ftext.prefix_match_indices(prefix);
+                for &i in &matched {
                     if !single_seg {
                         let key = seg.sst.row_map.key(i);
                         if !seen.insert(key) {
                             continue;
                         }
                     }
-                    let s = ftext.get_str_fast(i);
-                    if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
-                        indices.push((sidx, i));
-                        if indices.len() >= limit {
-                            return Some(indices);
-                        }
+                    indices.push((sidx, i));
+                    if indices.len() >= limit {
+                        return Some(indices);
                     }
                 }
             } else {
