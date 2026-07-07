@@ -5874,10 +5874,7 @@ impl QueryExecutor {
                     if let Expr::Column(filter_col) = expr.as_ref() {
                         if let Expr::Literal(Value::Text(pattern_val)) = pattern.as_ref() {
                             let pat = pattern_val.as_str();
-                            if pat.ends_with('%')
-                                && !pat[..pat.len() - 1].contains('%')
-                                && !pat[..pat.len() - 1].contains('_')
-                            {
+                            if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
                                 let prefix = &pat[..pat.len() - 1];
                                 if let Some(filter_pos) = schema.get_column_position(filter_col) {
                                     if let Some(col_sst) = self.db.columnar_sstables.get(table) {
@@ -7021,10 +7018,7 @@ impl QueryExecutor {
             } => match (expr.as_ref(), pattern.as_ref()) {
                 (Expr::Column(cn), Expr::Literal(Value::Text(s))) => {
                     let pat = s.as_str();
-                    if pat.ends_with('%')
-                        && !pat[..pat.len() - 1].contains('%')
-                        && !pat[..pat.len() - 1].contains('_')
-                    {
+                    if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
                         let prefix = pat[..pat.len() - 1].to_string();
                         let pos = schema.get_column_position(cn).unwrap_or(0);
                         (
@@ -7115,10 +7109,7 @@ impl QueryExecutor {
                 (expr.as_ref(), pattern.as_ref())
             {
                 let pat = s.as_str();
-                if pat.ends_with('%')
-                    && !pat[..pat.len() - 1].contains('%')
-                    && !pat[..pat.len() - 1].contains('_')
-                {
+                if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
                     let prefix = pat[..pat.len() - 1].to_string();
                     if let Some(fc) = schema.get_column_position(cn) {
                         if matches!(col_types.get(fc), Some(ColumnType::Text)) {
@@ -7286,10 +7277,7 @@ impl QueryExecutor {
                     Expr::Like { expr, pattern, .. } => match (expr.as_ref(), pattern.as_ref()) {
                         (Expr::Column(_), Expr::Literal(Value::Text(s))) => {
                             let pat = s.to_string();
-                            if pat.ends_with('%')
-                                && !pat[..pat.len() - 1].contains('%')
-                                && !pat[..pat.len() - 1].contains('_')
-                            {
+                            if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
                                 let prefix = pat[..pat.len() - 1].to_string();
                                 Box::new(move |sv: Option<&str>| {
                                     sv.map(|s| s.starts_with(&prefix)).unwrap_or(false)

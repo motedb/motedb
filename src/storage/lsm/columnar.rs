@@ -557,7 +557,20 @@ impl TextSegment {
                 ]) as usize;
                 if end - start >= plen {
                     // Direct byte compare against string_data, no &str creation.
-                    if &str_bytes[start..start + plen] == prefix {
+                    // '_' (0x5F) is the SQL LIKE single-char wildcard — matches
+                    // any byte. The common prefix has no '_', so the wildcard
+                    // branch is rarely taken (branch predictor friendly).
+                    let candidate = &str_bytes[start..start + plen];
+                    let matched = if !prefix.contains(&b'_') {
+                        candidate == prefix
+                    } else {
+                        // Wildcard prefix: byte-by-byte with _ as match-any.
+                        candidate
+                            .iter()
+                            .zip(prefix.iter())
+                            .all(|(&c, &p)| p == b'_' || p == c)
+                    };
+                    if matched {
                         result.push(i);
                     }
                 }
