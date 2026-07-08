@@ -138,6 +138,20 @@ impl MoteDB {
 
             if let Some(explicit) = explicit_id {
                 // 🔑 User provided an explicit ID for an AUTO_INCREMENT column.
+                // Check PK uniqueness first — explicit IDs can collide with
+                // previously auto-assigned IDs (the bug: explicit ID was accepted
+                // without checking, allowing duplicate PKs).
+                let pk_val = Value::Integer(explicit);
+                let pk_key = crate::database::pk_cache::PkKey::from_value(&pk_val);
+                if let Some(lookup) = self.pk_lookup.get(table_name) {
+                    if lookup.get_pk(&pk_key).is_some() {
+                        return Err(StorageError::InvalidData(format!(
+                            "Duplicate primary key {} for table '{}'",
+                            explicit, table_name
+                        )));
+                    }
+                }
+
                 // Use it, but advance the counter past it so the next auto
                 // insert doesn't collide.
                 let counter = {

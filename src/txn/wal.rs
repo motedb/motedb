@@ -401,8 +401,22 @@ impl WALRecord {
 
     /// Decode native or compressed format with fallback to bincode (for old WAL files)
     fn decode_with_fallback(data: &[u8]) -> Result<Self> {
+        Self::decode_with_fallback_depth(data, 0)
+    }
+
+    fn decode_with_fallback_depth(data: &[u8], depth: u8) -> Result<Self> {
         // Check for compression marker
         if !data.is_empty() && data[0] == TAG_COMPRESSED {
+            // Compression recursion depth guard: a legitimately compressed WAL
+            // record is exactly 1 layer (compress once). Nested compression
+            // (a malicious/corrupted record where the decompressed payload is
+            // itself another TAG_COMPRESSED) would recurse infinitely and
+            // overflow the stack. Cap at 1 layer.
+            if depth >= 1 {
+                return Err(StorageError::Serialization(
+                    "WAL: nested compression exceeds depth limit (possible corruption)".into(),
+                ));
+            }
             // Compressed: [0x00][u32 original_len][zstd_data...]
             if data.len() < 5 {
                 return Err(StorageError::Serialization(
@@ -424,8 +438,8 @@ impl WALRecord {
                     original_len
                 )));
             }
-            // Recurse on decompressed data
-            return Self::decode_with_fallback(&decompressed);
+            // Recurse on decompressed data (with depth guard)
+            return Self::decode_with_fallback_depth(&decompressed, depth + 1);
         }
         // Try native binary format first
         if let Some(result) = Self::decode_native(data) {

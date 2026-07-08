@@ -8042,7 +8042,7 @@ impl QueryExecutor {
                     | BinaryOperator::Gt
                     | BinaryOperator::Ge => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
-                            Ok(Value::Bool(false))
+                            Ok(Value::Null) // SQL: NULL comparison => UNKNOWN (3-valued logic)
                         } else {
                             Ok(Value::Bool(match op {
                                 BinaryOperator::Lt => lv < rv,
@@ -12760,11 +12760,19 @@ impl QueryExecutor {
                     temp_row.insert(name.clone(), result_row[i].clone());
                 }
 
-                let passes = self
+                // HAVING evaluation: propagate errors instead of silently
+                // treating them as "group doesn't pass" (which hides bugs).
+                let passes = match self
                     .evaluator
                     .eval(having_expr, &temp_row)
                     .and_then(|val| self.to_bool(&val))
-                    .unwrap_or(false);
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn_log!("[HAVING] evaluation error, skipping group: {}", e);
+                        continue;
+                    }
+                };
 
                 if !passes {
                     continue;
@@ -13736,8 +13744,7 @@ impl QueryExecutor {
 
             result_rows.sort_by(|a, b| {
                 for &(idx, asc) in &order_specs {
-                    let cmp = a[idx]
-                        .partial_cmp(&b[idx])
+                    let cmp = QueryExecutor::compare_values(&a[idx], &b[idx])
                         .unwrap_or(std::cmp::Ordering::Equal);
                     if cmp != std::cmp::Ordering::Equal {
                         return if asc { cmp } else { cmp.reverse() };
@@ -14102,8 +14109,7 @@ impl QueryExecutor {
 
             result_rows.sort_by(|a, b| {
                 for &(idx, asc) in &order_specs {
-                    let cmp = a[idx]
-                        .partial_cmp(&b[idx])
+                    let cmp = QueryExecutor::compare_values(&a[idx], &b[idx])
                         .unwrap_or(std::cmp::Ordering::Equal);
                     if cmp != std::cmp::Ordering::Equal {
                         return if asc { cmp } else { cmp.reverse() };
