@@ -1109,6 +1109,10 @@ impl LSMEngine {
                 let batch_results = sstable.batch_get(&query_keys)?;
 
                 // 处理批量查询结果
+                // 🔑 PERF: collect found indices into a HashSet for O(1) removal
+                // (was O(K²) with remaining_keys.iter().position() per found key).
+                let mut found_indices: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
                 for (i, (idx, _key)) in keys_in_range.iter().enumerate() {
                     if let Some(mut value) = batch_results[i].clone() {
                         // Resolve blob reference
@@ -1122,11 +1126,12 @@ impl LSMEngine {
                             results[*idx] = Some(value);
                         }
 
-                        // 从 remaining_keys 中移除
-                        if let Some(pos) = remaining_keys.iter().position(|(i, _)| *i == *idx) {
-                            remaining_keys.swap_remove(pos);
-                        }
+                        found_indices.insert(*idx);
                     }
+                }
+                // Batch-remove found keys from remaining_keys (single pass, O(K))
+                if !found_indices.is_empty() {
+                    remaining_keys.retain(|(idx, _)| !found_indices.contains(idx));
                 }
                 // 🔓 SSTable锁在这里释放（批量处理完成）
 

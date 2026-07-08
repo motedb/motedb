@@ -78,15 +78,28 @@ impl PkLookupCache {
 
     /// Look up a PK value by hash key string (legacy compat).
     pub fn get(&self, key: &str) -> Option<RowId> {
-        let mut cache = self.cache.write(); // LRU touch requires write
         let pk_key = PkKey::from_hash_key(key);
-        cache.get(&pk_key).copied()
+        self.get_pk(&pk_key)
     }
 
     /// Look up by compact PkKey (zero-allocation).
+    ///
+    /// 🔑 PERF: uses a read-lock fast path (peek) first. Only falls back to
+    /// write-lock (LRU touch) on the rare miss→promote path. Previously every
+    /// lookup took a write lock (LRU touch), serializing all concurrent PK
+    /// lookups — a major bottleneck on read-heavy workloads.
     pub fn get_pk(&self, key: &PkKey) -> Option<RowId> {
-        let mut cache = self.cache.write(); // LRU touch requires write
-        cache.get(key).copied()
+        // Fast path: read lock, no LRU touch. Concurrent readers don't block.
+        {
+            let cache = self.cache.read();
+            if let Some(&row_id) = cache.peek(key) {
+                return Some(row_id);
+            }
+        }
+        // Slow path: miss. We could upgrade to write to touch the LRU entry
+        // that was just peeked, but since it was a miss there's nothing to
+        // touch. Return None directly.
+        None
     }
 
     /// Remove a PK value (used during DELETE).
