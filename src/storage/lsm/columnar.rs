@@ -802,8 +802,10 @@ pub struct ColumnarSSTable {
     file_data: Vec<u8>,
     #[allow(dead_code)]
     mmap: Option<Arc<Mmap>>,
-    #[allow(dead_code)]
-    file: Option<File>,
+    /// Cached file handle for large files (>256KB, not in file_data). Used by
+    /// read_segment_bytes to avoid re-opening the file on every column read.
+    /// Wrapped in a Mutex because seek+read requires &mut access.
+    file: Option<parking_lot::Mutex<File>>,
     #[allow(dead_code)]
     header: ColumnarHeader,
     column_index: Vec<ColumnIndexEntry>,
@@ -984,11 +986,21 @@ impl ColumnarSSTable {
             .map(|&t| unsafe { std::mem::transmute(t) })
             .collect();
 
+        // Cache the file handle for large files (lazy-loaded, not in file_data).
+        // This avoids re-opening the file on every read_segment_bytes call —
+        // previously each column read did open+seek+read+close, causing hundreds
+        // of syscalls per scan on large tables.
+        let file = if file_data.is_empty() {
+            std::fs::File::open(&path).ok().map(parking_lot::Mutex::new)
+        } else {
+            None
+        };
+
         Ok(Self {
             path,
             file_data,
             mmap,
-            file: None,
+            file,
             header,
             column_index,
             row_map,
@@ -1053,16 +1065,26 @@ impl ColumnarSSTable {
         if let Some(ref mmap) = self.mmap {
             return Self::decompress_segment(&mmap[start..end]);
         }
-        // Seek+read from file: only read this column's bytes into heap.
+        // Seek+read from file: use cached file handle if available (avoids
+        // re-opening the file on every column read — was the #1 I/O bottleneck
+        // for large-segment scans). Falls back to open-on-demand if no cache.
         let len = end - start;
         let mut buf = vec![0u8; len];
-        if let Ok(mut f) = std::fs::File::open(&self.path) {
-            use std::io::{Read, Seek};
-            if f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok() {
-                return Self::decompress_segment(&buf).into_owned().into();
-            }
+        use std::io::{Read, Seek};
+        let ok = if let Some(ref cached) = self.file {
+            // Cached handle: lock, seek, read (no File::open syscall).
+            let mut f = cached.lock();
+            f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
+        } else if let Ok(mut f) = std::fs::File::open(&self.path) {
+            f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
+        } else {
+            false
+        };
+        if ok {
+            Self::decompress_segment(&buf).into_owned().into()
+        } else {
+            std::borrow::Cow::Owned(Vec::new())
         }
-        std::borrow::Cow::Owned(Vec::new())
     }
 
     /// Read spatial geometries from column segment.
