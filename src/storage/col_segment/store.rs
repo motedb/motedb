@@ -899,6 +899,69 @@ impl ColSegmentStore {
         Some(indices)
     }
 
+    /// Scan for rows where a TEXT column exactly equals `target`. Returns
+    /// (segment_idx, local_row_idx) pairs. Zero-alloc via eq_match_indices.
+    /// Used by `WHERE text_col = 'literal'` to bypass the Box<dyn Fn> path
+    /// that pre-interns the entire column into ArcString Values.
+    pub fn scan_row_indices_eq(
+        &self,
+        filter_col: usize,
+        target: &[u8],
+        limit: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        let segs = self.segments_snapshot();
+        let single_seg = segs.len() <= 1;
+        let mut indices: Vec<(usize, usize)> = Vec::with_capacity(1024);
+        let mut seen: std::collections::HashSet<u64> = if single_seg {
+            std::collections::HashSet::new()
+        } else {
+            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
+        };
+        for (sidx, seg) in segs.iter().enumerate() {
+            let ftext = match seg.sst.read_text(filter_col) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+            if !has_deletions {
+                let matched = ftext.eq_match_indices(target);
+                for &i in &matched {
+                    if !single_seg {
+                        let key = seg.sst.row_map.key(i);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                    }
+                    indices.push((sidx, i));
+                    if indices.len() >= limit {
+                        return Some(indices);
+                    }
+                }
+            } else {
+                for i in 0..seg.sst.num_rows {
+                    if !single_seg {
+                        let key = seg.sst.row_map.key(i);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                    }
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    if let Some(s) = ftext.get_str(i) {
+                        if s.as_bytes() == target {
+                            indices.push((sidx, i));
+                            if indices.len() >= limit {
+                                return Some(indices);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(indices)
+    }
+
     /// Legacy single-segment variant — kept for backward compat.
     pub fn scan_row_indices_prefix_single(
         &self,
