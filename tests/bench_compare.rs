@@ -90,6 +90,7 @@ fn ratio(mote_us: u128, sqlite_us: u128) -> String {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_motedb_vs_sqlite() {
     let n: usize = if std::env::var("CI").is_ok() {
         5_000

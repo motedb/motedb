@@ -49,6 +49,7 @@ fn print_separator() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_column_index_creation() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -135,6 +136,7 @@ fn bench_column_index_creation() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_column_index_queries() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -232,6 +234,7 @@ fn bench_column_index_queries() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_index_scaling() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -298,6 +301,7 @@ fn bench_index_scaling() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_vector_index_build() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -371,6 +375,7 @@ fn bench_vector_index_build() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_text_index_build() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -435,6 +440,7 @@ fn bench_text_index_build() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_multiple_indexes() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -532,6 +538,7 @@ fn bench_multiple_indexes() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_index_write_amplification() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");

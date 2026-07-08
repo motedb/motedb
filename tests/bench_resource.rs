@@ -110,6 +110,7 @@ fn print_separator() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_memory_footprint() {
     println!("\n{}", "=".repeat(130));
     println!("  Memory Footprint at Different Scales");
@@ -236,6 +237,7 @@ fn bench_memory_footprint() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_query_latency() {
     println!("\n{}", "=".repeat(130));
     println!("  Query Latency Distribution (p50/p95/p99)");
@@ -397,6 +399,7 @@ fn bench_query_latency() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_write_latency_cpu() {
     println!("\n{}", "=".repeat(130));
     println!("  Write Latency Distribution + CPU Throughput");
@@ -511,6 +514,7 @@ fn bench_write_latency_cpu() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_cpu() {
     use std::sync::Arc;
     use std::thread;

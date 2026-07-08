@@ -74,6 +74,7 @@ fn print_separator() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_insert_throughput() {
     let (db, _dir) = create_db();
     exec(
@@ -118,6 +119,7 @@ fn bench_insert_throughput() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_point_query() {
     let (db, _dir) = create_db();
     exec(
@@ -206,6 +208,7 @@ fn bench_point_query() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_update_delete() {
     let (db, _dir) = create_db();
     exec(
@@ -293,6 +296,7 @@ fn bench_update_delete() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_checkpoint() {
     let (db, _dir) = create_db();
     exec(
@@ -381,6 +385,7 @@ fn bench_checkpoint() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_auto_increment_recovery() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
@@ -427,6 +432,7 @@ fn bench_auto_increment_recovery() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_column_index() {
     let (db, _dir) = create_db();
     exec(
@@ -520,6 +526,7 @@ fn bench_column_index() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_full_scan() {
     let (db, _dir) = create_db();
     exec(
@@ -580,6 +587,7 @@ fn bench_full_scan() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_mixed_crud() {
     let (db, _dir) = create_db();
     exec(
@@ -660,6 +668,7 @@ fn bench_mixed_crud() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_wal_recovery() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
@@ -720,6 +729,7 @@ fn bench_wal_recovery() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_prepared_statement_cache() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t10 (id INTEGER PRIMARY KEY, data TEXT)");
@@ -789,6 +799,7 @@ fn bench_prepared_statement_cache() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_e2e_lifecycle() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
@@ -877,6 +888,7 @@ fn bench_e2e_lifecycle() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_mixed() {
     use std::sync::Arc;
     use std::thread;

@@ -56,6 +56,7 @@ fn count_rows(result: &QueryResult) -> usize {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_report_v020() {
     let n: usize = if std::env::var("CI").is_ok() {
         5_000

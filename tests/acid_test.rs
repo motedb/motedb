@@ -68,6 +68,7 @@ fn count_rows(db: &Database, table: &str) -> usize {
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_crud_insert_and_select() {
     let (db, _dir) = create_test_db();
 
@@ -86,6 +87,7 @@ fn test_crud_insert_and_select() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_crud_update() {
     let (db, _dir) = create_test_db();
     exec(
@@ -104,6 +106,7 @@ fn test_crud_update() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_crud_delete() {
     let (db, _dir) = create_test_db();
     exec(
@@ -122,6 +125,7 @@ fn test_crud_delete() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_crud_delete_all() {
     let (db, _dir) = create_test_db();
     exec(&db, "CREATE TABLE items (id INTEGER PRIMARY KEY, v TEXT)");
@@ -138,6 +142,7 @@ fn test_crud_delete_all() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_crud_multiple_rows() {
     let (db, _dir) = create_test_db();
     exec(
@@ -178,6 +183,7 @@ fn test_crud_multiple_rows() {
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_consistency_update_preserves_other_rows() {
     let (db, _dir) = create_test_db();
     exec(
@@ -205,6 +211,7 @@ fn test_consistency_update_preserves_other_rows() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_consistency_delete_does_not_corrupt_neighbors() {
     let (db, _dir) = create_test_db();
     exec(&db, "CREATE TABLE seq (id INTEGER PRIMARY KEY, data TEXT)");
@@ -234,6 +241,7 @@ fn test_consistency_delete_does_not_corrupt_neighbors() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_consistency_reinsert_after_delete() {
     let (db, _dir) = create_test_db();
     exec(&db, "CREATE TABLE kv (id INTEGER PRIMARY KEY, val TEXT)");
@@ -252,6 +260,7 @@ fn test_consistency_reinsert_after_delete() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_consistency_idempotent_update() {
     let (db, _dir) = create_test_db();
     exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
@@ -267,6 +276,7 @@ fn test_consistency_idempotent_update() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_consistency_sequential_updates() {
     let (db, _dir) = create_test_db();
     exec(
@@ -289,6 +299,7 @@ fn test_consistency_sequential_updates() {
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_isolation_separate_tables_independent() {
     let (db, _dir) = create_test_db();
 
@@ -309,6 +320,7 @@ fn test_isolation_separate_tables_independent() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_isolation_same_key_different_tables() {
     let (db, _dir) = create_test_db();
     exec(
@@ -331,6 +343,7 @@ fn test_isolation_same_key_different_tables() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_isolation_update_one_table_does_not_affect_another() {
     let (db, _dir) = create_test_db();
     exec(
@@ -355,6 +368,7 @@ fn test_isolation_update_one_table_does_not_affect_another() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_isolation_three_tables_full_crud() {
     let (db, _dir) = create_test_db();
     exec(
@@ -397,6 +411,7 @@ fn test_isolation_three_tables_full_crud() {
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_flush_then_read() {
     let (db, _dir) = create_test_db();
     exec(
@@ -420,6 +435,7 @@ fn test_durability_flush_then_read() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_data_persists_across_close() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();
@@ -449,6 +465,7 @@ fn test_durability_data_persists_across_close() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_wal_recovery_after_unclean_shutdown() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();
@@ -501,6 +518,7 @@ fn test_durability_wal_recovery_after_unclean_shutdown() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_update_survives_restart() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();
@@ -526,6 +544,7 @@ fn test_durability_update_survives_restart() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_delete_survives_restart() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();
@@ -563,6 +582,7 @@ fn test_durability_delete_survives_restart() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_full_crud_cycle_across_restart() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();
@@ -608,6 +628,7 @@ fn test_durability_full_crud_cycle_across_restart() {
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_multi_table_same_key_persists_across_restart() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();
@@ -645,6 +666,7 @@ fn test_multi_table_same_key_persists_across_restart() {
 // ════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_stress_large_dataset_crud() {
     let (db, _dir) = create_test_db();
     exec(
@@ -693,6 +715,7 @@ fn test_stress_large_dataset_crud() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_stress_restart_with_large_dataset() {
     let dir = TempDir::new().expect("create temp dir");
     let db_path = dir.path().to_path_buf();

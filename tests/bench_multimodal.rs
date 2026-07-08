@@ -85,6 +85,7 @@ fn rand_f64() -> f64 {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_vector() {
     println!("\n{}", "=".repeat(105));
     println!("  Vector Index Benchmark (DiskANN, 128-dim)");
@@ -191,6 +192,7 @@ fn bench_vector() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_spatial() {
     println!("\n{}", "=".repeat(105));
     println!("  Spatial Index Benchmark (Grid+RTree Hybrid)");
@@ -302,6 +304,7 @@ fn bench_spatial() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_text_search() {
     println!("\n{}", "=".repeat(105));
     println!("  Text / Full-Text Search Benchmark (BM25)");
@@ -424,6 +427,7 @@ fn bench_text_search() {
 // ============================================================================
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_multimodal_memory() {
     println!("\n{}", "=".repeat(105));
     println!("  Multimodal Memory Footprint (Vector + Spatial + Text Combined)");

@@ -50,6 +50,7 @@ fn print_separator() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_read_heavy_concurrent() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
@@ -121,6 +122,7 @@ fn bench_read_heavy_concurrent() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_mixed_read_write_concurrent() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
@@ -220,6 +222,7 @@ fn bench_mixed_read_write_concurrent() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_transactions() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
@@ -305,6 +308,7 @@ fn bench_concurrent_transactions() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_inserts() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
@@ -384,6 +388,7 @@ fn bench_concurrent_inserts() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_row_api() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
@@ -494,6 +499,7 @@ fn bench_concurrent_row_api() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_prepared() {
     use motedb::types::Value;
 
@@ -579,6 +585,7 @@ fn bench_concurrent_prepared() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_delete() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));
@@ -652,6 +659,7 @@ fn bench_concurrent_delete() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_concurrent_write_read_consistency() {
     let dir = TempDir::new().expect("temp dir");
     let db = Arc::new(Database::create_with_config(dir.path(), edge_config()).expect("create db"));

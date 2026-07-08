@@ -98,6 +98,7 @@ fn check(label: &str, ok: bool) {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_v060_report() {
     let n: usize = if std::env::var("CI").is_ok() {
         2_000

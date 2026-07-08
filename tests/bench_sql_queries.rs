@@ -85,6 +85,7 @@ fn seed_sales(db: &Database, n: usize) {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_group_by_aggregates() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
@@ -144,6 +145,7 @@ fn bench_group_by_aggregates() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_having() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
@@ -200,6 +202,7 @@ fn bench_having() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_order_by_limit() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
@@ -273,6 +276,7 @@ fn bench_order_by_limit() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_distinct() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
@@ -323,6 +327,7 @@ fn bench_distinct() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_where_patterns() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
@@ -400,6 +405,7 @@ fn bench_where_patterns() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_arithmetic_expressions() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 5_000 } else { 30_000 };
@@ -466,6 +472,7 @@ fn bench_arithmetic_expressions() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_subquery() {
     let (db, _dir) = create_db();
     let n: usize = if is_ci() { 3_000 } else { 20_000 };
@@ -511,6 +518,7 @@ fn bench_subquery() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_null_handling() {
     let (db, _dir) = create_db();
     exec(
@@ -588,6 +596,7 @@ fn bench_null_handling() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_prepared_statements() {
     use motedb::types::Value;
 
@@ -689,6 +698,7 @@ fn bench_prepared_statements() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_multi_table() {
     let (db, _dir) = create_db();
 

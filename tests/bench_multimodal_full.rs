@@ -45,6 +45,7 @@ fn timed<F: FnOnce()>(name: &str, f: F) {
 // Vector KNN Benchmark (50K vectors, 128-dim)
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_vector_knn_10k() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;
@@ -154,6 +155,7 @@ fn bench_vector_knn_10k() {
 // Spatial Benchmark (50K points)
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_spatial_10k() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;
@@ -222,6 +224,7 @@ fn bench_spatial_10k() {
 // Text/FTS Benchmark (50K documents)
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_text_fts_10k() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;
@@ -308,6 +311,7 @@ fn bench_text_fts_10k() {
 // Mixed Multimodal Benchmark (Vector + Spatial + Text in same table)
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_mixed_multimodal_10k() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;
@@ -415,6 +419,7 @@ fn bench_mixed_multimodal_10k() {
 // Correctness Tests for Multimodal
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_vector_insert_and_knn() {
     let (db, _dir) = edge_db();
     db.execute(
@@ -443,6 +448,7 @@ fn test_vector_insert_and_knn() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_spatial_insert_and_distance() {
     let (db, _dir) = edge_db();
     db.execute("CREATE TABLE pts (id INT PRIMARY KEY AUTO_INCREMENT, loc GEOMETRY)")
@@ -465,6 +471,7 @@ fn test_spatial_insert_and_distance() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_multimodal_table_all_types() {
     let (db, _dir) = edge_db();
     db.execute("CREATE TABLE mm (id INT PRIMARY KEY AUTO_INCREMENT, vec VECTOR(3), loc GEOMETRY, txt TEXT, val FLOAT, cat TEXT)").unwrap();
@@ -504,6 +511,7 @@ fn test_multimodal_table_all_types() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_p99_multimodal_queries() {
     let (db, _dir) = edge_db();
     let n = 10_000usize;

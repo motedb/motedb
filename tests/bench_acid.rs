@@ -63,6 +63,7 @@ fn sep() {
 // Test 1: Durability levels comparison
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_durability_comparison() {
     println!("\n{}", "=".repeat(100));
     println!("  Durability Level Comparison (INSERT 10K rows, single thread)");
@@ -123,6 +124,7 @@ fn test_durability_comparison() {
 // Test 2: Crash recovery — unflushed WAL
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_crash_recovery() {
     println!("\n{}", "=".repeat(100));
     println!("  Crash Recovery: simulate crash with unflushed data");
@@ -186,6 +188,7 @@ fn test_crash_recovery() {
 // Test 3: Checkpoint + full recovery (data integrity)
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_checkpoint_integrity() {
     println!("\n{}", "=".repeat(100));
     println!("  Checkpoint + Recovery: full data integrity verification");
@@ -268,6 +271,7 @@ fn test_checkpoint_integrity() {
 // Test 4: UPDATE/DELETE + verify
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_update_delete_consistency() {
     println!("\n{}", "=".repeat(100));
     println!("  UPDATE/DELETE Consistency: write → verify → update → verify → delete → verify");
@@ -366,6 +370,7 @@ fn test_update_delete_consistency() {
 // Test 5: Concurrent writes — no data loss
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_concurrent_consistency() {
     println!("\n{}", "=".repeat(100));
     println!("  Concurrent Write Consistency: 4 threads × 2.5K inserts, verify no loss");
@@ -451,6 +456,7 @@ fn test_concurrent_consistency() {
 // Test 6: Mixed OLTP workload
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_mixed_oltp() {
     println!("\n{}", "=".repeat(100));
     println!("  Mixed OLTP: INSERT → SELECT → UPDATE → SELECT → DELETE → SELECT");
@@ -539,6 +545,7 @@ fn test_mixed_oltp() {
 // Test 7: Flush + SSTable query correctness
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_sstable_query_correctness() {
     println!("\n{}", "=".repeat(100));
     println!("  SSTable Query Correctness: insert → flush → query → verify");
@@ -624,6 +631,7 @@ fn test_sstable_query_correctness() {
 // Test 8: Edge resource limits
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_edge_resource_usage() {
     println!("\n{}", "=".repeat(100));
     println!("  Edge Resource Usage: memory footprint + cold start time");

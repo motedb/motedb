@@ -44,6 +44,7 @@ fn print_separator() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_text_fts() {
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), edge_config()).unwrap();
@@ -158,6 +159,7 @@ fn bench_text_fts() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_vector_knn() {
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), edge_config()).unwrap();
@@ -265,6 +267,7 @@ fn bench_vector_knn() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_spatial_queries() {
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), edge_config()).unwrap();
@@ -368,6 +371,7 @@ fn bench_spatial_queries() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_multimodal_mixed() {
     let dir = TempDir::new().unwrap();
     let db = Database::create_with_config(dir.path(), edge_config()).unwrap();

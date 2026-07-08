@@ -127,6 +127,7 @@ fn time_sqlite(conn: &rusqlite::Connection, sql: &str, iters: usize) -> u128 {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_v050_vs_sqlite() {
     let n: usize = if std::env::var("CI").is_ok() {
         2_000

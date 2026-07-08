@@ -49,6 +49,7 @@ fn print_separator() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_batch_insert_sizes() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -112,6 +113,7 @@ fn bench_batch_insert_sizes() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_batch_insert_vs_map() {
     let dir = TempDir::new().expect("temp dir");
 
@@ -208,6 +210,7 @@ fn bench_batch_insert_vs_map() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_batch_insert_vectors() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -263,6 +266,7 @@ fn bench_batch_insert_vectors() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_row_api_vs_sql_insert() {
     let dir = TempDir::new().expect("temp dir");
 
@@ -375,6 +379,7 @@ fn bench_row_api_vs_sql_insert() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn batch_read_sequential() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -454,6 +459,7 @@ fn batch_read_sequential() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_batch_update_delete() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -530,6 +536,7 @@ fn bench_batch_update_delete() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_large_text() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");
@@ -596,6 +603,7 @@ fn bench_large_text() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_wide_table() {
     let dir = TempDir::new().expect("temp dir");
     let db = Database::create_with_config(dir.path(), edge_config()).expect("create db");

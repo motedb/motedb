@@ -79,6 +79,7 @@ where
 // ── Tests ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_insert_10k() {
     let (db, _dir) = create_db();
     exec(
@@ -125,6 +126,7 @@ fn test_perf_insert_10k() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_select_pk() {
     let (db, _dir) = create_db();
     exec(
@@ -169,6 +171,7 @@ fn test_perf_select_pk() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_full_scan() {
     let (db, _dir) = create_db();
     exec(
@@ -213,6 +216,7 @@ fn test_perf_full_scan() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_update() {
     let (db, _dir) = create_db();
     exec(
@@ -246,6 +250,7 @@ fn test_perf_update() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_delete() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)");
@@ -282,6 +287,7 @@ fn test_perf_delete() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_durability() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();
@@ -370,6 +376,7 @@ fn test_perf_durability() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_perf_mixed_crud() {
     let (db, _dir) = create_db();
     exec(

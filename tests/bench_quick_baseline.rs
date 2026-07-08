@@ -25,6 +25,7 @@ fn fmt(us: u128) -> String {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_quick() {
     let n: usize = 10_000;
     let db = setup("quick");

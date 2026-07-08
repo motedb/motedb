@@ -79,6 +79,7 @@ fn print_elapsed(name: &str, ops: usize, ms: u64) {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_insert_integrity() {
     let (db, _dir) = create_db();
     exec(
@@ -165,6 +166,7 @@ fn test_300k_insert_integrity() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_update_correctness() {
     let (db, _dir) = create_db();
     exec(
@@ -228,6 +230,7 @@ fn test_300k_update_correctness() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_delete_correctness() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE t3 (id INTEGER PRIMARY KEY, data TEXT)");
@@ -287,6 +290,7 @@ fn test_300k_delete_correctness() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_pk_lookup_consistency() {
     let (db, _dir) = create_db();
     exec(
@@ -345,6 +349,7 @@ fn test_300k_pk_lookup_consistency() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_where_filter_correctness() {
     let (db, _dir) = create_db();
     exec(
@@ -390,6 +395,7 @@ fn test_300k_where_filter_correctness() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_mixed_crud_correctness() {
     let (db, _dir) = create_db();
     exec(
@@ -483,6 +489,7 @@ fn test_300k_mixed_crud_correctness() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_flush_consistency() {
     let (db, _dir) = create_db();
     exec(
@@ -551,6 +558,7 @@ fn test_300k_flush_consistency() {
 // ════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn test_300k_restart_durability() {
     let dir = TempDir::new().expect("temp dir");
     let db_path = dir.path().to_path_buf();

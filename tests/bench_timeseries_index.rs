@@ -41,6 +41,7 @@ fn ingest_batch(db: &Database, table: &str, count: usize, base_ts: i64) {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_timeseries_full_suite() {
     let (_dir, db) = create_db_for_bench();
     setup_table(&db);
@@ -259,6 +260,7 @@ fn bench_timeseries_full_suite() {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn bench_ingest_throughput() {
     let (_dir, db) = create_db_for_bench();
     setup_table(&db);

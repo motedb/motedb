@@ -50,6 +50,7 @@ fn print_result(name: &str, ops: usize, elapsed_ms: u64) {
 // ── Test 1: 大规模 INSERT ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_insert_50k() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score FLOAT, age INTEGER)");
@@ -86,6 +87,7 @@ fn stress_insert_50k() {
 // ── Test 2: PK 点查 (MemTable + SSTable) ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_pk_lookup() {
     let (db, _dir) = create_db();
     exec(
@@ -169,6 +171,7 @@ fn stress_pk_lookup() {
 // ── Test 3: Column Index 查询 ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_column_index() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price FLOAT, stock INTEGER)");
@@ -249,6 +252,7 @@ fn stress_column_index() {
 // ── Test 4: 全表扫描 ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_full_scan() {
     let (db, _dir) = create_db();
     exec(
@@ -327,6 +331,7 @@ fn stress_full_scan() {
 // ── Test 5: 混合 CRUD (INSERT + UPDATE + DELETE + SELECT) ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_mixed_crud() {
     let (db, _dir) = create_db();
     exec(
@@ -397,6 +402,7 @@ fn stress_mixed_crud() {
 // ── Test 6: Batch INSERT 性能 ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_batch_insert() {
     let (db, _dir) = create_db();
     exec(&db, "CREATE TABLE metrics (id INTEGER PRIMARY KEY, host TEXT, cpu FLOAT, mem FLOAT, ts INTEGER)");
@@ -437,6 +443,7 @@ fn stress_batch_insert() {
 // ── Test 7: PreparedStatement 缓存效果 ──
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn stress_prepared_statement_cache() {
     let (db, _dir) = create_db();
     exec(

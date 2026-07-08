@@ -9,6 +9,7 @@ fn us(d: std::time::Duration) -> u64 {
 }
 
 #[test]
+#[ignore = "bench/stress/perf: slow in debug, run with --ignored or via bench examples"]
 fn perf_report() {
     let n: i64 = 20_000;
     let dir = "/tmp/motedb_final";
