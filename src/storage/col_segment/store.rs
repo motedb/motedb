@@ -2084,13 +2084,34 @@ impl ColSegmentStore {
             // Float column as i64 reinterprets the bits → garbage sort keys.
             if is_float {
                 if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
-                    for i in 0..n {
-                        let key = seg.sst.row_map.key(i);
-                        if let Some(ref mut s) = dedup {
-                            if !s.insert(key) {
-                                continue;
-                            }
+                    // 🔑 Fast path: no nulls, no deletions, single seg — walk the
+                    // raw 8-byte data directly (no per-row slice/bounds-check).
+                    let raw = fseg.raw_f64_slice();
+                    let has_nulls = fseg.has_nulls();
+                    if !has_nulls && !has_deletions && dedup.is_none() && raw.len() >= n * 8 {
+                        for i in 0..n {
+                            let off = i * 8;
+                            let v = f64::from_le_bytes([
+                                raw[off],
+                                raw[off + 1],
+                                raw[off + 2],
+                                raw[off + 3],
+                                raw[off + 4],
+                                raw[off + 5],
+                                raw[off + 6],
+                                raw[off + 7],
+                            ]);
+                            let ord_key = if desc {
+                                u64::MAX - to_ord(v)
+                            } else {
+                                to_ord(v)
+                            };
+                            push_capped(&mut heap, ord_key, sidx, i);
                         }
+                        continue;
+                    }
+                    // Fallback: per-row API (nulls/deletes/multi-seg)
+                    for i in 0..n {
                         if has_deletions && seg.sst.row_map.is_deleted(i) {
                             continue;
                         }

@@ -423,6 +423,24 @@ impl FixedSegment {
         (self.null_bitmap.get(row_idx / 8) >> (row_idx % 8)) & 1 != 0
     }
 
+    /// Returns true if any row in this segment is NULL. O(null_bitmap_size).
+    pub fn has_nulls(&self) -> bool {
+        let nb = self.null_bitmap.len();
+        for i in 0..nb {
+            if self.null_bitmap.get(i) != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the raw data bytes (the fixed-width values, after the null
+    /// bitmap). Used by batch scans (e.g. top_k) to walk data directly
+    /// without per-element slice() calls.
+    pub fn raw_f64_slice(&self) -> &[u8] {
+        self.data.as_bytes()
+    }
+
     #[inline]
     pub fn get_i64(&self, row_idx: usize) -> Option<i64> {
         if self.is_null(row_idx) {
