@@ -656,6 +656,53 @@ impl TextSegment {
         result
     }
 
+    /// Scan for rows whose string is in the given set of target byte-slices.
+    /// Returns row indices. Zero-alloc: walks raw offsets, checks each row's
+    /// bytes against the HashSet of target byte-slices.
+    /// Used by `WHERE text_col IN (v1, v2, ...)` to avoid per-row Value alloc.
+    pub fn in_set_match_indices(&self, targets: &std::collections::HashSet<&[u8]>) -> Vec<usize> {
+        let n = self.num_rows;
+        if n == 0 || targets.is_empty() {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(n / 8);
+        let off_bytes = self.offsets_data.as_bytes();
+        let str_bytes = self.string_data.as_bytes();
+        let has_nulls = self.has_any_null();
+        if !has_nulls && off_bytes.len() >= (n + 1) * 4 {
+            for i in 0..n {
+                let ob = i * 4;
+                let start = u32::from_le_bytes([
+                    off_bytes[ob],
+                    off_bytes[ob + 1],
+                    off_bytes[ob + 2],
+                    off_bytes[ob + 3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    off_bytes[ob + 4],
+                    off_bytes[ob + 5],
+                    off_bytes[ob + 6],
+                    off_bytes[ob + 7],
+                ]) as usize;
+                let slice = &str_bytes[start..end];
+                if targets.contains(slice) {
+                    result.push(i);
+                }
+            }
+        } else {
+            for i in 0..n {
+                if has_nulls && self.is_null(i) {
+                    continue;
+                }
+                let s = self.get_str_fast(i);
+                if targets.contains(s.as_bytes()) {
+                    result.push(i);
+                }
+            }
+        }
+        result
+    }
+
     /// Iterate all non-null strings as &str, calling f for each.
     /// Skips NULL rows. Used by GROUP BY to avoid per-row offset/slice overhead.
     pub fn for_each_str<F: FnMut(&str)>(&self, mut f: F) {

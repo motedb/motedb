@@ -6209,6 +6209,10 @@ impl QueryExecutor {
 
         // IN (literal list) HashSet fast path: avoid O(rows × list_len) linear scan.
         // For `WHERE col IN (v1, v2, ...)`, build a HashSet once and do O(1) lookup per row.
+        if let Some(ref wc) = where_clause {
+            let w: &crate::sql::ast::Expr = wc;
+            let is_in = matches!(w, crate::sql::ast::Expr::In { .. });
+        }
         let in_hashset: Option<(usize /*col_pos*/, std::collections::HashSet<Value>)> =
             match &where_clause {
                 Some(crate::sql::ast::Expr::In {
@@ -6286,11 +6290,84 @@ impl QueryExecutor {
             }
         }
 
+        // Resolve output column positions (needed by several fast paths below).
+        let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
+            .unwrap_or_else(|| (0..col_types.len()).collect());
+
+        // 🚀 TEXT IN-set zero-alloc fast path: WHERE text_col IN (v1, v2, ...)
+        // with a large set (e.g. from a subquery). The old path pre-interns
+        // the entire text column + builds a Box<dyn Fn> that checks
+        // HashSet<Value> per row (with ArcString alloc per row). This path
+        // uses scan_row_indices_in_set (raw byte HashSet check, zero alloc).
+        if let Some((col_pos, ref set)) = in_hashset {
+            if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 {
+                // Build a HashSet<&[u8]> from the Value set (once, not per-row).
+                let byte_set: std::collections::HashSet<&[u8]> = set
+                    .iter()
+                    .filter_map(|v| {
+                        if let Value::Text(t) = v {
+                            Some(t.as_str().as_bytes())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !byte_set.is_empty() {
+                    if let Some(indices) =
+                        store.scan_row_indices_in_set(col_pos, &byte_set, offset + limit)
+                    {
+                        let segs = store.segments_snapshot();
+                        // Materialize matched rows (same pattern as TEXT eq).
+                        let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
+                        for (seg_idx, local_row) in indices.iter().skip(offset).take(limit) {
+                            let seg = match segs.get(*seg_idx) {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            let mut row = Vec::with_capacity(out_positions.len());
+                            for &pc in out_positions.iter() {
+                                let v = if pc < seg.sst.column_tags.len()
+                                    && seg.sst.column_tags[pc].is_fixed()
+                                {
+                                    match seg.sst.read_fixed_i64(pc) {
+                                        Ok(f) => match col_types.get(pc) {
+                                            Some(ColumnType::Float) => f
+                                                .get_f64(*local_row)
+                                                .map(Value::Float)
+                                                .unwrap_or(Value::Null),
+                                            _ => f
+                                                .get_i64(*local_row)
+                                                .map(Value::Integer)
+                                                .unwrap_or(Value::Null),
+                                        },
+                                        Err(_) => Value::Null,
+                                    }
+                                } else {
+                                    match seg.sst.read_text(pc) {
+                                        Ok(t) => t
+                                            .get_str(*local_row)
+                                            .map(|s| Value::Text(s.into()))
+                                            .unwrap_or(Value::Null),
+                                        Err(_) => Value::Null,
+                                    }
+                                };
+                                row.push(v);
+                            }
+                            result.push(row);
+                        }
+                        return Ok(StreamingQueryResult::SelectReady {
+                            columns,
+                            rows: result,
+                        });
+                    }
+                }
+            }
+        }
+
         // 🆕 Projected + filtered scan: decode only filter col + output cols,
         // avoiding full-row Vec<Value> decode for non-matches (the dominant
         // cost — was 68-197ms for 300K rows; pure column read is <2ms).
-        let out_positions: Vec<usize> = Self::resolve_select_positions(&stmt.columns, schema)
-            .unwrap_or_else(|| (0..col_types.len()).collect());
+        // (out_positions already resolved above for the IN-set fast path.)
         // Computed SELECT expressions (a+b, CONCAT(...), -v, …) cannot be served
         // by the zero-copy SelectColumnar path (raw columns only); they're
         // evaluated later in the projected-scan fallback via eval_expr_on_row.
