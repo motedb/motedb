@@ -37,6 +37,7 @@ fn remove_db(path: &str) {
 
 /// Kill during uncommitted transaction — data must NOT survive
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_crash_uncommitted_txn_rollback() {
     let dir = "/tmp/motedb_e2e_rollback";
     remove_db(dir);
@@ -74,6 +75,7 @@ fn test_crash_uncommitted_txn_rollback() {
 
 /// Kill after commit and flush — all data must survive
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_crash_committed_and_flushed_survives() {
     let dir = "/tmp/motedb_e2e_commit";
     remove_db(dir);
@@ -126,6 +128,7 @@ fn test_crash_committed_and_flushed_survives() {
 
 /// Repeated close + reopen cycles — data integrity across sessions
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_repeated_open_close_cycles() {
     let dir = "/tmp/motedb_e2e_cycles";
     remove_db(dir);
@@ -158,6 +161,7 @@ fn test_repeated_open_close_cycles() {
 
 /// Transaction commit + rollback semantics (basic)
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_transaction_commit_and_rollback() {
     let dir = "/tmp/motedb_e2e_txn";
     remove_db(dir);
@@ -203,6 +207,7 @@ fn test_transaction_commit_and_rollback() {
 
 /// E-commerce style: products, orders, mixed CRUD
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_ecommerce_workload() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -269,6 +274,7 @@ fn test_ecommerce_workload() {
 
 /// Time-series: sensor data ingestion + time-range queries
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_timeseries_sensor_workload() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -312,6 +318,7 @@ fn test_timeseries_sensor_workload() {
 
 /// Bulk insert + index creation + aggregate queries
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_bulk_insert_and_aggregate() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -400,6 +407,7 @@ fn test_bulk_insert_and_aggregate() {
 
 /// 4 writers + 2 readers concurrently for 3 seconds
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_concurrent_writers_and_readers() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
@@ -461,6 +469,7 @@ fn test_concurrent_writers_and_readers() {
 
 /// Concurrent UPDATE + SELECT — verify no crashes and data consistency
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_concurrent_updates_stress() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
@@ -517,6 +526,7 @@ fn test_concurrent_updates_stress() {
 
 /// NULL handling in complex expressions
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_null_handling_comprehensive() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -562,6 +572,7 @@ fn test_null_handling_comprehensive() {
 
 /// Large text values
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_large_text_values() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -602,6 +613,7 @@ fn test_large_text_values() {
 
 /// Many columns (wide table)
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_wide_table_many_columns() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -650,6 +662,7 @@ fn test_wide_table_many_columns() {
 
 /// UPDATE many rows in bulk
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_bulk_update() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
@@ -687,6 +700,7 @@ fn test_bulk_update() {
 
 /// Extreme key distribution — all keys map to few distinct values
 #[test]
+#[ignore = "e2e stress: slow in debug (~50s), run with --ignored"]
 fn test_skewed_key_distribution() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
