@@ -4474,7 +4474,7 @@ impl QueryExecutor {
         // Falls back to HashMap if cardinality exceeds LINEAR_SCAN_MAX.
         let mut lin_groups: Vec<(String, GroupAcc)> = Vec::new();
         let mut use_hashmap = false;
-        let mut groups: HashMap<String, (GroupAcc, Vec<f64>)> = HashMap::new();
+        let mut groups: HashMap<String, GroupAcc> = HashMap::new();
         // Separate accumulator for NULL group rows. NULL must form its own group
         // (not be skipped), and is kept out of the &str-keyed maps to avoid
         // needing a sentinel string that could collide with a real value.
@@ -4500,16 +4500,14 @@ impl QueryExecutor {
         macro_rules! migrate_lin_to_groups {
             () => {{
                 for (k, a) in lin_groups.drain(..) {
-                    let entry = groups
-                        .entry(k)
-                        .or_insert_with(|| (GroupAcc::new(), Vec::new()));
-                    entry.0.count += a.count;
+                    let entry = groups.entry(k).or_insert_with(GroupAcc::new);
+                    entry.count += a.count;
                     // Re-add the accumulated sums so partial sums from lin_groups
                     // merge into the hashmap entry. add() handles int/float flagging.
                     if a.has_float {
-                        entry.0.add(a.float_sum, true);
+                        entry.add(a.float_sum, true);
                     }
-                    entry.0.add(a.int_sum as f64, false);
+                    entry.add(a.int_sum as f64, false);
                 }
                 use_hashmap = true;
             }};
@@ -4528,10 +4526,8 @@ impl QueryExecutor {
                         migrate_lin_to_groups!();
                     }
                 } else {
-                    let entry = groups
-                        .entry(key.to_string())
-                        .or_insert_with(|| (GroupAcc::new(), Vec::new()));
-                    entry.0.count += 1;
+                    let entry = groups.entry(key.to_string()).or_insert_with(GroupAcc::new);
+                    entry.count += 1;
                 }
             }
         } else if !has_deletes && !has_nulls {
@@ -4558,10 +4554,8 @@ impl QueryExecutor {
                         migrate_lin_to_groups!();
                     }
                 } else {
-                    let entry = groups
-                        .entry(key.to_string())
-                        .or_insert_with(|| (GroupAcc::new(), Vec::new()));
-                    entry.0.count += 1;
+                    let entry = groups.entry(key.to_string()).or_insert_with(GroupAcc::new);
+                    entry.count += 1;
                     for (j, a) in agg_cols.iter().enumerate() {
                         if a.func == "SUM" || a.func == "AVG" {
                             let is_int = agg_is_int[j];
@@ -4571,7 +4565,7 @@ impl QueryExecutor {
                                 agg_segs[j].get_f64(i)
                             };
                             if let Some(v) = v {
-                                entry.0.add(v, is_int);
+                                entry.add(v, is_int);
                             }
                         }
                     }
@@ -4624,10 +4618,8 @@ impl QueryExecutor {
                         migrate_lin_to_groups!();
                     }
                 } else {
-                    let entry = groups
-                        .entry(key.to_string())
-                        .or_insert_with(|| (GroupAcc::new(), Vec::new()));
-                    entry.0.count += 1;
+                    let entry = groups.entry(key.to_string()).or_insert_with(GroupAcc::new);
+                    entry.count += 1;
                     for (j, a) in agg_cols.iter().enumerate() {
                         if a.func == "SUM" || a.func == "AVG" {
                             let is_int = agg_is_int[j];
@@ -4637,7 +4629,7 @@ impl QueryExecutor {
                                 agg_segs[j].get_f64(i)
                             };
                             if let Some(v) = v {
-                                entry.0.add(v, is_int);
+                                entry.add(v, is_int);
                             }
                         }
                     }
@@ -4671,7 +4663,7 @@ impl QueryExecutor {
             rows.push(row);
         }
         // Append hashmap results (high-cardinality spill).
-        for (key, (acc, _)) in &groups {
+        for (key, acc) in &groups {
             let mut row = Vec::new();
             row.push(Value::Text(crate::types::ArcString(std::sync::Arc::from(
                 key.as_str(),
