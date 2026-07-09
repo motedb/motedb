@@ -6313,6 +6313,7 @@ impl QueryExecutor {
                     })
                     .collect();
                 if !byte_set.is_empty() {
+                    let _ = store.flush_buffer();
                     if let Some(indices) =
                         store.scan_row_indices_in_set(col_pos, &byte_set, offset + limit)
                     {
@@ -6732,6 +6733,12 @@ impl QueryExecutor {
                     {
                         if let Some(fc) = schema.get_column_position(cn) {
                             if matches!(col_types.get(fc), Some(ColumnType::Text)) {
+                                // 🔑 CRITICAL: flush write buffer first so
+                                // recent INSERT/UPDATE data is visible to the
+                                // segment scan. Without this, updated rows
+                                // only in the buffer are invisible (the
+                                // test_update_indexed_column_moves_entry bug).
+                                let _ = store.flush_buffer();
                                 let target_bytes = tv.as_str().as_bytes();
                                 if let Some(indices) =
                                     store.scan_row_indices_eq(fc, target_bytes, offset + limit)
@@ -6861,6 +6868,7 @@ impl QueryExecutor {
                             let prefix = &pat[..pat.len() - 1];
                             if let Some(fc) = schema.get_column_position(cn) {
                                 if matches!(col_types.get(fc), Some(ColumnType::Text)) {
+                                    let _ = store.flush_buffer();
                                     if let Some(indices) = store.scan_row_indices_prefix(
                                         fc,
                                         prefix.as_bytes(),

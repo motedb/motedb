@@ -910,50 +910,47 @@ impl ColSegmentStore {
         limit: usize,
     ) -> Option<Vec<(usize, usize)>> {
         let segs = self.segments_snapshot();
-        let single_seg = segs.len() <= 1;
         let mut indices: Vec<(usize, usize)> = Vec::with_capacity(1024);
-        let mut seen: std::collections::HashSet<u64> = if single_seg {
-            std::collections::HashSet::new()
-        } else {
+        // Newest-version-wins dedup: iterate segments newest→oldest, rows
+        // newest→oldest within each. The first time we see a composite key is
+        // the live version; older versions of the same key are skipped.
+        // Without this, an UPDATE that changed cat from 'a' to 'b' would leave
+        // the old 'a' row matchable even though it's logically overwritten.
+        let need_dedup = segs.len() > 1 || self.may_have_duplicate_keys();
+        let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
+        } else {
+            std::collections::HashSet::new()
         };
-        for (sidx, seg) in segs.iter().enumerate() {
+        for (sidx, seg) in segs.iter().enumerate().rev() {
             let ftext = match seg.sst.read_text(filter_col) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
             let has_deletions = seg.sst.row_map.has_any_deleted();
-            if !has_deletions {
-                let matched = ftext.eq_match_indices(target);
-                for &i in &matched {
-                    if !single_seg {
-                        let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                    }
-                    indices.push((sidx, i));
-                    if indices.len() >= limit {
-                        return Some(indices);
-                    }
-                }
+            // Iterate rows newest→oldest within segment so dedup keeps the
+            // latest version of each key.
+            let row_order: Vec<usize> = if need_dedup {
+                (0..seg.sst.num_rows).rev().collect()
             } else {
-                for i in 0..seg.sst.num_rows {
-                    if !single_seg {
-                        let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) {
-                            continue;
-                        }
-                    }
-                    if seg.sst.row_map.is_deleted(i) {
+                (0..seg.sst.num_rows).collect()
+            };
+            for &i in &row_order {
+                if need_dedup {
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) {
                         continue;
                     }
-                    if let Some(s) = ftext.get_str(i) {
-                        if s.as_bytes() == target {
-                            indices.push((sidx, i));
-                            if indices.len() >= limit {
-                                return Some(indices);
-                            }
+                }
+                if has_deletions && seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
+                // Check if this row's text value matches target.
+                if let Some(s) = ftext.get_str(i) {
+                    if s.as_bytes() == target {
+                        indices.push((sidx, i));
+                        if indices.len() >= limit {
+                            return Some(indices);
                         }
                     }
                 }
