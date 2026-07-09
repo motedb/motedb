@@ -79,6 +79,13 @@ pub struct IndexRegistry {
     /// Map: index_name -> IndexMetadata
     indexes: Arc<DashMap<String, IndexMetadata>>,
 
+    /// 🔑 PERF: lookup cache for find_by_column. Key: (table, column, type_tag).
+    /// Built lazily on first miss, invalidated on register/remove. Without this
+    /// cache, find_by_column does an O(N) linear scan of all indexes on EVERY
+    /// INSERT/UPDATE/DELETE row — a major write-path bottleneck.
+    lookup_cache:
+        parking_lot::RwLock<Option<std::collections::HashMap<(String, String, u8), String>>>,
+
     /// Persistence path
     metadata_path: std::path::PathBuf,
 }
@@ -90,6 +97,7 @@ impl IndexRegistry {
 
         Self {
             indexes: Arc::new(DashMap::new()),
+            lookup_cache: parking_lot::RwLock::new(None),
             metadata_path,
         }
     }
@@ -108,6 +116,7 @@ impl IndexRegistry {
         for metadata in metadata_list {
             self.indexes.insert(metadata.name.clone(), metadata);
         }
+        *self.lookup_cache.write() = None; // invalidate after load
 
         Ok(())
     }
@@ -150,6 +159,7 @@ impl IndexRegistry {
             ))),
             Entry::Vacant(entry) => {
                 entry.insert(metadata);
+                *self.lookup_cache.write() = None; // invalidate
                 if let Err(e) = self.save() {
                     self.indexes.remove(&name);
                     Err(e)
@@ -165,6 +175,7 @@ impl IndexRegistry {
     /// Removes from memory, then persists. If save() fails, rolls back.
     pub fn remove(&self, index_name: &str) -> Result<()> {
         let removed = self.indexes.remove(index_name).map(|(_, v)| v);
+        *self.lookup_cache.write() = None; // invalidate
         if let Err(e) = self.save() {
             // Roll back on failure
             if let Some(metadata) = removed {
@@ -178,6 +189,7 @@ impl IndexRegistry {
 
     /// Remove all indexes for a given table (used by DROP TABLE)
     pub fn remove_by_table(&self, table_name: &str) {
+        *self.lookup_cache.write() = None; // invalidate
         let keys_to_remove: Vec<String> = self
             .indexes
             .iter()
@@ -206,22 +218,60 @@ impl IndexRegistry {
             .collect()
     }
 
-    /// Find index by table and column
+    /// Find index by table and column. Uses a lookup cache to avoid O(N)
+    /// linear scan on every INSERT/UPDATE/DELETE. The cache is built lazily
+    /// on first call and invalidated on register/remove/load.
     pub fn find_by_column(
         &self,
         table_name: &str,
         column_name: &str,
         index_type: IndexType,
     ) -> Option<String> {
-        self.indexes
-            .iter()
-            .find(|entry| {
-                let meta = entry.value();
-                meta.table_name == table_name
-                    && meta.column_name == column_name
-                    && meta.index_type == index_type
-            })
-            .map(|entry| entry.key().clone())
+        let type_tag: u8 = match index_type {
+            IndexType::Column => 0,
+            IndexType::Vector => 1,
+            IndexType::Text => 2,
+            IndexType::Octree => 3,
+        };
+        // Fast path: check the lookup cache (read lock).
+        {
+            let cache = self.lookup_cache.read();
+            if let Some(ref map) = *cache {
+                if let Some(name) =
+                    map.get(&(table_name.to_string(), column_name.to_string(), type_tag))
+                {
+                    return Some(name.clone());
+                }
+                return None; // cache is authoritative: miss = no index
+            }
+        }
+        // Cache miss (not built yet): build it, then check.
+        {
+            let mut guard = self.lookup_cache.write();
+            if guard.is_none() {
+                let mut map = std::collections::HashMap::new();
+                for entry in self.indexes.iter() {
+                    let m = entry.value();
+                    let tag: u8 = match m.index_type {
+                        IndexType::Column => 0,
+                        IndexType::Vector => 1,
+                        IndexType::Text => 2,
+                        IndexType::Octree => 3,
+                    };
+                    map.insert(
+                        (m.table_name.clone(), m.column_name.clone(), tag),
+                        entry.key().clone(),
+                    );
+                }
+                *guard = Some(map);
+            }
+            if let Some(ref map) = *guard {
+                return map
+                    .get(&(table_name.to_string(), column_name.to_string(), type_tag))
+                    .cloned();
+            }
+        }
+        None
     }
 
     /// Get table_name and column_name from index name

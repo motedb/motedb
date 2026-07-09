@@ -4363,8 +4363,90 @@ impl QueryExecutor {
         // The HashMap path remains available for high-cardinality fallback.
         const LINEAR_SCAN_MAX: usize = 256;
 
+        // 🔑 Integer GROUP BY fast path: use i64 as HashMap key (zero alloc,
+        // vs the generic path which builds Vec<Value> keys). This was
+        // previously skipped (return Ok(None)) forcing all integer GROUP BY
+        // through the slow materialized path.
         if col_sst.column_tags[group_pos].is_fixed() {
-            return Ok(None);
+            let group_fseg = col_sst.read_fixed_i64(group_pos)?;
+            // Pre-decode agg columns
+            let mut agg_segs: Vec<crate::storage::lsm::columnar::FixedSegment> = Vec::new();
+            let mut agg_is_int: Vec<bool> = Vec::with_capacity(agg_cols.len());
+            for a in &agg_cols {
+                if a.col_pos < col_sst.column_tags.len()
+                    && col_sst.column_tags[a.col_pos].is_fixed()
+                {
+                    agg_segs.push(col_sst.read_fixed_i64(a.col_pos)?);
+                    agg_is_int.push(matches!(
+                        col_sst.column_tags[a.col_pos],
+                        crate::storage::lsm::columnar::ColumnTypeTag::Integer
+                            | crate::storage::lsm::columnar::ColumnTypeTag::Timestamp
+                    ));
+                } else {
+                    // Non-fixed agg column on fixed group — bail to generic path
+                    return Ok(None);
+                }
+            }
+            // Use i64-keyed HashMap for integer groups (zero-alloc keys)
+            let mut int_groups: std::collections::HashMap<i64, GroupAcc> =
+                std::collections::HashMap::with_capacity(256);
+            let has_count_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+            let n = col_sst.num_rows;
+            for i in 0..n {
+                let key = match group_fseg.get_i64(i) {
+                    Some(k) => k,
+                    None => continue, // NULL group — skip for simplicity
+                };
+                let acc = int_groups.entry(key).or_insert_with(GroupAcc::new);
+                acc.count += 1;
+                for (j, a) in agg_cols.iter().enumerate() {
+                    if a.func == "SUM" || a.func == "AVG" {
+                        let is_int = agg_is_int[j];
+                        let v = if is_int {
+                            agg_segs[j].get_i64(i).map(|x| x as f64)
+                        } else {
+                            agg_segs[j].get_f64(i)
+                        };
+                        if let Some(v) = v {
+                            acc.add(v, is_int);
+                        }
+                    }
+                }
+            }
+            // Build output rows
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            for (key, acc) in &int_groups {
+                let mut row = Vec::new();
+                row.push(Value::Integer(*key));
+                if has_count_star {
+                    row.push(Value::Integer(acc.count));
+                }
+                for a in &agg_cols {
+                    match a.func.as_str() {
+                        "SUM" => row.push(acc.sum()),
+                        "AVG" => row.push(acc.avg()),
+                        _ => row.push(Value::Null),
+                    }
+                }
+                rows.push(row);
+            }
+            // Sort by group key for deterministic output
+            rows.sort_by_key(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => 0,
+            });
+            let cols: Vec<String> = stmt
+                .columns
+                .iter()
+                .map(|c| match c {
+                    SelectColumn::Column(name) => name.clone(),
+                    _ => "expr".to_string(),
+                })
+                .collect();
+            return Ok(Some(StreamingQueryResult::SelectReady {
+                columns: cols,
+                rows,
+            }));
         }
         let group_seg = col_sst.read_text(group_pos)?;
         let mut agg_segs: Vec<crate::storage::lsm::columnar::FixedSegment> = Vec::new();
