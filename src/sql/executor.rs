@@ -2131,16 +2131,11 @@ impl QueryExecutor {
                                 let has_min = aggs.iter().any(|a| a.func == "MIN");
                                 let has_max = aggs.iter().any(|a| a.func == "MAX");
                                 if has_count && (has_sum || has_min || has_max) && aggs.len() <= 4 {
-                                    let (count, min, max) =
-                                        store.count_min_max_text_filter(fc, s.as_str(), ac);
-                                    let sum = if has_sum {
-                                        // count_sum includes sum; re-scan for sum if needed
-                                        let (_, s) =
-                                            store.count_sum_text_filter(fc, s.as_str(), ac);
-                                        s
-                                    } else {
-                                        0.0
-                                    };
+                                    // 🔑 Single-pass: count_sum_min_max does COUNT+SUM+MIN+MAX
+                                    // in one scan. Was previously two separate scans
+                                    // (count_min_max_text_filter + count_sum_text_filter).
+                                    let (count, sum, min, max) =
+                                        store.count_sum_min_max_text_filter(fc, s.as_str(), ac);
                                     let mut row: Vec<Value> = Vec::new();
                                     for a in &aggs {
                                         match a.func.as_str() {
