@@ -1418,6 +1418,12 @@ impl ColumnarSSTableBuilder {
         self.deleted.push(deleted);
 
         for (col_idx, value) in row.iter().enumerate() {
+            // Guard: a row with more columns than the builder expects (e.g.
+            // from a corrupted/orphan SSTable file) must not panic — skip the
+            // extra columns. This is the test_orphan_cleanup_on_open fix.
+            if col_idx >= self.column_buffers.len() {
+                break;
+            }
             let buf = &mut self.column_buffers[col_idx];
             // Track explicit NULL flag (authoritative; no value sentinel needed).
             self.null_flags[col_idx].push(matches!(value, Value::Null));
@@ -1626,6 +1632,12 @@ impl ColumnarSSTableBuilder {
         self.deleted.push(deleted);
 
         for (col_idx, value) in row.iter().enumerate() {
+            // Guard: a row with more columns than the builder expects (e.g.
+            // from a corrupted/orphan SSTable file) must not panic — skip the
+            // extra columns. This is the test_orphan_cleanup_on_open fix.
+            if col_idx >= self.column_buffers.len() {
+                break;
+            }
             let buf = &mut self.column_buffers[col_idx];
             // Track explicit NULL flag (authoritative; no value sentinel needed).
             self.null_flags[col_idx].push(matches!(value, Value::Null));
