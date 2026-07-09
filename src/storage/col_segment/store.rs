@@ -486,21 +486,13 @@ impl ColSegmentStore {
             });
             let fcol_type = filter_col.and_then(|fc| self.col_types.get(fc));
 
-            // Pre-intern filter Text column into ArcString vec to avoid per-row
-            // String allocation in the predicate (WHERE/LIKE on text cols).
-            let fcol_text_interned: Vec<Option<Value>> = if let Some(ref t) = fcol_text {
-                (0..n)
-                    .map(|i| {
-                        if t.is_null(i) {
-                            return None;
-                        }
-                        t.get_str(i)
-                            .map(|s| Value::Text(crate::types::ArcString(std::sync::Arc::from(s))))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            // 🔑 PERF: do NOT pre-intern the entire text column (was 300K ArcString
+            // allocations even when 99% of rows are filtered out by the predicate).
+            // Instead, decode each row's text lazily via fcol_text.get_str(i) only
+            // when the predicate needs it. The predicate receives Option<&Value>,
+            // so we construct a Value::Text on the fly only for rows that need it
+            // (all rows when filtering, but without the upfront allocation burst).
+            // The fixed-column path already does this (per-row get_i64/get_f64).
 
             // Pre-decode project columns (once per segment) — unless lazy mode
             // (small result set): then we decode only for matched rows below.
@@ -628,8 +620,6 @@ impl ColSegmentStore {
                             Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
                             _ => None,
                         }
-                    } else if !fcol_text_interned.is_empty() {
-                        fcol_text_interned.get(i).cloned().flatten()
                     } else if let Some(ref t) = fcol_text {
                         t.get_str(i).map(|s| Value::Text(s.into()))
                     } else {
