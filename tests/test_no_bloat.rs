@@ -296,13 +296,16 @@ fn test_empty_table_memory() {
 #[cfg(not(target_os = "macos"))]
 fn test_table_drop_frees_memory() {
     let (_dir, db) = setup_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE bench (id INT PRIMARY KEY, val FLOAT, tag TEXT)",
+    );
     insert_test_rows(&db, 5000);
-    let _ = fast_count(&db, "SELECT * FROM t");
+    let _ = fast_count(&db, "SELECT * FROM bench");
     let before_drop = get_rss_mb();
 
     // Drop the table
-    exec(&db, "DROP TABLE t");
+    exec(&db, "DROP TABLE bench");
     {
         #[cfg(feature = "jemalloc")]
         {
