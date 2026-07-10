@@ -300,10 +300,10 @@ impl SQ8Vectors {
 
     /// Get decompressed vector
     pub fn get(&self, row_id: RowId) -> Option<Arc<Vec<f32>>> {
-        // Check cache first
+        // 🔑 PERF: read-lock fast path (peek, no LRU touch).
         {
-            let mut cache = self.cache.write();
-            if let Some(vec) = cache.get(&row_id) {
+            let cache = self.cache.read();
+            if let Some(vec) = cache.peek(&row_id) {
                 return Some(Arc::clone(vec));
             }
         }
@@ -323,9 +323,12 @@ impl SQ8Vectors {
 
     /// Get quantized vector (no decompression)
     pub fn get_quantized(&self, row_id: RowId) -> Option<Arc<QuantizedVector>> {
+        // 🔑 PERF: read-lock fast path (peek, no LRU touch). The greedy_search
+        // loop calls this hundreds of times per KNN query — every call taking
+        // a write lock serializes all concurrent searches.
         {
-            let mut cache = self.quantized_cache.write();
-            if let Some(qvec) = cache.get(&row_id) {
+            let cache = self.quantized_cache.read();
+            if let Some(qvec) = cache.peek(&row_id) {
                 return Some(Arc::clone(qvec));
             }
         }

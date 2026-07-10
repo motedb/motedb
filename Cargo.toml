@@ -139,14 +139,18 @@ rayon = ["dep:rayon"]  # 启用 Rayon 并行处理
 
 [profile.release]
 opt-level = 3
+lto = "thin"       # was "fat" — fat LTO makes every rebuild take 5-10 min
+codegen-units = 16  # was 1 — parallel codegen for faster builds
+strip = true
+
+# Use this for final release binaries: cargo build --profile production
+# Use this for final release binaries: cargo build --profile production
+[profile.production]
+inherits = "release"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-# panic = "unwind" (default) — allows `cargo test --release` to work without conflicts
-
-[profile.production]
-# Smallest/fastest binary for deployment (use `cargo build --profile production`)
-inherits = "release"
 panic = "abort"
 
 [profile.release-small]

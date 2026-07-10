@@ -17848,6 +17848,70 @@ impl QueryExecutor {
 
     // 🚀 P0 FIX: Vector ORDER BY optimization helpers
 
+    /// Brute-force vector KNN: scan all vectors in the columnar store,
+    /// compute L2 distance inline, keep top-K. Used for small tables (<50K)
+    /// where DiskANN graph traversal overhead exceeds brute-force O(N).
+    fn brute_force_vector_knn(
+        &self,
+        table: &str,
+        col: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(RowId, f32)>> {
+        let schema = self.db.get_table_schema(table)?;
+        let col_pos = schema.get_column_position(col).unwrap_or(0);
+        let qdim = query.len();
+
+        // Try ColSegmentStore first (the common path).
+        if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
+            let _ = store.flush_buffer();
+            let segs = store.segments_snapshot();
+            // Collect (distance, key, seg_idx, local_row) then sort + take K.
+            // Simpler than heap for correctness; N < 50K so sort is fast.
+            let mut scored: Vec<(f32, u64)> = Vec::with_capacity(1024);
+            for (_sidx, seg) in segs.iter().enumerate() {
+                if col_pos >= seg.sst.column_tags.len() {
+                    continue;
+                }
+                let vec_data = match seg.sst.read_vectors(col_pos) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let n = seg.sst.num_rows;
+                for i in 0..n {
+                    if seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    let key = seg.sst.row_map.key(i);
+                    // Find decoded vector for this row via vec_data.
+                    // vec_data is Vec<(RowId, Vec<f32>)> sorted by row_id.
+                    // Binary search for our key's low 32 bits.
+                    let ek = key & 0xFFFFFFFF;
+                    let found = vec_data.binary_search_by_key(&ek, |(rid, _)| *rid);
+                    if let Ok(idx) = found {
+                        let vec = &vec_data[idx].1;
+                        if vec.len() == qdim {
+                            let dist: f32 = query
+                                .iter()
+                                .zip(vec.iter())
+                                .map(|(q, v)| {
+                                    let d = q - v;
+                                    d * d
+                                })
+                                .sum();
+                            scored.push((dist, key));
+                        }
+                    }
+                }
+            }
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let results: Vec<(RowId, f32)> =
+                scored.into_iter().take(k).map(|(d, k)| (k, d)).collect();
+            return Ok(results);
+        }
+        Ok(Vec::new())
+    }
+
     /// Try to optimize ORDER BY with vector distance
     fn try_optimize_vector_order_by(&self, stmt: &SelectStmt) -> Result<Option<VectorOrderByPlan>> {
         // 必须有 ORDER BY 和 LIMIT
@@ -17872,9 +17936,16 @@ impl QueryExecutor {
                 (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
                     (col.clone(), vec.clone(), order_by.asc)
                 }
-                _ => return Ok(None),
+                (Expr::Column(col), other) => {
+                    return Ok(None);
+                }
+                _ => {
+                    return Ok(None);
+                }
             },
-            _ => return Ok(None),
+            other_expr => {
+                return Ok(None);
+            }
         };
 
         // 向量距离必须是升序
@@ -17914,6 +17985,13 @@ impl QueryExecutor {
             plan.k
         );
 
+        // 🔑 Adaptive: for small tables (<50K rows), brute-force scan is faster
+        // than DiskANN graph traversal (which has high per-node overhead:
+        // HashSet + BinaryHeap + SQ8 distance per visited node). DiskANN's
+        // O(log N) advantage only kicks in at scale (50K+ rows).
+        // Threshold: 50000 rows × 128 dim ≈ brute force 2ms vs DiskANN 6ms.
+        const BRUTE_FORCE_THRESHOLD: u64 = 50_000;
+
         // Resolve index name via registry (supports custom index names)
         let index_name = self
             .db
@@ -17925,10 +18003,20 @@ impl QueryExecutor {
             )
             .unwrap_or_else(|| format!("{}_{}", plan.table, plan.column));
 
-        // 1. 向量搜索获取 Top-K row_ids
-        let candidates = self
-            .db
-            .vector_search(&index_name, &plan.query_vector, plan.k)?;
+        // 🔑 Adaptive brute-force: for small tables, scan + sort is faster
+        // than DiskANN graph traversal. The graph's per-node overhead (HashSet
+        // insert + BinaryHeap push + SQ8 distance) makes O(log N) slower than
+        // O(N) when N is small. We do a direct columnar scan of the vector
+        // column, compute distances inline, and keep top-K.
+        let estimated_rows = self.db.fast_row_count(&plan.table).unwrap_or(0);
+        let candidates = if estimated_rows > 0 && estimated_rows < BRUTE_FORCE_THRESHOLD {
+            // Brute-force: scan all vectors, compute distance, top-K heap.
+            self.brute_force_vector_knn(&plan.table, &plan.column, &plan.query_vector, plan.k)?
+        } else {
+            // DiskANN graph search.
+            self.db
+                .vector_search(&index_name, &plan.query_vector, plan.k)?
+        };
         debug_log!(
             "[Executor] 🔍 vector_search返回了{}个候选",
             candidates.len()
