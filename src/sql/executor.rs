@@ -17959,8 +17959,17 @@ impl QueryExecutor {
             _ => return Ok(None),
         };
 
-        // 检查索引
-        let index_name = format!("{}_{}", table_name, column);
+        // 检查索引: 先通过 registry 查实际索引名（支持自定义名如 idx_emb），
+        // 再 fallback 到默认名 table_col。
+        let index_name = self
+            .db
+            .index_registry
+            .find_by_column(
+                &table_name,
+                &column,
+                crate::database::index_metadata::IndexType::Vector,
+            )
+            .unwrap_or_else(|| format!("{}_{}", table_name, column));
         if !self.db.has_vector_index(&index_name) {
             return Ok(None);
         }
@@ -18009,7 +18018,8 @@ impl QueryExecutor {
         // O(N) when N is small. We do a direct columnar scan of the vector
         // column, compute distances inline, and keep top-K.
         let estimated_rows = self.db.fast_row_count(&plan.table).unwrap_or(0);
-        let candidates = if estimated_rows > 0 && estimated_rows < BRUTE_FORCE_THRESHOLD {
+        let use_brute = estimated_rows > 0 && estimated_rows < BRUTE_FORCE_THRESHOLD;
+        let candidates = if use_brute {
             // Brute-force: scan all vectors, compute distance, top-K heap.
             self.brute_force_vector_knn(&plan.table, &plan.column, &plan.query_vector, plan.k)?
         } else {
