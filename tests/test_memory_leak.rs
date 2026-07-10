@@ -50,6 +50,7 @@ fn setup_db(n: usize) -> (Database, TempDir) {
 /// Check that repeated queries don't cause RSS to grow unboundedly.
 /// If RSS grows >50% after the warmup phase, it suggests a leak.
 #[test]
+#[ignore = "slow: 50 rounds × 8 queries on 50K rows (incl IN subquery), ~5min in debug"]
 fn test_no_memory_leak_under_load() {
     let (db, _dir) = setup_db(50_000);
 
