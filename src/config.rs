@@ -473,12 +473,12 @@ impl Default for DBConfig {
             wal_config: WALConfig::default(),
             num_partitions: 4,
             lsm_config: LSMConfig::default(),
-            row_cache_size: None,                      // Use default 10000
-            pk_lookup_capacity: 10_000,                // ~0.8MB per table (embedded-friendly)
-            column_index_buffer_size: 8 * 1024 * 1024, // 8MB — fewer BTree flushes
-            max_result_rows: None,                     // No limit
+            row_cache_size: Some(2000), // Limit cache (was unlimited 10000)
+            pk_lookup_capacity: 5_000,  // was 10_000 — halve for memory
+            column_index_buffer_size: 4 * 1024 * 1024, // was 8MB — halve for memory
+            max_result_rows: None,      // No limit
             index_update_strategy: IndexUpdateStrategy::default(), // BatchOnly
-            query_timeout_secs: Some(30),              // 30-second timeout by default
+            query_timeout_secs: Some(30), // 30-second timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
         }
@@ -523,25 +523,38 @@ impl DBConfig {
         Self {
             wal_config: WALConfig {
                 durability_level: DurabilityLevel::Periodic { interval_ms: 50 },
-                max_wal_size: 8 * 1024 * 1024, // 8MB
+                max_wal_size: 2 * 1024 * 1024, // 2MB (was 8MB — WAL was 74% of disk!)
                 ..Default::default()
             },
-            num_partitions: 2,
+            num_partitions: 1, // was 2 — single partition halves WAL file count
             lsm_config: LSMConfig {
-                memtable_size_limit: 1024 * 1024, // 1MB (embedded: columnar handles bulk writes)
-                sstable_cache_size: Some(4),      // fewer cached SSTables for embedded
-                sstable_cache_memory_limit_mb: Some(10), // 10MB max
-                block_size: Some(16 * 1024),      // 16KB blocks
-                enable_compression: Some(false),  // Skip decompression CPU cost
+                memtable_size_limit: 1024 * 1024, // 1MB
+                sstable_cache_size: Some(4),
+                sstable_cache_memory_limit_mb: Some(10),
+                block_size: Some(16 * 1024),
+                enable_compression: Some(true), // was false — enable zstd for disk savings
                 ..Default::default()
             },
-            row_cache_size: Some(500),
+            row_cache_size: Some(200), // was 500 — cut cache memory
             max_result_rows: Some(50_000),
-            pk_lookup_capacity: 10_000, // ~0.8MB per table for edge devices
-            auto_checkpoint: Some(AutoCheckpointConfig::embedded()),
+            pk_lookup_capacity: 5_000, // was 10_000 — halve PK cache
+            auto_checkpoint: Some(AutoCheckpointConfig {
+                max_wal_size_bytes: 2 * 1024 * 1024, // 2MB trigger (was 8MB via embedded())
+                min_interval_secs: 30,
+            }),
             index_update_strategy: IndexUpdateStrategy::BatchOnly,
-            column_index_buffer_size: 8 * 1024 * 1024, // 8MB — fewer BTree flushes during batch insert
-            columnar_config: crate::storage::columnar::config::ColumnarConfig::for_edge(),
+            column_index_buffer_size: 4 * 1024 * 1024, // was 8MB — halve buffer
+            columnar_config: crate::storage::columnar::config::ColumnarConfig {
+                buffer_row_capacity: 4096,             // was 2048 — fewer, larger segments
+                buffer_byte_capacity: 2 * 1024 * 1024, // was 1MB
+                segment_target_rows: 50_000,           // was 30_000 — larger segments = fewer files
+                enable_merge: true,                    // was false — enable query-time compaction
+                merge_threshold_segments: 4,           // was 16 — merge sooner
+                enable_column_stats: true,
+                enable_bloom_filters: false,
+                enable_timestamp_sort: true,
+                bloom_filter_bits_per_key: 8,
+            },
             ..Default::default()
         }
     }
