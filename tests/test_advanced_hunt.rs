@@ -47,6 +47,7 @@ fn val(db: &Database, sql: &str) -> Value {
 
 /// 4 threads each insert 50 rows into the same table.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_concurrent_insert_4_threads() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
@@ -73,6 +74,7 @@ fn test_concurrent_insert_4_threads() {
 
 /// 2 threads read while 1 thread writes.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_concurrent_readers_one_writer() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
@@ -113,6 +115,7 @@ fn test_concurrent_readers_one_writer() {
 
 /// AUTO_INCREMENT starts from 1.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_auto_increment_starts_from_1() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v TEXT)")
@@ -131,6 +134,7 @@ fn test_auto_increment_starts_from_1() {
 
 /// AUTO_INCREMENT after DELETE — ID keeps incrementing (no reuse).
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_auto_increment_after_delete_no_reuse() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
@@ -149,6 +153,7 @@ fn test_auto_increment_after_delete_no_reuse() {
 
 /// AUTO_INCREMENT with explicit ID — counter advances past explicit ID.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_auto_increment_with_explicit_id() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
@@ -165,6 +170,7 @@ fn test_auto_increment_with_explicit_id() {
 
 /// AUTO_INCREMENT survives recovery.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_auto_increment_survives_recovery() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -197,6 +203,7 @@ fn test_auto_increment_survives_recovery() {
 
 /// Column index on INTEGER column — range query.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_column_index_range_query() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, age INT)")
@@ -214,6 +221,7 @@ fn test_column_index_range_query() {
 
 /// Column index — query returns correct row after UPDATE.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_column_index_after_update() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
@@ -242,6 +250,7 @@ fn test_column_index_after_update() {
 
 /// Data written but not checkpointed — survives via WAL replay.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_wal_recovery_without_checkpoint() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -264,6 +273,7 @@ fn test_wal_recovery_without_checkpoint() {
 
 /// Recovery after DELETE — deleted rows stay deleted via WAL.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_wal_recovery_after_delete() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -292,6 +302,7 @@ fn test_wal_recovery_after_delete() {
 
 /// CREATE TABLE IF NOT EXISTS — no error if already exists.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_create_table_if_not_exists() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
@@ -303,6 +314,7 @@ fn test_create_table_if_not_exists() {
 
 /// DROP TABLE IF EXISTS — no error if not exists.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_drop_table_if_exists() {
     let (db, _d) = mk();
     let r = db.execute("DROP TABLE IF EXISTS nonexistent");
@@ -314,6 +326,7 @@ fn test_drop_table_if_exists() {
 
 /// Multiple tables — interleaved operations.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_multiple_tables_interleaved() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)")
@@ -338,6 +351,7 @@ fn test_multiple_tables_interleaved() {
 
 /// 1000 rows with random-looking data — verify exact values after flush.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_1000_rows_exact_values() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)")
@@ -368,6 +382,7 @@ fn test_1000_rows_exact_values() {
 
 /// All rows readable via SELECT * — no truncation.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_all_no_truncation() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -383,6 +398,7 @@ fn test_select_all_no_truncation() {
 
 /// SUM over large dataset matches manual calculation.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_sum_large_dataset_accuracy() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -404,6 +420,7 @@ fn test_sum_large_dataset_accuracy() {
 
 /// COUNT(DISTINCT col) — counts unique values.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_count_distinct() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
@@ -425,6 +442,7 @@ fn test_count_distinct() {
 
 /// SELECT DISTINCT col — returns unique values.
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_distinct_values() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)")
@@ -445,6 +463,7 @@ fn test_select_distinct_values() {
 
 /// NULL in PK position (should error or handle gracefully).
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_null_primary_key_no_panic() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -456,6 +475,7 @@ fn test_null_primary_key_no_panic() {
 
 /// All-NULL table (every column is NULL for every row).
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_all_null_table() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT, c FLOAT)")

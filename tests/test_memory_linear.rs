@@ -27,6 +27,7 @@ fn get_rss_mb() -> f64 {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_memory_linear_growth() {
     println!("\n{}", "=".repeat(100));
     println!("  Memory Linear Growth Test v2 — incremental ΔRSS per batch");

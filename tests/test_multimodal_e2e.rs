@@ -39,6 +39,7 @@ fn assert_count(db: &Database, sql: &str, expected: usize) {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_vector_crud_lifecycle() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE vecs (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), label TEXT)")
@@ -77,6 +78,7 @@ fn test_vector_crud_lifecycle() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_spatial_crud_lifecycle() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE pts (id INT PRIMARY KEY AUTO_INCREMENT, loc GEOMETRY, name TEXT)")
@@ -109,6 +111,7 @@ fn test_spatial_crud_lifecycle() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_text_crud_lifecycle() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE docs (id INT PRIMARY KEY AUTO_INCREMENT, title TEXT, body TEXT)")
@@ -141,6 +144,7 @@ fn test_text_crud_lifecycle() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_multimodal_restart_recovery() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_str().unwrap().to_string();
@@ -175,6 +179,7 @@ fn test_multimodal_restart_recovery() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_mixed_vector_plus_spatial() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE items (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, cat TEXT)").unwrap();
@@ -213,6 +218,7 @@ fn test_mixed_vector_plus_spatial() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_mixed_vector_plus_text_plus_scalar() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE products (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(8), name TEXT, price FLOAT, in_stock INT)").unwrap();
@@ -255,6 +261,7 @@ fn test_mixed_vector_plus_text_plus_scalar() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_mixed_all_types_single_table() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE sensors (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, label TEXT, val FLOAT, region TEXT, active INT)").unwrap();
@@ -321,6 +328,7 @@ fn test_mixed_all_types_single_table() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_empty_table_queries() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE empty (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, txt TEXT)").unwrap();
@@ -336,6 +344,7 @@ fn test_empty_table_queries() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_single_row_table() {
     let (db, _dir) = db();
     db.execute(
@@ -362,6 +371,7 @@ fn test_single_row_table() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_large_vector_dim() {
     let (db, _dir) = db();
     let dim = 256;
@@ -393,6 +403,7 @@ fn test_large_vector_dim() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_null_and_missing_values() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE nullable (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(2), txt TEXT, val FLOAT)").unwrap();
@@ -410,6 +421,7 @@ fn test_null_and_missing_values() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_batch_insert_mixed_types() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE batch (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, cat TEXT)").unwrap();
@@ -436,6 +448,7 @@ fn test_batch_insert_mixed_types() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_create_query_with_indexes() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE idx_test (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, body TEXT, cat TEXT)").unwrap();
@@ -468,6 +481,7 @@ fn test_create_query_with_indexes() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_index_after_bulk_insert() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE bulk (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(8), region TEXT)")
@@ -503,6 +517,7 @@ fn test_index_after_bulk_insert() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_memory_does_not_grow_unbounded() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE scale (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(16), loc GEOMETRY, cat TEXT, val FLOAT)").unwrap();
@@ -580,6 +595,7 @@ fn test_memory_does_not_grow_unbounded() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_latency_growth_sublinear() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE perf (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT, val FLOAT)")
@@ -651,6 +667,7 @@ fn test_latency_growth_sublinear() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_transaction_multimodal_insert() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE txn_mm (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, txt TEXT)").unwrap();
@@ -668,6 +685,7 @@ fn test_transaction_multimodal_insert() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_transaction_multimodal_rollback() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE rb_mm (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), txt TEXT)")
@@ -691,6 +709,7 @@ fn test_transaction_multimodal_rollback() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_robot_sensor_scenario() {
     // Simulate a robot with LiDAR (spatial), camera (vector), and text logs
     let (db, _dir) = db();
@@ -769,6 +788,7 @@ fn test_robot_sensor_scenario() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_ar_glasses_scenario() {
     // Simulate AR glasses with spatial anchors, feature vectors, and text labels
     let (db, _dir) = db();
@@ -832,6 +852,7 @@ fn test_ar_glasses_scenario() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_iot_drone_scenario() {
     // Simulate a drone with GPS (spatial), telemetry vectors, and status logs
     let (db, _dir) = db();

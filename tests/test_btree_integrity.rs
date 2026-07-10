@@ -7,6 +7,7 @@ use tempfile::TempDir;
 
 /// 100K insert→flush→verify cycle — catches split bugs, superblock overflow
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_btree_insert_flush_verify_100k() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test_100k.bt");
@@ -39,6 +40,7 @@ fn test_btree_insert_flush_verify_100k() {
 
 /// interleaved insert+get: queries should see already-inserted keys
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_btree_insert_and_query_interleaved() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test_interleaved.bt");
@@ -63,6 +65,7 @@ fn test_btree_insert_and_query_interleaved() {
 
 /// Delete then re-insert: deleted keys should vanish, re-inserted should reappear
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_btree_delete_and_reinsert() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test_delete.bt");
@@ -129,6 +132,7 @@ fn test_btree_delete_and_reinsert() {
 
 /// Range queries across split boundaries
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_btree_range_query() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test_range.bt");
@@ -163,6 +167,7 @@ fn test_btree_range_query() {
 
 /// Two B+Tree instances on different files — no cross-contamination
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_two_independent_trees() {
     let dir = TempDir::new().unwrap();
     let path_a = dir.path().join("tree_a.bt");

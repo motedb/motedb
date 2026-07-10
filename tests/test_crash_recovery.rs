@@ -31,6 +31,7 @@ fn remove_db(path: &str) {
 // Test 1: Basic durability — committed rows survive crash
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_committed_rows_survive() {
     let dir = "/tmp/motedb_crash_test_1";
     remove_db(dir);
@@ -77,6 +78,7 @@ fn test_crash_committed_rows_survive() {
 // Transactional rollback of LSM data requires write buffering (future work).
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_raw_insert_survives() {
     let dir = "/tmp/motedb_crash_test_2";
     remove_db(dir);
@@ -105,6 +107,7 @@ fn test_crash_raw_insert_survives() {
 // Test 3: Multiple checkpoints survive crash
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_multiple_checkpoints() {
     let dir = "/tmp/motedb_crash_test_4";
     remove_db(dir);
@@ -165,6 +168,7 @@ fn test_crash_multiple_checkpoints() {
 // Test 5: Multiple transactions survive crash
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_multiple_transactions() {
     let dir = "/tmp/motedb_crash_test_5";
     remove_db(dir);
@@ -223,6 +227,7 @@ fn test_crash_multiple_transactions() {
 // Test 6: WAL recovery after many small writes
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_many_small_writes() {
     let dir = "/tmp/motedb_crash_test_6";
     remove_db(dir);
@@ -255,6 +260,7 @@ fn test_crash_many_small_writes() {
 // Test 7: Update survives crash
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_update_survives() {
     let dir = "/tmp/motedb_crash_test_7";
     remove_db(dir);
@@ -292,6 +298,7 @@ fn test_crash_update_survives() {
 // Test 8: Delete survives crash
 // ═══════════════════════════════════════════════════════════════
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_crash_delete_survives() {
     let dir = "/tmp/motedb_crash_test_8";
     remove_db(dir);

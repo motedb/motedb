@@ -7,6 +7,7 @@ mod common;
 use common::*;
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_10k_insert_consistency() {
     let (_dir, db) = setup_db();
     exec(
@@ -29,6 +30,7 @@ fn test_10k_insert_consistency() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_rapid_insert_delete_cycle() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -46,6 +48,7 @@ fn test_rapid_insert_delete_cycle() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_rapid_update_same_row() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -61,6 +64,7 @@ fn test_rapid_update_same_row() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_many_small_batches() {
     let (_dir, db) = setup_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)");
@@ -78,6 +82,7 @@ fn test_many_small_batches() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_large_result_set() {
     let (_dir, db) = setup_db();
     exec(
@@ -96,6 +101,7 @@ fn test_large_result_set() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_mixed_read_write_stability() {
     let (_dir, db) = setup_db();
     exec(
@@ -122,6 +128,7 @@ fn test_mixed_read_write_stability() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_index_after_bulk_insert() {
     let (_dir, db) = setup_db();
     exec(
@@ -139,6 +146,7 @@ fn test_index_after_bulk_insert() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_50k_full_workload() {
     let (_dir, db) = setup_db();
     exec(

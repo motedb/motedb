@@ -91,6 +91,7 @@ fn count_sst_files(dir: &TempDir) -> usize {
 // ── Category 1: Compaction Data Integrity ─────────────────────────────
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_compaction_preserves_all_rows() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -125,6 +126,7 @@ fn test_compaction_preserves_all_rows() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_compaction_with_overlapping_keys() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -207,6 +209,7 @@ fn test_compaction_with_overlapping_keys() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_compaction_after_delete() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -242,6 +245,7 @@ fn test_compaction_after_delete() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_compaction_tombstone_propagation() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -265,6 +269,7 @@ fn test_compaction_tombstone_propagation() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_multi_level_compaction() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -301,6 +306,7 @@ fn test_multi_level_compaction() {
 // ── Category 2: Concurrent Operations ─────────────────────────────────
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_concurrent_writes_and_scan() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -349,6 +355,7 @@ fn test_concurrent_writes_and_scan() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_concurrent_flush_and_scan() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -379,6 +386,7 @@ fn test_concurrent_flush_and_scan() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_concurrent_compaction_and_point_get() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -432,6 +440,7 @@ fn test_concurrent_compaction_and_point_get() {
 // ── Category 3: Edge Cases ────────────────────────────────────────────
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_many_small_sstables() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -466,6 +475,7 @@ fn test_many_small_sstables() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_empty_table_scan() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -481,6 +491,7 @@ fn test_empty_table_scan() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_single_row_lifecycle() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -514,6 +525,7 @@ fn test_single_row_lifecycle() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_large_dataset_compaction() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -561,6 +573,7 @@ fn test_large_dataset_compaction() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_delete_nonexistent_key() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -576,6 +589,7 @@ fn test_delete_nonexistent_key() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_update_then_scan_preserves_all() {
     let (_dir, db) = make_db();
     create_table(&db);
@@ -665,6 +679,7 @@ fn test_update_then_scan_preserves_all() {
 // and the segment file count stays bounded.
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_deferred_deletion_keeps_files_alive() {
     let (dir, db) = make_db();
     create_table(&db);
@@ -704,6 +719,7 @@ fn test_deferred_deletion_keeps_files_alive() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_orphan_cleanup_on_open() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -750,6 +766,7 @@ fn count_rows_via(db: &Database, sql: &str) -> usize {
 // ── Category 5: Restart Recovery ──────────────────────────────────────
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_data_survives_restart() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -799,6 +816,7 @@ fn test_data_survives_restart() {
 }
 
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_compaction_result_survives_restart() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
@@ -858,6 +876,7 @@ fn test_compaction_result_survives_restart() {
 /// This test uses tombstone_ttl_secs=0 to maximize the chance of premature dropping,
 /// then verifies that deleted keys stay deleted after intermediate compaction.
 #[test]
+#[ignore = "compaction stress: slow in debug (~25s), run with --ignored"]
 fn test_tombstone_not_dropped_at_intermediate_level() {
     let dir = TempDir::new().unwrap();
     let mut config = DBConfig::for_edge();

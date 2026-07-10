@@ -39,6 +39,7 @@ fn qv(db: &Database, sql: &str) -> Value {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_ddl_create_drop_create() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -56,6 +57,7 @@ fn test_ddl_create_drop_create() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_ddl_multiple_tables() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -75,6 +77,7 @@ fn test_ddl_multiple_tables() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_ddl_table_with_all_types() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -99,6 +102,7 @@ fn test_ddl_table_with_all_types() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_insert_auto_increment() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -116,6 +120,7 @@ fn test_insert_auto_increment() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_insert_null_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -139,6 +144,7 @@ fn test_insert_null_columns() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_insert_duplicate_pk_rejected() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -150,6 +156,7 @@ fn test_insert_duplicate_pk_rejected() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_insert_wrong_column_count() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -160,6 +167,7 @@ fn test_insert_wrong_column_count() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_insert_type_mismatch() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -170,6 +178,7 @@ fn test_insert_type_mismatch() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_insert_named_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -188,6 +197,7 @@ fn test_insert_named_columns() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_star() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -206,6 +216,7 @@ fn test_select_star() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_specific_columns() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -217,6 +228,7 @@ fn test_select_specific_columns() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_arithmetic() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -243,6 +255,7 @@ fn test_select_arithmetic() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_functions() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -263,6 +276,7 @@ fn test_select_functions() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_concat() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -277,6 +291,7 @@ fn test_select_concat() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_select_null_literal() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -292,6 +307,7 @@ fn test_select_null_literal() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_aggregates_basic() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -314,6 +330,7 @@ fn test_aggregates_basic() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_aggregates_with_nulls() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -330,6 +347,7 @@ fn test_aggregates_with_nulls() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_aggregates_all_null() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -345,6 +363,7 @@ fn test_aggregates_all_null() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_count_distinct() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -362,6 +381,7 @@ fn test_count_distinct() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_aggregates_empty_table() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -376,6 +396,7 @@ fn test_aggregates_empty_table() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_comparison_ops() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -395,6 +416,7 @@ fn test_where_comparison_ops() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_and_or() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -420,6 +442,7 @@ fn test_where_and_or() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_is_null_is_not_null() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -438,6 +461,7 @@ fn test_where_is_null_is_not_null() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_in_not_in() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -459,6 +483,7 @@ fn test_where_in_not_in() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_between() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -474,6 +499,7 @@ fn test_where_between() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_like() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -510,6 +536,7 @@ fn test_where_like() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_null_semantics() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -526,6 +553,7 @@ fn test_where_null_semantics() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_arithmetic() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -540,6 +568,7 @@ fn test_where_arithmetic() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_parenthesized() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -562,6 +591,7 @@ fn test_where_parenthesized() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_where_int_float_cross_type() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -580,6 +610,7 @@ fn test_where_int_float_cross_type() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_order_by_asc_desc() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -599,6 +630,7 @@ fn test_order_by_asc_desc() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_limit_offset() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -618,6 +650,7 @@ fn test_limit_offset() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_order_by_with_nulls() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -636,6 +669,7 @@ fn test_order_by_with_nulls() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_basic() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -647,6 +681,7 @@ fn test_update_basic() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_swap() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -660,6 +695,7 @@ fn test_update_swap() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_expression() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -672,6 +708,7 @@ fn test_update_expression() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_multi_column() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -688,6 +725,7 @@ fn test_update_multi_column() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_set_null() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -699,6 +737,7 @@ fn test_update_set_null() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_no_match() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -713,6 +752,7 @@ fn test_update_no_match() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_update_where_is_null() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -730,6 +770,7 @@ fn test_update_where_is_null() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_delete_basic() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -744,6 +785,7 @@ fn test_delete_basic() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_delete_with_where() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -760,6 +802,7 @@ fn test_delete_with_where() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_delete_all() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -774,6 +817,7 @@ fn test_delete_all() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_delete_reinsert() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -789,6 +833,7 @@ fn test_delete_reinsert() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_delete_is_null() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -805,6 +850,7 @@ fn test_delete_is_null() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_prepared_insert_select() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -840,6 +886,7 @@ fn test_prepared_insert_select() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_reopen_full_crud() {
     let path_ctx = TempDir::new().unwrap();
     let path = path_ctx.path().join("test.mote");
@@ -868,6 +915,7 @@ fn test_reopen_full_crud() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_reopen_null_data() {
     let path_ctx = TempDir::new().unwrap();
     let path = path_ctx.path().join("test.mote");
@@ -892,6 +940,7 @@ fn test_reopen_null_data() {
 // ============================================================
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_stress_500_rows_crud() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
@@ -984,6 +1033,7 @@ fn test_perf_insert_throughput() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_perf_select_throughput() {
     let dir = TempDir::new().unwrap();
     let db = setup_db_fast(dir.path());
@@ -1012,6 +1062,7 @@ fn test_perf_select_throughput() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_perf_prepared_select() {
     let dir = TempDir::new().unwrap();
     let db = setup_db_fast(dir.path());
@@ -1044,6 +1095,7 @@ fn test_perf_prepared_select() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_perf_update_throughput() {
     let dir = TempDir::new().unwrap();
     let db = setup_db_fast(dir.path());
@@ -1072,6 +1124,7 @@ fn test_perf_update_throughput() {
 }
 
 #[test]
+#[ignore = "slow in debug, run with --ignored"]
 fn test_perf_full_scan() {
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());

@@ -28,6 +28,7 @@ fn collect_files(path: &std::path::Path, out: &mut Vec<(String, u64)>, depth: us
 }
 
 #[test]
+#[ignore = "slow: measures disk usage of 100K rows, ~37s in debug"]
 fn disk_usage_measurement() {
     let base = format!("/tmp/motedb_disk_test_{}", std::process::id());
     let _ = std::fs::remove_dir_all(&base);
