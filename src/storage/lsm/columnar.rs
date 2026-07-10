@@ -201,9 +201,9 @@ impl ColumnarHeader {
 // ── Column Index Entry ─────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
-pub(crate) struct ColumnIndexEntry {
-    offset: u64,
-    size: u64,
+pub struct ColumnIndexEntry {
+    pub offset: u64,
+    pub size: u64,
 }
 
 const COLUMN_INDEX_ENTRY_SIZE: usize = 16; // (offset: u64, size: u64)
@@ -921,7 +921,7 @@ pub struct ColumnarSSTable {
     file: Option<parking_lot::Mutex<File>>,
     #[allow(dead_code)]
     header: ColumnarHeader,
-    column_index: Vec<ColumnIndexEntry>,
+    pub column_index: Vec<ColumnIndexEntry>,
     pub row_map: RowMap,
     pub column_tags: Vec<ColumnTypeTag>,
     pub num_rows: usize,
@@ -1169,7 +1169,7 @@ impl ColumnarSSTable {
     /// Read column segment bytes via seek+read from file. Only reads the
     /// specific column's bytes — NOT the entire file. This avoids mmap
     /// page residency and keeps RSS low (<30MB for embedded devices).
-    fn read_segment_bytes(&self, start: usize, end: usize) -> std::borrow::Cow<'_, [u8]> {
+    pub fn read_segment_bytes(&self, start: usize, end: usize) -> std::borrow::Cow<'_, [u8]> {
         // If file_data is populated (small files), use it directly.
         if !self.file_data.is_empty() {
             return Self::decompress_segment(&self.file_data[start..end]);

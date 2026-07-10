@@ -17862,46 +17862,55 @@ impl QueryExecutor {
         let col_pos = schema.get_column_position(col).unwrap_or(0);
         let qdim = query.len();
 
-        // Try ColSegmentStore first (the common path).
         if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
             let _ = store.flush_buffer();
             let segs = store.segments_snapshot();
-            // Collect (distance, key, seg_idx, local_row) then sort + take K.
-            // Simpler than heap for correctness; N < 50K so sort is fast.
             let mut scored: Vec<(f32, u64)> = Vec::with_capacity(1024);
             for (_sidx, seg) in segs.iter().enumerate() {
                 if col_pos >= seg.sst.column_tags.len() {
                     continue;
                 }
-                let vec_data = match seg.sst.read_vectors(col_pos) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                // Read raw vector column bytes (zero Vec<f32> allocation).
+                let entry = &seg.sst.column_index[col_pos];
+                let seg_bytes = seg.sst.read_segment_bytes(
+                    entry.offset as usize,
+                    (entry.offset + entry.size) as usize,
+                );
+                let data = seg_bytes.as_ref();
+                let null_bytes = seg.sst.num_rows.div_ceil(8);
+                if null_bytes + 2 > data.len() {
+                    continue;
+                }
+                let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes + 1]]) as usize;
+                if dim != qdim {
+                    continue;
+                }
+                let stride = dim * 4;
+                let data_start = null_bytes + 2;
                 let n = seg.sst.num_rows;
                 for i in 0..n {
+                    // Skip nulls and deleted rows.
+                    if (data[i / 8] >> (i % 8)) & 1 != 0 {
+                        continue;
+                    }
                     if seg.sst.row_map.is_deleted(i) {
                         continue;
                     }
-                    let key = seg.sst.row_map.key(i);
-                    // Find decoded vector for this row via vec_data.
-                    // vec_data is Vec<(RowId, Vec<f32>)> sorted by row_id.
-                    // Binary search for our key's low 32 bits.
-                    let ek = key & 0xFFFFFFFF;
-                    let found = vec_data.binary_search_by_key(&ek, |(rid, _)| *rid);
-                    if let Ok(idx) = found {
-                        let vec = &vec_data[idx].1;
-                        if vec.len() == qdim {
-                            let dist: f32 = query
-                                .iter()
-                                .zip(vec.iter())
-                                .map(|(q, v)| {
-                                    let d = q - v;
-                                    d * d
-                                })
-                                .sum();
-                            scored.push((dist, key));
-                        }
+                    // Inline L2 distance: decode f32 bytes + accumulate.
+                    let base = data_start + i * stride;
+                    let mut dist: f32 = 0.0;
+                    for j in 0..dim {
+                        let off = base + j * 4;
+                        let v = f32::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                            data[off + 2],
+                            data[off + 3],
+                        ]);
+                        let d = query[j] - v;
+                        dist += d * d;
                     }
+                    scored.push((dist, seg.sst.row_map.key(i)));
                 }
             }
             scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
