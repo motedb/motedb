@@ -1474,6 +1474,9 @@ impl ColSegmentStore {
         let segs = self.segments.read();
         for seg in segs.iter() {
             seg.clear_cache();
+            // Release mmap pages back to the OS so RSS stays low after heavy
+            // scans. Pages are re-faulted from the page cache on next access.
+            seg.release_pages();
         }
     }
 
@@ -2367,6 +2370,12 @@ impl ColSegmentStore {
 
     pub fn buffered_row_count(&self) -> usize {
         self.write_buf.lock().num_rows
+    }
+
+    /// Estimated heap bytes consumed by the write buffer. Used to trigger
+    /// memory-aware flushes so RSS doesn't grow with buffered row count.
+    pub fn buffered_bytes(&self) -> usize {
+        self.write_buf.lock().buffered_bytes()
     }
 
     /// Get cached IN-hash row indices for (col_pos, set_signature).

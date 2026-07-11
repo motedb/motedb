@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 /// Return freed heap memory to the OS after flush/checkpoint.
 pub(crate) fn trim_allocator() {
+    // jemalloc (default allocator when the feature is enabled): purge arenas.
+    // This works on all platforms (macOS + Linux).
+    crate::purge_memory_to_os();
+
     #[cfg(target_os = "linux")]
     {
         extern "C" {
@@ -87,6 +91,10 @@ impl MoteDB {
                     e
                 );
             }
+            // Release mmap pages from flushed segments so RSS stays bounded.
+            // Without this, each open segment's row_map + column data pages
+            // remain resident, causing RSS to grow with segment count.
+            entry.release_query_memory();
         }
 
         self.pending_updates.store(0, Ordering::Relaxed);
@@ -276,7 +284,35 @@ impl MoteDB {
         // avoid truncating the WAL before that data reaches an SSTable.
         let pending_after = self.pending_updates.load(Ordering::Acquire);
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
-        let checkpoint_done = if immutable_queue_len == 0 && pending_after == pending_before {
+
+        // 🔥 Flush ColSegmentStore write buffers BEFORE the WAL truncation
+        // decision. This is critical for two reasons:
+        // 1. ColSegmentStore is the source of truth (v0.3.0+). Once flush_buffer
+        //    succeeds, the WAL data is redundant and can be safely truncated.
+        // 2. Without this, the write_buf grows unboundedly (up to 100K rows =
+        //    ~22MB heap per table) because the auto-checkpoint never flushes it.
+        for entry in self.col_segment_stores.iter() {
+            if let Err(e) = entry.flush_buffer() {
+                debug_log!(
+                    "[Flush] ColSegmentStore flush failed for {}: {:?}",
+                    entry.key(),
+                    e
+                );
+            }
+            entry.release_query_memory();
+        }
+
+        if let Err(e) = self.columnar_store.flush_all() {
+            warn_log!("[Flush] Columnar store flush failed: {}", e);
+        }
+
+        let checkpoint_done = if immutable_queue_len == 0 || !self.col_segment_stores.is_empty() {
+            // All data has been flushed:
+            // - LSM memtables are empty (immutable_queue is 0), OR
+            // - ColSegmentStore tables are the source of truth and have been
+            //   flushed above. For these tables, WAL records are redundant once
+            //   the segment files are written. The WAL exists only for crash
+            //   recovery of unflushed write_buf data.
             self.wal.checkpoint_all()?;
             // Persist write_lsn so restarts survive clock regression
             let current_lsn = self.write_lsn.load(std::sync::atomic::Ordering::SeqCst);
@@ -296,9 +332,26 @@ impl MoteDB {
         if checkpoint_done {
             self.pending_updates.store(0, Ordering::Relaxed);
         }
-        if let Err(e) = self.columnar_store.flush_all() {
-            warn_log!("[Flush] Columnar store flush failed: {}", e);
+
+        // 🔥 Compact ColSegmentStore segments to reclaim disk and reduce segment
+        // count. Without this, bulk INSERT creates many small segments (one per
+        // flush) that stay on disk forever, growing linearly with data volume.
+        // force_compact_all merges all segments into one, dropping tombstones
+        // and old versions. This is the single most effective disk-reduction
+        // operation for ColSegmentStore tables.
+        for entry in self.col_segment_stores.iter() {
+            if let Err(e) = entry.force_compact_all() {
+                debug_log!(
+                    "[Flush] ColSegmentStore compaction failed for {}: {:?}",
+                    entry.key(),
+                    e
+                );
+            }
+            // Release pages after compaction (old segments are dropped, their
+            // mmap pages should be returned to the OS).
+            entry.release_query_memory();
         }
+
         if let Err(e) = self.table_registry.persist_auto_increment_counters() {
             warn_log!("[Flush] Auto-increment persistence failed: {}", e);
         }

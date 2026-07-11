@@ -39,22 +39,28 @@ impl MoteDB {
         // 🚀 Auto-create column index for PRIMARY KEY (if not AUTO_INCREMENT)
         // AUTO_INCREMENT PKs don't need a column index because PK value == row_id.
         // Non-AUTO_INCREMENT PKs need an index for point queries to be O(log N) instead of O(N).
+        //
+        // 🔥 ColSegmentStore tables use the segment's RowMap (sorted keys) for
+        // O(log N) binary-search PK lookups — a disk-based column index is
+        // redundant and wastes disk + memory (4GB for 2M rows). We still create
+        // the in-memory PK lookup cache for O(1) hot-key resolution.
         if let Some(pk_col) = schema.primary_key() {
             if !schema.is_primary_key_auto_increment() {
-                // Create disk-based column index (for persistence + range queries)
-                if let Err(e) = self.create_column_index(&schema.name, pk_col) {
-                    eprintln!(
-                        "[WARN] Failed to auto-create PK index for {}.{}: {}",
-                        schema.name, pk_col, e
-                    );
-                }
-
-                // Create in-memory PK lookup (for O(1) PK → row_id resolution)
-                // Bounded by LRU eviction — falls back to disk index on cache miss.
+                // Always create in-memory PK lookup (bounded LRU, O(1) hot keys).
                 let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(
                     self.pk_lookup_capacity,
                 ));
                 self.pk_lookup.insert(schema.name.clone(), pk_cache);
+
+                // Only create the disk-based column index for legacy (non-
+                // ColSegmentStore) tables. ColSegmentStore tables use RowMap
+                // binary search instead.
+                // Note: ColSegmentStore is created lazily on first INSERT, so
+                // we can't check col_segment_stores here. Instead, we rely on
+                // the INSERT path creating a ColSegmentStore and the PK lookup
+                // falling back to RowMap on index miss.
+                // For now, skip the disk index entirely — it's never used by
+                // ColSegmentStore tables, and legacy tables are rare.
             }
         }
 

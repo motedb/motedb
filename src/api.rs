@@ -381,6 +381,19 @@ impl Database {
         // DELETE-check + SELECT-check = 4× trim_start + 4× prefix compare.
         // Now it's 1× trim_start + 1 match → calls only the relevant path.
         let trimmed = sql.trim_start();
+
+        // Handle CHECKPOINT and VACUUM SQL commands (not part of the parser's
+        // Statement enum — intercepted here as DB operations).
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("CHECKPOINT") {
+            self.inner.checkpoint()?;
+            return Ok(StreamingQueryResult::Modification { affected_rows: 0 });
+        }
+        if upper.starts_with("VACUUM") {
+            self.inner.vacuum()?;
+            return Ok(StreamingQueryResult::Modification { affected_rows: 0 });
+        }
+
         if let Some(kw) = trimmed.as_bytes().get(0..6) {
             match kw {
                 b"INSERT" | b"insert" if !in_txn => {
@@ -1558,35 +1571,30 @@ impl Database {
                 if let Some(rid) = lookup.get_pk(&pk_key) {
                     rid
                 } else {
-                    let row_ids =
-                        self.inner
-                            .query_by_column(table_name, where_col, &where_value)?;
-                    match row_ids.into_iter().next() {
-                        Some(rid) => {
-                            if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
+                    // Cache miss. Try column index first; if no index exists
+                    // (ColSegmentStore tables don't auto-create a PK index),
+                    // fall through to the general UPDATE path (full scan).
+                    match self.inner.query_by_column(table_name, where_col, &where_value) {
+                        Ok(row_ids) => match row_ids.into_iter().next() {
+                            Some(rid) => {
                                 lookup.insert(pk_key, rid);
+                                rid
                             }
-                            rid
-                        }
-                        None => {
-                            return Ok(Some(StreamingQueryResult::Modification {
-                                affected_rows: 0,
-                            }))
+                            None => {
+                                return Ok(Some(StreamingQueryResult::Modification {
+                                    affected_rows: 0,
+                                }))
+                            }
+                        },
+                        Err(_) => {
+                            // No index — fall through to general path (full scan).
+                            return Ok(None);
                         }
                     }
                 }
             } else {
-                let row_ids = self
-                    .inner
-                    .query_by_column(table_name, where_col, &where_value)?;
-                match row_ids.into_iter().next() {
-                    Some(rid) => rid,
-                    None => {
-                        return Ok(Some(StreamingQueryResult::Modification {
-                            affected_rows: 0,
-                        }))
-                    }
-                }
+                // No pk_lookup cache for this table — fall through to general path.
+                return Ok(None);
             }
         };
 
@@ -1721,31 +1729,27 @@ impl Database {
                 if let Some(rid) = lookup.get_pk(&pk_key) {
                     rid
                 } else {
-                    let row_ids = self.inner.query_by_column(table_name, col_name, &value)?;
-                    match row_ids.into_iter().next() {
-                        Some(rid) => {
-                            if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
+                    // Cache miss. Try column index; if no index, fall through
+                    // to general DELETE path (full scan).
+                    match self.inner.query_by_column(table_name, col_name, &value) {
+                        Ok(row_ids) => match row_ids.into_iter().next() {
+                            Some(rid) => {
                                 lookup.insert(pk_key, rid);
+                                rid
                             }
-                            rid
-                        }
-                        None => {
-                            return Ok(Some(StreamingQueryResult::Modification {
-                                affected_rows: 0,
-                            }))
+                            None => {
+                                return Ok(Some(StreamingQueryResult::Modification {
+                                    affected_rows: 0,
+                                }))
+                            }
+                        },
+                        Err(_) => {
+                            return Ok(None);
                         }
                     }
                 }
             } else {
-                let row_ids = self.inner.query_by_column(table_name, col_name, &value)?;
-                match row_ids.into_iter().next() {
-                    Some(rid) => rid,
-                    None => {
-                        return Ok(Some(StreamingQueryResult::Modification {
-                            affected_rows: 0,
-                        }))
-                    }
-                }
+                return Ok(None);
             }
         };
 

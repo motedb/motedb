@@ -1,6 +1,5 @@
 use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTable, FixedSegment, TextSegment};
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,25 +9,71 @@ enum CachedCol {
     Text(TextSegment),
 }
 
+/// Max columns cached per segment. Each entry is O(rows) decoded data, so we
+/// bound to avoid unbounded growth on wide tables with many point queries.
+/// For typical 5-column schemas this caches all columns; for wide tables it
+/// keeps the most-recently-used set.
+const COL_CACHE_CAP: usize = 16;
+
+/// A simple bounded LRU for column decode cache. Keeps memory bounded even
+/// under adversarial access patterns.
+struct BoundedColCache {
+    entries: std::collections::VecDeque<(usize, CachedCol)>,
+}
+
+impl BoundedColCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::VecDeque::with_capacity(COL_CACHE_CAP),
+        }
+    }
+
+    fn get(&mut self, col_idx: usize) -> Option<&CachedCol> {
+        // Move to front (MRU).
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == col_idx) {
+            if pos != 0 {
+                if let Some(entry) = self.entries.remove(pos) {
+                    self.entries.push_front(entry);
+                }
+            }
+            return self.entries.front().map(|(_, v)| v);
+        }
+        None
+    }
+
+    fn insert(&mut self, col_idx: usize, val: CachedCol) {
+        // Evict oldest if at capacity.
+        while self.entries.len() >= COL_CACHE_CAP {
+            self.entries.pop_back();
+        }
+        // Remove existing entry for this key (if any).
+        self.entries.retain(|(k, _)| *k != col_idx);
+        self.entries.push_front((col_idx, val));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// Immutable columnar segment = a `ColumnarSSTable` plus bookkeeping metadata,
-/// with a lazy per-column decode cache. The cache avoids re-decompressing an
-/// entire column segment on every `get_row` call — the dominant cost for PK
-/// point queries (was ~11ms due to per-call Snappy decompression of all columns).
+/// with a bounded lazy per-column decode cache. The cache avoids re-decompressing
+/// a column segment on every `get_row` call — critical for PK point query latency.
+/// Bounded to COL_CACHE_CAP entries so memory never grows unbounded.
 pub struct Segment {
     /// Shared so merge cursors can hold a ref without cloning the SSTable.
     pub sst: Arc<ColumnarSSTable>,
     pub id: u64,
     pub row_count: usize,
     pub created_at: Instant,
-    /// Lazy column decode cache: col_idx → decoded segment. Populated on first
-    /// access, reused thereafter. RwLock so concurrent reads don't block.
-    col_cache: RwLock<HashMap<usize, CachedCol>>,
+    /// Bounded column decode cache: col_idx → decoded segment (max COL_CACHE_CAP).
+    col_cache: Mutex<BoundedColCache>,
 }
 
 impl Segment {
     /// Clear the column decode cache to free memory (call after bulk operations).
     pub fn clear_cache(&self) {
-        self.col_cache.write().clear();
+        self.col_cache.lock().clear();
     }
 
     /// Release mmap pages from RSS via MADV_DONTNEED. The OS will re-fault
@@ -46,7 +91,7 @@ impl Segment {
             id,
             row_count,
             created_at: Instant::now(),
-            col_cache: RwLock::new(HashMap::new()),
+            col_cache: Mutex::new(BoundedColCache::new()),
         })
     }
 
@@ -66,13 +111,13 @@ impl Segment {
             return None;
         }
 
-        // Decode each column from cache (lazy populate).
+        // Decode each column from cache (lazy populate, bounded).
         let mut row = Vec::with_capacity(col_types.len());
         for (ci, ct) in col_types.iter().enumerate() {
-            // Fast path: already cached.
+            // Try cache first.
             {
-                let cache = self.col_cache.read();
-                if let Some(cached) = cache.get(&ci) {
+                let mut cache = self.col_cache.lock();
+                if let Some(cached) = cache.get(ci) {
                     row.push(decode_cached_value(cached, idx, ct));
                     continue;
                 }
@@ -88,7 +133,7 @@ impl Segment {
             };
             if let Some(d) = decoded {
                 row.push(decode_cached_value(&d, idx, ct));
-                self.col_cache.write().insert(ci, d);
+                self.col_cache.lock().insert(ci, d);
             } else {
                 row.push(Value::Null);
             }

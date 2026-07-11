@@ -77,7 +77,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -216,6 +216,12 @@ const COLUMN_INDEX_ENTRY_SIZE: usize = 16; // (offset: u64, size: u64)
 /// - keys: u64 × num_rows (composite keys, preserves row order)
 /// - timestamps: u64 × num_rows (MVCC version)
 /// - deleted: bitset (u8 × ceil(num_rows/8))
+///
+/// For query paths, only `keys` and `deleted` are needed. `timestamps` is
+/// only read during merge/compaction (4 call sites). To minimize RSS:
+/// - `deleted` is always loaded into heap (small: ~250KB for 2M rows)
+/// - `keys` uses the backing SegData (mmap or owned)
+/// - `timestamps` uses the same backing SegData (never separately allocated)
 #[derive(Clone, Debug)]
 pub struct RowMap {
     pub num_rows: usize,
@@ -225,6 +231,10 @@ pub struct RowMap {
     deleted_offset: usize,
     #[allow(dead_code)]
     deleted_len: usize,
+    /// Eagerly-loaded deleted bitmap (heap). Separated from `data` so that
+    /// `has_any_deleted()` and `is_deleted()` don't fault mmap pages for keys
+    /// and timestamps. None when there are no deletions (common case).
+    deleted_bitmap: Option<Box<[u8]>>,
 }
 
 impl RowMap {
@@ -243,27 +253,56 @@ impl RowMap {
     #[allow(dead_code)]
     pub(crate) fn from_bytes(data: Vec<u8>, num_rows: usize) -> Self {
         let (_, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
+        let deleted_offset = keys_size + timestamps_size;
+        // Extract deleted bitmap into a separate heap allocation so is_deleted
+        // and has_any_deleted don't touch the keys/timestamps region.
+        let deleted_bitmap = Self::extract_deleted_bitmap(&data, deleted_offset, deleted_len);
         Self {
             num_rows,
             keys_offset: 0,
             timestamps_offset: keys_size,
-            deleted_offset: keys_size + timestamps_size,
+            deleted_offset,
             deleted_len,
             data: SegData::Owned(data),
+            deleted_bitmap,
         }
+    }
+
+    /// Extract the deleted bitmap from raw row_map data. Returns None when the
+    /// bitmap is all zeros (no deletions), which makes has_any_deleted() O(1).
+    fn extract_deleted_bitmap(data: &[u8], offset: usize, len: usize) -> Option<Box<[u8]>> {
+        if offset + len > data.len() {
+            return None;
+        }
+        let slice = &data[offset..offset + len];
+        // Check if any byte is non-zero. If all zeros, no deletions — return None.
+        let has_any = slice.iter().any(|&b| b != 0);
+        if !has_any {
+            return None;
+        }
+        Some(slice.to_vec().into_boxed_slice())
     }
 
     /// Zero-copy view into mmap data.
     #[allow(dead_code)]
     pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize) -> Result<Self> {
         let (_total, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
+        let deleted_offset = offset + keys_size + timestamps_size;
+        // Eagerly read the deleted bitmap from the mmap into heap. This is a
+        // small read (~250KB for 2M rows) that avoids faulting the entire
+        // row_map mmap region on every has_any_deleted() / is_deleted() call.
+        let deleted_bitmap = {
+            let mmap_ref = &mmap;
+            Self::extract_deleted_bitmap(mmap_ref, deleted_offset, deleted_len)
+        };
         Ok(Self {
             num_rows,
             keys_offset: offset,
             timestamps_offset: offset + keys_size,
-            deleted_offset: offset + keys_size + timestamps_size,
+            deleted_offset,
             deleted_len,
             data: SegData::Mmap { mmap, offset },
+            deleted_bitmap,
         })
     }
 
@@ -301,21 +340,19 @@ impl RowMap {
 
     #[inline]
     pub fn is_deleted(&self, row_idx: usize) -> bool {
-        let byte = self.data.get(self.deleted_offset + row_idx / 8);
-        (byte >> (row_idx % 8)) & 1 != 0
+        if let Some(ref bmp) = self.deleted_bitmap {
+            (bmp[row_idx / 8] >> (row_idx % 8)) & 1 != 0
+        } else {
+            // No deletions (deleted_bitmap is None when empty).
+            false
+        }
     }
 
-    /// Check if ANY row is marked deleted. O(deleted_bitmap_size / 8) — fast.
-    /// Used to skip per-row is_deleted checks when no deletions exist.
+    /// Check if ANY row is marked deleted. O(1) when deleted_bitmap is None
+    /// (the common case — no deletions). Previously this was O(N/8) scanning
+    /// the bitmap bytes on every scan.
     pub fn has_any_deleted(&self) -> bool {
-        let n = self.num_rows;
-        let nb = n.div_ceil(8);
-        for i in 0..nb {
-            if self.data.get(self.deleted_offset + i) != 0 {
-                return true;
-            }
-        }
-        false
+        self.deleted_bitmap.is_some()
     }
 }
 
@@ -1033,13 +1070,40 @@ impl ColumnarSSTable {
             footer_buf[15],
         ]);
 
-        // 🚀 Lazy loading: for files > 512KB, don't read/mmap the entire file.
-        // Only read metadata (header + column_index + row_map). Column data
-        // is read on-demand via seek+read in read_segment_bytes.
-        // For small files (< 512KB), read fully (avoids seek overhead).
+        // 🚀 Memory-mapped loading: for files > 256KB, use mmap the entire file.
+        // This is ZERO-heap: the mmap region is backed by the OS page cache,
+        // not the process heap. The OS evicts pages under memory pressure.
+        // We use MADV_RANDOM so point queries (binary search over keys) don't
+        // trigger sequential prefetch of the whole file. Scans that need
+        // sequential access will re-madvise as needed.
+        //
+        // For small files (< 256KB), read fully into heap (avoids mmap overhead).
         let lazy_load = file_len > 256 * 1024;
 
-        let mmap: Option<Arc<Mmap>> = None;
+        let mmap: Option<Arc<Mmap>> = if lazy_load {
+            // mmap the file read-only. Safe because the file is immutable after
+            // write (segments are append-only; compaction creates new files).
+            match unsafe { MmapOptions::new().map(&file) } {
+                Ok(m) => {
+                    // Advise the kernel: random access pattern (point queries).
+                    // This prevents the kernel from aggressively prefetching the
+                    // entire file into the page cache on first touch.
+                    let advice = libc::MADV_RANDOM;
+                    let _ = unsafe {
+                        libc::madvise(
+                            m.as_ptr() as *mut _,
+                            m.len(),
+                            advice,
+                        )
+                    };
+                    Some(Arc::new(m))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         let mut file_data: Vec<u8> = Vec::new();
 
         if !lazy_load {
@@ -1051,6 +1115,8 @@ impl ColumnarSSTable {
         // Read header.
         let header = if !file_data.is_empty() {
             ColumnarHeader::deserialize(&file_data[..HEADER_SIZE])?
+        } else if let Some(ref m) = mmap {
+            ColumnarHeader::deserialize(&m[..HEADER_SIZE])?
         } else {
             file.seek(SeekFrom::Start(0))?;
             let mut hb = vec![0u8; HEADER_SIZE];
@@ -1066,6 +1132,8 @@ impl ColumnarSSTable {
         let ci_start = HEADER_SIZE;
         let ci_buf = if !file_data.is_empty() {
             file_data[ci_start..ci_start + ci_size].to_vec()
+        } else if let Some(ref m) = mmap {
+            m[ci_start..ci_start + ci_size].to_vec()
         } else {
             let mut b = vec![0u8; ci_size];
             file.seek(SeekFrom::Start(ci_start as u64))?;
@@ -1101,23 +1169,58 @@ impl ColumnarSSTable {
             })
             .collect();
 
-        // Row map: read from file_data or seek+read.
+        // Row map: read from file_data, mmap (zero-copy), or seek+read.
         let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
-        let rm_data = if !file_data.is_empty() {
-            file_data[row_map_offset as usize..row_map_offset as usize + rm_total].to_vec()
+        let row_map = if !file_data.is_empty() {
+            // Small file: already in heap.
+            let rm_data = file_data
+                [row_map_offset as usize..row_map_offset as usize + rm_total]
+                .to_vec();
+            let del_off = keys_size + timestamps_size;
+            let del_bmp = RowMap::extract_deleted_bitmap(&rm_data, del_off, deleted_len);
+            RowMap {
+                num_rows,
+                keys_offset: 0,
+                timestamps_offset: keys_size,
+                deleted_offset: del_off,
+                deleted_len,
+                data: SegData::Owned(rm_data),
+                deleted_bitmap: del_bmp,
+            }
+        } else if let Some(ref m) = mmap {
+            // Large file: zero-copy mmap reference. The deleted bitmap is
+            // eagerly extracted into heap (small: ~250KB for 2M rows) so that
+            // is_deleted/has_any_deleted don't fault the keys/timestamps pages.
+            let del_off = row_map_offset as usize + keys_size + timestamps_size;
+            let del_bmp = RowMap::extract_deleted_bitmap(m, del_off, deleted_len);
+            RowMap {
+                num_rows,
+                keys_offset: 0,
+                timestamps_offset: keys_size,
+                deleted_offset: keys_size + timestamps_size,
+                deleted_len,
+                data: SegData::Mmap {
+                    mmap: Arc::clone(m),
+                    offset: row_map_offset as usize,
+                },
+                deleted_bitmap: del_bmp,
+            }
         } else {
+            // Fallback: seek+read into heap.
             let mut d = vec![0u8; rm_total];
             file.seek(SeekFrom::Start(row_map_offset))?;
             file.read_exact(&mut d)?;
-            d
-        };
-        let row_map = RowMap {
-            num_rows,
-            keys_offset: 0,
-            timestamps_offset: keys_size,
-            deleted_offset: keys_size + timestamps_size,
-            deleted_len,
-            data: SegData::Owned(rm_data),
+            let del_off = keys_size + timestamps_size;
+            let del_bmp = RowMap::extract_deleted_bitmap(&d, del_off, deleted_len);
+            RowMap {
+                num_rows,
+                keys_offset: 0,
+                timestamps_offset: keys_size,
+                deleted_offset: keys_size + timestamps_size,
+                deleted_len,
+                data: SegData::Owned(d),
+                deleted_bitmap: del_bmp,
+            }
         };
 
         let column_tags: Vec<ColumnTypeTag> = header.column_tags[..num_columns]
@@ -1125,11 +1228,10 @@ impl ColumnarSSTable {
             .map(|&t| unsafe { std::mem::transmute(t) })
             .collect();
 
-        // Cache the file handle for large files (lazy-loaded, not in file_data).
-        // This avoids re-opening the file on every read_segment_bytes call —
-        // previously each column read did open+seek+read+close, causing hundreds
-        // of syscalls per scan on large tables.
-        let file = if file_data.is_empty() {
+        // Cache the file handle for large files WITHOUT mmap (lazy-loaded
+        // seek+read fallback path). When mmap is available, read_segment_bytes
+        // uses the mmap directly, so no file handle is needed.
+        let file = if file_data.is_empty() && mmap.is_none() {
             std::fs::File::open(&path).ok().map(parking_lot::Mutex::new)
         } else {
             None
@@ -1200,18 +1302,20 @@ impl ColumnarSSTable {
         if !self.file_data.is_empty() {
             return Self::decompress_segment(&self.file_data[start..end]);
         }
-        // If mmap available, use it (zero-copy slice).
+        // If mmap available and the range is within bounds, use it (zero-copy).
+        // mmap is preferable to seek+read because the OS manages page cache
+        // eviction (MADV_DONTNEED can reclaim pages), whereas seek+read
+        // allocates heap buffers that jemalloc retains.
         if let Some(ref mmap) = self.mmap {
-            return Self::decompress_segment(&mmap[start..end]);
+            if end <= mmap.len() {
+                return Self::decompress_segment(&mmap[start..end]);
+            }
         }
-        // Seek+read from file: use cached file handle if available (avoids
-        // re-opening the file on every column read — was the #1 I/O bottleneck
-        // for large-segment scans). Falls back to open-on-demand if no cache.
+        // Seek+read fallback: use cached file handle if available.
         let len = end - start;
         let mut buf = vec![0u8; len];
         use std::io::{Read, Seek};
         let ok = if let Some(ref cached) = self.file {
-            // Cached handle: lock, seek, read (no File::open syscall).
             let mut f = cached.lock();
             f.seek(SeekFrom::Start(start as u64)).is_ok() && f.read_exact(&mut buf).is_ok()
         } else if let Ok(mut f) = std::fs::File::open(&self.path) {
@@ -1424,6 +1528,27 @@ impl ColumnarSSTableBuilder {
             null_flags: vec![Vec::new(); num_cols],
             finished: false,
         }
+    }
+
+    /// Estimated heap bytes consumed by this builder's buffers. Used to trigger
+    /// flushes based on memory pressure rather than a fixed row count.
+    pub fn buffered_bytes(&self) -> usize {
+        let mut total = 0;
+        // keys: u64 per row
+        total += self.keys.capacity() * 8;
+        // timestamps: u64 per row
+        total += self.timestamps.capacity() * 8;
+        // deleted: bool per row
+        total += self.deleted.capacity();
+        // column_buffers: raw bytes
+        for buf in &self.column_buffers {
+            total += buf.capacity();
+        }
+        // null_flags: bool per row per column
+        for flags in &self.null_flags {
+            total += flags.capacity();
+        }
+        total
     }
 
     /// Add a row to the builder.

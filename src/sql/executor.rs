@@ -1566,6 +1566,16 @@ impl QueryExecutor {
 
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
+
+        // 🔥 Release query memory from the previous query before starting a new
+        // one. This clears segment col_cache and releases mmap pages (MADV_
+        // DONTNEED) so RSS doesn't accumulate across queries. Without this,
+        // each full-table scan caches decoded columns and faults mmap pages
+        // into RSS, causing steady-state RSS to grow with query count.
+        for entry in self.db.col_segment_stores.iter() {
+            entry.release_query_memory();
+        }
+
         let result = match stmt {
             Statement::Select(s) => self.execute_select_streaming_ref(s)?,
             Statement::Insert(i) => {
@@ -15925,14 +15935,11 @@ impl QueryExecutor {
 
         self.db.create_table(schema.clone())?;
 
-        // 🚀 P0 FIX: Auto-create column index for primary key (ONLY if NOT AUTO_INCREMENT)
-        // AUTO_INCREMENT主键不需要列索引（主键值 = row_id，直接查询）
-        if let Some(pk_col) = primary_key_cols.first() {
-            if !pk_col.auto_increment {
-                let _pk_index_name = format!("{}.{}", stmt.table, pk_col.name);
-                self.db.create_column_index(&stmt.table, &pk_col.name)?;
-            }
-        }
+        // 🔥 ColSegmentStore tables use RowMap binary search for PK lookups.
+        // A disk-based column index is redundant — it duplicates every PK value
+        // on disk (4GB for 2M rows) and in memory. The in-memory pk_lookup
+        // cache (created by create_table) handles O(1) hot-key resolution.
+        // Explicit CREATE INDEX is still supported for non-PK columns.
 
         // 🚨 DEADLOCK FIX: create_table() already auto-creates primary key index
         // No need to manually create it again (prevents double creation deadlock)

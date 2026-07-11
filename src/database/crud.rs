@@ -296,8 +296,19 @@ impl MoteDB {
             // store already exists (the common case after the first insert).
             let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
             store.append_row_ref(composite_key, ts, &row)?;
-            if store.buffered_row_count() >= 100000 {
+            // Memory-aware flush: trigger when write buffer exceeds ~8MB of heap.
+            // This bounds the write_buf to ~8MB regardless of row width, while
+            // keeping segment count reasonable (2M rows → ~40 segments).
+            // Segment pages are released after flush (see release_pages below).
+            if store.buffered_bytes() >= 8 * 1024 * 1024 {
                 store.flush_buffer()?;
+                // Release mmap pages from old segments so RSS stays low.
+                // Pages re-fault from OS page cache on next read.
+                for entry in self.col_segment_stores.iter() {
+                    entry.release_query_memory();
+                }
+                // Purge freed heap to OS (jemalloc arena purge on all platforms).
+                crate::purge_memory_to_os();
             }
         }
 
@@ -770,7 +781,7 @@ impl MoteDB {
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
             let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
             store.append_row_ref(key, timestamp, &new_row)?;
-            if store.buffered_row_count() >= 100000 {
+            if store.buffered_bytes() >= 4 * 1024 * 1024 {
                 let _ = store.flush_buffer();
             }
 
@@ -2337,9 +2348,8 @@ impl MoteDB {
                 })
                 .collect();
             store.append_rows(&store_rows)?;
-            // Flush periodically to bound the in-memory buffer. 20K rows keeps
-            // buffer ~3MB while limiting segment count (500K → ~25 segs vs 125).
-            if store.buffered_row_count() >= 100000 {
+            // Flush periodically to bound the in-memory buffer (memory-aware).
+            if store.buffered_bytes() >= 4 * 1024 * 1024 {
                 store.flush_buffer()?;
                 // Defer compaction to background (keeps INSERT memory <30MB).
                 // Compaction at query time (SelectColumnar) handles first-query latency.
@@ -2634,7 +2644,7 @@ impl MoteDB {
         store.append_rows(&store_rows)?;
 
         // Flush periodically to bound memory (same threshold as full path).
-        if store.buffered_row_count() >= 100_000 {
+        if store.buffered_bytes() >= 4 * 1024 * 1024 {
             store.flush_buffer()?;
         }
 
@@ -2757,8 +2767,11 @@ impl MoteDB {
 
         let count = self.pending_updates.fetch_add(1, Ordering::Release);
 
-        // 每2000条触发一次flush（与LSM一致）
-        if count.is_multiple_of(2_000) && count > 0 {
+        // Trigger auto-flush every 20K writes. This bounds the write_buf to
+        // ~20K rows of heap while keeping segment count reasonable (2M rows →
+        // ~100 segments, compacted by CHECKPOINT to 1). Previously 2K (too
+        // frequent, 1000 segments) then 50K (write_buf too large).
+        if count.is_multiple_of(20_000) && count > 0 {
             debug_log!("[AUTO-FLUSH] Triggered after {} writes", count);
             self.request_auto_flush();
         }
