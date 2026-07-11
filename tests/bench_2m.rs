@@ -59,8 +59,9 @@ fn bench_2m_memory_and_perf() {
     println!("  2M-Row Benchmark  |  Target: ≤30MB daily, ≤60MB peak, zero data-dependent growth");
     println!("{}", "═".repeat(80));
 
-    let _rss0 = rss_kb();
-    println!("  Baseline RSS (empty DB):         {:>8.1} MB", mb(_rss0));
+    #[allow(unused_assignments)]
+    let rss0 = rss_kb();
+    println!("  Baseline RSS (empty DB):         {:>8.1} MB", mb(rss0));
 
     // ── Schema ──
     db.execute(
@@ -117,7 +118,7 @@ fn bench_2m_memory_and_perf() {
     };
 
     // Detailed disk breakdown
-    fn print_dir_breakdown(path: &std::path::Path, label: &str) -> u64 {
+    fn print_dir_breakdown(path: &std::path::Path, _label: &str) -> u64 {
         if !path.exists() {
             return 0;
         }

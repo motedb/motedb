@@ -2584,22 +2584,11 @@ impl QueryExecutor {
     fn col_segment_group_by(
         &self,
         stmt: &SelectStmt,
-        table_name: &str,
+        _table_name: &str,
         store: &crate::storage::col_segment::ColSegmentStore,
         schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
-        let rss0 = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
-            .unwrap_or(0);
-        use crate::sql::ast::{Expr, SelectColumn};
+        use crate::sql::ast::SelectColumn;
         use std::collections::HashMap;
 
         // Only handle: GROUP BY single column + COUNT(*) [+ SUM/MIN/MAX on fixed col]
@@ -6493,10 +6482,6 @@ impl QueryExecutor {
 
         // IN (literal list) HashSet fast path: avoid O(rows × list_len) linear scan.
         // For `WHERE col IN (v1, v2, ...)`, build a HashSet once and do O(1) lookup per row.
-        if let Some(ref wc) = where_clause {
-            let w: &crate::sql::ast::Expr = wc;
-            let is_in = matches!(w, crate::sql::ast::Expr::In { .. });
-        }
         let in_hashset: Option<(usize /*col_pos*/, std::collections::HashSet<Value>)> =
             match &where_clause {
                 Some(crate::sql::ast::Expr::In {
@@ -18157,14 +18142,14 @@ impl QueryExecutor {
                 (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
                     (col.clone(), vec.clone(), order_by.asc)
                 }
-                (Expr::Column(col), other) => {
+                (Expr::Column(_col), _other) => {
                     return Ok(None);
                 }
                 _ => {
                     return Ok(None);
                 }
             },
-            other_expr => {
+            _other_expr => {
                 return Ok(None);
             }
         };
