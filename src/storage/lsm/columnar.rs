@@ -228,6 +228,7 @@ pub struct RowMap {
     data: SegData, // Owned for builder, Mmap for zero-copy reads
     keys_offset: usize,
     timestamps_offset: usize,
+    #[allow(dead_code)]
     deleted_offset: usize,
     #[allow(dead_code)]
     deleted_len: usize,
@@ -1089,13 +1090,7 @@ impl ColumnarSSTable {
                     // This prevents the kernel from aggressively prefetching the
                     // entire file into the page cache on first touch.
                     let advice = libc::MADV_RANDOM;
-                    let _ = unsafe {
-                        libc::madvise(
-                            m.as_ptr() as *mut _,
-                            m.len(),
-                            advice,
-                        )
-                    };
+                    let _ = unsafe { libc::madvise(m.as_ptr() as *mut _, m.len(), advice) };
                     Some(Arc::new(m))
                 }
                 Err(_) => None,
@@ -1173,9 +1168,8 @@ impl ColumnarSSTable {
         let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
         let row_map = if !file_data.is_empty() {
             // Small file: already in heap.
-            let rm_data = file_data
-                [row_map_offset as usize..row_map_offset as usize + rm_total]
-                .to_vec();
+            let rm_data =
+                file_data[row_map_offset as usize..row_map_offset as usize + rm_total].to_vec();
             let del_off = keys_size + timestamps_size;
             let del_bmp = RowMap::extract_deleted_bitmap(&rm_data, del_off, deleted_len);
             RowMap {

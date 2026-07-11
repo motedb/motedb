@@ -279,10 +279,10 @@ impl MoteDB {
 
         self.flush_all_indexes()?;
 
-        // Re-check pending_updates: if a write was WAL-logged between flush()
-        // and here, its data is only in the active memtable. Skip checkpoint to
-        // avoid truncating the WAL before that data reaches an SSTable.
-        let pending_after = self.pending_updates.load(Ordering::Acquire);
+        // Re-check: if the LSM has pending immutable memtables, skip WAL
+        // truncation (that data is only in the active memtable, not yet in an
+        // SSTable). For ColSegmentStore tables (flushed above), the WAL data
+        // is redundant and safe to truncate regardless.
         let immutable_queue_len = self.lsm_engine.immutable_queue_len();
 
         // 🔥 Flush ColSegmentStore write buffers BEFORE the WAL truncation

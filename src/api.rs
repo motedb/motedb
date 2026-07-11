@@ -1574,7 +1574,10 @@ impl Database {
                     // Cache miss. Try column index first; if no index exists
                     // (ColSegmentStore tables don't auto-create a PK index),
                     // fall through to the general UPDATE path (full scan).
-                    match self.inner.query_by_column(table_name, where_col, &where_value) {
+                    match self
+                        .inner
+                        .query_by_column(table_name, where_col, &where_value)
+                    {
                         Ok(row_ids) => match row_ids.into_iter().next() {
                             Some(rid) => {
                                 lookup.insert(pk_key, rid);

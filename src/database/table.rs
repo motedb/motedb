@@ -44,7 +44,7 @@ impl MoteDB {
         // O(log N) binary-search PK lookups — a disk-based column index is
         // redundant and wastes disk + memory (4GB for 2M rows). We still create
         // the in-memory PK lookup cache for O(1) hot-key resolution.
-        if let Some(pk_col) = schema.primary_key() {
+        if let Some(_pk_col) = schema.primary_key() {
             if !schema.is_primary_key_auto_increment() {
                 // Always create in-memory PK lookup (bounded LRU, O(1) hot keys).
                 let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(

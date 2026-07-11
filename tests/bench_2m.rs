@@ -59,8 +59,8 @@ fn bench_2m_memory_and_perf() {
     println!("  2M-Row Benchmark  |  Target: ≤30MB daily, ≤60MB peak, zero data-dependent growth");
     println!("{}", "═".repeat(80));
 
-    let rss0 = rss_kb();
-    println!("  Baseline RSS (empty DB):         {:>8.1} MB", mb(rss0));
+    let _rss0 = rss_kb();
+    println!("  Baseline RSS (empty DB):         {:>8.1} MB", mb(_rss0));
 
     // ── Schema ──
     db.execute(
@@ -129,9 +129,17 @@ fn bench_2m_memory_and_perf() {
             if p.is_dir() {
                 let sub = print_dir_breakdown(&p, "");
                 total += sub;
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let count = std::fs::read_dir(&p).map(|d| d.count()).unwrap_or(0);
-                println!("    {:<25} {:>10.1} MB ({} entries)", name, sub as f64 / 1_048_576.0, count);
+                println!(
+                    "    {:<25} {:>10.1} MB ({} entries)",
+                    name,
+                    sub as f64 / 1_048_576.0,
+                    count
+                );
             } else if let Ok(m) = e.metadata() {
                 total += m.len();
             }
@@ -242,7 +250,10 @@ fn bench_2m_memory_and_perf() {
         "\n  RSS before heavy query:          {:>8.1} MB",
         mb(rss_before_peak)
     );
-    println!("  RSS peak during GROUP BY:        {:>8.1} MB", mb(rss_peak));
+    println!(
+        "  RSS peak during GROUP BY:        {:>8.1} MB",
+        mb(rss_peak)
+    );
     println!(
         "  RSS after (steady):              {:>8.1} MB",
         mb(rss_kb())
