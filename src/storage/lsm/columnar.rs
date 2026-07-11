@@ -77,6 +77,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[allow(unused_imports)]
 use memmap2::{Mmap, MmapOptions};
 
 // ── Constants ─────────────────────────────────────────────────────
@@ -1071,33 +1072,17 @@ impl ColumnarSSTable {
             footer_buf[15],
         ]);
 
-        // 🚀 Memory-mapped loading: for files > 256KB, use mmap the entire file.
-        // This is ZERO-heap: the mmap region is backed by the OS page cache,
-        // not the process heap. The OS evicts pages under memory pressure.
-        // We use MADV_RANDOM so point queries (binary search over keys) don't
-        // trigger sequential prefetch of the whole file. Scans that need
-        // sequential access will re-madvise as needed.
+        // 🔥 Memory strategy: NO mmap. On macOS, mmap pages are counted as RSS
+        // and the OS doesn't reclaim them aggressively (MADV_DONTNEED is slow).
+        // Instead, we load only the row_map metadata (keys + deleted bitmap)
+        // into heap, and use seek+read for column data. This gives precise
+        // control over memory: column data buffers are freed when the query
+        // completes, and only the row_map (~16MB/2M rows for keys) stays
+        // resident for fast binary search.
         //
-        // For small files (< 256KB), read fully into heap (avoids mmap overhead).
+        // For small files (< 256KB), read fully into heap (avoids seek overhead).
         let lazy_load = file_len > 256 * 1024;
-
-        let mmap: Option<Arc<Mmap>> = if lazy_load {
-            // mmap the file read-only. Safe because the file is immutable after
-            // write (segments are append-only; compaction creates new files).
-            match unsafe { MmapOptions::new().map(&file) } {
-                Ok(m) => {
-                    // Advise the kernel: random access pattern (point queries).
-                    // This prevents the kernel from aggressively prefetching the
-                    // entire file into the page cache on first touch.
-                    let advice = libc::MADV_RANDOM;
-                    let _ = unsafe { libc::madvise(m.as_ptr() as *mut _, m.len(), advice) };
-                    Some(Arc::new(m))
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+        let mmap: Option<Arc<Mmap>> = None;
 
         let mut file_data: Vec<u8> = Vec::new();
 
@@ -1110,8 +1095,6 @@ impl ColumnarSSTable {
         // Read header.
         let header = if !file_data.is_empty() {
             ColumnarHeader::deserialize(&file_data[..HEADER_SIZE])?
-        } else if let Some(ref m) = mmap {
-            ColumnarHeader::deserialize(&m[..HEADER_SIZE])?
         } else {
             file.seek(SeekFrom::Start(0))?;
             let mut hb = vec![0u8; HEADER_SIZE];
@@ -1164,7 +1147,9 @@ impl ColumnarSSTable {
             })
             .collect();
 
-        // Row map: read from file_data, mmap (zero-copy), or seek+read.
+        // Row map: load full row_map (keys + timestamps + deleted) into heap.
+        // For 2M rows this is ~34MB, which fits within the memory budget.
+        // Timestamps are needed by the merge cursor during compaction.
         let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
         let row_map = if !file_data.is_empty() {
             // Small file: already in heap.
@@ -1181,26 +1166,8 @@ impl ColumnarSSTable {
                 data: SegData::Owned(rm_data),
                 deleted_bitmap: del_bmp,
             }
-        } else if let Some(ref m) = mmap {
-            // Large file: zero-copy mmap reference. The deleted bitmap is
-            // eagerly extracted into heap (small: ~250KB for 2M rows) so that
-            // is_deleted/has_any_deleted don't fault the keys/timestamps pages.
-            let del_off = row_map_offset as usize + keys_size + timestamps_size;
-            let del_bmp = RowMap::extract_deleted_bitmap(m, del_off, deleted_len);
-            RowMap {
-                num_rows,
-                keys_offset: 0,
-                timestamps_offset: keys_size,
-                deleted_offset: keys_size + timestamps_size,
-                deleted_len,
-                data: SegData::Mmap {
-                    mmap: Arc::clone(m),
-                    offset: row_map_offset as usize,
-                },
-                deleted_bitmap: del_bmp,
-            }
         } else {
-            // Fallback: seek+read into heap.
+            // Large file: seek+read the entire row_map into heap.
             let mut d = vec![0u8; rm_total];
             file.seek(SeekFrom::Start(row_map_offset))?;
             file.read_exact(&mut d)?;
@@ -1210,7 +1177,7 @@ impl ColumnarSSTable {
                 num_rows,
                 keys_offset: 0,
                 timestamps_offset: keys_size,
-                deleted_offset: keys_size + timestamps_size,
+                deleted_offset: del_off,
                 deleted_len,
                 data: SegData::Owned(d),
                 deleted_bitmap: del_bmp,
@@ -1222,9 +1189,7 @@ impl ColumnarSSTable {
             .map(|&t| unsafe { std::mem::transmute(t) })
             .collect();
 
-        // Cache the file handle for large files WITHOUT mmap (lazy-loaded
-        // seek+read fallback path). When mmap is available, read_segment_bytes
-        // uses the mmap directly, so no file handle is needed.
+        // Cache the file handle for column data reads (seek+read on demand).
         let file = if file_data.is_empty() && mmap.is_none() {
             std::fs::File::open(&path).ok().map(parking_lot::Mutex::new)
         } else {
