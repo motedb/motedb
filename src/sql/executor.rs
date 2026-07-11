@@ -1567,14 +1567,10 @@ impl QueryExecutor {
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
 
-        // 🔥 Clear segment col_cache from the previous query so decoded column
-        // data doesn't accumulate. We do NOT release_pages (MADV_DONTNEED)
-        // here because that would force page re-faults on the next query,
-        // devastating point-query latency (59ms → re-faulting 16MB keys each time).
-        // The OS page cache manages mmap residency automatically.
-        for entry in self.db.col_segment_stores.iter() {
-            entry.clear_cache();
-        }
+        // NOTE: We intentionally do NOT clear segment col_cache here. The cache
+        // is bounded to 16 entries per segment (BoundedColCache), so it can't
+        // grow unboundedly. Clearing it forces point queries to re-decode entire
+        // column segments on every call (20ms+ for 2M-row segments).
 
         let result = match stmt {
             Statement::Select(s) => self.execute_select_streaming_ref(s)?,

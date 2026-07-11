@@ -1227,6 +1227,96 @@ impl ColumnarSSTable {
         }
     }
 
+    /// Read a single fixed-width column value at a specific row index WITHOUT
+    /// decoding the entire column segment. This is the O(1) point-read path —
+    /// it seeks directly to the row's byte offset and reads 8 bytes. Avoids the
+    /// O(N) full-column decode of read_fixed_i64 (which reads + decompresses
+    /// the entire column segment, ~16MB for 2M rows).
+    ///
+    /// Returns Ok(None) for NULL values, Ok(Some(value)) for non-NULL.
+    pub fn read_fixed_i64_at(&self, col_idx: usize, row_idx: usize) -> Result<Option<i64>> {
+        let entry = &self.column_index[col_idx];
+        let null_bytes = self.num_rows.div_ceil(8);
+
+        // Segment layout: [flag:1B][null_bitmap:null_bytes][data:num_rows*8]
+        // But the flag is stripped by decompress_segment, and read_segment_bytes
+        // returns the decompressed payload. For uncompressed data, the payload
+        // is [data after flag]. We need to read the raw segment to access by
+        // offset.
+        //
+        // Strategy: read just the bytes we need via seek+read (bypasses
+        // decompression for uncompressed segments, which is the common case).
+        let seg_start = entry.offset as usize;
+        let _seg_end = seg_start + entry.size as usize;
+
+        // Read the flag byte first.
+        let flag = if !self.file_data.is_empty() {
+            self.file_data[seg_start]
+        } else {
+            let mut buf = [0u8; 1];
+            self.read_raw(seg_start, &mut buf)?;
+            buf[0]
+        };
+
+        // Data starts after the flag byte.
+        let data_start = seg_start + 1;
+        // Null bitmap: data_start .. data_start + null_bytes
+        // Values: data_start + null_bytes .. end
+        let null_offset = data_start + row_idx / 8;
+        let value_offset = data_start + null_bytes + row_idx * 8;
+
+        // Read null bitmap byte.
+        let null_byte = if !self.file_data.is_empty() {
+            self.file_data[null_offset]
+        } else {
+            let mut buf = [0u8; 1];
+            self.read_raw(null_offset, &mut buf)?;
+            buf[0]
+        };
+
+        if (null_byte >> (row_idx % 8)) & 1 != 0 {
+            return Ok(None); // NULL
+        }
+
+        // Read the 8-byte value.
+        let val = if !self.file_data.is_empty() {
+            let s = &self.file_data[value_offset..value_offset + 8];
+            i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        } else if flag == 1 {
+            // Snappy compressed — fall back to full decode (rare for point reads).
+            let seg = self.read_fixed_i64(col_idx)?;
+            seg.get_i64(row_idx).unwrap_or(0)
+        } else {
+            let mut buf = [0u8; 8];
+            self.read_raw(value_offset, &mut buf)?;
+            i64::from_le_bytes(buf)
+        };
+
+        Ok(Some(val))
+    }
+
+    /// Read raw bytes from the file at an absolute offset. Uses the cached file
+    /// handle (no File::open per call).
+    fn read_raw(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        use std::io::{Read, Seek};
+        if !self.file_data.is_empty() {
+            let end = offset + buf.len();
+            if end <= self.file_data.len() {
+                buf.copy_from_slice(&self.file_data[offset..end]);
+                return Ok(());
+            }
+            return Err(StorageError::InvalidData("read_raw out of bounds".into()));
+        }
+        if let Some(ref cached) = self.file {
+            let mut f = cached.lock();
+            f.seek(SeekFrom::Start(offset as u64))?;
+            f.read_exact(buf)?;
+            Ok(())
+        } else {
+            Err(StorageError::InvalidData("No file handle".into()))
+        }
+    }
+
     pub fn read_fixed_i64(&self, col_idx: usize) -> Result<FixedSegment> {
         let tag = self.column_tags[col_idx];
         if !tag.is_fixed() {

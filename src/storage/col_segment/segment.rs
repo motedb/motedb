@@ -3,8 +3,9 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Cached decoded column segment (fixed or text).
+/// Cached decoded column segment (text only — fixed columns use O(1) direct read).
 enum CachedCol {
+    #[allow(dead_code)]
     Fixed(FixedSegment),
     Text(TextSegment),
 }
@@ -95,9 +96,9 @@ impl Segment {
         })
     }
 
-    /// Get a row by composite key, using cached column segments. First access
-    /// to each column decompresses it once; subsequent accesses are O(1) decode.
-    /// This is the fast path for PK point queries.
+    /// Get a row by composite key. For fixed-width columns, uses O(1) direct
+    /// byte read (no full-column decode). For text columns, falls back to
+    /// full-column decode + cache.
     pub fn get_row_cached(
         &self,
         key: u64,
@@ -111,10 +112,30 @@ impl Segment {
             return None;
         }
 
-        // Decode each column from cache (lazy populate, bounded).
         let mut row = Vec::with_capacity(col_types.len());
         for (ci, ct) in col_types.iter().enumerate() {
-            // Try cache first.
+            let tag = self.sst.column_tags.get(ci).copied();
+
+            if matches!(tag, Some(t) if t.is_fixed()) {
+                // O(1) direct read — no full-column decode needed.
+                match self.sst.read_fixed_i64_at(ci, idx) {
+                    Ok(Some(v)) => match ct {
+                        crate::types::ColumnType::Integer => row.push(Value::Integer(v)),
+                        crate::types::ColumnType::Float => {
+                            row.push(Value::Float(f64::from_bits(v as u64)))
+                        }
+                        crate::types::ColumnType::Boolean => row.push(Value::Bool(v != 0)),
+                        crate::types::ColumnType::Timestamp => {
+                            row.push(Value::Timestamp(crate::types::Timestamp::from_micros(v)))
+                        }
+                        _ => row.push(Value::Null),
+                    },
+                    _ => row.push(Value::Null),
+                }
+                continue;
+            }
+
+            // Text column: try cache, then full-column decode.
             {
                 let mut cache = self.col_cache.lock();
                 if let Some(cached) = cache.get(ci) {
@@ -122,11 +143,7 @@ impl Segment {
                     continue;
                 }
             }
-            // Cache miss: decode + insert.
-            let tag = self.sst.column_tags.get(ci).copied();
-            let decoded = if matches!(tag, Some(t) if t.is_fixed()) {
-                self.sst.read_fixed_i64(ci).ok().map(CachedCol::Fixed)
-            } else if matches!(tag, Some(ColumnTypeTag::Text)) {
+            let decoded = if matches!(tag, Some(ColumnTypeTag::Text)) {
                 self.sst.read_text(ci).ok().map(CachedCol::Text)
             } else {
                 None
