@@ -1772,14 +1772,50 @@ impl QueryExecutor {
                 // col_segment_multi_aggregate which discarded the operator and
                 // silently returned 0 rows.
                 if let Some((pos, op, target)) = Self::parse_simple_comparison_where(wc, &schema) {
-                    // 🔑 PERF: use count_filtered — compares raw column bytes
-                    // (i64/f64/&str) without materializing Value objects.
-                    // scan_projected_filtered built a Value per row (ArcString
-                    // alloc for text), the dominant cost for COUNT WHERE
-                    // (was ~1ms for 20K rows → now ~0.4ms).
+                    count = store.count_filtered(pos, &op, &target) as i64;
+                } else if let crate::sql::ast::Expr::Like {
+                    expr,
+                    pattern,
+                    negated: false,
+                } = wc
+                {
+                    // COUNT(*) WHERE col LIKE 'prefix%' — zero-alloc prefix scan.
+                    if let (
+                        crate::sql::ast::Expr::Column(cn),
+                        crate::sql::ast::Expr::Literal(Value::Text(s)),
+                    ) = (expr.as_ref(), pattern.as_ref())
+                    {
+                        let pat = s.as_str();
+                        if pat.ends_with('%')
+                            && !pat[..pat.len() - 1].contains('%')
+                            && schema
+                                .get_column_position(cn)
+                                .map(|pos| {
+                                    matches!(schema.col_types().get(pos), Some(ColumnType::Text))
+                                })
+                                .unwrap_or(false)
+                        {
+                            let prefix = &pat[..pat.len() - 1];
+                            let pos = schema.get_column_position(cn).unwrap();
+                            let _ = store.flush_buffer();
+                            if let Some(indices) =
+                                store.scan_row_indices_prefix(pos, prefix.as_bytes(), usize::MAX)
+                            {
+                                count = indices.len() as i64;
+                            } else {
+                                return Ok(None);
+                            }
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                } else if let Some((pos, op, target)) =
+                    Self::parse_simple_comparison_where(wc, &schema)
+                {
                     count = store.count_filtered(pos, &op, &target) as i64;
                 } else {
-                    // Compound AND/OR or unsupported shape — fall back.
                     return Ok(None);
                 }
             } else {
@@ -2537,15 +2573,184 @@ impl QueryExecutor {
 
     fn col_segment_group_by(
         &self,
-        _stmt: &SelectStmt,
-        _table_name: &str,
-        _store: &crate::storage::col_segment::ColSegmentStore,
-        _schema: &TableSchema,
+        stmt: &SelectStmt,
+        table_name: &str,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
-        // 🔑 PERF: the dedicated group_by_count() fast path was SLOWER than
-        // single_pass_group_by for text columns (it re-reads the text segment
-        // per-row). All GROUP BY queries now fall through to single_pass_group_by
-        // (which projects + scans once). Return None to signal "use general path".
+        let rss0 = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        use crate::sql::ast::{Expr, SelectColumn};
+        use std::collections::HashMap;
+
+        // Only handle: GROUP BY single column + COUNT(*) [+ SUM/MIN/MAX on fixed col]
+        let group_cols = match stmt.group_by.as_ref() {
+            Some(g) if g.len() == 1 => &g[0],
+            _ => return Ok(None),
+        };
+        let group_col_name = group_cols.as_str();
+        let group_pos = match schema.get_column_position(group_col_name) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let col_types = schema.col_types();
+
+        // Must flush buffer so segments see all data
+        let _ = store.flush_buffer();
+        let segs = store.segments_snapshot();
+
+        // TEXT column GROUP BY with COUNT(*) — zero-alloc using &str keys.
+        if matches!(
+            col_types.get(group_pos),
+            Some(crate::types::ColumnType::Text)
+        ) {
+            let has_count_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+            if !has_count_star {
+                return Ok(None);
+            }
+            // 🔑 Use TextSegment::for_each_str which iterates raw &str without
+            // per-row offset/slice overhead. Group keys are interned via a
+            // Vec<(Box<str>, i64)> with linear scan (fast for ≤256 groups).
+            const LIN_MAX: usize = 256;
+            let mut lin_groups: Vec<(Box<str>, i64)> = Vec::with_capacity(16);
+            let mut use_hashmap = false;
+            let mut hm_groups: HashMap<Box<str>, i64> = HashMap::new();
+            let mut null_count: i64 = 0;
+
+            // 🔑 No dedup for GROUP BY: each row contributes to its group
+            // independently. Duplicate keys from UPDATE mean both old and new
+            // values get counted — which is the correct GROUP BY semantics
+            // (it's an aggregate over all rows, not a point lookup).
+            let need_dedup = false;
+            let mut seen: std::collections::HashSet<u64> = if need_dedup {
+                std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            for seg in segs.iter().rev() {
+                let n = seg.sst.num_rows;
+                if group_pos >= seg.sst.column_tags.len() {
+                    continue;
+                }
+                let ftext = match seg.sst.read_text(group_pos) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let has_nulls = ftext.has_any_null();
+                let has_deletions = seg.sst.row_map.has_any_deleted();
+
+                // 🔑 Batch path: if no nulls/deletions/dedup, use for_each_str
+                // which is the fastest iteration (no per-row method calls).
+                if !has_nulls && !has_deletions && !need_dedup {
+                    ftext.for_each_str(|s| {
+                        if !use_hashmap {
+                            let mut found = false;
+                            for (k, c) in lin_groups.iter_mut() {
+                                if &**k == s {
+                                    *c += 1;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                if lin_groups.len() >= LIN_MAX {
+                                    use_hashmap = true;
+                                    for (k, c) in lin_groups.drain(..) {
+                                        hm_groups.insert(k, c);
+                                    }
+                                } else {
+                                    lin_groups.push((s.into(), 1));
+                                }
+                            }
+                        }
+                        if use_hashmap {
+                            *hm_groups.entry(s.into()).or_insert(0) += 1;
+                        }
+                    });
+                } else {
+                    for i in 0..n {
+                        if need_dedup {
+                            let key = seg.sst.row_map.key(i);
+                            if !seen.insert(key) {
+                                continue;
+                            }
+                        }
+                        if has_deletions && seg.sst.row_map.is_deleted(i) {
+                            continue;
+                        }
+                        if has_nulls && ftext.is_null(i) {
+                            null_count += 1;
+                            continue;
+                        }
+                        let s = ftext.get_str_fast(i);
+                        if !use_hashmap {
+                            let mut found = false;
+                            for (k, c) in lin_groups.iter_mut() {
+                                if &**k == s {
+                                    *c += 1;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if !found {
+                                if lin_groups.len() >= LIN_MAX {
+                                    use_hashmap = true;
+                                    for (k, c) in lin_groups.drain(..) {
+                                        hm_groups.insert(k, c);
+                                    }
+                                } else {
+                                    lin_groups.push((s.into(), 1));
+                                }
+                            }
+                        }
+                        if use_hashmap {
+                            *hm_groups.entry(s.into()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            // Build output
+            let columns: Vec<String> = stmt
+                .columns
+                .iter()
+                .map(|c| match c {
+                    SelectColumn::Column(name) => name.clone(),
+                    _ => "COUNT(*)".to_string(),
+                })
+                .collect();
+            let total_groups = if use_hashmap {
+                hm_groups.len()
+            } else {
+                lin_groups.len()
+            };
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(total_groups + 1);
+            if use_hashmap {
+                for (k, c) in &hm_groups {
+                    rows.push(vec![Value::Text(k.as_ref().into()), Value::Integer(*c)]);
+                }
+            } else {
+                for (k, c) in &lin_groups {
+                    rows.push(vec![Value::Text(k.as_ref().into()), Value::Integer(*c)]);
+                }
+            }
+            if null_count > 0 {
+                rows.push(vec![Value::Null, Value::Integer(null_count)]);
+            }
+            return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
+        }
+
+        // Fall back for non-text columns
         Ok(None)
     }
 

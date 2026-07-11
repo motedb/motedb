@@ -1497,7 +1497,7 @@ impl ColSegmentStore {
     /// appear only when an UPDATE was buffered and NOT yet flushed/compacted.
     /// Returns false for the common case (no pending UPDATEs), letting the scan
     /// path skip dedup entirely (the v0.5.0 performance fix).
-    fn may_have_duplicate_keys(&self) -> bool {
+    pub fn may_have_duplicate_keys(&self) -> bool {
         // The write buffer can hold a newer version of an already-segmented key.
         // Multiple segments can also hold overlapping keys (e.g. an INSERT
         // segment flushed by auto-checkpoint, then an UPDATE segment from a

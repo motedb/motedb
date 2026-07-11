@@ -707,14 +707,40 @@ impl TextSegment {
     /// Skips NULL rows. Used by GROUP BY to avoid per-row offset/slice overhead.
     pub fn for_each_str<F: FnMut(&str)>(&self, mut f: F) {
         let n = self.num_rows;
-        // If no nulls, skip the null check entirely.
         let has_nulls = self.has_any_null();
-        for i in 0..n {
-            if has_nulls && self.is_null(i) {
-                continue;
+        // 🔑 Fast path: no nulls, contiguous offsets — walk raw bytes.
+        let off_bytes = self.offsets_data.as_bytes();
+        let str_bytes = self.string_data.as_bytes();
+        if !has_nulls && off_bytes.len() >= (n + 1) * 4 {
+            for i in 0..n {
+                let ob = i * 4;
+                let start = u32::from_le_bytes([
+                    off_bytes[ob],
+                    off_bytes[ob + 1],
+                    off_bytes[ob + 2],
+                    off_bytes[ob + 3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    off_bytes[ob + 4],
+                    off_bytes[ob + 5],
+                    off_bytes[ob + 6],
+                    off_bytes[ob + 7],
+                ]) as usize;
+                let s = if self.trust_utf8 {
+                    unsafe { std::str::from_utf8_unchecked(&str_bytes[start..end]) }
+                } else {
+                    std::str::from_utf8(&str_bytes[start..end]).unwrap_or("")
+                };
+                f(s);
             }
-            let s = self.get_str_fast(i);
-            f(s);
+        } else {
+            for i in 0..n {
+                if has_nulls && self.is_null(i) {
+                    continue;
+                }
+                let s = self.get_str_fast(i);
+                f(s);
+            }
         }
     }
 
