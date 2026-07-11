@@ -1480,6 +1480,16 @@ impl ColSegmentStore {
         }
     }
 
+    /// Clear segment col_cache WITHOUT releasing mmap pages. Use this between
+    /// queries to prevent decoded column data from accumulating, while keeping
+    /// mmap pages resident for fast point queries.
+    pub fn clear_cache(&self) {
+        let segs = self.segments.read();
+        for seg in segs.iter() {
+            seg.clear_cache();
+        }
+    }
+
     /// After flush+compaction to a single segment, return that segment's SSTable
     /// as a shared Arc. Legacy read paths (aggregate, GROUP BY) read
     /// `columnar_sstables: DashMap<String, Arc<ColumnarSSTable>>`; this lets them

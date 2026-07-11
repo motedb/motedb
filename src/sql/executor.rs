@@ -1567,13 +1567,13 @@ impl QueryExecutor {
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
 
-        // 🔥 Release query memory from the previous query before starting a new
-        // one. This clears segment col_cache and releases mmap pages (MADV_
-        // DONTNEED) so RSS doesn't accumulate across queries. Without this,
-        // each full-table scan caches decoded columns and faults mmap pages
-        // into RSS, causing steady-state RSS to grow with query count.
+        // 🔥 Clear segment col_cache from the previous query so decoded column
+        // data doesn't accumulate. We do NOT release_pages (MADV_DONTNEED)
+        // here because that would force page re-faults on the next query,
+        // devastating point-query latency (59ms → re-faulting 16MB keys each time).
+        // The OS page cache manages mmap residency automatically.
         for entry in self.db.col_segment_stores.iter() {
-            entry.release_query_memory();
+            entry.clear_cache();
         }
 
         let result = match stmt {
@@ -2914,6 +2914,26 @@ impl QueryExecutor {
         // S9: ColSegmentStore tables — flush only (no compaction). Aggregate paths
         // (col_segment_aggregate) handle multi-segment directly. Compaction is
         // deferred to keep first-query P99 <50ms.
+
+        // 🔑 PK point query fast path: `WHERE pk = literal` → O(log N) binary
+        // search in the segment's row_map. This intercepts the most common
+        // point query BEFORE the full-scan routing, cutting latency from
+        // O(rows) to O(log rows).
+        if let Some(ref wc) = stmt.where_clause {
+            if let Some(TableRef::Table {
+                name: table_name, ..
+            }) = stmt.from.as_ref()
+            {
+                if self.db.has_col_segment_store(table_name) {
+                    if let Some(result) =
+                        self.try_col_segment_pk_point_query(stmt, table_name, wc)?
+                    {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
         if (self.has_aggregates(&stmt.columns)
             || stmt.group_by.is_some()
             || stmt.order_by.is_some()
@@ -5775,8 +5795,15 @@ impl QueryExecutor {
                 // AUTO_INCREMENT: pk value IS the row_id.
                 (table_id << 32) | (*id as u64 & 0xFFFFFFFF)
             }
+            Value::Integer(id) => {
+                // Non-AUTO_INCREMENT Integer PK: the PK value is used as the
+                // row_id (see crud.rs insert path), so composite_key =
+                // (table_id << 32) | pk_value. This enables O(log N) binary
+                // search in RowMap without a secondary index.
+                (table_id << 32) | (*id as u64 & 0xFFFFFFFF)
+            }
             _ => {
-                // Non-AUTO_INCREMENT: use pk_lookup cache to resolve pk → row_id.
+                // Non-Integer PK: use pk_lookup cache to resolve pk → row_id.
                 // If cache miss, fall back to scan (return None).
                 let pk_key = crate::database::pk_cache::PkKey::from_value(&literal);
                 match self
@@ -5813,7 +5840,6 @@ impl QueryExecutor {
                 }));
             }
         };
-
         // Build output: SELECT * → full row; SELECT col1, col2 → project.
         let columns: Vec<String> = self
             .build_select_columns(&stmt.columns, &schema)

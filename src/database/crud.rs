@@ -225,9 +225,37 @@ impl MoteDB {
                 id as RowId
             } // end else (auto counter path)
         } else {
-            // Non-AUTO_INCREMENT: use global row_id (lock-free atomic)
-            self.next_row_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            // Non-AUTO_INCREMENT: if the PK is an Integer column with a user-
+            // provided value, use it as the row_id. This makes composite_key =
+            // (table_id << 32) | pk_value, enabling O(log N) RowMap binary
+            // search for point queries (WHERE pk = value) without a secondary
+            // index. Falls back to global row_id for non-integer or NULL PKs.
+            if let Some(pk_col_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_col_name) {
+                    if matches!(pk_col.col_type, crate::types::ColumnType::Integer) {
+                        if let Some(Value::Integer(pk_val)) = row.get(pk_col.position) {
+                            if *pk_val >= 0 {
+                                *pk_val as RowId
+                            } else {
+                                self.next_row_id
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            }
+                        } else {
+                            self.next_row_id
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        }
+                    } else {
+                        self.next_row_id
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    }
+                } else {
+                    self.next_row_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                }
+            } else {
+                self.next_row_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            }
         };
 
         // 4. Determine partition
