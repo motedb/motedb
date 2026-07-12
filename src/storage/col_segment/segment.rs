@@ -29,6 +29,7 @@ impl BoundedColCache {
         }
     }
 
+    #[allow(dead_code)]
     fn get(&mut self, col_idx: usize) -> Option<&CachedCol> {
         // Move to front (MRU).
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == col_idx) {
@@ -135,25 +136,30 @@ impl Segment {
                 continue;
             }
 
-            // Text column: try cache, then full-column decode.
-            {
-                let mut cache = self.col_cache.lock();
-                if let Some(cached) = cache.get(ci) {
-                    row.push(decode_cached_value(cached, idx, ct));
-                    continue;
+            // Text column: use col_cache (full-column decode, cached for reuse).
+            // read_text_at (O(1) per-row) was too slow due to multiple seeks per
+            // column on macOS. The cache is bounded (16 entries) and cleared
+            // after scan queries via release_query_memory.
+            if matches!(tag, Some(ColumnTypeTag::Text)) {
+                {
+                    let mut cache = self.col_cache.lock();
+                    if let Some(cached) = cache.get(ci) {
+                        row.push(decode_cached_value(cached, idx, ct));
+                        continue;
+                    }
                 }
+                let decoded = self.sst.read_text(ci).ok().map(CachedCol::Text);
+                if let Some(d) = decoded {
+                    row.push(decode_cached_value(&d, idx, ct));
+                    self.col_cache.lock().insert(ci, d);
+                } else {
+                    row.push(Value::Null);
+                }
+                continue;
             }
-            let decoded = if matches!(tag, Some(ColumnTypeTag::Text)) {
-                self.sst.read_text(ci).ok().map(CachedCol::Text)
-            } else {
-                None
-            };
-            if let Some(d) = decoded {
-                row.push(decode_cached_value(&d, idx, ct));
-                self.col_cache.lock().insert(ci, d);
-            } else {
-                row.push(Value::Null);
-            }
+
+            // Unknown column type.
+            row.push(Value::Null);
         }
         Some(row)
     }

@@ -1664,6 +1664,70 @@ impl ColumnarSSTable {
         TextSegment::from_bytes(&seg_bytes, self.num_rows)
     }
 
+    /// Read a single text value at a specific row index WITHOUT decoding the
+    /// entire text column. Reads only the offset pair (8 bytes) + the string
+    /// bytes. This is the O(1) point-read path for text columns.
+    pub fn read_text_at(&self, col_idx: usize, row_idx: usize) -> Result<Option<String>> {
+        let entry = &self.column_index[col_idx];
+        let null_bytes = self.num_rows.div_ceil(8);
+        let data_base = entry.offset as usize + 1; // skip flag byte
+        let offsets_region = data_base + null_bytes;
+        let strings_region = offsets_region + (self.num_rows + 1) * 4;
+
+        // Single read: null byte (1B) + offset pair (8B) = 9 bytes.
+        // Read them in one seek+read to minimize syscall count.
+        let null_off = data_base + row_idx / 8;
+        let off_pos = offsets_region + row_idx * 4;
+
+        // Read null byte + offsets in one combined read if they're close enough.
+        // null_off and off_pos may be far apart, so read separately but batch
+        // the offset pair (8 bytes) in one read.
+        let null_byte = if !self.file_data.is_empty() {
+            self.file_data.get(null_off).copied().unwrap_or(0)
+        } else {
+            let mut buf = [0u8; 1];
+            if self.read_raw(null_off, &mut buf).is_err() {
+                return Ok(None);
+            }
+            buf[0]
+        };
+        if (null_byte >> (row_idx % 8)) & 1 != 0 {
+            return Ok(None); // NULL
+        }
+
+        // Read offset pair (8 bytes).
+        let mut off_buf = [0u8; 8];
+        if !self.file_data.is_empty() {
+            if off_pos + 8 <= self.file_data.len() {
+                off_buf.copy_from_slice(&self.file_data[off_pos..off_pos + 8]);
+            } else {
+                return Ok(None);
+            }
+        } else {
+            if self.read_raw(off_pos, &mut off_buf).is_err() {
+                return Ok(None);
+            }
+        }
+        let start = u32::from_le_bytes([off_buf[0], off_buf[1], off_buf[2], off_buf[3]]) as usize;
+        let end = u32::from_le_bytes([off_buf[4], off_buf[5], off_buf[6], off_buf[7]]) as usize;
+        let len = end.saturating_sub(start);
+        if len == 0 {
+            return Ok(Some(String::new()));
+        }
+
+        // Read string bytes.
+        let str_pos = strings_region + start;
+        let mut str_buf = vec![0u8; len];
+        if !self.file_data.is_empty() {
+            if str_pos + len <= self.file_data.len() {
+                str_buf.copy_from_slice(&self.file_data[str_pos..str_pos + len]);
+            }
+        } else {
+            let _ = self.read_raw(str_pos, &mut str_buf);
+        }
+        Ok(Some(String::from_utf8_lossy(&str_buf).into_owned()))
+    }
+
     /// Read column segment bytes via seek+read from file. Only reads the
     /// specific column's bytes — NOT the entire file. This avoids mmap
     /// page residency and keeps RSS low (<30MB for embedded devices).
