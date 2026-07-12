@@ -106,8 +106,8 @@ impl Segment {
     ) -> Option<Vec<crate::types::Value>> {
         use crate::types::Value;
 
-        // Binary search in RowMap for the row index.
-        let idx = self.sst.row_map.find_key(key)?;
+        // Find row index via sparse fence index (O(1) memory).
+        let idx = self.sst.find_row_by_key(key)?;
         if self.sst.row_map.is_deleted(idx) {
             return None;
         }

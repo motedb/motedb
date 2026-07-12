@@ -1389,6 +1389,7 @@ impl MoteDB {
             self.sync_col_segment_to_sstables(table_name);
         }
         if let Some(col_sst) = self.columnar_sstables.get(table_name).as_deref() {
+            let _ = col_sst.load_full_keys();
             let num_cols = col_types.len();
             let mut segments: Vec<ColumnarSegment> = Vec::with_capacity(num_cols);
             for col_idx in 0..num_cols {
@@ -1678,6 +1679,7 @@ impl MoteDB {
                     .collect();
                 let mut guard = builder_arc.value().lock();
                 let _ = old_sst.load_all_timestamps();
+                let _ = old_sst.load_full_keys();
                 for i in 0..old_sst.num_rows {
                     if old_sst.row_map.is_deleted(i) {
                         continue;
@@ -3303,6 +3305,7 @@ fn build_column_segment(
     num_rows: usize,
 ) -> Result<ColumnarSegment> {
     use crate::storage::lsm::columnar::ColumnTypeTag;
+    let _ = col_sst.load_full_keys();
     let tag = col_sst.column_tags.get(col_idx);
     match tag {
         Some(ColumnTypeTag::Vector) => {

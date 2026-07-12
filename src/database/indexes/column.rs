@@ -79,6 +79,7 @@ impl MoteDB {
                     for seg in segs.iter().rev() {
                         let n = seg.sst.num_rows;
                         let has_deletions = seg.sst.row_map.has_any_deleted();
+                        let _ = seg.sst.load_full_keys();
                         if seg.sst.column_tags[col_position].is_fixed() {
                             if let Ok(fseg) = seg.sst.read_fixed_i64(col_position) {
                                 raw_entries.reserve(n);
@@ -164,6 +165,7 @@ impl MoteDB {
                 } else if let Some(col_sst) = self.columnar_sstables.get(table_name) {
                     // Legacy single-SSTable path.
                     let num_rows = col_sst.num_rows;
+                    let _ = col_sst.load_full_keys();
                     let mut batch: Vec<(crate::types::Value, RowId)> =
                         Vec::with_capacity(SORT_BATCH);
 

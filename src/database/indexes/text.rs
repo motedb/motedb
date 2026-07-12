@@ -120,6 +120,7 @@ impl MoteDB {
 
         let mut batch: Vec<(RowId, String)> = Vec::with_capacity(10000);
         let mut total = 0usize;
+        let _ = col_sst.load_full_keys();
         for i in 0..col_sst.num_rows {
             if col_sst.row_map.is_deleted(i) {
                 continue;
@@ -163,6 +164,7 @@ impl MoteDB {
         for seg in segs.iter() {
             let n = seg.sst.num_rows;
             let has_deletions = seg.sst.row_map.has_any_deleted();
+            let _ = seg.sst.load_full_keys();
             match seg.sst.read_text(col_position) {
                 Ok(tseg) => {
                     let has_nulls = tseg.has_any_null();

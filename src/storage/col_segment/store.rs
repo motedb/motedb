@@ -371,18 +371,16 @@ impl ColSegmentStore {
         }
         let segs = self.segments.read();
         for seg in segs.iter().rev() {
-            // Check if this segment contains the key at all.
-            if let Some(idx) = seg.sst.row_map.find_key(key) {
-                // Key is in this segment. If deleted, it's a tombstone — the
-                // newest version of this key is a deletion, so return None
-                // regardless of older segments.
+            // Check if this segment contains the key using the sparse fence
+            // index (O(1) memory, ~16KB disk read for the key block).
+            if let Some(idx) = seg.sst.find_row_by_key(key) {
+                // Key is in this segment. If deleted, it's a tombstone.
                 if seg.sst.row_map.is_deleted(idx) {
                     return None;
                 }
-                // Live row: decode and return.
+                // Live row: decode and return using O(1) column read.
                 return seg.get_row_cached(key, &self.col_types);
             }
-            // Key not in this segment — continue to older segments.
         }
         None
     }
@@ -460,6 +458,7 @@ impl ColSegmentStore {
         };
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             // Descending index order within a segment: rows are appended old→new,
             // so iterating n→0 visits the newest (largest index) version of a key
             // first. Combined with `seen`, this keeps the newest version.
@@ -841,6 +840,7 @@ impl ColSegmentStore {
         let plen = prefix.len();
         for (sidx, seg) in segs.iter().enumerate() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let ftext = match seg.sst.read_text(filter_col) {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -913,6 +913,7 @@ impl ColSegmentStore {
             std::collections::HashSet::new()
         };
         for (sidx, seg) in segs.iter().enumerate().rev() {
+            let _ = seg.sst.load_full_keys();
             let ftext = match seg.sst.read_text(filter_col) {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -967,6 +968,7 @@ impl ColSegmentStore {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         };
         for (sidx, seg) in segs.iter().enumerate() {
+            let _ = seg.sst.load_full_keys();
             let ftext = match seg.sst.read_text(filter_col) {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -1104,6 +1106,7 @@ impl ColSegmentStore {
 
         'outer: for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
 
             // Filter column: read text segment once, predicate gets &str directly.
             let ftext = seg.sst.read_text(filter_col).ok();
@@ -1410,6 +1413,7 @@ impl ColSegmentStore {
         let mut heap: BinaryHeap<(OrdF64, u64)> = BinaryHeap::with_capacity(k + 1);
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let fseg = match seg.sst.read_fixed_i64(sort_col) {
                 Ok(f) => f,
                 Err(_) => continue,
@@ -1588,6 +1592,7 @@ impl ColSegmentStore {
         let mut count = 0usize;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             if filter_col >= seg.sst.column_tags.len() {
                 continue;
             }
@@ -1710,6 +1715,7 @@ impl ColSegmentStore {
         let mut result = AggregateResult::default();
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             if agg_col >= seg.sst.column_tags.len() {
                 continue;
             }
@@ -1874,6 +1880,7 @@ impl ColSegmentStore {
         };
         // Newest-version-wins: iterate segments newest→oldest.
         for seg in segs.iter().rev() {
+            let _ = seg.sst.load_full_keys();
             for i in (0..seg.sst.num_rows).rev() {
                 let key = seg.sst.row_map.key(i);
                 if liveness.contains_key(&key) {
@@ -1906,6 +1913,7 @@ impl ColSegmentStore {
         let mut sum = 0.0f64;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let ftext = seg.sst.read_text(filter_col).ok();
             let fsum = seg.sst.read_fixed_i64(sum_col).ok();
             if let Some(tseg) = ftext.as_ref() {
@@ -1954,6 +1962,7 @@ impl ColSegmentStore {
         let mut max = f64::NEG_INFINITY;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let ftext = seg.sst.read_text(filter_col).ok();
             let fagg = seg.sst.read_fixed_i64(agg_col).ok();
             if let Some(tseg) = ftext.as_ref() {
@@ -2005,6 +2014,7 @@ impl ColSegmentStore {
         let mut max = f64::NEG_INFINITY;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let ftext = seg.sst.read_text(filter_col).ok();
             let fagg = seg.sst.read_fixed_i64(agg_col).ok();
             if let Some(tseg) = ftext.as_ref() {
@@ -2159,6 +2169,7 @@ impl ColSegmentStore {
         };
         for (sidx, seg) in segs.iter().enumerate() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let has_deletions = seg.sst.row_map.has_any_deleted();
             // Read via the decoder matching the column's stored type. Reading a
             // Float column as i64 reinterprets the bits → garbage sort keys.
@@ -2264,6 +2275,7 @@ impl ColSegmentStore {
 
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             if group_col >= seg.sst.column_tags.len() {
                 continue;
             }
@@ -2332,6 +2344,7 @@ impl ColSegmentStore {
         'outer: for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
             let has_deletions = seg.sst.row_map.has_any_deleted();
+            let _ = seg.sst.load_full_keys();
             if let Ok(tseg) = seg.sst.read_text(col) {
                 for i in 0..n {
                     let key = seg.sst.row_map.key(i);
@@ -2469,6 +2482,7 @@ impl ColSegmentStore {
         };
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let gtext = seg.sst.read_text(group_col).ok();
             let afix = seg.sst.read_fixed_i64(agg_col).ok();
             let has_deletions = seg.sst.row_map.has_any_deleted();
@@ -2527,6 +2541,7 @@ impl ColSegmentStore {
         };
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
             let gfix = seg.sst.read_fixed_i64(group_col).ok();
             let afix = seg.sst.read_fixed_i64(agg_col).ok();
             if let Some(gseg) = gfix.as_ref() {
@@ -2662,6 +2677,7 @@ impl ColSegmentStore {
             max = max.max(key & 0xFFFFFFFF);
         }
         for seg in self.segments.read().iter() {
+            let _ = seg.sst.load_full_keys();
             for i in 0..seg.sst.num_rows {
                 let key = seg.sst.row_map.key(i);
                 max = max.max(key & 0xFFFFFFFF);
@@ -2714,6 +2730,7 @@ impl ColSegmentStore {
                 let n = seg.sst.num_rows;
                 // Load timestamps from disk (lazy — only needed during merge).
                 let _ = seg.sst.load_all_timestamps();
+                let _ = seg.sst.load_full_keys();
                 let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
                     ..ncols)
                     .map(|ci| {
@@ -2779,6 +2796,7 @@ impl ColSegmentStore {
                 let n = seg.sst.num_rows;
                 // Load timestamps from disk (lazy — only needed during merge).
                 let _ = seg.sst.load_all_timestamps();
+                let _ = seg.sst.load_full_keys();
                 let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
                     ..ncols)
                     .map(|ci| {

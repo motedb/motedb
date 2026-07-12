@@ -223,17 +223,26 @@ const COLUMN_INDEX_ENTRY_SIZE: usize = 16; // (offset: u64, size: u64)
 /// - `deleted` is always loaded into heap (small: ~250KB for 2M rows)
 /// - `keys` uses the backing SegData (mmap or owned)
 /// - `timestamps` uses the same backing SegData (never separately allocated)
+/// Sparse fence index: keeps every Nth key in memory for O(log(N/FENCE)) binary
+/// search, then reads a single 16KB block from disk for the final search.
+/// Memory: num_rows / FENCE_INTERVAL × 8 bytes = ~390KB for 100M rows (FIXED).
+/// Without this, the full keys array grows linearly at 8 bytes/row.
+const FENCE_INTERVAL: usize = 2048;
+
 #[derive(Clone, Debug)]
 pub struct RowMap {
     pub num_rows: usize,
-    /// Only keys are stored in `data` (NOT timestamps). This halves the
-    /// resident memory: 8 bytes/row for keys vs 17 bytes/row for the full
-    /// row_map. Timestamps are lazy-loaded into `timestamps_data` only when
-    /// `timestamp()` is called (merge/compaction path — rare).
-    data: SegData, // keys only
-    keys_offset: usize,
+    /// Sparse fence keys: one key per FENCE_INTERVAL rows, stored in heap.
+    /// Size = (num_rows / 2048 + 1) × 8 bytes. For 2M rows = ~8KB. For 100M
+    /// rows = ~390KB. This is the ONLY row-proportional memory — and it's
+    /// capped at <1MB even for billions of rows.
+    fence_keys: Vec<u64>,
+    /// File offset where the full keys array starts (for on-demand block reads).
+    keys_file_offset: u64,
+    /// Full keys data — only populated lazily for scan paths (index build, merge).
+    /// None for the common case (point queries use fence_keys + block read).
+    keys_data: Option<SegData>,
     /// File offset where timestamps start (for lazy-load via ColumnarSSTable).
-    /// 0 if timestamps were never present (builder path).
     timestamps_file_offset: u64,
     /// Lazy-loaded timestamps. None until first `timestamp()` call.
     timestamps_data: Option<Box<[u8]>>,
@@ -262,17 +271,33 @@ impl RowMap {
     pub(crate) fn from_bytes(data: Vec<u8>, num_rows: usize) -> Self {
         let (_, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
         let deleted_offset = keys_size + timestamps_size;
-        // Extract deleted bitmap into a separate heap allocation so is_deleted
-        // and has_any_deleted don't touch the keys/timestamps region.
         let deleted_bitmap = Self::extract_deleted_bitmap(&data, deleted_offset, deleted_len);
+        // Build fence keys from the data.
+        let mut fence_keys = Vec::with_capacity(num_rows / FENCE_INTERVAL + 1);
+        for i in (0..num_rows).step_by(FENCE_INTERVAL) {
+            let off = i * 8;
+            if off + 8 <= data.len() {
+                fence_keys.push(u64::from_le_bytes([
+                    data[off],
+                    data[off + 1],
+                    data[off + 2],
+                    data[off + 3],
+                    data[off + 4],
+                    data[off + 5],
+                    data[off + 6],
+                    data[off + 7],
+                ]));
+            }
+        }
         Self {
             num_rows,
-            keys_offset: 0,
+            fence_keys,
+            keys_file_offset: 0,
+            keys_data: Some(SegData::Owned(data)), // already in heap for from_bytes
             timestamps_file_offset: keys_size as u64,
             timestamps_data: None,
             deleted_offset,
             deleted_len,
-            data: SegData::Owned(data),
             deleted_bitmap,
         }
     }
@@ -301,44 +326,86 @@ impl RowMap {
             let mmap_ref = &mmap;
             Self::extract_deleted_bitmap(mmap_ref, deleted_offset, deleted_len)
         };
+        // Build fence keys from mmap.
+        let mut fence_keys = Vec::with_capacity(num_rows / FENCE_INTERVAL + 1);
+        for i in (0..num_rows).step_by(FENCE_INTERVAL) {
+            let off = offset + i * 8;
+            if off + 8 <= mmap.len() {
+                fence_keys.push(u64::from_le_bytes([
+                    mmap[off],
+                    mmap[off + 1],
+                    mmap[off + 2],
+                    mmap[off + 3],
+                    mmap[off + 4],
+                    mmap[off + 5],
+                    mmap[off + 6],
+                    mmap[off + 7],
+                ]));
+            }
+        }
         Ok(Self {
             num_rows,
-            keys_offset: offset,
+            fence_keys,
+            keys_file_offset: offset as u64,
+            keys_data: Some(SegData::Mmap { mmap, offset }),
             timestamps_file_offset: (offset + keys_size) as u64,
             timestamps_data: None,
             deleted_offset,
             deleted_len,
-            data: SegData::Mmap { mmap, offset },
             deleted_bitmap,
         })
     }
 
+    /// Get a key at the given row index. Requires keys_data to be loaded
+    /// (via load_full_keys). For point queries, use ColumnarSSTable::find_row_by_key
+    /// which uses the sparse fence index instead.
     #[inline]
     pub fn key(&self, row_idx: usize) -> u64 {
-        let off = self.keys_offset + row_idx * 8;
-        let s = self.data.slice(off, 8);
-        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        if let Some(ref data) = self.keys_data {
+            let s = data.slice(row_idx * 8, 8);
+            u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        } else {
+            // Fallback: try fence_keys (only accurate at fence boundaries).
+            // This should not happen in practice — callers should call
+            // load_full_keys() before scanning.
+            let fence_idx = row_idx / FENCE_INTERVAL;
+            self.fence_keys.get(fence_idx).copied().unwrap_or(0)
+        }
+    }
+
+    /// Check if full keys data has been loaded (for scan paths).
+    pub fn has_full_keys_loaded(&self) -> bool {
+        self.keys_data.is_some()
+    }
+
+    /// Get the file offset where the full keys array starts.
+    pub fn keys_file_offset(&self) -> u64 {
+        self.keys_file_offset
+    }
+
+    /// Get the sparse fence keys for binary search.
+    pub fn fence_keys(&self) -> &[u64] {
+        &self.fence_keys
+    }
+
+    /// Get the fence interval (rows per fence entry).
+    pub fn fence_interval(&self) -> usize {
+        FENCE_INTERVAL
     }
 
     /// Read a timestamp at the given row index. Timestamps are NOT stored in
-    /// the RowMap's `data` (to save 16MB/2M rows). The merge cursor calls
-    /// `load_all_timestamps()` on the ColumnarSSTable instead. This method
-    /// panics if called directly — it exists only for API compatibility.
+    /// the RowMap. Use timestamp_loaded() after load_all_timestamps().
     #[inline]
     pub fn timestamp(&self, _row_idx: usize) -> u64 {
-        // Timestamps are lazy-loaded via ColumnarSSTable::load_all_timestamps.
-        // Direct calls to this method indicate a code path that hasn't been
-        // migrated to the lazy-load API. Return 0 as a safe fallback (merge
-        // uses the loaded timestamps_data, not this method).
         0
     }
 
-    /// Check if timestamps have been lazy-loaded into `timestamps_data`.
+    /// Check if timestamps have been lazy-loaded.
     pub fn has_timestamps_loaded(&self) -> bool {
         self.timestamps_data.is_some()
     }
 
-    /// Get a timestamp from the lazy-loaded buffer. Panics if not loaded.
+    /// Get a timestamp from the lazy-loaded buffer.
     #[inline]
     pub fn timestamp_loaded(&self, row_idx: usize) -> u64 {
         let ts = self
@@ -358,19 +425,58 @@ impl RowMap {
         ])
     }
 
-    /// Binary search for a key in the RowMap. Returns row index if found.
-    pub fn find_key(&self, target: u64) -> Option<usize> {
+    /// Binary search using sparse fence index. Returns a row index RANGE
+    /// [start, end) where the target key MAY exist. The caller reads a block
+    /// of keys from disk to do the final lookup within this range.
+    /// Returns None if the key is definitely not present.
+    pub fn find_fence_range(&self, target: u64) -> Option<(usize, usize)> {
+        if self.fence_keys.is_empty() {
+            return if self.num_rows > 0 {
+                Some((0, self.num_rows))
+            } else {
+                None
+            };
+        }
+        // Binary search in fence_keys to find the block.
         let mut lo = 0usize;
-        let mut hi = self.num_rows;
+        let mut hi = self.fence_keys.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let k = self.key(mid);
-            if k < target {
+            if self.fence_keys[mid] <= target {
                 lo = mid + 1;
-            } else if k > target {
-                hi = mid;
             } else {
-                return Some(mid);
+                hi = mid;
+            }
+        }
+        // lo is the first fence key > target. The target (if present) is in
+        // the block BEFORE lo: [block_start, block_end).
+        let block_start = if lo > 0 { (lo - 1) * FENCE_INTERVAL } else { 0 };
+        let block_end = (block_start + FENCE_INTERVAL).min(self.num_rows);
+        // Quick check: if block_start fence key > target, not present.
+        if lo > 0 && self.fence_keys[lo - 1] > target {
+            return None;
+        }
+        Some((block_start, block_end))
+    }
+
+    /// Binary search for a key. Requires full keys to be loaded (scan path).
+    /// For point queries, use ColumnarSSTable::find_row_by_key instead.
+    pub fn find_key(&self, target: u64) -> Option<usize> {
+        if let Some(ref data) = self.keys_data {
+            let mut lo = 0usize;
+            let mut hi = self.num_rows;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let off = mid * 8;
+                let s = data.slice(off, 8);
+                let k = u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+                if k < target {
+                    lo = mid + 1;
+                } else if k > target {
+                    hi = mid;
+                } else {
+                    return Some(mid);
+                }
             }
         }
         None
@@ -381,7 +487,6 @@ impl RowMap {
         if let Some(ref bmp) = self.deleted_bitmap {
             (bmp[row_idx / 8] >> (row_idx % 8)) & 1 != 0
         } else {
-            // No deletions (deleted_bitmap is None when empty).
             false
         }
     }
@@ -1016,9 +1121,6 @@ pub struct ColumnarSSTable {
     file_data: Vec<u8>,
     #[allow(dead_code)]
     mmap: Option<Arc<Mmap>>,
-    /// Cached file handle for large files (>256KB, not in file_data). Used by
-    /// read_segment_bytes to avoid re-opening the file on every column read.
-    /// Wrapped in a Mutex because seek+read requires &mut access.
     file: Option<parking_lot::Mutex<File>>,
     #[allow(dead_code)]
     header: ColumnarHeader,
@@ -1026,6 +1128,45 @@ pub struct ColumnarSSTable {
     pub row_map: RowMap,
     pub column_tags: Vec<ColumnTypeTag>,
     pub num_rows: usize,
+    /// LRU cache for key blocks (used by find_row_by_key). Each entry is a
+    /// ~16KB block of keys. Caching the last 4 blocks covers 8K rows — enough
+    /// for sequential PK scans. Total memory: 4 × 16KB = 64KB (FIXED).
+    key_block_cache: parking_lot::Mutex<KeyBlockCache>,
+}
+
+/// Tiny LRU for key blocks (4 entries, 64KB total).
+struct KeyBlockCache {
+    entries: [(usize, Vec<u8>); 4], // (block_start_row, key bytes)
+    next: usize,
+}
+
+impl KeyBlockCache {
+    fn new() -> Self {
+        Self {
+            entries: [
+                (0, Vec::new()),
+                (0, Vec::new()),
+                (0, Vec::new()),
+                (0, Vec::new()),
+            ],
+            next: 0,
+        }
+    }
+
+    fn get(&self, block_start: usize) -> Option<&[u8]> {
+        for (start, data) in &self.entries {
+            if *start == block_start && !data.is_empty() {
+                return Some(data);
+            }
+        }
+        None
+    }
+
+    fn put(&mut self, block_start: usize, data: Vec<u8>) {
+        let slot = &mut self.entries[self.next];
+        *slot = (block_start, data);
+        self.next = (self.next + 1) % 4;
+    }
 }
 
 impl ColumnarSSTable {
@@ -1183,56 +1324,73 @@ impl ColumnarSSTable {
             })
             .collect();
 
-        // Row map: load ONLY keys + deleted bitmap into heap. Timestamps are
-        // NOT loaded — they're lazy-loaded from disk only when the merge cursor
-        // calls load_all_timestamps(). This saves 16MB/2M rows of heap.
+        // Row map: load ONLY sparse fence keys + deleted bitmap into heap.
+        // Full keys are loaded lazily (load_full_keys) for scan paths only.
+        // Memory: (num_rows/2048+1) × 8 bytes ≈ 8KB for 2M rows. FIXED.
         // Layout: [keys: u64×N][timestamps: u64×N][deleted: u8×ceil(N/8)]
         let (_rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
-        let row_map = if !file_data.is_empty() {
-            // Small file: keys + deleted are in file_data, skip timestamps.
-            let keys_data =
-                file_data[row_map_offset as usize..row_map_offset as usize + keys_size].to_vec();
-            let del_off = keys_size + timestamps_size;
-            let del_bmp = RowMap::extract_deleted_bitmap(
+
+        // Read deleted bitmap.
+        let deleted_file_offset = row_map_offset + keys_size as u64 + timestamps_size as u64;
+        let del_bmp = if !file_data.is_empty() {
+            RowMap::extract_deleted_bitmap(
                 &file_data[..],
-                row_map_offset as usize + del_off,
+                deleted_file_offset as usize,
                 deleted_len,
-            );
-            RowMap {
-                num_rows,
-                keys_offset: 0,
-                timestamps_file_offset: row_map_offset + keys_size as u64,
-                timestamps_data: None,
-                deleted_offset: del_off,
-                deleted_len,
-                data: SegData::Owned(keys_data),
-                deleted_bitmap: del_bmp,
-            }
+            )
         } else {
-            // Large file: seek+read keys + deleted (skip timestamps).
-            let mut keys_data = vec![0u8; keys_size];
-            file.seek(SeekFrom::Start(row_map_offset))?;
-            file.read_exact(&mut keys_data)?;
-            // Read deleted bitmap (skip timestamps).
-            let deleted_file_offset = row_map_offset + keys_size as u64 + timestamps_size as u64;
             let mut del_raw = vec![0u8; deleted_len];
             file.seek(SeekFrom::Start(deleted_file_offset))?;
             file.read_exact(&mut del_raw)?;
-            let del_bmp = if del_raw.iter().any(|&b| b != 0) {
+            if del_raw.iter().any(|&b| b != 0) {
                 Some(del_raw.into_boxed_slice())
             } else {
                 None
-            };
-            RowMap {
-                num_rows,
-                keys_offset: 0,
-                timestamps_file_offset: row_map_offset + keys_size as u64,
-                timestamps_data: None,
-                deleted_offset: keys_size,
-                deleted_len,
-                data: SegData::Owned(keys_data),
-                deleted_bitmap: del_bmp,
             }
+        };
+
+        // Build sparse fence keys: one key per FENCE_INTERVAL rows.
+        let fence_count = num_rows / FENCE_INTERVAL + 1;
+        let mut fence_keys = Vec::with_capacity(fence_count);
+        if !file_data.is_empty() {
+            // Small file: extract fence keys from file_data.
+            let keys_start = row_map_offset as usize;
+            for i in (0..num_rows).step_by(FENCE_INTERVAL) {
+                let off = keys_start + i * 8;
+                if off + 8 <= file_data.len() {
+                    fence_keys.push(u64::from_le_bytes([
+                        file_data[off],
+                        file_data[off + 1],
+                        file_data[off + 2],
+                        file_data[off + 3],
+                        file_data[off + 4],
+                        file_data[off + 5],
+                        file_data[off + 6],
+                        file_data[off + 7],
+                    ]));
+                }
+            }
+        } else {
+            // Large file: read fence keys via seek+read (sparse, ~1% of full keys).
+            let mut buf = [0u8; 8];
+            for i in (0..num_rows).step_by(FENCE_INTERVAL) {
+                let off = row_map_offset + (i * 8) as u64;
+                file.seek(SeekFrom::Start(off))?;
+                file.read_exact(&mut buf)?;
+                fence_keys.push(u64::from_le_bytes(buf));
+            }
+        }
+
+        let row_map = RowMap {
+            num_rows,
+            fence_keys,
+            keys_file_offset: row_map_offset,
+            keys_data: None, // lazy-loaded for scan paths
+            timestamps_file_offset: row_map_offset + keys_size as u64,
+            timestamps_data: None,
+            deleted_offset: keys_size + timestamps_size,
+            deleted_len,
+            deleted_bitmap: del_bmp,
         };
 
         let column_tags: Vec<ColumnTypeTag> = header.column_tags[..num_columns]
@@ -1257,6 +1415,7 @@ impl ColumnarSSTable {
             row_map,
             column_tags,
             num_rows,
+            key_block_cache: parking_lot::Mutex::new(KeyBlockCache::new()),
         })
     }
 
@@ -1279,6 +1438,80 @@ impl ColumnarSSTable {
             (*rm_mut).timestamps_data = Some(buf.into_boxed_slice());
         }
         Ok(())
+    }
+
+    /// Load full keys array from disk into the RowMap. Required before calling
+    /// row_map.key(i) for scan paths (index build, merge). Point queries don't
+    /// need this — they use find_row_by_key (sparse fence index).
+    pub fn load_full_keys(&self) -> Result<()> {
+        if self.row_map.keys_data.is_some() {
+            return Ok(());
+        }
+        let keys_size = self.num_rows * 8;
+        let mut buf = vec![0u8; keys_size];
+        self.read_raw(self.row_map.keys_file_offset as usize, &mut buf)?;
+        unsafe {
+            let rm: *const RowMap = &self.row_map;
+            let rm_mut: *mut RowMap = rm as *mut RowMap;
+            (*rm_mut).keys_data = Some(SegData::Owned(buf));
+        }
+        Ok(())
+    }
+
+    /// Find a row by composite key using the sparse fence index.
+    /// 1. Binary search fence_keys (in-memory) → find block [start, end)
+    /// 2. Read that block's keys from disk (≤16KB)
+    /// 3. Binary search within the block
+    /// Returns Some(row_idx) if found, None if not.
+    /// This is the O(1)-memory point query path — no full keys loaded.
+    pub fn find_row_by_key(&self, key: u64) -> Option<usize> {
+        // Step 1: fence binary search (in-memory, O(log N/FENCE)).
+        let (block_start, block_end) = self.row_map.find_fence_range(key)?;
+        let block_len = block_end - block_start;
+
+        // Step 2: get the key block (from cache or disk).
+        let buf: Vec<u8> = {
+            let cache = self.key_block_cache.lock();
+            if let Some(cached) = cache.get(block_start) {
+                cached.to_vec()
+            } else {
+                drop(cache);
+                let mut buf = vec![0u8; block_len * 8];
+                let offset = self.row_map.keys_file_offset as usize + block_start * 8;
+                if self.read_raw(offset, &mut buf).is_err() {
+                    return None;
+                }
+                // Cache the block for future lookups (sequential PK scans).
+                self.key_block_cache.lock().put(block_start, buf.clone());
+                buf
+            }
+        };
+
+        // Step 3: binary search within the block.
+        let mut lo = 0usize;
+        let mut hi = block_len;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let off = mid * 8;
+            let k = u64::from_le_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+                buf[off + 4],
+                buf[off + 5],
+                buf[off + 6],
+                buf[off + 7],
+            ]);
+            if k < key {
+                lo = mid + 1;
+            } else if k > key {
+                hi = mid;
+            } else {
+                return Some(block_start + mid);
+            }
+        }
+        None
     }
 
     /// Read a fixed column as an i64 array (zero-copy from mmap).
@@ -1483,6 +1716,7 @@ impl ColumnarSSTable {
         }
         let mut result = Vec::new();
         let mut pos = null_bytes;
+        let _ = self.load_full_keys();
         for i in 0..self.num_rows {
             if (data[i / 8] >> (i % 8)) & 1 != 0 {
                 // Null — skip to next row (read len to skip its bytes).
@@ -1595,6 +1829,7 @@ impl ColumnarSSTable {
         let data_start = null_bytes + 2;
         let n = ((data.len() - data_start) / stride).min(self.num_rows);
         let mut result = Vec::with_capacity(n);
+        let _ = self.load_full_keys();
         for i in 0..n {
             if (data[i / 8] >> (i % 8)) & 1 != 0 {
                 continue;

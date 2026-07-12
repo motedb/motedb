@@ -46,6 +46,8 @@ impl SegmentCursor {
         let n = seg.sst.num_rows;
         // Load timestamps from disk (lazy — only during merge/compaction).
         let _ = seg.sst.load_all_timestamps();
+        // Load full keys array (lazy — sparse fence index only by default).
+        let _ = seg.sst.load_full_keys();
         // Snapshot row_map into owned vectors (avoids repeated method calls).
         let mut row_map_keys = Vec::with_capacity(n);
         let mut row_map_ts = Vec::with_capacity(n);

@@ -56,6 +56,7 @@ impl MoteDB {
                     for col_def in &schema.columns {
                         if matches!(col_def.col_type, crate::types::ColumnType::Timestamp) {
                             if let Ok(seg) = col_sst.read_fixed_i64(col_def.position) {
+                                let _ = col_sst.load_full_keys();
                                 for i in 0..col_sst.num_rows {
                                     if col_sst.row_map.is_deleted(i) {
                                         continue;
