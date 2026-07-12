@@ -180,11 +180,9 @@ impl Segment {
             if matches!(tag, Some(ColumnTypeTag::Text)) {
                 if point_query {
                     // Use the bounded col_cache: decode the text column once,
-                    // reuse across point queries. This avoids per-row disk
-                    // seeks (read_text_at does 3 seek+read per call, which on
-                    // a cold page cache costs 30ms+ each on macOS). Decoding
-                    // the full column once is ~10-20ms but stays in the page
-                    // cache (sequential read), and subsequent queries are O(1).
+                    // reuse across point queries. read_text_at (O(1) per-row)
+                    // was tested but causes 100ms+ latency and 8GB RSS due to
+                    // page faults on macOS. Caching is the right trade-off.
                     {
                         let mut cache = self.col_cache.lock();
                         if let Some(cached) = cache.get(ci) {

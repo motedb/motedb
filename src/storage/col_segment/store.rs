@@ -391,9 +391,9 @@ impl ColSegmentStore {
                 }
                 // Live row: decode and return using O(1) column read.
                 let result = seg.get_row_cached(key, &self.col_types);
-                // Periodically clear col_cache to bound memory from text column
-                // caching. Fixed columns are now stored uncompressed (O(1) direct
-                // read, no cache), so only text columns contribute to col_cache.
+                // Periodic safety-net eviction for callers that don't explicitly
+                // clear_cache (e.g. UPDATE/DELETE row lookups via get_table_row).
+                // The main point-query executor path clears cache after each query.
                 let count = self
                     .point_query_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1895,23 +1895,14 @@ impl ColSegmentStore {
                 if no_filter && !has_deletions && agg_fixed.is_some() && agg_col < n {
                     let af = agg_fixed.as_ref().unwrap();
                     if agg_is_float {
-                        let raw = af.raw_f64_slice();
+                        // 🚀 Use typed f64 slice for auto-vectorizable iteration.
+                        let raw = af.raw_f64_typed_slice();
                         let nulls = af.null_bitmap_bytes();
-                        let nvals = n.min(raw.len() / 8);
-                        for i in 0..nvals {
-                            let off = i * 8;
-                            if off + 8 > raw.len() {
-                                break;
-                            }
-                            // Check null bitmap.
+                        for (i, &v) in raw.iter().enumerate().take(n) {
                             if !nulls.is_empty() && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
                                 result.null_count += 1;
                                 continue;
                             }
-                            let v = f64::from_le_bytes([
-                                raw[off], raw[off+1], raw[off+2], raw[off+3],
-                                raw[off+4], raw[off+5], raw[off+6], raw[off+7],
-                            ]);
                             result.count += 1;
                             result.float_sum += v;
                             result.has_float = true;
@@ -2182,8 +2173,31 @@ impl ColSegmentStore {
         }
         let segs = self.segments_snapshot();
         let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
-        // Pre-decode columns per segment lazily (cached in a local map).
-        // For small K this is much cheaper than N full-row decode.
+        // 🔑 Pre-decode each output column ONCE per segment (not per row).
+        // Previously this was inside the per-row loop causing O(N×K) re-decode.
+        // Now: decode at most |out_cols| × |segments| times regardless of K.
+        use std::collections::HashMap;
+        let mut pre_fixed: HashMap<(usize, usize), crate::storage::lsm::columnar::FixedSegment> = HashMap::new();
+        let mut pre_text: HashMap<(usize, usize), crate::storage::lsm::columnar::TextSegment> = HashMap::new();
+        for &(seg_idx, _) in indices {
+            let Some(seg) = segs.get(seg_idx) else { continue };
+            for &ci in out_cols {
+                let key = (seg_idx, ci);
+                if pre_fixed.contains_key(&key) || pre_text.contains_key(&key) {
+                    continue;
+                }
+                let tag = seg.sst.column_tags.get(ci).copied();
+                if matches!(tag, Some(t) if t.is_fixed()) {
+                    if let Ok(f) = seg.sst.read_fixed_i64(ci) {
+                        pre_fixed.insert(key, f);
+                    }
+                } else if matches!(tag, Some(crate::storage::lsm::columnar::ColumnTypeTag::Text)) {
+                    if let Ok(t) = seg.sst.read_text(ci) {
+                        pre_text.insert(key, t);
+                    }
+                }
+            }
+        }
         for &(seg_idx, row_idx) in indices {
             let Some(seg) = segs.get(seg_idx) else {
                 continue;
@@ -2196,26 +2210,25 @@ impl ColSegmentStore {
             }
             let mut row = Vec::with_capacity(out_cols.len());
             for &ci in out_cols {
-                let tag = seg.sst.column_tags.get(ci).copied();
-                let v =
-                    match tag {
-                        Some(t) if t.is_fixed() => seg.sst.read_fixed_i64(ci).ok().and_then(|f| {
-                            match self.col_types.get(ci) {
-                                Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
-                                Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
-                                Some(ColumnType::Boolean) => f.get_bool(row_idx).map(Value::Bool),
-                                Some(ColumnType::Timestamp) => f.get_i64(row_idx).map(|v| {
-                                    Value::Timestamp(crate::types::Timestamp::from_micros(v))
-                                }),
-                                _ => None,
-                            }
-                        }),
-                        Some(ColumnTypeTag::Text) => seg.sst.read_text(ci).ok().and_then(|t| {
-                            t.get_str(row_idx)
-                                .map(|s| Value::Text(ArcString(std::sync::Arc::from(s))))
+                // 🔑 Use pre-decoded column (decoded once per segment above),
+                // NOT per-row read_fixed_i64/read_text which re-decodes the
+                // entire column on every row (O(N×K) → O(N+K)).
+                let v = if let Some(ref f) = pre_fixed.get(&(seg_idx, ci)) {
+                    match self.col_types.get(ci) {
+                        Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
+                        Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
+                        Some(ColumnType::Boolean) => f.get_bool(row_idx).map(Value::Bool),
+                        Some(ColumnType::Timestamp) => f.get_i64(row_idx).map(|v| {
+                            Value::Timestamp(crate::types::Timestamp::from_micros(v))
                         }),
                         _ => None,
-                    };
+                    }
+                } else if let Some(ref t) = pre_text.get(&(seg_idx, ci)) {
+                    t.get_str(row_idx)
+                        .map(|s| Value::Text(ArcString(std::sync::Arc::from(s))))
+                } else {
+                    None
+                };
                 row.push(v.unwrap_or(Value::Null));
             }
             result.push(row);
