@@ -1677,6 +1677,7 @@ impl MoteDB {
                     .map(|t| t.to_column_type())
                     .collect();
                 let mut guard = builder_arc.value().lock();
+                let _ = old_sst.load_all_timestamps();
                 for i in 0..old_sst.num_rows {
                     if old_sst.row_map.is_deleted(i) {
                         continue;
@@ -1686,7 +1687,7 @@ impl MoteDB {
                     if guard.check_key(k).is_some() {
                         continue;
                     }
-                    let ts = old_sst.row_map.timestamp(i);
+                    let ts = old_sst.row_map.timestamp_loaded(i);
                     if let Some(row) = old_sst.get_row(k, &col_types) {
                         let _ = guard.add_values(k, ts, false, &row);
                     }

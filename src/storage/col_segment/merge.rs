@@ -44,13 +44,15 @@ struct SegmentCursor {
 impl SegmentCursor {
     fn new(seg: &Segment, col_types: Vec<ColumnType>) -> Self {
         let n = seg.sst.num_rows;
+        // Load timestamps from disk (lazy — only during merge/compaction).
+        let _ = seg.sst.load_all_timestamps();
         // Snapshot row_map into owned vectors (avoids repeated method calls).
         let mut row_map_keys = Vec::with_capacity(n);
         let mut row_map_ts = Vec::with_capacity(n);
         let mut row_map_deleted = Vec::with_capacity(n);
         for i in 0..n {
             row_map_keys.push(seg.sst.row_map.key(i));
-            row_map_ts.push(seg.sst.row_map.timestamp(i));
+            row_map_ts.push(seg.sst.row_map.timestamp_loaded(i));
             row_map_deleted.push(seg.sst.row_map.is_deleted(i));
         }
         // Sort row indices by key ascending.

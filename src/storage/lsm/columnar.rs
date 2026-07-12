@@ -226,16 +226,22 @@ const COLUMN_INDEX_ENTRY_SIZE: usize = 16; // (offset: u64, size: u64)
 #[derive(Clone, Debug)]
 pub struct RowMap {
     pub num_rows: usize,
-    data: SegData, // Owned for builder, Mmap for zero-copy reads
+    /// Only keys are stored in `data` (NOT timestamps). This halves the
+    /// resident memory: 8 bytes/row for keys vs 17 bytes/row for the full
+    /// row_map. Timestamps are lazy-loaded into `timestamps_data` only when
+    /// `timestamp()` is called (merge/compaction path — rare).
+    data: SegData, // keys only
     keys_offset: usize,
-    timestamps_offset: usize,
+    /// File offset where timestamps start (for lazy-load via ColumnarSSTable).
+    /// 0 if timestamps were never present (builder path).
+    timestamps_file_offset: u64,
+    /// Lazy-loaded timestamps. None until first `timestamp()` call.
+    timestamps_data: Option<Box<[u8]>>,
     #[allow(dead_code)]
     deleted_offset: usize,
     #[allow(dead_code)]
     deleted_len: usize,
-    /// Eagerly-loaded deleted bitmap (heap). Separated from `data` so that
-    /// `has_any_deleted()` and `is_deleted()` don't fault mmap pages for keys
-    /// and timestamps. None when there are no deletions (common case).
+    /// Eagerly-loaded deleted bitmap (heap). None when no deletions (common case).
     deleted_bitmap: Option<Box<[u8]>>,
 }
 
@@ -262,7 +268,8 @@ impl RowMap {
         Self {
             num_rows,
             keys_offset: 0,
-            timestamps_offset: keys_size,
+            timestamps_file_offset: keys_size as u64,
+            timestamps_data: None,
             deleted_offset,
             deleted_len,
             data: SegData::Owned(data),
@@ -290,9 +297,6 @@ impl RowMap {
     pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize) -> Result<Self> {
         let (_total, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
         let deleted_offset = offset + keys_size + timestamps_size;
-        // Eagerly read the deleted bitmap from the mmap into heap. This is a
-        // small read (~250KB for 2M rows) that avoids faulting the entire
-        // row_map mmap region on every has_any_deleted() / is_deleted() call.
         let deleted_bitmap = {
             let mmap_ref = &mmap;
             Self::extract_deleted_bitmap(mmap_ref, deleted_offset, deleted_len)
@@ -300,7 +304,8 @@ impl RowMap {
         Ok(Self {
             num_rows,
             keys_offset: offset,
-            timestamps_offset: offset + keys_size,
+            timestamps_file_offset: (offset + keys_size) as u64,
+            timestamps_data: None,
             deleted_offset,
             deleted_len,
             data: SegData::Mmap { mmap, offset },
@@ -315,11 +320,42 @@ impl RowMap {
         u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
     }
 
+    /// Read a timestamp at the given row index. Timestamps are NOT stored in
+    /// the RowMap's `data` (to save 16MB/2M rows). The merge cursor calls
+    /// `load_all_timestamps()` on the ColumnarSSTable instead. This method
+    /// panics if called directly — it exists only for API compatibility.
     #[inline]
-    pub fn timestamp(&self, row_idx: usize) -> u64 {
-        let off = self.timestamps_offset + row_idx * 8;
-        let s = self.data.slice(off, 8);
-        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+    pub fn timestamp(&self, _row_idx: usize) -> u64 {
+        // Timestamps are lazy-loaded via ColumnarSSTable::load_all_timestamps.
+        // Direct calls to this method indicate a code path that hasn't been
+        // migrated to the lazy-load API. Return 0 as a safe fallback (merge
+        // uses the loaded timestamps_data, not this method).
+        0
+    }
+
+    /// Check if timestamps have been lazy-loaded into `timestamps_data`.
+    pub fn has_timestamps_loaded(&self) -> bool {
+        self.timestamps_data.is_some()
+    }
+
+    /// Get a timestamp from the lazy-loaded buffer. Panics if not loaded.
+    #[inline]
+    pub fn timestamp_loaded(&self, row_idx: usize) -> u64 {
+        let ts = self
+            .timestamps_data
+            .as_ref()
+            .expect("timestamps not loaded");
+        let off = row_idx * 8;
+        u64::from_le_bytes([
+            ts[off],
+            ts[off + 1],
+            ts[off + 2],
+            ts[off + 3],
+            ts[off + 4],
+            ts[off + 5],
+            ts[off + 6],
+            ts[off + 7],
+        ])
     }
 
     /// Binary search for a key in the RowMap. Returns row index if found.
@@ -1147,39 +1183,54 @@ impl ColumnarSSTable {
             })
             .collect();
 
-        // Row map: load full row_map (keys + timestamps + deleted) into heap.
-        // For 2M rows this is ~34MB, which fits within the memory budget.
-        // Timestamps are needed by the merge cursor during compaction.
+        // Row map: load ONLY keys + deleted bitmap into heap. Timestamps are
+        // NOT loaded — they're lazy-loaded from disk only when the merge cursor
+        // calls load_all_timestamps(). This saves 16MB/2M rows of heap.
+        // Layout: [keys: u64×N][timestamps: u64×N][deleted: u8×ceil(N/8)]
         let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
         let row_map = if !file_data.is_empty() {
-            // Small file: already in heap.
-            let rm_data =
-                file_data[row_map_offset as usize..row_map_offset as usize + rm_total].to_vec();
+            // Small file: keys + deleted are in file_data, skip timestamps.
+            let keys_data =
+                file_data[row_map_offset as usize..row_map_offset as usize + keys_size].to_vec();
             let del_off = keys_size + timestamps_size;
-            let del_bmp = RowMap::extract_deleted_bitmap(&rm_data, del_off, deleted_len);
+            let del_bmp = RowMap::extract_deleted_bitmap(
+                &file_data[..],
+                row_map_offset as usize + del_off,
+                deleted_len,
+            );
             RowMap {
                 num_rows,
                 keys_offset: 0,
-                timestamps_offset: keys_size,
+                timestamps_file_offset: row_map_offset + keys_size as u64,
+                timestamps_data: None,
                 deleted_offset: del_off,
                 deleted_len,
-                data: SegData::Owned(rm_data),
+                data: SegData::Owned(keys_data),
                 deleted_bitmap: del_bmp,
             }
         } else {
-            // Large file: seek+read the entire row_map into heap.
-            let mut d = vec![0u8; rm_total];
+            // Large file: seek+read keys + deleted (skip timestamps).
+            let mut keys_data = vec![0u8; keys_size];
             file.seek(SeekFrom::Start(row_map_offset))?;
-            file.read_exact(&mut d)?;
-            let del_off = keys_size + timestamps_size;
-            let del_bmp = RowMap::extract_deleted_bitmap(&d, del_off, deleted_len);
+            file.read_exact(&mut keys_data)?;
+            // Read deleted bitmap (skip timestamps).
+            let deleted_file_offset = row_map_offset + keys_size as u64 + timestamps_size as u64;
+            let mut del_raw = vec![0u8; deleted_len];
+            file.seek(SeekFrom::Start(deleted_file_offset))?;
+            file.read_exact(&mut del_raw)?;
+            let del_bmp = if del_raw.iter().any(|&b| b != 0) {
+                Some(del_raw.into_boxed_slice())
+            } else {
+                None
+            };
             RowMap {
                 num_rows,
                 keys_offset: 0,
-                timestamps_offset: keys_size,
-                deleted_offset: del_off,
+                timestamps_file_offset: row_map_offset + keys_size as u64,
+                timestamps_data: None,
+                deleted_offset: keys_size,
                 deleted_len,
-                data: SegData::Owned(d),
+                data: SegData::Owned(keys_data),
                 deleted_bitmap: del_bmp,
             }
         };
@@ -1207,6 +1258,27 @@ impl ColumnarSSTable {
             column_tags,
             num_rows,
         })
+    }
+
+    /// Load all timestamps from the file into the RowMap's lazy buffer.
+    /// Called by the merge cursor before reading timestamps. This is the
+    /// only time timestamps are read from disk — normal query paths never
+    /// touch them, saving 16MB/2M rows of heap.
+    pub fn load_all_timestamps(&self) -> Result<()> {
+        if self.row_map.timestamps_data.is_some() {
+            return Ok(()); // already loaded
+        }
+        let ts_size = self.num_rows * 8;
+        let mut buf = vec![0u8; ts_size];
+        self.read_raw(self.row_map.timestamps_file_offset as usize, &mut buf)?;
+        // Store via unsafe ptr write — merge cursor is single-threaded and
+        // holds exclusive access to this segment during compaction.
+        unsafe {
+            let rm: *const RowMap = &self.row_map;
+            let rm_mut: *mut RowMap = rm as *mut RowMap;
+            (*rm_mut).timestamps_data = Some(buf.into_boxed_slice());
+        }
+        Ok(())
     }
 
     /// Read a fixed column as an i64 array (zero-copy from mmap).

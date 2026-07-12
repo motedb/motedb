@@ -2694,6 +2694,8 @@ impl ColSegmentStore {
             let mut collected: Vec<(u64, u64, Vec<[u8; 8]>, Vec<bool>)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
+                // Load timestamps from disk (lazy — only needed during merge).
+                let _ = seg.sst.load_all_timestamps();
                 let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
                     ..ncols)
                     .map(|ci| {
@@ -2712,7 +2714,7 @@ impl ColSegmentStore {
                     if seg.sst.row_map.is_deleted(i) {
                         continue;
                     }
-                    let ts = seg.sst.row_map.timestamp(i);
+                    let ts = seg.sst.row_map.timestamp_loaded(i);
                     let mut col_vals: Vec<[u8; 8]> = Vec::with_capacity(ncols);
                     let mut col_nulls: Vec<bool> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
@@ -2757,6 +2759,8 @@ impl ColSegmentStore {
             let mut collected: Vec<(u64, u64, Vec<Vec<u8>>, Vec<bool>)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
+                // Load timestamps from disk (lazy — only needed during merge).
+                let _ = seg.sst.load_all_timestamps();
                 let fixed_cols: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = (0
                     ..ncols)
                     .map(|ci| {
@@ -2845,7 +2849,7 @@ impl ColSegmentStore {
                     if seg.sst.row_map.is_deleted(i) {
                         continue;
                     }
-                    let ts = seg.sst.row_map.timestamp(i);
+                    let ts = seg.sst.row_map.timestamp_loaded(i);
                     let mut row_bytes: Vec<Vec<u8>> = Vec::with_capacity(ncols);
                     let mut row_nulls: Vec<bool> = Vec::with_capacity(ncols);
                     for ci in 0..ncols {
