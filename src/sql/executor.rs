@@ -2946,9 +2946,12 @@ impl QueryExecutor {
                         // ORDER BY LIMIT (no aggregate): full scan + in-memory sort.
                         if stmt.order_by.is_some() && !self.has_aggregates(&stmt.columns) {
                             let schema = self.db.get_table_schema(table_name)?;
-                            return self.execute_full_scan_via_col_segment(
+                            let result = self.execute_full_scan_via_col_segment(
                                 stmt, table_name, &schema, &store,
-                            );
+                            )?;
+                            // Release column data pages after heavy scan.
+                            store.release_query_memory();
+                            return Ok(result);
                         }
                         // DISTINCT (no aggregate): multi-segment scan + dedup.
                         if stmt.distinct && !self.has_aggregates(&stmt.columns) {
@@ -2973,6 +2976,7 @@ impl QueryExecutor {
                                     let columns = self
                                         .build_select_columns(&stmt.columns, &schema)
                                         .unwrap_or_default();
+                                    store.release_query_memory();
                                     return Ok(StreamingQueryResult::SelectReady { columns, rows });
                                 }
                                 let scanned =
@@ -2989,6 +2993,7 @@ impl QueryExecutor {
                                 let columns = self
                                     .build_select_columns(&stmt.columns, &schema)
                                     .unwrap_or_default();
+                                store.release_query_memory();
                                 return Ok(StreamingQueryResult::SelectReady { columns, rows });
                             }
                         }
@@ -3010,6 +3015,7 @@ impl QueryExecutor {
                         if let Some(result) =
                             self.col_segment_aggregate(stmt, table_name, &store)?
                         {
+                            store.release_query_memory();
                             return Ok(result);
                         }
                         // col_segment_aggregate returned None (complex aggregate).
@@ -3019,6 +3025,7 @@ impl QueryExecutor {
                             if let Some(result) =
                                 self.col_segment_group_by(stmt, table_name, &store, &schema)?
                             {
+                                store.release_query_memory();
                                 return Ok(result);
                             }
                             // 🔑 PERF: try try_group_by_columnar BEFORE syncing —
@@ -3034,6 +3041,7 @@ impl QueryExecutor {
                             if let Some(result) =
                                 self.col_segment_multi_aggregate(stmt, table_name, &store, &schema)?
                             {
+                                store.release_query_memory();
                                 return Ok(result);
                             }
                         }

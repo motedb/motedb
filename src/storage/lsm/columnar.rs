@@ -1389,6 +1389,22 @@ impl ColumnarSSTable {
         }
     }
 
+    /// Hint the OS to drop cached pages for this file (Linux: posix_fadvise
+    /// DONTNEED). This reduces RSS after heavy column scans. On macOS it's a
+    /// no-op (no per-file fadvise), but the OS reclaims pages under pressure.
+    pub fn advise_dontneed(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Some(ref cached) = self.file {
+                let f = cached.lock();
+                unsafe {
+                    libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                }
+            }
+        }
+    }
+
     pub fn read_fixed_i64(&self, col_idx: usize) -> Result<FixedSegment> {
         let tag = self.column_tags[col_idx];
         if !tag.is_fixed() {

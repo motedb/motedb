@@ -1477,6 +1477,8 @@ impl ColSegmentStore {
             // Release mmap pages back to the OS so RSS stays low after heavy
             // scans. Pages are re-faulted from the page cache on next access.
             seg.release_pages();
+            // Hint OS to drop page cache (Linux: posix_fadvise DONTNEED).
+            seg.sst.advise_dontneed();
         }
     }
 
