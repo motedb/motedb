@@ -1773,12 +1773,27 @@ impl QueryExecutor {
             // COUNT(*) with WHERE: filter then count. Without WHERE: count all.
             let count;
             if let Some(ref wc) = stmt.where_clause {
-                // Handle any simple comparison (col OP literal). Previously only
-                // `=` was supported; `>`, `>=`, `<`, `<=`, `!=` fell through to
-                // col_segment_multi_aggregate which discarded the operator and
-                // silently returned 0 rows.
+                // 🚀 Index-accelerated COUNT(*): if a column index exists on the
+                // WHERE filter column, use it to count matching rows in O(log N + K)
+                // instead of scanning the entire table O(N).
                 if let Some((pos, op, target)) = Self::parse_simple_comparison_where(wc, &schema) {
-                    count = store.count_filtered(pos, &op, &target) as i64;
+                    // Check if an index exists on this column.
+                    let col_name = &schema.columns[pos].name;
+                    let index_key = format!("{}.{}", table_name, col_name);
+                    let indexed_count = if matches!(op, crate::sql::ast::BinaryOperator::Eq) {
+                        // Equality lookup: index.get(value) → row_ids → count.
+                        self.db
+                            .column_indexes
+                            .get(&index_key)
+                            .and_then(|index| {
+                                let idx = index.value();
+                                idx.get(&target).ok().map(|ids| ids.len() as i64)
+                            })
+                    } else {
+                        None
+                    };
+                    count = indexed_count
+                        .unwrap_or_else(|| store.count_filtered(pos, &op, &target) as i64);
                 } else if let crate::sql::ast::Expr::Like {
                     expr,
                     pattern,
@@ -5210,8 +5225,10 @@ impl QueryExecutor {
         }
         // Only use index direct-fetch when selectivity is high (few matching rows).
         // For low-selectivity filters (100K/300K), a full scan decodes faster
-        // than 100K individual row fetches.
-        if row_ids_arc.len() > 1000 {
+        // than 100K individual row fetches. The threshold balances index fetch
+        // overhead vs scan decode cost: up to 10K rows, batch index fetch is
+        // typically faster than a full segment scan.
+        if row_ids_arc.len() > 10000 {
             return Ok(None);
         }
         drop(index_ref);
@@ -5804,7 +5821,15 @@ impl QueryExecutor {
                 // row_id (see crud.rs insert path), so composite_key =
                 // (table_id << 32) | pk_value. This enables O(log N) binary
                 // search in RowMap without a secondary index.
-                (table_id << 32) | (*id as u64 & 0xFFFFFFFF)
+                // 🔑 Negative PK values are mapped to high u32 range (matching
+                // the insert path in crud.rs) to avoid collision with
+                // next_row_id-assigned row_ids.
+                let row_id = if *id >= 0 {
+                    *id as u64
+                } else {
+                    0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)
+                };
+                (table_id << 32) | (row_id & 0xFFFFFFFF)
             }
             _ => {
                 // Non-Integer PK: use pk_lookup cache to resolve pk → row_id.
@@ -6733,6 +6758,12 @@ impl QueryExecutor {
                 let segs = store.segments_snapshot();
                 if let Some(last) = segs.last() {
                     let sst = &last.sst;
+                    // 🔑 Load full keys so row_map.key(i) returns accurate values.
+                    // Without this, the SelectColumnar dedup path in
+                    // materialize_with_hint uses fence-key fallback, which maps
+                    // all rows in a small segment (<2048 rows) to the same key —
+                    // collapsing N rows into 1.
+                    let _ = sst.load_full_keys();
                     let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
                     for &pc in &out_positions {
                         if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
@@ -6798,6 +6829,12 @@ impl QueryExecutor {
                 let segs = store.segments_snapshot();
                 if let Some(last) = segs.last() {
                     let sst = &last.sst;
+                    // 🔑 Load full keys so row_map.key(i) returns accurate values.
+                    // Without this, the SelectColumnar dedup path in
+                    // materialize_with_hint uses fence-key fallback, which maps
+                    // all rows in a small segment (<2048 rows) to the same key —
+                    // collapsing N rows into 1.
+                    let _ = sst.load_full_keys();
                     let mut col_segs: Vec<ColumnarSeg> = Vec::with_capacity(out_positions.len());
                     for &pc in &out_positions {
                         if pc < sst.column_tags.len() && sst.column_tags[pc].is_fixed() {
@@ -16496,7 +16533,6 @@ impl QueryExecutor {
 
     /// Execute COMMIT [TRANSACTION]
     fn execute_commit_transaction(&self) -> Result<QueryResult> {
-        eprintln!("[TXN] COMMIT called");
         let _txn_id_opt = *self.current_txn_id.lock();
         if let Some(txn_id) = _txn_id_opt {
             self.db.commit_transaction(txn_id)?;

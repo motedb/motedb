@@ -2397,8 +2397,17 @@ impl ColumnarSSTableBuilder {
         let keep: Vec<usize> = (0..self.num_rows)
             .filter(|&i| last_idx.get(&self.keys[i]) == Some(&i))
             .collect();
-        if keep.len() == self.num_rows {
-            return; // no dupes, nothing to do
+        let has_dupes = keep.len() != self.num_rows;
+        if !has_dupes {
+            // No duplicates, but we still need to ensure keys are sorted for
+            // binary search (find_row_by_key). Check if already sorted; if so,
+            // skip the expensive decode+re-add. If not, fall through to the
+            // sort path below.
+            let already_sorted = self.keys.windows(2).all(|w| w[0] <= w[1]);
+            if already_sorted {
+                return;
+            }
+            // Keys are unsorted — fall through to rebuild with sorting.
         }
         // 3. Decode each kept row into Vec<Value>, then reset buffers and re-add.
         //    We re-add via add_values to reuse the existing layout logic for every
@@ -2582,6 +2591,12 @@ impl ColumnarSSTableBuilder {
             f.clear();
         }
         self.num_rows = 0;
+        // 🔑 Sort by key (ascending) before re-adding. find_row_by_key and
+        // find_fence_range both use binary search, which requires sorted keys.
+        // Without sorting, segments in append order (e.g. after UPDATE appends
+        // a newer version of an earlier key) would have non-monotonic keys,
+        // causing point lookups to miss rows that exist in the segment.
+        kept_rows.sort_unstable_by_key(|(key, _, _, _)| *key);
         for (key, ts, deleted, row) in kept_rows {
             // Re-add using the SAME encoding + the preserved deleted flag. A
             // tombstone's newest version must be re-added with deleted=true so

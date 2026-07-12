@@ -1567,11 +1567,17 @@ impl Database {
             }
         } else if self.inner.has_col_segment_store(table_name) {
             // ColSegmentStore tables: for non-AUTO_INCREMENT Integer PK, the PK
-            // value IS the row_id (see crud.rs insert path). This gives O(log N)
-            // binary search via store.get() without needing the pk_lookup cache
-            // or a disk index.
+            // value maps to the row_id (see crud.rs insert path). This gives
+            // O(log N) binary search via store.get() without needing the
+            // pk_lookup cache or a disk index.
+            // 🔑 Negative PK values are mapped to high u32 range (matching
+            // crud.rs insert path) to avoid collision with next_row_id.
             match &where_value {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
+                Value::Integer(id) => {
+                    // Negative PK → high u32 range (0x80000000 + |pk_val|).
+                    (0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)) as RowId
+                }
                 _ => {
                     // Non-Integer PK: try pk_lookup cache.
                     let pk_key = crate::database::pk_cache::PkKey::from_value(&where_value);
@@ -1748,9 +1754,13 @@ impl Database {
             }
         } else if self.inner.has_col_segment_store(table_name) {
             // ColSegmentStore tables: for non-AUTO_INCREMENT Integer PK, the PK
-            // value IS the row_id (see crud.rs insert path).
+            // value maps to the row_id (see crud.rs insert path).
+            // 🔑 Negative PK → high u32 range (matching crud.rs insert path).
             match &value {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
+                Value::Integer(id) => {
+                    (0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)) as RowId
+                }
                 _ => {
                     let pk_key = crate::database::pk_cache::PkKey::from_value(&value);
                     if let Some(lookup) = self.inner.pk_lookup.get(table_name) {

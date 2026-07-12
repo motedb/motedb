@@ -230,6 +230,12 @@ impl MoteDB {
             // (table_id << 32) | pk_value, enabling O(log N) RowMap binary
             // search for point queries (WHERE pk = value) without a secondary
             // index. Falls back to global row_id for non-integer or NULL PKs.
+            //
+            // 🔑 For negative PK values, map to the high u32 range
+            // (0x80000000 + |pk_val|) so they never collide with auto-assigned
+            // row_ids from next_row_id (which starts at 0). Without this, a
+            // negative PK like -90 would get row_id=0, colliding with PK=0's
+            // row_id=0, causing data loss during flush dedup.
             if let Some(pk_col_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_col_name) {
                     if matches!(pk_col.col_type, crate::types::ColumnType::Integer) {
@@ -237,8 +243,10 @@ impl MoteDB {
                             if *pk_val >= 0 {
                                 *pk_val as RowId
                             } else {
-                                self.next_row_id
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                // Map negative PK to high u32 range to avoid
+                                // collision with next_row_id values (0, 1, 2...).
+                                // 0x80000000 + |pk_val| keeps it unique per PK value.
+                                0x8000_0000u64 | (*pk_val as u64 & 0x7FFF_FFFF)
                             }
                         } else {
                             self.next_row_id

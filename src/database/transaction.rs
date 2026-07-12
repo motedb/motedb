@@ -121,8 +121,35 @@ impl MoteDB {
             }
             id as RowId
         } else {
-            self.next_row_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            // 🔑 Non-AUTO_INCREMENT: use PK value as row_id (matching insert_row_to_table).
+            // For Integer PKs, this enables O(log N) binary search in ColSegmentStore.
+            // Negative PK values are mapped to high u32 range to avoid collision with
+            // next_row_id-assigned row_ids (see crud.rs insert_row_to_table).
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    if matches!(pk_col.col_type, crate::types::ColumnType::Integer) {
+                        if let Some(Value::Integer(pk_val)) = row.get(pk_col.position) {
+                            if *pk_val >= 0 {
+                                *pk_val as RowId
+                            } else {
+                                0x8000_0000u64 | (*pk_val as u64 & 0x7FFF_FFFF)
+                            }
+                        } else {
+                            self.next_row_id
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        }
+                    } else {
+                        self.next_row_id
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    }
+                } else {
+                    self.next_row_id
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                }
+            } else {
+                self.next_row_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            }
         };
 
         // Add to transaction write_set — NOT written to WAL or LSM yet
