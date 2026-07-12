@@ -640,6 +640,28 @@ impl FixedSegment {
         self.data.as_bytes()
     }
 
+    /// Returns the raw data bytes as a typed i64 slice (zero-copy).
+    /// Used by aggregate scans to avoid per-row get_i64() overhead.
+    #[inline]
+    pub fn raw_i64_slice(&self) -> &[i64] {
+        let bytes = self.data.as_bytes();
+        // SAFETY: i64 is #[repr(C)] and the data is num_rows*8 bytes aligned
+        // within a Vec<u8>. The builder writes i64 in little-endian, which
+        // matches the platform native representation.
+        unsafe {
+            std::slice::from_raw_parts(
+                bytes.as_ptr() as *const i64,
+                bytes.len() / 8,
+            )
+        }
+    }
+
+    /// Returns the null bitmap as raw bytes for batch null-checking.
+    #[inline]
+    pub fn null_bitmap_bytes(&self) -> &[u8] {
+        self.null_bitmap.as_bytes()
+    }
+
     #[inline]
     pub fn get_i64(&self, row_idx: usize) -> Option<i64> {
         if self.is_null(row_idx) {
@@ -698,7 +720,7 @@ impl TextSegment {
             null_bitmap: SegData::Owned(data[..null_bytes].to_vec()),
             offsets_data: SegData::Owned(data[null_bytes..null_bytes + offsets_size].to_vec()),
             string_data: SegData::Owned(data[null_bytes + offsets_size..].to_vec()),
-            trust_utf8: false,
+            trust_utf8: true, // data written by our builder is already validated UTF-8
             offsets_start: 0,
         })
     }
@@ -1000,6 +1022,59 @@ impl TextSegment {
             unsafe { std::str::from_utf8_unchecked(bytes) }
         } else {
             std::str::from_utf8(bytes).unwrap_or("")
+        }
+    }
+
+    /// 🚀 Check if row's text value equals target bytes, WITHOUT constructing
+    /// a &str or going through SegData::slice match. Reads offsets directly
+    /// from the raw Owned Vec for maximum throughput in scan loops.
+    /// Returns false for NULL rows.
+    #[inline]
+    pub fn eq_bytes(&self, row_idx: usize, target: &[u8]) -> bool {
+        if self.is_null(row_idx) {
+            return false;
+        }
+        // Direct index into Owned Vec — no match/branch per call.
+        let off_base = row_idx * 4;
+        match (&self.offsets_data, &self.string_data) {
+            (SegData::Owned(off), SegData::Owned(s)) => {
+                if off_base + 8 > off.len() {
+                    return false;
+                }
+                let start = u32::from_le_bytes([
+                    off[off_base],
+                    off[off_base + 1],
+                    off[off_base + 2],
+                    off[off_base + 3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    off[off_base + 4],
+                    off[off_base + 5],
+                    off[off_base + 6],
+                    off[off_base + 7],
+                ]) as usize;
+                let len = end - start;
+                len == target.len() && s[start..start + len] == *target
+            }
+            _ => {
+                // Mmap fallback: use slice.
+                let start_bytes = self.offsets_data.slice(off_base, 4);
+                let end_bytes = self.offsets_data.slice(off_base + 4, 4);
+                let start = u32::from_le_bytes([
+                    start_bytes[0],
+                    start_bytes[1],
+                    start_bytes[2],
+                    start_bytes[3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    end_bytes[0],
+                    end_bytes[1],
+                    end_bytes[2],
+                    end_bytes[3],
+                ]) as usize;
+                let bytes = self.string_data.slice(start, end - start);
+                bytes == target
+            }
         }
     }
 

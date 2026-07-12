@@ -2329,6 +2329,109 @@ impl QueryExecutor {
             }
         }
 
+        // 🚀 Fast path: no-WHERE multi-column aggregate over fixed columns.
+        // Directly iterate raw i64/f64 byte slices per column — no Vec<Value>
+        // materialization. For `SELECT SUM(qty), AVG(score), MIN(score), MAX(score),
+        // COUNT(*) FROM t` this avoids 2M×5 Value allocations.
+        if stmt.where_clause.is_none() {
+            let all_fixed = aggs.iter().all(|a| match a.col {
+                None => true, // COUNT(*)
+                Some(c) => matches!(schema.col_types().get(c), Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)),
+            });
+            if all_fixed {
+                let _ = store.flush_buffer();
+                let segs = store.segments_snapshot();
+                // Per-column accumulators.
+                let mut counts: Vec<i64> = vec![0; aggs.len()];
+                let mut sums: Vec<f64> = vec![0.0; aggs.len()];
+                let mut mins: Vec<f64> = vec![f64::INFINITY; aggs.len()];
+                let mut maxs: Vec<f64> = vec![f64::NEG_INFINITY; aggs.len()];
+                let mut has_float: Vec<bool> = vec![false; aggs.len()];
+                let is_float_col: Vec<bool> = aggs.iter().map(|a| {
+                    a.col.map(|c| matches!(schema.col_types().get(c), Some(ColumnType::Float)))
+                        .unwrap_or(false)
+                }).collect();
+
+                for seg in &segs {
+                    let n = seg.sst.num_rows;
+                    if n == 0 { continue; }
+                    // Pre-decode each agg column's raw slice.
+                    let raw_slices: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
+                        aggs.iter().map(|a| a.col.and_then(|c| {
+                            if c < seg.sst.column_tags.len() && seg.sst.column_tags[c].is_fixed() {
+                                seg.sst.read_fixed_i64(c).ok()
+                            } else { None }
+                        })).collect();
+
+                    let has_deletions = seg.sst.row_map.has_any_deleted();
+                    for i in 0..n {
+                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                        for (ai, agg) in aggs.iter().enumerate() {
+                            if agg.func == "COUNT" && agg.col.is_none() {
+                                counts[ai] += 1;
+                                continue;
+                            }
+                            if let Some(ref fs) = raw_slices[ai] {
+                                if is_float_col[ai] {
+                                    if let Some(v) = fs.get_f64(i) {
+                                        counts[ai] += 1;
+                                        sums[ai] += v;
+                                        has_float[ai] = true;
+                                        if v < mins[ai] { mins[ai] = v; }
+                                        if v > maxs[ai] { maxs[ai] = v; }
+                                    }
+                                } else {
+                                    if let Some(v) = fs.get_i64(i) {
+                                        counts[ai] += 1;
+                                        sums[ai] += v as f64;
+                                        if (v as f64) < mins[ai] { mins[ai] = v as f64; }
+                                        if (v as f64) > maxs[ai] { maxs[ai] = v as f64; }
+                                    }
+                                }
+                            } else if agg.func == "COUNT" {
+                                counts[ai] += 1;
+                            }
+                        }
+                    }
+                }
+
+                let columns: Vec<String> = self
+                    .build_select_columns(&stmt.columns, schema)
+                    .unwrap_or_default();
+                let mut row: Vec<Value> = Vec::with_capacity(aggs.len());
+                for (ai, agg) in aggs.iter().enumerate() {
+                    let cnt = counts[ai];
+                    match agg.func.as_str() {
+                        "COUNT" => row.push(Value::Integer(cnt)),
+                        "SUM" => {
+                            if cnt == 0 { row.push(Value::Null); }
+                            else if has_float[ai] { row.push(Value::Float(sums[ai])); }
+                            else { row.push(Value::Integer(sums[ai] as i64)); }
+                        }
+                        "AVG" => {
+                            if cnt == 0 { row.push(Value::Null); }
+                            else { row.push(Value::Float(sums[ai] / cnt as f64)); }
+                        }
+                        "MIN" => {
+                            if cnt == 0 { row.push(Value::Null); }
+                            else if has_float[ai] || is_float_col[ai] { row.push(Value::Float(mins[ai])); }
+                            else { row.push(Value::Integer(mins[ai] as i64)); }
+                        }
+                        "MAX" => {
+                            if cnt == 0 { row.push(Value::Null); }
+                            else if has_float[ai] || is_float_col[ai] { row.push(Value::Float(maxs[ai])); }
+                            else { row.push(Value::Integer(maxs[ai] as i64)); }
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                return Ok(Some(StreamingQueryResult::SelectReady {
+                    columns,
+                    rows: vec![row],
+                }));
+            }
+        }
+
         let mut scan_cols: Vec<usize> = Vec::new();
         if let Some(fc) = filter_col {
             scan_cols.push(fc);

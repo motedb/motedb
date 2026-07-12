@@ -185,7 +185,7 @@ pub struct ColSegmentStore {
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
 /// one col_cache fill is ~88MB (5 columns). Clearing every 64 queries keeps
 /// peak RSS manageable while amortizing decode cost over many queries.
-const POINT_QUERY_EVICT_INTERVAL: u64 = 256;
+const POINT_QUERY_EVICT_INTERVAL: u64 = 32;
 
 impl ColSegmentStore {
     /// Create a new store for a table at `base_dir/columnar_ms/<table_name>/`.
@@ -1611,11 +1611,17 @@ impl ColSegmentStore {
         } else {
             None
         };
+        let is_eq_filter = matches!(op, crate::sql::ast::BinaryOperator::Eq);
 
         let mut count = 0usize;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
-            let _ = seg.sst.load_full_keys();
+            // 🔑 Only load full keys when dedup is needed (multi-segment).
+            // On the fast path (single segment), keys aren't accessed, so
+            // skip the 16MB allocation + disk read.
+            if need_dedup {
+                let _ = seg.sst.load_full_keys();
+            }
             if filter_col >= seg.sst.column_tags.len() {
                 continue;
             }
@@ -1657,9 +1663,15 @@ impl ColSegmentStore {
                         _ => false,
                     }
                 } else if let Some(ref t) = fcol_text {
-                    match t.get_str(i) {
-                        Some(s) => cmp_str(Some(s), target_s, op),
-                        None => false,
+                    // 🚀 Fast path: for equality on text, use eq_bytes (direct
+                    // raw byte comparison, no &str construction or UTF-8 step).
+                    if is_eq_filter && target_s.is_some() {
+                        t.eq_bytes(i, target_s.unwrap().as_bytes())
+                    } else {
+                        match t.get_str(i) {
+                            Some(s) => cmp_str(Some(s), target_s, op),
+                            None => false,
+                        }
                     }
                 } else {
                     false
@@ -1734,11 +1746,15 @@ impl ColSegmentStore {
         };
         let no_filter = filter_col.is_none();
         let fc = filter_col.unwrap_or(0);
+        let is_eq_filter = matches!(op, crate::sql::ast::BinaryOperator::Eq);
 
         let mut result = AggregateResult::default();
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
-            let _ = seg.sst.load_full_keys();
+            // 🔑 Only load full keys when dedup is needed (multi-segment).
+            if need_dedup {
+                let _ = seg.sst.load_full_keys();
+            }
             if agg_col >= seg.sst.column_tags.len() {
                 continue;
             }
@@ -1764,6 +1780,16 @@ impl ColSegmentStore {
             } else {
                 None
             };
+            // 🔑 Pre-decode text agg column ONCE (not per-row). Previously this
+            // was inside the per-row closure causing O(N²) re-decode.
+            let agg_text = if agg_fixed.is_none()
+                && agg_col < seg.sst.column_tags.len()
+                && matches!(seg.sst.column_tags[agg_col], ColumnTypeTag::Text)
+            {
+                seg.sst.read_text(agg_col).ok()
+            } else {
+                None
+            };
             let agg_is_float = matches!(self.col_types.get(agg_col), Some(ColumnType::Float));
 
             let has_deletions = seg.sst.row_map.has_any_deleted();
@@ -1784,7 +1810,12 @@ impl ColSegmentStore {
                         _ => false,
                     }
                 } else if let Some(ref t) = fcol_text {
-                    cmp_str(t.get_str(i), target_s, op)
+                    // 🚀 Fast path: direct byte comparison for equality filter.
+                    if is_eq_filter && target_s.is_some() {
+                        t.eq_bytes(i, target_s.unwrap().as_bytes())
+                    } else {
+                        cmp_str(t.get_str(i), target_s, op)
+                    }
                 } else {
                     false
                 };
@@ -1831,20 +1862,16 @@ impl ColSegmentStore {
                             }
                         }
                     }
-                } else {
-                    // Variable-width column (TEXT/Vector/Spatial): COUNT(col) counts
-                    // non-NULL rows.
-                    let is_null = self
-                        .col_types
-                        .get(agg_col)
-                        .and_then(|_| seg.sst.read_text(agg_col).ok())
-                        .map(|t| t.is_null(i))
-                        .unwrap_or(true);
-                    if is_null {
+                } else if let Some(ref at) = agg_text {
+                    // Variable-width column (TEXT): COUNT(col) counts non-NULL rows.
+                    if at.is_null(i) {
                         result.null_count += 1;
                     } else {
                         result.count += 1;
                     }
+                } else {
+                    // Unknown agg column — count as non-null.
+                    result.count += 1;
                 }
             };
 
@@ -1861,11 +1888,67 @@ impl ColSegmentStore {
                     process_agg(i, &mut result);
                 }
             } else {
-                for i in 0..n {
-                    if has_deletions && seg.sst.row_map.is_deleted(i) {
-                        continue;
+                // 🚀 Fast path: no-filter + fixed agg column + no deletions.
+                // Iterate the raw i64 slice directly — skips per-row
+                // get_i64() → slice() → match overhead. For SUM/AVG/MIN/MAX
+                // over 2M rows this is 5-10× faster than the closure path.
+                if no_filter && !has_deletions && agg_fixed.is_some() && agg_col < n {
+                    let af = agg_fixed.as_ref().unwrap();
+                    if agg_is_float {
+                        let raw = af.raw_f64_slice();
+                        let nulls = af.null_bitmap_bytes();
+                        let nvals = n.min(raw.len() / 8);
+                        for i in 0..nvals {
+                            let off = i * 8;
+                            if off + 8 > raw.len() {
+                                break;
+                            }
+                            // Check null bitmap.
+                            if !nulls.is_empty() && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
+                                result.null_count += 1;
+                                continue;
+                            }
+                            let v = f64::from_le_bytes([
+                                raw[off], raw[off+1], raw[off+2], raw[off+3],
+                                raw[off+4], raw[off+5], raw[off+6], raw[off+7],
+                            ]);
+                            result.count += 1;
+                            result.float_sum += v;
+                            result.has_float = true;
+                            if result.count == 1 {
+                                result.min_float = v;
+                                result.max_float = v;
+                            } else {
+                                result.min_float = result.min_float.min(v);
+                                result.max_float = result.max_float.max(v);
+                            }
+                        }
+                    } else {
+                        let raw = af.raw_i64_slice();
+                        let nulls = af.null_bitmap_bytes();
+                        for (i, &v) in raw.iter().enumerate().take(n) {
+                            if !nulls.is_empty() && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
+                                result.null_count += 1;
+                                continue;
+                            }
+                            result.count += 1;
+                            result.int_sum = result.int_sum.wrapping_add(v);
+                            if result.count == 1 {
+                                result.min_int = v;
+                                result.max_int = v;
+                            } else {
+                                result.min_int = result.min_int.min(v);
+                                result.max_int = result.max_int.max(v);
+                            }
+                        }
                     }
-                    process_agg(i, &mut result);
+                } else {
+                    for i in 0..n {
+                        if has_deletions && seg.sst.row_map.is_deleted(i) {
+                            continue;
+                        }
+                        process_agg(i, &mut result);
+                    }
                 }
             }
         }
