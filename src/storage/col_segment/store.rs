@@ -175,7 +175,17 @@ pub struct ColSegmentStore {
     /// Cache for IN-hash query row indices: key = (col_pos << 64 | set_sig).
     /// Avoids re-scanning 300K rows against a HashSet on repeated calls.
     in_hash_cache: RwLock<std::collections::HashMap<u128, Vec<usize>>>,
+    /// Point-query counter for periodic cache eviction. Decoded column data in
+    /// col_cache can be large (~40MB per text column at 2M rows). To keep RSS
+    /// bounded, we clear the cache every POINT_QUERY_EVICT_INTERVAL queries.
+    /// This trades a one-time ~10ms re-decode for stable, bounded memory.
+    point_query_count: AtomicU64,
 }
+
+/// Clear col_cache after this many point queries to bound memory. At 2M rows,
+/// one col_cache fill is ~88MB (5 columns). Clearing every 64 queries keeps
+/// peak RSS manageable while amortizing decode cost over many queries.
+const POINT_QUERY_EVICT_INTERVAL: u64 = 256;
 
 impl ColSegmentStore {
     /// Create a new store for a table at `base_dir/columnar_ms/<table_name>/`.
@@ -207,6 +217,7 @@ impl ColSegmentStore {
             col_types,
             groupby_cache: RwLock::new(std::collections::HashMap::new()),
             in_hash_cache: RwLock::new(std::collections::HashMap::new()),
+            point_query_count: AtomicU64::new(0),
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -379,7 +390,19 @@ impl ColSegmentStore {
                     return None;
                 }
                 // Live row: decode and return using O(1) column read.
-                return seg.get_row_cached(key, &self.col_types);
+                let result = seg.get_row_cached(key, &self.col_types);
+                // Periodically clear col_cache to bound memory from text column
+                // caching. Fixed columns are now stored uncompressed (O(1) direct
+                // read, no cache), so only text columns contribute to col_cache.
+                let count = self
+                    .point_query_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count % POINT_QUERY_EVICT_INTERVAL == 0 && count > 0 {
+                    for s in segs.iter() {
+                        s.clear_cache();
+                    }
+                }
+                return result;
             }
         }
         None

@@ -1565,6 +1565,26 @@ impl Database {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
                 _ => return Ok(None),
             }
+        } else if self.inner.has_col_segment_store(table_name) {
+            // ColSegmentStore tables: for non-AUTO_INCREMENT Integer PK, the PK
+            // value IS the row_id (see crud.rs insert path). This gives O(log N)
+            // binary search via store.get() without needing the pk_lookup cache
+            // or a disk index.
+            match &where_value {
+                Value::Integer(id) if *id >= 0 => *id as RowId,
+                _ => {
+                    // Non-Integer PK: try pk_lookup cache.
+                    let pk_key = crate::database::pk_cache::PkKey::from_value(&where_value);
+                    if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
+                        match lookup.get_pk(&pk_key) {
+                            Some(rid) => rid,
+                            None => return Ok(None), // cache miss → fall through to scan
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+            }
         } else {
             let pk_key = crate::database::pk_cache::PkKey::from_value(&where_value);
             if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
@@ -1725,6 +1745,23 @@ impl Database {
             match &value {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
                 _ => return Ok(None),
+            }
+        } else if self.inner.has_col_segment_store(table_name) {
+            // ColSegmentStore tables: for non-AUTO_INCREMENT Integer PK, the PK
+            // value IS the row_id (see crud.rs insert path).
+            match &value {
+                Value::Integer(id) if *id >= 0 => *id as RowId,
+                _ => {
+                    let pk_key = crate::database::pk_cache::PkKey::from_value(&value);
+                    if let Some(lookup) = self.inner.pk_lookup.get(table_name) {
+                        match lookup.get_pk(&pk_key) {
+                            Some(rid) => rid,
+                            None => return Ok(None),
+                        }
+                    } else {
+                        return Ok(None);
+                    }
+                }
             }
         } else {
             let pk_key = crate::database::pk_cache::PkKey::from_value(&value);

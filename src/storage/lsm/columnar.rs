@@ -1607,9 +1607,12 @@ impl ColumnarSSTable {
             let s = &self.file_data[value_offset..value_offset + 8];
             i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
         } else if flag == 1 {
-            // Snappy compressed — fall back to full decode (rare for point reads).
-            let seg = self.read_fixed_i64(col_idx)?;
-            seg.get_i64(row_idx).unwrap_or(0)
+            // Snappy compressed — can't do O(1) byte read. Return an error so
+            // the caller falls back to the cached full-column decode path
+            // (decode once, reuse via col_cache for subsequent point queries).
+            return Err(StorageError::InvalidData(
+                "compressed segment — use full-column decode".into(),
+            ));
         } else {
             let mut buf = [0u8; 8];
             self.read_raw(value_offset, &mut buf)?;
@@ -2782,22 +2785,38 @@ impl ColumnarSSTableBuilder {
         let mut compressed_segs: Vec<Vec<u8>> = Vec::with_capacity(num_cols);
         let mut column_entries = Vec::with_capacity(num_cols);
         let mut current_offset = segments_start as u64;
-        for seg in &segments {
-            // Try Snappy compression — only use if it saves space.
-            // Compression reduces file size → less file_data heap memory on read.
-            let compressed = snap::raw::Encoder::new()
-                .compress_vec(seg)
-                .unwrap_or_else(|_| seg.clone());
-            let seg_data: Vec<u8> = if compressed.len() + 1 < seg.len() {
-                let mut out = Vec::with_capacity(1 + compressed.len());
-                out.push(1u8); // flag: Snappy compressed
-                out.extend_from_slice(&compressed);
-                out
-            } else {
+        for (col_idx, seg) in segments.iter().enumerate() {
+            // Determine if this column is fixed-width (Integer/Float/Timestamp/
+            // Boolean). Fixed-width columns are stored UNCOMPRESSED so that
+            // `read_fixed_i64_at` can do O(1) direct byte reads for point
+            // queries — no Snappy decompression, no col_cache, zero heap.
+            // This trades ~2× disk for fixed columns (sequential integers
+            // compress well) for O(1) point reads and bounded memory.
+            // Text/Vector/Spatial columns are still Snappy-compressed.
+            let is_fixed = col_idx < self.column_tags.len()
+                && self.column_tags[col_idx].is_fixed();
+            let seg_data: Vec<u8> = if is_fixed {
+                // Store uncompressed — enables O(1) point reads.
                 let mut out = Vec::with_capacity(1 + seg.len());
                 out.push(0u8); // flag: uncompressed
                 out.extend_from_slice(seg);
                 out
+            } else {
+                // Try Snappy compression — only use if it saves space.
+                let compressed = snap::raw::Encoder::new()
+                    .compress_vec(seg)
+                    .unwrap_or_else(|_| seg.clone());
+                if compressed.len() + 1 < seg.len() {
+                    let mut out = Vec::with_capacity(1 + compressed.len());
+                    out.push(1u8); // flag: Snappy compressed
+                    out.extend_from_slice(&compressed);
+                    out
+                } else {
+                    let mut out = Vec::with_capacity(1 + seg.len());
+                    out.push(0u8); // flag: uncompressed
+                    out.extend_from_slice(seg);
+                    out
+                }
             };
             let size = seg_data.len() as u64;
             column_entries.push(ColumnIndexEntry {
