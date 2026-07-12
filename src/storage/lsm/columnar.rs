@@ -223,20 +223,30 @@ const COLUMN_INDEX_ENTRY_SIZE: usize = 16; // (offset: u64, size: u64)
 /// - `deleted` is always loaded into heap (small: ~250KB for 2M rows)
 /// - `keys` uses the backing SegData (mmap or owned)
 /// - `timestamps` uses the same backing SegData (never separately allocated)
-/// Sparse fence index: keeps every Nth key in memory for O(log(N/FENCE)) binary
-/// search, then reads a single 16KB block from disk for the final search.
-/// Memory: num_rows / FENCE_INTERVAL × 8 bytes = ~390KB for 100M rows (FIXED).
-/// Without this, the full keys array grows linearly at 8 bytes/row.
-const FENCE_INTERVAL: usize = 2048;
+/// Sparse fence index with a HARD memory ceiling.
+///
+/// Keeps at most MAX_FENCE_KEYS keys in memory. The fence interval is
+/// computed per-segment as max(2048, num_rows / MAX_FENCE_KEYS), ensuring
+/// fence_keys.len() ≤ MAX_FENCE_KEYS regardless of data size.
+///
+/// Memory: MAX_FENCE_KEYS × 8 bytes = 8192 bytes (8 KB). FIXED FOREVER.
+/// For 2M rows: interval=2048, 977 fence keys.
+/// For 100M rows: interval=100_000, 1000 fence keys.
+/// For 10B rows: interval=10_000_000, 1000 fence keys.
+///
+/// The block read after fence lookup reads `interval × 8` bytes from disk
+/// (at most 80KB for 10B rows), which the OS caches in page cache.
+const MAX_FENCE_KEYS: usize = 1024; // 8KB hard ceiling for fence keys
 
 #[derive(Clone, Debug)]
 pub struct RowMap {
     pub num_rows: usize,
-    /// Sparse fence keys: one key per FENCE_INTERVAL rows, stored in heap.
-    /// Size = (num_rows / 2048 + 1) × 8 bytes. For 2M rows = ~8KB. For 100M
-    /// rows = ~390KB. This is the ONLY row-proportional memory — and it's
-    /// capped at <1MB even for billions of rows.
+    /// Sparse fence keys: at most MAX_FENCE_KEYS entries (8KB HARD CEILING).
+    /// The fence_interval adapts to data size so this Vec never exceeds 1024.
     fence_keys: Vec<u64>,
+    /// Rows per fence entry = max(2048, num_rows / MAX_FENCE_KEYS).
+    /// Affects the block read size after fence lookup.
+    fence_interval: usize,
     /// File offset where the full keys array starts (for on-demand block reads).
     keys_file_offset: u64,
     /// Full keys data — only populated lazily for scan paths (index build, merge).
@@ -267,33 +277,51 @@ impl RowMap {
         )
     }
 
+    /// Compute the fence interval for a given row count. Ensures at most
+    /// MAX_FENCE_KEYS fence entries, giving a hard 8KB memory ceiling.
+    fn compute_fence_interval(num_rows: usize) -> usize {
+        if num_rows <= MAX_FENCE_KEYS * 2048 {
+            2048 // Small tables: 1 key per 2048 rows
+        } else {
+            // Large tables: spread across MAX_FENCE_KEYS entries
+            (num_rows / MAX_FENCE_KEYS).max(2048)
+        }
+    }
+
+    /// Build fence keys from a full keys slice.
+    fn build_fence_keys(keys_data: &[u8], num_rows: usize, interval: usize) -> Vec<u64> {
+        let mut fence = Vec::with_capacity(num_rows / interval + 1);
+        for i in (0..num_rows).step_by(interval) {
+            let off = i * 8;
+            if off + 8 <= keys_data.len() {
+                fence.push(u64::from_le_bytes([
+                    keys_data[off],
+                    keys_data[off + 1],
+                    keys_data[off + 2],
+                    keys_data[off + 3],
+                    keys_data[off + 4],
+                    keys_data[off + 5],
+                    keys_data[off + 6],
+                    keys_data[off + 7],
+                ]));
+            }
+        }
+        fence
+    }
+
     #[allow(dead_code)]
     pub(crate) fn from_bytes(data: Vec<u8>, num_rows: usize) -> Self {
         let (_, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
         let deleted_offset = keys_size + timestamps_size;
         let deleted_bitmap = Self::extract_deleted_bitmap(&data, deleted_offset, deleted_len);
-        // Build fence keys from the data.
-        let mut fence_keys = Vec::with_capacity(num_rows / FENCE_INTERVAL + 1);
-        for i in (0..num_rows).step_by(FENCE_INTERVAL) {
-            let off = i * 8;
-            if off + 8 <= data.len() {
-                fence_keys.push(u64::from_le_bytes([
-                    data[off],
-                    data[off + 1],
-                    data[off + 2],
-                    data[off + 3],
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]));
-            }
-        }
+        let interval = Self::compute_fence_interval(num_rows);
+        let fence_keys = Self::build_fence_keys(&data, num_rows, interval);
         Self {
             num_rows,
             fence_keys,
+            fence_interval: interval,
             keys_file_offset: 0,
-            keys_data: Some(SegData::Owned(data)), // already in heap for from_bytes
+            keys_data: Some(SegData::Owned(data)),
             timestamps_file_offset: keys_size as u64,
             timestamps_data: None,
             deleted_offset,
@@ -326,26 +354,13 @@ impl RowMap {
             let mmap_ref = &mmap;
             Self::extract_deleted_bitmap(mmap_ref, deleted_offset, deleted_len)
         };
-        // Build fence keys from mmap.
-        let mut fence_keys = Vec::with_capacity(num_rows / FENCE_INTERVAL + 1);
-        for i in (0..num_rows).step_by(FENCE_INTERVAL) {
-            let off = offset + i * 8;
-            if off + 8 <= mmap.len() {
-                fence_keys.push(u64::from_le_bytes([
-                    mmap[off],
-                    mmap[off + 1],
-                    mmap[off + 2],
-                    mmap[off + 3],
-                    mmap[off + 4],
-                    mmap[off + 5],
-                    mmap[off + 6],
-                    mmap[off + 7],
-                ]));
-            }
-        }
+        let interval = Self::compute_fence_interval(num_rows);
+        let mmap_slice: &[u8] = &mmap[offset..];
+        let fence_keys = Self::build_fence_keys(mmap_slice, num_rows, interval);
         Ok(Self {
             num_rows,
             fence_keys,
+            fence_interval: interval,
             keys_file_offset: offset as u64,
             keys_data: Some(SegData::Mmap { mmap, offset }),
             timestamps_file_offset: (offset + keys_size) as u64,
@@ -368,7 +383,7 @@ impl RowMap {
             // Fallback: try fence_keys (only accurate at fence boundaries).
             // This should not happen in practice — callers should call
             // load_full_keys() before scanning.
-            let fence_idx = row_idx / FENCE_INTERVAL;
+            let fence_idx = row_idx / self.fence_interval;
             self.fence_keys.get(fence_idx).copied().unwrap_or(0)
         }
     }
@@ -390,7 +405,7 @@ impl RowMap {
 
     /// Get the fence interval (rows per fence entry).
     pub fn fence_interval(&self) -> usize {
-        FENCE_INTERVAL
+        self.fence_interval
     }
 
     /// Read a timestamp at the given row index. Timestamps are NOT stored in
@@ -450,8 +465,12 @@ impl RowMap {
         }
         // lo is the first fence key > target. The target (if present) is in
         // the block BEFORE lo: [block_start, block_end).
-        let block_start = if lo > 0 { (lo - 1) * FENCE_INTERVAL } else { 0 };
-        let block_end = (block_start + FENCE_INTERVAL).min(self.num_rows);
+        let block_start = if lo > 0 {
+            (lo - 1) * self.fence_interval
+        } else {
+            0
+        };
+        let block_end = (block_start + self.fence_interval).min(self.num_rows);
         // Quick check: if block_start fence key > target, not present.
         if lo > 0 && self.fence_keys[lo - 1] > target {
             return None;
@@ -1349,13 +1368,13 @@ impl ColumnarSSTable {
             }
         };
 
-        // Build sparse fence keys: one key per FENCE_INTERVAL rows.
-        let fence_count = num_rows / FENCE_INTERVAL + 1;
-        let mut fence_keys = Vec::with_capacity(fence_count);
+        // Build sparse fence keys: at most MAX_FENCE_KEYS entries (8KB ceiling).
+        let interval = RowMap::compute_fence_interval(num_rows);
+        let fence_count = num_rows / interval + 1;
+        let mut fence_keys = Vec::with_capacity(fence_count.min(MAX_FENCE_KEYS + 1));
         if !file_data.is_empty() {
-            // Small file: extract fence keys from file_data.
             let keys_start = row_map_offset as usize;
-            for i in (0..num_rows).step_by(FENCE_INTERVAL) {
+            for i in (0..num_rows).step_by(interval) {
                 let off = keys_start + i * 8;
                 if off + 8 <= file_data.len() {
                     fence_keys.push(u64::from_le_bytes([
@@ -1371,9 +1390,8 @@ impl ColumnarSSTable {
                 }
             }
         } else {
-            // Large file: read fence keys via seek+read (sparse, ~1% of full keys).
             let mut buf = [0u8; 8];
-            for i in (0..num_rows).step_by(FENCE_INTERVAL) {
+            for i in (0..num_rows).step_by(interval) {
                 let off = row_map_offset + (i * 8) as u64;
                 file.seek(SeekFrom::Start(off))?;
                 file.read_exact(&mut buf)?;
@@ -1384,8 +1402,9 @@ impl ColumnarSSTable {
         let row_map = RowMap {
             num_rows,
             fence_keys,
+            fence_interval: interval,
             keys_file_offset: row_map_offset,
-            keys_data: None, // lazy-loaded for scan paths
+            keys_data: None,
             timestamps_file_offset: row_map_offset + keys_size as u64,
             timestamps_data: None,
             deleted_offset: keys_size + timestamps_size,
