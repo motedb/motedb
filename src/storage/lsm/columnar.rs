@@ -1187,7 +1187,7 @@ impl ColumnarSSTable {
         // NOT loaded — they're lazy-loaded from disk only when the merge cursor
         // calls load_all_timestamps(). This saves 16MB/2M rows of heap.
         // Layout: [keys: u64×N][timestamps: u64×N][deleted: u8×ceil(N/8)]
-        let (rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
+        let (_rm_total, keys_size, timestamps_size, deleted_len) = RowMap::compute_sizes(num_rows);
         let row_map = if !file_data.is_empty() {
             // Small file: keys + deleted are in file_data, skip timestamps.
             let keys_data =

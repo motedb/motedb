@@ -1608,19 +1608,11 @@ impl ColSegmentStore {
             let order: Vec<usize> = if need_dedup {
                 (0..n).rev().collect()
             } else {
-                (0..n).collect()
+                Vec::new()
             };
-            for &i in &order {
-                let key = seg.sst.row_map.key(i);
-                if need_dedup && !seen.insert(key) {
-                    continue;
-                }
-                if seg.sst.row_map.is_deleted(i) {
-                    continue;
-                }
-
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+            let process_row = |i: usize, count: &mut usize| {
                 let matches = if let Some(ref f) = fcol_fixed {
-                    // Fixed-width: compare raw i64/f64 bits, no Value alloc.
                     match tag {
                         ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
                             let v = f.get_i64(i);
@@ -1637,17 +1629,34 @@ impl ColSegmentStore {
                         _ => false,
                     }
                 } else if let Some(ref t) = fcol_text {
-                    // Text: compare &str directly, no ArcString alloc.
                     match t.get_str(i) {
                         Some(s) => cmp_str(Some(s), target_s, op),
-                        None => false, // NULL never matches
+                        None => false,
                     }
                 } else {
                     false
                 };
-
                 if matches {
-                    count += 1;
+                    *count += 1;
+                }
+            };
+            if need_dedup {
+                for &i in &order {
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    process_row(i, &mut count);
+                }
+            } else {
+                for i in 0..n {
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    process_row(i, &mut count);
                 }
             }
         }
@@ -1728,20 +1737,8 @@ impl ColSegmentStore {
             };
             let agg_is_float = matches!(self.col_types.get(agg_col), Some(ColumnType::Float));
 
-            let order: Vec<usize> = if need_dedup {
-                (0..n).rev().collect()
-            } else {
-                (0..n).collect()
-            };
-            for &i in &order {
-                let key = seg.sst.row_map.key(i);
-                if need_dedup && !seen.insert(key) {
-                    continue;
-                }
-                if seg.sst.row_map.is_deleted(i) {
-                    continue;
-                }
-
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+            let process_agg = |i: usize, result: &mut AggregateResult| {
                 // Apply filter predicate (zero-alloc, same as count_filtered).
                 let passes = if no_filter {
                     true
@@ -1764,12 +1761,10 @@ impl ColSegmentStore {
                 };
 
                 if !passes {
-                    continue;
+                    return;
                 }
 
                 // Fold aggregate value directly (no Value construction).
-                // 🔑 COUNT(col)/SUM/AVG/MIN/MAX all skip NULLs — only count
-                // when the value is present (get_i64/get_f64 return None for NULL).
                 if let Some(ref af) = agg_fixed {
                     if agg_is_float {
                         match af.get_f64(i) {
@@ -1809,7 +1804,7 @@ impl ColSegmentStore {
                     }
                 } else {
                     // Variable-width column (TEXT/Vector/Spatial): COUNT(col) counts
-                    // non-NULL rows. Use the column's null_flags to determine NULL.
+                    // non-NULL rows.
                     let is_null = self
                         .col_types
                         .get(agg_col)
@@ -1821,6 +1816,27 @@ impl ColSegmentStore {
                     } else {
                         result.count += 1;
                     }
+                }
+            };
+
+            if need_dedup {
+                let order: Vec<usize> = (0..n).rev().collect();
+                for &i in &order {
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    process_agg(i, &mut result);
+                }
+            } else {
+                for i in 0..n {
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    process_agg(i, &mut result);
                 }
             }
         }
