@@ -297,6 +297,39 @@ impl Segment {
         let entry = &self.sst.column_index.get(col_idx)?;
         let num_rows = self.sst.num_rows;
         let null_bytes = num_rows.div_ceil(8);
+
+        // 🔑 Check if the text column is Snappy-compressed (flag=1).
+        // If so, the page-level cache can't read raw offsets from the file —
+        // the data is compressed. Fall back to full-column decode via col_cache.
+        let flag = if !self.sst.file_data.is_empty() {
+            self.sst.file_data.get(entry.offset as usize).copied().unwrap_or(0)
+        } else {
+            let mut buf = [0u8; 1];
+            if self.sst.read_raw(entry.offset as usize, &mut buf).is_err() {
+                return None;
+            }
+            buf[0]
+        };
+        if flag == 1 {
+            // Compressed text — fall back to full-column cache.
+            {
+                let mut cache = self.col_cache.lock();
+                if let Some(cached) = cache.get(col_idx) {
+                    return match cached {
+                        CachedCol::Text(t) => t.get_str(row_idx).map(|s| s.to_string()),
+                        _ => None,
+                    };
+                }
+            }
+            if let Ok(t) = self.sst.read_text(col_idx) {
+                let result = t.get_str(row_idx).map(|s| s.to_string());
+                self.col_cache.lock().insert(col_idx, CachedCol::Text(t));
+                return result;
+            }
+            return None;
+        }
+
+        // Uncompressed text — use page-level cache (file layout below).
         // File layout: [flag:1B][null_bitmap][offsets (num_rows+1)×4][strings]
         let data_base = entry.offset as usize + 1; // skip flag
         let offsets_region = data_base + null_bytes;
