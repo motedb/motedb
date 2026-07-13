@@ -815,8 +815,53 @@ impl MoteDB {
             // 🔑 PERF: use append_row_ref (by reference) to avoid Vec<Value> clone.
             let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
-            store.append_row_ref(key, timestamp, &new_row)?;
+
+            // 🔑 If the PK value changed, we need to:
+            // 1. Tombstone the OLD composite_key (so WHERE old_pk finds nothing)
+            // 2. Insert the new row at the NEW composite_key (so WHERE new_pk finds it)
+            // Without this, the row stays at the old row_id's composite_key and
+            // WHERE old_pk still returns it (with the new PK value).
+            let pk_changed = !schema.is_primary_key_auto_increment()
+                && schema
+                    .primary_key()
+                    .and_then(|pk| schema.get_column(pk))
+                    .map(|pk_col| old_row.get(pk_col.position) != new_row.get(pk_col.position))
+                    .unwrap_or(false);
+
+            if pk_changed {
+                // Tombstone the old composite_key.
+                let old_key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                store.append_tombstone(old_key, timestamp)?;
+
+                // Insert at the new composite_key (derived from new PK value).
+                if let Some(pk_name) = schema.primary_key() {
+                    if let Some(pk_col) = schema.get_column(pk_name) {
+                        if let Some(Value::Integer(new_pk)) = new_row.get(pk_col.position) {
+                            let new_row_id = if *new_pk >= 0 {
+                                *new_pk as u64
+                            } else {
+                                0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
+                            };
+                            let new_key = (table_id << 32) | (new_row_id & 0xFFFFFFFF);
+                            store.append_row_ref(new_key, timestamp, &new_row)?;
+                        } else {
+                            // Non-integer PK — fall back to old behavior.
+                            let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                            store.append_row_ref(key, timestamp, &new_row)?;
+                        }
+                    } else {
+                        let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                        store.append_row_ref(key, timestamp, &new_row)?;
+                    }
+                } else {
+                    let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                    store.append_row_ref(key, timestamp, &new_row)?;
+                }
+            } else {
+                // PK unchanged — write at the same composite_key as before.
+                let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                store.append_row_ref(key, timestamp, &new_row)?;
+            }
             if store.buffered_bytes() >= 4 * 1024 * 1024 {
                 let _ = store.flush_buffer();
             }
@@ -841,7 +886,8 @@ impl MoteDB {
                     }
                 };
                 let mut builder = builder_arc.lock();
-                let _ = builder.add_values(key, timestamp, false, &new_row);
+                let legacy_key = (table_id << 32) | (row_id & 0xFFFFFFFF);
+                let _ = builder.add_values(legacy_key, timestamp, false, &new_row);
             }
         }
 

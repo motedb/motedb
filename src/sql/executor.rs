@@ -2804,6 +2804,12 @@ impl QueryExecutor {
         };
         let col_types = schema.col_types();
 
+        // 🔑 HAVING clause requires post-group filtering — this fast path
+        // doesn't support HAVING, so fall through to the materialized path.
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
+
         // Must flush buffer so segments see all data
         let _ = store.flush_buffer();
         let segs = store.segments_snapshot();
