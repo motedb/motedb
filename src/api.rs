@@ -1758,9 +1758,7 @@ impl Database {
             // 🔑 Negative PK → high u32 range (matching crud.rs insert path).
             match &value {
                 Value::Integer(id) if *id >= 0 => *id as RowId,
-                Value::Integer(id) => {
-                    (0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)) as RowId
-                }
+                Value::Integer(id) => (0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)) as RowId,
                 _ => {
                     let pk_key = crate::database::pk_cache::PkKey::from_value(&value);
                     if let Some(lookup) = self.inner.pk_lookup.get(table_name) {

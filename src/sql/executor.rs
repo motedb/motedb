@@ -1782,13 +1782,10 @@ impl QueryExecutor {
                     let index_key = format!("{}.{}", table_name, col_name);
                     let indexed_count = if matches!(op, crate::sql::ast::BinaryOperator::Eq) {
                         // Equality lookup: index.get(value) → row_ids → count.
-                        self.db
-                            .column_indexes
-                            .get(&index_key)
-                            .and_then(|index| {
-                                let idx = index.value();
-                                idx.get(&target).ok().map(|ids| ids.len() as i64)
-                            })
+                        self.db.column_indexes.get(&index_key).and_then(|index| {
+                            let idx = index.value();
+                            idx.get(&target).ok().map(|ids| ids.len() as i64)
+                        })
                     } else {
                         None
                     };
@@ -2333,7 +2330,10 @@ impl QueryExecutor {
         if stmt.where_clause.is_none() {
             let all_fixed = aggs.iter().all(|a| match a.col {
                 None => true, // COUNT(*)
-                Some(c) => matches!(schema.col_types().get(c), Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)),
+                Some(c) => matches!(
+                    schema.col_types().get(c),
+                    Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)
+                ),
             });
             if all_fixed {
                 let _ = store.flush_buffer();
@@ -2344,14 +2344,20 @@ impl QueryExecutor {
                 let mut mins: Vec<f64> = vec![f64::INFINITY; aggs.len()];
                 let mut maxs: Vec<f64> = vec![f64::NEG_INFINITY; aggs.len()];
                 let mut has_float: Vec<bool> = vec![false; aggs.len()];
-                let is_float_col: Vec<bool> = aggs.iter().map(|a| {
-                    a.col.map(|c| matches!(schema.col_types().get(c), Some(ColumnType::Float)))
-                        .unwrap_or(false)
-                }).collect();
+                let is_float_col: Vec<bool> = aggs
+                    .iter()
+                    .map(|a| {
+                        a.col
+                            .map(|c| matches!(schema.col_types().get(c), Some(ColumnType::Float)))
+                            .unwrap_or(false)
+                    })
+                    .collect();
 
                 for seg in &segs {
                     let n = seg.sst.num_rows;
-                    if n == 0 { continue; }
+                    if n == 0 {
+                        continue;
+                    }
                     let has_deletions = seg.sst.row_map.has_any_deleted();
 
                     // 🚀 Column-major iteration: for each agg column, iterate
@@ -2364,7 +2370,9 @@ impl QueryExecutor {
                             if has_deletions {
                                 let mut c = 0i64;
                                 for i in 0..n {
-                                    if !seg.sst.row_map.is_deleted(i) { c += 1; }
+                                    if !seg.sst.row_map.is_deleted(i) {
+                                        c += 1;
+                                    }
                                 }
                                 counts[ai] += c;
                             } else {
@@ -2373,11 +2381,15 @@ impl QueryExecutor {
                             continue;
                         }
 
-                        let Some(c) = agg.col else { continue; };
+                        let Some(c) = agg.col else {
+                            continue;
+                        };
                         if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
                             continue;
                         }
-                        let Ok(fs) = seg.sst.read_fixed_i64(c) else { continue; };
+                        let Ok(fs) = seg.sst.read_fixed_i64(c) else {
+                            continue;
+                        };
                         let nulls = fs.null_bitmap_bytes();
                         let has_nulls = !nulls.is_empty() && fs.has_nulls();
 
@@ -2388,18 +2400,30 @@ impl QueryExecutor {
                                 // 🚀 Fully unchecked SIMD loop — no branches.
                                 for &v in raw.iter().take(nvals) {
                                     sums[ai] += v;
-                                    if v < mins[ai] { mins[ai] = v; }
-                                    if v > maxs[ai] { maxs[ai] = v; }
+                                    if v < mins[ai] {
+                                        mins[ai] = v;
+                                    }
+                                    if v > maxs[ai] {
+                                        maxs[ai] = v;
+                                    }
                                 }
                                 counts[ai] += nvals as i64;
                                 has_float[ai] = true;
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(nvals) {
-                                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
-                                    if has_nulls && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                                        continue;
+                                    }
+                                    if has_nulls && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
+                                        continue;
+                                    }
                                     sums[ai] += v;
-                                    if v < mins[ai] { mins[ai] = v; }
-                                    if v > maxs[ai] { maxs[ai] = v; }
+                                    if v < mins[ai] {
+                                        mins[ai] = v;
+                                    }
+                                    if v > maxs[ai] {
+                                        maxs[ai] = v;
+                                    }
                                     counts[ai] += 1;
                                     has_float[ai] = true;
                                 }
@@ -2412,18 +2436,30 @@ impl QueryExecutor {
                                 for &v in raw.iter().take(nvals) {
                                     sums[ai] += v as f64;
                                     let vf = v as f64;
-                                    if vf < mins[ai] { mins[ai] = vf; }
-                                    if vf > maxs[ai] { maxs[ai] = vf; }
+                                    if vf < mins[ai] {
+                                        mins[ai] = vf;
+                                    }
+                                    if vf > maxs[ai] {
+                                        maxs[ai] = vf;
+                                    }
                                 }
                                 counts[ai] += nvals as i64;
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(nvals) {
-                                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
-                                    if has_nulls && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                                        continue;
+                                    }
+                                    if has_nulls && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
+                                        continue;
+                                    }
                                     sums[ai] += v as f64;
                                     let vf = v as f64;
-                                    if vf < mins[ai] { mins[ai] = vf; }
-                                    if vf > maxs[ai] { maxs[ai] = vf; }
+                                    if vf < mins[ai] {
+                                        mins[ai] = vf;
+                                    }
+                                    if vf > maxs[ai] {
+                                        maxs[ai] = vf;
+                                    }
                                     counts[ai] += 1;
                                 }
                             }
@@ -2440,23 +2476,38 @@ impl QueryExecutor {
                     match agg.func.as_str() {
                         "COUNT" => row.push(Value::Integer(cnt)),
                         "SUM" => {
-                            if cnt == 0 { row.push(Value::Null); }
-                            else if has_float[ai] { row.push(Value::Float(sums[ai])); }
-                            else { row.push(Value::Integer(sums[ai] as i64)); }
+                            if cnt == 0 {
+                                row.push(Value::Null);
+                            } else if has_float[ai] {
+                                row.push(Value::Float(sums[ai]));
+                            } else {
+                                row.push(Value::Integer(sums[ai] as i64));
+                            }
                         }
                         "AVG" => {
-                            if cnt == 0 { row.push(Value::Null); }
-                            else { row.push(Value::Float(sums[ai] / cnt as f64)); }
+                            if cnt == 0 {
+                                row.push(Value::Null);
+                            } else {
+                                row.push(Value::Float(sums[ai] / cnt as f64));
+                            }
                         }
                         "MIN" => {
-                            if cnt == 0 { row.push(Value::Null); }
-                            else if has_float[ai] || is_float_col[ai] { row.push(Value::Float(mins[ai])); }
-                            else { row.push(Value::Integer(mins[ai] as i64)); }
+                            if cnt == 0 {
+                                row.push(Value::Null);
+                            } else if has_float[ai] || is_float_col[ai] {
+                                row.push(Value::Float(mins[ai]));
+                            } else {
+                                row.push(Value::Integer(mins[ai] as i64));
+                            }
                         }
                         "MAX" => {
-                            if cnt == 0 { row.push(Value::Null); }
-                            else if has_float[ai] || is_float_col[ai] { row.push(Value::Float(maxs[ai])); }
-                            else { row.push(Value::Integer(maxs[ai] as i64)); }
+                            if cnt == 0 {
+                                row.push(Value::Null);
+                            } else if has_float[ai] || is_float_col[ai] {
+                                row.push(Value::Float(maxs[ai]));
+                            } else {
+                                row.push(Value::Integer(maxs[ai] as i64));
+                            }
                         }
                         _ => return Ok(None),
                     }
@@ -2773,24 +2824,46 @@ impl QueryExecutor {
             });
             // Collect aggregate functions (besides COUNT) and their columns.
             // All must be on fixed-width columns for this path.
-            struct GbAgg { func: String, col: Option<usize> }
+            struct GbAgg {
+                func: String,
+                col: Option<usize>,
+            }
             let mut gb_aggs: Vec<GbAgg> = Vec::new();
             let mut all_fixed = has_count_star;
             for col in &stmt.columns {
-                if let SelectColumn::Expr(crate::sql::ast::Expr::FunctionCall { name, args, .. }, _) = col {
+                if let SelectColumn::Expr(
+                    crate::sql::ast::Expr::FunctionCall { name, args, .. },
+                    _,
+                ) = col
+                {
                     let fname = name.to_uppercase();
-                    if fname == "COUNT" { continue; }
-                    let agg_col = args.iter().filter_map(|a| {
-                        if let crate::sql::ast::Expr::Column(cn) = a { schema.get_column_position(cn) } else { None }
-                    }).next();
+                    if fname == "COUNT" {
+                        continue;
+                    }
+                    let agg_col = args
+                        .iter()
+                        .filter_map(|a| {
+                            if let crate::sql::ast::Expr::Column(cn) = a {
+                                schema.get_column_position(cn)
+                            } else {
+                                None
+                            }
+                        })
+                        .next();
                     // Check the agg column is fixed-width.
                     if let Some(c) = agg_col {
-                        if !matches!(col_types.get(c), Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)) {
+                        if !matches!(
+                            col_types.get(c),
+                            Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)
+                        ) {
                             all_fixed = false;
                             break;
                         }
                     }
-                    gb_aggs.push(GbAgg { func: fname, col: agg_col });
+                    gb_aggs.push(GbAgg {
+                        func: fname,
+                        col: agg_col,
+                    });
                 } else if !matches!(col, SelectColumn::Column(_)) {
                     // Non-column, non-function (e.g. expression) — can't handle.
                     all_fixed = false;
@@ -2815,12 +2888,20 @@ impl QueryExecutor {
             let mut group_counts: Vec<i64> = Vec::with_capacity(16);
             // Per-group, per-agg accumulators.
             let n_aggs = gb_aggs.len();
-            let mut group_sums: Vec<Vec<f64>> = (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
-            let mut group_mins: Vec<Vec<f64>> = (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
-            let mut group_maxs: Vec<Vec<f64>> = (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
-            let agg_is_float: Vec<bool> = gb_aggs.iter().map(|a| {
-                a.col.map(|c| matches!(col_types.get(c), Some(ColumnType::Float))).unwrap_or(false)
-            }).collect();
+            let mut group_sums: Vec<Vec<f64>> =
+                (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            let mut group_mins: Vec<Vec<f64>> =
+                (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            let mut group_maxs: Vec<Vec<f64>> =
+                (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            let agg_is_float: Vec<bool> = gb_aggs
+                .iter()
+                .map(|a| {
+                    a.col
+                        .map(|c| matches!(col_types.get(c), Some(ColumnType::Float)))
+                        .unwrap_or(false)
+                })
+                .collect();
             let mut key_index: HashMap<Box<str>, usize> = HashMap::with_capacity(16);
             let mut null_count: i64 = 0;
 
@@ -2882,49 +2963,77 @@ impl QueryExecutor {
                     }
                     // Phase 2: fold agg columns using raw typed slices.
                     for (ai, agg) in gb_aggs.iter().enumerate() {
-                        let Some(c) = agg.col else { continue; };
+                        let Some(c) = agg.col else {
+                            continue;
+                        };
                         if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
                             continue;
                         }
-                        let Ok(fs) = seg.sst.read_fixed_i64(c) else { continue; };
+                        let Ok(fs) = seg.sst.read_fixed_i64(c) else {
+                            continue;
+                        };
                         let nulls = fs.null_bitmap_bytes();
                         let has_nulls_col = fs.has_nulls();
                         if agg_is_float[ai] {
                             let raw = fs.raw_f64_typed_slice();
                             for (i, &v) in raw.iter().enumerate().take(n) {
-                                if has_nulls_col && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                if has_nulls_col && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
+                                    continue;
+                                }
                                 let gi = row_groups[i] as usize;
                                 group_sums[ai][gi] += v;
-                                if v < group_mins[ai][gi] { group_mins[ai][gi] = v; }
-                                if v > group_maxs[ai][gi] { group_maxs[ai][gi] = v; }
+                                if v < group_mins[ai][gi] {
+                                    group_mins[ai][gi] = v;
+                                }
+                                if v > group_maxs[ai][gi] {
+                                    group_maxs[ai][gi] = v;
+                                }
                             }
                         } else {
                             let raw = fs.raw_i64_slice();
                             for (i, &v) in raw.iter().enumerate().take(n) {
-                                if has_nulls_col && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                if has_nulls_col && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
+                                    continue;
+                                }
                                 let gi = row_groups[i] as usize;
                                 let vf = v as f64;
                                 group_sums[ai][gi] += vf;
-                                if vf < group_mins[ai][gi] { group_mins[ai][gi] = vf; }
-                                if vf > group_maxs[ai][gi] { group_maxs[ai][gi] = vf; }
+                                if vf < group_mins[ai][gi] {
+                                    group_mins[ai][gi] = vf;
+                                }
+                                if vf > group_maxs[ai][gi] {
+                                    group_maxs[ai][gi] = vf;
+                                }
                             }
                         }
                     }
                 } else {
                     // Slow path: nulls/deletions present.
-                    let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = gb_aggs.iter().map(|a| {
-                        a.col.and_then(|c| {
-                            if c < seg.sst.column_tags.len() && seg.sst.column_tags[c].is_fixed() {
-                                seg.sst.read_fixed_i64(c).ok()
-                            } else { None }
-                        })
-                    }).collect();
+                    let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
+                        gb_aggs
+                            .iter()
+                            .map(|a| {
+                                a.col.and_then(|c| {
+                                    if c < seg.sst.column_tags.len()
+                                        && seg.sst.column_tags[c].is_fixed()
+                                    {
+                                        seg.sst.read_fixed_i64(c).ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .collect();
                     for i in 0..n {
                         if need_dedup {
                             let key = seg.sst.row_map.key(i);
-                            if !seen.insert(key) { continue; }
+                            if !seen.insert(key) {
+                                continue;
+                            }
                         }
-                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                        if has_deletions && seg.sst.row_map.is_deleted(i) {
+                            continue;
+                        }
                         if has_nulls && ftext.is_null(i) {
                             null_count += 1;
                             continue;
@@ -2951,15 +3060,23 @@ impl QueryExecutor {
                                 if agg_is_float[ai] {
                                     if let Some(v) = fs.get_f64(i) {
                                         group_sums[ai][idx] += v;
-                                        if v < group_mins[ai][idx] { group_mins[ai][idx] = v; }
-                                        if v > group_maxs[ai][idx] { group_maxs[ai][idx] = v; }
+                                        if v < group_mins[ai][idx] {
+                                            group_mins[ai][idx] = v;
+                                        }
+                                        if v > group_maxs[ai][idx] {
+                                            group_maxs[ai][idx] = v;
+                                        }
                                     }
                                 } else {
                                     if let Some(v) = fs.get_i64(i) {
                                         let vf = v as f64;
                                         group_sums[ai][idx] += vf;
-                                        if vf < group_mins[ai][idx] { group_mins[ai][idx] = vf; }
-                                        if vf > group_maxs[ai][idx] { group_maxs[ai][idx] = vf; }
+                                        if vf < group_mins[ai][idx] {
+                                            group_mins[ai][idx] = vf;
+                                        }
+                                        if vf > group_maxs[ai][idx] {
+                                            group_maxs[ai][idx] = vf;
+                                        }
                                     }
                                 }
                             }
@@ -2974,9 +3091,9 @@ impl QueryExecutor {
                 .iter()
                 .map(|c| match c {
                     SelectColumn::Column(name) => name.clone(),
-                    SelectColumn::Expr(
-                        crate::sql::ast::Expr::FunctionCall { name, .. }, _,
-                    ) => name.as_str().to_string(),
+                    SelectColumn::Expr(crate::sql::ast::Expr::FunctionCall { name, .. }, _) => {
+                        name.as_str().to_string()
+                    }
                     _ => "expr".to_string(),
                 })
                 .collect();
@@ -2987,40 +3104,70 @@ impl QueryExecutor {
                 // Build values matching SELECT column order (skip the first GROUP BY column).
                 for col in stmt.columns.iter().skip(1) {
                     if let SelectColumn::Expr(
-                        crate::sql::ast::Expr::FunctionCall { name, args, .. }, _,
+                        crate::sql::ast::Expr::FunctionCall { name, args, .. },
+                        _,
                     ) = col
                     {
                         let fname = name.to_uppercase();
                         // Find this agg in gb_aggs.
-                        let agg_col = args.iter().filter_map(|a| {
-                            if let crate::sql::ast::Expr::Column(cn) = a { schema.get_column_position(cn) } else { None }
-                        }).next();
-                        let ai = gb_aggs.iter().position(|a| a.func == fname && a.col == agg_col);
+                        let agg_col = args
+                            .iter()
+                            .filter_map(|a| {
+                                if let crate::sql::ast::Expr::Column(cn) = a {
+                                    schema.get_column_position(cn)
+                                } else {
+                                    None
+                                }
+                            })
+                            .next();
+                        let ai = gb_aggs
+                            .iter()
+                            .position(|a| a.func == fname && a.col == agg_col);
                         match fname.as_str() {
                             "COUNT" => row.push(Value::Integer(cnt)),
                             "SUM" => {
                                 if let Some(ai) = ai {
-                                    if agg_is_float[ai] { row.push(Value::Float(group_sums[ai][gi])); }
-                                    else { row.push(Value::Integer(group_sums[ai][gi] as i64)); }
-                                } else { row.push(Value::Null); }
+                                    if agg_is_float[ai] {
+                                        row.push(Value::Float(group_sums[ai][gi]));
+                                    } else {
+                                        row.push(Value::Integer(group_sums[ai][gi] as i64));
+                                    }
+                                } else {
+                                    row.push(Value::Null);
+                                }
                             }
                             "AVG" => {
                                 if let Some(ai) = ai {
-                                    if cnt > 0 { row.push(Value::Float(group_sums[ai][gi] / cnt as f64)); }
-                                    else { row.push(Value::Null); }
-                                } else { row.push(Value::Null); }
+                                    if cnt > 0 {
+                                        row.push(Value::Float(group_sums[ai][gi] / cnt as f64));
+                                    } else {
+                                        row.push(Value::Null);
+                                    }
+                                } else {
+                                    row.push(Value::Null);
+                                }
                             }
                             "MIN" => {
                                 if let Some(ai) = ai {
-                                    if agg_is_float[ai] { row.push(Value::Float(group_mins[ai][gi])); }
-                                    else { row.push(Value::Integer(group_mins[ai][gi] as i64)); }
-                                } else { row.push(Value::Null); }
+                                    if agg_is_float[ai] {
+                                        row.push(Value::Float(group_mins[ai][gi]));
+                                    } else {
+                                        row.push(Value::Integer(group_mins[ai][gi] as i64));
+                                    }
+                                } else {
+                                    row.push(Value::Null);
+                                }
                             }
                             "MAX" => {
                                 if let Some(ai) = ai {
-                                    if agg_is_float[ai] { row.push(Value::Float(group_maxs[ai][gi])); }
-                                    else { row.push(Value::Integer(group_maxs[ai][gi] as i64)); }
-                                } else { row.push(Value::Null); }
+                                    if agg_is_float[ai] {
+                                        row.push(Value::Float(group_maxs[ai][gi]));
+                                    } else {
+                                        row.push(Value::Integer(group_maxs[ai][gi] as i64));
+                                    }
+                                } else {
+                                    row.push(Value::Null);
+                                }
                             }
                             _ => row.push(Value::Null),
                         }

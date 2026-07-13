@@ -873,9 +873,13 @@ impl ColSegmentStore {
                     if let Some(ref mut seen) = seen {
                         let _ = seg.sst.load_full_keys();
                         let key = seg.sst.row_map.key(i);
-                        if !seen.insert(key) { continue; }
+                        if !seen.insert(key) {
+                            continue;
+                        }
                     }
-                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
                     total += 1;
                 }
             }
@@ -2228,10 +2232,14 @@ impl ColSegmentStore {
         // Previously this was inside the per-row loop causing O(N×K) re-decode.
         // Now: decode at most |out_cols| × |segments| times regardless of K.
         use std::collections::HashMap;
-        let mut pre_fixed: HashMap<(usize, usize), crate::storage::lsm::columnar::FixedSegment> = HashMap::new();
-        let mut pre_text: HashMap<(usize, usize), crate::storage::lsm::columnar::TextSegment> = HashMap::new();
+        let mut pre_fixed: HashMap<(usize, usize), crate::storage::lsm::columnar::FixedSegment> =
+            HashMap::new();
+        let mut pre_text: HashMap<(usize, usize), crate::storage::lsm::columnar::TextSegment> =
+            HashMap::new();
         for &(seg_idx, _) in indices {
-            let Some(seg) = segs.get(seg_idx) else { continue };
+            let Some(seg) = segs.get(seg_idx) else {
+                continue;
+            };
             for &ci in out_cols {
                 let key = (seg_idx, ci);
                 if pre_fixed.contains_key(&key) || pre_text.contains_key(&key) {
@@ -2242,7 +2250,10 @@ impl ColSegmentStore {
                     if let Ok(f) = seg.sst.read_fixed_i64(ci) {
                         pre_fixed.insert(key, f);
                     }
-                } else if matches!(tag, Some(crate::storage::lsm::columnar::ColumnTypeTag::Text)) {
+                } else if matches!(
+                    tag,
+                    Some(crate::storage::lsm::columnar::ColumnTypeTag::Text)
+                ) {
                     if let Ok(t) = seg.sst.read_text(ci) {
                         pre_text.insert(key, t);
                     }
@@ -2269,9 +2280,9 @@ impl ColSegmentStore {
                         Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
                         Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
                         Some(ColumnType::Boolean) => f.get_bool(row_idx).map(Value::Bool),
-                        Some(ColumnType::Timestamp) => f.get_i64(row_idx).map(|v| {
-                            Value::Timestamp(crate::types::Timestamp::from_micros(v))
-                        }),
+                        Some(ColumnType::Timestamp) => f
+                            .get_i64(row_idx)
+                            .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
                         _ => None,
                     }
                 } else if let Some(ref t) = pre_text.get(&(seg_idx, ci)) {

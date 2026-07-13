@@ -54,7 +54,8 @@ impl TextPageCache {
         while self.offset_pages.len() >= 4 {
             self.offset_pages.pop_back();
         }
-        self.offset_pages.retain(|(c, p, _)| !(*c == col_idx && *p == page_idx));
+        self.offset_pages
+            .retain(|(c, p, _)| !(*c == col_idx && *p == page_idx));
         self.offset_pages.push_front((col_idx, page_idx, offsets));
     }
 
@@ -302,7 +303,11 @@ impl Segment {
         // If so, the page-level cache can't read raw offsets from the file —
         // the data is compressed. Fall back to full-column decode via col_cache.
         let flag = if !self.sst.file_data.is_empty() {
-            self.sst.file_data.get(entry.offset as usize).copied().unwrap_or(0)
+            self.sst
+                .file_data
+                .get(entry.offset as usize)
+                .copied()
+                .unwrap_or(0)
         } else {
             let mut buf = [0u8; 1];
             if self.sst.read_raw(entry.offset as usize, &mut buf).is_err() {
@@ -356,8 +361,13 @@ impl Segment {
             if off_pos + 8 > self.sst.file_data.len() {
                 return None;
             }
-            let s = u32::from_le_bytes(self.sst.file_data[off_pos..off_pos+4].try_into().unwrap()) as usize;
-            let e = u32::from_le_bytes(self.sst.file_data[off_pos+4..off_pos+8].try_into().unwrap()) as usize;
+            let s = u32::from_le_bytes(self.sst.file_data[off_pos..off_pos + 4].try_into().unwrap())
+                as usize;
+            let e = u32::from_le_bytes(
+                self.sst.file_data[off_pos + 4..off_pos + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             (s, e)
         } else {
             // Check page cache for this row's offset window.
@@ -372,7 +382,8 @@ impl Segment {
                         // Try string page cache.
                         if let Some((sdata, sbase)) = cache.get_strings(col_idx) {
                             if start >= sbase as usize && end <= sbase as usize + sdata.len() {
-                                let bytes = &sdata[start as usize - sbase as usize..end as usize - sbase as usize];
+                                let bytes = &sdata[start as usize - sbase as usize
+                                    ..end as usize - sbase as usize];
                                 return Some(String::from_utf8_lossy(bytes).into_owned());
                             }
                         }
@@ -406,18 +417,21 @@ impl Segment {
                 if self.sst.read_raw(off_pos, &mut buf8).is_err() {
                     return None;
                 }
-                let s = u32::from_le_bytes([buf8[0],buf8[1],buf8[2],buf8[3]]) as usize;
-                let e = u32::from_le_bytes([buf8[4],buf8[5],buf8[6],buf8[7]]) as usize;
+                let s = u32::from_le_bytes([buf8[0], buf8[1], buf8[2], buf8[3]]) as usize;
+                let e = u32::from_le_bytes([buf8[4], buf8[5], buf8[6], buf8[7]]) as usize;
                 (s, e)
             } else {
-                let offsets: Vec<u32> = off_buf.chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]]))
+                let offsets: Vec<u32> = off_buf
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 let local_idx = row_idx - window_start;
                 let start = offsets.get(local_idx).copied().unwrap_or(0) as usize;
                 let end = offsets.get(local_idx + 1).copied().unwrap_or(0) as usize;
                 // Cache the offset window.
-                self.text_page_cache.lock().put_offsets(col_idx, page_idx, offsets);
+                self.text_page_cache
+                    .lock()
+                    .put_offsets(col_idx, page_idx, offsets);
                 (start, end)
             }
         };
@@ -434,7 +448,10 @@ impl Segment {
         let str_pos = strings_region + start;
         if !self.sst.file_data.is_empty() {
             if str_pos + len <= self.sst.file_data.len() {
-                return Some(String::from_utf8_lossy(&self.sst.file_data[str_pos..str_pos+len]).into_owned());
+                return Some(
+                    String::from_utf8_lossy(&self.sst.file_data[str_pos..str_pos + len])
+                        .into_owned(),
+                );
             }
         } else {
             let mut str_buf = vec![0u8; len];

@@ -688,12 +688,7 @@ impl FixedSegment {
         // SAFETY: i64 is #[repr(C)] and the data is num_rows*8 bytes aligned
         // within a Vec<u8>. The builder writes i64 in little-endian, which
         // matches the platform native representation.
-        unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr() as *const i64,
-                bytes.len() / 8,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i64, bytes.len() / 8) }
     }
 
     /// Returns the raw data bytes as a typed f64 slice (zero-copy).
@@ -701,12 +696,7 @@ impl FixedSegment {
     #[inline]
     pub fn raw_f64_typed_slice(&self) -> &[f64] {
         let bytes = self.data.as_bytes();
-        unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr() as *const f64,
-                bytes.len() / 8,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, bytes.len() / 8) }
     }
 
     /// Returns the null bitmap as raw bytes for batch null-checking.
@@ -931,17 +921,25 @@ impl TextSegment {
             for i in 0..n {
                 let ob = i * 4;
                 let start = u32::from_le_bytes([
-                    off_bytes[ob], off_bytes[ob + 1], off_bytes[ob + 2], off_bytes[ob + 3],
+                    off_bytes[ob],
+                    off_bytes[ob + 1],
+                    off_bytes[ob + 2],
+                    off_bytes[ob + 3],
                 ]) as usize;
                 let end = u32::from_le_bytes([
-                    off_bytes[ob + 4], off_bytes[ob + 5], off_bytes[ob + 6], off_bytes[ob + 7],
+                    off_bytes[ob + 4],
+                    off_bytes[ob + 5],
+                    off_bytes[ob + 6],
+                    off_bytes[ob + 7],
                 ]) as usize;
                 if end - start >= plen {
                     let candidate = &str_bytes[start..start + plen];
                     let matched = if !prefix.contains(&b'_') {
                         candidate == prefix
                     } else {
-                        candidate.iter().zip(prefix.iter())
+                        candidate
+                            .iter()
+                            .zip(prefix.iter())
                             .all(|(&c, &p)| p == b'_' || p == c)
                     };
                     if matched {
@@ -951,7 +949,9 @@ impl TextSegment {
             }
         } else {
             for i in 0..n {
-                if has_nulls && self.is_null(i) { continue; }
+                if has_nulls && self.is_null(i) {
+                    continue;
+                }
                 let s = self.get_str_fast(i);
                 if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
                     count += 1;
@@ -960,7 +960,6 @@ impl TextSegment {
         }
         count
     }
-
 
     /// directly against string_data without creating &str or Value.
     /// Used by `WHERE text_col = 'literal'` to avoid 300K ArcString allocs.
@@ -1024,10 +1023,16 @@ impl TextSegment {
             for i in 0..n {
                 let ob = i * 4;
                 let start = u32::from_le_bytes([
-                    off_bytes[ob], off_bytes[ob + 1], off_bytes[ob + 2], off_bytes[ob + 3],
+                    off_bytes[ob],
+                    off_bytes[ob + 1],
+                    off_bytes[ob + 2],
+                    off_bytes[ob + 3],
                 ]) as usize;
                 let end = u32::from_le_bytes([
-                    off_bytes[ob + 4], off_bytes[ob + 5], off_bytes[ob + 6], off_bytes[ob + 7],
+                    off_bytes[ob + 4],
+                    off_bytes[ob + 5],
+                    off_bytes[ob + 6],
+                    off_bytes[ob + 7],
                 ]) as usize;
                 if end - start == tlen && &str_bytes[start..end] == target {
                     count += 1;
@@ -1035,7 +1040,9 @@ impl TextSegment {
             }
         } else {
             for i in 0..n {
-                if has_nulls && self.is_null(i) { continue; }
+                if has_nulls && self.is_null(i) {
+                    continue;
+                }
                 if self.get_str_fast(i).as_bytes() == target {
                     count += 1;
                 }
@@ -1233,12 +1240,9 @@ impl TextSegment {
                     start_bytes[2],
                     start_bytes[3],
                 ]) as usize;
-                let end = u32::from_le_bytes([
-                    end_bytes[0],
-                    end_bytes[1],
-                    end_bytes[2],
-                    end_bytes[3],
-                ]) as usize;
+                let end =
+                    u32::from_le_bytes([end_bytes[0], end_bytes[1], end_bytes[2], end_bytes[3]])
+                        as usize;
                 let bytes = self.string_data.slice(start, end - start);
                 bytes == target
             }
@@ -3134,8 +3138,7 @@ impl ColumnarSSTableBuilder {
             //   without Snappy decompression (page-level text cache).
             // Text data doesn't compress well (varied UTF-8), and the page-level
             // cache needs raw bytes. Vector/Spatial columns are still compressed.
-            let is_fixed = col_idx < self.column_tags.len()
-                && self.column_tags[col_idx].is_fixed();
+            let is_fixed = col_idx < self.column_tags.len() && self.column_tags[col_idx].is_fixed();
             let is_text = col_idx < self.column_tags.len()
                 && matches!(self.column_tags[col_idx], ColumnTypeTag::Text);
             let store_uncompressed = is_fixed || is_text;
