@@ -18561,6 +18561,12 @@ impl QueryExecutor {
         if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
             let _ = store.flush_buffer();
             let segs = store.segments_snapshot();
+            // 🔑 Load full keys so row_map.key(i) returns accurate values.
+            // Without this, small segments (<2048 rows) return fence_keys[0]
+            // for all rows, making all candidates have the same row_id.
+            for seg in &segs {
+                let _ = seg.sst.load_full_keys();
+            }
             let mut scored: Vec<(f32, u64)> = Vec::with_capacity(1024);
             for (_sidx, seg) in segs.iter().enumerate() {
                 if col_pos >= seg.sst.column_tags.len() {
