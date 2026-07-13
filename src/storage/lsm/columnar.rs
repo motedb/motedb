@@ -3128,17 +3128,19 @@ impl ColumnarSSTableBuilder {
         let mut column_entries = Vec::with_capacity(num_cols);
         let mut current_offset = segments_start as u64;
         for (col_idx, seg) in segments.iter().enumerate() {
-            // Determine if this column is fixed-width (Integer/Float/Timestamp/
-            // Boolean). Fixed-width columns are stored UNCOMPRESSED so that
-            // `read_fixed_i64_at` can do O(1) direct byte reads for point
-            // queries — no Snappy decompression, no col_cache, zero heap.
-            // This trades ~2× disk for fixed columns (sequential integers
-            // compress well) for O(1) point reads and bounded memory.
-            // Text/Vector/Spatial columns are still Snappy-compressed.
+            // 🔑 Store FIXED and TEXT columns UNCOMPRESSED so that:
+            // - read_fixed_i64_at can do O(1) direct byte reads for point queries
+            // - read_text_paged can read raw offsets/strings from the file
+            //   without Snappy decompression (page-level text cache).
+            // Text data doesn't compress well (varied UTF-8), and the page-level
+            // cache needs raw bytes. Vector/Spatial columns are still compressed.
             let is_fixed = col_idx < self.column_tags.len()
                 && self.column_tags[col_idx].is_fixed();
-            let seg_data: Vec<u8> = if is_fixed {
-                // Store uncompressed — enables O(1) point reads.
+            let is_text = col_idx < self.column_tags.len()
+                && matches!(self.column_tags[col_idx], ColumnTypeTag::Text);
+            let store_uncompressed = is_fixed || is_text;
+            let seg_data: Vec<u8> = if store_uncompressed {
+                // Store uncompressed — enables O(1)/page-level reads.
                 let mut out = Vec::with_capacity(1 + seg.len());
                 out.push(0u8); // flag: uncompressed
                 out.extend_from_slice(seg);
