@@ -2797,12 +2797,12 @@ impl QueryExecutor {
                     break;
                 }
             }
-            // 🔑 Only use this fast path for pure COUNT(*) (no SUM/AVG/MIN/MAX).
-            // The SUM/AVG path adds per-row get_i64/get_f64 overhead that makes
-            // it slower than the materialized scan path for grouped aggregates.
-            // The materialized path (col_segment_multi_aggregate fallback) is
-            // faster because it can vectorize per-column without group lookup.
-            if !has_count_star || !all_fixed || !gb_aggs.is_empty() {
+            // 🔑 Use this fast path for COUNT(*) with optional SUM/AVG/MIN/MAX
+            // on fixed columns. Uses a two-phase approach:
+            // Phase 1: scan text column → assign group index per row (HashMap)
+            // Phase 2: for each agg column, iterate raw typed slice and fold
+            // into per-group accumulators (vectorizable inner loop).
+            if !has_count_star || !all_fixed {
                 return Ok(None);
             }
             // 🔑 Use TextSegment::for_each_str which iterates raw &str without
@@ -2844,70 +2844,87 @@ impl QueryExecutor {
                 };
                 let has_nulls = ftext.has_any_null();
                 let has_deletions = seg.sst.row_map.has_any_deleted();
-                // Pre-decode agg columns for this segment.
-                let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = gb_aggs.iter().map(|a| {
-                    a.col.and_then(|c| {
-                        if c < seg.sst.column_tags.len() && seg.sst.column_tags[c].is_fixed() {
-                            seg.sst.read_fixed_i64(c).ok()
-                        } else { None }
-                    })
-                }).collect();
 
                 if !has_nulls && !has_deletions && !need_dedup {
-                    // 🚀 Fast indexed loop: get_str_fast + hash lookup + agg update.
+                    // 🚀 Two-phase approach for maximum throughput:
+                    // Phase 1: fast text scan → assign group index per row (linear
+                    //   scan over group_keys, string compare — fast for ≤256 groups).
+                    //   Store group index in a Vec<u16> (supports up to 65535 groups).
+                    // Phase 2: for each agg column, iterate raw typed slice and
+                    //   fold into per-group accumulators (cache-friendly, vectorizable).
+                    let mut row_groups: Vec<u16> = Vec::with_capacity(n);
                     for i in 0..n {
                         let s = ftext.get_str_fast(i);
-                        let idx = if let Some(&idx) = key_index.get(s) {
-                            idx
-                        } else {
-                            let boxed: Box<str> = s.into();
-                            if let Some(&idx) = key_index.get(boxed.as_ref()) {
-                                idx
-                            } else {
+                        // Linear scan to find group (fast for small group count).
+                        let mut found_idx: Option<usize> = None;
+                        for (gi, k) in group_keys.iter().enumerate() {
+                            if &**k == s {
+                                found_idx = Some(gi);
+                                break;
+                            }
+                        }
+                        let idx = match found_idx {
+                            Some(idx) => idx,
+                            None => {
                                 let idx = group_keys.len();
-                                group_keys.push(boxed.clone());
+                                group_keys.push(s.into());
                                 group_counts.push(0);
                                 for ai in 0..n_aggs {
                                     group_sums[ai].push(0.0);
                                     group_mins[ai].push(f64::INFINITY);
                                     group_maxs[ai].push(f64::NEG_INFINITY);
                                 }
-                                key_index.insert(boxed, idx);
                                 idx
                             }
                         };
                         group_counts[idx] += 1;
-                        // Update agg accumulators for this group.
-                        for (ai, _agg) in gb_aggs.iter().enumerate() {
-                            if let Some(ref fs) = agg_segs[ai] {
-                                if agg_is_float[ai] {
-                                    if let Some(v) = fs.get_f64(i) {
-                                        group_sums[ai][idx] += v;
-                                        if v < group_mins[ai][idx] { group_mins[ai][idx] = v; }
-                                        if v > group_maxs[ai][idx] { group_maxs[ai][idx] = v; }
-                                    }
-                                } else {
-                                    if let Some(v) = fs.get_i64(i) {
-                                        group_sums[ai][idx] += v as f64;
-                                        let vf = v as f64;
-                                        if vf < group_mins[ai][idx] { group_mins[ai][idx] = vf; }
-                                        if vf > group_maxs[ai][idx] { group_maxs[ai][idx] = vf; }
-                                    }
-                                }
+                        row_groups.push(idx as u16);
+                    }
+                    // Phase 2: fold agg columns using raw typed slices.
+                    for (ai, agg) in gb_aggs.iter().enumerate() {
+                        let Some(c) = agg.col else { continue; };
+                        if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
+                            continue;
+                        }
+                        let Ok(fs) = seg.sst.read_fixed_i64(c) else { continue; };
+                        let nulls = fs.null_bitmap_bytes();
+                        let has_nulls_col = fs.has_nulls();
+                        if agg_is_float[ai] {
+                            let raw = fs.raw_f64_typed_slice();
+                            for (i, &v) in raw.iter().enumerate().take(n) {
+                                if has_nulls_col && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                let gi = row_groups[i] as usize;
+                                group_sums[ai][gi] += v;
+                                if v < group_mins[ai][gi] { group_mins[ai][gi] = v; }
+                                if v > group_maxs[ai][gi] { group_maxs[ai][gi] = v; }
+                            }
+                        } else {
+                            let raw = fs.raw_i64_slice();
+                            for (i, &v) in raw.iter().enumerate().take(n) {
+                                if has_nulls_col && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                let gi = row_groups[i] as usize;
+                                let vf = v as f64;
+                                group_sums[ai][gi] += vf;
+                                if vf < group_mins[ai][gi] { group_mins[ai][gi] = vf; }
+                                if vf > group_maxs[ai][gi] { group_maxs[ai][gi] = vf; }
                             }
                         }
                     }
                 } else {
+                    // Slow path: nulls/deletions present.
+                    let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = gb_aggs.iter().map(|a| {
+                        a.col.and_then(|c| {
+                            if c < seg.sst.column_tags.len() && seg.sst.column_tags[c].is_fixed() {
+                                seg.sst.read_fixed_i64(c).ok()
+                            } else { None }
+                        })
+                    }).collect();
                     for i in 0..n {
                         if need_dedup {
                             let key = seg.sst.row_map.key(i);
-                            if !seen.insert(key) {
-                                continue;
-                            }
+                            if !seen.insert(key) { continue; }
                         }
-                        if has_deletions && seg.sst.row_map.is_deleted(i) {
-                            continue;
-                        }
+                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
                         if has_nulls && ftext.is_null(i) {
                             null_count += 1;
                             continue;
@@ -2939,8 +2956,8 @@ impl QueryExecutor {
                                     }
                                 } else {
                                     if let Some(v) = fs.get_i64(i) {
-                                        group_sums[ai][idx] += v as f64;
                                         let vf = v as f64;
+                                        group_sums[ai][idx] += vf;
                                         if vf < group_mins[ai][idx] { group_mins[ai][idx] = vf; }
                                         if vf > group_maxs[ai][idx] { group_maxs[ai][idx] = vf; }
                                     }
