@@ -1008,6 +1008,42 @@ impl TextSegment {
         result
     }
 
+    /// 🚀 Count rows whose string exactly equals target — no Vec allocation.
+    /// Same inner loop as eq_match_indices but counts instead of pushing.
+    pub fn eq_count_matches(&self, target: &[u8]) -> usize {
+        let n = self.num_rows;
+        let tlen = target.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut count = 0usize;
+        let off_bytes = self.offsets_data.as_bytes();
+        let str_bytes = self.string_data.as_bytes();
+        let has_nulls = self.has_any_null();
+        if !has_nulls && off_bytes.len() >= (n + 1) * 4 {
+            for i in 0..n {
+                let ob = i * 4;
+                let start = u32::from_le_bytes([
+                    off_bytes[ob], off_bytes[ob + 1], off_bytes[ob + 2], off_bytes[ob + 3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    off_bytes[ob + 4], off_bytes[ob + 5], off_bytes[ob + 6], off_bytes[ob + 7],
+                ]) as usize;
+                if end - start == tlen && &str_bytes[start..end] == target {
+                    count += 1;
+                }
+            }
+        } else {
+            for i in 0..n {
+                if has_nulls && self.is_null(i) { continue; }
+                if self.get_str_fast(i).as_bytes() == target {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// Scan for rows whose string is in the given set of target byte-slices.
     /// Returns row indices. Zero-alloc: walks raw offsets, checks each row's
     /// bytes against the HashSet of target byte-slices.

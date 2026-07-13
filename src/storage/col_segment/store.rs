@@ -1679,12 +1679,23 @@ impl ColSegmentStore {
                 None
             };
 
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+
+            // 🚀 Segment-level fast path: text equality with no dedup/deletions.
+            // Uses eq_count_matches (batch raw-byte scan) instead of per-row
+            // eq_bytes closure dispatch.
+            if is_eq_filter && fcol_text.is_some() && !need_dedup && !has_deletions {
+                if let Some(target_bytes) = target_s.map(|s| s.as_bytes()) {
+                    count += fcol_text.as_ref().unwrap().eq_count_matches(target_bytes);
+                    continue;
+                }
+            }
+
             let order: Vec<usize> = if need_dedup {
                 (0..n).rev().collect()
             } else {
                 Vec::new()
             };
-            let has_deletions = seg.sst.row_map.has_any_deleted();
             let process_row = |i: usize, count: &mut usize| {
                 let matches = if let Some(ref f) = fcol_fixed {
                     match tag {
@@ -2328,29 +2339,21 @@ impl ColSegmentStore {
         };
         for (sidx, seg) in segs.iter().enumerate() {
             let n = seg.sst.num_rows;
-            let _ = seg.sst.load_full_keys();
+            // 🔑 Only load full keys for dedup (multi-segment). Single-segment
+            // top-K doesn't need keys — saves 16MB allocation.
+            if dedup.is_some() {
+                let _ = seg.sst.load_full_keys();
+            }
             let has_deletions = seg.sst.row_map.has_any_deleted();
             // Read via the decoder matching the column's stored type. Reading a
             // Float column as i64 reinterprets the bits → garbage sort keys.
             if is_float {
                 if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
-                    // 🔑 Fast path: no nulls, no deletions, single seg — walk the
-                    // raw 8-byte data directly (no per-row slice/bounds-check).
-                    let raw = fseg.raw_f64_slice();
                     let has_nulls = fseg.has_nulls();
-                    if !has_nulls && !has_deletions && dedup.is_none() && raw.len() >= n * 8 {
-                        for i in 0..n {
-                            let off = i * 8;
-                            let v = f64::from_le_bytes([
-                                raw[off],
-                                raw[off + 1],
-                                raw[off + 2],
-                                raw[off + 3],
-                                raw[off + 4],
-                                raw[off + 5],
-                                raw[off + 6],
-                                raw[off + 7],
-                            ]);
+                    // 🚀 Fast path: no nulls/deletions/dedup — typed f64 slice.
+                    if !has_nulls && !has_deletions && dedup.is_none() {
+                        let raw = fseg.raw_f64_typed_slice();
+                        for (i, &v) in raw.iter().enumerate().take(n) {
                             let ord_key = if desc {
                                 u64::MAX - to_ord(v)
                             } else {
@@ -2375,24 +2378,38 @@ impl ColSegmentStore {
                     }
                 }
             } else if let Ok(fseg) = seg.sst.read_fixed_i64(order_col) {
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    if let Some(ref mut s) = dedup {
-                        if !s.insert(key) {
+                let has_nulls = fseg.has_nulls();
+                // 🚀 Fast path: no nulls/deletions/dedup — typed i64 slice.
+                if !has_nulls && !has_deletions && dedup.is_none() {
+                    let raw = fseg.raw_i64_slice();
+                    for (i, &v) in raw.iter().enumerate().take(n) {
+                        let vf = v as f64;
+                        let ord_key = if desc {
+                            u64::MAX - to_ord(vf)
+                        } else {
+                            to_ord(vf)
+                        };
+                        push_capped(&mut heap, ord_key, sidx, i);
+                    }
+                } else {
+                    for i in 0..n {
+                        let key = seg.sst.row_map.key(i);
+                        if let Some(ref mut s) = dedup {
+                            if !s.insert(key) {
+                                continue;
+                            }
+                        }
+                        if has_deletions && seg.sst.row_map.is_deleted(i) {
                             continue;
                         }
+                        let v = fseg.get_i64(i).unwrap_or(i64::MIN) as f64;
+                        let ord_key = if desc {
+                            u64::MAX - to_ord(v)
+                        } else {
+                            to_ord(v)
+                        };
+                        push_capped(&mut heap, ord_key, sidx, i);
                     }
-                    if has_deletions && seg.sst.row_map.is_deleted(i) {
-                        continue;
-                    }
-                    let v = fseg.get_i64(i).unwrap_or(i64::MIN) as f64;
-                    // DESC (largest K): invert ord so heap is a min-heap on true value.
-                    let ord_key = if desc {
-                        u64::MAX - to_ord(v)
-                    } else {
-                        to_ord(v)
-                    };
-                    push_capped(&mut heap, ord_key, sidx, i);
                 }
             }
         }
