@@ -3316,7 +3316,8 @@ mod tests {
         assert_eq!(col_sst.num_rows, 4);
         assert_eq!(col_sst.column_tags.len(), 4);
 
-        // Check row map
+        // Check row map — load full keys for accurate key() access.
+        col_sst.load_full_keys().unwrap();
         assert_eq!(col_sst.row_map.key(0), 1);
         assert_eq!(col_sst.row_map.key(3), 4);
         assert!(!col_sst.row_map.is_deleted(0));
