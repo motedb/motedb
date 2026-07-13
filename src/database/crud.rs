@@ -2370,12 +2370,52 @@ impl MoteDB {
                 row_ids.push(id as u64);
             }
         } else {
-            // Non-AUTO_INCREMENT: use global row_id
-            let start_id = self
-                .next_row_id
-                .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            for i in 0..rows.len() {
-                row_ids.push(start_id + i as u64);
+            // Non-AUTO_INCREMENT: use PK value as row_id (matching insert_row_to_table).
+            // For Integer PKs, this enables O(log N) binary search in ColSegmentStore.
+            // 🔑 Negative PK values are mapped to high u32 range (same as insert_row_to_table).
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    if matches!(pk_col.col_type, crate::types::ColumnType::Integer) {
+                        for (i, row) in rows.iter().enumerate() {
+                            if let Some(Value::Integer(pk_val)) = row.get(pk_col.position) {
+                                let rid = if *pk_val >= 0 {
+                                    *pk_val as u64
+                                } else {
+                                    0x8000_0000u64 | (*pk_val as u64 & 0x7FFF_FFFF)
+                                };
+                                row_ids.push(rid);
+                            } else {
+                                // Non-integer PK value — fall back to next_row_id.
+                                let id = self
+                                    .next_row_id
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                row_ids.push(id);
+                            }
+                        }
+                    } else {
+                        // Non-Integer PK column — use next_row_id for all.
+                        let start_id = self
+                            .next_row_id
+                            .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        for i in 0..rows.len() {
+                            row_ids.push(start_id + i as u64);
+                        }
+                    }
+                } else {
+                    let start_id = self
+                        .next_row_id
+                        .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    for i in 0..rows.len() {
+                        row_ids.push(start_id + i as u64);
+                    }
+                }
+            } else {
+                let start_id = self
+                    .next_row_id
+                    .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                for i in 0..rows.len() {
+                    row_ids.push(start_id + i as u64);
+                }
             }
         }
 
