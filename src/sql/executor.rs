@@ -1819,13 +1819,10 @@ impl QueryExecutor {
                             let prefix = &pat[..pat.len() - 1];
                             let pos = schema.get_column_position(cn).unwrap();
                             let _ = store.flush_buffer();
-                            if let Some(indices) =
-                                store.scan_row_indices_prefix(pos, prefix.as_bytes(), usize::MAX)
-                            {
-                                count = indices.len() as i64;
-                            } else {
-                                return Ok(None);
-                            }
+                            // 🚀 Use count_prefix_matches (zero allocation)
+                            // instead of scan_row_indices_prefix which builds
+                            // a Vec just to read .len().
+                            count = store.count_prefix_matches(pos, prefix.as_bytes()) as i64;
                         } else {
                             return Ok(None);
                         }
@@ -2355,41 +2352,80 @@ impl QueryExecutor {
                 for seg in &segs {
                     let n = seg.sst.num_rows;
                     if n == 0 { continue; }
-                    // Pre-decode each agg column's raw slice.
-                    let raw_slices: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> =
-                        aggs.iter().map(|a| a.col.and_then(|c| {
-                            if c < seg.sst.column_tags.len() && seg.sst.column_tags[c].is_fixed() {
-                                seg.sst.read_fixed_i64(c).ok()
-                            } else { None }
-                        })).collect();
-
                     let has_deletions = seg.sst.row_map.has_any_deleted();
-                    for i in 0..n {
-                        if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
-                        for (ai, agg) in aggs.iter().enumerate() {
-                            if agg.func == "COUNT" && agg.col.is_none() {
-                                counts[ai] += 1;
-                                continue;
-                            }
-                            if let Some(ref fs) = raw_slices[ai] {
-                                if is_float_col[ai] {
-                                    if let Some(v) = fs.get_f64(i) {
-                                        counts[ai] += 1;
-                                        sums[ai] += v;
-                                        has_float[ai] = true;
-                                        if v < mins[ai] { mins[ai] = v; }
-                                        if v > maxs[ai] { maxs[ai] = v; }
-                                    }
-                                } else {
-                                    if let Some(v) = fs.get_i64(i) {
-                                        counts[ai] += 1;
-                                        sums[ai] += v as f64;
-                                        if (v as f64) < mins[ai] { mins[ai] = v as f64; }
-                                        if (v as f64) > maxs[ai] { maxs[ai] = v as f64; }
-                                    }
+
+                    // 🚀 Column-major iteration: for each agg column, iterate
+                    // its raw typed slice once (auto-vectorizable SIMD) instead
+                    // of row-major get_i64(i) per row (which doesn't vectorize
+                    // due to Option return + match overhead).
+                    for (ai, agg) in aggs.iter().enumerate() {
+                        if agg.func == "COUNT" && agg.col.is_none() {
+                            // COUNT(*) — count non-deleted rows.
+                            if has_deletions {
+                                let mut c = 0i64;
+                                for i in 0..n {
+                                    if !seg.sst.row_map.is_deleted(i) { c += 1; }
                                 }
-                            } else if agg.func == "COUNT" {
-                                counts[ai] += 1;
+                                counts[ai] += c;
+                            } else {
+                                counts[ai] += n as i64;
+                            }
+                            continue;
+                        }
+
+                        let Some(c) = agg.col else { continue; };
+                        if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
+                            continue;
+                        }
+                        let Ok(fs) = seg.sst.read_fixed_i64(c) else { continue; };
+                        let nulls = fs.null_bitmap_bytes();
+                        let has_nulls = !nulls.is_empty() && fs.has_nulls();
+
+                        if is_float_col[ai] {
+                            let raw = fs.raw_f64_typed_slice();
+                            let nvals = n.min(raw.len());
+                            if !has_deletions && !has_nulls {
+                                // 🚀 Fully unchecked SIMD loop — no branches.
+                                for &v in raw.iter().take(nvals) {
+                                    sums[ai] += v;
+                                    if v < mins[ai] { mins[ai] = v; }
+                                    if v > maxs[ai] { maxs[ai] = v; }
+                                }
+                                counts[ai] += nvals as i64;
+                                has_float[ai] = true;
+                            } else {
+                                for (i, &v) in raw.iter().enumerate().take(nvals) {
+                                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                                    if has_nulls && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                    sums[ai] += v;
+                                    if v < mins[ai] { mins[ai] = v; }
+                                    if v > maxs[ai] { maxs[ai] = v; }
+                                    counts[ai] += 1;
+                                    has_float[ai] = true;
+                                }
+                            }
+                        } else {
+                            let raw = fs.raw_i64_slice();
+                            let nvals = n.min(raw.len());
+                            if !has_deletions && !has_nulls {
+                                // 🚀 Fully unchecked SIMD loop.
+                                for &v in raw.iter().take(nvals) {
+                                    sums[ai] += v as f64;
+                                    let vf = v as f64;
+                                    if vf < mins[ai] { mins[ai] = vf; }
+                                    if vf > maxs[ai] { maxs[ai] = vf; }
+                                }
+                                counts[ai] += nvals as i64;
+                            } else {
+                                for (i, &v) in raw.iter().enumerate().take(nvals) {
+                                    if has_deletions && seg.sst.row_map.is_deleted(i) { continue; }
+                                    if has_nulls && (nulls[i/8] >> (i%8)) & 1 != 0 { continue; }
+                                    sums[ai] += v as f64;
+                                    let vf = v as f64;
+                                    if vf < mins[ai] { mins[ai] = vf; }
+                                    if vf > maxs[ai] { maxs[ai] = vf; }
+                                    counts[ai] += 1;
+                                }
                             }
                         }
                     }
@@ -2726,23 +2762,70 @@ impl QueryExecutor {
             col_types.get(group_pos),
             Some(crate::types::ColumnType::Text)
         ) {
-            let has_count_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
-            if !has_count_star {
+            // 🚀 Extended GROUP BY fast path: COUNT(*) + SUM/AVG/MIN/MAX on
+            // fixed columns, grouped by a text column. Computes all aggregates
+            // in a single pass using raw typed slices per agg column.
+            let has_count_star = stmt.columns.iter().any(|c| {
+                matches!(c, SelectColumn::Expr(
+                    crate::sql::ast::Expr::FunctionCall { name, args, .. }, _
+                ) if name.eq_ignore_ascii_case("COUNT")
+                  && (args.is_empty() || (args.len() == 1 && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*"))))
+            });
+            // Collect aggregate functions (besides COUNT) and their columns.
+            // All must be on fixed-width columns for this path.
+            struct GbAgg { func: String, col: Option<usize> }
+            let mut gb_aggs: Vec<GbAgg> = Vec::new();
+            let mut all_fixed = has_count_star;
+            for col in &stmt.columns {
+                if let SelectColumn::Expr(crate::sql::ast::Expr::FunctionCall { name, args, .. }, _) = col {
+                    let fname = name.to_uppercase();
+                    if fname == "COUNT" { continue; }
+                    let agg_col = args.iter().filter_map(|a| {
+                        if let crate::sql::ast::Expr::Column(cn) = a { schema.get_column_position(cn) } else { None }
+                    }).next();
+                    // Check the agg column is fixed-width.
+                    if let Some(c) = agg_col {
+                        if !matches!(col_types.get(c), Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)) {
+                            all_fixed = false;
+                            break;
+                        }
+                    }
+                    gb_aggs.push(GbAgg { func: fname, col: agg_col });
+                } else if !matches!(col, SelectColumn::Column(_)) {
+                    // Non-column, non-function (e.g. expression) — can't handle.
+                    all_fixed = false;
+                    break;
+                }
+            }
+            // 🔑 Only use this fast path for pure COUNT(*) (no SUM/AVG/MIN/MAX).
+            // The SUM/AVG path adds per-row get_i64/get_f64 overhead that makes
+            // it slower than the materialized scan path for grouped aggregates.
+            // The materialized path (col_segment_multi_aggregate fallback) is
+            // faster because it can vectorize per-column without group lookup.
+            if !has_count_star || !all_fixed || !gb_aggs.is_empty() {
                 return Ok(None);
             }
             // 🔑 Use TextSegment::for_each_str which iterates raw &str without
-            // per-row offset/slice overhead. Group keys are interned via a
-            // Vec<(Box<str>, i64)> with linear scan (fast for ≤256 groups).
+            // per-row offset/slice overhead.
+            // 🚀 Index-based accumulator: HashMap<&str, usize> → counts Vec<i64>.
+            // Hot path is 1 hash lookup + i64 increment, no string comparison
+            // against every existing key (old linear-scan was O(groups) per row).
             const LIN_MAX: usize = 256;
-            let mut lin_groups: Vec<(Box<str>, i64)> = Vec::with_capacity(16);
-            let mut use_hashmap = false;
-            let mut hm_groups: HashMap<Box<str>, i64> = HashMap::new();
+            let mut group_keys: Vec<Box<str>> = Vec::with_capacity(16);
+            let mut group_counts: Vec<i64> = Vec::with_capacity(16);
+            // Per-group, per-agg accumulators.
+            let n_aggs = gb_aggs.len();
+            let mut group_sums: Vec<Vec<f64>> = (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            let mut group_mins: Vec<Vec<f64>> = (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            let mut group_maxs: Vec<Vec<f64>> = (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            let agg_is_float: Vec<bool> = gb_aggs.iter().map(|a| {
+                a.col.map(|c| matches!(col_types.get(c), Some(ColumnType::Float))).unwrap_or(false)
+            }).collect();
+            let mut key_index: HashMap<Box<str>, usize> = HashMap::with_capacity(16);
             let mut null_count: i64 = 0;
 
             // 🔑 No dedup for GROUP BY: each row contributes to its group
-            // independently. Duplicate keys from UPDATE mean both old and new
-            // values get counted — which is the correct GROUP BY semantics
-            // (it's an aggregate over all rows, not a point lookup).
+            // independently.
             let need_dedup = false;
             let mut seen: std::collections::HashSet<u64> = if need_dedup {
                 std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
@@ -2761,35 +2844,59 @@ impl QueryExecutor {
                 };
                 let has_nulls = ftext.has_any_null();
                 let has_deletions = seg.sst.row_map.has_any_deleted();
+                // Pre-decode agg columns for this segment.
+                let agg_segs: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = gb_aggs.iter().map(|a| {
+                    a.col.and_then(|c| {
+                        if c < seg.sst.column_tags.len() && seg.sst.column_tags[c].is_fixed() {
+                            seg.sst.read_fixed_i64(c).ok()
+                        } else { None }
+                    })
+                }).collect();
 
-                // 🔑 Batch path: if no nulls/deletions/dedup, use for_each_str
-                // which is the fastest iteration (no per-row method calls).
                 if !has_nulls && !has_deletions && !need_dedup {
-                    ftext.for_each_str(|s| {
-                        if !use_hashmap {
-                            let mut found = false;
-                            for (k, c) in lin_groups.iter_mut() {
-                                if &**k == s {
-                                    *c += 1;
-                                    found = true;
-                                    break;
+                    // 🚀 Fast indexed loop: get_str_fast + hash lookup + agg update.
+                    for i in 0..n {
+                        let s = ftext.get_str_fast(i);
+                        let idx = if let Some(&idx) = key_index.get(s) {
+                            idx
+                        } else {
+                            let boxed: Box<str> = s.into();
+                            if let Some(&idx) = key_index.get(boxed.as_ref()) {
+                                idx
+                            } else {
+                                let idx = group_keys.len();
+                                group_keys.push(boxed.clone());
+                                group_counts.push(0);
+                                for ai in 0..n_aggs {
+                                    group_sums[ai].push(0.0);
+                                    group_mins[ai].push(f64::INFINITY);
+                                    group_maxs[ai].push(f64::NEG_INFINITY);
                                 }
+                                key_index.insert(boxed, idx);
+                                idx
                             }
-                            if !found {
-                                if lin_groups.len() >= LIN_MAX {
-                                    use_hashmap = true;
-                                    for (k, c) in lin_groups.drain(..) {
-                                        hm_groups.insert(k, c);
+                        };
+                        group_counts[idx] += 1;
+                        // Update agg accumulators for this group.
+                        for (ai, _agg) in gb_aggs.iter().enumerate() {
+                            if let Some(ref fs) = agg_segs[ai] {
+                                if agg_is_float[ai] {
+                                    if let Some(v) = fs.get_f64(i) {
+                                        group_sums[ai][idx] += v;
+                                        if v < group_mins[ai][idx] { group_mins[ai][idx] = v; }
+                                        if v > group_maxs[ai][idx] { group_maxs[ai][idx] = v; }
                                     }
                                 } else {
-                                    lin_groups.push((s.into(), 1));
+                                    if let Some(v) = fs.get_i64(i) {
+                                        group_sums[ai][idx] += v as f64;
+                                        let vf = v as f64;
+                                        if vf < group_mins[ai][idx] { group_mins[ai][idx] = vf; }
+                                        if vf > group_maxs[ai][idx] { group_maxs[ai][idx] = vf; }
+                                    }
                                 }
                             }
                         }
-                        if use_hashmap {
-                            *hm_groups.entry(s.into()).or_insert(0) += 1;
-                        }
-                    });
+                    }
                 } else {
                     for i in 0..n {
                         if need_dedup {
@@ -2806,59 +2913,112 @@ impl QueryExecutor {
                             continue;
                         }
                         let s = ftext.get_str_fast(i);
-                        if !use_hashmap {
-                            let mut found = false;
-                            for (k, c) in lin_groups.iter_mut() {
-                                if &**k == s {
-                                    *c += 1;
-                                    found = true;
-                                    break;
-                                }
+                        let idx = if let Some(&idx) = key_index.get(s) {
+                            idx
+                        } else {
+                            let boxed: Box<str> = s.into();
+                            let idx = group_keys.len();
+                            group_keys.push(boxed.clone());
+                            group_counts.push(0);
+                            for ai in 0..n_aggs {
+                                group_sums[ai].push(0.0);
+                                group_mins[ai].push(f64::INFINITY);
+                                group_maxs[ai].push(f64::NEG_INFINITY);
                             }
-                            if !found {
-                                if lin_groups.len() >= LIN_MAX {
-                                    use_hashmap = true;
-                                    for (k, c) in lin_groups.drain(..) {
-                                        hm_groups.insert(k, c);
+                            key_index.insert(boxed, idx);
+                            idx
+                        };
+                        group_counts[idx] += 1;
+                        for (ai, _agg) in gb_aggs.iter().enumerate() {
+                            if let Some(ref fs) = agg_segs[ai] {
+                                if agg_is_float[ai] {
+                                    if let Some(v) = fs.get_f64(i) {
+                                        group_sums[ai][idx] += v;
+                                        if v < group_mins[ai][idx] { group_mins[ai][idx] = v; }
+                                        if v > group_maxs[ai][idx] { group_maxs[ai][idx] = v; }
                                     }
                                 } else {
-                                    lin_groups.push((s.into(), 1));
+                                    if let Some(v) = fs.get_i64(i) {
+                                        group_sums[ai][idx] += v as f64;
+                                        let vf = v as f64;
+                                        if vf < group_mins[ai][idx] { group_mins[ai][idx] = vf; }
+                                        if vf > group_maxs[ai][idx] { group_maxs[ai][idx] = vf; }
+                                    }
                                 }
                             }
-                        }
-                        if use_hashmap {
-                            *hm_groups.entry(s.into()).or_insert(0) += 1;
                         }
                     }
                 }
             }
 
-            // Build output
+            // Build output — iterate SELECT columns to match output order.
             let columns: Vec<String> = stmt
                 .columns
                 .iter()
                 .map(|c| match c {
                     SelectColumn::Column(name) => name.clone(),
-                    _ => "COUNT(*)".to_string(),
+                    SelectColumn::Expr(
+                        crate::sql::ast::Expr::FunctionCall { name, .. }, _,
+                    ) => name.as_str().to_string(),
+                    _ => "expr".to_string(),
                 })
                 .collect();
-            let total_groups = if use_hashmap {
-                hm_groups.len()
-            } else {
-                lin_groups.len()
-            };
-            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(total_groups + 1);
-            if use_hashmap {
-                for (k, c) in &hm_groups {
-                    rows.push(vec![Value::Text(k.as_ref().into()), Value::Integer(*c)]);
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(group_keys.len() + 1);
+            for (gi, k) in group_keys.iter().enumerate() {
+                let mut row: Vec<Value> = vec![Value::Text(k.as_ref().into())];
+                let cnt = group_counts[gi];
+                // Build values matching SELECT column order (skip the first GROUP BY column).
+                for col in stmt.columns.iter().skip(1) {
+                    if let SelectColumn::Expr(
+                        crate::sql::ast::Expr::FunctionCall { name, args, .. }, _,
+                    ) = col
+                    {
+                        let fname = name.to_uppercase();
+                        // Find this agg in gb_aggs.
+                        let agg_col = args.iter().filter_map(|a| {
+                            if let crate::sql::ast::Expr::Column(cn) = a { schema.get_column_position(cn) } else { None }
+                        }).next();
+                        let ai = gb_aggs.iter().position(|a| a.func == fname && a.col == agg_col);
+                        match fname.as_str() {
+                            "COUNT" => row.push(Value::Integer(cnt)),
+                            "SUM" => {
+                                if let Some(ai) = ai {
+                                    if agg_is_float[ai] { row.push(Value::Float(group_sums[ai][gi])); }
+                                    else { row.push(Value::Integer(group_sums[ai][gi] as i64)); }
+                                } else { row.push(Value::Null); }
+                            }
+                            "AVG" => {
+                                if let Some(ai) = ai {
+                                    if cnt > 0 { row.push(Value::Float(group_sums[ai][gi] / cnt as f64)); }
+                                    else { row.push(Value::Null); }
+                                } else { row.push(Value::Null); }
+                            }
+                            "MIN" => {
+                                if let Some(ai) = ai {
+                                    if agg_is_float[ai] { row.push(Value::Float(group_mins[ai][gi])); }
+                                    else { row.push(Value::Integer(group_mins[ai][gi] as i64)); }
+                                } else { row.push(Value::Null); }
+                            }
+                            "MAX" => {
+                                if let Some(ai) = ai {
+                                    if agg_is_float[ai] { row.push(Value::Float(group_maxs[ai][gi])); }
+                                    else { row.push(Value::Integer(group_maxs[ai][gi] as i64)); }
+                                } else { row.push(Value::Null); }
+                            }
+                            _ => row.push(Value::Null),
+                        }
+                    } else {
+                        row.push(Value::Null);
+                    }
                 }
-            } else {
-                for (k, c) in &lin_groups {
-                    rows.push(vec![Value::Text(k.as_ref().into()), Value::Integer(*c)]);
-                }
+                rows.push(row);
             }
             if null_count > 0 {
-                rows.push(vec![Value::Null, Value::Integer(null_count)]);
+                let mut null_row: Vec<Value> = vec![Value::Null];
+                for col in stmt.columns.iter().skip(1) {
+                    null_row.push(Value::Integer(null_count));
+                }
+                rows.push(null_row);
             }
             return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
         }

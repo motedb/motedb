@@ -915,8 +915,53 @@ impl TextSegment {
         result
     }
 
-    /// Scan all non-null rows for those whose string EXACTLY equals `target`.
-    /// Returns row indices. Zero-alloc: walks raw offsets, compares bytes
+    /// Count rows whose string starts with `prefix` — no allocation.
+    /// Same inner loop as prefix_match_indices but counts instead of pushing.
+    pub fn prefix_count_matches(&self, prefix: &[u8]) -> usize {
+        let n = self.num_rows;
+        let plen = prefix.len();
+        if plen == 0 || n == 0 {
+            return n;
+        }
+        let mut count = 0usize;
+        let off_bytes = self.offsets_data.as_bytes();
+        let str_bytes = self.string_data.as_bytes();
+        let has_nulls = self.has_any_null();
+        if !has_nulls && off_bytes.len() >= (n + 1) * 4 {
+            for i in 0..n {
+                let ob = i * 4;
+                let start = u32::from_le_bytes([
+                    off_bytes[ob], off_bytes[ob + 1], off_bytes[ob + 2], off_bytes[ob + 3],
+                ]) as usize;
+                let end = u32::from_le_bytes([
+                    off_bytes[ob + 4], off_bytes[ob + 5], off_bytes[ob + 6], off_bytes[ob + 7],
+                ]) as usize;
+                if end - start >= plen {
+                    let candidate = &str_bytes[start..start + plen];
+                    let matched = if !prefix.contains(&b'_') {
+                        candidate == prefix
+                    } else {
+                        candidate.iter().zip(prefix.iter())
+                            .all(|(&c, &p)| p == b'_' || p == c)
+                    };
+                    if matched {
+                        count += 1;
+                    }
+                }
+            }
+        } else {
+            for i in 0..n {
+                if has_nulls && self.is_null(i) { continue; }
+                let s = self.get_str_fast(i);
+                if s.len() >= plen && &s.as_bytes()[..plen] == prefix {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+
     /// directly against string_data without creating &str or Value.
     /// Used by `WHERE text_col = 'literal'` to avoid 300K ArcString allocs.
     pub fn eq_match_indices(&self, target: &[u8]) -> Vec<usize> {
