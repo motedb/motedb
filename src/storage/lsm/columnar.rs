@@ -1298,7 +1298,7 @@ impl TextSegment {
 /// Column data is accessed via zero-copy slices into the mmap — no heap copies.
 pub struct ColumnarSSTable {
     pub path: PathBuf,
-    file_data: Vec<u8>,
+    pub(crate) file_data: Vec<u8>,
     #[allow(dead_code)]
     mmap: Option<Arc<Mmap>>,
     file: Option<parking_lot::Mutex<File>>,
@@ -1785,7 +1785,7 @@ impl ColumnarSSTable {
 
     /// Read raw bytes from the file at an absolute offset. Uses the cached file
     /// handle (no File::open per call).
-    fn read_raw(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_raw(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
         use std::io::{Read, Seek};
         if !self.file_data.is_empty() {
             let end = offset + buf.len();
