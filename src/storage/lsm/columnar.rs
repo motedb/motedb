@@ -684,6 +684,7 @@ impl FixedSegment {
     /// Used by aggregate scans to avoid per-row get_i64() overhead.
     #[inline]
     pub fn raw_i64_slice(&self) -> &[i64] {
+        debug_assert!(self.elem_size == 8, "raw_i64_slice on non-8-byte column");
         let bytes = self.data.as_bytes();
         // SAFETY: i64 is #[repr(C)] and the data is num_rows*8 bytes aligned
         // within a Vec<u8>. The builder writes i64 in little-endian, which
@@ -695,6 +696,10 @@ impl FixedSegment {
     /// Enables auto-vectorization in float aggregate loops.
     #[inline]
     pub fn raw_f64_typed_slice(&self) -> &[f64] {
+        debug_assert!(
+            self.elem_size == 8,
+            "raw_f64_typed_slice on non-8-byte column"
+        );
         let bytes = self.data.as_bytes();
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, bytes.len() / 8) }
     }
@@ -1807,9 +1812,12 @@ impl ColumnarSSTable {
     pub fn read_fixed_i64_at(&self, col_idx: usize, row_idx: usize) -> Result<Option<i64>> {
         let entry = &self.column_index[col_idx];
         let null_bytes = self.num_rows.div_ceil(8);
+        // 🔑 Determine element size: Bool is 1 byte, others are 8 bytes.
+        // Without this, Bool columns read 8 bytes per row (garbage).
+        let col_tag = self.column_tags.get(col_idx).copied();
+        let elem_size = col_tag.map(|t| t.fixed_size()).unwrap_or(8);
 
-        // Segment layout: [flag:1B][null_bitmap:null_bytes][data:num_rows*8]
-        // But the flag is stripped by decompress_segment, and read_segment_bytes
+        // Segment layout: [flag:1B][null_bitmap:null_bytes][data:num_rows*elem_size]
         // returns the decompressed payload. For uncompressed data, the payload
         // is [data after flag]. We need to read the raw segment to access by
         // offset.
@@ -1833,7 +1841,7 @@ impl ColumnarSSTable {
         // Null bitmap: data_start .. data_start + null_bytes
         // Values: data_start + null_bytes .. end
         let null_offset = data_start + row_idx / 8;
-        let value_offset = data_start + null_bytes + row_idx * 8;
+        let value_offset = data_start + null_bytes + row_idx * elem_size;
 
         // Read null bitmap byte.
         let null_byte = if !self.file_data.is_empty() {
@@ -1848,8 +1856,20 @@ impl ColumnarSSTable {
             return Ok(None); // NULL
         }
 
-        // Read the 8-byte value.
-        let val = if !self.file_data.is_empty() {
+        // Read the value (elem_size bytes for Bool, 8 for Integer/Float/Timestamp).
+        let val = if elem_size == 1 {
+            // Bool: read 1 byte (0=false, 1=true, 2=NULL sentinel).
+            let b = if !self.file_data.is_empty() {
+                self.file_data.get(value_offset).copied().unwrap_or(0)
+            } else {
+                let mut buf = [0u8; 1];
+                self.read_raw(value_offset, &mut buf)?;
+                buf[0]
+            };
+            // The NULL sentinel (2) is already caught by the null bitmap above,
+            // but handle it defensively.
+            b as i64
+        } else if !self.file_data.is_empty() {
             let s = &self.file_data[value_offset..value_offset + 8];
             i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
         } else if flag == 1 {
