@@ -1527,6 +1527,12 @@ impl QueryExecutor {
     pub fn execute(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
             Statement::Select(s) => self.execute_select(s),
+            Statement::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => self.execute_set_op(left, right, op, all),
             Statement::Insert(i) => self.execute_insert(i),
             Statement::Update(u) => self.execute_update(u),
             Statement::Delete(d) => self.execute_delete(d),
@@ -1574,6 +1580,20 @@ impl QueryExecutor {
 
         let result = match stmt {
             Statement::Select(s) => self.execute_select_streaming_ref(s)?,
+            Statement::SetOp {
+                left,
+                right,
+                op,
+                all,
+            } => {
+                let result = self.execute_set_op(left.clone(), right.clone(), op.clone(), *all)?;
+                return Ok(match result {
+                    QueryResult::Select { columns, rows } => {
+                        StreamingQueryResult::SelectReady { columns, rows }
+                    }
+                    _ => StreamingQueryResult::Modification { affected_rows: 0 },
+                });
+            }
             Statement::Insert(i) => {
                 let result = self.execute_insert_ref(i)?;
                 StreamingQueryResult::Modification {
@@ -1741,6 +1761,52 @@ impl QueryExecutor {
     /// Execute SELECT statement
     fn execute_select(&self, stmt: SelectStmt) -> Result<QueryResult> {
         self.execute_select_internal(&stmt)
+    }
+
+    /// Execute UNION / UNION ALL set operation.
+    fn execute_set_op(
+        &self,
+        left: Box<SelectStmt>,
+        right: Box<SelectStmt>,
+        op: crate::sql::ast::SetOp,
+        all: bool,
+    ) -> Result<QueryResult> {
+        let left_result = self.execute_select_internal(&left)?;
+        let right_result = self.execute_select_internal(&right)?;
+        let (columns, left_rows) = match left_result {
+            QueryResult::Select { columns, rows } => (columns, rows),
+            _ => {
+                return Err(MoteDBError::Query(
+                    "Left side of set op must be SELECT".into(),
+                ))
+            }
+        };
+        let right_rows = match right_result {
+            QueryResult::Select { rows, .. } => rows,
+            _ => {
+                return Err(MoteDBError::Query(
+                    "Right side of set op must be SELECT".into(),
+                ))
+            }
+        };
+        let mut combined = left_rows;
+        combined.extend(right_rows);
+        match op {
+            crate::sql::ast::SetOp::Union => {
+                if !all {
+                    // UNION (without ALL): deduplicate rows.
+                    let mut seen = std::collections::HashSet::new();
+                    combined.retain(|row| seen.insert(row.clone()));
+                }
+                Ok(QueryResult::Select {
+                    columns,
+                    rows: combined,
+                })
+            }
+            crate::sql::ast::SetOp::Intersect | crate::sql::ast::SetOp::Except => Err(
+                MoteDBError::NotImplemented(format!("Set operation {:?} not yet implemented", op)),
+            ),
+        }
     }
 
     /// Materialize a SELECT via `execute_select_internal` and wrap as streaming.
@@ -2933,35 +2999,60 @@ impl QueryExecutor {
                 let has_deletions = seg.sst.row_map.has_any_deleted();
 
                 if !has_nulls && !has_deletions && !need_dedup {
-                    // 🚀 Two-phase approach for maximum throughput:
-                    // Phase 1: fast text scan → assign group index per row (linear
-                    //   scan over group_keys, string compare — fast for ≤256 groups).
-                    //   Store group index in a Vec<u16> (supports up to 65535 groups).
-                    // Phase 2: for each agg column, iterate raw typed slice and
-                    //   fold into per-group accumulators (cache-friendly, vectorizable).
+                    // 🚀 Adaptive: linear scan for ≤16 groups (fast: 5 string
+                    // compares + no hash overhead), HashMap for >16 groups
+                    // (avoids O(N×groups) blowup on high-cardinality GROUP BY).
+                    const LINEAR_THRESHOLD: usize = 16;
                     let mut row_groups: Vec<u16> = Vec::with_capacity(n);
+                    let mut use_hash = group_keys.len() >= LINEAR_THRESHOLD;
                     for i in 0..n {
                         let s = ftext.get_str_fast(i);
-                        // Linear scan to find group (fast for small group count).
-                        let mut found_idx: Option<usize> = None;
-                        for (gi, k) in group_keys.iter().enumerate() {
-                            if &**k == s {
-                                found_idx = Some(gi);
-                                break;
-                            }
-                        }
-                        let idx = match found_idx {
-                            Some(idx) => idx,
-                            None => {
+                        let idx = if use_hash {
+                            // HashMap path: O(1) lookup per row.
+                            if let Some(&idx) = key_index.get(s) {
+                                idx
+                            } else {
+                                let boxed: Box<str> = s.into();
                                 let idx = group_keys.len();
-                                group_keys.push(s.into());
+                                group_keys.push(boxed.clone());
                                 group_counts.push(0);
                                 for ai in 0..n_aggs {
                                     group_sums[ai].push(0.0);
                                     group_mins[ai].push(f64::INFINITY);
                                     group_maxs[ai].push(f64::NEG_INFINITY);
                                 }
+                                key_index.insert(boxed, idx);
                                 idx
+                            }
+                        } else {
+                            // Linear scan path: O(groups) but no hash/alloc overhead.
+                            let mut found: Option<usize> = None;
+                            for (gi, k) in group_keys.iter().enumerate() {
+                                if &**k == s {
+                                    found = Some(gi);
+                                    break;
+                                }
+                            }
+                            match found {
+                                Some(idx) => idx,
+                                None => {
+                                    let idx = group_keys.len();
+                                    group_keys.push(s.into());
+                                    group_counts.push(0);
+                                    for ai in 0..n_aggs {
+                                        group_sums[ai].push(0.0);
+                                        group_mins[ai].push(f64::INFINITY);
+                                        group_maxs[ai].push(f64::NEG_INFINITY);
+                                    }
+                                    // Switch to HashMap if too many groups.
+                                    if group_keys.len() >= LINEAR_THRESHOLD {
+                                        use_hash = true;
+                                        for (gi, k) in group_keys.iter().enumerate() {
+                                            key_index.insert(k.clone(), gi);
+                                        }
+                                    }
+                                    idx
+                                }
                             }
                         };
                         group_counts[idx] += 1;
@@ -9651,6 +9742,15 @@ impl QueryExecutor {
                 handled && args.iter().all(Self::can_eval_positional)
             }
             Expr::Match { .. } => true,
+            Expr::Case { whens, else_expr } => {
+                whens
+                    .iter()
+                    .all(|(c, r)| Self::can_eval_positional(c) && Self::can_eval_positional(r))
+                    && else_expr
+                        .as_ref()
+                        .map(|e| Self::can_eval_positional(e))
+                        .unwrap_or(true)
+            }
             _ => false,
         }
     }
@@ -11614,7 +11714,7 @@ impl QueryExecutor {
             Expr::FunctionCall { name, .. } => {
                 matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
                 )
             }
             Expr::BinaryOp { left, right, .. } => {
@@ -13112,7 +13212,8 @@ impl QueryExecutor {
             | Expr::StDistance3D { .. }
             | Expr::StKnn3D { .. }
             | Expr::StRadius3D { .. }
-            | Expr::WindowFunction { .. } => Ok(expr.clone()),
+            | Expr::WindowFunction { .. }
+            | Expr::Case { .. } => Ok(expr.clone()),
         }
     }
 
@@ -15266,6 +15367,51 @@ impl QueryExecutor {
                     }
                 }
                 Ok(max_val.unwrap_or(Value::Null))
+            }
+            "STDDEV" | "VARIANCE" => {
+                let mut sum = 0.0;
+                let mut count = 0u64;
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            match val {
+                                Value::Integer(i) => {
+                                    sum += *i as f64;
+                                    count += 1;
+                                }
+                                Value::Float(f) => {
+                                    sum += *f;
+                                    count += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if count < 2 {
+                    return Ok(Value::Null);
+                }
+                let mean = sum / count as f64;
+                let mut var_sum = 0.0;
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            let v = match val {
+                                Value::Integer(i) => *i as f64,
+                                Value::Float(f) => *f,
+                                _ => continue,
+                            };
+                            let d = v - mean;
+                            var_sum += d * d;
+                        }
+                    }
+                }
+                let variance = var_sum / (count as f64 - 1.0); // sample variance
+                if agg.func == "STDDEV" {
+                    Ok(Value::Float(variance.sqrt()))
+                } else {
+                    Ok(Value::Float(variance))
+                }
             }
             _ => Ok(Value::Null),
         }

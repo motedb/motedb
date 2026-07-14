@@ -6,6 +6,13 @@ use crate::types::Value;
 #[derive(Debug, Clone)]
 pub enum Statement {
     Select(SelectStmt),
+    /// UNION / UNION ALL / INTERSECT / EXCEPT
+    SetOp {
+        left: Box<SelectStmt>,
+        right: Box<SelectStmt>,
+        op: SetOp,
+        all: bool,
+    },
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
@@ -19,6 +26,14 @@ pub enum Statement {
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
+}
+
+/// Set operations for combining query results.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
 }
 
 /// SELECT statement
@@ -352,6 +367,13 @@ pub enum Expr {
         y: f64,
         z: f64,
         radius: f64,
+    },
+
+    /// CASE WHEN expression
+    /// Syntax: CASE WHEN cond1 THEN val1 [WHEN cond2 THEN val2 ...] [ELSE default] END
+    Case {
+        whens: Vec<(Expr, Expr)>, // (condition, result)
+        else_expr: Option<Box<Expr>>,
     },
 }
 

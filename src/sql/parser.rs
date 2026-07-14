@@ -34,7 +34,31 @@ impl Parser {
     /// Parse a SQL statement
     pub fn parse(&mut self) -> Result<Statement> {
         let stmt = match &self.current().token_type {
-            TokenType::Select => Statement::Select(self.parse_select()?),
+            TokenType::Select => {
+                let select = self.parse_select()?;
+                // Check for UNION / UNION ALL
+                if matches!(self.current().token_type, TokenType::Union) {
+                    self.advance(); // consume UNION
+                    let all = if matches!(self.current().token_type, TokenType::All) {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    if !matches!(self.current().token_type, TokenType::Select) {
+                        return Err(self.error("Expected SELECT after UNION"));
+                    }
+                    let right = self.parse_select()?;
+                    Statement::SetOp {
+                        left: Box::new(select),
+                        right: Box::new(right),
+                        op: SetOp::Union,
+                        all,
+                    }
+                } else {
+                    Statement::Select(select)
+                }
+            }
             TokenType::Insert => Statement::Insert(self.parse_insert()?),
             TokenType::Update => Statement::Update(self.parse_update()?),
             TokenType::Delete => Statement::Delete(self.parse_delete()?),
@@ -913,6 +937,28 @@ impl Parser {
 
     fn parse_prefix_expr(&mut self) -> Result<Expr> {
         match &self.current().token_type {
+            // CASE WHEN ... THEN ... [WHEN ... THEN ...] [ELSE ...] END
+            TokenType::Case => {
+                self.advance(); // consume CASE
+                let mut whens = Vec::new();
+                while matches!(self.current().token_type, TokenType::When) {
+                    self.advance(); // consume WHEN
+                    let cond = self.parse_expr(0)?;
+                    self.expect(TokenType::Then)?;
+                    self.advance(); // consume THEN
+                    let result = self.parse_expr(0)?;
+                    whens.push((cond, result));
+                }
+                let else_expr = if matches!(self.current().token_type, TokenType::Else) {
+                    self.advance();
+                    Some(Box::new(self.parse_expr(0)?))
+                } else {
+                    None
+                };
+                self.expect(TokenType::End)?;
+                self.advance(); // consume END
+                Ok(Expr::Case { whens, else_expr })
+            }
             // Unary operators (with depth guard to prevent stack overflow on chained NOT/-)
             TokenType::Not => {
                 self.advance();

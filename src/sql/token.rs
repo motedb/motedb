@@ -74,6 +74,13 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "begin" => TokenType::Begin,
     "commit" => TokenType::Commit,
     "rollback" => TokenType::Rollback,
+    "case" => TokenType::Case,
+    "when" => TokenType::When,
+    "then" => TokenType::Then,
+    "else" => TokenType::Else,
+    "end" => TokenType::End,
+    "union" => TokenType::Union,
+    "all" => TokenType::All,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +139,13 @@ pub enum TokenType {
     Begin,         // BEGIN
     Commit,        // COMMIT
     Rollback,      // ROLLBACK
+    Case,          // CASE
+    When,          // WHEN
+    Then,          // THEN
+    Else,          // ELSE
+    End,           // END
+    Union,         // UNION
+    All,           // ALL
 
     // Data types
     Integer,

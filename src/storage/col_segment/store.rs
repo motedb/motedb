@@ -2361,9 +2361,35 @@ impl ColSegmentStore {
             if is_float {
                 if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
                     let has_nulls = fseg.has_nulls();
-                    // 🚀 Fast path: no nulls/deletions/dedup — typed f64 slice.
-                    if !has_nulls && !has_deletions && dedup.is_none() {
+                    // 🚀 Fast path: no nulls/deletions/dedup — use select_nth_unstable.
+                    // Collect all (ord_key, seg_idx, row_idx), then partition.
+                    // This is O(N) instead of O(N log K) for the heap.
+                    if !has_nulls && !has_deletions && dedup.is_none() && n > k * 4 {
                         let raw = fseg.raw_f64_typed_slice();
+                        let mut entries: Vec<(u64, usize, usize)> = Vec::with_capacity(n);
+                        for (i, &v) in raw.iter().enumerate().take(n) {
+                            let ord_key = if desc {
+                                u64::MAX - to_ord(v)
+                            } else {
+                                to_ord(v)
+                            };
+                            entries.push((ord_key, sidx, i));
+                        }
+                        // O(N) selection of top-K.
+                        let k_actual = k.min(entries.len());
+                        if k_actual > 0 && k_actual < entries.len() {
+                            entries.select_nth_unstable_by(k_actual - 1, |a, b| a.0.cmp(&b.0));
+                        }
+                        entries.truncate(k_actual);
+                        // Merge into global heap (for multi-seg) or use directly.
+                        for (ord_key, si, ri) in entries {
+                            push_capped(&mut heap, ord_key, si, ri);
+                        }
+                        continue;
+                    }
+                    // Heap fallback
+                    let raw = fseg.raw_f64_typed_slice();
+                    if !has_nulls && !has_deletions && dedup.is_none() {
                         for (i, &v) in raw.iter().enumerate().take(n) {
                             let ord_key = if desc {
                                 u64::MAX - to_ord(v)
@@ -2390,8 +2416,28 @@ impl ColSegmentStore {
                 }
             } else if let Ok(fseg) = seg.sst.read_fixed_i64(order_col) {
                 let has_nulls = fseg.has_nulls();
-                // 🚀 Fast path: no nulls/deletions/dedup — typed i64 slice.
-                if !has_nulls && !has_deletions && dedup.is_none() {
+                // 🚀 Fast path: no nulls/deletions/dedup — select_nth_unstable.
+                if !has_nulls && !has_deletions && dedup.is_none() && n > k * 4 {
+                    let raw = fseg.raw_i64_slice();
+                    let mut entries: Vec<(u64, usize, usize)> = Vec::with_capacity(n);
+                    for (i, &v) in raw.iter().enumerate().take(n) {
+                        // Direct u64 ordering for i64 (XOR sign bit).
+                        let ord_key = if desc {
+                            !(v as u64 ^ (1u64 << 63))
+                        } else {
+                            v as u64 ^ (1u64 << 63)
+                        };
+                        entries.push((ord_key, sidx, i));
+                    }
+                    let k_actual = k.min(entries.len());
+                    if k_actual > 0 && k_actual < entries.len() {
+                        entries.select_nth_unstable_by(k_actual - 1, |a, b| a.0.cmp(&b.0));
+                    }
+                    entries.truncate(k_actual);
+                    for (ord_key, si, ri) in entries {
+                        push_capped(&mut heap, ord_key, si, ri);
+                    }
+                } else if !has_nulls && !has_deletions && dedup.is_none() {
                     let raw = fseg.raw_i64_slice();
                     for (i, &v) in raw.iter().enumerate().take(n) {
                         let vf = v as f64;

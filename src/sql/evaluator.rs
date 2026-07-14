@@ -408,6 +408,20 @@ impl ExprEvaluator {
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
 
+            Expr::Case { whens, else_expr } => {
+                for (cond, result) in whens {
+                    let cond_val = self.eval(cond, row)?;
+                    if matches!(cond_val, Value::Bool(true)) {
+                        return self.eval(result, row);
+                    }
+                }
+                if let Some(else_e) = else_expr {
+                    self.eval(else_e, row)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+
             Expr::Subquery(_) => {
                 // Subqueries are handled at executor level, not here
                 Err(MoteDBError::Query(
@@ -621,7 +635,7 @@ impl ExprEvaluator {
             }
 
             // Aggregate functions: look up pre-computed value in row (for HAVING)
-            "count" | "sum" | "avg" | "min" | "max" => {
+            "count" | "sum" | "avg" | "min" | "max" | "stddev" | "variance" => {
                 // Build the column name that matches how the executor stored it
                 let arg_str = if args.is_empty() {
                     "*".to_string()
