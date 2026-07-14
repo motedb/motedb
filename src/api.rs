@@ -356,6 +356,32 @@ impl Database {
         self.inner.max_result_rows
     }
 
+    /// Convenience method: execute a SELECT query and return rows directly.
+    /// This is shorthand for `execute(sql)?.materialize()?` + pattern match.
+    ///
+    /// Returns an empty Vec for non-SELECT statements.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let rows = db.query("SELECT * FROM users WHERE age > 18")?;
+    /// for row in rows {
+    ///     println!("{:?}", row);
+    /// }
+    /// ```
+    pub fn query(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        match self.execute(sql)?.materialize()? {
+            crate::QueryResult::Select { rows, .. } => Ok(rows),
+            _ => Ok(vec![]),
+        }
+    }
+
+    /// Get the approximate row count for a table without executing SQL.
+    /// Returns the live row count from the ColSegmentStore if available,
+    /// otherwise falls back to the LSM row counter.
+    pub fn row_count(&self, table_name: &str) -> Result<usize> {
+        Ok(self.inner.fast_row_count(table_name).unwrap_or(0) as usize)
+    }
+
     pub fn execute(&self, sql: &str) -> Result<StreamingQueryResult> {
         use crate::sql::{Lexer, Parser};
 

@@ -1789,6 +1789,16 @@ impl QueryExecutor {
                 ))
             }
         };
+        // 🔑 Verify column counts match (SQL standard requires this).
+        if !left_rows.is_empty() && !right_rows.is_empty() {
+            if left_rows[0].len() != right_rows[0].len() {
+                return Err(MoteDBError::Query(format!(
+                    "UNION: column count mismatch ({} vs {})",
+                    left_rows[0].len(),
+                    right_rows[0].len()
+                )));
+            }
+        }
         let mut combined = left_rows;
         combined.extend(right_rows);
         match op {

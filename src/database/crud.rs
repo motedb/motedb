@@ -747,6 +747,12 @@ impl MoteDB {
         schema: &crate::types::TableSchema,
     ) -> Result<()> {
         ensure_open!(self);
+        // 🔑 Validate the new row against schema (same as INSERT/batch INSERT).
+        // Without this, UPDATE t SET int_col = 3.5 bypasses type checking
+        // and stores a Float bit pattern as Integer → garbage on read.
+        schema.validate_row(&new_row).map_err(|e| {
+            StorageError::InvalidData(format!("UPDATE row validation failed: {}", e))
+        })?;
 
         // 1. Check PK uniqueness if primary key is being changed
         if !schema.is_primary_key_auto_increment() {

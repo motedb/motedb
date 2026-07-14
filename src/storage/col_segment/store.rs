@@ -363,8 +363,9 @@ impl ColSegmentStore {
         // invisible to get(), which would return the stale live row from a segment.
         {
             let buf = self.write_buf.lock();
-            if let Some(idx) = buf.keys.iter().position(|&k| k == key) {
-                // Found in buffer — newest version. If deleted, return None.
+            if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
+                // Found in buffer — newest version (rposition = last occurrence).
+                // If deleted, return None.
                 if buf.deleted[idx] {
                     return None;
                 }
