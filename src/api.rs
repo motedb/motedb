@@ -275,7 +275,7 @@ impl Database {
         // deadlock (threads may hold locks that checkpoint needs).
         if !self
             .inner
-            .wait_for_background_threads_stop(std::time::Duration::from_secs(30))
+            .wait_for_background_threads_stop(std::time::Duration::from_secs(5))
         {
             warn_log!("[close] Background threads did not stop within timeout");
         }
