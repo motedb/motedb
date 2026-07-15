@@ -2040,15 +2040,26 @@ impl MoteDB {
         handle: std::thread::JoinHandle<()>,
         timeout: std::time::Duration,
     ) {
-        // 🔑 Join with timeout to ensure deterministic thread shutdown.
-        // If the thread doesn't exit within timeout, detach it (it holds
-        // Weak<MoteDB> so it will exit naturally when DB drops).
-        let result = handle.join();
-        if let Err(_) = result {
-            warn_log!("[MoteDB::Drop] Thread '{}' panicked during shutdown", name);
+        // 🔑 True timeout join: spawn a helper thread that calls join(),
+        // and race it against a sleep. If the thread doesn't exit within
+        // timeout, we detach it (it holds Weak<MoteDB> so it exits naturally).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(()) => {
+                debug_log!("[MoteDB::Drop] ✅ Thread '{}' joined", name);
+            }
+            Err(_) => {
+                warn_log!(
+                    "[MoteDB::Drop] ⚠️ Thread '{}' did not exit within {:?}, detaching",
+                    name,
+                    timeout
+                );
+            }
         }
-        debug_log!("[MoteDB::Drop] ✅ Thread '{}' joined", name);
-        let _ = timeout; // timeout is advisory; join() blocks until thread exits
     }
 
     /// Persist the current write_lsn to a counter file.
