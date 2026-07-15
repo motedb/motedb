@@ -2040,26 +2040,26 @@ impl MoteDB {
         handle: std::thread::JoinHandle<()>,
         timeout: std::time::Duration,
     ) {
-        // 🔑 True timeout join: spawn a helper thread that calls join(),
-        // and race it against a sleep. If the thread doesn't exit within
-        // timeout, we detach it (it holds Weak<MoteDB> so it exits naturally).
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = handle.join();
-            let _ = tx.send(());
-        });
-        match rx.recv_timeout(timeout) {
-            Ok(()) => {
-                debug_log!("[MoteDB::Drop] ✅ Thread '{}' joined", name);
+        // 🔑 Signal should_stop is already set by caller. Try a non-blocking
+        // check: if the thread has already exited, join immediately. Otherwise
+        // detach — the thread holds Weak<MoteDB> so it exits naturally when
+        // the Arc is dropped. We avoid spawning a helper thread (which itself
+        // becomes an orphan that prevents process exit on CI).
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(()) => debug_log!("[MoteDB::Drop] ✅ Thread '{}' joined", name),
+                Err(_) => warn_log!("[MoteDB::Drop] Thread '{}' panicked", name),
             }
-            Err(_) => {
-                warn_log!(
-                    "[MoteDB::Drop] ⚠️ Thread '{}' did not exit within {:?}, detaching",
-                    name,
-                    timeout
-                );
-            }
+        } else {
+            // Thread still running — detach it. It will exit when should_stop
+            // is checked (within recv_timeout interval or sleep chunk).
+            warn_log!(
+                "[MoteDB::Drop] ⚠️ Thread '{}' still running, detaching (will exit naturally)",
+                name
+            );
+            std::mem::drop(handle);
         }
+        let _ = timeout;
     }
 
     /// Persist the current write_lsn to a counter file.
