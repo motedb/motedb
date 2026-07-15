@@ -944,19 +944,18 @@ impl Parser {
                 while matches!(self.current().token_type, TokenType::When) {
                     self.advance(); // consume WHEN
                     let cond = self.parse_expr(0)?;
+                    // expect() already calls advance() — don't double-advance.
                     self.expect(TokenType::Then)?;
-                    self.advance(); // consume THEN
                     let result = self.parse_expr(0)?;
                     whens.push((cond, result));
                 }
                 let else_expr = if matches!(self.current().token_type, TokenType::Else) {
-                    self.advance();
+                    self.advance(); // consume ELSE
                     Some(Box::new(self.parse_expr(0)?))
                 } else {
                     None
                 };
-                self.expect(TokenType::End)?;
-                self.advance(); // consume END
+                self.expect(TokenType::End)?; // consumes END
                 Ok(Expr::Case { whens, else_expr })
             }
             // Unary operators (with depth guard to prevent stack overflow on chained NOT/-)

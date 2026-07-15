@@ -9284,6 +9284,19 @@ impl QueryExecutor {
                     ))),
                 }
             }
+            Expr::Case { whens, else_expr } => {
+                for (cond, result) in whens {
+                    let cond_val = Self::eval_expr_simple(cond, row)?;
+                    if matches!(cond_val, Value::Bool(true)) {
+                        return Self::eval_expr_simple(result, row);
+                    }
+                }
+                if let Some(else_e) = else_expr {
+                    Self::eval_expr_simple(else_e, row)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
             _ => Err(MoteDBError::Query(format!(
                 "eval_expr_simple: unsupported expression: {:?}",
                 expr
@@ -10249,6 +10262,19 @@ impl QueryExecutor {
                         _ => Ok(Value::Bool(false)),
                     },
                     None => Ok(Value::Bool(false)),
+                }
+            }
+            Expr::Case { whens, else_expr } => {
+                for (cond, result) in whens {
+                    let cond_val = Self::eval_expr_on_row(cond, row, schema)?;
+                    if matches!(cond_val, Value::Bool(true)) {
+                        return Self::eval_expr_on_row(result, row, schema);
+                    }
+                }
+                if let Some(else_e) = else_expr {
+                    Self::eval_expr_on_row(else_e, row, schema)
+                } else {
+                    Ok(Value::Null)
                 }
             }
             _ => Err(MoteDBError::Query(format!(
