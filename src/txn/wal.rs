@@ -1066,6 +1066,7 @@ impl PartitionWAL {
 
         // Atomic rename: temp → original (on same filesystem, this is atomic)
         std::fs::rename(&tmp_path, &self.path)?;
+        crate::fsync_dir(&self.path);
 
         // Reopen the new empty file
         let file = OpenOptions::new()

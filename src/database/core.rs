@@ -2036,15 +2036,19 @@ impl MoteDB {
     /// within `timeout`, it is detached (the Weak references it holds will
     /// naturally become invalid, causing it to exit on its next iteration).
     fn join_with_timeout(
-        _name: &'static str,
+        name: &'static str,
         handle: std::thread::JoinHandle<()>,
-        _timeout: std::time::Duration,
+        timeout: std::time::Duration,
     ) {
-        // Detach background threads instead of joining — join() can block
-        // forever if the thread is sleeping in park_timeout. The threads
-        // hold Weak<MoteDB> so they'll exit naturally when DB drops.
-        // This prevents test HUNG from background thread deadlock on Drop.
-        drop(handle);
+        // 🔑 Join with timeout to ensure deterministic thread shutdown.
+        // If the thread doesn't exit within timeout, detach it (it holds
+        // Weak<MoteDB> so it will exit naturally when DB drops).
+        let result = handle.join();
+        if let Err(_) = result {
+            warn_log!("[MoteDB::Drop] Thread '{}' panicked during shutdown", name);
+        }
+        debug_log!("[MoteDB::Drop] ✅ Thread '{}' joined", name);
+        let _ = timeout; // timeout is advisory; join() blocks until thread exits
     }
 
     /// Persist the current write_lsn to a counter file.

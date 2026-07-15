@@ -3266,6 +3266,8 @@ impl ColumnarSSTableBuilder {
         // Atomic publish. On POSIX, rename guarantees readers see the new file
         // in its entirety once the syscall returns.
         std::fs::rename(&tmp_path, &final_path)?;
+        // 🔑 fsync parent directory to make the rename durable across crashes.
+        crate::fsync_dir(&final_path);
 
         // Success: clear internal state (data is now on disk)
         // Reset finished to false so the builder can be reused for new data.

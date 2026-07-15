@@ -246,9 +246,12 @@ impl MoteDB {
 
     /// Checkpoint during Drop — skips the is_closed check since we're shutting down.
     pub(crate) fn checkpoint_on_drop(&self) -> Result<()> {
-        // Skip checkpoint during Drop — background threads are already stopped,
-        // so lsm_engine.flush() would enter backpressure waiting for a dead
-        // flush thread. WAL files remain on disk for crash recovery on next open.
+        // 🔑 Flush ColSegmentStore write buffers so buffered data is durable.
+        // WAL files remain on disk for crash recovery regardless, but flushing
+        // buffers avoids replaying the entire WAL on next open.
+        for entry in self.col_segment_stores.iter() {
+            let _ = entry.flush_buffer();
+        }
         Ok(())
     }
 

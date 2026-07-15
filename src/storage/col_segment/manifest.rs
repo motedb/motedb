@@ -73,6 +73,7 @@ impl Manifest {
         file.write_all(&VERSION.to_le_bytes())?;
         file.write_all(&0u32.to_le_bytes())?; // record_count placeholder
         file.sync_all()?;
+        crate::fsync_dir(path);
         Ok(Self {
             path: path.to_path_buf(),
             writer: BufWriter::new(file),

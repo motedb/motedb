@@ -67,6 +67,27 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 /// Explicitly purge jemalloc's dirty pages back to the OS.
+/// Fsync the parent directory of a file path. This ensures that a file rename
+/// or creation is durable across crashes on POSIX systems (Linux ext4/xfs,
+/// macOS APFS). Without this, a rename is not guaranteed to survive a crash
+/// even if the file itself was fsync'd.
+pub fn fsync_dir<P: AsRef<std::path::Path>>(path: P) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let parent = path.as_ref().parent();
+        if let Some(dir) = parent {
+            if let Ok(f) = std::fs::File::open(dir) {
+                let _ = unsafe { libc::fsync(f.as_raw_fd()) };
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Call after bulk operations (CREATE INDEX, compaction) that create
 /// large transient allocations, to keep RSS low on edge devices.
 /// No-op when jemalloc is not enabled.
