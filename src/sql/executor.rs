@@ -3009,20 +3009,40 @@ impl QueryExecutor {
                 let has_deletions = seg.sst.row_map.has_any_deleted();
 
                 if !has_nulls && !has_deletions && !need_dedup {
-                    // 🚀 Adaptive: linear scan for ≤16 groups (fast: 5 string
-                    // compares + no hash overhead), HashMap for >16 groups
-                    // (avoids O(N×groups) blowup on high-cardinality GROUP BY).
-                    const LINEAR_THRESHOLD: usize = 16;
+                    // 🚀 Two-phase with raw-byte text decode (avoids get_str_fast's
+                    // 3× SegData::slice() overhead per row).
+                    // Phase 1: text scan → group index per row via raw bytes.
+                    // Phase 2: for each agg column, vectorized raw slice fold.
+                    let off_bytes = ftext.offsets_bytes();
+                    let str_bytes = ftext.strings_bytes();
                     let mut row_groups: Vec<u16> = Vec::with_capacity(n);
+                    const LINEAR_THRESHOLD: usize = 16;
                     let mut use_hash = group_keys.len() >= LINEAR_THRESHOLD;
                     for i in 0..n {
-                        let s = ftext.get_str_fast(i);
+                        // 🚀 Direct raw-byte offset decode (no get_str_fast overhead).
+                        let ob = i * 4;
+                        let start = u32::from_le_bytes([
+                            off_bytes[ob],
+                            off_bytes[ob + 1],
+                            off_bytes[ob + 2],
+                            off_bytes[ob + 3],
+                        ]) as usize;
+                        let end = u32::from_le_bytes([
+                            off_bytes[ob + 4],
+                            off_bytes[ob + 5],
+                            off_bytes[ob + 6],
+                            off_bytes[ob + 7],
+                        ]) as usize;
+                        let key_bytes = &str_bytes[start..end];
+
                         let idx = if use_hash {
-                            // HashMap path: O(1) lookup per row.
-                            if let Some(&idx) = key_index.get(s) {
+                            if let Some(&idx) =
+                                key_index.get(std::str::from_utf8(key_bytes).unwrap_or(""))
+                            {
                                 idx
                             } else {
-                                let boxed: Box<str> = s.into();
+                                let boxed: Box<str> =
+                                    std::str::from_utf8(key_bytes).unwrap_or("").into();
                                 let idx = group_keys.len();
                                 group_keys.push(boxed.clone());
                                 group_counts.push(0);
@@ -3035,10 +3055,9 @@ impl QueryExecutor {
                                 idx
                             }
                         } else {
-                            // Linear scan path: O(groups) but no hash/alloc overhead.
                             let mut found: Option<usize> = None;
                             for (gi, k) in group_keys.iter().enumerate() {
-                                if &**k == s {
+                                if k.as_bytes() == key_bytes {
                                     found = Some(gi);
                                     break;
                                 }
@@ -3047,14 +3066,14 @@ impl QueryExecutor {
                                 Some(idx) => idx,
                                 None => {
                                     let idx = group_keys.len();
-                                    group_keys.push(s.into());
+                                    group_keys
+                                        .push(std::str::from_utf8(key_bytes).unwrap_or("").into());
                                     group_counts.push(0);
                                     for ai in 0..n_aggs {
                                         group_sums[ai].push(0.0);
                                         group_mins[ai].push(f64::INFINITY);
                                         group_maxs[ai].push(f64::NEG_INFINITY);
                                     }
-                                    // Switch to HashMap if too many groups.
                                     if group_keys.len() >= LINEAR_THRESHOLD {
                                         use_hash = true;
                                         for (gi, k) in group_keys.iter().enumerate() {
@@ -3068,7 +3087,7 @@ impl QueryExecutor {
                         group_counts[idx] += 1;
                         row_groups.push(idx as u16);
                     }
-                    // Phase 2: fold agg columns using raw typed slices.
+                    // Phase 2: vectorized agg fold per column.
                     for (ai, agg) in gb_aggs.iter().enumerate() {
                         let Some(c) = agg.col else {
                             continue;
@@ -3079,14 +3098,9 @@ impl QueryExecutor {
                         let Ok(fs) = seg.sst.read_fixed_i64(c) else {
                             continue;
                         };
-                        let nulls = fs.null_bitmap_bytes();
-                        let has_nulls_col = fs.has_nulls();
                         if agg_is_float[ai] {
                             let raw = fs.raw_f64_typed_slice();
                             for (i, &v) in raw.iter().enumerate().take(n) {
-                                if has_nulls_col && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
-                                    continue;
-                                }
                                 let gi = row_groups[i] as usize;
                                 group_sums[ai][gi] += v;
                                 if v < group_mins[ai][gi] {
@@ -3099,9 +3113,6 @@ impl QueryExecutor {
                         } else {
                             let raw = fs.raw_i64_slice();
                             for (i, &v) in raw.iter().enumerate().take(n) {
-                                if has_nulls_col && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
-                                    continue;
-                                }
                                 let gi = row_groups[i] as usize;
                                 let vf = v as f64;
                                 group_sums[ai][gi] += vf;

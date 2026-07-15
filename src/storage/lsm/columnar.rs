@@ -757,6 +757,16 @@ pub struct TextSegment {
 }
 
 impl TextSegment {
+    /// Returns raw offset bytes for fast batch iteration (bypasses per-row slice()).
+    pub fn offsets_bytes(&self) -> &[u8] {
+        self.offsets_data.as_bytes()
+    }
+
+    /// Returns raw string data bytes for fast batch iteration.
+    pub fn strings_bytes(&self) -> &[u8] {
+        self.string_data.as_bytes()
+    }
+
     pub(crate) fn from_bytes(data: &[u8], num_rows: usize) -> Result<Self> {
         let null_bytes = num_rows.div_ceil(8);
         let offsets_size = (num_rows + 1) * 4;
@@ -922,33 +932,54 @@ impl TextSegment {
         let off_bytes = self.offsets_data.as_bytes();
         let str_bytes = self.string_data.as_bytes();
         let has_nulls = self.has_any_null();
+        // 🚀 Hoist wildcard check out of the 2M-iteration loop.
+        let has_wildcard = prefix.contains(&b'_');
         if !has_nulls && off_bytes.len() >= (n + 1) * 4 {
-            for i in 0..n {
-                let ob = i * 4;
-                let start = u32::from_le_bytes([
-                    off_bytes[ob],
-                    off_bytes[ob + 1],
-                    off_bytes[ob + 2],
-                    off_bytes[ob + 3],
-                ]) as usize;
-                let end = u32::from_le_bytes([
-                    off_bytes[ob + 4],
-                    off_bytes[ob + 5],
-                    off_bytes[ob + 6],
-                    off_bytes[ob + 7],
-                ]) as usize;
-                if end - start >= plen {
-                    let candidate = &str_bytes[start..start + plen];
-                    let matched = if !prefix.contains(&b'_') {
-                        candidate == prefix
-                    } else {
-                        candidate
+            if !has_wildcard {
+                // 🚀 Fast path: no wildcard — direct memcmp (most common case).
+                for i in 0..n {
+                    let ob = i * 4;
+                    let start = u32::from_le_bytes([
+                        off_bytes[ob],
+                        off_bytes[ob + 1],
+                        off_bytes[ob + 2],
+                        off_bytes[ob + 3],
+                    ]) as usize;
+                    let end = u32::from_le_bytes([
+                        off_bytes[ob + 4],
+                        off_bytes[ob + 5],
+                        off_bytes[ob + 6],
+                        off_bytes[ob + 7],
+                    ]) as usize;
+                    if end - start >= plen && &str_bytes[start..start + plen] == prefix {
+                        count += 1;
+                    }
+                }
+            } else {
+                // Wildcard path: byte-by-byte with _ as match-any.
+                for i in 0..n {
+                    let ob = i * 4;
+                    let start = u32::from_le_bytes([
+                        off_bytes[ob],
+                        off_bytes[ob + 1],
+                        off_bytes[ob + 2],
+                        off_bytes[ob + 3],
+                    ]) as usize;
+                    let end = u32::from_le_bytes([
+                        off_bytes[ob + 4],
+                        off_bytes[ob + 5],
+                        off_bytes[ob + 6],
+                        off_bytes[ob + 7],
+                    ]) as usize;
+                    if end - start >= plen {
+                        let candidate = &str_bytes[start..start + plen];
+                        if candidate
                             .iter()
                             .zip(prefix.iter())
                             .all(|(&c, &p)| p == b'_' || p == c)
-                    };
-                    if matched {
-                        count += 1;
+                        {
+                            count += 1;
+                        }
                     }
                 }
             }
