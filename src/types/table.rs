@@ -410,6 +410,7 @@ impl TableSchema {
 
                 // New SQL types
                 (ColumnType::Integer, crate::types::Value::Integer(_)) => true,
+                (ColumnType::Integer, crate::types::Value::Float(_)) => true, // Allow overflow promotion (i64 + i64 → f64)
                 (ColumnType::Float, crate::types::Value::Float(_)) => true,
                 (ColumnType::Float, crate::types::Value::Integer(_)) => true, // Allow integer to float conversion
                 (ColumnType::Boolean, crate::types::Value::Bool(_)) => true,
