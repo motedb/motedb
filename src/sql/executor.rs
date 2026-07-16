@@ -3098,29 +3098,44 @@ impl QueryExecutor {
                         let Ok(fs) = seg.sst.read_fixed_i64(c) else {
                             continue;
                         };
+                        // 🚀 Only compute min/max if the query actually uses them.
+                        let need_minmax = agg.func == "MIN" || agg.func == "MAX";
                         if agg_is_float[ai] {
                             let raw = fs.raw_f64_typed_slice();
-                            for (i, &v) in raw.iter().enumerate().take(n) {
-                                let gi = row_groups[i] as usize;
-                                group_sums[ai][gi] += v;
-                                if v < group_mins[ai][gi] {
-                                    group_mins[ai][gi] = v;
+                            if need_minmax {
+                                for (i, &v) in raw.iter().enumerate().take(n) {
+                                    let gi = row_groups[i] as usize;
+                                    group_sums[ai][gi] += v;
+                                    if v < group_mins[ai][gi] {
+                                        group_mins[ai][gi] = v;
+                                    }
+                                    if v > group_maxs[ai][gi] {
+                                        group_maxs[ai][gi] = v;
+                                    }
                                 }
-                                if v > group_maxs[ai][gi] {
-                                    group_maxs[ai][gi] = v;
+                            } else {
+                                // 🚀 Sum-only path: no min/max branches, auto-vectorizable.
+                                for (i, &v) in raw.iter().enumerate().take(n) {
+                                    group_sums[ai][row_groups[i] as usize] += v;
                                 }
                             }
                         } else {
                             let raw = fs.raw_i64_slice();
-                            for (i, &v) in raw.iter().enumerate().take(n) {
-                                let gi = row_groups[i] as usize;
-                                let vf = v as f64;
-                                group_sums[ai][gi] += vf;
-                                if vf < group_mins[ai][gi] {
-                                    group_mins[ai][gi] = vf;
+                            if need_minmax {
+                                for (i, &v) in raw.iter().enumerate().take(n) {
+                                    let gi = row_groups[i] as usize;
+                                    let vf = v as f64;
+                                    group_sums[ai][gi] += vf;
+                                    if vf < group_mins[ai][gi] {
+                                        group_mins[ai][gi] = vf;
+                                    }
+                                    if vf > group_maxs[ai][gi] {
+                                        group_maxs[ai][gi] = vf;
+                                    }
                                 }
-                                if vf > group_maxs[ai][gi] {
-                                    group_maxs[ai][gi] = vf;
+                            } else {
+                                for (i, &v) in raw.iter().enumerate().take(n) {
+                                    group_sums[ai][row_groups[i] as usize] += v as f64;
                                 }
                             }
                         }
