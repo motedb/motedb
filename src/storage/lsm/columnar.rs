@@ -1770,25 +1770,59 @@ impl ColumnarSSTable {
         let (block_start, block_end) = self.row_map.find_fence_range(key)?;
         let block_len = block_end - block_start;
 
-        // Step 2: get the key block (from cache or disk).
-        let buf: Vec<u8> = {
-            let cache = self.key_block_cache.lock();
-            if let Some(cached) = cache.get(block_start) {
-                cached.to_vec()
-            } else {
-                drop(cache);
-                let mut buf = vec![0u8; block_len * 8];
-                let offset = self.row_map.keys_file_offset as usize + block_start * 8;
-                if self.read_raw(offset, &mut buf).is_err() {
-                    return None;
-                }
-                // Cache the block for future lookups (sequential PK scans).
-                self.key_block_cache.lock().put(block_start, buf.clone());
-                buf
-            }
-        };
+        // Step 2 + 3: fetch the key block, then binary-search it.
+        //
+        // 🔑 PERF: on a cache hit, run the binary search *under the lock*
+        // (lock is never contended — this is the only user). This avoids
+        // cloning up to 16KB of key data per point query. The old code did
+        // `cached.to_vec()` (16KB alloc + memcpy) on every single cache hit.
+        //
+        // On a cache miss, we read from mmap/file into a fresh Vec, move it
+        // into the cache, then search the same buffer (one read, zero copies).
+        let cache = self.key_block_cache.lock();
+        if let Some(buf) = cache.get(block_start) {
+            return Self::binary_search_key_block(buf, block_start, block_len, key);
+        }
+        drop(cache);
 
-        // Step 3: binary search within the block.
+        // Cache miss. For mmap-backed SSTables (the common case), the mmap IS
+        // the cache — the OS page cache keeps the key block hot across queries.
+        // Binary-search the mmap directly: zero alloc, zero memcpy, zero clone.
+        // The KeyBlockCache below only helps non-mmap (file-seek) reads.
+        if !self.file_data.is_empty() {
+            let offset = self.row_map.keys_file_offset as usize + block_start * 8;
+            let end = offset + block_len * 8;
+            if end <= self.file_data.len() {
+                return Self::binary_search_key_block(
+                    &self.file_data[offset..end],
+                    block_start,
+                    block_len,
+                    key,
+                );
+            }
+        }
+
+        // Non-mmap path: read into a Vec, cache, then search.
+        let mut buf = vec![0u8; block_len * 8];
+        let offset = self.row_map.keys_file_offset as usize + block_start * 8;
+        if self.read_raw(offset, &mut buf).is_err() {
+            return None;
+        }
+        // Insert into cache (moved — no clone), then search. The cache holds
+        // a clone so our local `buf` stays valid for the search below.
+        self.key_block_cache.lock().put(block_start, buf.clone());
+        Self::binary_search_key_block(&buf, block_start, block_len, key)
+    }
+
+    /// Binary search a sorted key block for `key`. Each key is 8 bytes LE.
+    /// Returns the absolute row index (block_start + mid) on match.
+    #[inline]
+    fn binary_search_key_block(
+        buf: &[u8],
+        block_start: usize,
+        block_len: usize,
+        key: u64,
+    ) -> Option<usize> {
         let mut lo = 0usize;
         let mut hi = block_len;
         while lo < hi {

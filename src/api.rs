@@ -410,12 +410,24 @@ impl Database {
 
         // Handle CHECKPOINT and VACUUM SQL commands (not part of the parser's
         // Statement enum — intercepted here as DB operations).
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.starts_with("CHECKPOINT") {
+        // 🔑 PERF: byte-slice case-insensitive check — avoids a per-call
+        // to_ascii_uppercase() String allocation (was ~40ns + heap alloc on
+        // every execute(), even for SELECTs that never match).
+        let starts_checkpoint = trimmed
+            .as_bytes()
+            .get(..10)
+            .map(|b| b.eq_ignore_ascii_case(b"CHECKPOINT"))
+            .unwrap_or(false);
+        if starts_checkpoint {
             self.inner.checkpoint()?;
             return Ok(StreamingQueryResult::Modification { affected_rows: 0 });
         }
-        if upper.starts_with("VACUUM") {
+        let starts_vacuum = trimmed
+            .as_bytes()
+            .get(..6)
+            .map(|b| b.eq_ignore_ascii_case(b"VACUUM"))
+            .unwrap_or(false);
+        if starts_vacuum {
             self.inner.vacuum()?;
             return Ok(StreamingQueryResult::Modification { affected_rows: 0 });
         }
@@ -1074,17 +1086,17 @@ impl Database {
             return Ok(None);
         }
 
-        // 🆕 S9: ColSegmentStore tables use multi-segment storage. The fast
-        // SELECT path below fetches rows via column index + get_table_row,
-        // which works, but routing through the optimizer/full-scan path is
-        // simpler and already correct for these tables. Bail out here so the
-        // query goes through execute_full_scan_streaming → ColSegmentStore.
-        if self.inner.has_col_segment_store(table_name) {
-            return Ok(None);
+        // 🆕 ColSegmentStore tables: we no longer bail out wholesale. The PK
+        // point-query fast path below handles them too (routing directly to
+        // store.get() → fence-index binary search, skipping the SQL parser).
+        // Non-PK WHERE on ColSegmentStore tables still falls through to the
+        // full parse path (handled in the !is_pk branch below).
+        let has_col_seg = self.inner.has_col_segment_store(table_name);
+        if !has_col_seg {
+            // Legacy single-SSTable tables: finalize write buffer so the
+            // columnar paths below see all data.
+            self.inner.finalize_columnar_buffer(table_name);
         }
-
-        // Finalize write buffer (with merge) so columnar paths see all data
-        self.inner.finalize_columnar_buffer(table_name);
 
         // Check for "WHERE" keyword (word boundary)
         let where_pos = match Self::find_keyword_ci(after_table, "where") {
@@ -1118,6 +1130,18 @@ impl Database {
             None => return Ok(None),
         };
 
+        // 🔑 Reject set operations (UNION/INTERSECT/EXCEPT) — the fast path
+        // treats this as a single SELECT, which would silently drop the right
+        // side of the query. Check the tail after the parsed value for set-op
+        // keywords and fall through to the full parser if present.
+        // (LIMIT / ORDER BY after the value are handled correctly by the
+        //  val_str split_whitespace().next() above — only set ops are fatal.)
+        let after_val_pos = after_where[eq_pos + 1..].find(val_str).map(|p| eq_pos + 1 + p + val_str.len()).unwrap_or(after_where.len());
+        let after_val = after_where[after_val_pos..].trim_start();
+        if Self::starts_with_set_op(after_val) {
+            return Ok(None);
+        }
+
         // Resolve schema
         let schema = match self.inner.table_registry.get_table(table_name) {
             Ok(s) => s,
@@ -1141,7 +1165,29 @@ impl Database {
             return Ok(None);
         }
 
+        // 🚀 ColSegmentStore PK point query: route directly to store.get() →
+        // fence-index binary search, completely bypassing the SQL parser +
+        // AST executor. This is the hottest path for OLTP read workloads.
+        // Non-PK WHERE on ColSegmentStore tables falls through to the full
+        // parse path below (the !is_pk branch checks columnar_sstables,
+        // which sync_col_segment_to_sstables keeps populated).
+        if has_col_seg && is_pk {
+            return self.fast_col_segment_pk_select(
+                table_name,
+                &schema,
+                &value,
+                select_part,
+                is_star,
+            );
+        }
+
         if !is_pk {
+            // ColSegmentStore tables: non-PK WHERE goes through the full parse
+            // path (the executor's columnar scan handles it correctly). Only
+            // the PK point query has a no-parse shortcut above.
+            if has_col_seg {
+                return Ok(None);
+            }
             // 🚀 Columnar SSTable fast path: use columnar filtered scan instead of
             // per-row batch fetch. Much faster for low-selectivity filters.
             if self.inner.columnar_sstables.contains_key(table_name) {
@@ -1348,6 +1394,113 @@ impl Database {
         }))
     }
 
+    /// 🚀 ColSegmentStore PK point query — no-parse fast path.
+    ///
+    /// Called from `try_fast_select` when the table has a ColSegmentStore AND
+    /// the WHERE clause is `pk = literal`. Builds the composite key and does
+    /// a direct `store.get()` (fence-index binary search), completely skipping
+    /// the SQL lexer + parser + AST executor.
+    ///
+    /// Mirrors the logic in `try_col_segment_pk_point_query` (executor.rs) but
+    /// operates on the pre-parsed `col_name`/`value` from `try_fast_select`,
+    /// so there is zero parsing overhead.
+    fn fast_col_segment_pk_select(
+        &self,
+        table_name: &str,
+        schema: &crate::types::TableSchema,
+        value: &Value,
+        select_part: &str,
+        is_star: bool,
+    ) -> Result<Option<StreamingQueryResult>> {
+        // Resolve column positions for projection up front (cheap, no alloc
+        // unless non-star). Pre-compute so the not-found and found paths share.
+        let column_names: Vec<String> = if is_star {
+            schema.column_names()
+        } else {
+            select_part
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
+        };
+
+        // Build composite key (table_id << 32 | row_id), matching the insert
+        // path in crud.rs. Negative Integer PKs map to high u32 range.
+        let table_id = self
+            .inner
+            .table_registry
+            .get_table_id(table_name)
+            .unwrap_or(0) as u64;
+        let composite_key = if schema.is_primary_key_auto_increment() {
+            match value {
+                Value::Integer(id) if *id >= 0 => (table_id << 32) | (*id as u64 & 0xFFFFFFFF),
+                _ => return Ok(None), // non-int or negative AI PK → full parse
+            }
+        } else {
+            match value {
+                Value::Integer(id) => {
+                    let row_id = if *id >= 0 {
+                        *id as u64
+                    } else {
+                        0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)
+                    };
+                    (table_id << 32) | (row_id & 0xFFFFFFFF)
+                }
+                _ => {
+                    // Non-Integer PK: try pk_lookup cache. On miss, fall through
+                    // to the full parse path (which scans + populates cache).
+                    let pk_key = crate::database::pk_cache::PkKey::from_value(value);
+                    match self
+                        .inner
+                        .pk_lookup
+                        .get(table_name)
+                        .and_then(|l| l.get_pk(&pk_key))
+                    {
+                        Some(rid) => (table_id << 32) | (rid & 0xFFFFFFFF),
+                        None => return Ok(None),
+                    }
+                }
+            }
+        };
+
+        // Direct store lookup — fence-index binary search, no parser.
+        // Use the read-only accessor (no String alloc, no entry() creation)
+        // — the store always exists for a queried table.
+        let store = match self.inner.get_col_segment_store(table_name) {
+            Some(s) => s,
+            None => return Ok(None), // no store yet → full parse path
+        };
+        let row = match store.get(composite_key) {
+            Some(r) => r,
+            None => {
+                return Ok(Some(StreamingQueryResult::SelectReady {
+                    columns: column_names,
+                    rows: vec![],
+                }));
+            }
+        };
+
+        // Project columns. SELECT * → full row (no clone); SELECT col → project.
+        let result_row: Vec<Value> = if is_star {
+            row
+        } else {
+            let mut projected = Vec::with_capacity(column_names.len());
+            for cname in select_part.split(',').map(|s| s.trim()) {
+                if let Some(cd) = schema.get_column(cname) {
+                    projected.push(row.get(cd.position).cloned().unwrap_or(Value::Null));
+                } else {
+                    // Unknown column → fall back to parser for proper error.
+                    return Ok(None);
+                }
+            }
+            projected
+        };
+
+        Ok(Some(StreamingQueryResult::SelectReady {
+            columns: column_names,
+            rows: vec![result_row],
+        }))
+    }
+
     /// Parse a single SQL literal (integer, float, string, or simple expr like col + lit).
     /// Returns None if the value isn't a literal (falls through to full parser).
     /// Check if a SELECT column expression contains aggregate functions.
@@ -1371,6 +1524,24 @@ impl Database {
                     if before_ok && after_ok {
                         return true;
                     }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if a string starts with a SQL set operation keyword (UNION,
+    /// INTERSECT, EXCEPT), case-insensitive, with word boundary. Used by
+    /// the SELECT fast path to reject multi-statement queries.
+    fn starts_with_set_op(s: &str) -> bool {
+        let s = s.trim_start();
+        for kw in &["UNION", "INTERSECT", "EXCEPT"] {
+            let kb = kw.as_bytes();
+            if s.as_bytes().get(..kb.len()).map(|b| b.eq_ignore_ascii_case(kb)).unwrap_or(false) {
+                // Word boundary: next char is whitespace or end.
+                let after = s.get(kb.len()..).unwrap_or("");
+                if after.is_empty() || after.as_bytes()[0].is_ascii_whitespace() {
+                    return true;
                 }
             }
         }

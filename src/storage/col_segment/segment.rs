@@ -216,7 +216,24 @@ impl Segment {
         key: u64,
         col_types: &[crate::types::ColumnType],
     ) -> Option<Vec<crate::types::Value>> {
-        self.get_row_inner(key, col_types, true)
+        // Find row index via sparse fence index, then decode.
+        let idx = self.sst.find_row_by_key(key)?;
+        if self.sst.row_map.is_deleted(idx) {
+            return None;
+        }
+        Some(self.decode_row_at(idx, col_types, true))
+    }
+
+    /// Decode a row at a known index — skips the fence-index lookup.
+    /// Used by store.get() which already found the index via find_row_by_key,
+    /// avoiding a duplicate binary search + key block read (~2-3µs saved).
+    /// Caller MUST verify the row is not deleted before calling this.
+    pub fn get_row_at_idx(
+        &self,
+        idx: usize,
+        col_types: &[crate::types::ColumnType],
+    ) -> Vec<crate::types::Value> {
+        self.decode_row_at(idx, col_types, true)
     }
 
     /// Get a row for scan paths: text columns use the bounded col_cache (full
@@ -236,13 +253,22 @@ impl Segment {
         col_types: &[crate::types::ColumnType],
         point_query: bool,
     ) -> Option<Vec<crate::types::Value>> {
-        use crate::types::Value;
-
         // Find row index via sparse fence index (O(1) memory).
         let idx = self.sst.find_row_by_key(key)?;
         if self.sst.row_map.is_deleted(idx) {
             return None;
         }
+        Some(self.decode_row_at(idx, col_types, point_query))
+    }
+
+    /// Decode all columns of a row at a known index. No fence-index lookup.
+    fn decode_row_at(
+        &self,
+        idx: usize,
+        col_types: &[crate::types::ColumnType],
+        point_query: bool,
+    ) -> Vec<crate::types::Value> {
+        use crate::types::Value;
 
         let mut row = Vec::with_capacity(col_types.len());
         for (ci, ct) in col_types.iter().enumerate() {
@@ -322,7 +348,7 @@ impl Segment {
             // Unknown column type.
             row.push(Value::Null);
         }
-        Some(row)
+        row
     }
 
     /// Read a text value using page-level caching. Reads a small window of

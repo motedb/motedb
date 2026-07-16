@@ -1666,6 +1666,21 @@ impl MoteDB {
         }
     }
 
+    /// Read-only accessor for ColSegmentStore — no String allocation, no entry
+    /// creation. Used by the point-query fast path where the store always exists
+    /// (the table was queried via execute(), which implies it was created).
+    /// Returns None if no store exists yet (caller falls back to full path).
+    pub fn get_col_segment_store(
+        &self,
+        table_name: &str,
+    ) -> Option<Arc<crate::storage::col_segment::ColSegmentStore>> {
+        // DashMap::get borrows the key (no String alloc) and returns a guard.
+        // Clone the Arc under the guard, then release. ~10x cheaper than entry().
+        self.col_segment_stores
+            .get(table_name)
+            .map(|r| Arc::clone(r.value()))
+    }
+
     /// Whether this table has an active ColSegmentStore (new multi-segment path).
     pub fn has_col_segment_store(&self, table_name: &str) -> bool {
         self.col_segment_stores.contains_key(table_name)
