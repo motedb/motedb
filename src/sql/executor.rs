@@ -2463,7 +2463,7 @@ impl QueryExecutor {
                         if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
                             continue;
                         }
-                        let Ok(fs) = seg.sst.read_fixed_i64(c) else {
+                        let Some(fs) = seg.read_fixed_cached(c) else {
                             continue;
                         };
                         let nulls = fs.null_bitmap_bytes();
@@ -3001,9 +3001,9 @@ impl QueryExecutor {
                 if group_pos >= seg.sst.column_tags.len() {
                     continue;
                 }
-                let ftext = match seg.sst.read_text(group_pos) {
-                    Ok(t) => t,
-                    Err(_) => continue,
+                let ftext = match seg.read_text_cached(group_pos) {
+                    Some(t) => t,
+                    None => continue,
                 };
                 let has_nulls = ftext.has_any_null();
                 let has_deletions = seg.sst.row_map.has_any_deleted();
@@ -3095,7 +3095,7 @@ impl QueryExecutor {
                         if c >= seg.sst.column_tags.len() || !seg.sst.column_tags[c].is_fixed() {
                             continue;
                         }
-                        let Ok(fs) = seg.sst.read_fixed_i64(c) else {
+                        let Some(fs) = seg.read_fixed_cached(c) else {
                             continue;
                         };
                         // 🚀 Only compute min/max if the query actually uses them.
@@ -3150,7 +3150,7 @@ impl QueryExecutor {
                                     if c < seg.sst.column_tags.len()
                                         && seg.sst.column_tags[c].is_fixed()
                                     {
-                                        seg.sst.read_fixed_i64(c).ok()
+                                        seg.read_fixed_cached(c)
                                     } else {
                                         None
                                     }
@@ -3525,7 +3525,7 @@ impl QueryExecutor {
                                 stmt, table_name, &schema, &store,
                             )?;
                             // Release column data pages after heavy scan.
-                            store.release_query_memory();
+                            store.release_pages_only();
                             return Ok(result);
                         }
                         // DISTINCT (no aggregate): multi-segment scan + dedup.
@@ -3551,7 +3551,7 @@ impl QueryExecutor {
                                     let columns = self
                                         .build_select_columns(&stmt.columns, &schema)
                                         .unwrap_or_default();
-                                    store.release_query_memory();
+                                    store.release_pages_only();
                                     return Ok(StreamingQueryResult::SelectReady { columns, rows });
                                 }
                                 let scanned =
@@ -3568,7 +3568,7 @@ impl QueryExecutor {
                                 let columns = self
                                     .build_select_columns(&stmt.columns, &schema)
                                     .unwrap_or_default();
-                                store.release_query_memory();
+                                store.release_pages_only();
                                 return Ok(StreamingQueryResult::SelectReady { columns, rows });
                             }
                         }
@@ -3590,7 +3590,7 @@ impl QueryExecutor {
                         if let Some(result) =
                             self.col_segment_aggregate(stmt, table_name, &store)?
                         {
-                            store.release_query_memory();
+                            store.release_pages_only();
                             return Ok(result);
                         }
                         // col_segment_aggregate returned None (complex aggregate).
@@ -3600,7 +3600,7 @@ impl QueryExecutor {
                             if let Some(result) =
                                 self.col_segment_group_by(stmt, table_name, &store, &schema)?
                             {
-                                store.release_query_memory();
+                                store.release_pages_only();
                                 return Ok(result);
                             }
                             // 🔑 PERF: try try_group_by_columnar BEFORE syncing —
@@ -3616,7 +3616,7 @@ impl QueryExecutor {
                             if let Some(result) =
                                 self.col_segment_multi_aggregate(stmt, table_name, &store, &schema)?
                             {
-                                store.release_query_memory();
+                                store.release_pages_only();
                                 return Ok(result);
                             }
                         }

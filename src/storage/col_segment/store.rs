@@ -860,9 +860,9 @@ impl ColSegmentStore {
             ))
         };
         for seg in segs.iter() {
-            let ftext = match seg.sst.read_text(filter_col) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let ftext = match seg.read_text_cached(filter_col) {
+                Some(t) => t,
+                None => continue,
             };
             let has_deletions = seg.sst.row_map.has_any_deleted();
             if single_seg && !has_deletions {
@@ -909,9 +909,9 @@ impl ColSegmentStore {
         for (sidx, seg) in segs.iter().enumerate() {
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
-            let ftext = match seg.sst.read_text(filter_col) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let ftext = match seg.read_text_cached(filter_col) {
+                Some(t) => t,
+                None => continue,
             };
             let has_nulls = ftext.has_any_null();
             let has_deletions = seg.sst.row_map.has_any_deleted();
@@ -982,9 +982,9 @@ impl ColSegmentStore {
         };
         for (sidx, seg) in segs.iter().enumerate().rev() {
             let _ = seg.sst.load_full_keys();
-            let ftext = match seg.sst.read_text(filter_col) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let ftext = match seg.read_text_cached(filter_col) {
+                Some(t) => t,
+                None => continue,
             };
             let has_deletions = seg.sst.row_map.has_any_deleted();
             // Iterate rows newest→oldest within segment so dedup keeps the
@@ -1037,9 +1037,9 @@ impl ColSegmentStore {
         };
         for (sidx, seg) in segs.iter().enumerate() {
             let _ = seg.sst.load_full_keys();
-            let ftext = match seg.sst.read_text(filter_col) {
-                Ok(t) => t,
-                Err(_) => continue,
+            let ftext = match seg.read_text_cached(filter_col) {
+                Some(t) => t,
+                None => continue,
             };
             let has_deletions = seg.sst.row_map.has_any_deleted();
             if !has_deletions {
@@ -1546,10 +1546,17 @@ impl ColSegmentStore {
         let segs = self.segments.read();
         for seg in segs.iter() {
             seg.clear_cache();
-            // Release mmap pages back to the OS so RSS stays low after heavy
-            // scans. Pages are re-faulted from the page cache on next access.
             seg.release_pages();
-            // Hint OS to drop page cache (Linux: posix_fadvise DONTNEED).
+            seg.sst.advise_dontneed();
+        }
+    }
+
+    /// Release mmap pages WITHOUT clearing col_cache. Keeps decoded column
+    /// data in heap for fast repeated aggregate queries.
+    pub fn release_pages_only(&self) {
+        let segs = self.segments.read();
+        for seg in segs.iter() {
+            seg.release_pages();
             seg.sst.advise_dontneed();
         }
     }
@@ -1674,12 +1681,12 @@ impl ColSegmentStore {
 
             // Pre-decode the filter column once per segment.
             let fcol_fixed = if tag.is_fixed() {
-                seg.sst.read_fixed_i64(filter_col).ok()
+                seg.read_fixed_cached(filter_col)
             } else {
                 None
             };
             let fcol_text = if matches!(tag, ColumnTypeTag::Text) {
-                seg.sst.read_text(filter_col).ok()
+                seg.read_text_cached(filter_col)
             } else {
                 None
             };
@@ -1819,7 +1826,7 @@ impl ColSegmentStore {
                 && fc < seg.sst.column_tags.len()
                 && seg.sst.column_tags[fc].is_fixed()
             {
-                seg.sst.read_fixed_i64(fc).ok()
+                seg.read_fixed_cached(fc)
             } else {
                 None
             };
@@ -1827,22 +1834,20 @@ impl ColSegmentStore {
                 && fc < seg.sst.column_tags.len()
                 && matches!(seg.sst.column_tags[fc], ColumnTypeTag::Text)
             {
-                seg.sst.read_text(fc).ok()
+                seg.read_text_cached(fc)
             } else {
                 None
             };
             let agg_fixed = if seg.sst.column_tags[agg_col].is_fixed() {
-                seg.sst.read_fixed_i64(agg_col).ok()
+                seg.read_fixed_cached(agg_col)
             } else {
                 None
             };
-            // 🔑 Pre-decode text agg column ONCE (not per-row). Previously this
-            // was inside the per-row closure causing O(N²) re-decode.
             let agg_text = if agg_fixed.is_none()
                 && agg_col < seg.sst.column_tags.len()
                 && matches!(seg.sst.column_tags[agg_col], ColumnTypeTag::Text)
             {
-                seg.sst.read_text(agg_col).ok()
+                seg.read_text_cached(agg_col)
             } else {
                 None
             };

@@ -150,6 +150,43 @@ impl Segment {
         self.text_page_cache.lock().clear();
     }
 
+    /// Read a fixed-width column, using the cross-query col_cache.
+    /// On cache miss, decodes and caches the column segment. On hit,
+    /// returns the cached FixedSegment (zero allocation, zero decode).
+    pub fn read_fixed_cached(&self, col_idx: usize) -> Option<FixedSegment> {
+        {
+            let mut cache = self.col_cache.lock();
+            if let Some(cached) = cache.get(col_idx) {
+                if let CachedCol::Fixed(ref f) = cached {
+                    return Some(f.clone());
+                }
+            }
+        }
+        let seg = self.sst.read_fixed_i64(col_idx).ok()?;
+        self.col_cache
+            .lock()
+            .insert(col_idx, CachedCol::Fixed(seg.clone()));
+        Some(seg)
+    }
+
+    /// Read a text column, using the cross-query col_cache.
+    /// On cache miss, decodes and caches. On hit, returns cached TextSegment.
+    pub fn read_text_cached(&self, col_idx: usize) -> Option<TextSegment> {
+        {
+            let mut cache = self.col_cache.lock();
+            if let Some(cached) = cache.get(col_idx) {
+                if let CachedCol::Text(ref t) = cached {
+                    return Some(t.clone());
+                }
+            }
+        }
+        let seg = self.sst.read_text(col_idx).ok()?;
+        self.col_cache
+            .lock()
+            .insert(col_idx, CachedCol::Text(seg.clone()));
+        Some(seg)
+    }
+
     /// Release mmap pages from RSS via MADV_DONTNEED. The OS will re-fault
     /// pages on next access. Call after bulk reads (e.g. compaction) to keep
     /// peak RSS low on memory-constrained embedded devices.
