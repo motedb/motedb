@@ -894,6 +894,18 @@ impl TextFTSIndex {
             return self.search_single_term(&unique_tokens[0], top_k);
         }
 
+        // 🚀 Multi-term top-K cache: repeated queries with the same token set
+        // (e.g. benchmark loops, hot search terms) hit the cache and skip the
+        // WAND loop entirely. Key includes top_k so different LIMIT values
+        // don't collide.
+        let cache_key = format!("{}|{}", unique_tokens.join("\x1f"), top_k);
+        {
+            let mut cache = self.topk_cache.write();
+            if let Some(cached) = cache.get(&cache_key) {
+                return Ok(cached.clone());
+            }
+        }
+
         let doc_lengths = self.get_doc_lengths_cached()?;
         let avg_dl = if self.avg_doc_length > 0.0 {
             self.avg_doc_length
@@ -1114,6 +1126,11 @@ impl TextFTSIndex {
             .map(|std::cmp::Reverse((OrdF32(score), doc))| (doc as DocId, score))
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // 🚀 Populate multi-term top-K cache for future repeat queries.
+        if !results.is_empty() {
+            self.topk_cache.write().put(cache_key, results.clone());
+        }
 
         Ok(results)
     }

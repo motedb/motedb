@@ -17555,123 +17555,127 @@ impl QueryExecutor {
         let limit = stmt.limit.unwrap_or(1000);
 
         // Phrase search or ranked search depending on query type
-        let row_ids: Vec<u64> = if phrase {
+        // 🚀 Carry (row_id, score) through — don't discard BM25 scores and
+        // hardcode 1.0 (was executor.rs:17590). Keeps ORDER BY score correct.
+        let mut scored_results: Vec<(u64, f32)> = if phrase {
             let ids = match self.db.text_search_phrase(&index_name, &query) {
                 Ok(r) => r,
                 Err(_) => return Ok(None),
             };
-            ids.into_iter().take(limit).collect()
+            ids.into_iter().take(limit).map(|id| (id, 1.0)).collect()
         } else {
-            let results = match self.db.text_search_ranked(&index_name, &query, limit) {
+            match self.db.text_search_ranked(&index_name, &query, limit) {
                 Ok(r) => r,
                 Err(_) => return Ok(None),
-            };
-            results.into_iter().map(|(id, _score)| id).collect()
+            }
         };
 
-        if row_ids.is_empty() {
+        if scored_results.is_empty() {
             return Ok(Some(QueryResult::Select {
                 columns: vec![],
                 rows: vec![],
             }));
         }
 
-        // Load rows for matching row_ids — use batch fetch for efficiency
-        let schema = self.db.get_table_schema(table_name)?;
-        let mut sql_rows = Vec::with_capacity(row_ids.len());
-
-        let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
-
-        for (i, row_id) in row_ids.iter().enumerate() {
-            if let Some(row) = batch_rows.get(i).and_then(|(_, opt)| opt.as_ref()) {
-                let mut sql_row = row_to_sql_row(row, &schema)?;
-                sql_row.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                sql_row.insert("__table__".to_string(), Value::text(table_name.to_string()));
-                let score = 1.0f32;
-                sql_row.insert(
-                    format!("__text_score_{}__", column),
-                    Value::Float(score as f64),
-                );
-                let old_row = std::mem::take(&mut sql_row);
-                let mut qualified = SqlRow::new();
-                qualified.insert("__row_id__".to_string(), Value::Integer(*row_id as i64));
-                qualified.insert("__table__".to_string(), Value::text(table_name.to_string()));
-                qualified.insert(
-                    format!("__text_score_{}__", column),
-                    Value::Float(score as f64),
-                );
-                for (col_name, val) in old_row.into_iter() {
-                    let qname = Self::make_qualified_name(table_name, &col_name);
-                    qualified.insert(qname, val);
-                }
-                sql_rows.push((*row_id, qualified));
-            }
-        }
-
         // Apply ORDER BY if present.
         // Default order is BM25 score descending (already sorted by text_search_ranked).
-        // If ORDER BY specifies other columns, re-sort by those columns.
-        if let Some(ref order_by) = stmt.order_by {
-            let is_score_desc = order_by.len() == 1
-                && matches!(&order_by[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
-                && !order_by[0].asc;
-            if !is_score_desc {
-                sql_rows.sort_by(|a, b| {
-                    for ob in order_by {
-                        if let Expr::Column(ref col_name) = ob.expr {
-                            let a_val = a.1.get(col_name).or_else(|| {
-                                a.1.get(&Self::make_qualified_name(table_name, col_name))
-                            });
-                            let b_val = b.1.get(col_name).or_else(|| {
-                                b.1.get(&Self::make_qualified_name(table_name, col_name))
-                            });
-                            let cmp = match (a_val, b_val) {
-                                (Some(Value::Integer(ai)), Some(Value::Integer(bi))) => ai.cmp(bi),
-                                (Some(Value::Float(af)), Some(Value::Float(bf))) => {
-                                    af.partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal)
-                                }
-                                (Some(Value::Text(at)), Some(Value::Text(bt))) => at.cmp(bt),
-                                _ => std::cmp::Ordering::Equal,
-                            };
-                            let result = if ob.asc { cmp } else { cmp.reverse() };
-                            if result != std::cmp::Ordering::Equal {
-                                return result;
-                            }
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
+        // If ORDER BY specifies other columns, sort the projected results by
+        // those columns after projection (handles the common ORDER BY id case).
+        let needs_resort = stmt.order_by.as_ref().map_or(false, |ob| {
+            !(ob.len() == 1
+                && matches!(&ob[0].expr, Expr::Column(c) if c.to_lowercase().contains("score"))
+                && !ob[0].asc)
+        });
+
+        // Build score lookup map (row_id → BM25 score) for MATCH-expr columns.
+        let score_map: std::collections::HashMap<u64, f64> = scored_results
+            .iter()
+            .map(|(id, s)| (*id, *s as f64))
+            .collect();
+
+        let row_ids: Vec<u64> = scored_results.iter().map(|(id, _)| *id).collect();
+        let schema = self.db.get_table_schema(table_name)?;
+        let columns = self.build_select_columns(&stmt.columns, &schema)?;
+
+        // 🚀 Batch-fetch rows and project directly via project_row_direct
+        // (no SqlRow HashMap build/teardown — was 2× HashMap alloc per row).
+        let batch_rows = self.db.get_table_rows_batch(table_name, &row_ids)?;
+        // Build a row_id → row lookup so we preserve BM25-sorted order.
+        let mut row_lookup: std::collections::HashMap<u64, &Row> =
+            std::collections::HashMap::with_capacity(batch_rows.len());
+        for (rid, opt) in &batch_rows {
+            if let Some(r) = opt {
+                row_lookup.insert(*rid, r);
             }
         }
 
-        // Build scores from sql_rows metadata
-        let scores: Vec<(RowId, f32)> = sql_rows
-            .iter()
-            .map(|(id, row)| {
-                let score = row
-                    .get(&format!("__text_score_{}__", column))
-                    .and_then(|v| {
-                        if let Value::Float(f) = v {
-                            Some(*f as f32)
+        let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(scored_results.len());
+        for (row_id, _score) in &scored_results {
+            if let Some(row) = row_lookup.get(row_id) {
+                let mut projected =
+                    Self::project_row_direct(row, &stmt.columns, &columns, &schema);
+                // Append MATCH-expr scores for SELECT columns that are
+                // `MATCH(col) AGAINST(...) AS score`.
+                let mut appended_match_score = false;
+                for (ci, sel_col) in stmt.columns.iter().enumerate() {
+                    if let SelectColumn::Expr(Expr::Match { column: mc, .. }, _) = sel_col {
+                        if mc == &column {
+                            projected[ci] = score_map
+                                .get(row_id)
+                                .map(|s| Value::Float(*s))
+                                .unwrap_or(Value::Float(0.0));
+                            appended_match_score = true;
+                        }
+                    }
+                }
+                let _ = appended_match_score;
+                result_rows.push(projected);
+            }
+        }
+
+        // Apply ORDER BY on non-score columns (e.g. ORDER BY id) by re-sorting
+        // the projected results. The BM25-sorted order is preserved otherwise.
+        if needs_resort {
+            if let Some(ref order_by) = stmt.order_by {
+                // Build column-position lookup for ORDER BY columns.
+                let col_pos: Vec<(usize, bool)> = order_by
+                    .iter()
+                    .filter_map(|ob| {
+                        if let Expr::Column(ref col_name) = ob.expr {
+                            columns.iter().position(|c| c == col_name || c.ends_with(&format!(".{}", col_name)))
+                                .map(|pos| (pos, ob.asc))
                         } else {
                             None
                         }
                     })
-                    .unwrap_or(1.0);
-                (*id, score)
-            })
-            .collect();
-
-        let (column_names, result_rows) =
-            self.project_text_search_columns(stmt, &sql_rows, &schema, &column, &scores)?;
+                    .collect();
+                if !col_pos.is_empty() {
+                    result_rows.sort_by(|a, b| {
+                        for &(pos, asc) in &col_pos {
+                            let cmp = Self::compare_values(
+                                a.get(pos).unwrap_or(&Value::Null),
+                                b.get(pos).unwrap_or(&Value::Null),
+                            )
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                            let result = if asc { cmp } else { cmp.reverse() };
+                            if result != std::cmp::Ordering::Equal {
+                                return result;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+            }
+        }
 
         Ok(Some(QueryResult::Select {
-            columns: column_names,
+            columns,
             rows: result_rows,
         }))
     }
 
     /// Project columns for text search fast path, handling MATCH score columns
+    #[allow(dead_code)]
     fn project_text_search_columns(
         &self,
         stmt: &SelectStmt,
