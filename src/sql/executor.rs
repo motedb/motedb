@@ -1592,6 +1592,67 @@ impl QueryExecutor {
         self.current_txn_id.lock().is_some()
     }
 
+    /// Mark a transaction as active so subsequent execute() calls route writes
+    /// through the transaction coordinator (buffered in write_set until commit).
+    /// Called by Database::begin_transaction() to keep the executor in sync
+    /// with the coordinator — without this, the executor would write directly
+    /// to storage and rollback could not undo the writes.
+    pub fn begin_txn_context(&self, txn_id: u64) {
+        *self.current_txn_id.lock() = Some(txn_id);
+    }
+
+    /// Clear the active transaction context (after commit or rollback).
+    pub fn clear_txn_context(&self) {
+        *self.current_txn_id.lock() = None;
+    }
+
+    /// Get the active transaction id, if any.
+    pub fn current_txn_id(&self) -> Option<u64> {
+        *self.current_txn_id.lock()
+    }
+
+    /// 🔑 Replay the transaction's undo log in reverse order, restoring the
+    /// pre-transaction state of rows that UPDATE/DELETE modified directly in
+    /// storage. INSERTs are NOT replayed here — they were buffered in the
+    /// write_set and never written to storage, so rollback just discards them.
+    ///
+    /// This MUST be called by Database::rollback_transaction() (the API path)
+    /// before delegating to the coordinator. The SQL ROLLBACK path in
+    /// execute_streaming_ref inlines the same logic. Without this, API-level
+    /// rollback would silently fail to undo UPDATE/DELETE changes.
+    pub fn replay_undo_log(&self, txn_id: u64) {
+        let ctx = match self.db.txn_coordinator.get_context(txn_id) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let undo_log = std::mem::take(&mut *ctx.undo_log.write());
+        for delta in undo_log.into_iter().rev() {
+            match delta {
+                crate::txn::coordinator::DeltaOperation::Update(row_id, table_name, old_value) => {
+                    let old_row = std::sync::Arc::try_unwrap(old_value)
+                        .unwrap_or_else(|arc| (*arc).clone());
+                    if let Ok(schema) = self.db.get_table_schema(&table_name) {
+                        let _ = self.db.update_row_in_table_with_schema(
+                            &table_name,
+                            row_id,
+                            old_row.clone(),
+                            old_row,
+                            &schema,
+                        );
+                    }
+                }
+                crate::txn::coordinator::DeltaOperation::Delete(row_id, table_name, old_value) => {
+                    let old_row = std::sync::Arc::try_unwrap(old_value)
+                        .unwrap_or_else(|arc| (*arc).clone());
+                    let _ = self.db.insert_row_to_table(&table_name, old_row);
+                }
+                crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
+                    // INSERT undo: write_set INSERT was never committed to store.
+                }
+            }
+        }
+    }
+
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
 

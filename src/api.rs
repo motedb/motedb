@@ -508,6 +508,19 @@ impl Database {
     pub fn execute_prepared(&self, sql: &str, params: Vec<Value>) -> Result<StreamingQueryResult> {
         use crate::sql::{Lexer, Parser};
 
+        // 🛡️ Guard: reject all operations after close() (execute() has this
+        // check; execute_prepared was missing it — writes could silently
+        // proceed against a closed database).
+        if self
+            .inner
+            .is_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::StorageError::InvalidData(
+                "Database is closed".into(),
+            ));
+        }
+
         // Get or parse the statement — check for cached fast PK metadata
         let (statement, cached_fast_pk): (Arc<Statement>, bool) = {
             let read_cache = self.stmt_cache.read();
@@ -2157,7 +2170,13 @@ impl Database {
     /// db.commit_transaction(tx_id)?;
     /// ```
     pub fn begin_transaction(&self) -> Result<u64> {
-        self.inner.begin_transaction()
+        let tx_id = self.inner.begin_transaction()?;
+        // 🔑 Keep the SQL executor in sync so execute()/execute_prepared()
+        // route writes through the transaction coordinator (buffered in
+        // write_set until commit). Without this the executor writes directly
+        // to storage and rollback cannot undo the writes.
+        self.query_executor.begin_txn_context(tx_id);
+        Ok(tx_id)
     }
 
     /// 提交事务
@@ -2169,7 +2188,9 @@ impl Database {
     /// db.commit_transaction(tx_id)?;
     /// ```
     pub fn commit_transaction(&self, tx_id: u64) -> Result<()> {
-        self.inner.commit_transaction(tx_id)
+        self.inner.commit_transaction(tx_id)?;
+        self.query_executor.clear_txn_context();
+        Ok(())
     }
 
     /// 回滚事务
@@ -2181,7 +2202,15 @@ impl Database {
     /// db.rollback_transaction(tx_id)?; // 撤销所有修改
     /// ```
     pub fn rollback_transaction(&self, tx_id: u64) -> Result<()> {
-        self.inner.rollback_transaction(tx_id)
+        // 🔑 Replay the undo log BEFORE delegating to the coordinator. UPDATE
+        // and DELETE write directly to storage during the transaction (recording
+        // old values in the undo log). Without this replay, rollback would
+        // silently fail to undo those changes — the coordinator's rollback()
+        // only discards the write_set and clears bookkeeping.
+        self.query_executor.replay_undo_log(tx_id);
+        self.inner.rollback_transaction(tx_id)?;
+        self.query_executor.clear_txn_context();
+        Ok(())
     }
 
     /// 创建保存点（事务内的检查点）
