@@ -360,3 +360,76 @@ fn ryw_mixed_insert_delete_update() {
     db.rollback_transaction(tx).expect("rollback");
     assert_eq!(count(&db, "t"), 2, "after rollback original 2 rows restored");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. Read-your-writes in JOIN and subquery (multi-table transactions)
+//     Regression guard for the write_set key bug: the write_set was keyed by
+//     row_id only, so two tables with the same row_id (e.g. both PK=2)
+//     overwrote each other's INSERTs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn ryw_join_sees_uncommitted_writes() {
+    let (db, _dir) = setup_two_tables();
+    let tx = db.begin_transaction().expect("begin");
+    // Both tables insert row_id=2 (PK=2) — would collide under the old
+    // row_id-only write_set keying.
+    db.execute("INSERT INTO a VALUES (2, 20)").expect("insert a");
+    db.execute("INSERT INTO b VALUES (2, 2, 'second')").expect("insert b");
+
+    let rs = db
+        .execute("SELECT a.id, b.name FROM a INNER JOIN b ON a.id = b.a_id")
+        .expect("join")
+        .materialize()
+        .expect("mat");
+    use motedb::sql::QueryResult;
+    if let QueryResult::Select { rows, .. } = rs {
+        assert_eq!(rows.len(), 2, "JOIN must see both committed + uncommitted rows");
+    } else {
+        panic!("expected Select");
+    }
+    db.rollback_transaction(tx).expect("rollback");
+}
+
+#[test]
+fn ryw_subquery_sees_uncommitted_writes() {
+    let (db, _dir) = setup_two_tables();
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("INSERT INTO a VALUES (2, 20)").expect("insert a");
+    db.execute("INSERT INTO b VALUES (2, 2, 'second')").expect("insert b");
+
+    let rs = db
+        .execute("SELECT id FROM a WHERE id IN (SELECT a_id FROM b)")
+        .expect("subquery")
+        .materialize()
+        .expect("mat");
+    use motedb::sql::QueryResult;
+    if let QueryResult::Select { rows, .. } = rs {
+        assert_eq!(rows.len(), 2, "subquery must see both rows");
+    }
+    db.rollback_transaction(tx).expect("rollback");
+}
+
+#[test]
+fn ryw_multi_table_counts_independent() {
+    // Two tables, both with PK=1 — write_set must keep them distinct.
+    let (db, _dir) = setup_two_tables();
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("INSERT INTO a VALUES (5, 50)").expect("insert a");
+    db.execute("INSERT INTO b VALUES (5, 5, 'fifth')").expect("insert b");
+    assert_eq!(count(&db, "a"), 2, "table a must see its own insert");
+    assert_eq!(count(&db, "b"), 2, "table b must see its own insert");
+    db.rollback_transaction(tx).expect("rollback");
+    assert_eq!(count(&db, "a"), 1);
+    assert_eq!(count(&db, "b"), 1);
+}
+
+fn setup_two_tables() -> (Database, TempDir) {
+    let dir = TempDir::new().expect("temp dir");
+    let db = Database::create(dir.path()).expect("create db");
+    db.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)").expect("create a");
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT, name TEXT)").expect("create b");
+    db.execute("INSERT INTO a VALUES (1, 10)").expect("seed a");
+    db.execute("INSERT INTO b VALUES (1, 1, 'first')").expect("seed b");
+    (db, dir)
+}

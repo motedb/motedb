@@ -1675,8 +1675,8 @@ impl QueryExecutor {
         };
         let ws = ctx.write_set.read();
         ws.iter()
-            .filter(|(_, (tbl, _))| tbl == table)
-            .map(|(&rid, (_, row))| (rid, row.clone()))
+            .filter(|((tbl, _), _)| tbl == table)
+            .map(|((_, rid), row)| (*rid, row.clone()))
             .collect()
     }
 
@@ -1721,10 +1721,8 @@ impl QueryExecutor {
         });
         drop(undo);
         let ws = ctx.write_set.read();
-        if let Some((tbl, row)) = ws.get(&row_id) {
-            if tbl == table {
-                return Some(Some(row.clone()));
-            }
+        if let Some(row) = ws.get(&(table.to_string(), row_id)) {
+            return Some(Some(row.clone()));
         }
         if deleted {
             return Some(None);
@@ -6505,7 +6503,20 @@ impl QueryExecutor {
         table: &str,
         schema: &TableSchema,
     ) -> Result<Vec<(u64, Vec<Value>)>> {
-        if self.db.has_col_segment_store(table) {
+        // 🔑 Read-your-writes: when inside a transaction, merge the write_set
+        // and filter undo_log deletes so JOINs and subqueries see uncommitted
+        // writes. Covers JOIN (try_positional_inner_join) and IN/scalar
+        // subquery materialization paths that call this helper.
+        let txn_writes = self.txn_write_set_rows(table);
+        let txn_deletes = self.txn_deleted_row_ids(table);
+        let in_txn = self.is_in_transaction() && (!txn_writes.is_empty() || !txn_deletes.is_empty());
+
+        if in_txn && !self.db.has_col_segment_store(table) {
+            // Txn-only table (no committed data): just return the write_set rows
+            // (filtered for deletes — though a fresh INSERT can't be in deletes).
+            return Ok(txn_writes);
+        }
+        let mut scanned: Vec<(u64, Vec<Value>)> = if self.db.has_col_segment_store(table) {
             let store = self
                 .db
                 .get_or_create_col_segment_store(table, schema.col_types())?;
@@ -6513,11 +6524,21 @@ impl QueryExecutor {
             // Use projected scan with ALL columns (full row needed for JOIN output).
             let ncols = schema.columns.len();
             let project_cols: Vec<usize> = (0..ncols).collect();
-            let scanned = store.scan_projected_filtered(None, &project_cols, &|_| true);
-            Ok(scanned)
+            store.scan_projected_filtered(None, &project_cols, &|_| true)
         } else {
-            self.db.scan_table_rows_streaming(table)?.collect()
+            self.db.scan_table_rows_streaming(table)?.collect::<Result<_>>()?
+        };
+        if in_txn {
+            // Filter out rows the transaction has deleted.
+            scanned.retain(|(rid, _)| !txn_deletes.contains(rid));
+            // Remove segment rows whose row_id is also in the write_set (write_set
+            // has the newer version), then append the write_set rows.
+            let ws_ids: std::collections::HashSet<u64> =
+                txn_writes.iter().map(|(rid, _)| *rid).collect();
+            scanned.retain(|(rid, _)| !ws_ids.contains(rid));
+            scanned.extend(txn_writes);
         }
+        Ok(scanned)
     }
 
     fn try_col_segment_pk_point_query(
@@ -6678,6 +6699,19 @@ impl QueryExecutor {
             let col_types = schema.col_types().to_vec();
             if let Ok(store) = self.db.get_or_create_col_segment_store(table, &col_types) {
                 let _ = store.flush_buffer();
+                // 🔑 Read-your-writes: the zero-copy SelectColumnar path below
+                // bypasses execute_full_scan_via_col_segment and would miss
+                // uncommitted transactional writes. When in a transaction with
+                // writes for this table, force the merge path.
+                if self.is_in_transaction() {
+                    let ws = self.txn_write_set_rows(table);
+                    let del = self.txn_deleted_row_ids(table);
+                    if !ws.is_empty() || !del.is_empty() {
+                        return self.execute_full_scan_txn_merge(
+                            stmt, table, &schema, &store, ws, del,
+                        );
+                    }
+                }
                 return self.execute_full_scan_via_col_segment(stmt, table, &schema, &store);
             }
         }

@@ -155,7 +155,7 @@ impl MoteDB {
         // Add to transaction write_set — NOT written to WAL or LSM yet
         let ctx = self.txn_coordinator.get_context(txn_id)?;
         let mut write_set = ctx.write_set.write();
-        write_set.insert(row_id, (table_name.to_string(), row.clone()));
+        write_set.insert((table_name.to_string(), row_id), row.clone());
 
         // Record delta for savepoint rollback
         let _ = self.txn_coordinator.record_write_delta(
@@ -195,7 +195,7 @@ impl MoteDB {
         let commit_ts = self.txn_coordinator.commit(txn_id)?;
 
         // 2. Write each row to WAL (coordinator already committed)
-        for (row_id, (table_name, row_data)) in &write_set {
+        for ((table_name, row_id), row_data) in &write_set {
             let partition = (*row_id % self.num_partitions as u64) as PartitionId;
             self.wal
                 .log_insert(table_name, partition, *row_id, row_data.clone(), txn_id)?;
@@ -209,7 +209,7 @@ impl MoteDB {
         // instead (SELECT reads from there, not LSM for columnar tables).
         // LSM write happens asynchronously via WAL checkpoint.
         let mut kvs: Vec<(u64, crate::storage::lsm::Value)> = Vec::with_capacity(write_set.len());
-        for (row_id, (table_name, row_data)) in &write_set {
+        for ((table_name, row_id), row_data) in &write_set {
             let composite_key = self.make_composite_key(table_name, *row_id);
             let tbl_schema = self.table_registry.get_table(table_name)?;
             let col_types = tbl_schema.col_types();
@@ -228,7 +228,7 @@ impl MoteDB {
         // second INSERT data is in WAL only — it will be replayed on checkpoint.
         //
         // Update caches so the data is visible to queries via row_cache.
-        for (row_id, (table_name, row_data)) in &write_set {
+        for ((table_name, row_id), row_data) in &write_set {
             self.row_cache
                 .put(table_name.to_string(), *row_id, row_data.clone());
 

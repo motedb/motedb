@@ -1443,10 +1443,8 @@ impl Database {
         });
         drop(undo);
         let ws = ctx.write_set.read();
-        if let Some((tbl, row)) = ws.get(&row_id) {
-            if tbl == table {
-                return Some(Some(row.clone()));
-            }
+        if let Some(row) = ws.get(&(table.to_string(), row_id)) {
+            return Some(Some(row.clone()));
         }
         if deleted {
             return Some(None);

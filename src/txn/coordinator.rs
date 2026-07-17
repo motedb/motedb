@@ -77,8 +77,12 @@ pub struct TransactionContext {
     pub state: AtomicU8,
 
     /// Write set (local cache of writes) with table metadata
-    /// Format: RowId → (table_name, row_data)
-    pub write_set: RwLock<HashMap<RowId, (String, Row)>>,
+    /// Format: (table_name, RowId) → row_data
+    /// 🔑 Keyed by (table_name, row_id) — NOT just row_id — because different
+    /// tables can have the same row_id (e.g. both have PK=2 → row_id=2).
+    /// Keying by row_id alone caused cross-table INSERTs to overwrite each
+    /// other, silently losing transactional writes.
+    pub write_set: RwLock<HashMap<(String, RowId), Row>>,
 
     /// Read set (for conflict detection in Serializable)
     pub read_set: RwLock<HashSet<RowId>>,
@@ -173,16 +177,16 @@ impl TransactionCoordinator {
 
         // Sort rows by row_id to avoid deadlocks when acquiring write locks
         let write_set = ctx.write_set.read();
-        let mut sorted_rows: Vec<(RowId, Row)> = write_set
+        let mut sorted_rows: Vec<((String, RowId), Row)> = write_set
             .iter()
-            .map(|(row_id, (_, data))| (*row_id, data.clone()))
+            .map(|(key, data)| (key.clone(), data.clone()))
             .collect();
         drop(write_set);
-        sorted_rows.sort_by_key(|(row_id, _)| *row_id);
+        sorted_rows.sort_by_key(|((_, rid), _)| *rid);
 
         // Insert each row version with atomic validation (validation + insertion
         // happen under a single write lock, eliminating the TOCTOU window).
-        for (row_id, data) in &sorted_rows {
+        for ((_, row_id), data) in &sorted_rows {
             self.version_store.insert_version_atomic(
                 *row_id,
                 data.clone(),
@@ -345,30 +349,24 @@ impl TransactionCoordinator {
         let mut undo_count = 0;
         for delta in all_deltas {
             match delta {
-                DeltaOperation::Insert(row_id, _table_name, _new_value) => {
+                DeltaOperation::Insert(row_id, table_name, _new_value) => {
                     // Undo insert: remove from write_set
-                    write_set.remove(&row_id);
+                    write_set.remove(&(table_name, row_id));
                     undo_count += 1;
                 }
                 DeltaOperation::Update(row_id, table_name, old_value) => {
                     // Undo update: restore old value (Arc clone is O(1))
                     write_set.insert(
-                        row_id,
-                        (
-                            table_name,
-                            Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
-                        ),
+                        (table_name, row_id),
+                        Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
                     );
                     undo_count += 1;
                 }
                 DeltaOperation::Delete(row_id, table_name, old_value) => {
                     // Undo delete: restore old value (Arc clone is O(1))
                     write_set.insert(
-                        row_id,
-                        (
-                            table_name,
-                            Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
-                        ),
+                        (table_name, row_id),
+                        Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
                     );
                     undo_count += 1;
                 }
@@ -553,11 +551,8 @@ mod tests {
         // Add some writes (with table metadata)
         let ctx = coord.get_context(txn_id).unwrap();
         ctx.write_set.write().insert(
-            1,
-            (
-                "test_table".to_string(),
-                vec![Value::Timestamp(Timestamp::from_micros(100))],
-            ),
+            ("test_table".to_string(), 1),
+            vec![Value::Timestamp(Timestamp::from_micros(100))],
         );
 
         coord.commit(txn_id).unwrap();
@@ -573,11 +568,8 @@ mod tests {
         // Add some writes (with table metadata)
         let ctx = coord.get_context(txn_id).unwrap();
         ctx.write_set.write().insert(
-            1,
-            (
-                "test_table".to_string(),
-                vec![Value::Timestamp(Timestamp::from_micros(100))],
-            ),
+            ("test_table".to_string(), 1),
+            vec![Value::Timestamp(Timestamp::from_micros(100))],
         );
 
         coord.rollback(txn_id).unwrap();
