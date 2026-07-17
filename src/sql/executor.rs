@@ -1653,6 +1653,85 @@ impl QueryExecutor {
         }
     }
 
+    // ==================== Read-Your-Writes helpers ====================
+    //
+    // When inside a transaction, SELECT must see the transaction's own
+    // uncommitted INSERTs (write_set) and must NOT see rows the transaction
+    // has DELETEd (undo_log tombstones). These helpers extract the relevant
+    // state from the active transaction's context. All return empty
+    // containers when no transaction is active → zero overhead on the
+    // autocommit fast path.
+
+    /// Returns the (row_id, row) pairs buffered in the active transaction's
+    /// write_set that belong to `table`. Empty when not in a transaction.
+    pub(crate) fn txn_write_set_rows(&self, table: &str) -> Vec<(RowId, Row)> {
+        let txn_id = match self.current_txn_id() {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let ctx = match self.db.txn_coordinator.get_context(txn_id) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let ws = ctx.write_set.read();
+        ws.iter()
+            .filter(|(_, (tbl, _))| tbl == table)
+            .map(|(&rid, (_, row))| (rid, row.clone()))
+            .collect()
+    }
+
+    /// Returns the set of row_ids the active transaction has DELETEd from
+    /// `table` (recorded in the undo_log). Empty when not in a transaction.
+    pub(crate) fn txn_deleted_row_ids(&self, table: &str) -> std::collections::HashSet<RowId> {
+        let txn_id = match self.current_txn_id() {
+            Some(t) => t,
+            None => return std::collections::HashSet::new(),
+        };
+        let ctx = match self.db.txn_coordinator.get_context(txn_id) {
+            Ok(c) => c,
+            Err(_) => return std::collections::HashSet::new(),
+        };
+        let undo = ctx.undo_log.read();
+        undo.iter()
+            .filter_map(|delta| match delta {
+                crate::txn::coordinator::DeltaOperation::Delete(rid, tbl, _) if tbl == table => {
+                    Some(*rid)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Point-lookup a single row within the active transaction.
+    /// Returns:
+    /// - `Some(Some(row))` — row is in the write_set (uncommitted INSERT).
+    /// - `Some(None)` — row was DELETEd by this transaction (tombstone).
+    /// - `None` — no transactional info; caller should consult storage.
+    pub(crate) fn txn_lookup_row(&self, table: &str, row_id: RowId) -> Option<Option<Row>> {
+        let txn_id = self.current_txn_id()?;
+        let ctx = self.db.txn_coordinator.get_context(txn_id).ok()?;
+        // DELETE tombstone check first (a row could be deleted then re-inserted;
+        // write_set wins for re-inserts, so check it after).
+        let undo = ctx.undo_log.read();
+        let deleted = undo.iter().any(|d| match d {
+            crate::txn::coordinator::DeltaOperation::Delete(rid, tbl, _) => {
+                *rid == row_id && tbl == table
+            }
+            _ => false,
+        });
+        drop(undo);
+        let ws = ctx.write_set.read();
+        if let Some((tbl, row)) = ws.get(&row_id) {
+            if tbl == table {
+                return Some(Some(row.clone()));
+            }
+        }
+        if deleted {
+            return Some(None);
+        }
+        None
+    }
+
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
 
@@ -1930,7 +2009,7 @@ impl QueryExecutor {
 
         if is_count_star {
             // COUNT(*) with WHERE: filter then count. Without WHERE: count all.
-            let count;
+            let mut count;
             if let Some(ref wc) = stmt.where_clause {
                 // 🚀 Index-accelerated COUNT(*): if a column index exists on the
                 // WHERE filter column, use it to count matching rows in O(log N + K)
@@ -2003,6 +2082,15 @@ impl QueryExecutor {
                     Some(n) => n as i64,
                     None => store.count_live_rows() as i64,
                 };
+            }
+            // 🔑 Read-your-writes: adjust count for uncommitted transactional
+            // INSERTs. write_set INSERTs were never written to storage, so the
+            // atomic counter / count_live_rows doesn't include them — add them.
+            // (DELETEs already wrote a tombstone to storage during the txn, so
+            // count_live_rows already excludes them — no adjustment needed.)
+            if self.is_in_transaction() {
+                let ws = self.txn_write_set_rows(table_name);
+                count += ws.len() as i64;
             }
             let columns: Vec<String> = self
                 .build_select_columns(&stmt.columns, &schema)
@@ -3433,6 +3521,25 @@ impl QueryExecutor {
     /// Takes &SelectStmt — no cloning of the AST at all.
     /// This is the primary entry point from the statement cache.
     fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
+        // 🔑 Read-your-writes: when inside a transaction with buffered writes for
+        // this table, ensure the ColSegmentStore exists so downstream paths
+        // (full scan, aggregate) take the txn-merge route. Without this, a table
+        // whose only rows are uncommitted INSERTs has no store yet, and SELECT
+        // returns empty. get_or_create is a no-op if the store already exists.
+        if self.is_in_transaction() {
+            if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
+                if !self.db.has_col_segment_store(table_name) {
+                    let ws = self.txn_write_set_rows(table_name);
+                    if !ws.is_empty() {
+                        if let Ok(schema) = self.db.get_table_schema(table_name) {
+                            let _ = self
+                                .db
+                                .get_or_create_col_segment_store(table_name, schema.col_types());
+                        }
+                    }
+                }
+            }
+        }
         // 🚀 Pre-resolve scalar/IN subqueries in WHERE clause BEFORE any routing.
         // This converts `WHERE col > (SELECT ...)` / `WHERE col IN (SELECT ...)`
         // into literal forms early, so every downstream path (columnar scan,
@@ -6499,10 +6606,13 @@ impl QueryExecutor {
             Err(_) => return Ok(None),
         };
         let _ = store.flush_buffer(); // ensure buffered rows are visible
-        let row = match store.get(composite_key) {
-            Some(r) => r,
-            None => {
-                // Not found — return empty result.
+        // 🔑 Read-your-writes: check transaction write_set / undo_log first.
+        // write_set keys by raw row_id (low 32 bits of composite_key).
+        let row_id = composite_key as u32 as RowId;
+        let txn_row = self.txn_lookup_row(table_name, row_id);
+        let row: Vec<Value> = match txn_row {
+            // Transaction deleted this row → invisible.
+            Some(None) => {
                 let columns: Vec<String> = self
                     .build_select_columns(&stmt.columns, &schema)
                     .unwrap_or_default();
@@ -6511,6 +6621,22 @@ impl QueryExecutor {
                     rows: vec![],
                 }));
             }
+            // Transaction inserted this row → return buffered version.
+            Some(Some(r)) => r,
+            // No txn info → fall through to storage.
+            None => match store.get(composite_key) {
+                Some(r) => r,
+                None => {
+                    // Not found — return empty result.
+                    let columns: Vec<String> = self
+                        .build_select_columns(&stmt.columns, &schema)
+                        .unwrap_or_default();
+                    return Ok(Some(StreamingQueryResult::SelectReady {
+                        columns,
+                        rows: vec![],
+                    }));
+                }
+            },
         };
         // Build output: SELECT * → full row; SELECT col1, col2 → project.
         let columns: Vec<String> = self
@@ -7171,6 +7297,17 @@ impl QueryExecutor {
         schema: &TableSchema,
         store: &crate::storage::col_segment::ColSegmentStore,
     ) -> Result<StreamingQueryResult> {
+        // 🔑 Read-your-writes: when inside a transaction with buffered writes
+        // for this table, route through a merge path that combines segment
+        // scan results with the write_set and filters undo_log deletes.
+        // The autocommit fast path (no txn) hits None → zero overhead.
+        if self.is_in_transaction() {
+            let ws_rows = self.txn_write_set_rows(table);
+            let deleted = self.txn_deleted_row_ids(table);
+            if !ws_rows.is_empty() || !deleted.is_empty() {
+                return self.execute_full_scan_txn_merge(stmt, table, schema, store, ws_rows, deleted);
+            }
+        }
         let col_types = schema.col_types().to_vec();
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
         let where_clause = stmt.where_clause.clone();
@@ -8141,6 +8278,90 @@ impl QueryExecutor {
             result_rows.truncate(lim);
         }
 
+        Ok(StreamingQueryResult::SelectReady {
+            columns,
+            rows: result_rows,
+        })
+    }
+
+    /// 🔑 Transaction-aware full scan: merges segment-scan results with the
+    /// active transaction's write_set (uncommitted INSERTs) and filters out
+    /// undo_log tombstones (DELETEs). Used by execute_full_scan_via_col_segment
+    /// when a transaction has buffered writes for this table.
+    ///
+    /// This is the simple/obvious path — materialize all rows, merge, filter,
+    /// apply WHERE/LIMIT/OFFSET/project. Correctness over speed: transactions
+    /// are not the hot path for full scans.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_full_scan_txn_merge(
+        &self,
+        stmt: &SelectStmt,
+        table: &str,
+        schema: &TableSchema,
+        store: &crate::storage::col_segment::ColSegmentStore,
+        ws_rows: Vec<(RowId, Row)>,
+        deleted: std::collections::HashSet<RowId>,
+    ) -> Result<StreamingQueryResult> {
+        use crate::sql::ast::SelectColumn;
+        let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
+        let is_star = stmt.columns.iter().any(|c| matches!(c, SelectColumn::Star));
+        let where_clause = stmt.where_clause.clone();
+        let limit = stmt.limit.unwrap_or(usize::MAX);
+        let offset = stmt.offset.unwrap_or(0);
+
+        // Collect (row_id, row) pairs from segment scan, filtering deleted.
+        let table_id = self
+            .db
+            .table_registry
+            .get_table_id(table)
+            .unwrap_or(0) as u64;
+        let mut all_rows: Vec<(RowId, Row)> = Vec::new();
+        for (composite_key, _ts, row) in store.scan() {
+            let rid = composite_key as u32 as RowId;
+            if deleted.contains(&rid) {
+                continue;
+            }
+            all_rows.push((rid, row));
+        }
+        // Merge write_set rows (newer versions override segment rows by row_id).
+        let ws_ids: std::collections::HashSet<RowId> =
+            ws_rows.iter().map(|(rid, _)| *rid).collect();
+        all_rows.retain(|(rid, _)| !ws_ids.contains(rid));
+        all_rows.extend(ws_rows);
+        all_rows.sort_by_key(|(rid, _)| *rid);
+
+        // Apply WHERE filter + projection.
+        let mut result_rows: Vec<Vec<Value>> = Vec::new();
+        let mut skipped = 0usize;
+        for (_, row) in all_rows {
+            // WHERE filter.
+            if let Some(ref wc) = where_clause {
+                let v = match Self::eval_expr_on_row(wc, &row, schema) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if !Self::is_truthy(&v) {
+                    continue;
+                }
+            }
+            // OFFSET.
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            // LIMIT.
+            if result_rows.len() >= limit {
+                break;
+            }
+            // Project.
+            let projected = if is_star {
+                row.clone()
+            } else {
+                Self::project_row_direct(&row, &stmt.columns, &columns, schema)
+            };
+            result_rows.push(projected);
+        }
+        let _ = table_id; // (table_id reserved for future composite_key reconstruction)
         Ok(StreamingQueryResult::SelectReady {
             columns,
             rows: result_rows,

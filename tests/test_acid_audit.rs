@@ -242,3 +242,121 @@ fn empty_transaction_rollback_is_noop() {
     db.rollback_transaction(tx).expect("rollback");
     assert_eq!(count(&db, "t"), 1);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9. Read-your-writes: SELECT inside a transaction must see uncommitted writes
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn ryw_insert_visible_in_full_scan() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.execute("INSERT INTO t VALUES (1, 10)").expect("seed");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("INSERT INTO t VALUES (2, 20)").expect("insert in txn");
+    // SELECT * must see 2 rows (1 committed + 1 uncommitted)
+    assert_eq!(count(&db, "t"), 2, "full scan must see uncommitted insert");
+    db.rollback_transaction(tx).expect("rollback");
+}
+
+#[test]
+fn ryw_insert_visible_in_pk_point_query() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("INSERT INTO t VALUES (42, 99)").expect("insert in txn");
+    // PK point query must find the uncommitted row
+    let rs = db.execute("SELECT v FROM t WHERE id = 42").expect("select").materialize().expect("mat");
+    use motedb::sql::QueryResult;
+    if let QueryResult::Select { rows, .. } = rs {
+        assert_eq!(rows.len(), 1, "pk point query must see uncommitted insert");
+        match &rows[0][0] {
+            motedb::types::Value::Integer(n) => assert_eq!(*n, 99),
+            other => panic!("expected Integer 99, got {:?}", other),
+        }
+    } else {
+        panic!("expected Select result");
+    }
+    db.rollback_transaction(tx).expect("rollback");
+}
+
+#[test]
+fn ryw_count_reflects_uncommitted_writes() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY)");
+    db.execute("INSERT INTO t VALUES (1)").expect("seed");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("INSERT INTO t VALUES (2)").expect("insert in txn");
+    db.execute("INSERT INTO t VALUES (3)").expect("insert in txn");
+    assert_eq!(count(&db, "t"), 3, "COUNT(*) must reflect uncommitted inserts");
+    db.rollback_transaction(tx).expect("rollback");
+    assert_eq!(count(&db, "t"), 1, "after rollback only seed remains");
+}
+
+#[test]
+fn ryw_delete_invisible_in_scan() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.execute("INSERT INTO t VALUES (1, 10)").expect("seed1");
+    db.execute("INSERT INTO t VALUES (2, 20)").expect("seed2");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("DELETE FROM t WHERE id = 1").expect("delete in txn");
+    // SELECT * must see only 1 row (the undeleted one)
+    assert_eq!(count(&db, "t"), 1, "scan must not see deleted row");
+    db.rollback_transaction(tx).expect("rollback");
+    assert_eq!(count(&db, "t"), 2, "after rollback both rows restored");
+}
+
+#[test]
+fn ryw_delete_invisible_in_pk_point_query() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.execute("INSERT INTO t VALUES (1, 10)").expect("seed");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("DELETE FROM t WHERE id = 1").expect("delete in txn");
+    // PK point query must NOT find the deleted row
+    let rs = db.execute("SELECT v FROM t WHERE id = 1").expect("select").materialize().expect("mat");
+    use motedb::sql::QueryResult;
+    if let QueryResult::Select { rows, .. } = rs {
+        assert_eq!(rows.len(), 0, "pk point query must not see deleted row");
+    }
+    db.rollback_transaction(tx).expect("rollback");
+}
+
+#[test]
+fn ryw_update_visible_in_scan() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.execute("INSERT INTO t VALUES (1, 10)").expect("seed");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("UPDATE t SET v = 999 WHERE id = 1").expect("update in txn");
+    // SELECT must see the updated value
+    let rs = db.execute("SELECT v FROM t WHERE id = 1").expect("select").materialize().expect("mat");
+    use motedb::sql::QueryResult;
+    if let QueryResult::Select { rows, .. } = rs {
+        assert_eq!(rows.len(), 1);
+        match &rows[0][0] {
+            motedb::types::Value::Integer(n) => assert_eq!(*n, 999, "must see updated value"),
+            other => panic!("expected Integer 999, got {:?}", other),
+        }
+    }
+    db.rollback_transaction(tx).expect("rollback");
+}
+
+#[test]
+fn ryw_mixed_insert_delete_update() {
+    let (db, _dir) = setup("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    db.execute("INSERT INTO t VALUES (1, 10)").expect("seed1");
+    db.execute("INSERT INTO t VALUES (2, 20)").expect("seed2");
+    let tx = db.begin_transaction().expect("begin");
+    db.execute("INSERT INTO t VALUES (3, 30)").expect("insert in txn");
+    db.execute("DELETE FROM t WHERE id = 1").expect("delete in txn");
+    db.execute("UPDATE t SET v = 222 WHERE id = 2").expect("update in txn");
+    // After: id=1 deleted, id=2 v=222, id=3 v=30 → 2 rows
+    assert_eq!(count(&db, "t"), 2, "must reflect all uncommitted changes");
+    // Check id=2 has updated value
+    let rs = db.execute("SELECT v FROM t WHERE id = 2").expect("select").materialize().expect("mat");
+    use motedb::sql::QueryResult;
+    if let QueryResult::Select { rows, .. } = rs {
+        match &rows[0][0] {
+            motedb::types::Value::Integer(n) => assert_eq!(*n, 222),
+            other => panic!("expected 222, got {:?}", other),
+        }
+    }
+    db.rollback_transaction(tx).expect("rollback");
+    assert_eq!(count(&db, "t"), 2, "after rollback original 2 rows restored");
+}

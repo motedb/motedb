@@ -1105,11 +1105,18 @@ impl Database {
         // Non-PK WHERE on ColSegmentStore tables still falls through to the
         // full parse path (handled in the !is_pk branch below).
         let has_col_seg = self.inner.has_col_segment_store(table_name);
-        if !has_col_seg {
+        // 🔑 When inside a transaction, also treat the table as "having a
+        // col segment store" if there are buffered writes for it — so the
+        // PK fast path below checks the write_set even when no committed
+        // data exists yet (txn-only INSERTs).
+        let has_txn_writes = self.query_executor.is_in_transaction()
+            && !self.query_executor.txn_write_set_rows(table_name).is_empty();
+        if !has_col_seg && !has_txn_writes {
             // Legacy single-SSTable tables: finalize write buffer so the
             // columnar paths below see all data.
             self.inner.finalize_columnar_buffer(table_name);
         }
+        let has_col_seg = has_col_seg || has_txn_writes;
 
         // Check for "WHERE" keyword (word boundary)
         let where_pos = match Self::find_keyword_ci(after_table, "where") {
@@ -1417,6 +1424,36 @@ impl Database {
     /// Mirrors the logic in `try_col_segment_pk_point_query` (executor.rs) but
     /// operates on the pre-parsed `col_name`/`value` from `try_fast_select`,
     /// so there is zero parsing overhead.
+    /// 🔑 Read-your-writes point lookup for the no-parse API fast path.
+    /// Mirrors QueryExecutor::txn_lookup_row but accessible from Database
+    /// (which holds query_executor + inner directly). Returns:
+    /// - Some(Some(row)) — row in write_set (uncommitted INSERT)
+    /// - Some(None) — row was DELETEd by this transaction
+    /// - None — no transactional info
+    fn txn_lookup_row_api(&self, table: &str, row_id: u64) -> Option<Option<Vec<Value>>> {
+        let txn_id = self.query_executor.current_txn_id()?;
+        let ctx = self.inner.txn_coordinator.get_context(txn_id).ok()?;
+        // DELETE tombstone check.
+        let undo = ctx.undo_log.read();
+        let deleted = undo.iter().any(|d| match d {
+            crate::txn::coordinator::DeltaOperation::Delete(rid, tbl, _) => {
+                *rid == row_id && tbl == table
+            }
+            _ => false,
+        });
+        drop(undo);
+        let ws = ctx.write_set.read();
+        if let Some((tbl, row)) = ws.get(&row_id) {
+            if tbl == table {
+                return Some(Some(row.clone()));
+            }
+        }
+        if deleted {
+            return Some(None);
+        }
+        None
+    }
+
     fn fast_col_segment_pk_select(
         &self,
         table_name: &str,
@@ -1475,14 +1512,30 @@ impl Database {
             }
         };
 
-        // Direct store lookup — fence-index binary search, no parser.
-        // Use the read-only accessor (no String alloc, no entry() creation)
-        // — the store always exists for a queried table.
+        // 🔑 Read-your-writes: check transaction write_set / undo_log first.
+        // write_set keys by raw row_id (low 32 bits of composite_key).
+        let row_id = composite_key as u32 as u64;
+        let txn_row = self.txn_lookup_row_api(table_name, row_id);
+        // If the row is in the transaction (insert or tombstone), we can answer
+        // without a store lookup — even if no store exists yet (txn-only data).
+        if let Some(opt_row) = &txn_row {
+            let row: Vec<Value> = match opt_row {
+                Some(r) => r.clone(),     // transaction inserted this row
+                None => {                  // transaction deleted this row → empty
+                    return Ok(Some(StreamingQueryResult::SelectReady {
+                        columns: column_names,
+                        rows: vec![],
+                    }));
+                }
+            };
+            return self.finish_fast_pk_select(table_name, &schema, row, select_part, is_star, column_names);
+        }
+        // No transactional info — consult storage.
         let store = match self.inner.get_col_segment_store(table_name) {
             Some(s) => s,
             None => return Ok(None), // no store yet → full parse path
         };
-        let row = match store.get(composite_key) {
+        let row: Vec<Value> = match store.get(composite_key) {
             Some(r) => r,
             None => {
                 return Ok(Some(StreamingQueryResult::SelectReady {
@@ -1491,7 +1544,21 @@ impl Database {
                 }));
             }
         };
+        self.finish_fast_pk_select(table_name, &schema, row, select_part, is_star, column_names)
+    }
 
+    /// Shared projection tail for fast_col_segment_pk_select — used by both
+    /// the transaction-write_set path and the storage path.
+    fn finish_fast_pk_select(
+        &self,
+        table_name: &str,
+        schema: &crate::types::TableSchema,
+        row: Vec<Value>,
+        select_part: &str,
+        is_star: bool,
+        column_names: Vec<String>,
+    ) -> Result<Option<StreamingQueryResult>> {
+        let _ = table_name;
         // Project columns. SELECT * → full row (no clone); SELECT col → project.
         let result_row: Vec<Value> = if is_star {
             row
