@@ -635,45 +635,35 @@ fn union_combines_disjoint_sets() {
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
-fn stddev_on_empty_set_currently_broken() {
+fn stddev_on_empty_set() {
     let (_dir, db) = edge_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
 
-    // Correct SQL behavior: STDDEV/VARIANCE over an empty set must yield a
-    // single row containing NULL (matching SUM/AVG, which return [[Null]]).
-    //
-    // KNOWN BUG: STDDEV/VARIANCE are not registered as aggregates, so over an
-    // empty table they return zero rows. Contrast with SUM below which, as a
-    // proper aggregate, returns exactly one NULL row.
+    // STDDEV/VARIANCE over an empty set must yield a single row containing
+    // NULL (matching SUM/AVG, which return [[Null]]). Now that STDDEV/
+    // VARIANCE are registered as aggregates, this works correctly.
     let sd_rows = rows(&db, "SELECT STDDEV(v) FROM t");
-    assert_eq!(
-        sd_rows.len(),
-        0,
-        "KNOWN BUG: STDDEV on empty set should yield 1 NULL row, got {} rows",
-        sd_rows.len()
-    );
+    assert_eq!(sd_rows.len(), 1, "STDDEV on empty set yields 1 NULL row");
+    assert_eq!(sd_rows[0][0], Value::Null);
 
     let var_rows = rows(&db, "SELECT VARIANCE(v) FROM t");
-    assert_eq!(var_rows.len(), 0);
+    assert_eq!(var_rows.len(), 1);
+    assert_eq!(var_rows[0][0], Value::Null);
 
     // Sanity check: SUM is a proper aggregate and does return one NULL row.
     assert_eq!(val(&db, "SELECT SUM(v) FROM t"), Value::Null);
 }
 
 #[test]
-fn stddev_on_single_value_currently_broken() {
+fn stddev_on_single_value() {
     let (_dir, db) = edge_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
-    // Correct SQL behavior: sample stddev with n<2 is undefined → NULL,
-    // returned as a single aggregate row.
-    //
-    // KNOWN BUG: the executor evaluates STDDEV per-row, so this returns one
-    // row of NULL. The single-row NULL value is correct, but the planner
-    // should collapse any aggregate-without-GROUP-BY to exactly one row.
+    // Sample stddev with n<2 is undefined → NULL, returned as a single
+    // aggregate row (count < 2 guard in compute_aggregate_positional).
     let rs = rows(&db, "SELECT STDDEV(v) FROM t");
     assert_eq!(
         rs.len(),
@@ -688,7 +678,7 @@ fn stddev_on_single_value_currently_broken() {
 }
 
 #[test]
-fn stddev_over_three_values_currently_broken() {
+fn stddev_over_three_values() {
     let (_dir, db) = edge_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
@@ -698,57 +688,42 @@ fn stddev_over_three_values_currently_broken() {
     db.execute("INSERT INTO t VALUES (2, 4)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 6)").unwrap();
 
-    // Correct expectations (when fixed):
-    //   assert!((float_val(&db, "SELECT STDDEV(v) FROM t") - 2.0).abs() < 1e-9);
-    //   assert!((float_val(&db, "SELECT VARIANCE(v) FROM t") - 4.0).abs() < 1e-9);
-    //
-    // KNOWN BUG: STDDEV/VARIANCE are not treated as aggregates by the
-    // projection planner, so the query returns one NULL row per input row
-    // instead of a single computed value. Pin this so the fix is detected.
+    // STDDEV/VARIANCE now collapse to a single aggregate row with the correct
+    // sample-statistic values (n-1 denominator).
     let rs = rows(&db, "SELECT STDDEV(v) FROM t");
-    assert_eq!(
-        rs.len(),
-        3,
-        "KNOWN BUG: STDDEV should collapse to 1 aggregate row, got {}",
-        rs.len()
-    );
-    for r in &rs {
-        assert_eq!(r[0], Value::Null);
+    assert_eq!(rs.len(), 1, "STDDEV collapses to 1 aggregate row");
+    match &rs[0][0] {
+        Value::Float(f) => assert!((f - 2.0).abs() < 1e-9, "STDDEV(2,4,6) = 2.0, got {}", f),
+        Value::Null => panic!("STDDEV returned NULL"),
+        other => panic!("expected Float, got {:?}", other),
     }
 
     let rs = rows(&db, "SELECT VARIANCE(v) FROM t");
-    assert_eq!(rs.len(), 3);
-    for r in &rs {
-        assert_eq!(r[0], Value::Null);
+    assert_eq!(rs.len(), 1);
+    match &rs[0][0] {
+        Value::Float(f) => assert!((f - 4.0).abs() < 1e-9, "VARIANCE(2,4,6) = 4.0, got {}", f),
+        Value::Null => panic!("VARIANCE returned NULL"),
+        other => panic!("expected Float, got {:?}", other),
     }
 }
 
 #[test]
-fn stddev_with_group_by_currently_broken() {
+fn stddev_with_group_by() {
     let (_dir, db) = edge_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT, cat TEXT)")
         .unwrap();
-    // Group A: 10, 20, 30 → STDDEV should be 10.0 (sample).
+    // Group A: 10, 20, 30 → sample STDDEV = 10.0.
     db.execute("INSERT INTO t VALUES (1, 10, 'A')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20, 'A')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 30, 'A')").unwrap();
 
-    // Correct expectation (when fixed):
-    //   let rs = rows(&db, "SELECT cat, STDDEV(v) FROM t GROUP BY cat");
-    //   assert_eq!(rs.len(), 1);
-    //   assert!((float_of(rs[0][1]) - 10.0).abs() < 1e-9);
-    //
-    // KNOWN BUG: even with GROUP BY, STDDEV is evaluated per source row and
-    // returns NULL (a per-row group of size 1 has undefined sample stddev).
+    // GROUP BY cat yields 1 group with the correct STDDEV.
     let rs = rows(&db, "SELECT cat, STDDEV(v) FROM t GROUP BY cat");
-    assert_eq!(
-        rs.len(),
-        3,
-        "KNOWN BUG: GROUP BY cat should yield 1 group, got {}",
-        rs.len()
-    );
-    for r in &rs {
-        assert_eq!(r[1], Value::Null);
+    assert_eq!(rs.len(), 1, "GROUP BY cat yields 1 group");
+    match &rs[0][1] {
+        Value::Float(f) => assert!((f - 10.0).abs() < 1e-9, "STDDEV(10,20,30) = 10.0, got {}", f),
+        Value::Null => panic!("group STDDEV returned NULL"),
+        other => panic!("expected Float, got {:?}", other),
     }
 }
 

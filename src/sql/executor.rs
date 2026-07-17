@@ -2123,11 +2123,15 @@ impl QueryExecutor {
                     return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
                 }
                 let scanned = store.scan_projected_filtered(Some(dc), &out_pos, &|_| true);
-                let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                // 🔑 Dedup on the FULL row (all selected columns), not just the
+                // first. The old code used `row.first()` as the key, which made
+                // `DISTINCT a, b` dedup on `a` alone — silently dropping rows
+                // like (1,2) when (1,1) was already seen.
+                let mut seen: std::collections::HashSet<Vec<Value>> =
+                    std::collections::HashSet::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for (_, row) in scanned {
-                    let key = row.first().cloned().unwrap_or(Value::Null);
-                    if seen.insert(key) {
+                    if seen.insert(row.clone()) {
                         rows.push(row);
                     }
                 }
@@ -3129,6 +3133,11 @@ impl QueryExecutor {
             if !has_count_star || !all_fixed {
                 return Ok(None);
             }
+            // 🔑 STDDEV/VARIANCE need sum-of-squared-deviations — this fast path
+            // only tracks sum/min/max. Fall back to compute_aggregate_positional.
+            if gb_aggs.iter().any(|a| matches!(a.func.as_str(), "STDDEV" | "VARIANCE")) {
+                return Ok(None);
+            }
             // 🔑 Use TextSegment::for_each_str which iterates raw &str without
             // per-row offset/slice overhead.
             // 🚀 Index-based accumulator: HashMap<&str, usize> → counts Vec<i64>.
@@ -3744,12 +3753,13 @@ impl QueryExecutor {
                                 }
                                 let scanned =
                                     store.scan_projected_filtered(Some(dc), &out_pos, &|_| true);
-                                let mut seen: std::collections::HashSet<Value> =
+                                // 🔑 Dedup on full row (not just first column) —
+                                // same fix as the non-aggregate DISTINCT path.
+                                let mut seen: std::collections::HashSet<Vec<Value>> =
                                     std::collections::HashSet::new();
                                 let mut rows: Vec<Vec<Value>> = Vec::new();
                                 for (_, row) in scanned {
-                                    let key = row.first().cloned().unwrap_or(Value::Null);
-                                    if seen.insert(key) {
+                                    if seen.insert(row.clone()) {
                                         rows.push(row);
                                     }
                                 }
@@ -5268,6 +5278,11 @@ impl QueryExecutor {
                                     has_count_star = true; // COUNT(col) → treat as count
                                 }
                             }
+                            // 🔑 STDDEV/VARIANCE need sum-of-squared-deviations.
+                            // This fast path's GroupAcc only tracks count/sum, so
+                            // it would emit NULL for them. Fall back to the
+                            // materialized path (compute_aggregate_positional).
+                            "STDDEV" | "VARIANCE" => return Ok(None),
                             _ => {
                                 let col = match args.first() {
                                     Some(Expr::Column(c)) => c.as_str(),
@@ -14597,7 +14612,12 @@ impl QueryExecutor {
             } => {
                 matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+                    // 🔑 STDDEV/VARIANCE MUST be listed here — without them,
+                    // is_aggregate_expr returns false, the query isn't routed
+                    // to the aggregate path, and VARIANCE/STDDEV evaluate
+                    // per-row (returning NULL for every row instead of one
+                    // aggregated value).
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
                 )
             }
             _ => false,
@@ -14619,7 +14639,7 @@ impl QueryExecutor {
             } => {
                 let func = name.to_uppercase();
                 match func.as_str() {
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE" => {
                         let col_pos = if args.len() == 1 {
                             match &args[0] {
                                 Expr::Column(col_name) => {
@@ -14705,6 +14725,16 @@ impl QueryExecutor {
         // DISTINCT aggregates require a HashSet per accumulator — fall back to
         // try_apply_group_by_positional which handles that correctly.
         if agg_specs.iter().any(|(_, a)| a.distinct) {
+            return Ok(None);
+        }
+        // 🔑 STDDEV/VARIANCE need a two-pass algorithm (compute mean, then sum
+        // of squared deviations). The streaming Acc accumulator only tracks
+        // count/sum/min/max — it can't compute variance. Fall back to the
+        // positional path (compute_aggregate_positional) which handles them.
+        if agg_specs
+            .iter()
+            .any(|(_, a)| matches!(a.func.as_str(), "STDDEV" | "VARIANCE"))
+        {
             return Ok(None);
         }
 
@@ -15079,11 +15109,19 @@ impl QueryExecutor {
         let row_iter = self.db.scan_table_rows_streaming(table_name)?;
 
         // Check if we can use single-pass aggregation (no HAVING, or simple HAVING)
+        // 🔑 STDDEV/VARIANCE are excluded: the single-pass AggAccumulator only
+        // tracks count/sum/min/max (not sum-of-squares), so it returns NULL for
+        // them. Fall through to the two-pass materialized path which calls
+        // compute_aggregate_positional (handles STDDEV/VARIANCE correctly).
         let can_single_pass = stmt.having.is_none()
             && group_col_positions.len() <= 2
             && !select_col_info
                 .iter()
-                .any(|(_, _, agg)| agg.as_ref().is_some_and(|a| a.distinct));
+                .any(|(_, _, agg)| agg.as_ref().is_some_and(|a| a.distinct))
+            && !select_col_info.iter().any(|(_, _, agg)| {
+                agg.as_ref()
+                    .is_some_and(|a| matches!(a.func.as_str(), "STDDEV" | "VARIANCE"))
+            });
 
         if can_single_pass {
             return self.single_pass_group_by(
