@@ -12398,6 +12398,11 @@ impl QueryExecutor {
         } else {
             let mut col_indices: Vec<Option<usize>> = Vec::new();
             let mut out_names: Vec<String> = Vec::new();
+            // Track which combined_cols indices have already been claimed by a
+            // previous SELECT column. This prevents two SELECT columns from
+            // matching the same combined_col when bare names are ambiguous
+            // (e.g. SELECT a.name, b.name where both have suffix "name").
+            let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
             for sc in &stmt.columns {
                 match sc {
                     SelectColumn::Star => {
@@ -12408,9 +12413,23 @@ impl QueryExecutor {
                     }
                     SelectColumn::Column(name) => {
                         let bare = name.rsplit('.').next().unwrap_or(name);
-                        if let Some(pos) = combined_cols.iter().position(|c| c == bare || c == name)
-                        {
-                            col_indices.push(Some(pos));
+                        // 🔑 combined_cols are table-qualified ("a.name", "b.val").
+                        // 1) Try exact match (qualified or bare exact).
+                        // 2) Fall back to bare-suffix match, skipping already-claimed.
+                        let pos = combined_cols.iter().enumerate()
+                            .find(|(i, c)| !claimed.contains(i) && (*c == bare || *c == name))
+                            .map(|(i, _)| i)
+                            .or_else(|| {
+                                combined_cols.iter().enumerate()
+                                    .find(|(i, c)| {
+                                        !claimed.contains(i)
+                                            && c.rsplit('.').next().unwrap_or(c) == bare
+                                    })
+                                    .map(|(i, _)| i)
+                            });
+                        if let Some(p) = pos {
+                            claimed.insert(p);
+                            col_indices.push(Some(p));
                             out_names.push(bare.to_string());
                         } else {
                             col_indices.push(None);
@@ -12419,9 +12438,20 @@ impl QueryExecutor {
                     }
                     SelectColumn::ColumnWithAlias(name, alias) => {
                         let bare = name.rsplit('.').next().unwrap_or(name);
-                        if let Some(pos) = combined_cols.iter().position(|c| c == bare || c == name)
-                        {
-                            col_indices.push(Some(pos));
+                        let pos = combined_cols.iter().enumerate()
+                            .find(|(i, c)| !claimed.contains(i) && (*c == bare || *c == name))
+                            .map(|(i, _)| i)
+                            .or_else(|| {
+                                combined_cols.iter().enumerate()
+                                    .find(|(i, c)| {
+                                        !claimed.contains(i)
+                                            && c.rsplit('.').next().unwrap_or(c) == bare
+                                    })
+                                    .map(|(i, _)| i)
+                            });
+                        if let Some(p) = pos {
+                            claimed.insert(p);
+                            col_indices.push(Some(p));
                             out_names.push(alias.clone());
                         } else {
                             col_indices.push(None);
