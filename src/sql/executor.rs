@@ -3065,6 +3065,12 @@ impl QueryExecutor {
         if stmt.where_clause.is_some() {
             return Ok(None);
         }
+        // 🔑 ORDER BY / LIMIT on the grouped result: this path emits groups in
+        // scan order without sorting or truncating. Fall back to the path that
+        // applies ORDER BY (including on aggregates) and LIMIT correctly.
+        if stmt.order_by.is_some() || stmt.limit.is_some() {
+            return Ok(None);
+        }
 
         // Must flush buffer so segments see all data
         let _ = store.flush_buffer();
