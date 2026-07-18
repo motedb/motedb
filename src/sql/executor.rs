@@ -3058,6 +3058,13 @@ impl QueryExecutor {
         if stmt.having.is_some() {
             return Ok(None);
         }
+        // 🔑 WHERE clause: this fast path scans all rows without applying a
+        // WHERE filter (it only handles the bare GROUP BY + aggregate case).
+        // A WHERE that filters out all rows would incorrectly produce groups
+        // with count > 0. Fall back to single_pass_group_by which applies WHERE.
+        if stmt.where_clause.is_some() {
+            return Ok(None);
+        }
 
         // Must flush buffer so segments see all data
         let _ = store.flush_buffer();
@@ -5242,7 +5249,9 @@ impl QueryExecutor {
         // fall back to the materialized GROUP BY path which evaluates them.
         // ORDER BY over the grouped result is also not applied here (the
         // pushdown emits groups in scan/hash order, not sorted).
-        if stmt.having.is_some() || stmt.order_by.is_some() {
+        // 🔑 WHERE is also not applied by this path (it scans all rows) —
+        // fall back so WHERE filters are respected.
+        if stmt.having.is_some() || stmt.order_by.is_some() || stmt.where_clause.is_some() {
             return Ok(None);
         }
 
