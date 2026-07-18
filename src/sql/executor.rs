@@ -5745,6 +5745,17 @@ impl QueryExecutor {
         if stmt.group_by.is_some() {
             return Ok(None);
         }
+        // 🔑 DISTINCT aggregates (COUNT(DISTINCT col)) need dedup logic this
+        // fast path doesn't implement — it would emit an empty row (COUNT is
+        // a no-op here unless it's COUNT(*) via Star). Fall back.
+        let has_distinct_agg = stmt.columns.iter().any(|c| {
+            matches!(c, SelectColumn::Expr(
+                Expr::FunctionCall { distinct: true, .. }, _
+            ))
+        });
+        if has_distinct_agg {
+            return Ok(None);
+        }
         let table = match &stmt.from {
             Some(TableRef::Table { name, .. }) => name.as_str(),
             _ => return Ok(None),
@@ -5985,6 +5996,18 @@ impl QueryExecutor {
         };
         let schema = self.db.get_table_schema(table)?;
 
+        // 🔑 DISTINCT aggregates (COUNT(DISTINCT col)) require dedup logic this
+        // fast path doesn't implement — it would emit an empty/wrong row.
+        // Fall back to compute_aggregate_positional which handles DISTINCT.
+        let has_distinct_agg = stmt.columns.iter().any(|c| {
+            matches!(c, SelectColumn::Expr(
+                Expr::FunctionCall { distinct: true, .. }, _
+            ))
+        });
+        if has_distinct_agg {
+            return Ok(None);
+        }
+
         // Check for column value index on the filtered column
         let index_name = format!("{}.{}", table, filter_col);
         let index_ref = match self.db.column_indexes.get(&index_name) {
@@ -6163,7 +6186,12 @@ impl QueryExecutor {
                     has_count_star = true;
                 }
                 SelectColumn::Expr(expr, _) => {
-                    if let Expr::FunctionCall { name, args, .. } = expr {
+                    if let Expr::FunctionCall { name, args, distinct, .. } = expr {
+                        // 🔑 DISTINCT aggregates need dedup — this fast path
+                        // counts all rows without dedup. Fall back.
+                        if *distinct {
+                            return Ok(None);
+                        }
                         // COUNT(*) or COUNT with any non-column arg
                         if name.eq_ignore_ascii_case("COUNT")
                             && !matches!(args.first(), Some(Expr::Column(_)))
@@ -11050,6 +11078,7 @@ impl QueryExecutor {
             .is_some_and(|w| !Self::expr_needs_materialized_path(w))
             && stmt.where_clause.is_some()
             && stmt.group_by.is_none()
+            && !self.has_aggregates(&stmt.columns)
         {
             if let TableRef::Table {
                 name: table_name, ..
@@ -11299,10 +11328,14 @@ impl QueryExecutor {
         // projects positionally. Eliminates O(R*C) HashMap allocations entirely.
         // Handles: SELECT cols FROM t WHERE col IN (list) / LIKE / BETWEEN / comparisons
         //          without GROUP BY / ORDER BY / DISTINCT.
+        // 🔑 Must NOT trigger for aggregate queries (COUNT/SUM/...): those need
+        // the aggregate path (try_apply_group_by_positional above), otherwise
+        // COUNT(DISTINCT col) WHERE ... evaluates per-row and returns NULLs.
         if stmt.where_clause.is_some()
             && stmt.group_by.is_none()
             && stmt.order_by.is_none()
             && !stmt.distinct
+            && !self.has_aggregates(&stmt.columns)
         {
             if let TableRef::Table {
                 name: table_name, ..
@@ -15621,12 +15654,25 @@ impl QueryExecutor {
             let order_specs: Vec<(usize, bool)> = order_by
                 .iter()
                 .filter_map(|ob| {
-                    if let Expr::Column(ref col_name) = ob.expr {
-                        let idx = column_names.iter().position(|c| c == col_name)?;
-                        Some((idx, ob.asc))
-                    } else {
-                        None
-                    }
+                    // 🔑 ORDER BY can reference a bare column (e.g. ORDER BY cat)
+                    // OR an aggregate expression (e.g. ORDER BY SUM(v) DESC).
+                    // For aggregates, match by the function-call column name that
+                    // was built for the result (e.g. "SUM(v)"). Without this,
+                    // ORDER BY SUM(v) was silently dropped → non-deterministic
+                    // group order (flaky test failures).
+                    let ob_name = match &ob.expr {
+                        Expr::Column(col_name) => col_name.clone(),
+                        Expr::FunctionCall { name, args, .. } => {
+                            let arg_str = args.iter().map(|a| match a {
+                                Expr::Column(c) => c.clone(),
+                                e => format!("{:?}", e),
+                            }).collect::<Vec<_>>().join(", ");
+                            format!("{}({})", name.to_uppercase(), arg_str)
+                        }
+                        _ => return None,
+                    };
+                    let idx = column_names.iter().position(|c| c == &ob_name)?;
+                    Some((idx, ob.asc))
                 })
                 .collect();
 
