@@ -10550,9 +10550,20 @@ impl QueryExecutor {
                 } else {
                     name
                 };
-                schema
-                    .get_column_position(col_name)
-                    .and_then(|pos| row.get(pos).cloned())
+                if let Some(pos) = schema.get_column_position(col_name) {
+                    return row
+                        .get(pos)
+                        .cloned()
+                        .ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()));
+                }
+                // 🔑 JOIN WHERE fallback: schema columns may be table-qualified
+                // (e.g. "b.status") but the WHERE references the bare name
+                // ("status"). Match by stripping the table prefix from each
+                // schema column name.
+                let pos = schema.columns.iter().position(|c| {
+                    c.name.rsplit('.').next().unwrap_or(&c.name) == col_name
+                });
+                pos.and_then(|p| row.get(p).cloned())
                     .ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))
             }
             Expr::Literal(val) => Ok(val.clone()),
