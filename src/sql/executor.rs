@@ -3178,9 +3178,12 @@ impl QueryExecutor {
             let mut key_index: HashMap<Box<str>, usize> = HashMap::with_capacity(16);
             let mut null_count: i64 = 0;
 
-            // 🔑 No dedup for GROUP BY: each row contributes to its group
-            // independently.
-            let need_dedup = false;
+            // 🔑 Dedup IS needed for GROUP BY when there are 2+ segments: a
+            // DELETE creates a tombstone in a newer segment that must suppress
+            // the live row in the older segment. Without dedup, the GROUP BY
+            // double-counts deleted rows (they still appear in the old segment).
+            // was hardcoded false — caused GROUP BY to count deleted rows.
+            let need_dedup = segs.len() > 1 || store.may_have_duplicate_keys();
             let mut seen: std::collections::HashSet<u64> = if need_dedup {
                 std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
             } else {
