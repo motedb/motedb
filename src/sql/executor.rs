@@ -16640,6 +16640,21 @@ impl QueryExecutor {
         Ok(QueryResult::Modification { affected_rows })
     }
     fn execute_delete(&self, stmt: DeleteStmt) -> Result<QueryResult> {
+        // 🔑 Resolve subqueries in WHERE clause before evaluation. Without this,
+        // DELETE ... WHERE id NOT IN (SELECT ...) silently matches no rows
+        // (the evaluator can't execute subqueries against an SqlRow).
+        let stmt = if let Some(ref wc) = stmt.where_clause {
+            if Self::expr_contains_subquery(wc) {
+                DeleteStmt {
+                    table: stmt.table.clone(),
+                    where_clause: Some(self.materialize_subqueries(wc)?),
+                }
+            } else {
+                stmt
+            }
+        } else {
+            stmt
+        };
         let schema = self.db.get_table_schema(&stmt.table)?;
 
         // 🚀 PK fast path: skip full table scan for WHERE pk = value
