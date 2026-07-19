@@ -81,6 +81,8 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "end" => TokenType::End,
     "union" => TokenType::Union,
     "all" => TokenType::All,
+    "add" => TokenType::Add,
+    "default" => TokenType::Default,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +148,8 @@ pub enum TokenType {
     End,           // END
     Union,         // UNION
     All,           // ALL
+    Add,           // ADD (ALTER TABLE ADD COLUMN)
+    Default,       // DEFAULT (column default value)
 
     // Data types
     Integer,

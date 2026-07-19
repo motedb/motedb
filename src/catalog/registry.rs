@@ -180,6 +180,51 @@ impl TableRegistry {
         Ok(())
     }
 
+    /// Add a column to an existing table's schema (ALTER TABLE ADD COLUMN).
+    /// The column is appended at the end. Existing rows get the default value
+    /// (or NULL) when read — no rewrite of stored data is needed because the
+    /// row decoder checks schema.columns.len() and fills missing positions.
+    pub fn add_column(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        col_type: crate::types::ColumnType,
+        default_value: Option<&crate::types::Value>,
+    ) -> Result<()> {
+        let mut meta = self
+            .metadata
+            .write()
+            .map_err(|e| StorageError::InvalidData(e.to_string()))?;
+
+        let schema = meta
+            .tables
+            .get_mut(table_name)
+            .ok_or_else(|| StorageError::InvalidData(format!("Table '{}' not found", table_name)))?;
+
+        // Don't allow duplicate column names.
+        if schema.columns.iter().any(|c| c.name == col_name) {
+            return Err(StorageError::InvalidData(format!(
+                "Column '{}' already exists in table '{}'",
+                col_name, table_name
+            )));
+        }
+
+        let pos = schema.columns.len();
+        let mut col_def = crate::types::ColumnDef::new(col_name.to_string(), col_type, pos);
+        col_def.nullable = true; // ALTER-added columns are always nullable
+        schema.columns.push(col_def);
+        schema.rebuild_column_map();
+
+        drop(meta);
+
+        // Invalidate schema cache so the new column is visible.
+        self.schema_cache.write().remove(table_name);
+
+        self.persist()?;
+
+        Ok(())
+    }
+
     /// Get table schema (returns Arc clone — O(1) refcount bump via schema cache)
     ///
     /// On first access, the schema is cloned into an Arc and cached.

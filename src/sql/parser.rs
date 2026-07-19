@@ -1970,33 +1970,85 @@ impl Parser {
     /// 🆕 Parse ALTER TABLE statement
     ///
     /// Syntax: ALTER TABLE table_name AUTO_INCREMENT = value
+    ///      |  ALTER TABLE table_name ADD [COLUMN] name type [DEFAULT value]
     fn parse_alter_table(&mut self) -> Result<AlterTableStmt> {
         self.expect(TokenType::Alter)?;
         self.expect(TokenType::Table)?;
 
         let table = self.parse_identifier()?;
 
-        // Currently only support AUTO_INCREMENT modification
-        self.expect(TokenType::AutoIncrement)?;
-        self.expect(TokenType::Eq)?;
-
-        let value = match &self.current().token_type {
-            TokenType::Number(n) => {
-                let f = *n;
-                if f < 0.0 || f > i64::MAX as f64 || f.fract() != 0.0 {
-                    return Err(self.error("AUTO_INCREMENT value must be a non-negative integer"));
+        // Branch on ADD vs AUTO_INCREMENT
+        if matches!(self.current().token_type, TokenType::Add) {
+            self.advance();
+            // Optional COLUMN keyword (parsed as identifier since it's not a
+            // registered keyword — avoids breaking USING COLUMN in CREATE INDEX).
+            if let TokenType::Identifier(name) = &self.current().token_type {
+                if name.eq_ignore_ascii_case("COLUMN") {
+                    self.advance();
                 }
-                let value = f as i64;
-                self.advance();
-                value
             }
-            _ => return Err(self.error("Expected integer value for AUTO_INCREMENT")),
-        };
+            let col_name = self.parse_identifier()?;
+            let data_type = self.parse_data_type()?;
+            // Optional DEFAULT value
+            let default_value = if matches!(self.current().token_type, TokenType::Default) {
+                self.advance();
+                // Parse a literal: number, string, true/false, null
+                let val = match &self.current().token_type {
+                    TokenType::Number(n) => {
+                        let f = *n;
+                        let v = if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+                            crate::types::Value::Integer(f as i64)
+                        } else {
+                            crate::types::Value::Float(f)
+                        };
+                        self.advance();
+                        v
+                    }
+                    TokenType::String(s) => {
+                        let v = crate::types::Value::Text(s.clone().into());
+                        self.advance();
+                        v
+                    }
+                    TokenType::True => { self.advance(); crate::types::Value::Bool(true) }
+                    TokenType::False => { self.advance(); crate::types::Value::Bool(false) }
+                    TokenType::Null => { self.advance(); crate::types::Value::Null }
+                    _ => return Err(self.error("Expected literal value for DEFAULT")),
+                };
+                Some(val)
+            } else {
+                None
+            };
+            Ok(AlterTableStmt {
+                table,
+                action: AlterTableAction::AddColumn {
+                    name: col_name,
+                    data_type,
+                    default_value,
+                },
+            })
+        } else {
+            // AUTO_INCREMENT = value
+            self.expect(TokenType::AutoIncrement)?;
+            self.expect(TokenType::Eq)?;
 
-        Ok(AlterTableStmt {
-            table,
-            action: AlterTableAction::SetAutoIncrement(value),
-        })
+            let value = match &self.current().token_type {
+                TokenType::Number(n) => {
+                    let f = *n;
+                    if f < 0.0 || f > i64::MAX as f64 || f.fract() != 0.0 {
+                        return Err(self.error("AUTO_INCREMENT value must be a non-negative integer"));
+                    }
+                    let value = f as i64;
+                    self.advance();
+                    value
+                }
+                _ => return Err(self.error("Expected integer value for AUTO_INCREMENT")),
+            };
+
+            Ok(AlterTableStmt {
+                table,
+                action: AlterTableAction::SetAutoIncrement(value),
+            })
+        }
     }
 }
 

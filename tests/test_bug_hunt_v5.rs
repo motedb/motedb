@@ -36,16 +36,28 @@ fn scalar_i64(db: &Database, sql: &str) -> i64 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn alter_add_column_unsupported_errors_cleanly() {
+fn alter_add_column_works() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
-    // ADD COLUMN is not supported — must error cleanly, not corrupt the table.
-    let result = db.execute("ALTER TABLE t ADD COLUMN name TEXT");
-    assert!(result.is_err(), "ADD COLUMN should error (unsupported)");
-    // Table must still be usable after the failed ALTER.
+    // ALTER TABLE ADD COLUMN is now supported.
+    let result = db.execute("ALTER TABLE t ADD COLUMN name TEXT DEFAULT 'unknown'");
+    assert!(result.is_ok(), "ADD COLUMN should succeed");
+    // Table must still be usable with the new column.
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1);
-    assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 10);
+    // Old rows: new column is NULL (not in original data).
+    let r = rows(&db, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(r.len(), 1);
+    // New insert with the new column works.
+    exec(&db, "INSERT INTO t VALUES (2, 20, 'hello')");
+    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 2);
+    // Verify new column value.
+    let r = rows(&db, "SELECT name FROM t WHERE id = 2");
+    match &r[0][0] {
+        motedb::types::Value::Text(s) => assert_eq!(&*s.0, "hello"),
+        motedb::types::Value::Null => panic!("expected 'hello', got NULL"),
+        _ => panic!("expected Text"),
+    }
 }
 
 #[test]

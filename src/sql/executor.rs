@@ -17621,6 +17621,44 @@ impl QueryExecutor {
                     message: format!("Table {} AUTO_INCREMENT set to {}", stmt.table, new_value),
                 })
             }
+            AlterTableAction::AddColumn { name, data_type, default_value } => {
+                // Convert DataType to ColumnType (same mapping as CREATE TABLE).
+                let col_type = match data_type {
+                    super::ast::DataType::Integer => ColumnType::Integer,
+                    super::ast::DataType::BigInt => ColumnType::Integer,
+                    super::ast::DataType::Float => ColumnType::Float,
+                    super::ast::DataType::Text => ColumnType::Text,
+                    super::ast::DataType::Boolean => ColumnType::Boolean,
+                    super::ast::DataType::Timestamp => ColumnType::Timestamp,
+                    super::ast::DataType::Vector(dim) => ColumnType::Tensor(dim.unwrap_or(128)),
+                    super::ast::DataType::Geometry => ColumnType::Spatial,
+                };
+                // Verify table exists.
+                let _schema = self.db.get_table_schema(&stmt.table)?;
+                // Mutate schema in registry.
+                self.db.table_registry.add_column(
+                    &stmt.table,
+                    &name,
+                    col_type,
+                    default_value.as_ref(),
+                )?;
+                // 🔑 Remove the old ColSegmentStore so the next INSERT/SELECT
+                // recreates it with the updated col_types. The segment files on
+                // disk are not affected — they store columnar data by column
+                // index, and the new column is appended at the end.
+                // Flush buffered data first so no rows are lost.
+                if let Some(store) = self.db.col_segment_stores.get(&stmt.table) {
+                    let _ = store.flush_buffer();
+                }
+                self.db.col_segment_stores.remove(&stmt.table);
+                // Also invalidate the columnar_sstables entry so stale column
+                // tags don't cause index-out-of-bounds.
+                self.db.columnar_sstables.remove(&stmt.table);
+
+                Ok(QueryResult::Definition {
+                    message: format!("Added column '{}' to table '{}'", name, stmt.table),
+                })
+            }
         }
     }
 
