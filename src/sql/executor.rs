@@ -14794,6 +14794,16 @@ impl QueryExecutor {
                     _ => Err(MoteDBError::UnknownFunction(name.clone())),
                 }
             }
+            // 🆕 Compound expressions that wrap an aggregate (e.g.
+            // `CASE WHEN COUNT(*) > 3 THEN 'many' ELSE 'few' END` or
+            // `SUM(v) + 1`). Evaluate the aggregate sub-expressions against
+            // the group's rows, then evaluate the outer expression with the
+            // aggregates replaced by their computed scalar values.
+            Expr::Case { .. } | Expr::BinaryOp { .. } | Expr::UnaryOp { .. }
+                if self.is_aggregate_expr(expr) =>
+            {
+                self.eval_aggregate_compound(expr, rows)
+            }
             _ => {
                 // Non-aggregate expression in GROUP BY context
                 Err(MoteDBError::Query(
@@ -14801,6 +14811,79 @@ impl QueryExecutor {
                         .to_string(),
                 ))
             }
+        }
+    }
+
+    /// Evaluate a compound expression (CASE / BinaryOp / UnaryOp) that
+    /// contains nested aggregate function calls.
+    ///
+    /// Strategy: walk the expression tree, replace each aggregate
+    /// `FunctionCall` with `Expr::Literal(computed_value)`, then evaluate
+    /// the resulting purely-scalar expression against an empty row (the
+    /// scalar expression no longer depends on any row).
+    fn eval_aggregate_compound(&self, expr: &Expr, rows: &[&SqlRow]) -> Result<Value> {
+        let resolved = self.resolve_aggregates_in_expr(expr, rows)?;
+        // resolved has aggregates replaced with Literals; evaluate it.
+        // Use an empty SqlRow since no per-row data is needed.
+        let empty_row = SqlRow::new();
+        self.evaluator.eval(&resolved, &empty_row)
+    }
+
+    /// Recursively replace aggregate FunctionCall nodes with Literal values
+    /// computed over `rows`. Non-aggregate parts of the tree are unchanged.
+    fn resolve_aggregates_in_expr(&self, expr: &Expr, rows: &[&SqlRow]) -> Result<Expr> {
+        match expr {
+            Expr::FunctionCall { name, .. }
+                if matches!(
+                    name.to_uppercase().as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                ) =>
+            {
+                let val = self.eval_aggregate(expr, rows)?;
+                Ok(Expr::Literal(val))
+            }
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+            } => {
+                let resolved_args: Result<Vec<Expr>> =
+                    args.iter().map(|a| self.resolve_aggregates_in_expr(a, rows)).collect();
+                Ok(Expr::FunctionCall {
+                    name: name.clone(),
+                    args: resolved_args?,
+                    distinct: *distinct,
+                })
+            }
+            Expr::Case { whens, else_expr } => {
+                let new_whens: Result<Vec<(Expr, Expr)>> = whens
+                    .iter()
+                    .map(|(cond, val)| {
+                        Ok((
+                            self.resolve_aggregates_in_expr(cond, rows)?,
+                            self.resolve_aggregates_in_expr(val, rows)?,
+                        ))
+                    })
+                    .collect();
+                let new_else = match else_expr {
+                    Some(e) => Some(Box::new(self.resolve_aggregates_in_expr(e, rows)?)),
+                    None => None,
+                };
+                Ok(Expr::Case {
+                    whens: new_whens?,
+                    else_expr: new_else,
+                })
+            }
+            Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+                left: Box::new(self.resolve_aggregates_in_expr(left, rows)?),
+                op: op.clone(),
+                right: Box::new(self.resolve_aggregates_in_expr(right, rows)?),
+            }),
+            Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(self.resolve_aggregates_in_expr(expr, rows)?),
+            }),
+            _ => Ok(expr.clone()),
         }
     }
 
@@ -14941,10 +15024,11 @@ impl QueryExecutor {
         match expr {
             Expr::FunctionCall {
                 name,
-                args: _,
+                args,
                 distinct: _,
             } => {
-                matches!(
+                // Top-level aggregate function?
+                let is_agg_top = matches!(
                     name.to_uppercase().as_str(),
                     // 🔑 STDDEV/VARIANCE MUST be listed here — without them,
                     // is_aggregate_expr returns false, the query isn't routed
@@ -14952,8 +15036,34 @@ impl QueryExecutor {
                     // per-row (returning NULL for every row instead of one
                     // aggregated value).
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
-                )
+                );
+                if is_agg_top {
+                    return true;
+                }
+                // 🆕 Non-aggregate function — still recurse into args in case
+                // an aggregate is nested (e.g., ABS(SUM(v))).
+                args.iter().any(|a| self.is_aggregate_expr(a))
             }
+            // 🆕 Recurse into compound expressions so that an aggregate
+            // hidden inside a CASE / arithmetic / comparison expression is
+            // still detected. Without this, `SELECT CASE WHEN COUNT(*) > 3
+            // THEN 'many' ELSE 'few' END FROM t` returns one NULL per row
+            // instead of a single aggregated value.
+            Expr::Case { whens, else_expr } => {
+                whens
+                    .iter()
+                    .any(|(cond, val)| {
+                        self.is_aggregate_expr(cond) || self.is_aggregate_expr(val)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .map(|e| self.is_aggregate_expr(e))
+                        .unwrap_or(false)
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.is_aggregate_expr(left) || self.is_aggregate_expr(right)
+            }
+            Expr::UnaryOp { expr, .. } => self.is_aggregate_expr(expr),
             _ => false,
         }
     }
