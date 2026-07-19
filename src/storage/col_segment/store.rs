@@ -1801,6 +1801,13 @@ impl ColSegmentStore {
         };
         let target_f = if let Value::Float(v) = target {
             Some(*v)
+        } else if let Value::Integer(v) = target {
+            // 🔑 Float column compared with integer literal (e.g.
+            // WHERE v >= 15 on a FLOAT column): coerce the integer
+            // to f64 so the float comparison path matches correctly.
+            // Without this, target_f is None and all float rows fail
+            // the filter → SUM returns NULL (wrong).
+            Some(*v as f64)
         } else {
             None
         };
