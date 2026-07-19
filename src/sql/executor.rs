@@ -2714,6 +2714,12 @@ impl QueryExecutor {
         // on the same column (or COUNT(*)) with at most a single-column WHERE,
         // use store.aggregate_filtered — folds SUM/AVG/MIN/MAX/COUNT in one scan
         // over raw column bytes, zero per-row Value allocation.
+        //
+        // 🚨 This path's AggregateResult only tracks int/float min/max/sum — it
+        // cannot represent TEXT or other non-numeric values. A TEXT column
+        // would silently return 0 (the default min_int). Skip the fast path
+        // when the aggregate column is non-numeric so the materialized path
+        // (compute_aggregate_positional) handles it correctly.
         {
             let agg_cols: Vec<Option<usize>> = aggs.iter().map(|a| a.col).collect();
             let single_agg_col = agg_cols.iter().filter_map(|&c| c).next();
@@ -2722,7 +2728,16 @@ impl QueryExecutor {
                 (Some(a), Some(b)) => a == b,
                 (Some(_), None) => false,
             });
-            if all_same_col && post_comparisons.is_empty() {
+            // 🆕 TEXT/Boolean/etc. columns can't use this numeric fast path.
+            let agg_col_is_numeric = single_agg_col
+                .map(|c| {
+                    matches!(
+                        schema.col_types().get(c),
+                        Some(ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp)
+                    )
+                })
+                .unwrap_or(true); // COUNT(*) has no agg col → numeric ok
+            if all_same_col && post_comparisons.is_empty() && agg_col_is_numeric {
                 if let Some(ac) = single_agg_col {
                     let (fcol, fop, ftarget) = match comparisons.first() {
                         Some((c, o, t)) => (Some(*c), o.clone(), t.clone()),
