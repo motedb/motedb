@@ -150,6 +150,9 @@ pub struct CreateTableStmt {
     pub timeseries_column: Option<String>,
     /// TTL retention policy
     pub ttl: Option<crate::types::TTLDuration>,
+    /// 🆕 `CREATE TABLE IF NOT EXISTS` — if true, silently no-op when the
+    /// table already exists instead of erroring.
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone)]

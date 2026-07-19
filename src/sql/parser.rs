@@ -565,6 +565,33 @@ impl Parser {
 
     fn parse_create_table(&mut self) -> Result<CreateTableStmt> {
         self.expect(TokenType::Table)?;
+
+        // 🆕 Optional IF NOT EXISTS (must come BEFORE the table name in SQL
+        // standard syntax: `CREATE TABLE IF NOT EXISTS name (...)`).
+        // Parse "IF NOT EXISTS" — IF and EXISTS are identifiers (not
+        // registered keywords), NOT is the Not keyword.
+        let mut if_not_exists = false;
+        if let TokenType::Identifier(id) = &self.current().token_type {
+            if id.eq_ignore_ascii_case("IF") {
+                self.advance();
+                // Expect NOT (which is a registered keyword)
+                if !self.match_token(TokenType::Not) {
+                    return Err(self.error("Expected NOT after IF"));
+                }
+                // Expect EXISTS (identifier)
+                if let TokenType::Identifier(id3) = &self.current().token_type {
+                    if id3.eq_ignore_ascii_case("EXISTS") {
+                        self.advance();
+                        if_not_exists = true;
+                    } else {
+                        return Err(self.error("Expected EXISTS after NOT"));
+                    }
+                } else {
+                    return Err(self.error("Expected EXISTS after NOT"));
+                }
+            }
+        }
+
         let table = self.parse_identifier()?;
 
         self.expect(TokenType::LParen)?;
@@ -594,6 +621,7 @@ impl Parser {
             table_type,
             timeseries_column,
             ttl,
+            if_not_exists,
         })
     }
 

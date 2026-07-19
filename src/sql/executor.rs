@@ -17402,6 +17402,11 @@ impl QueryExecutor {
 
     /// Execute CREATE TABLE statement
     fn execute_create_table(&self, stmt: CreateTableStmt) -> Result<QueryResult> {
+        // 🆕 IF NOT EXISTS: if the table already exists, silently no-op.
+        if stmt.if_not_exists && self.db.get_table_schema(&stmt.table).is_ok() {
+            return Ok(QueryResult::Modification { affected_rows: 0 });
+        }
+
         // Convert AST column defs to TableSchema
         let columns: Vec<crate::types::ColumnDef> = stmt
             .columns
