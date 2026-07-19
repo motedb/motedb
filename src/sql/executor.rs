@@ -18051,18 +18051,20 @@ impl QueryExecutor {
                     col_type,
                     default_value.as_ref(),
                 )?;
-                // 🔑 Remove the old ColSegmentStore so the next INSERT/SELECT
-                // recreates it with the updated col_types. The segment files on
-                // disk are not affected — they store columnar data by column
-                // index, and the new column is appended at the end.
-                // Flush buffered data first so no rows are lost.
+                // 🔑 Flush buffered data first so no rows are lost.
                 if let Some(store) = self.db.col_segment_stores.get(&stmt.table) {
                     let _ = store.flush_buffer();
                 }
-                self.db.col_segment_stores.remove(&stmt.table);
-                // Also invalidate the columnar_sstables entry so stale column
-                // tags don't cause index-out-of-bounds.
-                self.db.columnar_sstables.remove(&stmt.table);
+                // 🚨 DO NOT remove col_segment_stores — the existing store's
+                // on-disk segments hold the pre-ALTER rows, and removing it
+                // would cause all subsequent SELECTs to return 0 rows (data
+                // appears lost until database reopen). The store's col_types
+                // is now stale (N-1 columns vs schema's N), but that's OK:
+                // queries against the new column will get NULL via index-
+                // out-of-range fallback in row_format, which is correct
+                // behavior for "new column on pre-existing rows".
+                //
+                // DO NOT remove columnar_sstables either — same reason.
 
                 Ok(QueryResult::Definition {
                     message: format!("Added column '{}' to table '{}'", name, stmt.table),
