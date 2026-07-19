@@ -2200,6 +2200,11 @@ impl QueryExecutor {
         store: &crate::storage::col_segment::ColSegmentStore,
     ) -> Result<Option<StreamingQueryResult>> {
         use crate::sql::ast::{Expr, SelectColumn};
+        // 🆕 HAVING requires post-aggregation filtering that this pushdown path
+        // doesn't apply — fall back to the materialized path.
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
         let schema = self.db.get_table_schema(table_name).ok();
         let schema = match schema {
             Some(s) => s,
@@ -2571,6 +2576,11 @@ impl QueryExecutor {
         schema: &TableSchema,
     ) -> Result<Option<StreamingQueryResult>> {
         use crate::sql::ast::{Expr, SelectColumn};
+        // 🆕 HAVING requires post-aggregation filtering that this pushdown path
+        // doesn't apply — fall back to the materialized path.
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
         // COUNT(DISTINCT col) and other DISTINCT aggregates are not supported
         // here (this path counts without dedup). Fall back to the materialized
         // path which dedups via HashSet (compute_aggregate_positional).
@@ -5965,6 +5975,13 @@ impl QueryExecutor {
         if stmt.group_by.is_some() {
             return Ok(None);
         }
+        // 🆕 HAVING requires post-aggregation filtering that this pushdown path
+        // doesn't apply — fall back to the materialized path (which evaluates
+        // HAVING correctly). Without this guard, `SELECT SUM(v) FROM t HAVING
+        // SUM(v) > 100` returns the SUM even when the condition is false.
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
         // 🔑 DISTINCT aggregates (COUNT(DISTINCT col)) need dedup logic this
         // fast path doesn't implement — it would emit an empty row (COUNT is
         // a no-op here unless it's COUNT(*) via Star). Fall back.
@@ -6190,6 +6207,10 @@ impl QueryExecutor {
             Some(w) => w,
             None => return Ok(None),
         };
+        // 🆕 HAVING not supported by this pushdown path — fall back.
+        if stmt.having.is_some() {
+            return Ok(None);
+        };
         // Extract: col_name = literal_value
         let (filter_col, filter_value) = match where_clause {
             Expr::BinaryOp {
@@ -6365,6 +6386,10 @@ impl QueryExecutor {
         &self,
         stmt: &SelectStmt,
     ) -> Result<Option<StreamingQueryResult>> {
+        // 🆕 HAVING not supported by this pushdown path — fall back.
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
         let (filter_col, filter_value) = match &stmt.where_clause {
             Some(Expr::BinaryOp {
                 left,
@@ -15133,6 +15158,11 @@ impl QueryExecutor {
         schema: &TableSchema,
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
+        // 🆕 HAVING requires post-aggregation filtering that this streaming
+        // path doesn't apply — fall back to the materialized path.
+        if stmt.having.is_some() {
+            return Ok(None);
+        }
         // This path scans via raw bytes (LSM), which is empty for ColSegmentStore
         // tables (data lives in segment files). Bail so the caller falls through
         // to try_apply_group_by_positional, which scans columnar segments.
