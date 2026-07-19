@@ -241,12 +241,27 @@ impl Parser {
     fn parse_column_list(&mut self) -> Result<Vec<String>> {
         let mut columns = Vec::new();
         loop {
-            columns.push(self.parse_identifier()?);
+            columns.push(self.parse_qualified_column_name()?);
             if !self.match_token(TokenType::Comma) {
                 break;
             }
         }
         Ok(columns)
+    }
+
+    /// Parse a column reference that may be table-qualified: `name` or `tbl.name`.
+    /// Used by GROUP BY / ORDER BY column lists where bare identifiers
+    /// (`parse_identifier`) would stop at the dot.
+    fn parse_qualified_column_name(&mut self) -> Result<String> {
+        let first = self.parse_identifier()?;
+        // Optional `.col` suffix for table-qualified references.
+        if matches!(self.current().token_type, TokenType::Dot) {
+            self.advance(); // consume '.'
+            let second = self.parse_identifier()?;
+            Ok(format!("{}.{}", first, second))
+        } else {
+            Ok(first)
+        }
     }
 
     fn parse_select_columns(&mut self) -> Result<Vec<SelectColumn>> {
