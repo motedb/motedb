@@ -124,15 +124,12 @@ fn update_changes_sort_order() {
     exec(&db, "UPDATE t SET v = 999 WHERE id = 1");
     // Verify the updated value is correct.
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 999);
-    // ORDER BY may read stale segment data for unflushed UPDATEs (known
-    // architectural limitation — the Top-K path reads raw segment columns).
-    // After a checkpoint (which flushes), ORDER BY reflects the new value.
-    db.checkpoint().unwrap();
+    // ORDER BY must reflect the UPDATE immediately (no checkpoint needed).
     let after = rows(&db, "SELECT id FROM t ORDER BY v ASC LIMIT 3");
     let ids: Vec<i64> = after.iter().filter_map(|r| match &r[0] {
         Value::Integer(n) => Some(*n), _ => None
     }).collect();
-    assert_eq!(ids, vec![2, 3, 4], "after checkpoint, ORDER BY reflects UPDATE");
+    assert_eq!(ids, vec![2, 3, 4], "ORDER BY must reflect UPDATE without checkpoint");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

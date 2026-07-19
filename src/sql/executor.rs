@@ -7780,6 +7780,11 @@ impl QueryExecutor {
                                         schema.col_types().get(order_col),
                                         Some(crate::types::ColumnType::Float)
                                     );
+                                    // 🔑 Flush write buffer so UPDATEd values in
+                                    // the buffer are persisted to a segment and
+                                    // visible to the Top-K scan. Without this,
+                                    // ORDER BY reads stale pre-UPDATE values.
+                                    let _ = store.flush_buffer();
                                     let top_indices = store.top_k_row_indices_typed(
                                         order_col,
                                         lim,
