@@ -17019,6 +17019,18 @@ impl QueryExecutor {
                 if let Some(cd) = schema.get_column(col_name) {
                     let new_val = if let Expr::Literal(v) = expr {
                         v.clone()
+                    } else if Self::expr_contains_subquery(expr) {
+                        // 🆕 Resolve scalar subqueries in SET expression
+                        // (e.g., `UPDATE t SET v = (SELECT MAX(v) FROM t)`).
+                        // Without this, eval_expr_on_row returns NULL for
+                        // Subquery nodes (it doesn't execute them).
+                        let materialized = self.materialize_subqueries(expr)?;
+                        if let Expr::Literal(v) = materialized {
+                            v
+                        } else {
+                            Self::eval_expr_on_row(&materialized, &row, &schema)
+                                .unwrap_or(Value::Null)
+                        }
                     } else {
                         Self::eval_expr_on_row(expr, &row, &schema).unwrap_or(Value::Null)
                     };
