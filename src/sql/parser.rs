@@ -33,6 +33,14 @@ impl Parser {
 
     /// Parse a SQL statement
     pub fn parse(&mut self) -> Result<Statement> {
+        // 🆕 WITH clause — parsed once at the top so the CTEs are visible to
+        // both halves of a UNION. Returns (ctes, is_recursive_marker).
+        let (mut ctes, _recursive_marker) = if matches!(self.current().token_type, TokenType::With) {
+            self.parse_with_clause()?
+        } else {
+            (Vec::new(), false)
+        };
+
         let stmt = match &self.current().token_type {
             TokenType::Select => {
                 let select = self.parse_select()?;
@@ -54,9 +62,13 @@ impl Parser {
                         right: Box::new(right),
                         op: SetOp::Union,
                         all,
+                        ctes: std::mem::take(&mut ctes),
                     }
                 } else {
-                    Statement::Select(select)
+                    Statement::Select {
+                        stmt: select,
+                        ctes: std::mem::take(&mut ctes),
+                    }
                 }
             }
             TokenType::Insert => Statement::Insert(self.parse_insert()?),
@@ -72,6 +84,13 @@ impl Parser {
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
             _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
         };
+
+        // Reject WITH attached to a non-query statement. (Also catches the
+        // case where the parser advanced past WITH but didn't consume ctes.)
+        if !ctes.is_empty() {
+            return Err(self.error(
+                "WITH clause is only valid before SELECT (or SELECT ... UNION ...)"));
+        }
 
         // Optionally consume semicolon
         if matches!(self.current().token_type, TokenType::Semicolon) {
@@ -168,6 +187,55 @@ impl Parser {
             offset,
             latest_by,
         })
+    }
+
+    /// Parse a WITH clause: `WITH [RECURSIVE] name [(col, ...)] AS ( SELECT ... ), ...`
+    ///
+    /// Returns `(Vec<CteDef>, is_recursive)`. The caller is responsible for
+    /// attaching the CTEs to the following SELECT/SetOp statement.
+    ///
+    /// RECURSIVE is accepted syntactically (matches SQL standard) but v1 of
+    /// the executor rejects any CTE body that self-references — see
+    /// `QueryExecutor::apply_ctes`.
+    fn parse_with_clause(&mut self) -> Result<(Vec<CteDef>, bool)> {
+        self.expect(TokenType::With)?; // consume WITH
+        let is_recursive = self.match_token(TokenType::Recursive);
+
+        let mut ctes = Vec::new();
+        loop {
+            // CTE name
+            let name = self.parse_identifier()?;
+            // Optional column list: ( col, col, ... )
+            let columns = if self.match_token(TokenType::LParen) {
+                let cols = self.parse_identifier_list()?;
+                self.expect(TokenType::RParen)?;
+                Some(cols)
+            } else {
+                None
+            };
+            // AS
+            self.expect(TokenType::As)?;
+            // ( SELECT ... )
+            self.expect(TokenType::LParen)?;
+            if !matches!(self.current().token_type, TokenType::Select) {
+                return Err(self.error("Expected SELECT inside CTE body"));
+            }
+            let query = self.parse_select()?;
+            self.expect(TokenType::RParen)?;
+
+            ctes.push(CteDef {
+                name,
+                columns,
+                query,
+            });
+
+            // Another CTE?
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+
+        Ok((ctes, is_recursive))
     }
 
     fn parse_column_list(&mut self) -> Result<Vec<String>> {
@@ -2068,7 +2136,7 @@ mod tests {
     fn test_parse_simple_select() {
         let stmt = parse_sql("SELECT * FROM users").unwrap();
         match stmt {
-            Statement::Select(s) => {
+            Statement::Select { stmt: s, .. } => {
                 match &s.from {
                     Some(TableRef::Table { name, .. }) => assert_eq!(name, "users"),
                     _ => panic!("Expected simple table reference"),
@@ -2083,7 +2151,7 @@ mod tests {
     fn test_parse_select_with_where() {
         let stmt = parse_sql("SELECT id, name FROM users WHERE age > 18").unwrap();
         match stmt {
-            Statement::Select(s) => {
+            Statement::Select { stmt: s, .. } => {
                 match &s.from {
                     Some(TableRef::Table { name, .. }) => assert_eq!(name, "users"),
                     _ => panic!("Expected simple table reference"),

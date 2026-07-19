@@ -189,15 +189,28 @@ See [`docs/`](docs/) for the full configuration reference and per-field docs.
 
 ## SQL Support
 
-**Supported:** `CREATE TABLE` / `CREATE INDEX` (column, vector, text, spatial),
-`DROP TABLE [IF EXISTS]`, `INSERT`, `UPDATE`, `DELETE`, `SELECT` with
-`WHERE`, `JOIN` (INNER/LEFT/RIGHT/FULL), `GROUP BY`, `ORDER BY`, `LIMIT/OFFSET`,
-`DISTINCT`, aggregates (`COUNT`, `SUM`, `MIN`, `MAX`), and transactions
-(`BEGIN`/`COMMIT`/`ROLLBACK`).
+**Supported:** `CREATE TABLE` / `CREATE INDEX` (column, vector, text, spatial,
+timestamp) / `CREATE TEXT|VECTOR|SPATIAL|TIMESTAMP INDEX`, `DROP TABLE [IF
+EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
+`INSERT`, `UPDATE`, `DELETE`, `SELECT` with:
 
-**Not yet supported:** `WITH`/CTE/recursive queries, `COUNT(DISTINCT ...)`,
-multi-column `GROUP BY`, `DECIMAL`/`DATE`/`BLOB` types, and full-text search
-predicate functions (the FTS index builds, but `MATCH ... AGAINST` is incomplete).
+- `WHERE`, `JOIN` (INNER / LEFT / RIGHT / FULL), subqueries in `WHERE`
+- `GROUP BY` (single- and multi-column), `HAVING`, `ORDER BY`, `LIMIT/OFFSET`
+- `DISTINCT` (rows) and `COUNT(DISTINCT col)` aggregates
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`
+- `UNION` / `UNION ALL`
+- `CASE WHEN ... THEN ... ELSE ... END`
+- `WITH` / Common Table Expressions (non-recursive; `WITH name [(cols)] AS
+  (SELECT ...), ... <main query>`)
+- Multimodal predicates: `MATCH(col) AGAINST('q')` (BM25 ranked FTS),
+  vector `<->`/`<~>` ordering (DiskANN ANN), `ST_WITHIN`, `ST_DISTANCE`,
+  `ST_KNN`
+- Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, read-your-writes
+  visibility inside a transaction
+
+**Not yet supported:** `WITH RECURSIVE` (the keyword is accepted but
+self-referencing CTEs error out), `DECIMAL`/`DATE`/`BLOB` types, window
+functions, and cross-statement server-side cursors.
 
 ## Documentation
 

@@ -5,13 +5,21 @@ use crate::types::Value;
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Statement {
-    Select(SelectStmt),
+    Select {
+        stmt: SelectStmt,
+        /// WITH clause common table expressions (empty if no WITH).
+        /// Visible to `stmt` (including all UNION branches when `stmt` is the
+        /// left side of a top-level SetOp assembled by the parser).
+        ctes: Vec<CteDef>,
+    },
     /// UNION / UNION ALL / INTERSECT / EXCEPT
     SetOp {
         left: Box<SelectStmt>,
         right: Box<SelectStmt>,
         op: SetOp,
         all: bool,
+        /// WITH clause CTEs — visible to both `left` and `right`.
+        ctes: Vec<CteDef>,
     },
     Insert(InsertStmt),
     Update(UpdateStmt),
@@ -26,6 +34,19 @@ pub enum Statement {
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
+}
+
+/// Common Table Expression definition (`WITH name [(cols)] AS ( SELECT ... )`).
+///
+/// Non-recursive in v1. The body is a `SelectStmt`; subsequent CTEs and the
+/// main query may reference `name` in their FROM clause.
+#[derive(Debug, Clone)]
+pub struct CteDef {
+    pub name: String,
+    /// Optional explicit column aliases: `WITH x(a, b) AS (...)`.
+    /// When present, overrides the body's projected column names.
+    pub columns: Option<Vec<String>>,
+    pub query: SelectStmt,
 }
 
 /// Set operations for combining query results.

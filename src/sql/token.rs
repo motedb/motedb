@@ -83,6 +83,8 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "all" => TokenType::All,
     "add" => TokenType::Add,
     "default" => TokenType::Default,
+    "with" => TokenType::With,
+    "recursive" => TokenType::Recursive,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +152,8 @@ pub enum TokenType {
     All,           // ALL
     Add,           // ADD (ALTER TABLE ADD COLUMN)
     Default,       // DEFAULT (column default value)
+    With,          // WITH (CTE)
+    Recursive,     // RECURSIVE (recursive CTE marker; v1 accepts but rejects self-reference)
 
     // Data types
     Integer,

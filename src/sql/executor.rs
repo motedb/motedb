@@ -672,6 +672,14 @@ impl StreamingQueryResult {
                                         idx
                                     } else if let Some(dot_pos) = name.rfind('.') {
                                         columns.iter().position(|c| c == &name[dot_pos + 1..])?
+                                    } else if !name.contains('.') {
+                                        // 🆕 Derived-table case: bare ORDER BY
+                                        // name against table-qualified output
+                                        // columns (e.g., ORDER BY cat when
+                                        // columns are ["x.cat"]).
+                                        columns.iter().position(|c| {
+                                            c.rsplit('.').next().unwrap_or(c) == name
+                                        })?
                                     } else {
                                         return None;
                                     }
@@ -946,12 +954,27 @@ impl StreamingQueryResult {
                         match columns.iter().position(|c| c == name) {
                             Some(idx) => idx,
                             None => {
-                                // Try stripping table prefix (e.g., "t.id" → "id")
+                                // Try stripping table prefix from the ORDER BY
+                                // name itself (e.g., "t.id" → "id").
                                 if let Some(dot_pos) = name.rfind('.') {
                                     let base = &name[dot_pos + 1..];
-                                    match columns.iter().position(|c| c == base) {
-                                        Some(idx) => return Some((idx, clause.asc)),
-                                        None => return None,
+                                    if let Some(idx) =
+                                        columns.iter().position(|c| c == base)
+                                    {
+                                        return Some((idx, clause.asc));
+                                    }
+                                }
+                                // 🆕 Derived-table case: ORDER BY references a
+                                // bare column name ("cat") but the output
+                                // columns are table-qualified ("x.cat"). Match
+                                // against the base name of each output column.
+                                // This makes `WITH x AS (...) SELECT ... FROM x
+                                // ORDER BY col` sort correctly.
+                                if !name.contains('.') {
+                                    if let Some(idx) = columns.iter().position(|c| {
+                                        c.rsplit('.').next().unwrap_or(c) == name
+                                    }) {
+                                        return Some((idx, clause.asc));
                                     }
                                 }
                                 return None;
@@ -1548,13 +1571,21 @@ impl QueryExecutor {
 
     pub fn execute(&self, stmt: Statement) -> Result<QueryResult> {
         match stmt {
-            Statement::Select(s) => self.execute_select(s),
+            Statement::Select { stmt: s, ctes } => {
+                let s = self.apply_ctes_for_select(s, &ctes)?;
+                self.execute_select(s)
+            }
             Statement::SetOp {
                 left,
                 right,
                 op,
                 all,
-            } => self.execute_set_op(left, right, op, all),
+                ctes,
+            } => {
+                let left = self.apply_ctes_for_select(*left, &ctes)?;
+                let right = self.apply_ctes_for_select(*right, &ctes)?;
+                self.execute_set_op(Box::new(left), Box::new(right), op, all)
+            }
             Statement::Insert(i) => self.execute_insert(i),
             Statement::Update(u) => self.execute_update(u),
             Statement::Delete(d) => self.execute_delete(d),
@@ -1739,14 +1770,21 @@ impl QueryExecutor {
         // column segments on every call (20ms+ for 2M-row segments).
 
         let result = match stmt {
-            Statement::Select(s) => self.execute_select_streaming_ref(s)?,
+            Statement::Select { stmt: s, ctes } => {
+                let s = self.apply_ctes_for_select(s.clone(), ctes)?;
+                self.execute_select_streaming_ref(&s)?
+            }
             Statement::SetOp {
                 left,
                 right,
                 op,
                 all,
+                ctes,
             } => {
-                let result = self.execute_set_op(left.clone(), right.clone(), op.clone(), *all)?;
+                let left = self.apply_ctes_for_select((**left).clone(), ctes)?;
+                let right = self.apply_ctes_for_select((**right).clone(), ctes)?;
+                let result =
+                    self.execute_set_op(Box::new(left), Box::new(right), op.clone(), *all)?;
                 return Ok(match result {
                     QueryResult::Select { columns, rows } => {
                         StreamingQueryResult::SelectReady { columns, rows }
@@ -1922,6 +1960,179 @@ impl QueryExecutor {
     fn execute_select(&self, stmt: SelectStmt) -> Result<QueryResult> {
         self.execute_select_internal(&stmt)
     }
+
+    /// Rewrite a SELECT's FROM clause so that any reference to a CTE name
+    /// becomes a `TableRef::Subquery` over the CTE's body.
+    ///
+    /// This is the heart of WITH/CTE support: by the time the executor sees
+    /// the statement, CTE references have been inlined as derived tables,
+    /// which `execute_from_with_limit` already knows how to materialize
+    /// (`executor.rs:12252`). No storage or executor core changes needed.
+    ///
+    /// **Lexical scoping**: CTEs are processed in definition order. Each CTE's
+    /// body is rewritten against the set of *preceding* CTEs (so a later CTE
+    /// can reference an earlier one); the main statement is rewritten against
+    /// *all* CTEs.
+    ///
+    /// **RECURSIVE**: v1 does not implement fixed-point evaluation. If a CTE
+    /// body references a CTE of the same name (direct self-reference) we
+    /// return an explicit error rather than silently producing wrong results.
+    /// Forward references to not-yet-defined CTEs are also rejected.
+    fn apply_ctes_for_select(&self, mut stmt: SelectStmt, ctes: &[CteDef]) -> Result<SelectStmt> {
+        if ctes.is_empty() {
+            return Ok(stmt);
+        }
+
+        // Accumulate visible CTE bodies as we go (name -> cloned body).
+        // Stored as Vec to preserve insertion order for diagnostics.
+        let mut visible: Vec<(String, CteDef)> = Vec::with_capacity(ctes.len());
+
+        for cte in ctes {
+            // Detect direct self-reference / forward reference.
+            if let Some(from) = &cte.query.from {
+                Self::check_recursive_ref(
+                    from,
+                    &cte.name,
+                    &visible.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                )?;
+            }
+
+            // Rewrite this CTE's body against previously-defined CTEs.
+            let mut body = cte.query.clone();
+            if let Some(from) = body.from.as_mut() {
+                Self::rewrite_from_cte_refs(from, &visible, &cte.columns, &cte.name);
+            }
+            // Apply explicit column aliases (WITH x(a, b) AS (...)).
+            if let Some(cols) = &cte.columns {
+                Self::apply_cte_column_aliases(&mut body, cols);
+            }
+
+            visible.push((cte.name.clone(), CteDef {
+                name: cte.name.clone(),
+                columns: cte.columns.clone(),
+                query: body,
+            }));
+        }
+
+        // Rewrite the main statement's FROM against all CTEs.
+        if let Some(from) = stmt.from.as_mut() {
+            Self::rewrite_from_cte_refs(from, &visible, &None, "");
+        }
+
+        Ok(stmt)
+    }
+
+    /// Walk a `TableRef` tree and replace `Table { name: cte_name, .. }` with
+    /// `Subquery { query: <cloned body>, alias }` for every name in `visible`.
+    ///
+    /// `owner_name` / `owner_aliases` are used to apply CTE-level column
+    /// aliases when the CTE itself is referenced (rare; usually None / "").
+    fn rewrite_from_cte_refs(
+        table_ref: &mut TableRef,
+        visible: &[(String, CteDef)],
+        _owner_aliases: &Option<Vec<String>>,
+        _owner_name: &str,
+    ) {
+        match table_ref {
+            TableRef::Table { name, alias } => {
+                if let Some((_, cte)) = visible.iter().find(|(n, _)| n == name) {
+                    let new_alias = alias.clone().unwrap_or_else(|| name.clone());
+                    *table_ref = TableRef::Subquery {
+                        query: Box::new(cte.query.clone()),
+                        alias: new_alias,
+                    };
+                }
+            }
+            TableRef::Subquery { query, .. } => {
+                // v1: do not rewrite inside nested subqueries. A CTE name
+                // referenced inside a derived table is out of scope.
+                // (Avoids surprising re-execution semantics.)
+                let _ = query;
+            }
+            TableRef::Join {
+                left,
+                right,
+                join_type: _,
+                on_condition: _,
+            } => {
+                Self::rewrite_from_cte_refs(left, visible, &None, "");
+                Self::rewrite_from_cte_refs(right, visible, &None, "");
+            }
+        }
+    }
+
+    /// Detect direct self-reference (the CTE body names itself) or forward
+    /// reference (names a CTE defined later). Both are unsupported in v1.
+    fn check_recursive_ref(
+        table_ref: &TableRef,
+        self_name: &str,
+        defined_so_far: &[&str],
+    ) -> Result<()> {
+        match table_ref {
+            TableRef::Table { name, .. } => {
+                if name == self_name {
+                    return Err(MoteDBError::Query(format!(
+                        "Recursive CTE '{}' is not supported (self-reference in FROM)",
+                        self_name
+                    )));
+                }
+                // A name that looks like a CTE but isn't yet defined is a
+                // forward reference — only flag if it matches a CTE defined
+                // later. We can't see "later" here, so we check: if the name
+                // isn't a real table AND isn't an already-defined CTE, the
+                // normal "no such table" error from execute_from will surface
+                // it. So no extra check here.
+                let _ = defined_so_far;
+            }
+            TableRef::Join { left, right, .. } => {
+                Self::check_recursive_ref(left, self_name, defined_so_far)?;
+                Self::check_recursive_ref(right, self_name, defined_so_far)?;
+            }
+            TableRef::Subquery { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Apply CTE-level column aliases: `WITH x(a, b) AS (SELECT id, name ...)`
+    /// → make the body emit columns named a, b without changing source names.
+    ///
+    /// Strategy: if the body uses `SELECT *`, leave it (can't reliably map).
+    /// Otherwise rewrite each `SelectColumn` to carry the alias from position
+    /// `i` in `aliases` while preserving the source column / expression.
+    fn apply_cte_column_aliases(body: &mut SelectStmt, aliases: &[String]) {
+        // Only rewrite if column count matches and body isn't SELECT *.
+        if body.columns.len() != aliases.len() {
+            return;
+        }
+        if body
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::Star))
+        {
+            return;
+        }
+        for (col, alias) in body.columns.iter_mut().zip(aliases.iter()) {
+            match col {
+                // SELECT col  →  SELECT col AS alias
+                SelectColumn::Column(name) => {
+                    let name = name.clone();
+                    *col = SelectColumn::ColumnWithAlias(name, alias.clone());
+                }
+                // SELECT col AS x  →  SELECT col AS alias (override)
+                SelectColumn::ColumnWithAlias(name, _) => {
+                    let name = name.clone();
+                    *col = SelectColumn::ColumnWithAlias(name, alias.clone());
+                }
+                // SELECT expr [AS x]  →  SELECT expr AS alias
+                SelectColumn::Expr(e, _) => {
+                    let e = e.clone();
+                    *col = SelectColumn::Expr(e, Some(alias.clone()));
+                }
+                SelectColumn::Star => {}
+            }
+        }
+    }
+
 
     /// Execute UNION / UNION ALL set operation.
     fn execute_set_op(
@@ -9776,7 +9987,7 @@ impl QueryExecutor {
         }
         fn walk_stmt(stmt: &Statement) -> usize {
             match stmt {
-                Statement::Select(s) => {
+                Statement::Select { stmt: s, .. } => {
                     s.where_clause
                         .as_ref()
                         .map(walk_expr)
@@ -12011,9 +12222,35 @@ impl QueryExecutor {
                                     // Use projected column value
                                     return Ok(proj_row[idx].clone());
                                 }
-                                // Try direct column lookup in full_row
+                                // 🆕 GROUP BY / projection case: look up the
+                                // ORDER BY name against the OUTPUT columns
+                                // (column_names) FIRST. This is critical for
+                                // GROUP BY queries: the projected row holds
+                                // the aggregated/grouped value, while the
+                                // underlying `full_row` is from an arbitrary
+                                // input row whose value may belong to a
+                                // different group. Resolving against the
+                                // projected output makes ORDER BY deterministic.
+                                if let Some(idx) = column_names.iter().position(|cn| {
+                                    cn == col_name
+                                        || cn.rsplit('.').next().unwrap_or(cn) == col_name
+                                }) {
+                                    if idx < proj_row.len() {
+                                        return Ok(proj_row[idx].clone());
+                                    }
+                                }
+                                // Try direct column lookup in full_row (non-GROUP-BY path)
                                 if let Some(val) = full_row.get(col_name) {
                                     return Ok(val.clone());
+                                }
+                                // 🆕 Derived-table case: bare ORDER BY name
+                                // against table-qualified full_row keys.
+                                if !col_name.contains('.') {
+                                    if let Some((_k, val)) = full_row.iter().find(|(k, _)| {
+                                        k.rsplit('.').next().unwrap_or(k) == col_name
+                                    }) {
+                                        return Ok(val.clone());
+                                    }
                                 }
                             }
                             // ORDER BY column position (1-based integer literal)

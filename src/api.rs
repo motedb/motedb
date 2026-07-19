@@ -589,7 +589,10 @@ impl Database {
 
         // Validate parameter count
         if !params.is_empty()
-            || matches!(statement.as_ref(), Statement::Select(s) if s.where_clause.is_some())
+            || matches!(
+                statement.as_ref(),
+                Statement::Select { stmt: s, .. } if s.where_clause.is_some()
+            )
         {
             let max_idx = crate::sql::QueryExecutor::max_parameter_index(&statement);
             if max_idx > 0 && params.len() < max_idx {
@@ -613,7 +616,7 @@ impl Database {
         use crate::sql::ast::{BinaryOperator, Expr, SelectColumn, Statement as S, TableRef};
 
         let (stmt_type, table_ref, where_expr, select_cols) = match statement {
-            S::Select(s) => (
+            S::Select { stmt: s, .. } => (
                 "select",
                 s.from.as_ref().and_then(|t| match t {
                     TableRef::Table { name, .. } => Some(name.as_str()),
