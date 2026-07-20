@@ -13140,6 +13140,17 @@ impl QueryExecutor {
     ) -> Result<Vec<(u64, SqlRow)>> {
         use std::collections::HashMap;
 
+        // 🚨 Normalize ON operand order: extract_equi_join_columns returns
+        // (left_col, right_col) in SYNTACTIC order. But `ON b.k = a.id`
+        // (reversed) would make left_col=b.k (which is actually in the RIGHT
+        // table) and right_col=a.id (LEFT table). The build/probe below would
+        // then key the hash on a column absent from right_rows → empty result.
+        // Detect this by sampling the row keys and swap if needed.
+        let (left_col, right_col) =
+            Self::normalize_join_columns(left_rows, right_rows, left_col, right_col);
+        let left_col = left_col.as_str();
+        let right_col = right_col.as_str();
+
         // Hash key type — preserves full i64 precision
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         enum HashKey {
@@ -13226,6 +13237,57 @@ impl QueryExecutor {
         None
     }
 
+    /// Normalize equi-join column order to match the actual left/right row sets.
+    ///
+    /// `extract_equi_join_columns` returns columns in SYNTACTIC order (the order
+    /// they appear in `ON a = b`). But callers pass `left_rows` / `right_rows`
+    /// based on FROM-clause order. For `ON b.k = a.id` (reversed), the syntactic
+    /// left_col (b.k) actually lives in the RIGHT table, so the hash build would
+    /// key on a column absent from right_rows → empty result.
+    ///
+    /// This samples a row from each side and checks whether each column name
+    /// appears as a key (directly or as a `.suffix`). If the columns are
+    /// swapped relative to the row sets, swap them back.
+    fn normalize_join_columns(
+        left_rows: &[(u64, SqlRow)],
+        right_rows: &[(u64, SqlRow)],
+        left_col: &str,
+        right_col: &str,
+    ) -> (String, String) {
+        // Check if a column name resolves against a row's keys.
+        // Matches exact key, or any key ending in ".<col>" (table-qualified).
+        #[inline]
+        fn row_has_col(row: &SqlRow, col: &str) -> bool {
+            if row.contains_key(col) {
+                return true;
+            }
+            let suffix = format!(".{}", col);
+            row.keys().any(|k| !k.starts_with("__") && k.ends_with(&suffix))
+        }
+        let (left_sample, right_sample) = match (left_rows.first(), right_rows.first()) {
+            (Some((_, l)), Some((_, r))) => (l, r),
+            _ => return (left_col.to_string(), right_col.to_string()),
+        };
+        let left_in_left = row_has_col(left_sample, left_col);
+        let right_in_right = row_has_col(right_sample, right_col);
+        if left_in_left && right_in_right {
+            // Already correctly oriented.
+            (left_col.to_string(), right_col.to_string())
+        } else {
+            // Check the swapped orientation: is left_col in right, and right_col in left?
+            let left_in_right = row_has_col(right_sample, left_col);
+            let right_in_left = row_has_col(left_sample, right_col);
+            if left_in_right && right_in_left {
+                // Swap so build/probe line up with the actual row sets.
+                (right_col.to_string(), left_col.to_string())
+            } else {
+                // Can't determine confidently — leave as-is (nested-loop fallback
+                // in the caller will evaluate correctly).
+                (left_col.to_string(), right_col.to_string())
+            }
+        }
+    }
+
     /// LEFT JOIN: all rows from left, matched rows from right (NULL if no match)
     fn left_join(
         &self,
@@ -13294,6 +13356,12 @@ impl QueryExecutor {
         null_right_row: &SqlRow,
     ) -> Result<Vec<(u64, SqlRow)>> {
         use std::collections::HashMap;
+
+        // 🚨 Normalize ON operand order (see hash_join_inner for rationale).
+        let (left_col, right_col) =
+            Self::normalize_join_columns(left_rows, right_rows, left_col, right_col);
+        let left_col = left_col.as_str();
+        let right_col = right_col.as_str();
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         enum HashKey {
@@ -13434,6 +13502,12 @@ impl QueryExecutor {
         null_left_row: &SqlRow,
     ) -> Result<Vec<(u64, SqlRow)>> {
         use std::collections::HashMap;
+
+        // 🚨 Normalize ON operand order (see hash_join_inner for rationale).
+        let (left_col, right_col) =
+            Self::normalize_join_columns(left_rows, right_rows, left_col, right_col);
+        let left_col = left_col.as_str();
+        let right_col = right_col.as_str();
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         enum HashKey {
@@ -13592,6 +13666,12 @@ impl QueryExecutor {
         null_right_row: &SqlRow,
     ) -> Result<Vec<(u64, SqlRow)>> {
         use std::collections::HashMap;
+
+        // 🚨 Normalize ON operand order (see hash_join_inner for rationale).
+        let (left_col, right_col) =
+            Self::normalize_join_columns(left_rows, right_rows, left_col, right_col);
+        let left_col = left_col.as_str();
+        let right_col = right_col.as_str();
 
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         enum HashKey {

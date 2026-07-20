@@ -2007,7 +2007,18 @@ impl ColSegmentStore {
                         match af.get_i64(i) {
                             Some(v) => {
                                 result.count += 1;
-                                result.int_sum = result.int_sum.wrapping_add(v);
+                                // 🚨 Use checked_add, not wrapping_add: silent
+                                // wraparound on SUM overflow returned wrong
+                                // (negative) totals for large i64 columns.
+                                // On overflow, promote to float accumulator.
+                                if result.has_float {
+                                    result.float_sum += v as f64;
+                                } else if let Some(s) = result.int_sum.checked_add(v) {
+                                    result.int_sum = s;
+                                } else {
+                                    result.has_float = true;
+                                    result.float_sum = result.int_sum as f64 + v as f64;
+                                }
                                 if result.count == 1 {
                                     result.min_int = v;
                                     result.max_int = v;
@@ -2082,7 +2093,16 @@ impl ColSegmentStore {
                                 continue;
                             }
                             result.count += 1;
-                            result.int_sum = result.int_sum.wrapping_add(v);
+                            // 🚨 checked_add + float promotion on overflow
+                            // (see matching site above for rationale).
+                            if result.has_float {
+                                result.float_sum += v as f64;
+                            } else if let Some(s) = result.int_sum.checked_add(v) {
+                                result.int_sum = s;
+                            } else {
+                                result.has_float = true;
+                                result.float_sum = result.int_sum as f64 + v as f64;
+                            }
                             if result.count == 1 {
                                 result.min_int = v;
                                 result.max_int = v;

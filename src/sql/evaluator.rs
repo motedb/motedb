@@ -622,7 +622,33 @@ impl ExprEvaluator {
         // Note: distinct parameter is only used for aggregate functions like COUNT(DISTINCT)
         // It's ignored for non-aggregate functions
 
-        match name.to_lowercase().as_str() {
+        let name_lower = name.to_lowercase();
+        // 🚨 SQL NULL propagation: scalar functions (string, math, etc.) return
+        // NULL when any argument evaluates to NULL — EXCEPT the conditional
+        // functions that explicitly handle NULL (coalesce/ifnull/nullif/if),
+        // concat (which also propagates but is handled below for clarity), and
+        // aggregate functions (count/sum/avg/min/max/stddev/variance, which
+        // skip NULLs per-row at the executor level). Apply this up front so we
+        // don't have to add a Null arm to every match in the big dispatch.
+        const NULL_PROPAGATING: &[&str] = &[
+            "lower", "upper", "length", "len", "substr", "substring", "trim",
+            "ltrim", "rtrim", "replace", "reverse", "leftstr", "str_left",
+            "rightstr", "str_right", "repeat", "abs", "round", "floor",
+            "ceil", "ceiling", "power", "pow", "sqrt", "exp", "ln", "log",
+            "log10", "mod", "sign", "cast", "year", "month", "day", "hour",
+            "minute", "second", "day_of_week", "to_micros", "date_add",
+            "date_diff", "time_bucket",
+        ];
+        if NULL_PROPAGATING.contains(&name_lower.as_str()) {
+            // Pre-evaluate args; if any is NULL, short-circuit to NULL.
+            for arg in args {
+                if matches!(self.eval(arg, row)?, Value::Null) {
+                    return Ok(Value::Null);
+                }
+            }
+        }
+
+        match name_lower.as_str() {
             // 🆕 LAST_INSERT_ID() - returns the last AUTO_INCREMENT value
             "last_insert_id" => {
                 if !args.is_empty() {
