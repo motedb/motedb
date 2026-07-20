@@ -4008,7 +4008,17 @@ impl QueryExecutor {
                             return Ok(result);
                         }
                         // DISTINCT (no aggregate): multi-segment scan + dedup.
-                        if stmt.distinct && !self.has_aggregates(&stmt.columns) {
+                        if stmt.distinct
+                            && !self.has_aggregates(&stmt.columns)
+                            // 🚨 ORDER BY / LIMIT must be applied AFTER dedup.
+                            // This fast path returns rows without sorting/limiting,
+                            // so for `SELECT DISTINCT v ORDER BY v LIMIT 2` it would
+                            // return all distinct values unordered (silent wrong
+                            // result). Fall through to execute_full_scan_via_col_segment.
+                            && stmt.order_by.is_none()
+                            && stmt.limit.is_none()
+                            && stmt.offset.is_none()
+                        {
                             let schema = self.db.get_table_schema(table_name)?;
                             let out_pos: Vec<usize> =
                                 Self::resolve_select_positions(&stmt.columns, &schema)
@@ -4055,6 +4065,16 @@ impl QueryExecutor {
                     }
                 }
             }
+        }
+
+        // 🚨 GROUP BY (with or without aggregates) must go through the GROUP BY
+        // execution path (execute_select_internal → try_apply_group_by_positional
+        // → apply_group_by). The streaming full-scan path below ignores GROUP BY
+        // entirely, returning un-grouped rows (silent wrong result). The fast
+        // paths above (DISTINCT, ORDER BY) already returned; if we reach here
+        // with GROUP BY set, route to materialize which handles it correctly.
+        if stmt.group_by.is_some() && !Self::contains_parameter_stmt(stmt) {
+            return self.materialize_as_streaming(stmt);
         }
 
         // Aggregate queries (COUNT, SUM, etc.) — try fast paths
@@ -8043,6 +8063,11 @@ impl QueryExecutor {
         if where_clause.is_none()
             && offset == 0
             && stmt.order_by.as_ref().is_none_or(|o| o.len() <= 1)
+            // 🚨 DISTINCT must dedup AFTER sort+limit. The Top-K path below
+            // returns the K smallest/largest raw rows without dedup, so
+            // `SELECT DISTINCT v ORDER BY v LIMIT 2` could return duplicate
+            // values (e.g. [10,10] instead of [10,20]). Skip when DISTINCT.
+            && !stmt.distinct
         {
             if let Some(ref ob) = stmt.order_by {
                 if let Some(first_ob) = ob.first() {
@@ -8445,6 +8470,25 @@ impl QueryExecutor {
         if let Some(ref ob) = stmt.order_by {
             if !ob.is_empty() {
                 let ncol = schema.columns.len();
+                // 🚨 Build SELECT-alias → schema-column-position map so that
+                // `SELECT v AS val ... ORDER BY val` resolves `val` to the
+                // underlying `v` column. Without this, the ORDER BY column
+                // lookup fails (val isn't a schema column) and the sort silently
+                // does nothing (rows returned in scan/insertion order).
+                let alias_to_col: std::collections::HashMap<&str, usize> = stmt
+                    .columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        SelectColumn::ColumnWithAlias(name, alias)
+                        | SelectColumn::Expr(
+                            crate::sql::ast::Expr::Column(name), Some(alias),
+                        ) => {
+                            let bare = name.rsplit('.').next().unwrap_or(name);
+                            schema.get_column_position(bare).map(|p| (alias.as_str(), p))
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 enum SortKey {
                     Col(usize),
                     Expr(Expr),
@@ -8455,7 +8499,11 @@ impl QueryExecutor {
                         let bare_col = match &oe.expr {
                             crate::sql::ast::Expr::Column(cn) => {
                                 let b = cn.rsplit('.').next().unwrap_or(cn);
-                                schema.get_column_position(b)
+                                // Try direct schema lookup first.
+                                schema
+                                    .get_column_position(b)
+                                    // Then try SELECT alias resolution.
+                                    .or_else(|| alias_to_col.get(b).copied())
                             }
                             // ORDER BY column position (1-based, references
                             // SELECT output columns). Resolve to schema position
@@ -14138,6 +14186,31 @@ impl QueryExecutor {
             Expr::BinaryOp { left, op, right } => {
                 let left_val = self.eval_with_materialized(left, row)?;
                 let right_val = self.eval_with_materialized(right, row)?;
+                // 🚨 SQL three-valued logic: any comparison with NULL is UNKNOWN.
+                // The previous code used Rust's `PartialOrd for Value` which
+                // orders Null below all values — so `NULL < 5` returned `true`
+                // and `NULL > 5` returned `false`, letting unmatched LEFT-JOIN
+                // NULLs pass WHERE filters incorrectly. Defer NULL handling to
+                // the evaluator's eval_binary_op, which correctly returns
+                // Bool(false) for any NULL comparison (filtering the row out).
+                if matches!(left_val, Value::Null) || matches!(right_val, Value::Null) {
+                    // For comparison ops, NULL → false (UNKNOWN treated as not-true
+                    // for WHERE filtering). For AND/OR, defer to evaluator for
+                    // proper three-valued logic.
+                    match op {
+                        BinaryOperator::Lt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Ge
+                        | BinaryOperator::Eq
+                        | BinaryOperator::Ne => return Ok(Value::Bool(false)),
+                        BinaryOperator::And | BinaryOperator::Or => {
+                            // Fall through to evaluator for proper 3VL.
+                            return self.evaluator.eval(expr, row);
+                        }
+                        _ => return self.evaluator.eval(expr, row),
+                    }
+                }
                 // Use simple comparison logic
                 match op {
                     BinaryOperator::Lt => Ok(Value::Bool(left_val < right_val)),
@@ -15218,6 +15291,73 @@ impl QueryExecutor {
         }
     }
 
+    /// Collect all top-level aggregate function calls (COUNT/SUM/AVG/MIN/MAX/
+    /// STDDEV/VARIANCE) referenced anywhere in `expr`. Used to compute HAVING-
+    /// only aggregates that aren't in the SELECT list.
+    fn collect_aggregate_calls(expr: &Expr) -> Vec<Expr> {
+        let mut out = Vec::new();
+        Self::collect_aggregate_calls_inner(expr, &mut out);
+        out
+    }
+
+    fn collect_aggregate_calls_inner(expr: &Expr, out: &mut Vec<Expr>) {
+        match expr {
+            Expr::FunctionCall { name, args, .. }
+                if matches!(
+                    name.to_uppercase().as_str(),
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                ) =>
+            {
+                out.push(expr.clone());
+                // Also recurse into args in case of nested aggregates (rare).
+                for a in args {
+                    Self::collect_aggregate_calls_inner(a, out);
+                }
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    Self::collect_aggregate_calls_inner(a, out);
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_aggregate_calls_inner(left, out);
+                Self::collect_aggregate_calls_inner(right, out);
+            }
+            Expr::UnaryOp { expr, .. } => Self::collect_aggregate_calls_inner(expr, out),
+            Expr::Case { whens, else_expr } => {
+                for (cond, val) in whens {
+                    Self::collect_aggregate_calls_inner(cond, out);
+                    Self::collect_aggregate_calls_inner(val, out);
+                }
+                if let Some(e) = else_expr {
+                    Self::collect_aggregate_calls_inner(e, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Build the SqlRow lookup key for an aggregate expression, matching the
+    /// format the evaluator's aggregate dispatch expects: "FUNC(arg)" with
+    /// the function name uppercased and the arg as the bare column name.
+    fn aggregate_expr_key(expr: &Expr) -> String {
+        if let Expr::FunctionCall { name, args, .. } = expr {
+            let arg_str = if args.is_empty() {
+                "*".to_string()
+            } else {
+                args.iter()
+                    .map(|a| match a {
+                        Expr::Column(c) => c.clone(),
+                        _ => format!("{:?}", a),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            return format!("{}({})", name.to_uppercase(), arg_str);
+        }
+        format!("{:?}", expr)
+    }
+
     // ───────────────────────────────────────────────────────────────
     // Positional GROUP BY fast path — bypasses HashMap conversion
     // ───────────────────────────────────────────────────────────────
@@ -15826,6 +15966,21 @@ impl QueryExecutor {
                         temp_row
                             .entry(sql_name)
                             .or_insert_with(|| result_row[i].clone());
+                    }
+                }
+                // 🚨 Compute aggregates referenced in HAVING but NOT in the SELECT
+                // list (e.g. `SELECT cat FROM t GROUP BY cat HAVING SUM(v) > 20`).
+                // Without this, the evaluator's aggregate lookup fails → NotImplemented
+                // error → every group filtered out (silent wrong result: empty).
+                for agg_expr in Self::collect_aggregate_calls(having_expr) {
+                    // Build the lookup key the evaluator expects (e.g. "SUM(v)").
+                    let key = Self::aggregate_expr_key(&agg_expr);
+                    if !temp_row.contains_key(&key) {
+                        // Parse to AggregateInfo + compute via the positional path.
+                        if let Some(agg_info) = self.try_parse_aggregate(&agg_expr, schema) {
+                            let val = self.compute_aggregate_positional(&agg_info, &group_rows)?;
+                            temp_row.insert(key, val);
+                        }
                     }
                 }
                 let passes = self
