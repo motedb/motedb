@@ -2605,18 +2605,48 @@ impl QueryExecutor {
         let mut aggs: Vec<AggInfo> = Vec::new();
         for col in &stmt.columns {
             if let SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _) = col {
+                let func_upper = name.to_uppercase();
+                // 🚨 Correctness guard: this fast path only handles bare-column
+                // aggregate args (`SUM(col)`, `COUNT(col)`) or no-arg forms
+                // (`COUNT(*)`). A compound arg like `SUM(CASE WHEN ... END)` or
+                // `SUM(a + b)` has no resolvable column position — pushing it
+                // through here silently produces NULL (the accumulator never
+                // adds anything). Bail so the materialized path evaluates the
+                // expression per row.
+                let is_no_arg = args.is_empty()
+                    || (args.len() == 1 && matches!(args[0], Expr::Column(ref c) if c == "*"));
+                let arg_is_bare_col =
+                    args.len() == 1 && matches!(args[0], Expr::Column(_));
+                if !is_no_arg && !arg_is_bare_col {
+                    return Ok(None);
+                }
                 let target = args
                     .iter()
                     .filter_map(|a| {
                         if let Expr::Column(cn) = a {
-                            schema.get_column_position(cn)
+                            // Strip table prefix for qualified names
+                            let bare = if cn.contains('.') {
+                                cn.rsplit('.').next().unwrap_or(cn)
+                            } else {
+                                cn
+                            };
+                            schema.get_column_position(bare)
                         } else {
                             None
                         }
                     })
                     .next();
+                // For value aggregates (SUM/AVG/MIN/MAX/STDDEV/VARIANCE) the
+                // arg MUST resolve to a column. If it doesn't, bail.
+                if matches!(
+                    func_upper.as_str(),
+                    "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                ) && target.is_none()
+                {
+                    return Ok(None);
+                }
                 aggs.push(AggInfo {
-                    func: name.to_uppercase(),
+                    func: func_upper,
                     col: target,
                 });
             } else {
