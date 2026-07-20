@@ -18074,25 +18074,38 @@ impl QueryExecutor {
                 };
                 // Verify table exists.
                 let _schema = self.db.get_table_schema(&stmt.table)?;
-                // Mutate schema in registry.
+                // Mutate schema in registry. col_type is moved here, so clone
+                // for the store update below (ColumnType is Clone, not Copy).
                 self.db.table_registry.add_column(
                     &stmt.table,
                     &name,
-                    col_type,
+                    col_type.clone(),
                     default_value.as_ref(),
                 )?;
-                // 🔑 Flush buffered data first so no rows are lost.
+                // 🔑 Extend the store's col_types so post-ALTER INSERTs preserve
+                // the new column's value. Without this, the in-memory write_buf
+                // still has N-1 column_buffers and `add_values` silently drops
+                // the Nth value. add_column_type flushes the stale buffer,
+                // swaps in the widened col_types, and rebuilds write_buf.
                 if let Some(store) = self.db.col_segment_stores.get(&stmt.table) {
-                    let _ = store.flush_buffer();
+                    store.add_column_type(col_type)?;
                 }
+                // 🚨 Invalidate the legacy `columnar_sstables` read cache for this
+                // table. That map holds an Arc<ColumnarSSTable> snapshot of the
+                // LATEST segment (N-1 columns). Legacy aggregate / GROUP BY paths
+                // (try_group_by_columnar, etc.) read it directly via column_index
+                // — accessing column N would "Text segment too short" / OOB.
+                // Removing the entry forces the next reader to sync from the now-
+                // widened col_segment_store (which has the N-column layout).
+                self.db.columnar_sstables.remove(&stmt.table);
                 // 🚨 DO NOT remove col_segment_stores — the existing store's
                 // on-disk segments hold the pre-ALTER rows, and removing it
                 // would cause all subsequent SELECTs to return 0 rows (data
-                // appears lost until database reopen). The store's col_types
-                // is now stale (N-1 columns vs schema's N), but that's OK:
-                // queries against the new column will get NULL via index-
-                // out-of-range fallback in row_format, which is correct
-                // behavior for "new column on pre-existing rows".
+                // appears lost until database reopen). Pre-ALTER on-disk
+                // segments keep their N-1 column layout; the read path
+                // returns Value::Null for the new column on those rows, which
+                // is the correct "new column on pre-existing rows = NULL"
+                // semantics.
                 //
                 // DO NOT remove columnar_sstables either — same reason.
 

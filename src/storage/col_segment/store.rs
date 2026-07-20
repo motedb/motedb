@@ -4,10 +4,12 @@ use super::segment::Segment;
 use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTableBuilder};
 use crate::types::{ArcString, ColumnType, Value};
 use crate::Result;
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Result of a single-pass aggregate scan (SUM/AVG/MIN/MAX/COUNT).
 /// Computed without per-row Value allocation.
@@ -147,7 +149,6 @@ fn decode_buffered_value(
         _ => Value::Null,
     }
 }
-use std::sync::Arc;
 
 /// Compaction trigger: merge when segment count reaches this.
 const COMPACTION_SEGMENT_THRESHOLD: usize = 3;
@@ -168,7 +169,12 @@ pub struct ColSegmentStore {
     flush_merge_lock: parking_lot::Mutex<()>,
     next_segment_id: AtomicU64,
     manifest: Mutex<Manifest>,
-    col_types: Vec<ColumnType>,
+    /// Column types for this table. Lock-free atomic swap so ALTER TABLE
+    /// ADD COLUMN can extend it without invalidating the store or risking
+    /// deadlock with the write_buf / flush_merge_lock holders below.
+    /// Reads do `let ct = self.col_types.load();` (cheap Arc clone) and
+    /// then index `ct[pc]` via Deref coercion.
+    col_types: ArcSwap<Vec<ColumnType>>,
     /// Cache for GROUP BY results: key = (group_col << 32 | agg_col).
     /// Invalidated by clear_cache() on any write (INSERT/UPDATE/DELETE).
     groupby_cache: RwLock<std::collections::HashMap<u64, Vec<(String, i64, f64)>>>,
@@ -214,7 +220,7 @@ impl ColSegmentStore {
             flush_merge_lock: parking_lot::Mutex::new(()),
             next_segment_id: AtomicU64::new(1),
             manifest: Mutex::new(manifest),
-            col_types,
+            col_types: ArcSwap::from_pointee(col_types),
             groupby_cache: RwLock::new(std::collections::HashMap::new()),
             in_hash_cache: RwLock::new(std::collections::HashMap::new()),
             point_query_count: AtomicU64::new(0),
@@ -265,13 +271,78 @@ impl ColSegmentStore {
     /// the row in multi-segment scans (newest-version-wins with deleted=true).
     /// 🔥 Stability: auto-compacts when segments exceed threshold.
     pub fn append_tombstone(&self, key: u64, ts: u64) -> Result<()> {
+        let col_types = self.col_types.load();
         let mut buf = self.write_buf.lock();
         // Write placeholder values for each column (keeps column_buffers in sync
         // with num_rows). The actual values are never read for deleted rows.
-        let placeholder: Vec<Value> = self.col_types.iter().map(|_| Value::Null).collect();
+        let placeholder: Vec<Value> = col_types.iter().map(|_| Value::Null).collect();
         buf.add_values(key, ts, true, &placeholder)?;
         drop(buf);
         // Auto-compaction disabled — can deadlock with merge_segments.
+        Ok(())
+    }
+
+    /// Extend `col_types` to support `ALTER TABLE ADD COLUMN`.
+    ///
+    /// Without this call, a post-ALTER INSERT silently drops the new column's
+    /// value: the in-memory `write_buf` (a `ColumnarSSTableBuilder`) was
+    /// created with N-1 column_buffers, and `add_values` `break`s on any
+    /// column index ≥ column_buffers.len().
+    ///
+    /// Steps (all under `flush_merge_lock` so no concurrent flush/merge races):
+    /// 1. `flush_buffer()` — drains the N-1 column buffer to a delta segment,
+    ///    so no in-flight row is lost.
+    /// 2. `col_types.store(Arc::new([...old, new_col]))` — atomic, lock-free
+    ///    swap. Future reads see N columns immediately.
+    /// 3. Replace `write_buf` with a fresh builder constructed from the new
+    ///    N-column types. Subsequent `append_row_ref` calls write all N columns.
+    ///
+    /// Pre-existing on-disk segments keep their N-1 column layout; the read
+    /// path returns `Value::Null` for the new column on those rows (correct
+    /// "new column on pre-existing rows = NULL" semantics). After a database
+    /// reopen, `create()` reconstructs the store from the live schema's N
+    /// types, so the bug does NOT persist across reopen — this fix closes the
+    /// live-session window between ALTER and reopen.
+    pub fn add_column_type(&self, new_col: ColumnType) -> Result<()> {
+        let _guard = self.flush_merge_lock.lock();
+        // 1. Drain the N-1 column buffer to a segment first.
+        //    Use flush_buffer_locked — calling flush_buffer here would
+        //    deadlock (parking_lot::Mutex is not reentrant; we already hold
+        //    flush_merge_lock above).
+        let _ = self.flush_buffer_locked();
+        // 2. Atomically extend col_types.
+        //    `load()` returns a Guard deref-ing to Arc<Vec<ColumnType>>;
+        //    double-deref + clone to materialize the owned Vec.
+        let mut new_types = (**self.col_types.load()).clone();
+        // Defensive: ALTER enforces no-duplicate at the registry level, but
+        // guard against a double-call anyway (idempotent).
+        new_types.push(new_col);
+        self.col_types.store(Arc::new(new_types));
+        // 3. Rebuild write_buf with the widened column layout.
+        let buf_path = self.dir.join(".writebuf.tmp");
+        let new_buf =
+            ColumnarSSTableBuilder::new(&buf_path, (**self.col_types.load()).clone());
+        *self.write_buf.lock() = new_buf;
+        // 4. Rewrite all pre-existing segments to the new N-column layout.
+        //    This is critical: many read paths assume col_types.len() equals
+        //    every segment's column_tags.len(). Pre-ALTER segments have N-1
+        //    column_tags, so a GROUP BY / scan over the new column would OOB
+        //    column_index or misinterpret an unrelated column's bytes ("Text
+        //    segment too short"). merge_segments reads each old segment row-by-
+        //    row (NULL-padding the new column since ci >= column_tags.len())
+        //    and writes a fresh N-column segment. We unconditionally compact
+        //    even a single segment (force_compact_all skips single-segment
+        //    tables, which would leave the layout mismatch in place).
+        let old_segs: Vec<Arc<Segment>> = self.segments.read().iter().cloned().collect();
+        if !old_segs.is_empty() {
+            // merge_segments_locked — we already hold flush_merge_lock above
+            // (calling merge_segments would deadlock: parking_lot::Mutex is
+            // not reentrant).
+            self.merge_segments_locked(old_segs)?;
+        }
+        // 5. Invalidate schema-dependent caches.
+        self.groupby_cache.write().clear();
+        self.in_hash_cache.write().clear();
         Ok(())
     }
 
@@ -282,11 +353,21 @@ impl ColSegmentStore {
         // Without this, flush can create a segment that the merge then
         // clobbers (the large_batch_durability race).
         let _guard = self.flush_merge_lock.lock();
+        self.flush_buffer_locked()
+    }
+
+    /// Flush the buffer assuming the caller already holds `flush_merge_lock`.
+    /// Used by `add_column_type` (which needs to flush + swap atomically under
+    /// the same lock — calling `flush_buffer` from there would deadlock since
+    /// parking_lot::Mutex is NOT reentrant).
+    fn flush_buffer_locked(&self) -> Result<()> {
+        // Snapshot col_types once — the fresh builder inherits this layout.
+        let col_types = self.col_types.load();
         // Take buffer contents out, replace with a fresh builder, release the lock fast.
         let buf_path = self.dir.join(".writebuf.tmp");
         let mut old_buf = {
             let mut guard = self.write_buf.lock();
-            let fresh = ColumnarSSTableBuilder::new(&buf_path, self.col_types.clone());
+            let fresh = ColumnarSSTableBuilder::new(&buf_path, (**col_types).clone());
             std::mem::replace(&mut *guard, fresh)
         };
         if old_buf.num_rows == 0 {
@@ -357,6 +438,8 @@ impl ColSegmentStore {
     /// `get` fell through to an older segment holding the live row and
     /// returned stale data after a DELETE.
     pub fn get(&self, key: u64) -> Option<Vec<Value>> {
+        // Snapshot col_types once — used by both buffer-decode and segment-decode.
+        let col_types = self.col_types.load();
         // 🔑 Check the write buffer FIRST — it may hold a newer version (UPDATE)
         // or a tombstone (DELETE) that supersedes the segment data. Without this,
         // a DELETE whose tombstone is still in the buffer (lazy flush) would be
@@ -370,10 +453,10 @@ impl ColSegmentStore {
                     return None;
                 }
                 // Live buffered row: decode from the columnar buffer.
-                let mut row = Vec::with_capacity(self.col_types.len());
-                for ci in 0..self.col_types.len() {
+                let mut row = Vec::with_capacity(col_types.len());
+                for ci in 0..col_types.len() {
                     if ci < buf.column_buffers.len() {
-                        row.push(decode_buffered_value(&buf, ci, idx, &self.col_types[ci]));
+                        row.push(decode_buffered_value(&buf, ci, idx, &col_types[ci]));
                     } else {
                         row.push(Value::Null);
                     }
@@ -393,7 +476,7 @@ impl ColSegmentStore {
                 // Live row: decode using the already-found row index.
                 // 🚀 get_row_at_idx skips the duplicate find_row_by_key call
                 // that get_row_cached would make (saves ~2-3µs per query).
-                let result = seg.get_row_at_idx(idx, &self.col_types);
+                let result = seg.get_row_at_idx(idx, &col_types);
                 // Periodic safety-net eviction for callers that don't explicitly
                 // clear_cache (e.g. UPDATE/DELETE row lookups via get_table_row).
                 // The main point-query executor path clears cache after each query.
@@ -413,8 +496,9 @@ impl ColSegmentStore {
 
     /// Full-table ordered scan via multi-way merge. Newest version wins.
     pub fn scan(&self) -> MergeCursor {
+        let col_types = self.col_types.load();
         let segs: Vec<Arc<Segment>> = self.segments.read().iter().cloned().collect();
-        MergeCursor::new(&segs, &self.col_types)
+        MergeCursor::new(&segs, &col_types)
     }
 
     /// High-performance projected + filtered scan.
@@ -455,6 +539,9 @@ impl ColSegmentStore {
         predicate: &dyn Fn(Option<&Value>) -> bool,
         max_results: usize,
     ) -> Vec<(u64, Vec<Value>)> {
+        // Snapshot col_types once for the whole scan — guards against a
+        // concurrent ALTER swapping in a new layout mid-scan.
+        let col_types = self.col_types.load();
         let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
         let mut result: Vec<(u64, Vec<Value>)> =
             Vec::with_capacity(total_rows.min(max_results).min(65536));
@@ -509,7 +596,7 @@ impl ColSegmentStore {
                     None
                 }
             });
-            let fcol_type = filter_col.and_then(|fc| self.col_types.get(fc));
+            let fcol_type = filter_col.and_then(|fc| col_types.get(fc));
 
             // 🔑 PERF: do NOT pre-intern the entire text column (was 300K ArcString
             // allocations even when 99% of rows are filtered out by the predicate).
@@ -664,9 +751,9 @@ impl ColSegmentStore {
                 if lazy_project {
                     // Lazy mode: decode each column on-demand for this single row.
                     for &pc in project_cols.iter() {
-                        let v = if pc < self.col_types.len() && pc < seg.sst.column_tags.len() {
+                        let v = if pc < col_types.len() && pc < seg.sst.column_tags.len() {
                             if seg.sst.column_tags[pc].is_fixed() {
-                                match self.col_types[pc] {
+                                match col_types[pc] {
                                     ColumnType::Integer => seg
                                         .sst
                                         .read_fixed_i64(pc)
@@ -710,8 +797,8 @@ impl ColSegmentStore {
                     }
                 } else {
                     for (pi, &pc) in project_cols.iter().enumerate() {
-                        let v = if pc < self.col_types.len() {
-                            match (&pfixed.get(pi), &ptext.get(pi), &self.col_types[pc]) {
+                        let v = if pc < col_types.len() {
+                            match (&pfixed.get(pi), &ptext.get(pi), &col_types[pc]) {
                                 (Some(Some(f)), _, ColumnType::Integer) => {
                                     f.get_i64(i).map(Value::Integer)
                                 }
@@ -1160,6 +1247,7 @@ impl ColSegmentStore {
         str_predicate: &dyn Fn(Option<&str>) -> bool,
         limit: usize,
     ) -> Vec<(u64, Vec<Value>)> {
+        let col_types = self.col_types.load();
         let cap = if limit == usize::MAX { 65536 } else { limit };
         let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(cap.min(65536));
         let segs = self.segments_snapshot();
@@ -1238,14 +1326,14 @@ impl ColSegmentStore {
                     // Decode output columns from pre-read segments (O(1) per row).
                     let mut row = Vec::with_capacity(project_cols.len());
                     for (pi, &pc) in project_cols.iter().enumerate() {
-                        let v = if pc < self.col_types.len() {
+                        let v = if pc < col_types.len() {
                             if matches!(
-                                self.col_types[pc],
+                                col_types[pc],
                                 ColumnType::Spatial | ColumnType::Tensor(_)
                             ) {
                                 Some(Value::Null)
                             } else if let Some(Some(ref f)) = pfixed.get(pi) {
-                                match self.col_types[pc] {
+                                match col_types[pc] {
                                     ColumnType::Integer => f.get_i64(i).map(Value::Integer),
                                     ColumnType::Float => f.get_f64(i).map(Value::Float),
                                     ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
@@ -1786,6 +1874,7 @@ impl ColSegmentStore {
     ) -> AggregateResult {
         // 🔑 Flush buffered writes so they're visible to the segment scan.
         let _ = self.flush_buffer();
+        let col_types = self.col_types.load();
         let need_dedup = self.may_have_duplicate_keys();
         let segs = self.segments_snapshot();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
@@ -1860,7 +1949,7 @@ impl ColSegmentStore {
             } else {
                 None
             };
-            let agg_is_float = matches!(self.col_types.get(agg_col), Some(ColumnType::Float));
+            let agg_is_float = matches!(col_types.get(agg_col), Some(ColumnType::Float));
 
             let has_deletions = seg.sst.row_map.has_any_deleted();
             let process_agg = |i: usize, result: &mut AggregateResult| {
@@ -2241,6 +2330,7 @@ impl ColSegmentStore {
         if indices.is_empty() {
             return Vec::new();
         }
+        let col_types = self.col_types.load();
         let segs = self.segments_snapshot();
         let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
         // 🔑 Pre-decode each output column ONCE per segment (not per row).
@@ -2291,7 +2381,7 @@ impl ColSegmentStore {
                 // NOT per-row read_fixed_i64/read_text which re-decodes the
                 // entire column on every row (O(N×K) → O(N+K)).
                 let v = if let Some(ref f) = pre_fixed.get(&(seg_idx, ci)) {
-                    match self.col_types.get(ci) {
+                    match col_types.get(ci) {
                         Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
                         Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
                         Some(ColumnType::Boolean) => f.get_bool(row_idx).map(Value::Bool),
@@ -2880,8 +2970,11 @@ impl ColSegmentStore {
         // Already in push order (ascending id) — correct.
     }
 
-    pub fn col_types(&self) -> &[ColumnType] {
-        &self.col_types
+    /// Returns a cheap `Arc<Vec<ColumnType>>` snapshot of the current column
+    /// types. The Arc keeps the snapshot alive even if a concurrent ALTER
+    /// swaps in a new one. Index via Deref: `ct[pc]`, `ct.len()`, `ct.get(i)`.
+    pub fn col_types(&self) -> Arc<Vec<ColumnType>> {
+        self.col_types.load_full()
     }
 
     pub fn needs_compaction(&self) -> bool {
@@ -2944,12 +3037,23 @@ impl ColSegmentStore {
         // complete before merging, and hold the lock so no new flush can
         // create a segment that this merge would miss.
         let _guard = self.flush_merge_lock.lock();
+        self.merge_segments_locked(old_segs)
+    }
+
+    /// Merge assuming the caller already holds `flush_merge_lock`. Used by
+    /// `add_column_type` (which already holds the lock — calling `merge_segments`
+    /// from there would deadlock since parking_lot::Mutex is NOT reentrant).
+    fn merge_segments_locked(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
+        if old_segs.is_empty() {
+            return Ok(());
+        }
+        let col_types = self.col_types.load();
         let old_ids: Vec<u64> = old_segs.iter().map(|s| s.id).collect();
-        let ncols = self.col_types.len();
+        let ncols = col_types.len();
 
         let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{:010}.sst", id));
-        let mut builder = ColumnarSSTableBuilder::new(&path, self.col_types.clone());
+        let mut builder = ColumnarSSTableBuilder::new(&path, (**col_types).clone());
 
         // Check if ALL columns are fixed-width (integer/float/bool/timestamp).
         // If so, use the fast column-direct path (no Vec<Value>).
@@ -2957,7 +3061,7 @@ impl ColSegmentStore {
         // Boolean is fixed-width but only 1 byte, so it must go through the
         // mixed path (which reads via the type-correct accessor); including it
         // here would write 8 bytes per Boolean row and corrupt the segment.
-        let all_fixed = self.col_types.iter().all(|ct| {
+        let all_fixed = col_types.iter().all(|ct| {
             matches!(
                 ct,
                 ColumnType::Integer | ColumnType::Float | ColumnType::Timestamp
@@ -3207,7 +3311,34 @@ impl ColSegmentStore {
                                 row_nulls.push(true);
                             }
                         } else {
-                            row_nulls.push(false);
+                            // 🚨 Column ci doesn't exist in this segment (e.g.
+                            // ALTER TABLE ADD COLUMN added it after this segment
+                            // was written; ci >= column_tags.len()). Emit a NULL
+                            // placeholder sized for the column's declared type so
+                            // add_values_raw_with_nulls gets the right byte width.
+                            // Without this, the column's buffer would be empty
+                            // while null=false, corrupting the segment layout
+                            // (subsequent reads OOB / "Text segment too short").
+                            match col_types.get(ci) {
+                                Some(ColumnType::Integer)
+                                | Some(ColumnType::Float)
+                                | Some(ColumnType::Timestamp) => {
+                                    buf.extend_from_slice(&[0u8; 8]);
+                                }
+                                Some(ColumnType::Boolean) => {
+                                    buf.push(0u8);
+                                }
+                                // Text/Vector/Spatial rows in the raw buffer
+                                // are prefixed by a u16 length. NULL = 0xFFFF
+                                // sentinel (matches add_values' Text NULL
+                                // encoding). Without these 2 bytes the finish()
+                                // path would see pos+2 > raw.len() and truncate
+                                // the column, corrupting subsequent rows.
+                                _ => {
+                                    buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
+                                }
+                            }
+                            row_nulls.push(true);
                         }
                         row_bytes.push(buf);
                     }

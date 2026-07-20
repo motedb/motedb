@@ -36,11 +36,6 @@ fn scalar_i64(db: &Database, sql: &str) -> i64 {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "KNOWN LIMITATION (v24/v25): after ALTER TABLE ADD COLUMN, INSERTs that \
-    supply a value for the new column silently drop it (the col_segment_store's \
-    col_types is fixed at creation time and doesn't know about the new column). \
-    Tracked as a documented limitation. Requires store-layer support for dynamic \
-    col_types (RwLock<Vec<ColumnType>>) to fix properly."]
 fn alter_add_column_works() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");

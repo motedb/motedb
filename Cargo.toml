@@ -88,6 +88,9 @@ rand = "0.8"
 rayon = { version = "1.8", optional = true }
 dashmap = "6.1.0"  # Concurrent HashMap
 
+# Lock-free atomic swap for ColSegmentStore.col_types (ALTER TABLE ADD COLUMN)
+arc-swap = "1.7"
+
 # Perfect hash map for O(1) keyword lookup (used by: SQL lexer)
 phf = { version = "0.11", features = ["macros"] }
 

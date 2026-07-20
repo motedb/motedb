@@ -1849,10 +1849,16 @@ impl MoteDB {
         // Build mapping: output position → segment index in SSTable
         let mut segments: Vec<(usize, ColumnarSegment)> = Vec::with_capacity(col_positions.len());
         for &col_idx in col_positions {
-            let seg = if col_sst.column_tags[col_idx].is_fixed() {
-                ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-            } else {
-                ColumnarSegment::Text(col_sst.read_text(col_idx)?)
+            // 🚨 Guard: a column added via ALTER TABLE ADD COLUMN won't be
+            // present in an SSTable written before the ALTER (column_tags is
+            // shorter). Indexing directly would panic; reading via read_text/
+            // read_fixed would OOB column_index. Emit an all-NULL segment.
+            let seg = match col_sst.column_tags.get(col_idx) {
+                Some(t) if t.is_fixed() => {
+                    ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
+                }
+                Some(_) => ColumnarSegment::Text(col_sst.read_text(col_idx)?),
+                None => ColumnarSegment::null_for(col_sst.num_rows),
             };
             segments.push((col_idx, seg));
         }
@@ -1912,6 +1918,9 @@ impl MoteDB {
                 // Vector/Spatial columns aren't supported as filter columns
                 // here; the caller routes such queries through a different path.
                 ColumnarSegment::Vector(_) | ColumnarSegment::Spatial(_) => false,
+                // ALTER-added column on a pre-ALTER SSTable: all NULL → never
+                // matches a non-NULL filter value.
+                ColumnarSegment::AllNull { .. } => false,
             };
             if matches {
                 match_indices.push(row_idx);
@@ -3316,6 +3325,7 @@ impl Iterator for TableRowStreamingIterator {
                                 .flatten()
                                 .map(|g| crate::types::Value::Spatial(std::boxed::Box::new(g)))
                                 .unwrap_or(crate::types::Value::Null),
+                            ColumnarSegment::AllNull { .. } => crate::types::Value::Null,
                         };
                         row.push(v);
                     }
@@ -3408,6 +3418,19 @@ enum ColumnarSegment {
     Vector(Vec<Option<Vec<f32>>>),
     /// Pre-decoded Spatial column: one Geometry per row (None = NULL).
     Spatial(Vec<Option<crate::types::Geometry>>),
+    /// Column added after this SSTable was written (ALTER TABLE ADD COLUMN).
+    /// All rows read NULL — used when column_tags has no entry for col_idx.
+    /// Tracked so build_row knows to emit Value::Null without consulting any
+    /// underlying segment reader.
+    AllNull { num_rows: usize },
+}
+
+impl ColumnarSegment {
+    /// Construct an all-NULL segment for a column that doesn't exist in the
+    /// backing SSTable (added later via ALTER TABLE ADD COLUMN).
+    fn null_for(num_rows: usize) -> Self {
+        ColumnarSegment::AllNull { num_rows }
+    }
 }
 
 /// Build a ColumnarSegment from an SSTable column, dispatching on the stored
@@ -3465,8 +3488,17 @@ fn build_column_segment(
             }
             Ok(ColumnarSegment::Spatial(per_row))
         }
-        Some(t) if t.is_fixed() => Ok(ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)),
-        _ => Ok(ColumnarSegment::Text(col_sst.read_text(col_idx)?)),
+        Some(ColumnTypeTag::Text) => Ok(ColumnarSegment::Text(col_sst.read_text(col_idx)?)),
+        // 🚨 Column doesn't exist in this SSTable (e.g. it was added by a prior
+        // ALTER TABLE ADD COLUMN, but this on-disk SSTable predates it). Reading
+        // it via read_text/read_fixed would OOB column_index or misinterpret an
+        // unrelated column's bytes ("Text segment too short"). Return an
+        // all-NULL segment — every row sees NULL for the new column, which is the
+        // correct "new column on pre-existing rows" semantics.
+        None => Ok(ColumnarSegment::null_for(num_rows)),
+        // Fallback for fixed-width tags (Integer/Float/Bool/Timestamp). These
+        // share the read_fixed_i64 reader; build_row reinterprets by col_type.
+        Some(_) => Ok(ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)),
     }
 }
 
@@ -3558,6 +3590,7 @@ impl ColumnarScanIterator {
                     .flatten()
                     .map(|g| crate::types::Value::Spatial(std::boxed::Box::new(g)))
                     .unwrap_or(crate::types::Value::Null),
+                ColumnarSegment::AllNull { .. } => crate::types::Value::Null,
             };
             row.push(val);
         }

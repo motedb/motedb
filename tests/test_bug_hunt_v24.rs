@@ -165,31 +165,33 @@ fn alter_add_column_existing_rows_null() {
 }
 
 #[test]
-fn alter_add_column_then_insert_with_value_current_limitation() {
-    // ⚠️ KNOWN LIMITATION: after ALTER TABLE ADD COLUMN, the
-    // ColSegmentStore's col_types is stale (still has the old column
-    // count). Subsequent INSERTs that provide values for the new column
-    // silently drop those values — the new column reads back as NULL.
+fn alter_add_column_then_insert_with_value_now_preserved() {
+    // ✅ FIXED (v26): after ALTER TABLE ADD COLUMN, the ColSegmentStore's
+    // col_types is now dynamically extended via ArcSwap (see add_column_type),
+    // the write_buf is rebuilt with the new column count, and existing segments
+    // are compacted into the new layout (NULL-padding the new column on
+    // pre-ALTER rows). Post-ALTER INSERTs correctly preserve the new column's
+    // value.
     //
-    // Correctly fixing this requires either (a) making col_types mutable
-    // on ColSegmentStore and updating it on ALTER, or (b) dropping the
-    // store and rebuilding from disk (which is complex because segments
-    // are encoded with the old column count).
-    //
-    // The data-loss bug (ALTER dropping ALL rows) was fixed; this
-    // remaining issue only affects the value of the new column on rows
-    // inserted post-ALTER. Documented here so the limitation is known.
+    // Previously (v24/v25) this was a documented limitation: the new column's
+    // value was silently dropped (read back as NULL). The data-loss variant
+    // (ALTER dropping ALL rows) was fixed earlier in v24.
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
     exec(&db, "ALTER TABLE t ADD COLUMN extra INT");
     exec(&db, "INSERT INTO t VALUES (2, 20, 99)");
     let r = rows(&db, "SELECT extra FROM t WHERE id = 2");
-    // Current behavior: NULL (limitation). Correct would be 99.
+    assert_eq!(
+        r[0][0],
+        Value::Integer(99),
+        "post-ALTER INSERT's new-column value must be preserved"
+    );
+    // Pre-ALTER row: new column reads NULL.
+    let r = rows(&db, "SELECT extra FROM t WHERE id = 1");
     assert!(
         matches!(&r[0][0], Value::Null),
-        "post-ALTER INSERT's new-column value is dropped (known limitation); got {:?}",
-        r[0][0]
+        "pre-ALTER row's new column should read NULL"
     );
 }
 
