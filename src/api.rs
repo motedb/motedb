@@ -1229,6 +1229,11 @@ impl Database {
             // per-row batch fetch. Much faster for low-selectivity filters.
             // NOTE: only use this when there is NO column index — the index path
             // below (line ~1306) is O(log N + K) vs this full scan's O(N).
+            // EXCEPTION: for ColSegmentStore tables where the index matches many
+            // rows (high cardinality), per-row get() is extremely expensive
+            // (100K rows × lock+scan+decode). The columnar scan is a single-pass
+            // filter, much faster in that case. The index path below has a
+            // cardinality check that skips to this path when len > 1000.
             if !has_col_index && self.inner.columnar_sstables.contains_key(table_name) {
                 let col_types = schema.col_types();
                 let filter_pos = schema.get_column_position(col_name);
@@ -1266,6 +1271,47 @@ impl Database {
                 .unwrap_or_else(|| format!("{}.{}", table_name, col_name));
             if let Some(index_ref) = self.inner.column_indexes.get(&index_name) {
                 let row_ids_arc = index_ref.value().get_arc(&value)?;
+
+                // 🚀 High-cardinality redirect: for ColSegmentStore tables, when
+                // the index matches many rows (>1000), per-row get() is O(K)
+                // lock+scan+decode — extremely slow for K=100K. Redirect to a
+                // single-pass columnar scan which is dramatically faster.
+                if has_col_seg && row_ids_arc.len() > 1000 {
+                    if let Some(store) = self.inner.get_col_segment_store(table_name) {
+                        let col_types = schema.col_types();
+                        let filter_pos = schema.get_column_position(col_name);
+                        if let Some(fc) = filter_pos {
+                            let _ = store.flush_buffer();
+                            let out_pos: Vec<usize> = if is_star {
+                                (0..col_types.len()).collect()
+                            } else {
+                                select_part
+                                    .split(',')
+                                    .filter_map(|s| schema.get_column_position(s.trim()))
+                                    .collect()
+                            };
+                            let target = value.clone();
+                            let scanned = store.scan_projected_filtered(
+                                Some(fc),
+                                &out_pos,
+                                &move |fv: Option<&Value>| fv == Some(&target),
+                            );
+                            let column_names: Vec<String> = if is_star {
+                                schema.column_names()
+                            } else {
+                                select_part
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .collect()
+                            };
+                            let rows: Vec<Vec<Value>> = scanned.into_iter().map(|(_, r)| r).collect();
+                            return Ok(Some(StreamingQueryResult::SelectReady {
+                                columns: column_names,
+                                rows,
+                            }));
+                        }
+                    }
+                }
 
                 // If index returns empty, the async pipeline may not have built it yet.
                 // Fall through to full SQL path to avoid false empty results.
