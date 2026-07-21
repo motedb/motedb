@@ -288,6 +288,21 @@ pub enum Expr {
         negated: bool,
     },
 
+    /// IN with a pre-built HashSet (from subquery materialization).
+    ///
+    /// Produced by `materialize_subqueries` when an IN-subquery is resolved.
+    /// Carries the pre-built `HashSet<Value>` end-to-end so every consumer
+    /// does O(1) per-row lookup instead of rebuilding the set from a
+    /// `Vec<Expr::Literal>` and/or iterating the full list per row.
+    ///
+    /// Without this, `WHERE x IN (SELECT ...)` over 300K rows × 100K-element
+    /// list took 25.5s (the Vec→HashSet round-trip + O(list_len) per row).
+    InHashset {
+        expr: Box<Expr>,
+        set: std::collections::HashSet<crate::types::Value>,
+        negated: bool,
+    },
+
     /// BETWEEN expression: column BETWEEN low AND high
     Between {
         expr: Box<Expr>,

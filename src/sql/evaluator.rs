@@ -463,6 +463,16 @@ impl ExprEvaluator {
                 "ST_RADIUS_3D must be evaluated by executor".into(),
             )),
 
+            Expr::InHashset { expr, set, negated } => {
+                // 🚀 Pre-built HashSet from subquery materialization: O(1) per row.
+                let val = self.eval(expr, row)?;
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+                let found = set.contains(&val);
+                Ok(Value::Bool(if *negated { !found } else { found }))
+            }
+
             Expr::WindowFunction { .. } => {
                 // Window functions are handled at executor level (require partition data)
                 Err(MoteDBError::Query(

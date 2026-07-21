@@ -2282,6 +2282,30 @@ impl QueryExecutor {
                     Self::parse_simple_comparison_where(wc, &schema)
                 {
                     count = store.count_filtered(pos, &op, &target) as i64;
+                } else if let crate::sql::ast::Expr::InHashset { expr, set, .. } = wc {
+                    // 🚀 COUNT(*) WHERE col IN (SELECT ...) — use the pre-built
+                    // HashSet for an O(N) count without per-row list iteration.
+                    // Falls back to None if the outer expr isn't a simple column.
+                    if let crate::sql::ast::Expr::Column(cn) = expr.as_ref() {
+                        let bare = cn.rsplit('.').next().unwrap_or(cn);
+                        if let Some(pos) = schema.get_column_position(bare) {
+                            // Use scan_projected_filtered with a HashSet predicate.
+                            let _ = store.flush_buffer();
+                            let pred_set = set.clone();
+                            let scanned = store.scan_projected_filtered(
+                                Some(pos),
+                                &[pos],
+                                &move |fv: Option<&Value>| {
+                                    fv.map(|v| pred_set.contains(v)).unwrap_or(false)
+                                },
+                            );
+                            count = scanned.len() as i64;
+                        } else {
+                            return Ok(None);
+                        }
+                    } else {
+                        return Ok(None);
+                    }
                 } else {
                     return Ok(None);
                 }
@@ -10445,6 +10469,24 @@ impl QueryExecutor {
                     None
                 }
             }
+            // 🚀 Pre-built HashSet from subquery materialization: use directly,
+            // skip the HashSet rebuild (the whole point of InHashset).
+            Expr::InHashset {
+                expr,
+                set,
+                negated: _,
+            } => {
+                if let Expr::Column(col_name) = expr.as_ref() {
+                    let pos = schema.get_column_position(if col_name.contains('.') {
+                        col_name.rsplit('.').next().unwrap_or(col_name)
+                    } else {
+                        col_name
+                    })?;
+                    Some(CompiledWhere::InHash(pos, set.clone()))
+                } else {
+                    None
+                }
+            }
             Expr::Like {
                 expr,
                 pattern,
@@ -11008,6 +11050,18 @@ impl QueryExecutor {
                 let v = Self::eval_expr_on_row(expr, row, schema)?;
                 let is_null = matches!(v, Value::Null);
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+            }
+            Expr::InHashset { expr, set, negated } => {
+                // 🚀 O(1) per-row lookup (pre-built HashSet from subquery).
+                // This is the fix for the 25.5s IN-subquery slowdown: the old
+                // path (Expr::In with Vec<Literal>) iterated the full list per
+                // row — O(rows × list_len).
+                let val = Self::eval_expr_on_row(expr, row, schema)?;
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Bool(false));
+                }
+                let found = set.contains(&val);
+                Ok(Value::Bool(if *negated { !found } else { found }))
             }
             Expr::In {
                 expr,
@@ -14154,7 +14208,7 @@ impl QueryExecutor {
                 negated,
             } => {
                 // Check if list contains a subquery
-                let materialized_list: Result<Vec<Expr>> = if list.len() == 1 {
+                if list.len() == 1 {
                     if let Expr::Subquery(subquery) = &list[0] {
                         // 🚀 Fast path: if the outer column is a simple Column reference,
                         // stream the subquery result directly into a HashSet, avoiding
@@ -14165,43 +14219,66 @@ impl QueryExecutor {
                             None
                         };
 
-                        let fast_literals = outer_col_opt
+                        let fast_hashset = outer_col_opt
                             .and_then(|col| self.stream_in_subquery_to_hashset(subquery, col));
 
-                        if let Some(hashset) = fast_literals {
-                            let literals: Vec<Expr> =
-                                hashset.into_iter().map(Expr::Literal).collect();
-                            Ok(literals)
-                        } else {
-                            // Fallback: execute subquery normally
-                            let result = self.execute_select_internal(subquery)?;
-                            match result {
-                                QueryResult::Select { rows, .. } => {
-                                    let literals: Vec<Expr> = rows
-                                        .iter()
-                                        .filter_map(|row| row.first().cloned())
-                                        .map(Expr::Literal)
-                                        .collect();
-                                    Ok(literals)
-                                }
-                                _ => Err(MoteDBError::Query(
+                        if let Some(hashset) = fast_hashset {
+                            // 🚀 Carry the pre-built HashSet end-to-end via InHashset
+                            // (avoids the HashSet → Vec<Literal> → HashSet round-trip
+                            // and the O(list_len) per-row eval in eval_expr_on_row).
+                            return Ok(Expr::InHashset {
+                                expr: Box::new(self.materialize_subqueries(expr)?),
+                                set: hashset,
+                                negated: *negated,
+                            });
+                        }
+
+                        // Fallback: execute subquery normally, build HashSet from rows.
+                        let result = self.execute_select_internal(subquery)?;
+                        match result {
+                            QueryResult::Select { rows, .. } => {
+                                let set: std::collections::HashSet<Value> = rows
+                                    .into_iter()
+                                    .filter_map(|mut r| r.drain(..).next())
+                                    .collect();
+                                return Ok(Expr::InHashset {
+                                    expr: Box::new(self.materialize_subqueries(expr)?),
+                                    set,
+                                    negated: *negated,
+                                });
+                            }
+                            _ => {
+                                return Err(MoteDBError::Query(
                                     "Subquery must return SELECT result".into(),
-                                )),
+                                ))
                             }
                         }
-                    } else {
-                        Ok(list.clone())
                     }
-                } else {
-                    Ok(list.clone())
-                };
+                }
 
+                // No subquery in list — materialize each list item + the expr.
+                let materialized_list: Result<Vec<Expr>> = list
+                    .iter()
+                    .map(|e| self.materialize_subqueries(e))
+                    .collect();
                 Ok(Expr::In {
                     expr: Box::new(self.materialize_subqueries(expr)?),
                     list: materialized_list?,
                     negated: *negated,
                 })
             }
+
+            // InHashset: set is already pre-built. Only recurse into the expr
+            // sub-tree (it may contain its own subqueries in rare cases).
+            Expr::InHashset {
+                expr,
+                set,
+                negated,
+            } => Ok(Expr::InHashset {
+                expr: Box::new(self.materialize_subqueries(expr)?),
+                set: set.clone(),
+                negated: *negated,
+            }),
 
             Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
                 left: Box::new(self.materialize_subqueries(left)?),
