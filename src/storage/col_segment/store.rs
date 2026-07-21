@@ -186,6 +186,11 @@ pub struct ColSegmentStore {
     /// bounded, we clear the cache every POINT_QUERY_EVICT_INTERVAL queries.
     /// This trades a one-time ~10ms re-decode for stable, bounded memory.
     point_query_count: AtomicU64,
+    /// 🚀 Atomic mirror of write_buf.num_rows, so `get()` can skip the
+    /// write_buf Mutex lock + rposition scan when the buffer is empty (the
+    /// common steady-state case after flush). Without this, every point query
+    /// pays ~20-40ns of Mutex lock/unlock even when the buffer is empty.
+    buffered_count: AtomicU64,
 }
 
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
@@ -224,6 +229,7 @@ impl ColSegmentStore {
             groupby_cache: RwLock::new(std::collections::HashMap::new()),
             in_hash_cache: RwLock::new(std::collections::HashMap::new()),
             point_query_count: AtomicU64::new(0),
+            buffered_count: AtomicU64::new(0),
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -247,7 +253,9 @@ impl ColSegmentStore {
         for (key, ts, row) in rows {
             buf.add_values(*key, *ts, false, row)?;
         }
+        let n = buf.num_rows as u64;
         drop(buf);
+        self.buffered_count.store(n, Ordering::Relaxed);
         // Auto-compaction disabled during append_rows — it can deadlock
         // when merge_segments reads column data while holding write locks.
         // Compaction runs on demand via ensure_query_visibility or compact_once.
@@ -262,8 +270,9 @@ impl ColSegmentStore {
         self.in_hash_cache.write().clear();
         let mut buf = self.write_buf.lock();
         buf.add_values(key, ts, false, row)?;
+        let n = buf.num_rows as u64;
         drop(buf);
-        // Auto-compaction disabled — can deadlock with merge_segments.
+        self.buffered_count.store(n, Ordering::Relaxed);
         Ok(())
     }
 
@@ -277,8 +286,9 @@ impl ColSegmentStore {
         // with num_rows). The actual values are never read for deleted rows.
         let placeholder: Vec<Value> = col_types.iter().map(|_| Value::Null).collect();
         buf.add_values(key, ts, true, &placeholder)?;
+        let n = buf.num_rows as u64;
         drop(buf);
-        // Auto-compaction disabled — can deadlock with merge_segments.
+        self.buffered_count.store(n, Ordering::Relaxed);
         Ok(())
     }
 
@@ -385,6 +395,7 @@ impl ColSegmentStore {
         // Invalidate all query caches (data changed).
         self.groupby_cache.write().clear();
         self.in_hash_cache.write().clear();
+        self.buffered_count.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -440,11 +451,14 @@ impl ColSegmentStore {
     pub fn get(&self, key: u64) -> Option<Vec<Value>> {
         // Snapshot col_types once — used by both buffer-decode and segment-decode.
         let col_types = self.col_types.load();
-        // 🔑 Check the write buffer FIRST — it may hold a newer version (UPDATE)
-        // or a tombstone (DELETE) that supersedes the segment data. Without this,
-        // a DELETE whose tombstone is still in the buffer (lazy flush) would be
-        // invisible to get(), which would return the stale live row from a segment.
-        {
+        // 🚀 Fast path: if the write buffer is empty (common steady-state after
+        // flush), skip the Mutex lock + rposition scan entirely. Saves ~20-40ns
+        // per point query (the lock acquire/release + iterator setup overhead).
+        if self.buffered_count.load(Ordering::Relaxed) > 0 {
+            // 🔑 Check the write buffer FIRST — it may hold a newer version (UPDATE)
+            // or a tombstone (DELETE) that supersedes the segment data. Without this,
+            // a DELETE whose tombstone is still in the buffer (lazy flush) would be
+            // invisible to get(), which would return the stale live row from a segment.
             let buf = self.write_buf.lock();
             if let Some(idx) = buf.keys.iter().rposition(|&k| k == key) {
                 // Found in buffer — newest version (rposition = last occurrence).

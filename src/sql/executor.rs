@@ -4126,12 +4126,35 @@ impl QueryExecutor {
         }
 
         // 🚨 GROUP BY (with or without aggregates) must go through the GROUP BY
-        // execution path (execute_select_internal → try_apply_group_by_positional
-        // → apply_group_by). The streaming full-scan path below ignores GROUP BY
-        // entirely, returning un-grouped rows (silent wrong result). The fast
-        // paths above (DISTINCT, ORDER BY) already returned; if we reach here
-        // with GROUP BY set, route to materialize which handles it correctly.
+        // execution path. The streaming full-scan path below ignores GROUP BY
+        // entirely, returning un-grouped rows (silent wrong result).
+        //
+        // 🚀 PERFORMANCE: Before falling back to materialize_as_streaming (which
+        // materializes ALL rows as Vec<Value> — 300K allocations for a 300K-row
+        // table), try the columnar GROUP BY fast path (col_segment_group_by).
+        // It reads raw text bytes + typed numeric slices, folds into per-group
+        // accumulators in a single pass — zero Value allocation in the hot loop.
+        // Previously this was unreachable because the intercept below returned
+        // before the aggregate block that calls col_segment_group_by.
         if stmt.group_by.is_some() && !Self::contains_parameter_stmt(stmt) {
+            // Try the columnar GROUP BY pushdown first (much faster).
+            if let Some(TableRef::Table {
+                name: table_name, ..
+            }) = stmt.from.as_ref()
+            {
+                if self.db.has_col_segment_store(table_name) {
+                    if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
+                        let _ = store.flush_buffer();
+                        let schema = self.db.get_table_schema(table_name)?;
+                        if let Some(result) =
+                            self.col_segment_group_by(stmt, table_name, &store, &schema)?
+                        {
+                            store.release_pages_only();
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
             return self.materialize_as_streaming(stmt);
         }
 
