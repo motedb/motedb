@@ -3192,12 +3192,29 @@ impl QueryExecutor {
                         })
                         .filter(|v| !v.is_nan())
                         .collect();
+                    // 🚨 Text MIN: was missing → returned NULL for TEXT columns.
+                    let texts: Vec<String> = scanned
+                        .iter()
+                        .filter_map(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                                if let Value::Text(t) = v {
+                                    Some(t.as_str().to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
                     if !ints.is_empty() {
                         result_row.push(Value::Integer(*ints.iter().min().unwrap()));
                     } else if !floats.is_empty() {
                         result_row.push(Value::Float(
                             floats.iter().cloned().fold(f64::INFINITY, f64::min),
                         ));
+                    } else if !texts.is_empty() {
+                        // Alphabetical min (SQL standard for TEXT).
+                        let min_text = texts.iter().min().cloned().unwrap();
+                        result_row.push(Value::text(min_text));
                     } else {
                         result_row.push(Value::Null);
                     }
@@ -3231,12 +3248,29 @@ impl QueryExecutor {
                         })
                         .filter(|v| !v.is_nan())
                         .collect();
+                    // 🚨 Text MAX: was missing → returned NULL for TEXT columns.
+                    let texts: Vec<String> = scanned
+                        .iter()
+                        .filter_map(|(_, row)| {
+                            col_idx_in_scan.and_then(|ci| row.get(ci)).and_then(|v| {
+                                if let Value::Text(t) = v {
+                                    Some(t.as_str().to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
                     if !ints.is_empty() {
                         result_row.push(Value::Integer(*ints.iter().max().unwrap()));
                     } else if !floats.is_empty() {
                         result_row.push(Value::Float(
                             floats.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                         ));
+                    } else if !texts.is_empty() {
+                        // Alphabetical max (SQL standard for TEXT).
+                        let max_text = texts.iter().max().cloned().unwrap();
+                        result_row.push(Value::text(max_text));
                     } else {
                         result_row.push(Value::Null);
                     }
@@ -9841,9 +9875,41 @@ impl QueryExecutor {
                     ))),
                 }
             }
-            _ => Err(MoteDBError::Query(
-                "eval_function_positional: unsupported expression type".to_string(),
-            )),
+            _ => {
+                // 🚨 Fallback to the full evaluator for functions not handled
+                // above (timestamp/date functions, CAST, COALESCE, NULLIF, etc.).
+                // The positional path returns NULL on error (callers do
+                // .unwrap_or(Value::Null)), which silently broke queries like
+                // `SELECT TO_MICROS(ts) FROM t` (returned NULL instead of the
+                // micros value). Build a SqlRow from the positional row so the
+                // evaluator can resolve Column references.
+                //
+                // 🔑 Coerce values to their declared schema type: the columnar
+                // scan decodes Timestamp columns as Integer (they share 8-byte
+                // fixed-width storage). Without this, TO_MICROS/YEAR/etc. fail
+                // with TypeError ("requires timestamp argument").
+                let mut sql_row = SqlRow::new();
+                for (pos, col_def) in schema.columns.iter().enumerate() {
+                    if let Some(v) = row.get(pos) {
+                        let coerced = match (&col_def.col_type, v) {
+                            (ColumnType::Timestamp, Value::Integer(i)) => {
+                                Value::Timestamp(crate::types::Timestamp::from_micros(*i))
+                            }
+                            (_, other) => other.clone(),
+                        };
+                        sql_row.insert(col_def.name.clone(), coerced);
+                    }
+                }
+                let evaluator = ExprEvaluator::new();
+                evaluator.eval(
+                    &Expr::FunctionCall {
+                        name: name.to_string(),
+                        args: args.to_vec(),
+                        distinct: false,
+                    },
+                    &sql_row,
+                )
+            }
         }
     }
 
@@ -13226,6 +13292,17 @@ impl QueryExecutor {
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Null => None, // SQL: NULL != NULL in joins
+                // 🚨 Timestamp: hash on micros (matches Integer with the same
+                // numeric value). Without this, JOIN ON ts = ts returned 0 rows
+                // (fell into _ => None → no hash entry).
+                Value::Timestamp(t) => {
+                    let i = t.as_micros();
+                    if i >= -(1i64 << 53) && i <= (1i64 << 53) {
+                        Some(HashKey::Numeric((i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 _ => None,
             }
         }
@@ -13436,6 +13513,17 @@ impl QueryExecutor {
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
+                Value::Null => None, // SQL: NULL != NULL in joins
+                // 🚨 Timestamp: hash on micros (matches Integer). Without this,
+                // JOIN ON ts = ts returned 0 rows (fell into _ => None).
+                Value::Timestamp(t) => {
+                    let i = t.as_micros();
+                    if i >= -(1i64 << 53) && i <= (1i64 << 53) {
+                        Some(HashKey::Numeric((i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 _ => None,
             }
         }
@@ -13582,6 +13670,17 @@ impl QueryExecutor {
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
+                Value::Null => None, // SQL: NULL != NULL in joins
+                // 🚨 Timestamp: hash on micros (matches Integer). Without this,
+                // JOIN ON ts = ts returned 0 rows (fell into _ => None).
+                Value::Timestamp(t) => {
+                    let i = t.as_micros();
+                    if i >= -(1i64 << 53) && i <= (1i64 << 53) {
+                        Some(HashKey::Numeric((i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 _ => None,
             }
         }
@@ -13746,6 +13845,17 @@ impl QueryExecutor {
                 Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
+                Value::Null => None, // SQL: NULL != NULL in joins
+                // 🚨 Timestamp: hash on micros (matches Integer). Without this,
+                // JOIN ON ts = ts returned 0 rows (fell into _ => None).
+                Value::Timestamp(t) => {
+                    let i = t.as_micros();
+                    if i >= -(1i64 << 53) && i <= (1i64 << 53) {
+                        Some(HashKey::Numeric((i as f64).to_bits()))
+                    } else {
+                        Some(HashKey::Integer((i as u64).wrapping_add(i64::MIN as u64)))
+                    }
+                }
                 _ => None,
             }
         }
