@@ -1205,15 +1205,31 @@ impl Database {
         }
 
         if !is_pk {
-            // ColSegmentStore tables: non-PK WHERE goes through the full parse
-            // path (the executor's columnar scan handles it correctly). Only
-            // the PK point query has a no-parse shortcut above.
-            if has_col_seg {
+            // 🚀 For ColSegmentStore tables, check if the filter column has a
+            // column index FIRST — the index fast path below (line ~1241) does
+            // an O(log N) B+tree lookup + batch row fetch, much faster than the
+            // full SQL parse path. Previously this was gated off entirely for
+            // ColSeg tables (the `return Ok(None)`), forcing 89µs of re-parsing
+            // per query. Now we only fall through to the parse path when there
+            // is NO index on the filter column.
+            let has_col_index = self
+                .inner
+                .index_registry
+                .find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Column,
+                )
+                .is_some();
+            if has_col_seg && !has_col_index {
+                // No index: fall through to full parse path (columnar scan).
                 return Ok(None);
             }
             // 🚀 Columnar SSTable fast path: use columnar filtered scan instead of
             // per-row batch fetch. Much faster for low-selectivity filters.
-            if self.inner.columnar_sstables.contains_key(table_name) {
+            // NOTE: only use this when there is NO column index — the index path
+            // below (line ~1306) is O(log N + K) vs this full scan's O(N).
+            if !has_col_index && self.inner.columnar_sstables.contains_key(table_name) {
                 let col_types = schema.col_types();
                 let filter_pos = schema.get_column_position(col_name);
                 if let Some(pos) = filter_pos {

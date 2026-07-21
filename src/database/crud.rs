@@ -1709,11 +1709,14 @@ impl MoteDB {
                         break;
                     }
                 }
-                // Release mmap pages only after actual compaction.
-                for seg in store.segments_snapshot() {
-                    seg.clear_cache();
-                    seg.release_pages();
-                }
+                // 🔑 After compaction, the merged segment is brand new (Segment::open
+                // creates an empty col_cache), so clear_cache() is redundant.
+                // release_pages() (MADV_DONTNEED) forces the next query to re-fault
+                // all mmap pages + re-decompress Snappy columns — this was the cause
+                // of the 612ms cold-cache WHERE region='US' in bench_vs_sqlite
+                // (vs 1.5ms warm). Skip both: the OS page cache handles memory
+                // pressure naturally, and keeping pages resident avoids the
+                // first-query re-fault cost.
             }
             if let Some(sst) = store.latest_segment_sst() {
                 self.columnar_sstables.insert(table_name.to_string(), sst);
