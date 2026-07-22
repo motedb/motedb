@@ -7895,12 +7895,17 @@ impl QueryExecutor {
         // HashSet<Value> per row (with ArcString alloc per row). This path
         // uses scan_row_indices_in_set (raw byte HashSet check, zero alloc).
         if let Some((col_pos, ref set)) = in_hashset {
-            // 🚨 Skip the raw-byte IN-set scan for high-cardinality sets (>1000
-            // matching rows). The per-row decode in this path has poor cache
-            // locality for scattered matches — 100K rows × 4 cols = 400K
-            // read_raw syscalls. Fall through to the columnar scan path below
-            // which does a single-pass projected scan (much better locality).
-            if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 && set.len() <= 1000 {
+            // 🚀 Raw-byte IN-set scan for TEXT columns. Uses scan_row_indices_in_set
+            // which does zero-allocation HashSet<&[u8]> matching via
+            // TextSegment::in_set_match_indices — a single-pass raw byte scan
+            // over contiguous columnar data. No per-row Value::Text allocation.
+            //
+            // Previously capped at set.len() <= 1000 because the materialization
+            // loop did scattered per-row read_fixed_i64/read_text (poor locality).
+            // Now we pre-decode each output column once per segment, then index
+            // into the pre-decoded data by local_row — converting 100K scattered
+            // decodes into 4 sequential column reads + 100K cheap indexed lookups.
+            if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 {
                 // Build a HashSet<&[u8]> from the Value set (once, not per-row).
                 let byte_set: std::collections::HashSet<&[u8]> = set
                     .iter()
@@ -7913,48 +7918,63 @@ impl QueryExecutor {
                     })
                     .collect();
                 if !byte_set.is_empty() {
-                    let _ = store.flush_buffer();
+                    let _ = store.prepare_for_query();
                     if let Some(indices) =
                         store.scan_row_indices_in_set(col_pos, &byte_set, offset + limit)
                     {
                         let segs = store.segments_snapshot();
-                        // Materialize matched rows (same pattern as TEXT eq).
                         let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
-                        for (seg_idx, local_row) in indices.iter().skip(offset).take(limit) {
+                        // Group indices by segment for sequential pre-decode.
+                        let mut by_seg: std::collections::HashMap<usize, Vec<usize>> =
+                            std::collections::HashMap::new();
+                        for &(seg_idx, local_row) in indices.iter() {
+                            by_seg.entry(seg_idx).or_default().push(local_row);
+                        }
+                        for (seg_idx, row_indices) in &by_seg {
                             let seg = match segs.get(*seg_idx) {
                                 Some(s) => s,
                                 None => continue,
                             };
-                            let mut row = Vec::with_capacity(out_positions.len());
+                            // Pre-decode each output column once for this segment.
+                            let mut col_data: Vec<Vec<Option<Value>>> =
+                                Vec::with_capacity(out_positions.len());
                             for &pc in out_positions.iter() {
-                                let v = if pc < seg.sst.column_tags.len()
+                                let decoded: Vec<Option<Value>> = if pc < seg.sst.column_tags.len()
                                     && seg.sst.column_tags[pc].is_fixed()
                                 {
                                     match seg.sst.read_fixed_i64(pc) {
                                         Ok(f) => match col_types.get(pc) {
-                                            Some(ColumnType::Float) => f
-                                                .get_f64(*local_row)
-                                                .map(Value::Float)
-                                                .unwrap_or(Value::Null),
-                                            _ => f
-                                                .get_i64(*local_row)
-                                                .map(Value::Integer)
-                                                .unwrap_or(Value::Null),
+                                            Some(ColumnType::Float) => (0..seg.sst.num_rows)
+                                                .map(|i| f.get_f64(i).map(Value::Float))
+                                                .collect(),
+                                            _ => (0..seg.sst.num_rows)
+                                                .map(|i| f.get_i64(i).map(Value::Integer))
+                                                .collect(),
                                         },
-                                        Err(_) => Value::Null,
+                                        Err(_) => vec![None; seg.sst.num_rows],
                                     }
                                 } else {
                                     match seg.sst.read_text(pc) {
-                                        Ok(t) => t
-                                            .get_str(*local_row)
-                                            .map(|s| Value::Text(s.into()))
-                                            .unwrap_or(Value::Null),
-                                        Err(_) => Value::Null,
+                                        Ok(t) => (0..seg.sst.num_rows)
+                                            .map(|i| {
+                                                t.get_str(i).map(|s| Value::Text(s.into()))
+                                            })
+                                            .collect(),
+                                        Err(_) => vec![None; seg.sst.num_rows],
                                     }
                                 };
-                                row.push(v);
+                                col_data.push(decoded);
                             }
-                            result.push(row);
+                            // Materialize matched rows from pre-decoded data.
+                            for &local_row in row_indices.iter().skip(0).take(limit) {
+                                let row: Vec<Value> = col_data
+                                    .iter()
+                                    .map(|col| {
+                                        col.get(local_row).cloned().flatten().unwrap_or(Value::Null)
+                                    })
+                                    .collect();
+                                result.push(row);
+                            }
                         }
                         return Ok(StreamingQueryResult::SelectReady {
                             columns,

@@ -1558,17 +1558,13 @@ impl ColumnarSSTable {
         // completes, and only the row_map (~16MB/2M rows for keys) stays
         // resident for fast binary search.
         //
-        // 🚀 PERF: raise the threshold from 256KB to 64MB. The old 256KB
-        // threshold meant virtually ALL real table segments (>256KB) used
-        // lazy-load (file seek per read), turning each row decode into
-        // ~10-16 Mutex-guarded seek+read syscalls. With 64MB, segments up
-        // to 64MB are fully loaded into file_data on open — subsequent reads
-        // are pure pointer math, zero syscalls. This dramatically speeds up
-        // point queries (WHERE customer='x'), IN-subquery scans, and any
-        // path that reads individual rows. RSS cost: ~one segment's worth
-        // per table (typically 5-15MB for 300K rows), acceptable for an
-        // embedded DB.
-        let lazy_load = file_len > 64 * 1024 * 1024;
+        // 🚀 PERF + MEMORY BALANCE: segments ≤ 4MB are fully loaded into
+        // file_data (pure pointer reads, zero syscalls). Segments > 4MB use
+        // lazy-load (fence_keys + seek+read for column data). The 4MB threshold
+        // balances speed (small tables are fast) with memory (large tables
+        // don't consume heap for their entire file_data). Auto-compaction keeps
+        // segment count low, and col_cache provides hot data caching.
+        let lazy_load = file_len > 4 * 1024 * 1024;
         let mmap: Option<Arc<Mmap>> = None;
 
         let mut file_data: Vec<u8> = Vec::new();
