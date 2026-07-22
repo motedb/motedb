@@ -2283,23 +2283,47 @@ impl QueryExecutor {
                 {
                     count = store.count_filtered(pos, &op, &target) as i64;
                 } else if let crate::sql::ast::Expr::InHashset { expr, set, .. } = wc {
-                    // 🚀 COUNT(*) WHERE col IN (SELECT ...) — use the pre-built
-                    // HashSet for an O(N) count without per-row list iteration.
-                    // Falls back to None if the outer expr isn't a simple column.
+                    // 🚀 COUNT(*) WHERE col IN (SELECT ...) — use raw-byte
+                    // scan_row_indices_in_set (zero Value::Text allocation)
+                    // instead of scan_projected_filtered with HashSet<Value>
+                    // predicate (300K ArcString allocations).
                     if let crate::sql::ast::Expr::Column(cn) = expr.as_ref() {
                         let bare = cn.rsplit('.').next().unwrap_or(cn);
                         if let Some(pos) = schema.get_column_position(bare) {
-                            // Use scan_projected_filtered with a HashSet predicate.
-                            let _ = store.flush_buffer();
-                            let pred_set = set.clone();
-                            let scanned = store.scan_projected_filtered(
-                                Some(pos),
-                                &[pos],
-                                &move |fv: Option<&Value>| {
-                                    fv.map(|v| pred_set.contains(v)).unwrap_or(false)
-                                },
-                            );
-                            count = scanned.len() as i64;
+                            if matches!(schema.col_types().get(pos), Some(ColumnType::Text)) {
+                                let _ = store.prepare_for_query();
+                                let byte_set: std::collections::HashSet<&[u8]> = set
+                                    .iter()
+                                    .filter_map(|v| {
+                                        if let Value::Text(t) = v {
+                                            Some(t.as_str().as_bytes())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if byte_set.is_empty() {
+                                    count = 0;
+                                } else if let Some(indices) =
+                                    store.scan_row_indices_in_set(pos, &byte_set, usize::MAX)
+                                {
+                                    count = indices.len() as i64;
+                                } else {
+                                    count = 0;
+                                }
+                            } else {
+                                // Non-text column: fall back to projected scan.
+                                let _ = store.flush_buffer();
+                                let pred_set = set.clone();
+                                let scanned = store.scan_projected_filtered(
+                                    Some(pos),
+                                    &[pos],
+                                    &move |fv: Option<&Value>| {
+                                        fv.map(|v| pred_set.contains(v)).unwrap_or(false)
+                                    },
+                                );
+                                count = scanned.len() as i64;
+                            }
                         } else {
                             return Ok(None);
                         }
