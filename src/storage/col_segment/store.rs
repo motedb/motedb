@@ -432,8 +432,24 @@ impl ColSegmentStore {
 
     /// SegData slices held by in-flight SelectColumnar queries (use-after-free).
     pub fn ensure_query_visibility(&self) -> Result<()> {
-        if self.write_buf.lock().num_rows > 0 {
+        // 🚀 Use the atomic buffered_count (avoids Mutex lock when empty).
+        if self.buffered_count.load(Ordering::Relaxed) > 0 {
             self.flush_buffer()?;
+        }
+        Ok(())
+    }
+
+    /// 🚀 Flush buffer + auto-compact when segments exceed threshold.
+    /// Called at query entry points to bound memory: N segments × ~18MB
+    /// → 1 segment × ~18MB. This is what makes RSS stabilize after bulk insert.
+    pub fn prepare_for_query(&self) -> Result<()> {
+        if self.buffered_count.load(Ordering::Relaxed) > 0 {
+            self.flush_buffer()?;
+        }
+        if self.segments.read().len() >= COMPACTION_SEGMENT_THRESHOLD {
+            let _ = self.force_compact_all();
+            // Purge freed heap pages to OS so RSS drops immediately.
+            crate::purge_memory_to_os();
         }
         Ok(())
     }

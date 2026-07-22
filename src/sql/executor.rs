@@ -4144,7 +4144,7 @@ impl QueryExecutor {
             {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
-                        let _ = store.flush_buffer();
+                        let _ = store.prepare_for_query();
                         let schema = self.db.get_table_schema(table_name)?;
                         if let Some(result) =
                             self.col_segment_group_by(stmt, table_name, &store, &schema)?
@@ -4167,7 +4167,7 @@ impl QueryExecutor {
             {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
-                        let _ = store.flush_buffer();
+                        let _ = store.prepare_for_query();
                         if let Some(result) =
                             self.col_segment_aggregate(stmt, table_name, &store)?
                         {
@@ -7141,7 +7141,7 @@ impl QueryExecutor {
         if self.db.has_col_segment_store(table) {
             let col_types = schema.col_types().to_vec();
             if let Ok(store) = self.db.get_or_create_col_segment_store(table, &col_types) {
-                let _ = store.flush_buffer();
+                let _ = store.prepare_for_query();
                 // 🔑 Read-your-writes: the zero-copy SelectColumnar path below
                 // bypasses execute_full_scan_via_col_segment and would miss
                 // uncommitted transactional writes. When in a transaction with
