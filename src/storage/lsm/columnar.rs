@@ -767,6 +767,7 @@ impl TextSegment {
         self.string_data.as_bytes()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_bytes(data: &[u8], num_rows: usize) -> Result<Self> {
         let null_bytes = num_rows.div_ceil(8);
         let offsets_size = (num_rows + 1) * 4;

@@ -1672,7 +1672,7 @@ impl QueryExecutor {
                         );
                     }
                 }
-                crate::txn::coordinator::DeltaOperation::Delete(row_id, table_name, old_value) => {
+                crate::txn::coordinator::DeltaOperation::Delete(_row_id, table_name, old_value) => {
                     let old_row = std::sync::Arc::try_unwrap(old_value)
                         .unwrap_or_else(|arc| (*arc).clone());
                     let _ = self.db.insert_row_to_table(&table_name, old_row);
@@ -3504,7 +3504,6 @@ impl QueryExecutor {
             // 🚀 Index-based accumulator: HashMap<&str, usize> → counts Vec<i64>.
             // Hot path is 1 hash lookup + i64 increment, no string comparison
             // against every existing key (old linear-scan was O(groups) per row).
-            const LIN_MAX: usize = 256;
             let mut group_keys: Vec<Box<str>> = Vec::with_capacity(16);
             let mut group_counts: Vec<i64> = Vec::with_capacity(16);
             // Per-group, per-agg accumulators.
@@ -3854,7 +3853,7 @@ impl QueryExecutor {
             }
             if null_count > 0 {
                 let mut null_row: Vec<Value> = vec![Value::Null];
-                for col in stmt.columns.iter().skip(1) {
+                for _col in stmt.columns.iter().skip(1) {
                     null_row.push(Value::Integer(null_count));
                 }
                 rows.push(null_row);
@@ -19062,7 +19061,7 @@ impl QueryExecutor {
         // Phrase search or ranked search depending on query type
         // 🚀 Carry (row_id, score) through — don't discard BM25 scores and
         // hardcode 1.0 (was executor.rs:17590). Keeps ORDER BY score correct.
-        let mut scored_results: Vec<(u64, f32)> = if phrase {
+        let scored_results: Vec<(u64, f32)> = if phrase {
             let ids = match self.db.text_search_phrase(&index_name, &query) {
                 Ok(r) => r,
                 Err(_) => return Ok(None),

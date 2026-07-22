@@ -191,6 +191,7 @@ impl TableRegistry {
         col_type: crate::types::ColumnType,
         default_value: Option<&crate::types::Value>,
     ) -> Result<()> {
+        let _ = default_value; // Reserved for future DEFAULT clause support.
         let mut meta = self
             .metadata
             .write()

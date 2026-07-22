@@ -68,14 +68,6 @@ impl TextPageCache {
         None
     }
 
-    fn put_strings(&mut self, col_idx: usize, data: Vec<u8>, base_offset: u32) {
-        while self.string_pages.len() >= 4 {
-            self.string_pages.pop_back();
-        }
-        self.string_pages.retain(|(c, _, _)| *c != col_idx);
-        self.string_pages.push_front((col_idx, data, base_offset));
-    }
-
     fn clear(&mut self) {
         self.offset_pages.clear();
         self.string_pages.clear();
@@ -365,8 +357,6 @@ impl Segment {
     /// corresponding string data, caching both for subsequent point queries.
     /// Memory per text column: ~10KB (vs ~31MB for full-column cache).
     fn read_text_paged(&self, col_idx: usize, row_idx: usize) -> Option<String> {
-        use std::io::{Read, Seek, SeekFrom};
-
         let entry = &self.sst.column_index.get(col_idx)?;
         let num_rows = self.sst.num_rows;
         let null_bytes = num_rows.div_ceil(8);

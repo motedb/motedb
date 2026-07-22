@@ -1923,7 +1923,7 @@ impl MoteDB {
                 ColumnarSegment::Vector(_) | ColumnarSegment::Spatial(_) => false,
                 // ALTER-added column on a pre-ALTER SSTable: all NULL → never
                 // matches a non-NULL filter value.
-                ColumnarSegment::AllNull { .. } => false,
+                ColumnarSegment::AllNull => false,
             };
             if matches {
                 match_indices.push(row_idx);
@@ -2409,7 +2409,7 @@ impl MoteDB {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if matches!(pk_col.col_type, crate::types::ColumnType::Integer) {
-                        for (i, row) in rows.iter().enumerate() {
+                        for (_i, row) in rows.iter().enumerate() {
                             if let Some(Value::Integer(pk_val)) = row.get(pk_col.position) {
                                 let rid = if *pk_val >= 0 {
                                     *pk_val as u64
@@ -2518,7 +2518,7 @@ impl MoteDB {
         // Pages re-fault on next read access.
         if let Some(store) = self.col_segment_stores.get(table_name) {
             for seg in store.segments_snapshot() {
-                seg.clear_cache();
+                seg.clear_all_caches();
                 seg.release_pages();
             }
         }
@@ -3328,7 +3328,7 @@ impl Iterator for TableRowStreamingIterator {
                                 .flatten()
                                 .map(|g| crate::types::Value::Spatial(std::boxed::Box::new(g)))
                                 .unwrap_or(crate::types::Value::Null),
-                            ColumnarSegment::AllNull { .. } => crate::types::Value::Null,
+                            ColumnarSegment::AllNull => crate::types::Value::Null,
                         };
                         row.push(v);
                     }
@@ -3423,16 +3423,14 @@ enum ColumnarSegment {
     Spatial(Vec<Option<crate::types::Geometry>>),
     /// Column added after this SSTable was written (ALTER TABLE ADD COLUMN).
     /// All rows read NULL — used when column_tags has no entry for col_idx.
-    /// Tracked so build_row knows to emit Value::Null without consulting any
-    /// underlying segment reader.
-    AllNull { num_rows: usize },
+    AllNull,
 }
 
 impl ColumnarSegment {
     /// Construct an all-NULL segment for a column that doesn't exist in the
     /// backing SSTable (added later via ALTER TABLE ADD COLUMN).
-    fn null_for(num_rows: usize) -> Self {
-        ColumnarSegment::AllNull { num_rows }
+    fn null_for(_num_rows: usize) -> Self {
+        ColumnarSegment::AllNull
     }
 }
 
@@ -3593,7 +3591,7 @@ impl ColumnarScanIterator {
                     .flatten()
                     .map(|g| crate::types::Value::Spatial(std::boxed::Box::new(g)))
                     .unwrap_or(crate::types::Value::Null),
-                ColumnarSegment::AllNull { .. } => crate::types::Value::Null,
+                ColumnarSegment::AllNull => crate::types::Value::Null,
             };
             row.push(val);
         }
