@@ -631,7 +631,7 @@ impl ColSegmentStore {
             });
             let fcol_text = filter_col.and_then(|fc| {
                 if fc < seg.sst.column_tags.len() && !seg.sst.column_tags[fc].is_fixed() {
-                    seg.sst.read_text(fc).ok()
+                    seg.read_text_cached(fc)
                 } else {
                     None
                 }
