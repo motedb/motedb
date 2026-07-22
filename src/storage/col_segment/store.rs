@@ -194,9 +194,12 @@ pub struct ColSegmentStore {
 }
 
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
-/// one col_cache fill is ~88MB (5 columns). Clearing every 64 queries keeps
+/// one col_cache fill is ~88MB (5 columns). Clearing every 4096 queries keeps
 /// peak RSS manageable while amortizing decode cost over many queries.
-const POINT_QUERY_EVICT_INTERVAL: u64 = 32;
+/// Raised from 32: the old value cleared caches every ~3 indexed queries
+/// (10 gets/query), causing text_page_cache thrashing. text_page_cache is
+/// tiny (~40KB/segment) and should stay warm.
+const POINT_QUERY_EVICT_INTERVAL: u64 = 4096;
 
 impl ColSegmentStore {
     /// Create a new store for a table at `base_dir/columnar_ms/<table_name>/`.
@@ -446,10 +449,17 @@ impl ColSegmentStore {
         if self.buffered_count.load(Ordering::Relaxed) > 0 {
             self.flush_buffer()?;
         }
-        if self.segments.read().len() >= COMPACTION_SEGMENT_THRESHOLD {
+        let segs = self.segments.read();
+        if segs.len() >= COMPACTION_SEGMENT_THRESHOLD {
+            drop(segs);
             let _ = self.force_compact_all();
-            // Purge freed heap pages to OS so RSS drops immediately.
             crate::purge_memory_to_os();
+        } else if segs.len() == 1 {
+            // 🚀 Single segment (post-compaction): eagerly load file_data
+            // so point queries use pure pointer reads instead of seek+read.
+            // Memory cost: one segment's file (~18MB for 300K rows), bounded.
+            let seg = &segs[0];
+            let _ = seg.sst.ensure_file_data_loaded();
         }
         Ok(())
     }
@@ -1665,7 +1675,7 @@ impl ColSegmentStore {
     pub fn release_query_memory(&self) {
         let segs = self.segments.read();
         for seg in segs.iter() {
-            seg.clear_cache();
+            seg.clear_all_caches();
             seg.release_pages();
             seg.sst.advise_dontneed();
         }
@@ -1687,7 +1697,7 @@ impl ColSegmentStore {
     pub fn clear_cache(&self) {
         let segs = self.segments.read();
         for seg in segs.iter() {
-            seg.clear_cache();
+            seg.clear_all_caches();
         }
     }
 
@@ -3425,7 +3435,7 @@ impl ColSegmentStore {
         {
             let segs = self.segments.read();
             for seg in segs.iter() {
-                seg.clear_cache();
+                seg.clear_all_caches();
                 seg.release_pages();
             }
         }

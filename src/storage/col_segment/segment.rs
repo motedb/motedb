@@ -147,6 +147,15 @@ impl Segment {
     /// Clear the column decode cache to free memory (call after bulk operations).
     pub fn clear_cache(&self) {
         self.col_cache.lock().clear();
+        // 🚀 Keep text_page_cache: it's tiny (~40KB/segment) and provides
+        // critical cross-query locality for point queries. Clearing it on
+        // every 4096th query (POINT_QUERY_EVICT_INTERVAL) caused text column
+        // re-decode thrashing. Only clear on writes (clear_all_caches).
+    }
+
+    /// Clear ALL caches including text_page_cache (used on writes/compaction).
+    pub fn clear_all_caches(&self) {
+        self.col_cache.lock().clear();
         self.text_page_cache.lock().clear();
     }
 

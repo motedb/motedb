@@ -1749,6 +1749,41 @@ impl ColumnarSSTable {
     /// Load full keys array from disk into the RowMap. Required before calling
     /// row_map.key(i) for scan paths (index build, merge). Point queries don't
     /// need this — they use find_row_by_key (sparse fence index).
+    /// 🚀 Eagerly load file_data for lazy-load segments (file > threshold).
+    /// Called when a segment is the only one (post-compaction) so that point
+    /// queries and indexed lookups get pure pointer reads instead of seek+read.
+    /// Uses unsafe interior mutability (same pattern as load_full_keys).
+    pub fn ensure_file_data_loaded(&self) -> Result<()> {
+        if !self.file_data.is_empty() {
+            return Ok(()); // Already loaded (small file or previously called).
+        }
+        let file_len = match &self.file {
+            Some(f) => f.lock().metadata().map(|m| m.len() as usize).unwrap_or(0),
+            None => 0,
+        };
+        if file_len == 0 {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; file_len];
+        use std::io::{Read, Seek, SeekFrom};
+        let ok = if let Some(ref cached) = self.file {
+            let mut f = cached.lock();
+            f.seek(SeekFrom::Start(0)).is_ok() && f.read_exact(&mut buf).is_ok()
+        } else {
+            false
+        };
+        if !ok {
+            return Ok(());
+        }
+        // Swap into file_data via unsafe interior mutability.
+        unsafe {
+            let sst: *const Self = self;
+            let sst_mut: *mut Self = sst as *mut Self;
+            (*sst_mut).file_data = buf;
+        }
+        Ok(())
+    }
+
     pub fn load_full_keys(&self) -> Result<()> {
         if self.row_map.keys_data.is_some() {
             return Ok(());
