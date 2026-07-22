@@ -1689,6 +1689,11 @@ impl ColSegmentStore {
             seg.release_pages();
             seg.sst.advise_dontneed();
         }
+        // 🚀 Purge jemalloc arenas so freed heap (from temp Vec<Value> results)
+        // is returned to the OS. Without this, RSS stays high after large
+        // SELECT * queries even though the data is freed — jemalloc retains
+        // arena pages for reuse. Purging bounds RSS after query bursts.
+        crate::purge_memory_to_os();
     }
 
     /// Clear segment col_cache WITHOUT releasing mmap pages. Use this between

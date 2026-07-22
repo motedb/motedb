@@ -1558,13 +1558,13 @@ impl ColumnarSSTable {
         // completes, and only the row_map (~16MB/2M rows for keys) stays
         // resident for fast binary search.
         //
-        // 🚀 PERF + MEMORY BALANCE: segments ≤ 4MB are fully loaded into
-        // file_data (pure pointer reads, zero syscalls). Segments > 4MB use
-        // lazy-load (fence_keys + seek+read for column data). The 4MB threshold
-        // balances speed (small tables are fast) with memory (large tables
-        // don't consume heap for their entire file_data). Auto-compaction keeps
-        // segment count low, and col_cache provides hot data caching.
-        let lazy_load = file_len > 4 * 1024 * 1024;
+        // 🚀 PERF + MEMORY BALANCE: segments ≤ 8MB are fully loaded into
+        // file_data (pure pointer reads, zero syscalls). Segments > 8MB use
+        // lazy-load (fence_keys + seek+read for column data). The 8MB threshold
+        // balances speed (small/medium tables are fast) with memory (large
+        // tables don't consume heap for their entire file_data). Auto-compaction
+        // keeps segment count low, and ensure_file_data_loaded covers single-seg.
+        let lazy_load = file_len > 8 * 1024 * 1024;
         let mmap: Option<Arc<Mmap>> = None;
 
         let mut file_data: Vec<u8> = Vec::new();
