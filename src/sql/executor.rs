@@ -7823,6 +7823,20 @@ impl QueryExecutor {
                         _ => None,
                     }
                 }
+                // 🚀 Pre-built HashSet from subquery materialization (Expr::InHashset).
+                // Without this arm, IN-subquery queries fell through to the slow
+                // col_segment_general_scan (full MergeCursor decode of all rows).
+                // Now they use the raw-byte scan_row_indices_in_set fast path.
+                Some(crate::sql::ast::Expr::InHashset {
+                    expr,
+                    set,
+                    negated: false,
+                }) => match expr.as_ref() {
+                    crate::sql::ast::Expr::Column(col_name) => {
+                        schema.get_column_position(col_name).map(|pos| (pos, set.clone()))
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
 
@@ -7881,7 +7895,12 @@ impl QueryExecutor {
         // HashSet<Value> per row (with ArcString alloc per row). This path
         // uses scan_row_indices_in_set (raw byte HashSet check, zero alloc).
         if let Some((col_pos, ref set)) = in_hashset {
-            if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 {
+            // 🚨 Skip the raw-byte IN-set scan for high-cardinality sets (>1000
+            // matching rows). The per-row decode in this path has poor cache
+            // locality for scattered matches — 100K rows × 4 cols = 400K
+            // read_raw syscalls. Fall through to the columnar scan path below
+            // which does a single-pass projected scan (much better locality).
+            if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 && set.len() <= 1000 {
                 // Build a HashSet<&[u8]> from the Value set (once, not per-row).
                 let byte_set: std::collections::HashSet<&[u8]> = set
                     .iter()
@@ -8983,6 +9002,32 @@ impl QueryExecutor {
                             }
                         })
                         .collect();
+                    (
+                        Some(pos),
+                        Box::new(move |fv: Option<&Value>| {
+                            fv.map(|v| set.contains(v)).unwrap_or(false)
+                        }),
+                    )
+                }
+                _ => {
+                    return self.col_segment_general_scan(
+                        store,
+                        wc,
+                        schema,
+                        out_positions,
+                        offset,
+                        limit,
+                    )
+                }
+            },
+            // 🚀 Pre-built HashSet from subquery materialization.
+            Expr::InHashset {
+                expr,
+                set,
+                negated: false,
+            } => match expr.as_ref() {
+                Expr::Column(cn) => {
+                    let pos = schema.get_column_position(cn).unwrap_or(0);
                     (
                         Some(pos),
                         Box::new(move |fv: Option<&Value>| {
