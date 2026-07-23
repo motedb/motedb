@@ -1848,7 +1848,16 @@ impl ColSegmentStore {
                     match tag {
                         ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
                             let v = f.get_i64(i);
-                            cmp_opt(v, target_i, op)
+                            // Prefer integer target; if the target is a Float
+                            // (e.g. AVG() subquery resolved to Float), compare
+                            // the column value promoted to f64 against target_f.
+                            if target_i.is_some() {
+                                cmp_opt(v, target_i, op)
+                            } else if target_f.is_some() {
+                                cmp_opt_f64(v.map(|x| x as f64), target_f, op)
+                            } else {
+                                false
+                            }
                         }
                         ColumnTypeTag::Float => {
                             let v = f.get_f64(i);
@@ -2004,7 +2013,16 @@ impl ColSegmentStore {
                 } else if let Some(ref f) = fcol_fixed {
                     match seg.sst.column_tags[fc] {
                         ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
-                            cmp_opt(f.get_i64(i), target_i, op)
+                            // Prefer integer target; if the target is a Float
+                            // (e.g. AVG() subquery resolved to Float), compare
+                            // the column value promoted to f64 against target_f.
+                            if target_i.is_some() {
+                                cmp_opt(f.get_i64(i), target_i, op)
+                            } else if target_f.is_some() {
+                                cmp_opt_f64(f.get_i64(i).map(|x| x as f64), target_f, op)
+                            } else {
+                                false
+                            }
                         }
                         ColumnTypeTag::Float => cmp_opt_f64(f.get_f64(i), target_f, op),
                         ColumnTypeTag::Bool => {

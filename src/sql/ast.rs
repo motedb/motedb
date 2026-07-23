@@ -301,6 +301,9 @@ pub enum Expr {
         expr: Box<Expr>,
         set: std::collections::HashSet<crate::types::Value>,
         negated: bool,
+        /// True if the subquery result contained any NULL. Per SQL standard,
+        /// `x NOT IN (subquery)` returns no rows when the subquery has a NULL.
+        has_null: bool,
     },
 
     /// BETWEEN expression: column BETWEEN low AND high

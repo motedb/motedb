@@ -411,7 +411,15 @@ impl ExprEvaluator {
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     let cond_val = self.eval(cond, row)?;
-                    if matches!(cond_val, Value::Bool(true)) {
+                    // SQL standard: condition must be TRUE. SQLite also treats
+                    // non-zero numbers as TRUE (truthy). NULL → not matched.
+                    let matched = match &cond_val {
+                        Value::Bool(b) => *b,
+                        Value::Integer(i) => *i != 0,
+                        Value::Float(f) => *f != 0.0,
+                        _ => false,
+                    };
+                    if matched {
                         return self.eval(result, row);
                     }
                 }
@@ -463,14 +471,30 @@ impl ExprEvaluator {
                 "ST_RADIUS_3D must be evaluated by executor".into(),
             )),
 
-            Expr::InHashset { expr, set, negated } => {
+            Expr::InHashset {
+                expr,
+                set,
+                negated,
+                has_null,
+            } => {
                 // 🚀 Pre-built HashSet from subquery materialization: O(1) per row.
                 let val = self.eval(expr, row)?;
                 if matches!(val, Value::Null) {
+                    // NULL IN anything → UNKNOWN (treated as false in WHERE).
                     return Ok(Value::Bool(false));
                 }
                 let found = set.contains(&val);
-                Ok(Value::Bool(if *negated { !found } else { found }))
+                if *negated {
+                    // NOT IN: per SQL standard, if the subquery produced any NULL,
+                    // NOT IN is UNKNOWN (false) for every row.
+                    if *has_null {
+                        Ok(Value::Bool(false))
+                    } else {
+                        Ok(Value::Bool(!found))
+                    }
+                } else {
+                    Ok(Value::Bool(found))
+                }
             }
 
             Expr::WindowFunction { .. } => {
@@ -746,13 +770,13 @@ impl ExprEvaluator {
 
             // 🆕 String manipulation functions
             "concat" => {
-                // CONCAT(str1, str2, ...) - concatenate strings
-                // ✅ 优化：预估容量，减少重新分配
-                let estimated_capacity = args.len() * 20; // 每个参数估计 20 字节
+                // CONCAT(str1, str2, ...) - concatenate strings.
+                // NULL args are SKIPPED (Postgres concat() semantics), so
+                // concat('a', NULL, 'b') = 'ab'. Use `||` to propagate NULL.
+                let estimated_capacity = args.len() * 20;
                 let mut result = String::with_capacity(estimated_capacity);
                 for arg in args {
                     let val = self.eval(arg, row)?;
-                    // ✅ 优化：直接 push_str，避免中间 String 分配
                     match val {
                         Value::Text(s) => result.push_str(&s),
                         Value::Integer(i) => {
@@ -764,7 +788,7 @@ impl ExprEvaluator {
                             let _ = write!(result, "{}", f);
                         }
                         Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                        Value::Null => return Ok(Value::Null),
+                        Value::Null => { /* skip NULL */ }
                         _ => {
                             use std::fmt::Write;
                             let _ = write!(result, "{:?}", val);

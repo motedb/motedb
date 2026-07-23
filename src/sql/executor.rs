@@ -1538,6 +1538,59 @@ pub struct QueryExecutor {
     current_txn_id: parking_lot::Mutex<Option<u64>>,
 }
 
+/// Determine if a CASE WHEN condition value is "true".
+/// SQL standard: only Bool(true) matches. SQLite also treats non-zero
+/// Integer/Float as true (truthy). NULL never matches.
+fn case_cond_matched(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Integer(i) => *i != 0,
+        Value::Float(f) => *f != 0.0,
+        _ => false,
+    }
+}
+
+/// Compare two values for ORDER BY in the GROUP BY result path.
+/// NULLs sort FIRST in ASC and LAST in DESC (matches the non-GROUP-BY
+/// apply_order_by path and SQLite's default NULL ordering: NULL is
+/// considered smaller than every other value).
+/// Falls back to Value::partial_cmp for types not in the fast path
+/// (Bool, Timestamp, Blob), so they sort correctly too.
+fn compare_with_nulls(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        // Non-NULL: try the optimized numeric/text path, then full partial_cmp.
+        (a, b) => QueryExecutor::compare_values(a, b)
+            .unwrap_or_else(|| a.partial_cmp(b).unwrap_or(Ordering::Equal)),
+    }
+}
+
+/// Collect distinct non-NULL values at a column position from positional rows.
+/// Used by SUM(DISTINCT)/AVG(DISTINCT) on the positional path.
+fn collect_distinct_positional(col_pos: Option<usize>, rows: &[&Row]) -> Vec<Value> {
+    use std::collections::HashSet;
+    let pos = match col_pos {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let mut seen: HashSet<Value> = HashSet::new();
+    let mut out: Vec<Value> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(val) = row.get(pos) {
+            if matches!(val, Value::Null) {
+                continue;
+            }
+            if seen.insert(val.clone()) {
+                out.push(val.clone());
+            }
+        }
+    }
+    out
+}
+
 impl QueryExecutor {
     pub fn new(db: Arc<MoteDB>) -> Self {
         Self {
@@ -2282,12 +2335,23 @@ impl QueryExecutor {
                     Self::parse_simple_comparison_where(wc, &schema)
                 {
                     count = store.count_filtered(pos, &op, &target) as i64;
-                } else if let crate::sql::ast::Expr::InHashset { expr, set, .. } = wc {
+                } else if let crate::sql::ast::Expr::InHashset {
+                    expr,
+                    set,
+                    negated,
+                    has_null,
+                } = wc
+                {
                     // 🚀 COUNT(*) WHERE col IN (SELECT ...) — use raw-byte
                     // scan_row_indices_in_set (zero Value::Text allocation)
                     // instead of scan_projected_filtered with HashSet<Value>
                     // predicate (300K ArcString allocations).
-                    if let crate::sql::ast::Expr::Column(cn) = expr.as_ref() {
+                    //
+                    // SQL standard: NOT IN with a NULL in the subquery result
+                    // produces no rows (UNKNOWN).
+                    if *negated && *has_null {
+                        count = 0;
+                    } else if let crate::sql::ast::Expr::Column(cn) = expr.as_ref() {
                         let bare = cn.rsplit('.').next().unwrap_or(cn);
                         if let Some(pos) = schema.get_column_position(bare) {
                             if matches!(schema.col_types().get(pos), Some(ColumnType::Text)) {
@@ -2302,7 +2366,23 @@ impl QueryExecutor {
                                         }
                                     })
                                     .collect();
-                                if byte_set.is_empty() {
+                                if *negated {
+                                    // NOT IN: count rows whose value is NOT in set
+                                    // (and non-NULL). This needs a full scan.
+                                    let _ = store.flush_buffer();
+                                    let pred_set = set.clone();
+                                    let scanned = store.scan_projected_filtered(
+                                        Some(pos),
+                                        &[pos],
+                                        &move |fv: Option<&Value>| {
+                                            match fv {
+                                                Some(Value::Null) | None => false,
+                                                Some(v) => !pred_set.contains(v),
+                                            }
+                                        },
+                                    );
+                                    count = scanned.len() as i64;
+                                } else if byte_set.is_empty() {
                                     count = 0;
                                 } else if let Some(indices) =
                                     store.scan_row_indices_in_set(pos, &byte_set, usize::MAX)
@@ -2315,11 +2395,22 @@ impl QueryExecutor {
                                 // Non-text column: fall back to projected scan.
                                 let _ = store.flush_buffer();
                                 let pred_set = set.clone();
+                                let neg = *negated;
                                 let scanned = store.scan_projected_filtered(
                                     Some(pos),
                                     &[pos],
                                     &move |fv: Option<&Value>| {
-                                        fv.map(|v| pred_set.contains(v)).unwrap_or(false)
+                                        match fv {
+                                            Some(Value::Null) | None => false,
+                                            Some(v) => {
+                                                let found = pred_set.contains(v);
+                                                if neg {
+                                                    !found
+                                                } else {
+                                                    found
+                                                }
+                                            }
+                                        }
                                     },
                                 );
                                 count = scanned.len() as i64;
@@ -3970,8 +4061,16 @@ impl QueryExecutor {
                             _ => None,
                         };
                         if let Some(sub) = sub {
-                            if let Ok(sub_result) = self.execute_select_internal(&sub) {
-                                if let QueryResult::Select { rows, .. } = &sub_result {
+                            match self.execute_select_internal(&sub) {
+                                Ok(QueryResult::Select { rows, .. }) => {
+                                    // SQL standard: scalar subquery must return
+                                    // at most one row.
+                                    if rows.len() > 1 {
+                                        return Err(MoteDBError::Query(
+                                            "Scalar subquery returned more than one row"
+                                                .to_string(),
+                                        ));
+                                    }
                                     let scalar = rows
                                         .first()
                                         .and_then(|r| r.first())
@@ -3979,6 +4078,8 @@ impl QueryExecutor {
                                         .unwrap_or(Value::Null);
                                     *expr = crate::sql::ast::Expr::Literal(scalar);
                                 }
+                                Ok(_) => {}
+                                Err(_) => { /* leave node; eval surfaces error */ }
                             }
                         }
                     }
@@ -7854,6 +7955,7 @@ impl QueryExecutor {
                     expr,
                     set,
                     negated: false,
+                    ..
                 }) => match expr.as_ref() {
                     crate::sql::ast::Expr::Column(col_name) => {
                         schema.get_column_position(col_name).map(|pos| (pos, set.clone()))
@@ -8749,14 +8851,26 @@ impl QueryExecutor {
                     };
                     if let Some(subquery) = subquery_stmt {
                         // Execute the scalar subquery once.
-                        if let Ok(sub_result) = self.execute_select_internal(&subquery) {
-                            if let QueryResult::Select { rows, .. } = &sub_result {
+                        match self.execute_select_internal(&subquery) {
+                            Ok(QueryResult::Select { rows, .. }) => {
+                                // SQL standard: a scalar subquery must return at
+                                // most one row. Multiple rows is an error.
+                                if rows.len() > 1 {
+                                    return Err(MoteDBError::Query(
+                                        "Scalar subquery returned more than one row"
+                                            .to_string(),
+                                    ));
+                                }
                                 let scalar = rows
                                     .first()
                                     .and_then(|r| r.first())
                                     .cloned()
                                     .unwrap_or(Value::Null);
                                 *expr = Expr::Literal(scalar);
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                // Leave the Subquery node; eval will surface the error.
                             }
                         }
                     }
@@ -9068,6 +9182,7 @@ impl QueryExecutor {
                 expr,
                 set,
                 negated: false,
+                ..
             } => match expr.as_ref() {
                 Expr::Column(cn) => {
                     let pos = schema.get_column_position(cn).unwrap_or(0);
@@ -9680,7 +9795,7 @@ impl QueryExecutor {
                             let _ = write!(result, "{}", f);
                         }
                         Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                        Value::Null => return Ok(Value::Null),
+                        Value::Null => { /* skip NULL (Postgres concat() semantics) */ }
                         other => result.push_str(&format!("{:?}", other)),
                     }
                 }
@@ -10169,7 +10284,7 @@ impl QueryExecutor {
                                     let _ = write!(result, "{}", f);
                                 }
                                 Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                                Value::Null => return Ok(Value::Null),
+                                Value::Null => { /* skip NULL */ }
                                 other => result.push_str(&format!("{:?}", other)),
                             }
                         }
@@ -10236,7 +10351,7 @@ impl QueryExecutor {
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     let cond_val = Self::eval_expr_simple(cond, row)?;
-                    if matches!(cond_val, Value::Bool(true)) {
+                    if case_cond_matched(&cond_val) {
                         return Self::eval_expr_simple(result, row);
                     }
                 }
@@ -10586,6 +10701,7 @@ impl QueryExecutor {
                 expr,
                 set,
                 negated: _,
+                has_null: _,
             } => {
                 if let Expr::Column(col_name) = expr.as_ref() {
                     let pos = schema.get_column_position(if col_name.contains('.') {
@@ -11162,7 +11278,12 @@ impl QueryExecutor {
                 let is_null = matches!(v, Value::Null);
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
-            Expr::InHashset { expr, set, negated } => {
+            Expr::InHashset {
+                expr,
+                set,
+                negated,
+                has_null,
+            } => {
                 // 🚀 O(1) per-row lookup (pre-built HashSet from subquery).
                 // This is the fix for the 25.5s IN-subquery slowdown: the old
                 // path (Expr::In with Vec<Literal>) iterated the full list per
@@ -11172,7 +11293,16 @@ impl QueryExecutor {
                     return Ok(Value::Bool(false));
                 }
                 let found = set.contains(&val);
-                Ok(Value::Bool(if *negated { !found } else { found }))
+                if *negated {
+                    // NOT IN with NULL in subquery → UNKNOWN (false) for all rows.
+                    if *has_null {
+                        Ok(Value::Bool(false))
+                    } else {
+                        Ok(Value::Bool(!found))
+                    }
+                } else {
+                    Ok(Value::Bool(found))
+                }
             }
             Expr::In {
                 expr,
@@ -11257,7 +11387,7 @@ impl QueryExecutor {
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     let cond_val = Self::eval_expr_on_row(cond, row, schema)?;
-                    if matches!(cond_val, Value::Bool(true)) {
+                    if case_cond_matched(&cond_val) {
                         return Self::eval_expr_on_row(result, row, schema);
                     }
                 }
@@ -13453,7 +13583,10 @@ impl QueryExecutor {
                         Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
                     }
                 }
-                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                // Normalize -0.0 → +0.0 so they hash/match as equal (IEEE-754:
+                // 0.0 == -0.0, but their bit patterns differ). Adding 0.0 turns
+                // -0.0 into +0.0; non-zero values are unchanged.
+                Value::Float(f) => Some(HashKey::Numeric((f + 0.0).to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Null => None, // SQL: NULL != NULL in joins
@@ -13675,7 +13808,10 @@ impl QueryExecutor {
                         Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
                     }
                 }
-                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                // Normalize -0.0 → +0.0 so they hash/match as equal (IEEE-754:
+                // 0.0 == -0.0, but their bit patterns differ). Adding 0.0 turns
+                // -0.0 into +0.0; non-zero values are unchanged.
+                Value::Float(f) => Some(HashKey::Numeric((f + 0.0).to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Null => None, // SQL: NULL != NULL in joins
@@ -13832,7 +13968,10 @@ impl QueryExecutor {
                         Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
                     }
                 }
-                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                // Normalize -0.0 → +0.0 so they hash/match as equal (IEEE-754:
+                // 0.0 == -0.0, but their bit patterns differ). Adding 0.0 turns
+                // -0.0 into +0.0; non-zero values are unchanged.
+                Value::Float(f) => Some(HashKey::Numeric((f + 0.0).to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Null => None, // SQL: NULL != NULL in joins
@@ -14007,7 +14146,10 @@ impl QueryExecutor {
                         Some(HashKey::Integer((*i as u64).wrapping_add(i64::MIN as u64)))
                     }
                 }
-                Value::Float(f) => Some(HashKey::Numeric(f.to_bits())),
+                // Normalize -0.0 → +0.0 so they hash/match as equal (IEEE-754:
+                // 0.0 == -0.0, but their bit patterns differ). Adding 0.0 turns
+                // -0.0 into +0.0; non-zero values are unchanged.
+                Value::Float(f) => Some(HashKey::Numeric((f + 0.0).to_bits())),
                 Value::Text(s) => Some(HashKey::Text(s.to_string())),
                 Value::Bool(b) => Some(HashKey::Bool(*b)),
                 Value::Null => None, // SQL: NULL != NULL in joins
@@ -14101,7 +14243,7 @@ impl QueryExecutor {
         &self,
         subquery_stmt: &SelectStmt,
         _outer_col_name: &str,
-    ) -> Option<std::collections::HashSet<Value>> {
+    ) -> Option<(std::collections::HashSet<Value>, bool)> {
         use crate::sql::ast::TableRef;
 
         // Must be a simple single-table SELECT with no GROUP BY/ORDER BY/DISTINCT/HAVING
@@ -14160,7 +14302,7 @@ impl QueryExecutor {
         // SSTable, NOT in the LSM row store. The legacy raw scan path below would
         // return empty/obsolete data for columnar tables (bug: IN subquery on a
         // columnar table silently matched 0 rows). So we branch on storage type.
-        let set = if self.db.is_columnar_table(table_name) {
+        let (set, has_null) = if self.db.is_columnar_table(table_name) {
             self.build_in_hashset_from_columnar(
                 table_name,
                 &col_types,
@@ -14175,6 +14317,7 @@ impl QueryExecutor {
             let cap = if has_where { 1024 } else { 16384 };
             let mut set = std::collections::HashSet::with_capacity(cap);
             let mut where_buf = Vec::with_capacity(where_positions.len().max(1));
+            let mut has_null = false;
 
             for result in raw_iter {
                 let (_row_id, raw_bytes) = match result {
@@ -14207,17 +14350,21 @@ impl QueryExecutor {
                 let val =
                     crate::storage::row_format::get_column(&raw_bytes, &col_types, inner_col_pos)
                         .unwrap_or(Value::Null);
-                set.insert(val);
+                if matches!(val, Value::Null) {
+                    has_null = true;
+                } else {
+                    set.insert(val);
+                }
             }
-            set
+            (set, has_null)
         };
 
-        if set.is_empty() {
-            // Empty set means outer IN should match nothing
-            return Some(set);
+        if set.is_empty() && !has_null {
+            // Empty set (no NULLs) means outer IN should match nothing
+            return Some((set, false));
         }
 
-        Some(set)
+        Some((set, has_null))
     }
 
     /// Columnar-backed implementation of the IN-subquery hashset build.
@@ -14232,7 +14379,7 @@ impl QueryExecutor {
         compiled_where: Option<&CompiledWhere>,
         where_positions: &[usize],
         where_pos_to_idx: &[Option<usize>],
-    ) -> Option<std::collections::HashSet<Value>> {
+    ) -> Option<(std::collections::HashSet<Value>, bool)> {
         // Ensure all buffered rows are in the SSTable before scanning.
         self.db.finalize_columnar_buffer(table_name);
 
@@ -14258,6 +14405,7 @@ impl QueryExecutor {
         let cap = if has_where { 1024 } else { 16384 };
         let mut set = std::collections::HashSet::with_capacity(cap);
         let mut where_buf: Vec<Value> = Vec::with_capacity(where_positions.len().max(1));
+        let mut has_null = false;
 
         for row in iter.by_ref() {
             if let Some(cw) = compiled_where {
@@ -14281,9 +14429,13 @@ impl QueryExecutor {
                 }
             }
             let val = row.get(inner_proj).cloned().unwrap_or(Value::Null);
-            set.insert(val);
+            if matches!(val, Value::Null) {
+                has_null = true;
+            } else {
+                set.insert(val);
+            }
         }
-        Some(set)
+        Some((set, has_null))
     }
 
     fn materialize_subqueries(&self, expr: &Expr) -> Result<Expr> {
@@ -14333,7 +14485,7 @@ impl QueryExecutor {
                         let fast_hashset = outer_col_opt
                             .and_then(|col| self.stream_in_subquery_to_hashset(subquery, col));
 
-                        if let Some(hashset) = fast_hashset {
+                        if let Some((hashset, has_null)) = fast_hashset {
                             // 🚀 Carry the pre-built HashSet end-to-end via InHashset
                             // (avoids the HashSet → Vec<Literal> → HashSet round-trip
                             // and the O(list_len) per-row eval in eval_expr_on_row).
@@ -14341,6 +14493,7 @@ impl QueryExecutor {
                                 expr: Box::new(self.materialize_subqueries(expr)?),
                                 set: hashset,
                                 negated: *negated,
+                                has_null,
                             });
                         }
 
@@ -14348,14 +14501,23 @@ impl QueryExecutor {
                         let result = self.execute_select_internal(subquery)?;
                         match result {
                             QueryResult::Select { rows, .. } => {
-                                let set: std::collections::HashSet<Value> = rows
-                                    .into_iter()
-                                    .filter_map(|mut r| r.drain(..).next())
-                                    .collect();
+                                let mut set: std::collections::HashSet<Value> =
+                                    std::collections::HashSet::new();
+                                let mut has_null = false;
+                                for mut r in rows {
+                                    if let Some(v) = r.drain(..).next() {
+                                        if matches!(v, Value::Null) {
+                                            has_null = true;
+                                        } else {
+                                            set.insert(v);
+                                        }
+                                    }
+                                }
                                 return Ok(Expr::InHashset {
                                     expr: Box::new(self.materialize_subqueries(expr)?),
                                     set,
                                     negated: *negated,
+                                    has_null,
                                 });
                             }
                             _ => {
@@ -14385,10 +14547,12 @@ impl QueryExecutor {
                 expr,
                 set,
                 negated,
+                has_null,
             } => Ok(Expr::InHashset {
                 expr: Box::new(self.materialize_subqueries(expr)?),
                 set: set.clone(),
                 negated: *negated,
+                has_null: *has_null,
             }),
 
             Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
@@ -15185,22 +15349,36 @@ impl QueryExecutor {
                                 "SUM requires an argument".to_string(),
                             ));
                         }
+                        // Collect values, dedup if DISTINCT.
+                        let all_vals: Vec<Value> = rows
+                            .iter()
+                            .map(|r| self.evaluator.eval(&args[0], r))
+                            .collect::<Result<Vec<_>>>()?;
+                        let vals: Vec<Value> = if *distinct {
+                            use std::collections::HashSet;
+                            let mut seen: HashSet<Value> = HashSet::new();
+                            all_vals
+                                .into_iter()
+                                .filter(|v| !matches!(v, Value::Null) && seen.insert(v.clone()))
+                                .collect()
+                        } else {
+                            all_vals
+                        };
                         let mut int_sum: i64 = 0;
                         let mut float_sum: f64 = 0.0;
                         let mut has_float = false;
                         let mut has_value = false;
-                        for row in rows {
-                            let val = self.evaluator.eval(&args[0], row)?;
+                        for val in &vals {
                             match val {
                                 Value::Integer(i) => {
                                     has_value = true;
                                     if has_float {
-                                        float_sum += i as f64;
-                                    } else if let Some(s) = int_sum.checked_add(i) {
+                                        float_sum += *i as f64;
+                                    } else if let Some(s) = int_sum.checked_add(*i) {
                                         int_sum = s;
                                     } else {
                                         has_float = true;
-                                        float_sum = int_sum as f64 + i as f64;
+                                        float_sum = int_sum as f64 + *i as f64;
                                     }
                                 }
                                 Value::Float(f) => {
@@ -15209,7 +15387,7 @@ impl QueryExecutor {
                                         has_float = true;
                                         float_sum = int_sum as f64;
                                     }
-                                    float_sum += f;
+                                    float_sum += *f;
                                 }
                                 Value::Null => {}
                                 _ => {
@@ -15233,17 +15411,30 @@ impl QueryExecutor {
                                 "AVG requires an argument".to_string(),
                             ));
                         }
+                        let all_vals: Vec<Value> = rows
+                            .iter()
+                            .map(|r| self.evaluator.eval(&args[0], r))
+                            .collect::<Result<Vec<_>>>()?;
+                        let vals: Vec<Value> = if *distinct {
+                            use std::collections::HashSet;
+                            let mut seen: HashSet<Value> = HashSet::new();
+                            all_vals
+                                .into_iter()
+                                .filter(|v| !matches!(v, Value::Null) && seen.insert(v.clone()))
+                                .collect()
+                        } else {
+                            all_vals
+                        };
                         let mut sum = 0.0;
                         let mut count = 0;
-                        for row in rows {
-                            let val = self.evaluator.eval(&args[0], row)?;
+                        for val in &vals {
                             match val {
                                 Value::Integer(i) => {
-                                    sum += i as f64;
+                                    sum += *i as f64;
                                     count += 1;
                                 }
                                 Value::Float(f) => {
-                                    sum += f;
+                                    sum += *f;
                                     count += 1;
                                 }
                                 Value::Null => {}
@@ -15266,23 +15457,33 @@ impl QueryExecutor {
                                 "MIN requires an argument".to_string(),
                             ));
                         }
+                        // DISTINCT has no effect on MIN/MAX, but for correctness we
+                        // still respect it (dedup is a no-op on the result).
                         let mut min_val: Option<Value> = None;
+                        let mut seen: Option<std::collections::HashSet<Value>> =
+                            if *distinct { Some(std::collections::HashSet::new()) } else { None };
                         for row in rows {
                             let val = self.evaluator.eval(&args[0], row)?;
-                            if !matches!(val, Value::Null) {
-                                min_val = Some(match min_val {
-                                    None => val,
-                                    Some(current) => {
-                                        if val.partial_cmp(&current)
-                                            == Some(std::cmp::Ordering::Less)
-                                        {
-                                            val
-                                        } else {
-                                            current
-                                        }
-                                    }
-                                });
+                            if matches!(val, Value::Null) {
+                                continue;
                             }
+                            if let Some(ref mut s) = seen {
+                                if !s.insert(val.clone()) {
+                                    continue;
+                                }
+                            }
+                            min_val = Some(match min_val {
+                                None => val,
+                                Some(current) => {
+                                    if val.partial_cmp(&current)
+                                        == Some(std::cmp::Ordering::Less)
+                                    {
+                                        val
+                                    } else {
+                                        current
+                                    }
+                                }
+                            });
                         }
                         Ok(min_val.unwrap_or(Value::Null))
                     }
@@ -15293,22 +15494,30 @@ impl QueryExecutor {
                             ));
                         }
                         let mut max_val: Option<Value> = None;
+                        let mut seen: Option<std::collections::HashSet<Value>> =
+                            if *distinct { Some(std::collections::HashSet::new()) } else { None };
                         for row in rows {
                             let val = self.evaluator.eval(&args[0], row)?;
-                            if !matches!(val, Value::Null) {
-                                max_val = Some(match max_val {
-                                    None => val,
-                                    Some(current) => {
-                                        if val.partial_cmp(&current)
-                                            == Some(std::cmp::Ordering::Greater)
-                                        {
-                                            val
-                                        } else {
-                                            current
-                                        }
-                                    }
-                                });
+                            if matches!(val, Value::Null) {
+                                continue;
                             }
+                            if let Some(ref mut s) = seen {
+                                if !s.insert(val.clone()) {
+                                    continue;
+                                }
+                            }
+                            max_val = Some(match max_val {
+                                None => val,
+                                Some(current) => {
+                                    if val.partial_cmp(&current)
+                                        == Some(std::cmp::Ordering::Greater)
+                                    {
+                                        val
+                                    } else {
+                                        current
+                                    }
+                                }
+                            });
                         }
                         Ok(max_val.unwrap_or(Value::Null))
                     }
@@ -16310,10 +16519,12 @@ impl QueryExecutor {
 
             result_rows.sort_by(|a, b| {
                 for &(idx, asc) in &order_specs {
-                    let cmp = QueryExecutor::compare_values(&a[idx], &b[idx])
-                        .unwrap_or(std::cmp::Ordering::Equal);
+                    // NULL ordering: NULLs sort last in ASC, first in DESC
+                    // (matches apply_order_by, the non-GROUP-BY ORDER BY path).
+                    let cmp = compare_with_nulls(&a[idx], &b[idx]);
+                    let cmp = if asc { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
-                        return if asc { cmp } else { cmp.reverse() };
+                        return cmp;
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -16688,10 +16899,12 @@ impl QueryExecutor {
 
             result_rows.sort_by(|a, b| {
                 for &(idx, asc) in &order_specs {
-                    let cmp = QueryExecutor::compare_values(&a[idx], &b[idx])
-                        .unwrap_or(std::cmp::Ordering::Equal);
+                    // NULL ordering: NULLs sort last in ASC, first in DESC
+                    // (matches apply_order_by, the non-GROUP-BY ORDER BY path).
+                    let cmp = compare_with_nulls(&a[idx], &b[idx]);
+                    let cmp = if asc { cmp } else { cmp.reverse() };
                     if cmp != std::cmp::Ordering::Equal {
-                        return if asc { cmp } else { cmp.reverse() };
+                        return cmp;
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -16751,36 +16964,44 @@ impl QueryExecutor {
                 let mut float_sum: f64 = 0.0;
                 let mut has_float = false;
                 let mut has_value = false;
-                for row in rows {
-                    if let Some(pos) = agg.col_pos {
-                        if let Some(val) = row.get(pos) {
-                            match val {
-                                Value::Integer(i) => {
-                                    has_value = true;
-                                    if has_float {
-                                        float_sum += *i as f64;
-                                    } else if let Some(s) = int_sum.checked_add(*i) {
-                                        int_sum = s;
-                                    } else {
-                                        has_float = true;
-                                        float_sum = int_sum as f64 + *i as f64;
-                                    }
-                                }
-                                Value::Float(f) => {
-                                    has_value = true;
-                                    if !has_float {
-                                        has_float = true;
-                                        float_sum = int_sum as f64;
-                                    }
-                                    float_sum += *f;
-                                }
-                                Value::Null => {}
-                                _ => {
-                                    return Err(MoteDBError::TypeError(
-                                        "SUM requires numeric values".to_string(),
-                                    ))
-                                }
+                // DISTINCT: dedup non-NULL values first.
+                let distinct_vals: Vec<Value> = if agg.distinct {
+                    collect_distinct_positional(agg.col_pos, rows)
+                } else {
+                    Vec::new()
+                };
+                let iter_vals = distinct_vals.into_iter();
+                let iter: Box<dyn Iterator<Item = Value>> = if agg.distinct {
+                    Box::new(iter_vals)
+                } else {
+                    Box::new(rows.iter().filter_map(|r| agg.col_pos.and_then(|p| r.get(p).cloned())))
+                };
+                for val in iter {
+                    match val {
+                        Value::Integer(i) => {
+                            has_value = true;
+                            if has_float {
+                                float_sum += i as f64;
+                            } else if let Some(s) = int_sum.checked_add(i) {
+                                int_sum = s;
+                            } else {
+                                has_float = true;
+                                float_sum = int_sum as f64 + i as f64;
                             }
+                        }
+                        Value::Float(f) => {
+                            has_value = true;
+                            if !has_float {
+                                has_float = true;
+                                float_sum = int_sum as f64;
+                            }
+                            float_sum += f;
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(MoteDBError::TypeError(
+                                "SUM requires numeric values".to_string(),
+                            ))
                         }
                     }
                 }
@@ -16795,25 +17016,31 @@ impl QueryExecutor {
             "AVG" => {
                 let mut sum = 0.0;
                 let mut count = 0;
-                for row in rows {
-                    if let Some(pos) = agg.col_pos {
-                        if let Some(val) = row.get(pos) {
-                            match val {
-                                Value::Integer(i) => {
-                                    sum += *i as f64;
-                                    count += 1;
-                                }
-                                Value::Float(f) => {
-                                    sum += *f;
-                                    count += 1;
-                                }
-                                Value::Null => {}
-                                _ => {
-                                    return Err(MoteDBError::TypeError(
-                                        "AVG requires numeric values".to_string(),
-                                    ))
-                                }
-                            }
+                let distinct_vals: Vec<Value> = if agg.distinct {
+                    collect_distinct_positional(agg.col_pos, rows)
+                } else {
+                    Vec::new()
+                };
+                let iter: Box<dyn Iterator<Item = Value>> = if agg.distinct {
+                    Box::new(distinct_vals.into_iter())
+                } else {
+                    Box::new(rows.iter().filter_map(|r| agg.col_pos.and_then(|p| r.get(p).cloned())))
+                };
+                for val in iter {
+                    match val {
+                        Value::Integer(i) => {
+                            sum += i as f64;
+                            count += 1;
+                        }
+                        Value::Float(f) => {
+                            sum += f;
+                            count += 1;
+                        }
+                        Value::Null => {}
+                        _ => {
+                            return Err(MoteDBError::TypeError(
+                                "AVG requires numeric values".to_string(),
+                            ))
                         }
                     }
                 }
@@ -16825,23 +17052,31 @@ impl QueryExecutor {
             }
             "MIN" => {
                 let mut min_val: Option<Value> = None;
+                let mut seen: Option<HashSet<Value>> =
+                    if agg.distinct { Some(HashSet::new()) } else { None };
                 for row in rows {
                     if let Some(pos) = agg.col_pos {
                         if let Some(val) = row.get(pos) {
-                            if !matches!(val, Value::Null) {
-                                min_val = Some(match min_val {
-                                    None => val.clone(),
-                                    Some(current) => {
-                                        if val.partial_cmp(&current)
-                                            == Some(std::cmp::Ordering::Less)
-                                        {
-                                            val.clone()
-                                        } else {
-                                            current
-                                        }
-                                    }
-                                });
+                            if matches!(val, Value::Null) {
+                                continue;
                             }
+                            if let Some(ref mut s) = seen {
+                                if !s.insert(val.clone()) {
+                                    continue;
+                                }
+                            }
+                            min_val = Some(match min_val {
+                                None => val.clone(),
+                                Some(current) => {
+                                    if val.partial_cmp(&current)
+                                        == Some(std::cmp::Ordering::Less)
+                                    {
+                                        val.clone()
+                                    } else {
+                                        current
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -16849,23 +17084,31 @@ impl QueryExecutor {
             }
             "MAX" => {
                 let mut max_val: Option<Value> = None;
+                let mut seen: Option<HashSet<Value>> =
+                    if agg.distinct { Some(HashSet::new()) } else { None };
                 for row in rows {
                     if let Some(pos) = agg.col_pos {
                         if let Some(val) = row.get(pos) {
-                            if !matches!(val, Value::Null) {
-                                max_val = Some(match max_val {
-                                    None => val.clone(),
-                                    Some(current) => {
-                                        if val.partial_cmp(&current)
-                                            == Some(std::cmp::Ordering::Greater)
-                                        {
-                                            val.clone()
-                                        } else {
-                                            current
-                                        }
-                                    }
-                                });
+                            if matches!(val, Value::Null) {
+                                continue;
                             }
+                            if let Some(ref mut s) = seen {
+                                if !s.insert(val.clone()) {
+                                    continue;
+                                }
+                            }
+                            max_val = Some(match max_val {
+                                None => val.clone(),
+                                Some(current) => {
+                                    if val.partial_cmp(&current)
+                                        == Some(std::cmp::Ordering::Greater)
+                                    {
+                                        val.clone()
+                                    } else {
+                                        current
+                                    }
+                                }
+                            });
                         }
                     }
                 }
