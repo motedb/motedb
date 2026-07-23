@@ -457,3 +457,48 @@ fn test_multi_segment_recovery() {
     let db = open_db_at(&path);
     assert_eq!(count_rows(&db, "SELECT * FROM t"), 1000);
 }
+
+// ─── Reopen INSERT latency (group-commit recovery regression) ───────────
+// After close()+open(), every single-row INSERT was hitting the 2-second
+// group_commit_append timeout because recover() called flush_group_commit_queue
+// which set should_stop on the freshly-started gc thread, leaving no live
+// consumer. This test asserts reopen INSERTs stay well under that timeout.
+
+#[test]
+fn test_reopen_single_row_insert_is_fast() {
+    use std::time::Instant;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // 🔑 Use the DEFAULT config (GroupCommit durability) — the bug only
+    // reproduces under group-commit, which the for_edge() config used elsewhere
+    // in this file disables (Periodic).
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        for i in 1..=20 {
+            db.execute(&format!("INSERT INTO t VALUES ({}, 1)", i)).unwrap();
+        }
+        db.close().unwrap();
+        drop(db);
+    }
+
+    let db = Database::open(&path).unwrap();
+    // After reopen, a single-row INSERT must not hit the group-commit timeout
+    // (2s). Bound it well below that — 500ms is generous even on a slow CI box.
+    for i in 21..=25 {
+        let t = Instant::now();
+        db.execute(&format!("INSERT INTO t VALUES ({}, 2)", i)).unwrap();
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed.as_millis() < 500,
+            "reopen INSERT #{} took {:?} (group-commit thread likely wedged)",
+            i,
+            elapsed
+        );
+    }
+    let r = db.execute("SELECT COUNT(*) FROM t").unwrap().materialize().unwrap();
+    if let motedb::QueryResult::Select { rows, .. } = r {
+        assert_eq!(rows[0][0], motedb::types::Value::Integer(25));
+    }
+}

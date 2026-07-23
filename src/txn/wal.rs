@@ -1997,29 +1997,32 @@ impl WALManager {
     /// Called before `recover()` so in-flight records are visible on disk.
     pub fn flush_group_commit_queue(&self) {
         if let Some(ref gc) = self.group_commit {
-            // Stop the background thread so it stops competing for the queue.
-            gc.should_stop.store(true, Ordering::Relaxed);
-            gc.state.wakeup.notify_all();
-
-            // Wait for the background thread to exit (it has a final drain in its
-            // shutdown path). Poll the queue until empty, then give the thread time
-            // to finish its in-flight writes.
+            // 🔑 Do NOT stop the background thread here. The previous code set
+            // should_stop=true to get a clean drain, but recover() calls this on
+            // every open() — and open_with_config starts the gc thread *before*
+            // recover() runs. So this killed the freshly-started gc thread,
+            // leaving group_commit set but with no live consumer. Every INSERT
+            // after reopen then queued an entry nobody processed, hitting the
+            // 2-second group_commit_append timeout on each single-row write.
+            //
+            // Instead: wake the thread so it drains promptly, give it a short
+            // window to process in-flight entries, then take a final drain under
+            // the queue lock ourselves (the gc thread cooperates on the same lock).
             let deadline = std::time::Instant::now() + Duration::from_millis(200);
-            loop {
-                let queue_len = gc.state.queue.lock().len();
-                if queue_len == 0 {
-                    // Extra sleep to let the thread finish writing its last batch
+            while std::time::Instant::now() < deadline {
+                gc.state.wakeup.notify_all();
+                if gc.state.queue.lock().is_empty() {
+                    // Let the thread finish any in-flight batch_append.
                     std::thread::sleep(Duration::from_millis(5));
                     break;
                 }
-                if std::time::Instant::now() > deadline {
-                    break;
-                }
-                gc.state.wakeup.notify_all();
                 std::thread::sleep(Duration::from_micros(500));
             }
 
-            // Safety net: drain anything still left (e.g. thread didn't finish in time)
+            // Safety net: drain anything still left under the lock. The gc thread
+            // uses the same queue lock, so this is race-free — at worst we steal
+            // entries it was about to process, and it will find an empty queue on
+            // its next iteration (harmless).
             let entries: Vec<GroupCommitEntry> = {
                 let mut queue = gc.state.queue.lock();
                 std::mem::take(&mut *queue)
