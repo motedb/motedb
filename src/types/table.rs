@@ -109,6 +109,10 @@ pub struct ColumnDef {
     /// 🚀 Phase 4: AUTO_INCREMENT 起始值 (默认为 1)
     #[serde(default)]
     pub auto_increment_start: Option<i64>,
+    /// DEFAULT value for the column (used by ALTER TABLE ADD COLUMN ...
+    /// DEFAULT x to backfill existing rows on read).
+    #[serde(default)]
+    pub default_value: Option<crate::types::Value>,
 }
 
 impl ColumnDef {
@@ -120,6 +124,7 @@ impl ColumnDef {
             nullable: true,
             auto_increment: false,
             auto_increment_start: None,
+            default_value: None,
         }
     }
 

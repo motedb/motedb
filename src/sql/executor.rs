@@ -21336,6 +21336,7 @@ mod tests {
                 nullable: false,
                 auto_increment: false,
                 auto_increment_start: None,
+                default_value: None,
             },
             ColumnDef {
                 name: "name".into(),
@@ -21344,6 +21345,7 @@ mod tests {
                 nullable: true,
                 auto_increment: false,
                 auto_increment_start: None,
+                default_value: None,
             },
             ColumnDef {
                 name: "score".into(),
@@ -21352,6 +21354,7 @@ mod tests {
                 nullable: true,
                 auto_increment: false,
                 auto_increment_start: None,
+                default_value: None,
             },
             ColumnDef {
                 name: "active".into(),
@@ -21360,6 +21363,7 @@ mod tests {
                 nullable: true,
                 auto_increment: false,
                 auto_increment_start: None,
+                default_value: None,
             },
         ];
         TableSchema::new("t".into(), columns)

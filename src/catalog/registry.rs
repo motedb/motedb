@@ -213,6 +213,9 @@ impl TableRegistry {
         let pos = schema.columns.len();
         let mut col_def = crate::types::ColumnDef::new(col_name.to_string(), col_type, pos);
         col_def.nullable = true; // ALTER-added columns are always nullable
+        // Store the DEFAULT so existing rows read back the default value
+        // (rather than NULL) for the new column.
+        col_def.default_value = default_value.cloned();
         schema.columns.push(col_def);
         schema.rebuild_column_map();
 
