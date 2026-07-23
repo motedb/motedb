@@ -386,27 +386,32 @@ fn order_by_asc_with_nulls_deterministic() {
 
 #[test]
 fn min_max_on_text_lexicographic_currently_null() {
-    // ⚠️ KNOWN LIMITATION: MIN/MAX on a TEXT column currently returns NULL
-    // (or in older versions, Integer(0)) instead of the lexicographically
-    // smallest/largest text value. The numeric aggregate fast paths
-    // (col_segment_multi_aggregate, aggregate_filtered, single_pass_group_by)
-    // only track int/float min/max — TEXT values aren't represented.
-    //
-    // Documented here so the limitation is known. A future fix would need
-    // to either (a) add min_text/max_text fields to AggregateResult and
-    // thread them through, or (b) consistently fall back to the materialized
-    // path (compute_aggregate_positional) which DOES handle TEXT correctly.
+    // MIN/MAX on a TEXT column returns the lexicographically smallest/largest
+    // value. (Previously this returned NULL — a known limitation of the numeric
+    // aggregate fast paths. The materialized path now handles TEXT correctly.)
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
     exec(&db, "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')");
     let r = rows(&db, "SELECT MIN(s) FROM t");
-    // Current behavior: NULL (incorrect — should be 'apple').
-    // Test asserts the *current* behavior; a fix must update this test.
-    assert!(
-        matches!(&r[0][0], Value::Null),
-        "MIN on TEXT returns NULL (known limitation); got {:?}",
-        r[0][0]
-    );
+    assert_eq!(r.len(), 1);
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(
+            s.as_str(),
+            "apple",
+            "MIN on TEXT should be lexicographically smallest"
+        ),
+        other => panic!("MIN on TEXT should return 'apple', got {:?}", other),
+    }
+    let r = rows(&db, "SELECT MAX(s) FROM t");
+    assert_eq!(r.len(), 1);
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(
+            s.as_str(),
+            "cherry",
+            "MAX on TEXT should be lexicographically largest"
+        ),
+        other => panic!("MAX on TEXT should return 'cherry', got {:?}", other),
+    }
 }
 
 #[test]

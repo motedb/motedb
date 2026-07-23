@@ -407,18 +407,19 @@ fn test_concat_skips_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (a TEXT, b TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES ('hello', NULL)").unwrap();
-    // concat skips NULL args (Postgres concat() semantics).
+    // CONCAT propagates NULL: any NULL argument yields NULL (standard SQL /
+    // MySQL CONCAT semantics). Use COALESCE to skip NULLs.
     let r = q(&db, "SELECT concat('a', NULL, 'b')");
-    assert_eq!(r[0][0], Value::text("ab".to_string()));
+    assert_eq!(r[0][0], Value::Null);
     let r = q(&db, "SELECT concat(a, b) FROM t");
-    assert_eq!(r[0][0], Value::text("hello".to_string()));
+    assert_eq!(r[0][0], Value::Null);
 }
 
 #[test]
 fn test_concat_all_null() {
     let (db, _d) = db();
     let r = q(&db, "SELECT concat(NULL, NULL)");
-    assert_eq!(r[0][0], Value::text("".to_string()));
+    assert_eq!(r[0][0], Value::Null);
 }
 
 #[test]

@@ -4663,6 +4663,21 @@ impl QueryExecutor {
                         }
                     }
                     if !result_rows.is_empty() {
+                        // 🚨 Apply OFFSET/LIMIT. This index point-lookup path
+                        // returns ALL matching rows; without truncation,
+                        // `SELECT ... WHERE cat='c0' LIMIT 5` returned all 20
+                        // matches. (ORDER BY should not reach here — the
+                        // optimizer routes ordered queries away from PointQuery
+                        // — but guard anyway.)
+                        let offset = stmt.offset.unwrap_or(0);
+                        if offset >= result_rows.len() {
+                            result_rows.clear();
+                        } else if offset > 0 {
+                            result_rows.drain(..offset);
+                        }
+                        if let Some(lim) = stmt.limit {
+                            result_rows.truncate(lim);
+                        }
                         return Ok(StreamingQueryResult::SelectReady {
                             columns,
                             rows: result_rows,
@@ -9795,7 +9810,7 @@ impl QueryExecutor {
                             let _ = write!(result, "{}", f);
                         }
                         Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                        Value::Null => { /* skip NULL (Postgres concat() semantics) */ }
+                        Value::Null => return Ok(Value::Null), /* NULL propagates */
                         other => result.push_str(&format!("{:?}", other)),
                     }
                 }
@@ -10284,7 +10299,7 @@ impl QueryExecutor {
                                     let _ = write!(result, "{}", f);
                                 }
                                 Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                                Value::Null => { /* skip NULL */ }
+                                Value::Null => return Ok(Value::Null), /* NULL propagates */
                                 other => result.push_str(&format!("{:?}", other)),
                             }
                         }

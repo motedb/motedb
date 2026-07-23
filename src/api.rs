@@ -1157,13 +1157,26 @@ impl Database {
         // treats this as a single SELECT, which would silently drop the right
         // side of the query. Check the tail after the parsed value for set-op
         // keywords and fall through to the full parser if present.
-        // (LIMIT / ORDER BY after the value are handled correctly by the
-        //  val_str split_whitespace().next() above — only set ops are fatal.)
         let after_val_pos = after_where[eq_pos + 1..].find(val_str).map(|p| eq_pos + 1 + p + val_str.len()).unwrap_or(after_where.len());
         let after_val = after_where[after_val_pos..].trim_start();
         if Self::starts_with_set_op(after_val) {
             return Ok(None);
         }
+
+        // 🚨 This fast path only implements `col = value` filtering followed by
+        // a direct row fetch — it does NOT apply ORDER BY / LIMIT / OFFSET /
+        // DISTINCT. Previously it silently ignored those trailing clauses,
+        // so `SELECT v FROM t WHERE cat='c0' ORDER BY v DESC LIMIT 5` returned
+        // ALL 20 matching rows instead of the top 5. If any such clause is
+        // present after the value, fall through to the full parser/executor
+        // which handles them correctly.
+        if Self::find_keyword_ci(after_val, "order").is_some()
+            || Self::find_keyword_ci(after_val, "limit").is_some()
+            || Self::find_keyword_ci(after_val, "offset").is_some()
+        {
+            return Ok(None);
+        }
+
 
         // Resolve schema
         let schema = match self.inner.table_registry.get_table(table_name) {
@@ -1185,6 +1198,13 @@ impl Database {
         // Must fall through to full SQL path for proper aggregation.
         let has_aggregates = Self::contains_aggregate_function(select_part);
         if has_aggregates {
+            return Ok(None);
+        }
+
+        // 🚨 DISTINCT: this fast path returns raw matching rows without dedup,
+        // so `SELECT DISTINCT cat FROM t WHERE ...` would return duplicates.
+        // Fall through to the full parser which applies DISTINCT correctly.
+        if Self::find_keyword_ci(select_part, "distinct").is_some() {
             return Ok(None);
         }
 

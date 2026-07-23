@@ -771,10 +771,10 @@ impl ExprEvaluator {
             // 🆕 String manipulation functions
             "concat" => {
                 // CONCAT(str1, str2, ...) - concatenate strings.
-                // NULL args are SKIPPED (Postgres concat() semantics), so
-                // concat('a', NULL, 'b') = 'ab'. Use `||` to propagate NULL.
-                let estimated_capacity = args.len() * 20;
-                let mut result = String::with_capacity(estimated_capacity);
+                // NULL propagates: any NULL argument yields NULL (standard SQL
+                // / MySQL CONCAT semantics). Use CONCAT_WS or COALESCE to skip
+                // NULLs.
+                let mut result = String::with_capacity(args.len() * 20);
                 for arg in args {
                     let val = self.eval(arg, row)?;
                     match val {
@@ -788,7 +788,7 @@ impl ExprEvaluator {
                             let _ = write!(result, "{}", f);
                         }
                         Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
-                        Value::Null => { /* skip NULL */ }
+                        Value::Null => return Ok(Value::Null),
                         _ => {
                             use std::fmt::Write;
                             let _ = write!(result, "{:?}", val);
