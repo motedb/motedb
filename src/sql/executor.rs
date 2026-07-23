@@ -4453,7 +4453,16 @@ impl QueryExecutor {
             super::optimizer::ScanMethod::FullScan { ref table } => {
                 // 🚀 DISTINCT via column value index: SELECT DISTINCT col FROM table
                 // without WHERE — iterate index keys directly (O(unique) vs O(N) scan).
-                if stmt.distinct && stmt.where_clause.is_none() && stmt.order_by.is_none() {
+                // 🚨 Guard LIMIT/OFFSET: this fast path returns ALL distinct values
+                // without truncation, so `SELECT DISTINCT cat LIMIT 2` would return
+                // all distinct values. Fall through to the full path which applies
+                // OFFSET/LIMIT over the deduplicated result.
+                if stmt.distinct
+                    && stmt.where_clause.is_none()
+                    && stmt.order_by.is_none()
+                    && stmt.limit.is_none()
+                    && stmt.offset.is_none()
+                {
                     if let Some(result) = self.try_distinct_via_column_index(stmt, table)? {
                         return Ok(result);
                     }

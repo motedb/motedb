@@ -390,3 +390,29 @@ fn all_six_aggregates_one_query() {
         o => panic!("{:?}", o),
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 16. DISTINCT + LIMIT with a column index (regression)
+//    try_distinct_via_column_index returned ALL distinct values, ignoring
+//    LIMIT/OFFSET. Only triggered when the DISTINCT column has an index.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn distinct_with_limit_and_index() {
+    let (db, _d) = new_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)");
+    for i in 0..20 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}')", i, i % 3));
+    }
+    exec(&db, "CREATE INDEX t_cat ON t(cat)");
+    db.checkpoint().unwrap();
+    db.wait_for_indexes_ready();
+
+    // Without index this already worked; with the index it returned 3 rows.
+    let r = rows(&db, "SELECT DISTINCT cat FROM t LIMIT 2");
+    assert_eq!(r.len(), 2, "DISTINCT cat LIMIT 2 must return 2 rows, got {}", r.len());
+
+    // OFFSET must also be respected over the deduplicated set.
+    let r = rows(&db, "SELECT DISTINCT cat FROM t LIMIT 2 OFFSET 1");
+    assert_eq!(r.len(), 2, "DISTINCT cat LIMIT 2 OFFSET 1 must return 2 rows");
+}
