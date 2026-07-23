@@ -1533,9 +1533,23 @@ pub struct QueryExecutor {
     optimizer: super::optimizer::QueryOptimizer,
     /// Store the last AUTO_INCREMENT value inserted (mirrors evaluator)
     last_insert_id: std::sync::atomic::AtomicI64,
-    /// Current transaction ID when inside BEGIN...COMMIT/ROLLBACK block.
-    /// None = auto-commit mode (each statement is its own transaction).
-    current_txn_id: parking_lot::Mutex<Option<u64>>,
+}
+
+// 🔑 Per-thread transaction context.
+//
+// `execute()` resolves the active transaction from this thread-local rather
+// than from a shared single-slot field. The previous design stored a single
+// `current_txn_id` in a `Mutex<Option<u64>>` on the executor, which is shared
+// across all threads holding an `Arc<Database>`. When multiple threads each
+// opened a transaction on the same `Database`, one thread's `begin` would
+// overwrite another's slot, and a third thread's `commit` would clear it —
+// producing "Transaction N not found" panics (see test_concurrent_transactions).
+//
+// Thread-local storage is correct here because the documented concurrency
+// model calls `execute()` on the same thread that called `begin_transaction()`,
+// so each thread independently tracks its own active transaction.
+thread_local! {
+    static CURRENT_TXN_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Determine if a CASE WHEN condition value is "true".
@@ -1597,7 +1611,6 @@ impl QueryExecutor {
             evaluator: ExprEvaluator::with_db(db.clone()),
             optimizer: super::optimizer::QueryOptimizer::new(db.clone()),
             last_insert_id: std::sync::atomic::AtomicI64::new(i64::MIN),
-            current_txn_id: parking_lot::Mutex::new(None),
             db,
         }
     }
@@ -1673,7 +1686,7 @@ impl QueryExecutor {
     /// For other statements: clones only the specific variant needed.
     /// Check if a transaction is active (for fast-path bypass).
     pub fn is_in_transaction(&self) -> bool {
-        self.current_txn_id.lock().is_some()
+        CURRENT_TXN_ID.with(|c| c.get().is_some())
     }
 
     /// Mark a transaction as active so subsequent execute() calls route writes
@@ -1682,17 +1695,17 @@ impl QueryExecutor {
     /// with the coordinator — without this, the executor would write directly
     /// to storage and rollback could not undo the writes.
     pub fn begin_txn_context(&self, txn_id: u64) {
-        *self.current_txn_id.lock() = Some(txn_id);
+        CURRENT_TXN_ID.with(|c| c.set(Some(txn_id)));
     }
 
     /// Clear the active transaction context (after commit or rollback).
     pub fn clear_txn_context(&self) {
-        *self.current_txn_id.lock() = None;
+        CURRENT_TXN_ID.with(|c| c.set(None));
     }
 
     /// Get the active transaction id, if any.
     pub fn current_txn_id(&self) -> Option<u64> {
-        *self.current_txn_id.lock()
+        CURRENT_TXN_ID.with(|c| c.get())
     }
 
     /// 🔑 Replay the transaction's undo log in reverse order, restoring the
@@ -1928,16 +1941,16 @@ impl QueryExecutor {
             }
             Statement::BeginTransaction => {
                 let txn_id = self.db.begin_transaction()?;
-                *self.current_txn_id.lock() = Some(txn_id);
+                self.begin_txn_context(txn_id);
                 StreamingQueryResult::Definition {
                     message: format!("Transaction {} started", txn_id),
                 }
             }
             Statement::CommitTransaction => {
-                let _txn_id_opt = *self.current_txn_id.lock();
+                let _txn_id_opt = self.current_txn_id();
                 if let Some(txn_id) = _txn_id_opt {
                     self.db.commit_transaction(txn_id)?;
-                    *self.current_txn_id.lock() = None;
+                    self.clear_txn_context();
                     StreamingQueryResult::Definition {
                         message: format!("Transaction {} committed", txn_id),
                     }
@@ -1948,7 +1961,7 @@ impl QueryExecutor {
                 }
             }
             Statement::RollbackTransaction => {
-                let _txn_id_opt = *self.current_txn_id.lock();
+                let _txn_id_opt = self.current_txn_id();
                 if let Some(txn_id) = _txn_id_opt {
                     // 🔑 Replay undo log BEFORE clearing the transaction context.
                     // execute_update/execute_delete recorded old values for rows
@@ -1991,7 +2004,7 @@ impl QueryExecutor {
                         }
                     }
                     self.db.rollback_transaction(txn_id)?;
-                    *self.current_txn_id.lock() = None;
+                    self.clear_txn_context();
                     StreamingQueryResult::Definition {
                         message: format!("Transaction {} rolled back", txn_id),
                     }
@@ -17698,7 +17711,7 @@ impl QueryExecutor {
 
         // Track last_insert_id for AUTO_INCREMENT primary key
         // If inside an explicit transaction, buffer INSERTs via coordinator write_set.
-        let txn_id: Option<u64> = *self.current_txn_id.lock();
+        let txn_id: Option<u64> = self.current_txn_id();
         let mut last_row_id: Option<u64> = None;
 
         if has_vector_column && prepared_rows.len() > 1 {
@@ -17872,7 +17885,7 @@ impl QueryExecutor {
             }
 
             // 🔑 Record undo delta for transactional UPDATE (so ROLLBACK can restore).
-            let txn_id = *self.current_txn_id.lock();
+            let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
@@ -17972,7 +17985,7 @@ impl QueryExecutor {
             }
 
             // 🔑 Record undo delta for transactional DELETE (so ROLLBACK can restore).
-            let txn_id = *self.current_txn_id.lock();
+            let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
@@ -18117,7 +18130,7 @@ impl QueryExecutor {
             }
 
             // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
-            let txn_id = *self.current_txn_id.lock();
+            let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
@@ -18157,7 +18170,7 @@ impl QueryExecutor {
             };
 
             // 🔑 Record undo delta for transactional DELETE (PK fast path).
-            let txn_id = *self.current_txn_id.lock();
+            let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
@@ -18220,7 +18233,7 @@ impl QueryExecutor {
             }
 
             // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
-            let txn_id = *self.current_txn_id.lock();
+            let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
@@ -18268,7 +18281,7 @@ impl QueryExecutor {
             }
 
             // 🔑 Record undo delta for transactional DELETE (PK/index fast path).
-            let txn_id = *self.current_txn_id.lock();
+            let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
                 let _ = self.db.txn_coordinator.record_write_delta(
                     tid,
@@ -18959,7 +18972,7 @@ impl QueryExecutor {
     /// Execute BEGIN [TRANSACTION]
     fn execute_begin_transaction(&self) -> Result<QueryResult> {
         let txn_id = self.db.begin_transaction()?;
-        *self.current_txn_id.lock() = Some(txn_id);
+        self.begin_txn_context(txn_id);
         Ok(QueryResult::Definition {
             message: format!("Transaction {} started", txn_id),
         })
@@ -18967,10 +18980,10 @@ impl QueryExecutor {
 
     /// Execute COMMIT [TRANSACTION]
     fn execute_commit_transaction(&self) -> Result<QueryResult> {
-        let _txn_id_opt = *self.current_txn_id.lock();
+        let _txn_id_opt = self.current_txn_id();
         if let Some(txn_id) = _txn_id_opt {
             self.db.commit_transaction(txn_id)?;
-            *self.current_txn_id.lock() = None;
+            self.clear_txn_context();
             Ok(QueryResult::Definition {
                 message: format!("Transaction {} committed", txn_id),
             })
@@ -18983,10 +18996,10 @@ impl QueryExecutor {
 
     /// Execute ROLLBACK [TRANSACTION]
     fn execute_rollback_transaction(&self) -> Result<QueryResult> {
-        let _txn_id_opt = *self.current_txn_id.lock();
+        let _txn_id_opt = self.current_txn_id();
         if let Some(txn_id) = _txn_id_opt {
             self.db.rollback_transaction(txn_id)?;
-            *self.current_txn_id.lock() = None;
+            self.clear_txn_context();
             Ok(QueryResult::Definition {
                 message: format!("Transaction {} rolled back", txn_id),
             })
