@@ -730,3 +730,116 @@ fn test_avg_distinct_negative_values() {
         _ => panic!("expected Float"),
     }
 }
+
+// =========================================================================
+// Round 2 additions: CAST(x AS type) standard SQL syntax + substr edges
+// =========================================================================
+
+#[test]
+fn test_cast_as_integer_syntax() {
+    // CAST(x AS INTEGER) — standard SQL syntax was previously a parse error.
+    let (db, _d) = db();
+    let r = q(&db, "SELECT CAST(3.14 AS INTEGER)");
+    assert_eq!(r[0][0], Value::Integer(3));
+}
+
+#[test]
+fn test_cast_as_int_alias() {
+    let (db, _d) = db();
+    let r = q(&db, "SELECT CAST(3.7 AS INT)");
+    assert_eq!(r[0][0], Value::Integer(3));
+}
+
+#[test]
+fn test_cast_as_text() {
+    let (db, _d) = db();
+    let r = q(&db, "SELECT CAST(42 AS TEXT)");
+    assert_eq!(r[0][0], Value::text("42".to_string()));
+}
+
+#[test]
+fn test_cast_as_float() {
+    let (db, _d) = db();
+    let r = q(&db, "SELECT CAST(42 AS FLOAT)");
+    assert_eq!(r[0][0], Value::Float(42.0));
+}
+
+#[test]
+fn test_cast_null() {
+    let (db, _d) = db();
+    let r = q(&db, "SELECT CAST(NULL AS INT)");
+    assert_eq!(r[0][0], Value::Null);
+}
+
+#[test]
+fn test_cast_string_to_int() {
+    let (db, _d) = db();
+    let r = q(&db, "SELECT CAST('42' AS INTEGER)");
+    assert_eq!(r[0][0], Value::Integer(42));
+}
+
+#[test]
+fn test_cast_in_where_clause() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (v FLOAT)").unwrap();
+    db.execute("INSERT INTO t VALUES (3.14), (2.71), (3.99)").unwrap();
+    // CAST(v AS INT) = 3 should match 3.14 and 3.99 (both truncate to 3).
+    let r = q(&db, "SELECT COUNT(*) FROM t WHERE CAST(v AS INT) = 3");
+    assert_eq!(r[0][0], Value::Integer(2));
+}
+
+#[test]
+fn test_cast_in_select_projection() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (v FLOAT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1.5), (2.5)").unwrap();
+    let r = q(&db, "SELECT CAST(v AS INT) FROM t ORDER BY v");
+    assert_eq!(r[0][0], Value::Integer(1));
+    assert_eq!(r[1][0], Value::Integer(2));
+}
+
+#[test]
+fn test_cast_preserves_function_form() {
+    // The lowercase cast(value, 'TYPE') function form must still work.
+    let (db, _d) = db();
+    let r = q(&db, "SELECT cast(3.14, 'INTEGER')");
+    assert_eq!(r[0][0], Value::Integer(3));
+}
+
+#[test]
+fn test_cast_lowercase_keyword() {
+    let (db, _d) = db();
+    let r = q(&db, "SELECT cast(3.14 as integer)");
+    assert_eq!(r[0][0], Value::Integer(3));
+}
+
+#[test]
+fn test_substr_negative_in_range() {
+    let (db, _d) = db();
+    assert_eq!(q(&db, "SELECT substr('abc', -1)")[0][0], Value::text("c".to_string()));
+    assert_eq!(q(&db, "SELECT substr('abc', -2)")[0][0], Value::text("bc".to_string()));
+    assert_eq!(q(&db, "SELECT substr('abc', -3)")[0][0], Value::text("abc".to_string()));
+}
+
+#[test]
+fn test_substr_negative_out_of_range() {
+    // SQLite: substr(s, -n) where n >= length returns the whole string.
+    let (db, _d) = db();
+    assert_eq!(q(&db, "SELECT substr('abc', -4)")[0][0], Value::text("abc".to_string()));
+    assert_eq!(q(&db, "SELECT substr('abc', -10)")[0][0], Value::text("abc".to_string()));
+}
+
+#[test]
+fn test_substr_zero_start() {
+    // 0 is treated as position 1 (SQL standard).
+    let (db, _d) = db();
+    assert_eq!(q(&db, "SELECT substr('abc', 0)")[0][0], Value::text("abc".to_string()));
+    assert_eq!(q(&db, "SELECT substr('abc', 1)")[0][0], Value::text("abc".to_string()));
+}
+
+#[test]
+fn test_substr_with_length() {
+    let (db, _d) = db();
+    assert_eq!(q(&db, "SELECT substr('abcdef', 2, 3)")[0][0], Value::text("bcd".to_string()));
+    assert_eq!(q(&db, "SELECT substr('abcdef', -3, 2)")[0][0], Value::text("de".to_string()));
+}

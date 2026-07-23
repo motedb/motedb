@@ -1264,6 +1264,51 @@ impl Parser {
                     // Check for DISTINCT keyword (COUNT(DISTINCT column))
                     let distinct = self.match_token(TokenType::Distinct);
 
+                    // 🔑 CAST(expr AS type) — standard SQL syntax. Parse the
+                    // value expression, expect AS, then read the type name, and
+                    // lower to the existing cast(value, 'TYPE') function form.
+                    // The 2-arg function form cast(value, 'TYPE') (comma-separated)
+                    // is handled by the generic function-call path below.
+                    if name.eq_ignore_ascii_case("CAST") && !distinct {
+                        let value = self.parse_expr(0)?;
+                        // AS keyword → standard CAST syntax.
+                        // Comma → legacy cast(value, type) function form.
+                        if self.match_token(TokenType::As) {
+                            // The target type is a keyword token (Integer/Float/...)
+                            // in the lexer, so we can't use parse_identifier here.
+                            let type_name = match self.current().token_type {
+                                TokenType::Integer => "INTEGER".to_string(),
+                                TokenType::BigInt => "BIGINT".to_string(),
+                                TokenType::Float => "FLOAT".to_string(),
+                                TokenType::Text => "TEXT".to_string(),
+                                TokenType::Boolean => "BOOLEAN".to_string(),
+                                TokenType::Timestamp => "TIMESTAMP".to_string(),
+                                TokenType::Identifier(ref s) => s.to_uppercase(),
+                                _ => return Err(self.error("Expected type name in CAST")),
+                            };
+                            self.advance();
+                            self.expect(TokenType::RParen)?;
+                            return Ok(Expr::FunctionCall {
+                                name: "cast".to_string(),
+                                args: vec![value, Expr::Literal(Value::text(type_name))],
+                                distinct: false,
+                            });
+                        } else if self.match_token(TokenType::Comma) {
+                            // Legacy function form: cast(value, 'TYPE').
+                            let type_arg = self.parse_expr(0)?;
+                            self.expect(TokenType::RParen)?;
+                            return Ok(Expr::FunctionCall {
+                                name: "cast".to_string(),
+                                args: vec![value, type_arg],
+                                distinct: false,
+                            });
+                        } else {
+                            return Err(
+                                self.error("Expected AS or ',' in CAST(expr AS type)")
+                            );
+                        }
+                    }
+
                     let args = if matches!(self.current().token_type, TokenType::RParen) {
                         Vec::new()
                     } else if matches!(self.current().token_type, TokenType::Star) {

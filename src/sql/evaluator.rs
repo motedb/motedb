@@ -813,13 +813,20 @@ impl ExprEvaluator {
                         ))
                     }
                 };
+                let char_count = text.chars().count();
                 let start = match self.eval(&args[1], row)? {
                     // SQL standard: position is 1-indexed; 0 is treated as 1
                     Value::Integer(i) if i >= 0 => (i.max(1) as usize) - 1,
-                    // Negative position counts from end of string
+                    // Negative position counts from end of string.
+                    // SQLite: if abs(start) >= length, start from position 1
+                    // (the whole string). Otherwise start at (length - abs(start)).
                     Value::Integer(i) if i < 0 => {
                         let from_end = (-i) as usize;
-                        text.chars().count().saturating_sub(from_end)
+                        if from_end >= char_count {
+                            0
+                        } else {
+                            char_count - from_end
+                        }
                     }
                     _ => return Ok(Value::text(String::new())),
                 };
