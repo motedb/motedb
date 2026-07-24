@@ -4685,12 +4685,33 @@ impl QueryExecutor {
                         }
                     }
                     if !result_rows.is_empty() {
-                        // 🚨 Apply OFFSET/LIMIT. This index point-lookup path
-                        // returns ALL matching rows; without truncation,
-                        // `SELECT ... WHERE cat='c0' LIMIT 5` returned all 20
-                        // matches. (ORDER BY should not reach here — the
-                        // optimizer routes ordered queries away from PointQuery
-                        // — but guard anyway.)
+                        // 🚨 Apply post_filters BEFORE project/limit. This
+                        // index point-lookup returns rows matching the single
+                        // indexed predicate (e.g. a=1); a compound WHERE like
+                        // `a=1 AND b=2` carries the full predicate as a
+                        // post_filter, and without applying it here the
+                        // `AND b=2` side was silently dropped (7 rows instead
+                        // of 1). Note: result_rows are already projected above,
+                        // but post_filters reference schema columns — so we
+                        // keep the full decoded rows for filtering.
+                        // (Re-fetch full rows for filtering since we projected.)
+                        let filtered: Vec<Vec<Value>> = if post_filters.is_empty() {
+                            result_rows
+                        } else {
+                            let mut kept = Vec::with_capacity(result_rows.len());
+                            for (_, row_opt) in self.db.get_table_rows_batch(table, &row_ids)? {
+                                if let Some(row) = row_opt {
+                                    if Self::row_passes_post_filters(&row, post_filters, &schema) {
+                                        kept.push(Self::project_row_direct(
+                                            &row, &stmt.columns, &columns, &schema,
+                                        ));
+                                    }
+                                }
+                            }
+                            kept
+                        };
+                        let mut result_rows = filtered;
+                        // 🚨 Apply OFFSET/LIMIT (after post_filter).
                         let offset = stmt.offset.unwrap_or(0);
                         if offset >= result_rows.len() {
                             result_rows.clear();

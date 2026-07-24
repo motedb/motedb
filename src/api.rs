@@ -1177,6 +1177,17 @@ impl Database {
             return Ok(None);
         }
 
+        // 🚨 Compound predicates: this fast path only implements a single
+        // `col = value` filter. `a = 1 AND b = 2` was parsed as `a = 1` (the
+        // value parser took "1" via split_whitespace, dropping `AND b = 2`),
+        // returning rows matching only the first predicate. Fall through to
+        // the full parser/executor if AND follows the value.
+        // (OR is excluded for now — the full executor's OR path has a
+        // separate performance issue under indexed columns; AND is the
+        // critical correctness case.)
+        if Self::find_keyword_ci(after_val, "and").is_some() {
+            return Ok(None);
+        }
 
         // Resolve schema
         let schema = match self.inner.table_registry.get_table(table_name) {

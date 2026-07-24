@@ -627,3 +627,49 @@ fn test_spatial_update_and_reread() {
         "Updated point should be nearest to (5,5)"
     );
 }
+
+// === Compound AND predicate on indexed columns (regression) ===
+// WHERE a=1 AND b=2 with indexes on both a and b returned all a=1 rows
+// (the second predicate was dropped). Two bugs: try_fast_select parsed only
+// the first `col = value`, and the PointQuery executor skipped post_filters.
+
+#[test]
+fn test_compound_and_both_indexed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX t_a ON t(a)").unwrap();
+        db.execute("CREATE INDEX t_b ON t(b)").unwrap();
+        // Insert rows where a=1 is common but a=1 AND b=2 is rare.
+        db.execute("INSERT INTO t VALUES (1, 1, 1)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 1, 2)").unwrap();  // only this matches a=1 AND b=2
+        db.execute("INSERT INTO t VALUES (3, 1, 3)").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 2, 2)").unwrap();
+        db.execute("INSERT INTO t VALUES (5, 1, 2)").unwrap();  // also matches
+        db.checkpoint().unwrap();
+        db.wait_for_indexes_ready();
+    }
+    let db = Database::open(&path).unwrap();
+    // a=1 AND b=2 should return exactly id=2 and id=5 (NOT all a=1 rows).
+    let r = db.execute("SELECT id FROM t WHERE a = 1 AND b = 2").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    let mut ids: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
+    }).collect();
+    ids.sort();
+    assert_eq!(ids, vec![2, 5], "a=1 AND b=2 must apply both predicates, got {:?}", ids);
+
+    // Single predicate still works.
+    let r = db.execute("SELECT id FROM t WHERE a = 1").unwrap();
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    assert_eq!(rows.len(), 4, "a=1 alone should return 4 rows");
+}
