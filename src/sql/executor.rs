@@ -9853,39 +9853,21 @@ impl QueryExecutor {
                     _ => Ok(Value::Null),
                 }
             }
-            "abs" | "round" | "floor" | "ceil" | "log" | "ln" | "log10" | "sqrt" | "exp" => {
+            "abs" => {
+                // 🔑 Only ABS is handled here (it's divergence-free: Integer→Integer,
+                // Float→Float, with i64::MIN overflow → Float). round/floor/ceil/
+                // log/ln/log10/sqrt/exp previously had bugs in this path (ROUND
+                // ignored its decimals arg; SQRT/LN/LOG returned NaN/-inf on
+                // negative/zero). They now fall through to the evaluator fallback
+                // below for correct, consistent semantics.
                 let val = Self::eval_expr_on_row(&args[0], row, schema)?;
                 match val {
-                    Value::Integer(i) => match fname.as_str() {
-                        "abs" => match i.checked_abs() {
-                            Some(n) => Ok(Value::Integer(n)),
-                            None => Ok(Value::Float(-(i as f64))),
-                        },
-                        _ => {
-                            let f = i as f64;
-                            Ok(Value::Float(match fname.as_str() {
-                                "round" => f.round(),
-                                "floor" => f.floor(),
-                                "ceil" => f.ceil(),
-                                "log" | "log10" => f.log10(),
-                                "ln" => f.ln(),
-                                "sqrt" => f.sqrt(),
-                                "exp" => f.exp(),
-                                _ => f,
-                            }))
-                        }
+                    Value::Integer(i) => match i.checked_abs() {
+                        Some(n) => Ok(Value::Integer(n)),
+                        None => Ok(Value::Float(-(i as f64))),
                     },
-                    Value::Float(f) => match fname.as_str() {
-                        "abs" => Ok(Value::Float(f.abs())),
-                        "round" => Ok(Value::Float(f.round())),
-                        "floor" => Ok(Value::Float(f.floor())),
-                        "ceil" => Ok(Value::Float(f.ceil())),
-                        "log" | "log10" => Ok(Value::Float(f.log10())),
-                        "ln" => Ok(Value::Float(f.ln())),
-                        "sqrt" => Ok(Value::Float(f.sqrt())),
-                        "exp" => Ok(Value::Float(f.exp())),
-                        _ => Ok(Value::Float(f)),
-                    },
+                    Value::Float(f) => Ok(Value::Float(f.abs())),
+                    Value::Null => Ok(Value::Null),
                     _ => Ok(Value::Null),
                 }
             }
