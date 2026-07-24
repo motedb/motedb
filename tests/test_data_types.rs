@@ -362,3 +362,48 @@ fn test_wide_table() {
     assert_eq!(&r[1], &Value::Integer(5));
     assert_eq!(&r[2], &Value::Integer(10));
 }
+
+// === Large text values: columnar format caps text at 65534 bytes ===
+// Regression: previously, text > 65534 bytes was silently truncated to 65534
+// (the u16 length prefix, with 0xFFFF reserved as NULL sentinel), causing
+// silent data loss. Now it errors loudly.
+
+#[test]
+fn test_oversized_text_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+
+    // A value just under the limit (65534 bytes) stores and round-trips fine.
+    let near_max = "a".repeat(65534);
+    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", near_max)).unwrap();
+    let r = row(db.execute("SELECT length(s) FROM t WHERE id = 1").unwrap());
+    assert_eq!(r[0], Value::Integer(65534));
+
+    // A value over the limit must error, not silently truncate.
+    let too_big = "b".repeat(100_000);
+    let result = db.execute(&format!("INSERT INTO t VALUES (2, '{}')", too_big));
+    assert!(
+        result.is_err(),
+        "oversized text should be rejected, not truncated"
+    );
+    // Confirm no partial row was written.
+    let r = row(db.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(r[0], Value::Integer(1));
+}
+
+#[test]
+fn test_normal_text_unaffected_by_cap() {
+    // Typical text sizes (up to a few KB) must work normally after the cap fix.
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    let s = "héllo 世界 🎉 ".repeat(100); // ~1800 bytes, multibyte
+    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", s)).unwrap();
+    let r = row(db.execute("SELECT length(s) FROM t WHERE id = 1").unwrap());
+    // length() counts chars, not bytes
+    match &r[0] {
+        Value::Integer(n) => assert_eq!(*n, 1100, "100 repeats of 11 chars"),
+        o => panic!("expected int, got {:?}", o),
+    }
+}

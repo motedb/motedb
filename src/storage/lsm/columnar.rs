@@ -2555,9 +2555,22 @@ impl ColumnarSSTableBuilder {
                         }
                         Value::Text(t) => {
                             let s = t.as_str();
-                            let len = s.len().min(65534) as u16; // cap < 0xFFFF
+                            // 🔑 The columnar Text format uses a u16 length prefix
+                            // (0xFFFF is reserved as the NULL sentinel), so the
+                            // maximum storable text value is 65534 bytes. The
+                            // previous code silently truncated larger values via
+                            // `.min(65534)`, causing data loss with no error. Fail
+                            // loudly instead — callers should chunk or use a
+                            // different layout for very large text.
+                            if s.len() > 65534 {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Text value of {} bytes exceeds the columnar maximum of 65534 bytes (0xFFFF is reserved for NULL)",
+                                    s.len()
+                                )));
+                            }
+                            let len = s.len() as u16;
                             buf.extend_from_slice(&len.to_le_bytes());
-                            buf.extend_from_slice(&s.as_bytes()[..len as usize]);
+                            buf.extend_from_slice(s.as_bytes());
                         }
                         _ => {
                             buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
@@ -2751,8 +2764,17 @@ impl ColumnarSSTableBuilder {
                         Value::Null => String::new(),
                         _ => String::new(),
                     };
-                    // Store length-prefixed: [len: u16 LE] [bytes]
-                    let len = s.len().min(65535) as u16;
+                    // Store length-prefixed: [len: u16 LE] [bytes]. The u16 prefix
+                    // caps text at 65535 bytes; previously larger values were
+                    // silently truncated (len capped, full bytes written → decode
+                    // mismatch). Fail loudly instead.
+                    if s.len() > 65535 {
+                        return Err(StorageError::InvalidData(format!(
+                            "Text value of {} bytes exceeds the columnar maximum of 65535 bytes",
+                            s.len()
+                        )));
+                    }
+                    let len = s.len() as u16;
                     buf.extend_from_slice(&len.to_le_bytes());
                     buf.extend_from_slice(s.as_bytes());
                 }
