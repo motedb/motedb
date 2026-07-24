@@ -407,3 +407,38 @@ fn test_normal_text_unaffected_by_cap() {
         o => panic!("expected int, got {:?}", o),
     }
 }
+
+// === CAST(FLOAT AS INT) at i64 boundaries (regression) ===
+// f64 can't distinguish i64::MAX from 2^63, so the old check
+// `f >= i64::MAX as f64` rejected every large integer. Fixed with saturating
+// cast + round-trip verification.
+
+#[test]
+fn test_cast_float_to_int_boundaries() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // Large integers should round-trip through FLOAT without overflow errors.
+    for v in [-9223372036854775807i64, 9223372036854775806, 9223372036854775807] {
+        let sql = format!("SELECT CAST(CAST({} AS FLOAT) AS INT)", v);
+        let r = row(db.execute(&sql).unwrap());
+        match &r[0] {
+            Value::Integer(got) => {
+                // f64 rounding means the result may be off by 1 at the boundary,
+                // but it must NOT error and must be very close to the input.
+                assert!(((*got as i128) - (v as i128)).abs() <= 1, "CAST round-trip {} got {}", v, got);
+            }
+            o => panic!("CAST(CAST({} AS FLOAT) AS INT) returned {:?}, expected Integer", v, o),
+        }
+    }
+
+    // Genuine overflow must still error.
+    let r = db.execute("SELECT CAST(1e30 AS INT)");
+    assert!(r.is_err(), "1e30 should overflow INTEGER");
+
+    // Fractional truncation (toward zero, SQL standard).
+    assert_eq!(row(db.execute("SELECT CAST(3.7 AS INT)").unwrap())[0], Value::Integer(3));
+    assert_eq!(row(db.execute("SELECT CAST(-3.7 AS INT)").unwrap())[0], Value::Integer(-3));
+}

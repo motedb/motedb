@@ -1807,14 +1807,29 @@ impl ExprEvaluator {
                         match val {
                             Value::Integer(i) => Ok(Value::Integer(i)),
                             Value::Float(f) => {
-                                // Check for overflow: f64 as i64 is UB for out-of-range values
-                                if f >= i64::MAX as f64 || f <= i64::MIN as f64 {
+                                // Check for overflow. f64 cannot exactly represent most i64
+                                // values near ±2^63, so a pre-cast range check using f64 bounds
+                                // is unreliable: i64::MAX (9223372036854775807) rounds up to
+                                // 9223372036854776000.0 in f64, which exceeds 2^63, causing
+                                // false-positive overflow errors. Instead, use Rust's saturating
+                                // `as i64` cast (since Rust 1.45, out-of-range floats clamp to
+                                // i64::MAX/MIN rather than being UB), then verify the result
+                                // round-trips back to the same f64 — if it doesn't, the float
+                                // was genuinely out of integer range (or NaN/inf).
+                                if !f.is_finite() {
+                                    return Err(MoteDBError::TypeError(format!(
+                                        "{} cannot be cast to INTEGER",
+                                        f
+                                    )));
+                                }
+                                let i = f as i64;
+                                if i as f64 != f.trunc() {
                                     return Err(MoteDBError::TypeError(format!(
                                         "Float {} overflows INTEGER range",
                                         f
                                     )));
                                 }
-                                Ok(Value::Integer(f as i64))
+                                Ok(Value::Integer(i))
                             }
                             Value::Text(s) => s.parse::<i64>().map(Value::Integer).map_err(|_| {
                                 MoteDBError::TypeError("Cannot parse integer".to_string())
