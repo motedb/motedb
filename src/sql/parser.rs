@@ -1086,6 +1086,17 @@ impl Parser {
             }
             TokenType::Minus => {
                 self.advance();
+                // 🔑 `-9223372036854775808` (i64::MIN): the lexer emits this as
+                // Minus + OverflowInteger(9223372036854775808). Fold the whole
+                // literal to i64::MIN. (Without this, OverflowInteger alone is
+                // out of i64 range as a positive value, and negating i64::MAX
+                // gives i64::MIN+1.)
+                if let TokenType::OverflowInteger(big) = &self.current().token_type {
+                    if *big == 9223372036854775808_i128 {
+                        self.advance();
+                        return Ok(Expr::Literal(Value::Integer(i64::MIN)));
+                    }
+                }
                 self.recursion_depth += 1;
                 if self.recursion_depth > MAX_RECURSION_DEPTH {
                     self.recursion_depth -= 1;
@@ -1146,6 +1157,14 @@ impl Parser {
             }
 
             // Literals
+            TokenType::OverflowInteger(big) => {
+                // A pure-integer literal that overflowed i64 (e.g. 2^63).
+                // Positive → out of INTEGER range, keep as Float. The i64::MIN
+                // case (-2^63) is folded in the Minus prefix branch below.
+                let big = *big;
+                self.advance();
+                Ok(Expr::Literal(Value::Float(big as f64)))
+            }
             TokenType::Number(n) => {
                 let n = *n;
                 self.advance();

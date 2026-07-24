@@ -412,6 +412,20 @@ impl<'a> Lexer<'a> {
                 value
             )));
         }
+        // 🔑 Pure integers: prefer exact i64, then i128, to avoid f64 precision
+        // loss at the i64 boundary (i64::MAX and 2^63 are the same f64). This
+        // matters for `-9223372036854775808` (i64::MIN): as f64 it equals 2^63,
+        // which the parser clamps to i64::MAX, and negating gives i64::MIN+1.
+        // By keeping the exact i128, the parser can fold -2^63 → i64::MIN.
+        let is_pure_int = !value.contains('.') && !value.contains('e') && !value.contains('E');
+        if is_pure_int {
+            if let Ok(i) = value.parse::<i64>() {
+                return Ok(TokenType::Number(i as f64));
+            }
+            if let Ok(big) = value.parse::<i128>() {
+                return Ok(TokenType::OverflowInteger(big));
+            }
+        }
         Ok(TokenType::Number(num))
     }
 

@@ -442,3 +442,32 @@ fn test_cast_float_to_int_boundaries() {
     assert_eq!(row(db.execute("SELECT CAST(3.7 AS INT)").unwrap())[0], Value::Integer(3));
     assert_eq!(row(db.execute("SELECT CAST(-3.7 AS INT)").unwrap())[0], Value::Integer(-3));
 }
+
+// === i64::MIN literal parsing (regression) ===
+// `-9223372036854775808` was parsed as i64::MIN+1 because the f64 round-trip
+// collapsed 2^63 and i64::MAX (both = 9223372036854775808.0 in f64). Fixed via
+// an OverflowInteger token variant preserving the exact i128 value.
+
+#[test]
+fn test_i64_min_literal_parsing() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // The critical case: -i64::MIN must be exact, not MIN+1.
+    let r = row(db.execute("SELECT -9223372036854775808").unwrap());
+    assert_eq!(r[0], Value::Integer(-9223372036854775808), "i64::MIN literal must be exact");
+
+    // -i64::MAX must NOT be collapsed to i64::MIN.
+    let r = row(db.execute("SELECT -9223372036854775807").unwrap());
+    assert_eq!(r[0], Value::Integer(-9223372036854775807));
+
+    // +i64::MAX still correct.
+    let r = row(db.execute("SELECT 9223372036854775807").unwrap());
+    assert_eq!(r[0], Value::Integer(9223372036854775807));
+
+    // Arithmetic with i64::MIN.
+    let r = row(db.execute("SELECT -9223372036854775808 + 1").unwrap());
+    assert_eq!(r[0], Value::Integer(-9223372036854775807));
+}

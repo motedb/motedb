@@ -194,6 +194,11 @@ pub enum TokenType {
 
     // Literals
     Number(f64),
+    /// A pure integer literal that overflows i64 (e.g. 9223372036854775808 = 2^63).
+    /// Kept as i128 to preserve exact value distinction that f64 loses.
+    /// Without this, `-9223372036854775808` (i64::MIN) parsed as f64 and
+    /// collapsed to i64::MAX+1 incorrectly.
+    OverflowInteger(i128),
     String(String),
     Identifier(String),
     True,
