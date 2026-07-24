@@ -9925,11 +9925,13 @@ impl QueryExecutor {
             }
             "substr" | "substring" => {
                 // SUBSTR(text, start [, length]) — SQL 1-indexed.
+                // NULL propagates: any NULL argument yields NULL (standard SQL).
                 if args.len() < 2 || args.len() > 3 {
                     return Ok(Value::text(String::new()));
                 }
                 let text = match Self::eval_expr_on_row(&args[0], row, schema)? {
                     Value::Text(s) => s,
+                    Value::Null => return Ok(Value::Null),
                     _ => return Ok(Value::text(String::new())),
                 };
                 let start = match Self::eval_expr_on_row(&args[1], row, schema)? {
@@ -9937,11 +9939,13 @@ impl QueryExecutor {
                     Value::Integer(i) if i < 0 => {
                         text.chars().count().saturating_sub((-i) as usize)
                     }
+                    Value::Null => return Ok(Value::Null),
                     _ => return Ok(Value::text(String::new())),
                 };
                 let result = if args.len() == 3 {
                     let length = match Self::eval_expr_on_row(&args[2], row, schema)? {
                         Value::Integer(i) => i.max(0) as usize,
+                        Value::Null => return Ok(Value::Null),
                         _ => return Ok(Value::text(String::new())),
                     };
                     text.chars().skip(start).take(length).collect()

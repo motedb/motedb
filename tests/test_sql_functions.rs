@@ -343,3 +343,32 @@ fn test_coalesce_with_column() {
         "COALESCE(NULL, 0) should not be NULL"
     );
 }
+
+// === SUBSTR NULL propagation (regression) ===
+// Previously SUBSTR(NULL, ...) returned an empty string instead of NULL
+// (the executor path fell through to `Value::text(String::new())`). Standard
+// SQL: any NULL argument to SUBSTR yields NULL.
+
+#[test]
+fn test_substr_null_propagates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello'), (2, NULL)").unwrap();
+
+    // text arg NULL -> NULL
+    let r = row(db.execute("SELECT SUBSTR(s, 1, 2) FROM t WHERE id = 2").unwrap());
+    assert_eq!(r[0], Value::Null, "SUBSTR(NULL,1,2) should be NULL");
+
+    // start arg NULL -> NULL
+    let r = row(db.execute("SELECT SUBSTR('hello', NULL, 2)").unwrap());
+    assert_eq!(r[0], Value::Null, "SUBSTR('hello',NULL,2) should be NULL");
+
+    // length arg NULL -> NULL
+    let r = row(db.execute("SELECT SUBSTR('hello', 1, NULL)").unwrap());
+    assert_eq!(r[0], Value::Null, "SUBSTR('hello',1,NULL) should be NULL");
+
+    // Non-NULL still works correctly.
+    let r = row(db.execute("SELECT SUBSTR(s, 2, 3) FROM t WHERE id = 1").unwrap());
+    assert_eq!(r[0], Value::text("ell".to_string()));
+}
