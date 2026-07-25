@@ -62,8 +62,11 @@ impl<'a> Lexer<'a> {
         }
 
         let token_type = match ch {
-            // String literals
-            '\'' | '"' => self.read_string(ch)?,
+            // String literals (single-quote only)
+            '\'' => self.read_string('\'')?,
+
+            // Double-quoted identifiers (SQL standard): "order", "my column"
+            '"' => self.read_quoted_identifier()?,
 
             // Numbers
             '0'..='9' => self.read_number()?,
@@ -379,6 +382,35 @@ impl<'a> Lexer<'a> {
 
         self.advance(); // skip closing quote
         Ok(TokenType::String(value))
+    }
+
+    /// Read a double-quoted identifier (SQL standard quoted identifier).
+    /// `"order"` → Identifier("order"), `"my col"` → Identifier("my col").
+    /// Doubled `""` inside escapes a literal `"`.
+    fn read_quoted_identifier(&mut self) -> Result<TokenType> {
+        self.advance(); // skip opening "
+        let mut value = String::with_capacity(32);
+        while !self.is_eof() {
+            let ch = self.current_utf8_char();
+            if ch == '"' {
+                // Check for doubled "" = escaped quote
+                let after = self.position + 1;
+                if after < self.bytes.len() && self.bytes[after] == b'"' {
+                    value.push('"');
+                    self.advance();
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            value.push(ch);
+            self.advance_utf8();
+        }
+        if self.is_eof() {
+            return Err(MoteDBError::ParseError("Unterminated quoted identifier".to_string()));
+        }
+        self.advance(); // skip closing "
+        Ok(TokenType::Identifier(value))
     }
 
     fn read_number(&mut self) -> Result<TokenType> {

@@ -903,8 +903,18 @@ impl Database {
             match after_table.find(')') {
                 Some(p) => {
                     let col_str = &after_table[1..p];
-                    let cols: Vec<String> =
-                        col_str.split(',').map(|s| s.trim().to_string()).collect();
+                    let cols: Vec<String> = col_str
+                        .split(',')
+                        .map(|s| {
+                            let s = s.trim();
+                            // Strip surrounding double-quotes (quoted identifier)
+                            if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+                                s[1..s.len() - 1].to_string()
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .collect();
                     (Some(cols), after_table[p + 1..].trim_start())
                 }
                 None => return Ok(None),
