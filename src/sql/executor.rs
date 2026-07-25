@@ -4093,6 +4093,22 @@ impl QueryExecutor {
                             _ => None,
                         };
                         if let Some(sub) = sub {
+                            // 🔑 Skip correlated subqueries — they reference outer
+                            // columns and must be evaluated per-row, not pre-resolved.
+                            let outer_schema = stmt.from.as_ref().and_then(|f| {
+                                if let TableRef::Table { name, .. } = f {
+                                    self.db.get_table_schema(name).ok()
+                                } else {
+                                    None
+                                }
+                            });
+                            let is_correlated = outer_schema
+                                .as_ref()
+                                .map(|s| Self::is_correlated_subquery(&sub, s))
+                                .unwrap_or(false);
+                            if is_correlated {
+                                continue; // keep Subquery node for per-row eval
+                            }
                             match self.execute_select_internal(&sub) {
                                 Ok(QueryResult::Select { rows, .. }) => {
                                     // SQL standard: scalar subquery must return
@@ -8927,7 +8943,16 @@ impl QueryExecutor {
                         _ => None,
                     };
                     if let Some(subquery) = subquery_stmt {
-                        // Execute the scalar subquery once.
+                        // 🔑 Detect correlated subquery: if the subquery references
+                        // columns from the outer query's table (not its own FROM
+                        // table), it must be re-evaluated per outer row, not
+                        // pre-resolved once. Leave the Subquery node in place;
+                        // the projection loop handles it via per-row execution.
+                        if Self::is_correlated_subquery(&subquery, &schema) {
+                            // Don't pre-resolve — keep Expr::Subquery for per-row eval.
+                            continue;
+                        }
+                        // Non-correlated: execute the scalar subquery once.
                         match self.execute_select_internal(&subquery) {
                             Ok(QueryResult::Select { rows, .. }) => {
                                 // SQL standard: a scalar subquery must return at
@@ -9005,7 +9030,14 @@ impl QueryExecutor {
                         .map(|oc| match oc {
                             OutCol::CopySchema(p) => full.get(*p).cloned().unwrap_or(Value::Null),
                             OutCol::Expr(e) => {
-                                Self::eval_expr_on_row(e, &full, schema).unwrap_or(Value::Null)
+                                // 🔑 Correlated subquery: substitute outer column
+                                // references with current row values, then execute.
+                                if Self::expr_contains_subquery(e) {
+                                    let bound = Self::bind_outer_columns(e, &full, schema);
+                                    self.eval_correlated_expr(&bound, schema).unwrap_or(Value::Null)
+                                } else {
+                                    Self::eval_expr_on_row(e, &full, schema).unwrap_or(Value::Null)
+                                }
                             }
                         })
                         .collect()
@@ -15708,9 +15740,146 @@ impl QueryExecutor {
         })
     }
 
+    /// Check if a scalar subquery is correlated (references outer columns).
+    /// Collects all column names referenced in the subquery's WHERE clause,
+    /// then checks if any are NOT in the subquery's own FROM table schema
+    /// (meaning they must come from the outer query).
+    fn is_correlated_subquery(subquery: &SelectStmt, _outer_schema: &TableSchema) -> bool {
+        // Get the subquery's own table name to resolve its schema.
+        let table_name = match subquery.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name,
+            _ => return false, // joins/subqueries in FROM — can't easily resolve
+        };
+        // Collect all column names referenced in the subquery's WHERE.
+        let where_clause = match &subquery.where_clause {
+            Some(w) => w,
+            None => return false, // no WHERE = can't be correlated via column refs
+        };
+        let mut col_names: Vec<String> = Vec::new();
+        Self::collect_column_names(where_clause, &mut col_names);
+        // Check if any column name is NOT in the subquery's table schema.
+        // We can't access self.db here (static method), so we use a heuristic:
+        // if the column name has a table prefix (e.g. "d.id") AND that prefix
+        // doesn't match the subquery's table, it's an outer reference.
+        let subq_table_bare = table_name.rsplit('.').next().unwrap_or(table_name);
+        for cn in &col_names {
+            if cn.contains('.') {
+                let prefix = cn.rsplit('.').nth(1).unwrap_or("");
+                let prefix_bare = prefix.rsplit('.').next().unwrap_or(prefix);
+                if prefix_bare != subq_table_bare {
+                    return true; // references an outer table
+                }
+            }
+        }
+        false
+    }
+
+    /// Recursively collect column names from an expression tree.
+    fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::Column(name) => out.push(name.clone()),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_column_names(left, out);
+                Self::collect_column_names(right, out);
+            }
+            Expr::UnaryOp { expr, .. } => Self::collect_column_names(expr, out),
+            Expr::FunctionCall { args, .. } => {
+                for a in args { Self::collect_column_names(a, out); }
+            }
+            Expr::IsNull { expr, .. } => Self::collect_column_names(expr, out),
+            Expr::In { expr, list, .. } => {
+                Self::collect_column_names(expr, out);
+                for e in list { Self::collect_column_names(e, out); }
+            }
+            Expr::Between { expr, low, high, .. } => {
+                Self::collect_column_names(expr, out);
+                Self::collect_column_names(low, out);
+                Self::collect_column_names(high, out);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                Self::collect_column_names(expr, out);
+                Self::collect_column_names(pattern, out);
+            }
+            Expr::Case { whens, else_expr } => {
+                for (cond, val) in whens {
+                    Self::collect_column_names(cond, out);
+                    Self::collect_column_names(val, out);
+                }
+                if let Some(e) = else_expr { Self::collect_column_names(e, out); }
+            }
+            _ => {}
+        }
+    }
+
     /// Recursively collect schema column positions referenced by an expression.
     /// Used to ensure a columnar scan reads all columns a SELECT expression needs
-    /// before evaluating it.
+    /// Bind outer column references in an expression to their current row values.
+    /// Replaces `Expr::Column("d.id")` (table-prefixed) with `Expr::Literal(value)`
+    /// using the outer row's data. Columns without a table prefix are left as-is
+    /// (they belong to the inner query).
+    fn bind_outer_columns(expr: &Expr, outer_row: &[Value], outer_schema: &TableSchema) -> Expr {
+        match expr {
+            Expr::Column(name) => {
+                // Only bind table-prefixed columns (outer references).
+                if name.contains('.') {
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    if let Some(pos) = outer_schema.get_column_position(bare) {
+                        if let Some(v) = outer_row.get(pos) {
+                            return Expr::Literal(v.clone());
+                        }
+                    }
+                }
+                expr.clone()
+            }
+            Expr::Subquery(sub) => {
+                // Recursively bind outer refs inside the subquery's WHERE.
+                let mut bound = sub.clone();
+                if let Some(wc) = &bound.where_clause {
+                    bound.where_clause = Some(Self::bind_outer_columns(wc, outer_row, outer_schema));
+                }
+                Expr::Subquery(bound)
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(Self::bind_outer_columns(left, outer_row, outer_schema)),
+                op: op.clone(),
+                right: Box::new(Self::bind_outer_columns(right, outer_row, outer_schema)),
+            },
+            Expr::FunctionCall { name, args, distinct } => Expr::FunctionCall {
+                name: name.clone(),
+                args: args.iter().map(|a| Self::bind_outer_columns(a, outer_row, outer_schema)).collect(),
+                distinct: *distinct,
+            },
+            _ => expr.clone(),
+        }
+    }
+
+    /// Evaluate an expression that may contain a (now-bound) scalar subquery.
+    /// Uses self to execute the subquery.
+    fn eval_correlated_expr(&self, expr: &Expr, schema: &TableSchema) -> Result<Value> {
+        match expr {
+            Expr::Subquery(sub) => {
+                let result = self.execute_select_internal(sub)?;
+                match result {
+                    QueryResult::Select { rows, .. } => {
+                        if rows.len() > 1 {
+                            return Err(MoteDBError::Query(
+                                "Scalar subquery returned more than one row".to_string(),
+                            ));
+                        }
+                        Ok(rows.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            }
+            _ => {
+                // Non-subquery expr: use standard positional eval (no outer refs now).
+                // Build a positional row from schema for column resolution.
+                Ok(Self::eval_expr_on_row(expr, &[], schema).unwrap_or(Value::Null))
+            }
+        }
+    }
+
+    /// Recursively collect schema column positions referenced by an expression.
     fn expr_referenced_columns(expr: &Expr, schema: &TableSchema) -> Vec<usize> {
         let mut out = Vec::new();
         let add = |name: &str, out: &mut Vec<usize>| {
