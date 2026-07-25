@@ -673,3 +673,41 @@ fn test_compound_and_both_indexed() {
     };
     assert_eq!(rows.len(), 4, "a=1 alone should return 4 rows");
 }
+
+// === Compound OR predicate on indexed columns (regression) ===
+// WHERE a=0 OR b=0 (with indexes on both) returned only a=0 rows — the
+// optimizer generated a PointQuery for one side, which can't satisfy OR
+// (missing rows matching only the other side). Fixed: OR no longer
+// generates single-column index plans; uses FullScan.
+
+#[test]
+fn test_compound_or_both_indexed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+        db.execute("CREATE INDEX t_a ON t(a)").unwrap();
+        db.execute("CREATE INDEX t_b ON t(b)").unwrap();
+        // a=0: ids 1,2. b=0: ids 1,3,5. Union => 1,2,3,5
+        db.execute("INSERT INTO t VALUES (1, 0, 0)").unwrap(); // both
+        db.execute("INSERT INTO t VALUES (2, 0, 1)").unwrap(); // a only
+        db.execute("INSERT INTO t VALUES (3, 1, 0)").unwrap(); // b only
+        db.execute("INSERT INTO t VALUES (4, 1, 1)").unwrap(); // neither
+        db.execute("INSERT INTO t VALUES (5, 2, 0)").unwrap(); // b only
+        db.checkpoint().unwrap();
+        db.wait_for_indexes_ready();
+    }
+    let db = Database::open(&path).unwrap();
+    use motedb::QueryResult;
+    let r = db.execute("SELECT id FROM t WHERE a = 0 OR b = 0").unwrap();
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    let mut ids: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
+    }).collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3, 5], "a=0 OR b=0 must return union, got {:?}", ids);
+}

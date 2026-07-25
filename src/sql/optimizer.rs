@@ -408,16 +408,21 @@ impl QueryOptimizer {
                 self.try_index_intersection(table_name, left, right, params, plans)?;
             }
 
-            // OR: Must evaluate all branches
+            // OR: Must evaluate all branches. A single-column PointQuery plan
+            // (e.g. for `a=0 OR b=0`, an index lookup on just `a=0`) is
+            // INCORRECT for OR — it returns only rows matching that one side,
+            // silently dropping rows matching only the other side (`b=0` with
+            // `a!=0`). The post_filter (full WHERE) can remove false positives
+            // but cannot add back the missing rows. So OR must NOT generate
+            // index plans here — only the baseline FullScan (which evaluates
+            // the full OR predicate against every row) is correct.
             Expr::BinaryOp {
-                left,
                 op: BinaryOperator::Or,
-                right,
+                ..
             } => {
-                // ORs typically can't use indexes efficiently
-                // Just analyze for completeness
-                self.analyze_where_clause(table_name, left, params, plans)?;
-                self.analyze_where_clause(table_name, right, params, plans)?;
+                // Deliberately do NOT recurse into left/right — that would
+                // generate single-column index plans that miss OR rows.
+                // The baseline FullScan plan (already in `plans`) handles OR.
             }
 
             // Point query: col = value (supports Literal AND Parameter)
