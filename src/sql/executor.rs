@@ -3988,6 +3988,244 @@ impl QueryExecutor {
         Ok(None)
     }
 
+    /// Execute a query with window functions (ROW_NUMBER/RANK/DENSE_RANK).
+    /// Strategy: build a base stmt (window cols → NULL placeholder), execute it
+    /// to get all data rows, then compute window values in-place.
+    fn execute_window_query(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
+        use crate::sql::ast::{Expr, SelectColumn, WindowFunc, OrderByExpr};
+        // Collect window column specs and build base stmt (replace window cols with NULL).
+        let mut base_stmt = stmt.clone();
+        let mut win_specs: Vec<(usize, WindowFunc, Option<Vec<String>>, Option<Vec<OrderByExpr>>)> = Vec::new();
+        for (i, col) in base_stmt.columns.iter_mut().enumerate() {
+            if let SelectColumn::Expr(Expr::WindowFunction { func, partition_by, order_by }, alias) = col {
+                win_specs.push((i, func.clone(), partition_by.clone(), order_by.clone()));
+                *col = SelectColumn::Expr(Expr::Literal(Value::Null), alias.clone());
+            }
+        }
+        // Execute base query (gets all non-window data columns).
+        let base = self.materialize_as_streaming(&base_stmt)?;
+        let (columns, mut rows) = match base.materialize()? {
+            QueryResult::Select { columns, rows } => (columns, rows),
+            _ => return Err(MoteDBError::Query("Window base query failed".into())),
+        };
+        // We need the schema to resolve partition/order column positions.
+        // Get it from the base query's columns (they correspond to stmt.columns).
+        let table_name = match stmt.from.as_ref() {
+            Some(crate::sql::ast::TableRef::Table { name, .. }) => name.clone(),
+            _ => return Err(MoteDBError::Query("Window query needs FROM table".into())),
+        };
+        let schema = self.db.get_table_schema(&table_name)?;
+        // The base query's rows only have the SELECT columns, not all schema columns.
+        // We need the full row data for partition/order columns that may not be in SELECT.
+        // Re-scan to get full rows, compute windows, then project.
+        let store = self.db.get_or_create_col_segment_store(&table_name, schema.col_types())?;
+        let _ = store.flush_buffer();
+        let scan_pos: Vec<usize> = (0..schema.columns.len()).collect();
+        let scanned = store.scan_projected_filtered(None, &scan_pos, &|_| true);
+        let mut full_rows: Vec<Vec<Value>> = scanned.into_iter().map(|(_, r)| r).collect();
+        // Apply WHERE
+        if let Some(ref wc) = stmt.where_clause {
+            full_rows.retain(|row| {
+                Self::eval_expr_on_row(wc, row, &schema)
+                    .map(|v| match v {
+                        Value::Bool(true) => true,
+                        Value::Integer(n) => n != 0,
+                        _ => false,
+                    })
+                    .unwrap_or(false)
+            });
+        }
+        // Compute each window function, appending result as extra column.
+        for (_col_idx, func, partition_by, order_by) in &win_specs {
+            Self::compute_window(&mut full_rows, &schema, func, partition_by.as_ref(), order_by.as_ref());
+        }
+        // Build output rows: for each SELECT column, pull from schema cols or window cols.
+        let num_schema = schema.columns.len();
+        let out_rows: Vec<Vec<Value>> = full_rows.iter().map(|row| {
+            let mut win_idx = 0usize;
+            stmt.columns.iter().map(|c| match c {
+                SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    schema.get_column_position(bare)
+                        .and_then(|p| row.get(p).cloned())
+                        .unwrap_or(Value::Null)
+                }
+                SelectColumn::Star => row.get(0).cloned().unwrap_or(Value::Null),
+                SelectColumn::Expr(expr, _) => {
+                    if let Expr::WindowFunction { .. } = expr {
+                        let v = row.get(num_schema + win_idx).cloned().unwrap_or(Value::Null);
+                        win_idx += 1;
+                        v
+                    } else {
+                        Self::eval_expr_on_row(expr, row, &schema).unwrap_or(Value::Null)
+                    }
+                }
+            }).collect()
+        }).collect();
+        let final_cols: Vec<String> = stmt.columns.iter().map(|c| match c {
+            SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => n.clone(),
+            SelectColumn::Expr(_, Some(a)) => a.clone(),
+            SelectColumn::Expr(e, None) => format!("{:?}", e),
+            SelectColumn::Star => "*".to_string(),
+        }).collect();
+        let mut out_rows = out_rows;
+        // Apply outer ORDER BY (resolve column by alias or position in output)
+        if let Some(ref ob) = stmt.order_by {
+            if !ob.is_empty() {
+                // Build sort keys from output columns (match by alias name)
+                let col_names = &final_cols;
+                let sort_plan: Vec<(usize, bool)> = ob.iter().map(|oe| {
+                    let pos = if let Expr::Column(cn) = &oe.expr {
+                        let bare = cn.rsplit('.').next().unwrap_or(cn);
+                        // Try output column name match
+                        col_names.iter().position(|n| n == bare)
+                            .or_else(|| schema.get_column_position(bare))
+                            .unwrap_or(0)
+                    } else if let Expr::Literal(Value::Integer(n)) = &oe.expr {
+                        (*n as usize).saturating_sub(1)
+                    } else { 0 };
+                    (pos, oe.asc)
+                }).collect();
+                out_rows.sort_by(|a, b| {
+                    for &(pos, asc) in &sort_plan {
+                        let av = a.get(pos).cloned().unwrap_or(Value::Null);
+                        let bv = b.get(pos).cloned().unwrap_or(Value::Null);
+                        let cmp = match (&av, &bv) {
+                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                            (Value::Null, _) => std::cmp::Ordering::Less,
+                            (_, Value::Null) => std::cmp::Ordering::Greater,
+                            _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return if asc { cmp } else { cmp.reverse() };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+        }
+        // Apply OFFSET then LIMIT
+        if let Some(off) = stmt.offset {
+            if off >= out_rows.len() { out_rows.clear(); }
+            else { out_rows.drain(..off); }
+        }
+        if let Some(lim) = stmt.limit {
+            out_rows.truncate(lim);
+        }
+        Ok(StreamingQueryResult::SelectReady {
+            columns: final_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// Compute a window function over rows, appending the result column.
+    fn compute_window(
+        rows: &mut Vec<Vec<Value>>,
+        schema: &crate::types::TableSchema,
+        func: &crate::sql::ast::WindowFunc,
+        partition_by: Option<&Vec<String>>,
+        order_by: Option<&Vec<crate::sql::ast::OrderByExpr>>,
+    ) {
+        use crate::sql::ast::WindowFunc;
+        // Resolve partition column positions
+        let part_cols: Vec<usize> = partition_by.map(|cols| {
+            cols.iter().filter_map(|c| {
+                let bare = c.rsplit('.').next().unwrap_or(c);
+                schema.get_column_position(bare)
+            }).collect()
+        }).unwrap_or_default();
+        // Resolve order key positions + directions
+        let order_keys: Vec<(usize, bool)> = order_by.map(|ords| {
+            ords.iter().filter_map(|oe| {
+                if let Expr::Column(cn) = &oe.expr {
+                    let bare = cn.rsplit('.').next().unwrap_or(cn);
+                    schema.get_column_position(bare).map(|p| (p, oe.asc))
+                } else { None }
+            }).collect()
+        }).unwrap_or_default();
+        // Group row indices by partition key
+        let mut groups: std::collections::HashMap<Vec<String>, Vec<usize>> = std::collections::HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let key: Vec<String> = part_cols.iter().map(|&p| format!("{:?}", row.get(p))).collect();
+            groups.entry(key).or_default().push(i);
+        }
+        // For each partition: sort by order keys, compute window values
+        for (_key, mut indices) in groups {
+            if !order_keys.is_empty() {
+                indices.sort_by(|&a, &b| {
+                    for &(col, asc) in &order_keys {
+                        let av = rows[a].get(col).cloned().unwrap_or(Value::Null);
+                        let bv = rows[b].get(col).cloned().unwrap_or(Value::Null);
+                        let cmp = match (&av, &bv) {
+                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                            (Value::Null, _) => std::cmp::Ordering::Less,
+                            (_, Value::Null) => std::cmp::Ordering::Greater,
+                            _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
+                        };
+                        if cmp != std::cmp::Ordering::Equal {
+                            return if asc { cmp } else { cmp.reverse() };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            // Compute window values
+            match func {
+                WindowFunc::RowNumber => {
+                    for (rank, &idx) in indices.iter().enumerate() {
+                        let r = (rank + 1) as i64;
+                        if rows[idx].len() <= schema.columns.len() + rows[idx].len().saturating_sub(schema.columns.len()) {
+                            // append only once per row — ensure capacity
+                        }
+                        rows[idx].push(Value::Integer(r));
+                    }
+                }
+                WindowFunc::Rank => {
+                    let mut rank = 0i64;
+                    let mut prev_key: Option<Vec<Value>> = None;
+                    let mut count = 0i64;
+                    for &idx in &indices {
+                        count += 1;
+                        let cur_key: Vec<Value> = order_keys.iter()
+                            .map(|&(p, _)| rows[idx].get(p).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        if prev_key.as_ref() != Some(&cur_key) {
+                            rank = count;
+                        }
+                        rows[idx].push(Value::Integer(rank));
+                        prev_key = Some(cur_key);
+                    }
+                }
+                WindowFunc::DenseRank => {
+                    let mut dr = 0i64;
+                    let mut prev_key: Option<Vec<Value>> = None;
+                    for &idx in &indices {
+                        let cur_key: Vec<Value> = order_keys.iter()
+                            .map(|&(p, _)| rows[idx].get(p).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        if prev_key.as_ref() != Some(&cur_key) {
+                            dr += 1;
+                        }
+                        rows[idx].push(Value::Integer(dr));
+                        prev_key = Some(cur_key);
+                    }
+                }
+                _ => {
+                    // LAG/LEAD not yet supported — append NULL
+                    for &idx in &indices {
+                        rows[idx].push(Value::Null);
+                    }
+                }
+            }
+        }
+        // Ensure rows without a window value (shouldn't happen) get NULL
+        for row in rows.iter_mut() {
+            while row.len() <= schema.columns.len() {
+                row.push(Value::Null);
+            }
+        }
+    }
+
     fn materialize_as_streaming(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
         let result = self.execute_select_internal(stmt)?;
         match result {
@@ -4033,6 +4271,15 @@ impl QueryExecutor {
                 }
             }
         }
+        // 🔑 Window functions: route to specialized executor.
+        let has_window = stmt.columns.iter().any(|c| {
+            matches!(c, crate::sql::ast::SelectColumn::Expr(
+                crate::sql::ast::Expr::WindowFunction { .. }, _))
+        });
+        if has_window {
+            return self.execute_window_query(stmt);
+        }
+
         // 🚀 Pre-resolve scalar/IN subqueries in WHERE clause BEFORE any routing.
         // This converts `WHERE col > (SELECT ...)` / `WHERE col IN (SELECT ...)`
         // into literal forms early, so every downstream path (columnar scan,

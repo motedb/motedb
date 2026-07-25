@@ -87,6 +87,8 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "default" => TokenType::Default,
     "with" => TokenType::With,
     "recursive" => TokenType::Recursive,
+    "over" => TokenType::Over,
+    "partition" => TokenType::Partition,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +155,8 @@ pub enum TokenType {
     Union,         // UNION
     Intersect,     // INTERSECT
     Except,        // EXCEPT
+    Over,          // OVER (window functions)
+    Partition,     // PARTITION (window functions)
     All,           // ALL
     Add,           // ADD (ALTER TABLE ADD COLUMN)
     Default,       // DEFAULT (column default value)

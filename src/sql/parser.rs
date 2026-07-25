@@ -216,6 +216,60 @@ impl Parser {
     /// RECURSIVE is accepted syntactically (matches SQL standard) but v1 of
     /// the executor rejects any CTE body that self-references — see
     /// `QueryExecutor::apply_ctes`.
+    /// Parse OVER (...) for window functions. Converts FunctionCall → WindowFunction.
+    fn parse_window_spec(&mut self, fc: Expr) -> Result<Expr> {
+        let name = match &fc {
+            Expr::FunctionCall { name, .. } => name.clone(),
+            _ => return Ok(fc),
+        };
+        let func = match name.to_uppercase().as_str() {
+            "ROW_NUMBER" => crate::sql::ast::WindowFunc::RowNumber,
+            "RANK" => crate::sql::ast::WindowFunc::Rank,
+            "DENSE_RANK" => crate::sql::ast::WindowFunc::DenseRank,
+            other => return Err(self.error(&format!(
+                "Unsupported window function '{}' (supported: ROW_NUMBER, RANK, DENSE_RANK)", other
+            ))),
+        };
+        self.expect(TokenType::Over)?;
+        self.expect(TokenType::LParen)?;
+        let mut partition_by = None;
+        let mut order_by = None;
+        // PARTITION BY col1, col2
+        if matches!(self.current().token_type, TokenType::Partition) {
+            self.advance();
+            self.expect(TokenType::By)?;
+            let mut cols = Vec::new();
+            loop {
+                if let TokenType::Identifier(col) = self.current().token_type.clone() {
+                    cols.push(col);
+                    self.advance();
+                    if matches!(self.current().token_type, TokenType::Comma) { self.advance(); } else { break; }
+                } else { return Err(self.error("Expected column after PARTITION BY")); }
+            }
+            partition_by = Some(cols);
+        }
+        // ORDER BY expr [ASC|DESC]
+        if matches!(self.current().token_type, TokenType::Order) {
+            self.advance();
+            self.expect(TokenType::By)?;
+            let mut ords = Vec::new();
+            loop {
+                let expr = self.parse_expr(0)?;
+                let asc = if matches!(self.current().token_type, TokenType::Desc) {
+                    self.advance(); false
+                } else {
+                    if matches!(self.current().token_type, TokenType::Asc) { self.advance(); }
+                    true
+                };
+                ords.push(crate::sql::ast::OrderByExpr { expr, asc });
+                if matches!(self.current().token_type, TokenType::Comma) { self.advance(); } else { break; }
+            }
+            order_by = Some(ords);
+        }
+        self.expect(TokenType::RParen)?;
+        Ok(Expr::WindowFunction { func, partition_by, order_by })
+    }
+
     fn parse_with_clause(&mut self) -> Result<(Vec<CteDef>, bool)> {
         self.expect(TokenType::With)?; // consume WITH
         let is_recursive = self.match_token(TokenType::Recursive);
@@ -1810,11 +1864,12 @@ impl Parser {
                             radius,
                         })
                     } else {
-                        Ok(Expr::FunctionCall {
-                            name,
-                            args,
-                            distinct,
-                        })
+                        let fc = Expr::FunctionCall { name, args, distinct };
+                        // Check for OVER (window function)
+                        if matches!(self.current().token_type, TokenType::Over) {
+                            return self.parse_window_spec(fc);
+                        }
+                        Ok(fc)
                     }
                 } else {
                     Ok(Expr::Column(name))

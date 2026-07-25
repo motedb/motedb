@@ -542,3 +542,75 @@ fn test_non_correlated_subquery_still_works() {
         }
     }
 }
+
+// === Window functions (ROW_NUMBER, RANK, DENSE_RANK) ===
+
+#[test]
+fn test_row_number() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (1,90),(2,85),(3,90),(4,70),(5,80)").unwrap();
+    let r = db.execute("SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM s ORDER BY rn").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    assert_eq!(rows.len(), 5);
+    let rns: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(n) = &r[1] { Some(*n) } else { None }
+    }).collect();
+    assert_eq!(rns, vec![1, 2, 3, 4, 5], "ROW_NUMBER should be 1-5");
+}
+
+#[test]
+fn test_rank_with_ties() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (1,90),(2,90),(3,85),(4,70)").unwrap();
+    let r = db.execute("SELECT id, RANK() OVER (ORDER BY score DESC) AS rk FROM s ORDER BY rk, id").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    let rks: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(n) = &r[1] { Some(*n) } else { None }
+    }).collect();
+    assert_eq!(rks, vec![1, 1, 3, 4], "RANK: ties share rank, gap after");
+}
+
+#[test]
+fn test_dense_rank() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (1,90),(2,90),(3,85),(4,70)").unwrap();
+    let r = db.execute("SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM s ORDER BY dr, id").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    let drs: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(n) = &r[1] { Some(*n) } else { None }
+    }).collect();
+    assert_eq!(drs, vec![1, 1, 2, 3], "DENSE_RANK: no gap after ties");
+}
+
+#[test]
+fn test_row_number_partitioned() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, cat TEXT, score INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (1,'a',90),(2,'a',85),(3,'b',70),(4,'b',80)").unwrap();
+    let r = db.execute("SELECT id, cat, ROW_NUMBER() OVER (PARTITION BY cat ORDER BY score DESC) AS rn FROM s ORDER BY cat, rn").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    assert_eq!(rows.len(), 4);
+    // cat 'a': rn 1,2. cat 'b': rn 1,2.
+    let a_rns: Vec<i64> = rows.iter().filter(|r| matches!(&r[1], motedb::types::Value::Text(t) if t.as_str()=="a"))
+        .filter_map(|r| if let motedb::types::Value::Integer(n)=&r[2]{Some(*n)}else{None}).collect();
+    assert_eq!(a_rns, vec![1, 2]);
+}
