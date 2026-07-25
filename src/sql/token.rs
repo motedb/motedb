@@ -80,6 +80,8 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "else" => TokenType::Else,
     "end" => TokenType::End,
     "union" => TokenType::Union,
+    "intersect" => TokenType::Intersect,
+    "except" => TokenType::Except,
     "all" => TokenType::All,
     "add" => TokenType::Add,
     "default" => TokenType::Default,
@@ -149,6 +151,8 @@ pub enum TokenType {
     Else,          // ELSE
     End,           // END
     Union,         // UNION
+    Intersect,     // INTERSECT
+    Except,        // EXCEPT
     All,           // ALL
     Add,           // ADD (ALTER TABLE ADD COLUMN)
     Default,       // DEFAULT (column default value)

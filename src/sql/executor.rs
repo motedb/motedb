@@ -2236,10 +2236,10 @@ impl QueryExecutor {
                 )));
             }
         }
-        let mut combined = left_rows;
-        combined.extend(right_rows);
         match op {
             crate::sql::ast::SetOp::Union => {
+                let mut combined = left_rows;
+                combined.extend(right_rows);
                 if !all {
                     // UNION (without ALL): deduplicate rows.
                     let mut seen = std::collections::HashSet::new();
@@ -2250,9 +2250,28 @@ impl QueryExecutor {
                     rows: combined,
                 })
             }
-            crate::sql::ast::SetOp::Intersect | crate::sql::ast::SetOp::Except => Err(
-                MoteDBError::NotImplemented(format!("Set operation {:?} not yet implemented", op)),
-            ),
+            crate::sql::ast::SetOp::Intersect => {
+                // Rows present in BOTH left and right (deduplicated).
+                let right_set: std::collections::HashSet<Vec<Value>> =
+                    right_rows.iter().cloned().collect();
+                let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+                let result: Vec<Vec<Value>> = left_rows
+                    .into_iter()
+                    .filter(|row| right_set.contains(row) && seen.insert(row.clone()))
+                    .collect();
+                Ok(QueryResult::Select { columns, rows: result })
+            }
+            crate::sql::ast::SetOp::Except => {
+                // Rows in left but NOT in right (deduplicated).
+                let right_set: std::collections::HashSet<Vec<Value>> =
+                    right_rows.iter().cloned().collect();
+                let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+                let result: Vec<Vec<Value>> = left_rows
+                    .into_iter()
+                    .filter(|row| !right_set.contains(row) && seen.insert(row.clone()))
+                    .collect();
+                Ok(QueryResult::Select { columns, rows: result })
+            }
         }
     }
 

@@ -421,3 +421,74 @@ fn test_select_always_true() {
     let r = rows(db.execute("SELECT * FROM orders WHERE 1 = 1").unwrap());
     assert_eq!(r.len(), 5);
 }
+
+// === INTERSECT / EXCEPT (regression) ===
+// These were unimplemented (parser didn't recognize the keywords; executor
+// returned NotImplemented). Now both work.
+
+#[test]
+fn test_intersect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE a (v INT)").unwrap();
+    db.execute("CREATE TABLE b (v INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
+    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
+    }).collect();
+    vals.sort();
+    assert_eq!(vals, vec![2, 3], "INTERSECT should return common values");
+}
+
+#[test]
+fn test_except() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE a (v INT)").unwrap();
+    db.execute("CREATE TABLE b (v INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
+    let r = db.execute("SELECT v FROM a EXCEPT SELECT v FROM b").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
+    }).collect();
+    vals.sort();
+    assert_eq!(vals, vec![1], "EXCEPT should return values only in left side");
+}
+
+#[test]
+fn test_intersect_except_with_duplicates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE a (v INT)").unwrap();
+    db.execute("CREATE TABLE b (v INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(1),(2),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES (2),(2),(3),(4)").unwrap();
+    // INTERSECT dedups: {2,3}
+    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    assert_eq!(rows.len(), 2, "INTERSECT dedups to 2,3");
+    // EXCEPT dedups: {1}
+    let r = db.execute("SELECT v FROM a EXCEPT SELECT v FROM b").unwrap();
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
+    };
+    assert_eq!(rows.len(), 1, "EXCEPT dedups to 1");
+}

@@ -44,23 +44,42 @@ impl Parser {
         let stmt = match &self.current().token_type {
             TokenType::Select => {
                 let select = self.parse_select()?;
-                // Check for UNION / UNION ALL
-                if matches!(self.current().token_type, TokenType::Union) {
-                    self.advance(); // consume UNION
-                    let all = if matches!(self.current().token_type, TokenType::All) {
-                        self.advance();
-                        true
-                    } else {
-                        false
+                // Check for set operators: UNION / UNION ALL / INTERSECT / EXCEPT.
+                // Standard SQL left-associates: A UNION B INTERSECT C =
+                // (A UNION B) INTERSECT C.
+                if matches!(
+                    self.current().token_type,
+                    TokenType::Union | TokenType::Intersect | TokenType::Except
+                ) {
+                    let (op, all) = match self.current().token_type {
+                        TokenType::Union => {
+                            self.advance();
+                            let all = if matches!(self.current().token_type, TokenType::All) {
+                                self.advance();
+                                true
+                            } else {
+                                false
+                            };
+                            (SetOp::Union, all)
+                        }
+                        TokenType::Intersect => {
+                            self.advance();
+                            (SetOp::Intersect, false)
+                        }
+                        TokenType::Except => {
+                            self.advance();
+                            (SetOp::Except, false)
+                        }
+                        _ => unreachable!(),
                     };
                     if !matches!(self.current().token_type, TokenType::Select) {
-                        return Err(self.error("Expected SELECT after UNION"));
+                        return Err(self.error("Expected SELECT after set operator"));
                     }
                     let right = self.parse_select()?;
                     Statement::SetOp {
                         left: Box::new(select),
                         right: Box::new(right),
-                        op: SetOp::Union,
+                        op,
                         all,
                         ctes: std::mem::take(&mut ctes),
                     }
