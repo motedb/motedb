@@ -132,6 +132,11 @@ pub fn values_to_row_schema_order(values: &[Value], schema: &TableSchema) -> Res
             (ColumnType::Timestamp, Value::Integer(ts)) => {
                 Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
             }
+            (ColumnType::Timestamp, Value::Text(s)) => {
+                // Parse ISO 8601 date/datetime strings into microseconds.
+                // Supported: "2024-01-15", "2024-01-15 10:30:00", "2024-01-15T10:30:00"
+                parse_datetime(s.as_str()).unwrap_or_else(|| val.clone())
+            }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             _ => val,
         };
@@ -139,6 +144,55 @@ pub fn values_to_row_schema_order(values: &[Value], schema: &TableSchema) -> Res
     }
 
     Ok(row)
+}
+
+/// Parse an ISO 8601 date/datetime string into a Timestamp (microseconds since epoch).
+/// Supports: "2024-01-15", "2024-01-15 10:30:00", "2024-01-15T10:30:00".
+/// Returns None if the string doesn't match a known format (caller falls back).
+fn parse_datetime(s: &str) -> Option<Value> {
+    use crate::types::Timestamp;
+    // Try parsing as integer microseconds first (numeric timestamp).
+    if let Ok(micros) = s.parse::<i64>() {
+        return Some(Value::Timestamp(Timestamp::from_micros(micros)));
+    }
+    // Split date and optional time.
+    let (date_part, time_part) = if let Some(idx) = s.find(['T', ' ']) {
+        (&s[..idx], Some(&s[idx + 1..]))
+    } else {
+        (s, None)
+    };
+    // Parse date: YYYY-MM-DD
+    let dparts: Vec<&str> = date_part.split('-').collect();
+    if dparts.len() != 3 { return None; }
+    let year: i32 = dparts[0].parse().ok()?;
+    let month: u32 = dparts[1].parse().ok()?;
+    let day: u32 = dparts[2].parse().ok()?;
+    if month < 1 || month > 12 || day < 1 || day > 31 { return None; }
+    // Parse time: HH:MM:SS (seconds optional)
+    let (hour, min, sec) = if let Some(tp) = time_part {
+        let tparts: Vec<&str> = tp.split(':').collect();
+        let h: u32 = tparts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let m: u32 = tparts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let s: u32 = tparts.get(2).and_then(|s| s.split('.').next().and_then(|n| n.parse().ok())).unwrap_or(0);
+        (h, m, s)
+    } else {
+        (0, 0, 0)
+    };
+    // Convert to Unix epoch microseconds using Howard Hinnant's algorithm.
+    let days = days_from_civil(year, month, day)?;
+    let micros = days as i64 * 86_400_000_000 + hour as i64 * 3_600_000_000 + min as i64 * 60_000_000 + sec as i64 * 1_000_000;
+    Some(Value::Timestamp(Timestamp::from_micros(micros)))
+}
+
+/// Convert civil date to days since Unix epoch (1970-01-01).
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = m as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era as i64 * 146097 + doe as i64 - 719468)
 }
 
 #[cfg(test)]

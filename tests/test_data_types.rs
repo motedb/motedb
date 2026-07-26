@@ -498,3 +498,33 @@ fn test_multiple_primary_key_rejected() {
     let r = db.execute("CREATE TABLE ok (a INT PRIMARY KEY, b INT)");
     assert!(r.is_ok());
 }
+
+// === TIMESTAMP column: string date insertion (ISO 8601) ===
+
+#[test]
+fn test_timestamp_string_insert() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
+    // Date only
+    db.execute("INSERT INTO t VALUES (1, '2024-01-15')").unwrap();
+    // Datetime with space separator
+    db.execute("INSERT INTO t VALUES (2, '2024-06-01 10:30:00')").unwrap();
+    // Datetime with T separator
+    db.execute("INSERT INTO t VALUES (3, '2024-12-31T23:59:59')").unwrap();
+
+    // YEAR should work on all
+    assert_eq!(row(db.execute("SELECT YEAR(ts) FROM t WHERE id=1").unwrap())[0], Value::Integer(2024));
+    assert_eq!(row(db.execute("SELECT YEAR(ts) FROM t WHERE id=2").unwrap())[0], Value::Integer(2024));
+    assert_eq!(row(db.execute("SELECT YEAR(ts) FROM t WHERE id=3").unwrap())[0], Value::Integer(2024));
+
+    // MONTH and DAY
+    assert_eq!(row(db.execute("SELECT MONTH(ts) FROM t WHERE id=1").unwrap())[0], Value::Integer(1));
+    assert_eq!(row(db.execute("SELECT DAY(ts) FROM t WHERE id=3").unwrap())[0], Value::Integer(31));
+
+    // Raw timestamp value is stored correctly (as microseconds)
+    assert_eq!(
+        row(db.execute("SELECT CAST(ts AS INT) FROM t WHERE id=1").unwrap())[0],
+        Value::Integer(1705276800000000) // 2024-01-15 00:00:00 UTC
+    );
+}

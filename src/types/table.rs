@@ -428,6 +428,8 @@ impl TableSchema {
 
                 // Legacy types
                 (ColumnType::Timestamp, crate::types::Value::Timestamp(_)) => true,
+                (ColumnType::Timestamp, crate::types::Value::Text(_)) => true, // ISO date string parsed at insert time
+                (ColumnType::Timestamp, crate::types::Value::Integer(_)) => true, // micros since epoch
                 (ColumnType::Tensor(dim), crate::types::Value::Tensor(t)) => t.dimension() == *dim,
                 (ColumnType::Tensor(dim), crate::types::Value::Vector(v)) => v.len() == *dim,
 

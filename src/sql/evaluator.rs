@@ -506,7 +506,7 @@ impl ExprEvaluator {
         }
     }
 
-    fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+    pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
         // SQL NULL semantics: NULL comparison → false (for WHERE filtering),
         // NULL arithmetic → NULL (for SELECT projection correctness).
         let either_null = matches!(&left, Value::Null) || matches!(&right, Value::Null);
