@@ -812,6 +812,13 @@ impl Parser {
                 }
             }
 
+            // 🚨 Reject multiple PRIMARY KEY columns (SQL standard: at most one).
+            if primary_key {
+                if columns[..columns.len() - 1].iter().any(|c| c.primary_key) {
+                    return Err(self.error("Multiple PRIMARY KEY columns are not allowed"));
+                }
+            }
+
             if !self.match_token(TokenType::Comma) {
                 break;
             }

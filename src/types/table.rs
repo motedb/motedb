@@ -415,7 +415,11 @@ impl TableSchema {
 
                 // New SQL types
                 (ColumnType::Integer, crate::types::Value::Integer(_)) => true,
-                (ColumnType::Integer, crate::types::Value::Float(_)) => true, // Allow overflow promotion (i64 + i64 → f64)
+                // 🚨 Float → Integer was allowed ("overflow promotion") but the
+                // value was stored as raw f64 bits reinterpreted as i64, producing
+                // garbage (e.g. 3.9 → Integer(4615964438073389875)). Now rejected;
+                // users should CAST or use an Integer literal.
+                (ColumnType::Integer, crate::types::Value::Float(_)) => false,
                 (ColumnType::Float, crate::types::Value::Float(_)) => true,
                 (ColumnType::Float, crate::types::Value::Integer(_)) => true, // Allow integer to float conversion
                 (ColumnType::Boolean, crate::types::Value::Bool(_)) => true,

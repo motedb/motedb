@@ -471,3 +471,30 @@ fn test_i64_min_literal_parsing() {
     let r = row(db.execute("SELECT -9223372036854775808 + 1").unwrap());
     assert_eq!(r[0], Value::Integer(-9223372036854775807));
 }
+
+// === Float value into INT column: was silently corrupted (f64 bits as i64) ===
+#[test]
+fn test_float_into_int_column_rejected() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    // 3.9 stored as Integer(4615964438073389875) before fix — now rejected.
+    let r = db.execute("INSERT INTO t VALUES (1, 3.9)");
+    assert!(r.is_err(), "float into INT column should be rejected, not silently corrupted");
+    // Integer into FLOAT still works (safe promotion).
+    db.execute("CREATE TABLE tf (id INT PRIMARY KEY, f FLOAT)").unwrap();
+    let r = db.execute("INSERT INTO tf VALUES (1, 42)");
+    assert!(r.is_ok(), "int into FLOAT should work");
+}
+
+// === Multiple PRIMARY KEY columns should error ===
+#[test]
+fn test_multiple_primary_key_rejected() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    let r = db.execute("CREATE TABLE bad (a INT PRIMARY KEY, b INT PRIMARY KEY)");
+    assert!(r.is_err(), "multiple PRIMARY KEY columns should be rejected");
+    // Single PK still works.
+    let r = db.execute("CREATE TABLE ok (a INT PRIMARY KEY, b INT)");
+    assert!(r.is_ok());
+}
