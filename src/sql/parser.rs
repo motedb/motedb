@@ -45,44 +45,46 @@ impl Parser {
             TokenType::Select => {
                 let select = self.parse_select()?;
                 // Check for set operators: UNION / UNION ALL / INTERSECT / EXCEPT.
-                // Standard SQL left-associates: A UNION B INTERSECT C =
-                // (A UNION B) INTERSECT C.
+                // Supports chaining: A UNION B INTERSECT C (left-associative).
                 if matches!(
                     self.current().token_type,
                     TokenType::Union | TokenType::Intersect | TokenType::Except
                 ) {
-                    let (op, all) = match self.current().token_type {
-                        TokenType::Union => {
-                            self.advance();
-                            let all = if matches!(self.current().token_type, TokenType::All) {
-                                self.advance();
-                                true
-                            } else {
-                                false
-                            };
-                            (SetOp::Union, all)
-                        }
-                        TokenType::Intersect => {
-                            self.advance();
-                            (SetOp::Intersect, false)
-                        }
-                        TokenType::Except => {
-                            self.advance();
-                            (SetOp::Except, false)
-                        }
-                        _ => unreachable!(),
+                    let mut left_stmt: Statement = Statement::Select {
+                        stmt: select,
+                        ctes: ctes.clone(),
                     };
-                    if !matches!(self.current().token_type, TokenType::Select) {
-                        return Err(self.error("Expected SELECT after set operator"));
+                    loop {
+                        let (op, all) = match self.current().token_type {
+                            TokenType::Union => {
+                                self.advance();
+                                let all = if matches!(self.current().token_type, TokenType::All) {
+                                    self.advance();
+                                    true
+                                } else { false };
+                                (SetOp::Union, all)
+                            }
+                            TokenType::Intersect => { self.advance(); (SetOp::Intersect, false) }
+                            TokenType::Except => { self.advance(); (SetOp::Except, false) }
+                            _ => break,
+                        };
+                        if !matches!(self.current().token_type, TokenType::Select) {
+                            return Err(self.error("Expected SELECT after set operator"));
+                        }
+                        let right = self.parse_select()?;
+                        left_stmt = Statement::SetOp {
+                            left: Box::new(left_stmt),
+                            right: Box::new(right),
+                            op,
+                            all,
+                            ctes: Vec::new(),
+                        };
                     }
-                    let right = self.parse_select()?;
-                    Statement::SetOp {
-                        left: Box::new(select),
-                        right: Box::new(right),
-                        op,
-                        all,
-                        ctes: std::mem::take(&mut ctes),
+                    // Attach CTEs to the outermost SetOp.
+                    if let Statement::SetOp { ctes: ref mut c, .. } = &mut left_stmt {
+                        *c = std::mem::take(&mut ctes);
                     }
+                    left_stmt
                 } else {
                     Statement::Select {
                         stmt: select,

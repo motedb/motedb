@@ -14,7 +14,8 @@ pub enum Statement {
     },
     /// UNION / UNION ALL / INTERSECT / EXCEPT
     SetOp {
-        left: Box<SelectStmt>,
+        /// Left operand — either a SelectStmt or a nested SetOp (for chaining).
+        left: Box<Statement>,
         right: Box<SelectStmt>,
         op: SetOp,
         all: bool,

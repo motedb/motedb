@@ -1648,9 +1648,9 @@ impl QueryExecutor {
                 all,
                 ctes,
             } => {
-                let left = self.apply_ctes_for_select(*left, &ctes)?;
-                let right = self.apply_ctes_for_select(*right, &ctes)?;
-                self.execute_set_op(Box::new(left), Box::new(right), op, all)
+                // Apply CTEs to the right (always a SelectStmt).
+                let right_stmt = self.apply_ctes_for_select(*right, &ctes)?;
+                self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), all)
             }
             Statement::Insert(i) => self.execute_insert(i),
             Statement::Update(u) => self.execute_update(u),
@@ -1847,10 +1847,9 @@ impl QueryExecutor {
                 all,
                 ctes,
             } => {
-                let left = self.apply_ctes_for_select((**left).clone(), ctes)?;
-                let right = self.apply_ctes_for_select((**right).clone(), ctes)?;
+                let right_stmt = self.apply_ctes_for_select((**right).clone(), &ctes)?;
                 let result =
-                    self.execute_set_op(Box::new(left), Box::new(right), op.clone(), *all)?;
+                    self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), *all)?;
                 return Ok(match result {
                     QueryResult::Select { columns, rows } => {
                         StreamingQueryResult::SelectReady { columns, rows }
@@ -2203,12 +2202,19 @@ impl QueryExecutor {
     /// Execute UNION / UNION ALL set operation.
     fn execute_set_op(
         &self,
-        left: Box<SelectStmt>,
-        right: Box<SelectStmt>,
+        left: &Statement,
+        right: &SelectStmt,
         op: crate::sql::ast::SetOp,
         all: bool,
     ) -> Result<QueryResult> {
-        let left_result = self.execute_select_internal(&left)?;
+        // left can be a nested SetOp (chained) or a Select — execute accordingly.
+        let left_result = match left {
+            Statement::SetOp { left: l, right: r, op: o, all: a, ctes } => {
+                self.execute_set_op(l, r, o.clone(), *a)?
+            }
+            Statement::Select { stmt, .. } => self.execute_select_internal(stmt)?,
+            _ => return Err(MoteDBError::Query("Left side of set op must be SELECT".into())),
+        };
         let right_result = self.execute_select_internal(&right)?;
         let (columns, left_rows) = match left_result {
             QueryResult::Select { columns, rows } => (columns, rows),

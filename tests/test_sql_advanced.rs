@@ -614,3 +614,68 @@ fn test_row_number_partitioned() {
         .filter_map(|r| if let motedb::types::Value::Integer(n)=&r[2]{Some(*n)}else{None}).collect();
     assert_eq!(a_rns, vec![1, 2]);
 }
+
+// === Chained set operations (A UNION B UNION C, A INTERSECT B UNION C) ===
+
+#[test]
+fn test_chained_union() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    for tn in ["a", "b", "c"] {
+        db.execute(&format!("CREATE TABLE {} (v INT)", tn)).unwrap();
+    }
+    db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
+    db.execute("INSERT INTO c VALUES (3),(4),(5)").unwrap();
+    let r = db.execute("SELECT v FROM a UNION SELECT v FROM b UNION SELECT v FROM c").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
+    }).collect();
+    vals.sort();
+    assert_eq!(vals, vec![1, 2, 3, 4, 5], "3-way UNION should dedup all");
+}
+
+#[test]
+fn test_chained_intersect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    for tn in ["a", "b", "c"] {
+        db.execute(&format!("CREATE TABLE {} (v INT)", tn)).unwrap();
+    }
+    db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
+    db.execute("INSERT INTO c VALUES (3),(4),(5)").unwrap();
+    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b INTERSECT SELECT v FROM c").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    assert_eq!(rows.len(), 1, "3-way INTERSECT => only 3");
+}
+
+#[test]
+fn test_mixed_set_ops_left_assoc() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    for tn in ["a", "b", "c"] {
+        db.execute(&format!("CREATE TABLE {} (v INT)", tn)).unwrap();
+    }
+    db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
+    db.execute("INSERT INTO c VALUES (3),(4),(5)").unwrap();
+    // Left-assoc: (a INTERSECT b) UNION c = {2,3} UNION {3,4,5} = {2,3,4,5}
+    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b UNION SELECT v FROM c").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
+    }).collect();
+    vals.sort();
+    assert_eq!(vals, vec![2, 3, 4, 5], "left-assoc (a intersect b) union c = 2,3,4,5");
+}
