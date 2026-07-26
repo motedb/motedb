@@ -4004,7 +4004,7 @@ impl QueryExecutor {
         }
         // Execute base query (gets all non-window data columns).
         let base = self.materialize_as_streaming(&base_stmt)?;
-        let (columns, mut rows) = match base.materialize()? {
+        let (_base_cols, _base_rows) = match base.materialize()? {
             QueryResult::Select { columns, rows } => (columns, rows),
             _ => return Err(MoteDBError::Query("Window base query failed".into())),
         };
