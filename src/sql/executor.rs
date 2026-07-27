@@ -3774,6 +3774,7 @@ impl QueryExecutor {
                             let raw = fs.raw_f64_typed_slice();
                             if need_minmax {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
+                                    if v.is_nan() { continue; } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     group_sums[ai][gi] += v;
                                     if v < group_mins[ai][gi] {
@@ -3784,8 +3785,8 @@ impl QueryExecutor {
                                     }
                                 }
                             } else {
-                                // 🚀 Sum-only path: no min/max branches, auto-vectorizable.
                                 for (i, &v) in raw.iter().enumerate().take(n) {
+                                    if v.is_nan() { continue; } // NULL sentinel
                                     group_sums[ai][row_groups[i] as usize] += v;
                                 }
                             }
@@ -3793,6 +3794,7 @@ impl QueryExecutor {
                             let raw = fs.raw_i64_slice();
                             if need_minmax {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
+                                    if v == i64::MIN { continue; } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     let vf = v as f64;
                                     group_sums[ai][gi] += vf;
@@ -3805,6 +3807,7 @@ impl QueryExecutor {
                                 }
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
+                                    if v == i64::MIN { continue; } // NULL sentinel
                                     group_sums[ai][row_groups[i] as usize] += v as f64;
                                 }
                             }
@@ -3927,10 +3930,34 @@ impl QueryExecutor {
                             .iter()
                             .position(|a| a.func == fname && a.col == agg_col);
                         match fname.as_str() {
-                            "COUNT" => row.push(Value::Integer(cnt)),
+                            "COUNT" => {
+                                if agg_col.is_some() {
+                                    // COUNT(col): check if this group had any non-NULL
+                                    // values by looking at the SUM agg's min tracker.
+                                    // If another SUM/MIN/MAX agg exists on the same col
+                                    // and its min is still INFINITY, all values were NULL.
+                                    let any_agg = gb_aggs.iter().enumerate()
+                                        .find(|(_, a)| a.col == agg_col);
+                                    if let Some((ai2, _)) = any_agg {
+                                        if group_mins[ai2][gi] == f64::INFINITY {
+                                            row.push(Value::Integer(0));
+                                        } else {
+                                            row.push(Value::Integer(cnt));
+                                        }
+                                    } else {
+                                        row.push(Value::Integer(cnt));
+                                    }
+                                } else {
+                                    row.push(Value::Integer(cnt));
+                                }
+                            }
                             "SUM" => {
                                 if let Some(ai) = ai {
-                                    if agg_is_float[ai] {
+                                    // 🔑 If no non-NULL value was accumulated
+                                    // (min still at INFINITY = initial), SUM is NULL.
+                                    if group_mins[ai][gi] == f64::INFINITY {
+                                        row.push(Value::Null);
+                                    } else if agg_is_float[ai] {
                                         row.push(Value::Float(group_sums[ai][gi]));
                                     } else {
                                         row.push(Value::Integer(group_sums[ai][gi] as i64));
