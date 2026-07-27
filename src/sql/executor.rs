@@ -9173,7 +9173,10 @@ impl QueryExecutor {
                 let lim = stmt.limit.unwrap_or(usize::MAX);
                 let off = stmt.offset.unwrap_or(0);
                 let need = lim.saturating_add(off).min(keyed.len());
-                if need < keyed.len() && need > 0 && need < keyed.len() / 2 {
+                // 🚨 Skip partial-sort when DISTINCT is set — it truncates to
+                // LIMIT rows BEFORE dedup, causing wrong results (e.g.
+                // DISTINCT cat LIMIT 3 returns 1 row instead of 3 after dedup).
+                if !stmt.distinct && need < keyed.len() && need > 0 && need < keyed.len() / 2 {
                     // Partition: top `need` elements moved to front (unsorted),
                     // then sort just those. OFFSET/LIMIT applied later by the
                     // existing code (don't apply here — would double-skip).

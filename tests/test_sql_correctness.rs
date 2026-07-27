@@ -1481,3 +1481,26 @@ fn test_concurrent_reads_see_consistent_data() {
     handle.join().unwrap();
     db.close().ok();
 }
+
+// === DISTINCT + ORDER BY + LIMIT combo (regression) ===
+// The partial-sort optimization truncated to LIMIT rows BEFORE dedup,
+// so DISTINCT cat ORDER BY cat DESC LIMIT 3 returned 1 row instead of 3.
+
+#[test]
+fn test_distinct_order_by_limit() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)").unwrap();
+    for i in 0..20 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, 'c{}')", i, i % 5)).unwrap();
+    }
+    let r = db.execute("SELECT DISTINCT cat FROM t ORDER BY cat DESC LIMIT 3").unwrap();
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+    };
+    let cats: Vec<String> = rows.iter().filter_map(|r| {
+        if let motedb::types::Value::Text(t) = &r[0] { Some(t.as_str().to_string()) } else { None }
+    }).collect();
+    assert_eq!(cats, vec!["c4", "c3", "c2"], "DISTINCT+ORDER BY DESC+LIMIT 3 must return 3 rows after dedup");
+}
