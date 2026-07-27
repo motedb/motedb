@@ -415,11 +415,16 @@ impl TableSchema {
 
                 // New SQL types
                 (ColumnType::Integer, crate::types::Value::Integer(_)) => true,
-                // 🚨 Float → Integer was allowed ("overflow promotion") but the
-                // value was stored as raw f64 bits reinterpreted as i64, producing
-                // garbage (e.g. 3.9 → Integer(4615964438073389875)). Now rejected;
-                // users should CAST or use an Integer literal.
-                (ColumnType::Integer, crate::types::Value::Float(_)) => false,
+                // Float → Integer: allow only for whole-number floats that fit in
+                // i64 (e.g. overflow promotion from i64::MAX + 100 → Float, then
+                // stored back as Integer). Non-whole floats (3.9) are rejected.
+                // This was previously rejected entirely, which broke UPDATE SET
+                // val = val + 100 when val was near i64::MAX (overflow promotion).
+                (ColumnType::Integer, crate::types::Value::Float(f)) => {
+                    // Allow whole-number floats (overflow promotion from arithmetic).
+                    // Reject fractional floats (3.9) — those are genuine type errors.
+                    f.is_finite() && f.fract() == 0.0
+                }
                 (ColumnType::Float, crate::types::Value::Float(_)) => true,
                 (ColumnType::Float, crate::types::Value::Integer(_)) => true, // Allow integer to float conversion
                 (ColumnType::Boolean, crate::types::Value::Bool(_)) => true,

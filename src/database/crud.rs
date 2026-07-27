@@ -743,10 +743,24 @@ impl MoteDB {
         table_name: &str,
         row_id: RowId,
         old_row: &Row,
-        new_row: Row,
+        mut new_row: Row,
         schema: &crate::types::TableSchema,
     ) -> Result<()> {
         ensure_open!(self);
+        // 🔑 Coerce Float→Integer for whole-number overflow promotion.
+        // Arithmetic like val + 100 when val is near i64::MAX promotes to Float;
+        // if the Float is a whole number, cast it back to Integer so it stores
+        // correctly (otherwise the f64 bit pattern is stored as i64 = garbage).
+        let col_types = schema.col_types();
+        for (i, ct) in col_types.iter().enumerate() {
+            if matches!(ct, crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp) {
+                if let Some(crate::types::Value::Float(f)) = new_row.get(i) {
+                    if f.is_finite() && f.fract() == 0.0 {
+                        new_row[i] = crate::types::Value::Integer(*f as i64);
+                    }
+                }
+            }
+        }
         // 🔑 Validate the new row against schema (same as INSERT/batch INSERT).
         // Without this, UPDATE t SET int_col = 3.5 bypasses type checking
         // and stores a Float bit pattern as Integer → garbage on read.
