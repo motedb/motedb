@@ -134,8 +134,14 @@ pub fn values_to_row_schema_order(values: &[Value], schema: &TableSchema) -> Res
             }
             (ColumnType::Timestamp, Value::Text(s)) => {
                 // Parse ISO 8601 date/datetime strings into microseconds.
-                // Supported: "2024-01-15", "2024-01-15 10:30:00", "2024-01-15T10:30:00"
-                parse_datetime(s.as_str()).unwrap_or_else(|| val.clone())
+                match parse_datetime(s.as_str()) {
+                    Some(ts) => ts,
+                    None => {
+                        return Err(crate::error::MoteDBError::InvalidArgument(format!(
+                            "Cannot parse '{}' as TIMESTAMP (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)", s
+                        )));
+                    }
+                }
             }
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
             _ => val,

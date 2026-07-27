@@ -1039,7 +1039,7 @@ impl Database {
                 }
                 match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
                     Ok(r) => r,
-                    Err(_) => return Ok(None),
+                    Err(e) => return Err(e),
                 }
             };
             rows.push(row);
