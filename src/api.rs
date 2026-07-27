@@ -432,6 +432,19 @@ impl Database {
             return Ok(StreamingQueryResult::Modification { affected_rows: 0 });
         }
 
+        // 🔑 Serialize autocommit writes (INSERT/UPDATE/DELETE) to prevent
+        // lost-update races (concurrent v=v+1 reading same old value).
+        // Explicit transactions are NOT serialized (they use MVCC isolation).
+        let is_autocommit_write = !in_txn && matches!(
+            trimmed.as_bytes().get(0..6),
+            Some(b"INSERT") | Some(b"insert") | Some(b"UPDATE") | Some(b"update") | Some(b"DELETE") | Some(b"delete")
+        );
+        let _write_guard = if is_autocommit_write {
+            Some(self.inner.write_lock.lock())
+        } else {
+            None
+        };
+
         if let Some(kw) = trimmed.as_bytes().get(0..6) {
             match kw {
                 b"INSERT" | b"insert" if !in_txn => {

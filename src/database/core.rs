@@ -53,6 +53,12 @@ pub struct MoteDB {
     /// max_row_id + 1) on open, guaranteeing it exceeds any pre-existing timestamp.
     pub(crate) write_lsn: Arc<AtomicU64>,
 
+    /// 🔑 Global write serialization lock. Held during autocommit write
+    /// operations (INSERT/UPDATE/DELETE) to prevent lost-update races
+    /// (e.g. concurrent `SET v=v+1` reading the same old value). Reads
+    /// are not affected (still concurrent).
+    pub(crate) write_lock: Arc<parking_lot::Mutex<()>>,
+
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
     /// 🚀 Optimized: DashMap for lock-free reads after first insert per table.
@@ -381,6 +387,7 @@ impl MoteDB {
             timestamp_index,
             next_row_id: next_row_id.clone(),
             write_lsn: write_lsn.clone(),
+            write_lock: Arc::new(parking_lot::Mutex::new(())),
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
@@ -597,6 +604,7 @@ impl MoteDB {
             timestamp_index: self.timestamp_index.clone(),
             next_row_id: self.next_row_id.clone(),
             write_lsn: self.write_lsn.clone(),
+            write_lock: self.write_lock.clone(),
             table_auto_increment: self.table_auto_increment.clone(), // 🚀 Phase 4
             num_partitions: self.num_partitions,
             txn_coordinator: self.txn_coordinator.clone(),
@@ -1128,6 +1136,7 @@ impl MoteDB {
             timestamp_index,
             next_row_id,
             write_lsn,
+            write_lock: Arc::new(parking_lot::Mutex::new(())),
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
