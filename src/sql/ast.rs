@@ -227,11 +227,12 @@ pub struct AlterTableStmt {
 pub enum AlterTableAction {
     /// ALTER TABLE table_name AUTO_INCREMENT = value
     SetAutoIncrement(i64),
-    /// ALTER TABLE table_name ADD COLUMN name type [DEFAULT value]
+    /// ALTER TABLE table_name ADD COLUMN name type [DEFAULT value] [NOT NULL]
     AddColumn {
         name: String,
         data_type: super::ast::DataType,
         default_value: Option<crate::types::Value>,
+        nullable: bool,
     },
 }
 

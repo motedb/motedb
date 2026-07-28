@@ -19602,7 +19602,7 @@ impl QueryExecutor {
                     message: format!("Table {} AUTO_INCREMENT set to {}", stmt.table, new_value),
                 })
             }
-            AlterTableAction::AddColumn { name, data_type, default_value } => {
+            AlterTableAction::AddColumn { name, data_type, default_value, nullable } => {
                 // Convert DataType to ColumnType (same mapping as CREATE TABLE).
                 let col_type = match data_type {
                     super::ast::DataType::Integer => ColumnType::Integer,
@@ -19623,6 +19623,7 @@ impl QueryExecutor {
                     &name,
                     col_type.clone(),
                     default_value.as_ref(),
+                    nullable,
                 )?;
                 // 🔑 Extend the store's col_types so post-ALTER INSERTs preserve
                 // the new column's value. Without this, the in-memory write_buf
@@ -19630,7 +19631,9 @@ impl QueryExecutor {
                 // the Nth value. add_column_type flushes the stale buffer,
                 // swaps in the widened col_types, and rebuilds write_buf.
                 if let Some(store) = self.db.col_segment_stores.get(&stmt.table) {
-                    store.add_column_type(col_type)?;
+                    // 🔑 Pass the DEFAULT value so existing rows get backfilled
+                    // with it (not NULL) during the segment rewrite.
+                    store.add_column_type_with_default(col_type, default_value.as_ref())?;
                 }
                 // 🚨 Invalidate the legacy `columnar_sstables` read cache for this
                 // table. That map holds an Arc<ColumnarSSTable> snapshot of the
@@ -19650,6 +19653,9 @@ impl QueryExecutor {
                 // semantics.
                 //
                 // DO NOT remove columnar_sstables either — same reason.
+                // 🔑 DEFAULT backfill is handled inside add_column_type_with_default
+                // (the segment merge writes the default value instead of NULL
+                // for the new column on pre-existing rows).
 
                 Ok(QueryResult::Definition {
                     message: format!("Added column '{}' to table '{}'", name, stmt.table),

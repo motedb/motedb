@@ -1159,7 +1159,12 @@ impl Parser {
                     self.recursion_depth -= 1;
                     return Err(self.error("Expression nesting too deep"));
                 }
-                let expr = self.parse_expr(10)?;
+                // 🔑 SQL precedence: NOT binds tighter than AND(2)/OR(1) but
+                // looser than comparisons(3)/arithmetic(4,5). Use min_precedence=3
+                // so `NOT v > 20` parses as `NOT (v > 20)` (not `(NOT v) > 20`).
+                // Previously this was 10, which stopped before the comparison
+                // operator, producing wrong results (NOT v > 20 matched nothing).
+                let expr = self.parse_expr(3)?;
                 self.recursion_depth -= 1;
                 Ok(Expr::UnaryOp {
                     op: UnaryOperator::Not,
@@ -2280,41 +2285,57 @@ impl Parser {
             }
             let col_name = self.parse_identifier()?;
             let data_type = self.parse_data_type()?;
-            // Optional DEFAULT value
-            let default_value = if matches!(self.current().token_type, TokenType::Default) {
-                self.advance();
-                // Parse a literal: number, string, true/false, null
-                let val = match &self.current().token_type {
-                    TokenType::PureInteger(i) => {
-                        let v = crate::types::Value::Integer(*i);
-                        self.advance();
-                        v
+            // 🔑 Parse column constraints in any order: DEFAULT, NULL, NOT NULL.
+            // Accepts e.g. `INT DEFAULT 0 NOT NULL`, `INT NOT NULL DEFAULT 0`,
+            // `TEXT DEFAULT 'x'`, `INT NOT NULL`.
+            let mut default_value: Option<crate::types::Value> = None;
+            let mut nullable = true;
+            loop {
+                if matches!(self.current().token_type, TokenType::Default) {
+                    self.advance();
+                    let val = match &self.current().token_type {
+                        TokenType::PureInteger(i) => {
+                            let v = crate::types::Value::Integer(*i);
+                            self.advance();
+                            v
+                        }
+                        TokenType::Number(n) => {
+                            let v = crate::types::Value::Float(*n);
+                            self.advance();
+                            v
+                        }
+                        TokenType::String(s) => {
+                            let v = crate::types::Value::Text(s.clone().into());
+                            self.advance();
+                            v
+                        }
+                        TokenType::True => { self.advance(); crate::types::Value::Bool(true) }
+                        TokenType::False => { self.advance(); crate::types::Value::Bool(false) }
+                        TokenType::Null => { self.advance(); crate::types::Value::Null }
+                        _ => return Err(self.error("Expected literal value for DEFAULT")),
+                    };
+                    default_value = Some(val);
+                } else if matches!(self.current().token_type, TokenType::Not) {
+                    self.advance();
+                    if !matches!(self.current().token_type, TokenType::Null) {
+                        return Err(self.error("Expected NULL after NOT"));
                     }
-                    TokenType::Number(n) => {
-                        let v = crate::types::Value::Float(*n);
-                        self.advance();
-                        v
-                    }
-                    TokenType::String(s) => {
-                        let v = crate::types::Value::Text(s.clone().into());
-                        self.advance();
-                        v
-                    }
-                    TokenType::True => { self.advance(); crate::types::Value::Bool(true) }
-                    TokenType::False => { self.advance(); crate::types::Value::Bool(false) }
-                    TokenType::Null => { self.advance(); crate::types::Value::Null }
-                    _ => return Err(self.error("Expected literal value for DEFAULT")),
-                };
-                Some(val)
-            } else {
-                None
-            };
+                    self.advance();
+                    nullable = false;
+                } else if matches!(self.current().token_type, TokenType::Null) {
+                    self.advance();
+                    nullable = true;
+                } else {
+                    break;
+                }
+            }
             Ok(AlterTableStmt {
                 table,
                 action: AlterTableAction::AddColumn {
                     name: col_name,
                     data_type,
                     default_value,
+                    nullable,
                 },
             })
         } else {
@@ -2323,6 +2344,11 @@ impl Parser {
             self.expect(TokenType::Eq)?;
 
             let value = match &self.current().token_type {
+                TokenType::PureInteger(i) => {
+                    let value = *i;
+                    self.advance();
+                    value
+                }
                 TokenType::Number(n) => {
                     let f = *n;
                     if f < 0.0 || f > i64::MAX as f64 || f.fract() != 0.0 {

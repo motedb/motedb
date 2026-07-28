@@ -190,6 +190,7 @@ impl TableRegistry {
         col_name: &str,
         col_type: crate::types::ColumnType,
         default_value: Option<&crate::types::Value>,
+        nullable: bool,
     ) -> Result<()> {
         let _ = default_value; // Reserved for future DEFAULT clause support.
         let mut meta = self
@@ -212,7 +213,7 @@ impl TableRegistry {
 
         let pos = schema.columns.len();
         let mut col_def = crate::types::ColumnDef::new(col_name.to_string(), col_type, pos);
-        col_def.nullable = true; // ALTER-added columns are always nullable
+        col_def.nullable = nullable;
         // Store the DEFAULT so existing rows read back the default value
         // (rather than NULL) for the new column.
         col_def.default_value = default_value.cloned();

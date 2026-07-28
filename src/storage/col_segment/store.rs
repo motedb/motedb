@@ -317,6 +317,16 @@ impl ColSegmentStore {
     /// types, so the bug does NOT persist across reopen — this fix closes the
     /// live-session window between ALTER and reopen.
     pub fn add_column_type(&self, new_col: ColumnType) -> Result<()> {
+        self.add_column_type_with_default(new_col, None)
+    }
+
+    /// Like `add_column_type`, but backfills pre-existing rows with `default_value`
+    /// instead of NULL. Used by `ALTER TABLE ADD COLUMN ... DEFAULT x`.
+    pub fn add_column_type_with_default(
+        &self,
+        new_col: ColumnType,
+        default_value: Option<&crate::types::Value>,
+    ) -> Result<()> {
         let _guard = self.flush_merge_lock.lock();
         // 1. Drain the N-1 column buffer to a segment first.
         //    Use flush_buffer_locked — calling flush_buffer here would
@@ -350,8 +360,9 @@ impl ColSegmentStore {
         if !old_segs.is_empty() {
             // merge_segments_locked — we already hold flush_merge_lock above
             // (calling merge_segments would deadlock: parking_lot::Mutex is
-            // not reentrant).
-            self.merge_segments_locked(old_segs)?;
+            // not reentrant). Pass the new column's default_value so the merge
+            // backfills pre-existing rows with it instead of NULL.
+            self.merge_segments_locked_with_default(old_segs, default_value)?;
         }
         // 5. Invalidate schema-dependent caches.
         self.groupby_cache.write().clear();
@@ -3127,6 +3138,17 @@ impl ColSegmentStore {
     /// `add_column_type` (which already holds the lock — calling `merge_segments`
     /// from there would deadlock since parking_lot::Mutex is NOT reentrant).
     fn merge_segments_locked(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
+        self.merge_segments_locked_with_default(old_segs, None)
+    }
+
+    /// Merge segments, backfilling the new (last) column with `new_col_default`
+    /// instead of NULL for rows from pre-ALTER segments. Used by
+    /// `ALTER TABLE ADD COLUMN ... DEFAULT x`.
+    fn merge_segments_locked_with_default(
+        &self,
+        old_segs: Vec<Arc<Segment>>,
+        new_col_default: Option<&crate::types::Value>,
+    ) -> Result<()> {
         if old_segs.is_empty() {
             return Ok(());
         }
@@ -3198,6 +3220,34 @@ impl ColSegmentStore {
                                 col_nulls.push(false);
                             }
                             None => {
+                                // 🔑 Backfill: if this is the new column (ci is
+                                // the last column, beyond old segment's tags)
+                                // AND a default value exists, encode it instead
+                                // of NULL. For the all-fixed path, the default
+                                // must be a fixed-width numeric (Integer/Float/
+                                // Timestamp — encoded as i64 bytes).
+                                if ci >= seg.sst.column_tags.len() {
+                                    if let Some(dv) = new_col_default {
+                                        match dv {
+                                            crate::types::Value::Integer(iv) => {
+                                                col_vals.push(iv.to_le_bytes());
+                                                col_nulls.push(false);
+                                                continue;
+                                            }
+                                            crate::types::Value::Float(fv) => {
+                                                col_vals.push(fv.to_le_bytes());
+                                                col_nulls.push(false);
+                                                continue;
+                                            }
+                                            crate::types::Value::Timestamp(tv) => {
+                                                col_vals.push(tv.as_micros().to_le_bytes());
+                                                col_nulls.push(false);
+                                                continue;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                                 col_vals.push(0i64.to_le_bytes());
                                 col_nulls.push(true);
                             }
@@ -3396,12 +3446,44 @@ impl ColSegmentStore {
                         } else {
                             // 🚨 Column ci doesn't exist in this segment (e.g.
                             // ALTER TABLE ADD COLUMN added it after this segment
-                            // was written; ci >= column_tags.len()). Emit a NULL
-                            // placeholder sized for the column's declared type so
-                            // add_values_raw_with_nulls gets the right byte width.
-                            // Without this, the column's buffer would be empty
-                            // while null=false, corrupting the segment layout
-                            // (subsequent reads OOB / "Text segment too short").
+                            // was written; ci >= column_tags.len()).
+                            // 🔑 If a DEFAULT value exists for this new column,
+                            // encode it instead of NULL (SQL: ADD COLUMN DEFAULT
+                            // backfills existing rows with the default).
+                            if let Some(dv) = new_col_default {
+                                let encoded_default = match dv {
+                                    crate::types::Value::Integer(iv) => {
+                                        iv.to_le_bytes().to_vec() // fixed-width 8 bytes, null=false
+                                    }
+                                    crate::types::Value::Float(fv) => {
+                                        fv.to_le_bytes().to_vec()
+                                    }
+                                    crate::types::Value::Timestamp(tv) => {
+                                        tv.as_micros().to_le_bytes().to_vec()
+                                    }
+                                    crate::types::Value::Bool(bv) => {
+                                        vec![if *bv { 1u8 } else { 0u8 }]
+                                    }
+                                    crate::types::Value::Text(ts) => {
+                                        // [len:u16][bytes] (matches add_values Text encoding)
+                                        let bytes = ts.as_bytes();
+                                        let len = bytes.len().min(65535) as u16;
+                                        let mut b = len.to_le_bytes().to_vec();
+                                        b.extend_from_slice(&bytes[..len as usize]);
+                                        b
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                if !encoded_default.is_empty() {
+                                    buf.extend_from_slice(&encoded_default);
+                                    row_nulls.push(false);
+                                    row_bytes.push(buf);
+                                    continue;
+                                }
+                            }
+                            // No default — emit a NULL placeholder sized for the
+                            // column's declared type so add_values_raw_with_nulls
+                            // gets the right byte width.
                             match col_types.get(ci) {
                                 Some(ColumnType::Integer)
                                 | Some(ColumnType::Float)
