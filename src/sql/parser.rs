@@ -747,6 +747,7 @@ impl Parser {
             let mut primary_key = false;
             let mut auto_increment = false;
             let mut auto_increment_start: Option<i64> = None;
+            let mut default_value: Option<crate::types::Value> = None;
 
             loop {
                 // NOT NULL
@@ -791,6 +792,33 @@ impl Parser {
                     continue;
                 }
 
+                // 🔑 DEFAULT value (CREATE TABLE column constraint)
+                if self.match_token(TokenType::Default) {
+                    let val = match &self.current().token_type {
+                        TokenType::PureInteger(i) => {
+                            let v = crate::types::Value::Integer(*i);
+                            self.advance();
+                            v
+                        }
+                        TokenType::Number(n) => {
+                            let v = crate::types::Value::Float(*n);
+                            self.advance();
+                            v
+                        }
+                        TokenType::String(s) => {
+                            let v = crate::types::Value::Text(s.clone().into());
+                            self.advance();
+                            v
+                        }
+                        TokenType::True => { self.advance(); crate::types::Value::Bool(true) }
+                        TokenType::False => { self.advance(); crate::types::Value::Bool(false) }
+                        TokenType::Null => { self.advance(); crate::types::Value::Null }
+                        _ => return Err(self.error("Expected literal value for DEFAULT")),
+                    };
+                    default_value = Some(val);
+                    continue;
+                }
+
                 break;
             }
 
@@ -801,6 +829,7 @@ impl Parser {
                 primary_key,
                 auto_increment,
                 auto_increment_start,
+                default_value,
             });
 
             // Check for duplicate column names

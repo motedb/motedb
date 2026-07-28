@@ -15843,21 +15843,17 @@ impl QueryExecutor {
             for col_spec in columns {
                 let col_value = match col_spec {
                     SelectColumn::Column(name) => {
-                        if !group_by_cols.contains(name) {
-                            return Err(MoteDBError::Query(format!(
-                                "Column '{}' must appear in GROUP BY or be in aggregate function",
-                                name
-                            )));
-                        }
+                        // 🔑 Allow bare columns not in GROUP BY (SQLite behavior):
+                        // take the value from the first row of the group. This
+                        // supports functional-dependency cases like
+                        // `SELECT a.name, COUNT(*) ... GROUP BY a.id` where a.id
+                        // is the PK (so a.name is determined per group), and
+                        // table-prefixed columns (`a.name` vs GROUP BY `a.id`).
+                        // Previously this rejected `a.name` because the string
+                        // didn't literally match `a.id`.
                         Self::get_value_from_row(group_rows[0], name)
                     }
                     SelectColumn::ColumnWithAlias(name, _) => {
-                        if !group_by_cols.contains(name) {
-                            return Err(MoteDBError::Query(format!(
-                                "Column '{}' must appear in GROUP BY",
-                                name
-                            )));
-                        }
                         Self::get_value_from_row(group_rows[0], name)
                     }
                     SelectColumn::Expr(expr, _) => {
@@ -19065,6 +19061,8 @@ impl QueryExecutor {
                         col_def = col_def.auto_increment();
                     }
                 }
+                // 🔑 DEFAULT value (CREATE TABLE column constraint).
+                col_def.default_value = col.default_value.clone();
                 col_def
             })
             .collect();

@@ -69,7 +69,15 @@ pub fn values_to_row_by_columns(
     columns: &[String],
     schema: &TableSchema,
 ) -> Result<Row> {
-    let mut row = vec![Value::Null; schema.columns.len()];
+    // 🔑 Initialize all columns to their DEFAULT value (if specified) instead
+    // of NULL. Columns not in the INSERT column list retain their default.
+    // This makes `INSERT INTO t (id) VALUES (1)` correctly populate other
+    // columns with their CREATE TABLE DEFAULT values.
+    let mut row: Vec<Value> = schema
+        .columns
+        .iter()
+        .map(|c| c.default_value.clone().unwrap_or(Value::Null))
+        .collect();
 
     for (i, col_name) in columns.iter().enumerate() {
         let val = values.get(i).cloned().unwrap_or(Value::Null);
@@ -79,8 +87,8 @@ pub fn values_to_row_by_columns(
             if col_def.auto_increment {
                 continue;
             }
-            // Enforce NOT NULL
-            if !col_def.nullable && matches!(val, Value::Null) {
+            // Enforce NOT NULL (but allow DEFAULT to satisfy it)
+            if !col_def.nullable && matches!(val, Value::Null) && col_def.default_value.is_none() {
                 return Err(crate::error::MoteDBError::InvalidArgument(format!(
                     "Column '{}' cannot be null",
                     col_name

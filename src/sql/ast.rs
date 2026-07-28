@@ -166,6 +166,8 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     /// 🚀 Phase 5: AUTO_INCREMENT starting value (e.g., AUTO_INCREMENT = 100)
     pub auto_increment_start: Option<i64>,
+    /// DEFAULT value for the column (CREATE TABLE / ALTER TABLE).
+    pub default_value: Option<crate::types::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
