@@ -844,3 +844,77 @@ fn test_substr_with_length() {
     assert_eq!(q(&db, "SELECT substr('abcdef', 2, 3)")[0][0], Value::text("bcd".to_string()));
     assert_eq!(q(&db, "SELECT substr('abcdef', -3, 2)")[0][0], Value::text("de".to_string()));
 }
+
+// =========================================================================
+// Round 28: UPDATE division-by-zero must error, not silently write NULL
+// =========================================================================
+
+#[test]
+fn test_update_div_by_zero_pk_path() {
+    // UPDATE ... WHERE id = <const> takes the PK fast path in execute_update_pk.
+    // Previously, eval_expr_on_row used unwrap_or(Value::Null), swallowing
+    // DivisionByZero and silently writing NULL.
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    let err = q_err(&db, "UPDATE t SET v = v / 0 WHERE id = 1");
+    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+           "expected division error, got: {err}");
+
+    // Value must be unchanged after the failed update.
+    let r = q(&db, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(r[0][0], Value::Integer(10));
+}
+
+#[test]
+fn test_update_div_by_zero_scan_path() {
+    // UPDATE ... WHERE <non-PK predicate> takes the scan path in execute_update.
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    let err = q_err(&db, "UPDATE t SET v = v / 0 WHERE v > 0");
+    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+           "expected division error, got: {err}");
+
+    let r = q(&db, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(r[0][1], Value::Integer(10));
+    assert_eq!(r[1][1], Value::Integer(20));
+}
+
+#[test]
+fn test_update_div_by_zero_literal_divisor() {
+    // Literal divisor 0 (not column reference).
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let err = q_err(&db, "UPDATE t SET v = 100 / 0 WHERE id = 1");
+    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+           "expected division error, got: {err}");
+
+    let r = q(&db, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(r[0][0], Value::Integer(10));
+}
+
+#[test]
+fn test_update_div_by_zero_rowid_path() {
+    // Force the row-id path by updating via a non-unique column predicate.
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5, 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 5, 20)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 6, 30)").unwrap();
+
+    let err = q_err(&db, "UPDATE t SET v = v / 0 WHERE g = 5");
+    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+           "expected division error, got: {err}");
+
+    let r = q(&db, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(r[0][1], Value::Integer(10));
+    assert_eq!(r[1][1], Value::Integer(20));
+    assert_eq!(r[2][1], Value::Integer(30));
+}

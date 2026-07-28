@@ -2047,6 +2047,9 @@ impl Database {
             let val = match Self::parse_single_literal(val_str) {
                 Some(v) => v,
                 None => match Self::evaluate_simple_set_expr(val_str, &old_row, &schema) {
+                    // 🔑 div-by-zero: positional_fast_div returns None when divisor
+                    // is 0 (checked_div). Fall through to the full parser, which
+                    // now propagates the DivisionByZero error instead of swallowing it.
                     Some(v) => v,
                     None => return Ok(None), // complex expression → fall through to full parser
                 },

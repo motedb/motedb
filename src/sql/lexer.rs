@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(tokens.len(), 9);
         assert!(matches!(tokens[5].token_type, TokenType::Identifier(_)));
         assert!(matches!(tokens[6].token_type, TokenType::Gt));
-        assert!(matches!(tokens[7].token_type, TokenType::Number(_)));
+        assert!(matches!(tokens[7].token_type, TokenType::PureInteger(_)));
     }
 
     #[test]

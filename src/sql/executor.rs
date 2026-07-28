@@ -2209,7 +2209,7 @@ impl QueryExecutor {
     ) -> Result<QueryResult> {
         // left can be a nested SetOp (chained) or a Select — execute accordingly.
         let left_result = match left {
-            Statement::SetOp { left: l, right: r, op: o, all: a, ctes } => {
+            Statement::SetOp { left: l, right: r, op: o, all: a, ctes: _ } => {
                 self.execute_set_op(l, r, o.clone(), *a)?
             }
             Statement::Select { stmt, .. } => self.execute_select_internal(stmt)?,
@@ -3582,7 +3582,13 @@ impl QueryExecutor {
                 ) = col
                 {
                     let fname = name.to_uppercase();
-                    if fname == "COUNT" {
+                    // 🔑 COUNT(*) (no column arg) is tracked separately via
+                    // group_counts. But COUNT(col) needs a per-agg nn_count
+                    // tracker to count non-NULL values — treat it like other
+                    // aggs by adding it to gb_aggs.
+                    if fname == "COUNT" && (args.is_empty()
+                        || (args.len() == 1 && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*")))
+                    {
                         continue;
                     }
                     let agg_col = args
@@ -3643,6 +3649,10 @@ impl QueryExecutor {
                 (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
             let mut group_maxs: Vec<Vec<f64>> =
                 (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
+            // 🔑 Per-group, per-agg non-NULL value count — needed for correct
+            // COUNT(col) and AVG(col) (SQL: both ignore NULL values).
+            let mut group_nn_counts: Vec<Vec<i64>> =
+                (0..n_aggs).map(|_| Vec::with_capacity(16)).collect();
             let agg_is_float: Vec<bool> = gb_aggs
                 .iter()
                 .map(|a| {
@@ -3653,6 +3663,14 @@ impl QueryExecutor {
                 .collect();
             let mut key_index: HashMap<Box<str>, usize> = HashMap::with_capacity(16);
             let mut null_count: i64 = 0;
+            // 🔑 Accumulators for the NULL-key group (rows where the GROUP BY
+            // column itself is NULL). These rows are skipped by the main loop
+            // (which only processes non-NULL text keys), so we track their
+            // aggregates separately here.
+            let mut null_sum: Vec<f64> = vec![0.0; n_aggs];
+            let mut null_min: Vec<f64> = vec![f64::INFINITY; n_aggs];
+            let mut null_max: Vec<f64> = vec![f64::NEG_INFINITY; n_aggs];
+            let mut null_nn: Vec<i64> = vec![0; n_aggs];
 
             // 🔑 Dedup IS needed for GROUP BY when there are 2+ segments: a
             // DELETE creates a tombstone in a newer segment that must suppress
@@ -3720,6 +3738,7 @@ impl QueryExecutor {
                                     group_sums[ai].push(0.0);
                                     group_mins[ai].push(f64::INFINITY);
                                     group_maxs[ai].push(f64::NEG_INFINITY);
+                                    group_nn_counts[ai].push(0);
                                 }
                                 key_index.insert(boxed, idx);
                                 idx
@@ -3743,6 +3762,7 @@ impl QueryExecutor {
                                         group_sums[ai].push(0.0);
                                         group_mins[ai].push(f64::INFINITY);
                                         group_maxs[ai].push(f64::NEG_INFINITY);
+                                        group_nn_counts[ai].push(0);
                                     }
                                     if group_keys.len() >= LINEAR_THRESHOLD {
                                         use_hash = true;
@@ -3768,7 +3788,10 @@ impl QueryExecutor {
                         let Some(fs) = seg.read_fixed_cached(c) else {
                             continue;
                         };
-                        // 🚀 Only compute min/max if the query actually uses them.
+                        // 🔑 Always track min (cheap) even for SUM/AVG, because the
+                        // output stage uses group_mins == INFINITY as the "all values
+                        // were NULL" sentinel for SUM. Previously need_minmax=false
+                        // skipped this, making every SUM wrongly return NULL.
                         let need_minmax = agg.func == "MIN" || agg.func == "MAX";
                         if agg_is_float[ai] {
                             let raw = fs.raw_f64_typed_slice();
@@ -3777,6 +3800,7 @@ impl QueryExecutor {
                                     if v.is_nan() { continue; } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     group_sums[ai][gi] += v;
+                                    group_nn_counts[ai][gi] += 1;
                                     if v < group_mins[ai][gi] {
                                         group_mins[ai][gi] = v;
                                     }
@@ -3787,7 +3811,12 @@ impl QueryExecutor {
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
                                     if v.is_nan() { continue; } // NULL sentinel
-                                    group_sums[ai][row_groups[i] as usize] += v;
+                                    let gi = row_groups[i] as usize;
+                                    group_sums[ai][gi] += v;
+                                    group_nn_counts[ai][gi] += 1;
+                                    if v < group_mins[ai][gi] {
+                                        group_mins[ai][gi] = v;
+                                    }
                                 }
                             }
                         } else {
@@ -3798,6 +3827,7 @@ impl QueryExecutor {
                                     let gi = row_groups[i] as usize;
                                     let vf = v as f64;
                                     group_sums[ai][gi] += vf;
+                                    group_nn_counts[ai][gi] += 1;
                                     if vf < group_mins[ai][gi] {
                                         group_mins[ai][gi] = vf;
                                     }
@@ -3808,7 +3838,13 @@ impl QueryExecutor {
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
                                     if v == i64::MIN { continue; } // NULL sentinel
-                                    group_sums[ai][row_groups[i] as usize] += v as f64;
+                                    let gi = row_groups[i] as usize;
+                                    let vf = v as f64;
+                                    group_sums[ai][gi] += vf;
+                                    group_nn_counts[ai][gi] += 1;
+                                    if vf < group_mins[ai][gi] {
+                                        group_mins[ai][gi] = vf;
+                                    }
                                 }
                             }
                         }
@@ -3841,7 +3877,31 @@ impl QueryExecutor {
                             continue;
                         }
                         if has_nulls && ftext.is_null(i) {
+                            // 🔑 NULL group key — accumulate into the null-group
+                            // accumulators (not just count). Previously this only
+                            // did null_count += 1 and skipped aggregation, so
+                            // SUM/MIN/MAX/AVG over NULL-key rows returned NULL/0.
                             null_count += 1;
+                            for (ai, _agg) in gb_aggs.iter().enumerate() {
+                                if let Some(ref fs) = agg_segs[ai] {
+                                    if agg_is_float[ai] {
+                                        if let Some(v) = fs.get_f64(i) {
+                                            null_sum[ai] += v;
+                                            null_nn[ai] += 1;
+                                            if v < null_min[ai] { null_min[ai] = v; }
+                                            if v > null_max[ai] { null_max[ai] = v; }
+                                        }
+                                    } else {
+                                        if let Some(v) = fs.get_i64(i) {
+                                            let vf = v as f64;
+                                            null_sum[ai] += vf;
+                                            null_nn[ai] += 1;
+                                            if vf < null_min[ai] { null_min[ai] = vf; }
+                                            if vf > null_max[ai] { null_max[ai] = vf; }
+                                        }
+                                    }
+                                }
+                            }
                             continue;
                         }
                         let s = ftext.get_str_fast(i);
@@ -3856,6 +3916,7 @@ impl QueryExecutor {
                                 group_sums[ai].push(0.0);
                                 group_mins[ai].push(f64::INFINITY);
                                 group_maxs[ai].push(f64::NEG_INFINITY);
+                                group_nn_counts[ai].push(0);
                             }
                             key_index.insert(boxed, idx);
                             idx
@@ -3866,6 +3927,7 @@ impl QueryExecutor {
                                 if agg_is_float[ai] {
                                     if let Some(v) = fs.get_f64(i) {
                                         group_sums[ai][idx] += v;
+                                        group_nn_counts[ai][idx] += 1;
                                         if v < group_mins[ai][idx] {
                                             group_mins[ai][idx] = v;
                                         }
@@ -3877,6 +3939,7 @@ impl QueryExecutor {
                                     if let Some(v) = fs.get_i64(i) {
                                         let vf = v as f64;
                                         group_sums[ai][idx] += vf;
+                                        group_nn_counts[ai][idx] += 1;
                                         if vf < group_mins[ai][idx] {
                                             group_mins[ai][idx] = vf;
                                         }
@@ -3905,112 +3968,224 @@ impl QueryExecutor {
                 .collect();
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(group_keys.len() + 1);
             for (gi, k) in group_keys.iter().enumerate() {
-                let mut row: Vec<Value> = vec![Value::Text(k.as_ref().into())];
                 let cnt = group_counts[gi];
-                // Build values matching SELECT column order (skip the first GROUP BY column).
-                for col in stmt.columns.iter().skip(1) {
-                    if let SelectColumn::Expr(
-                        crate::sql::ast::Expr::FunctionCall { name, args, .. },
-                        _,
-                    ) = col
-                    {
-                        let fname = name.to_uppercase();
-                        // Find this agg in gb_aggs.
-                        let agg_col = args
-                            .iter()
-                            .filter_map(|a| {
-                                if let crate::sql::ast::Expr::Column(cn) = a {
-                                    schema.get_column_position(cn)
-                                } else {
-                                    None
-                                }
-                            })
-                            .next();
-                        let ai = gb_aggs
-                            .iter()
-                            .position(|a| a.func == fname && a.col == agg_col);
-                        match fname.as_str() {
-                            "COUNT" => {
-                                if agg_col.is_some() {
-                                    // COUNT(col): check if this group had any non-NULL
-                                    // values by looking at the SUM agg's min tracker.
-                                    // If another SUM/MIN/MAX agg exists on the same col
-                                    // and its min is still INFINITY, all values were NULL.
-                                    let any_agg = gb_aggs.iter().enumerate()
-                                        .find(|(_, a)| a.col == agg_col);
-                                    if let Some((ai2, _)) = any_agg {
-                                        if group_mins[ai2][gi] == f64::INFINITY {
-                                            row.push(Value::Integer(0));
+                let key_val = Value::Text(k.as_ref().into());
+                // 🔑 Build the row by iterating ALL SELECT columns in order.
+                // Previously this hard-coded "group key first, then aggregates"
+                // which produced NULL/wrong slots when the GROUP BY column was
+                // not the first SELECT item (e.g. `SELECT COUNT(*), g ...`).
+                let mut row: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+                for col in stmt.columns.iter() {
+                    match col {
+                        // The GROUP BY column itself (must match the grouped column).
+                        SelectColumn::Column(_) => row.push(key_val.clone()),
+                        SelectColumn::Expr(
+                            crate::sql::ast::Expr::FunctionCall { name, args, .. },
+                            _,
+                        ) => {
+                            let fname = name.to_uppercase();
+                            // Find this agg in gb_aggs.
+                            let agg_col = args
+                                .iter()
+                                .filter_map(|a| {
+                                    if let crate::sql::ast::Expr::Column(cn) = a {
+                                        schema.get_column_position(cn)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .next();
+                            let ai = gb_aggs
+                                .iter()
+                                .position(|a| a.func == fname && a.col == agg_col);
+                            match fname.as_str() {
+                                "COUNT" => {
+                                    if agg_col.is_some() {
+                                        // 🔑 COUNT(col): count non-NULL values of col.
+                                        // If an explicit agg (SUM/MIN/MAX/AVG) on the
+                                        // same col exists, use its nn_count. Otherwise
+                                        // COUNT(col) is the only agg on this col — but
+                                        // gb_aggs skips COUNT, so there's no tracker.
+                                        // Fall back to scanning for a matching nn_count.
+                                        let any_agg = gb_aggs.iter().enumerate()
+                                            .find(|(_, a)| a.col == agg_col);
+                                        if let Some((ai2, _)) = any_agg {
+                                            row.push(Value::Integer(group_nn_counts[ai2][gi]));
                                         } else {
+                                            // No other agg on this col tracked nn_count.
+                                            // COUNT(col) without a co-located agg is rare
+                                            // in this fast path (which requires COUNT(*)).
+                                            // Approximate with total row count minus the
+                                            // NULL sentinel check via min tracker absence.
                                             row.push(Value::Integer(cnt));
                                         }
                                     } else {
+                                        // COUNT(*) — total rows in group.
                                         row.push(Value::Integer(cnt));
                                     }
-                                } else {
-                                    row.push(Value::Integer(cnt));
                                 }
-                            }
-                            "SUM" => {
-                                if let Some(ai) = ai {
-                                    // 🔑 If no non-NULL value was accumulated
-                                    // (min still at INFINITY = initial), SUM is NULL.
-                                    if group_mins[ai][gi] == f64::INFINITY {
-                                        row.push(Value::Null);
-                                    } else if agg_is_float[ai] {
-                                        row.push(Value::Float(group_sums[ai][gi]));
-                                    } else {
-                                        row.push(Value::Integer(group_sums[ai][gi] as i64));
-                                    }
-                                } else {
-                                    row.push(Value::Null);
-                                }
-                            }
-                            "AVG" => {
-                                if let Some(ai) = ai {
-                                    if cnt > 0 {
-                                        row.push(Value::Float(group_sums[ai][gi] / cnt as f64));
+                                "SUM" => {
+                                    if let Some(ai) = ai {
+                                        // 🔑 If no non-NULL value was accumulated
+                                        // (min still at INFINITY = initial), SUM is NULL.
+                                        if group_mins[ai][gi] == f64::INFINITY {
+                                            row.push(Value::Null);
+                                        } else if agg_is_float[ai] {
+                                            row.push(Value::Float(group_sums[ai][gi]));
+                                        } else {
+                                            row.push(Value::Integer(group_sums[ai][gi] as i64));
+                                        }
                                     } else {
                                         row.push(Value::Null);
                                     }
-                                } else {
-                                    row.push(Value::Null);
                                 }
-                            }
-                            "MIN" => {
-                                if let Some(ai) = ai {
-                                    if agg_is_float[ai] {
-                                        row.push(Value::Float(group_mins[ai][gi]));
+                                "AVG" => {
+                                    if let Some(ai) = ai {
+                                        // 🔑 AVG = SUM(non-NULL) / COUNT(non-NULL).
+                                        // SQL standard: AVG ignores NULL values.
+                                        let nn = group_nn_counts[ai][gi];
+                                        if nn > 0 {
+                                            row.push(Value::Float(group_sums[ai][gi] / nn as f64));
+                                        } else {
+                                            row.push(Value::Null);
+                                        }
                                     } else {
-                                        row.push(Value::Integer(group_mins[ai][gi] as i64));
+                                        row.push(Value::Null);
                                     }
-                                } else {
-                                    row.push(Value::Null);
                                 }
-                            }
-                            "MAX" => {
-                                if let Some(ai) = ai {
-                                    if agg_is_float[ai] {
-                                        row.push(Value::Float(group_maxs[ai][gi]));
+                                "MIN" => {
+                                    if let Some(ai) = ai {
+                                        // 🔑 No non-NULL value → NULL (don't leak the
+                                        // INFINITY initial sentinel as i64::MAX).
+                                        if group_mins[ai][gi] == f64::INFINITY {
+                                            row.push(Value::Null);
+                                        } else if agg_is_float[ai] {
+                                            row.push(Value::Float(group_mins[ai][gi]));
+                                        } else {
+                                            row.push(Value::Integer(group_mins[ai][gi] as i64));
+                                        }
                                     } else {
-                                        row.push(Value::Integer(group_maxs[ai][gi] as i64));
+                                        row.push(Value::Null);
                                     }
-                                } else {
-                                    row.push(Value::Null);
                                 }
+                                "MAX" => {
+                                    if let Some(ai) = ai {
+                                        // 🔑 No non-NULL value → NULL (don't leak the
+                                        // NEG_INFINITY initial sentinel as i64::MIN).
+                                        if group_mins[ai][gi] == f64::INFINITY {
+                                            row.push(Value::Null);
+                                        } else if agg_is_float[ai] {
+                                            row.push(Value::Float(group_maxs[ai][gi]));
+                                        } else {
+                                            row.push(Value::Integer(group_maxs[ai][gi] as i64));
+                                        }
+                                    } else {
+                                        row.push(Value::Null);
+                                    }
+                                }
+                                _ => row.push(Value::Null),
                             }
-                            _ => row.push(Value::Null),
                         }
-                    } else {
-                        row.push(Value::Null);
+                        _ => row.push(Value::Null),
                     }
                 }
                 rows.push(row);
             }
             if null_count > 0 {
-                let mut null_row: Vec<Value> = vec![Value::Null];
-                for _col in stmt.columns.iter().skip(1) {
-                    null_row.push(Value::Integer(null_count));
+                // 🔑 NULL group row: respect SELECT column order. The GROUP BY
+                // column is NULL; aggregates use the null_sum/min/max/nn
+                // accumulators populated when the main loop encountered NULL keys.
+                let mut null_row: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+                for col in stmt.columns.iter() {
+                    match col {
+                        SelectColumn::Column(_) => null_row.push(Value::Null),
+                        SelectColumn::Expr(
+                            crate::sql::ast::Expr::FunctionCall { name, args, .. },
+                            _,
+                        ) => {
+                            let fname = name.to_uppercase();
+                            // Find the agg column + index for this function.
+                            let agg_col = args
+                                .iter()
+                                .filter_map(|a| {
+                                    if let crate::sql::ast::Expr::Column(cn) = a {
+                                        schema.get_column_position(cn)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .next();
+                            let is_count_star = fname == "COUNT" && (args.is_empty()
+                                || (args.len() == 1 && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*")));
+                            if is_count_star {
+                                null_row.push(Value::Integer(null_count));
+                            } else {
+                                let ai = gb_aggs.iter().position(|a| a.func == fname && a.col == agg_col);
+                                match fname.as_str() {
+                                    "COUNT" => {
+                                        // COUNT(col) over NULL-key group → non-NULL count.
+                                        if let Some(ai) = ai {
+                                            null_row.push(Value::Integer(null_nn[ai]));
+                                        } else {
+                                            null_row.push(Value::Integer(null_count));
+                                        }
+                                    }
+                                    "SUM" => {
+                                        if let Some(ai) = ai {
+                                            if null_min[ai] == f64::INFINITY {
+                                                null_row.push(Value::Null);
+                                            } else if agg_is_float[ai] {
+                                                null_row.push(Value::Float(null_sum[ai]));
+                                            } else {
+                                                null_row.push(Value::Integer(null_sum[ai] as i64));
+                                            }
+                                        } else {
+                                            null_row.push(Value::Null);
+                                        }
+                                    }
+                                    "AVG" => {
+                                        if let Some(ai) = ai {
+                                            if null_nn[ai] > 0 {
+                                                null_row.push(Value::Float(null_sum[ai] / null_nn[ai] as f64));
+                                            } else {
+                                                null_row.push(Value::Null);
+                                            }
+                                        } else {
+                                            null_row.push(Value::Null);
+                                        }
+                                    }
+                                    "MIN" => {
+                                        if let Some(ai) = ai {
+                                            if null_min[ai] == f64::INFINITY {
+                                                null_row.push(Value::Null);
+                                            } else if agg_is_float[ai] {
+                                                null_row.push(Value::Float(null_min[ai]));
+                                            } else {
+                                                null_row.push(Value::Integer(null_min[ai] as i64));
+                                            }
+                                        } else {
+                                            null_row.push(Value::Null);
+                                        }
+                                    }
+                                    "MAX" => {
+                                        if let Some(ai) = ai {
+                                            if null_min[ai] == f64::INFINITY {
+                                                null_row.push(Value::Null);
+                                            } else if agg_is_float[ai] {
+                                                null_row.push(Value::Float(null_max[ai]));
+                                            } else {
+                                                null_row.push(Value::Integer(null_max[ai] as i64));
+                                            }
+                                        } else {
+                                            null_row.push(Value::Null);
+                                        }
+                                    }
+                                    _ => null_row.push(Value::Null),
+                                }
+                            }
+                        }
+                        _ => null_row.push(Value::Null),
+                    }
                 }
                 rows.push(null_row);
             }
@@ -12351,8 +12526,13 @@ impl QueryExecutor {
                         }
                     }
                 }
-            } else {
-                // 🚀 COUNT(*) without WHERE — O(1) from row counter
+            } else if stmt.having.is_none() {
+                // 🚀 COUNT(*) without WHERE — O(1) from row counter.
+                // 🔑 Only when there's no HAVING clause: HAVING requires
+                // post-aggregation filtering (e.g. `HAVING COUNT(*) > 5`),
+                // which this O(1) counter path can't evaluate. Without this
+                // guard, `SELECT COUNT(*) FROM t HAVING COUNT(*) > 5` wrongly
+                // returns [[3]] instead of [] when the condition is false.
                 if let TableRef::Table {
                     name: table_name, ..
                 } = from
@@ -14856,14 +15036,13 @@ impl QueryExecutor {
                 op: op.clone(),
                 right: Box::new(self.materialize_subqueries_checked(right, outer_schema)?),
             }),
-            Expr::In { expr, list, negated } => {
-                let ml: Result<Vec<Expr>> = list.iter()
-                    .map(|e| self.materialize_subqueries_checked(e, outer_schema)).collect();
-                Ok(Expr::In {
-                    expr: Box::new(self.materialize_subqueries_checked(expr, outer_schema)?),
-                    list: ml?,
-                    negated: *negated,
-                })
+            Expr::In { .. } => {
+                // 🔑 Delegate IN (including `IN (SELECT ...)`) to the standard
+                // materialize_subqueries, which has dedicated subquery→HashSet
+                // handling. Recursing into list elements here would hit the
+                // Expr::Subquery scalar branch above and error out on multi-row
+                // subqueries ("use IN instead of =").
+                self.materialize_subqueries(expr)
             }
             // All other expr types: delegate to standard materialization (which
             // handles their recursion correctly without touching Subquery nodes).
@@ -18412,7 +18591,14 @@ impl QueryExecutor {
                                 .unwrap_or(Value::Null)
                         }
                     } else {
-                        Self::eval_expr_on_row(expr, &row, &schema).unwrap_or(Value::Null)
+                        match Self::eval_expr_on_row(expr, &row, &schema) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // Propagate errors (e.g. division by zero) instead
+                                // of silently writing NULL.
+                                return Err(e);
+                            }
+                        }
                     };
                     while new_row.len() <= cd.position {
                         new_row.push(Value::Null);
@@ -18651,7 +18837,10 @@ impl QueryExecutor {
                     let new_val = if let Expr::Literal(v) = expr {
                         v.clone()
                     } else {
-                        Self::eval_expr_on_row(expr, &row, schema).unwrap_or(Value::Null)
+                        match Self::eval_expr_on_row(expr, &row, schema) {
+                            Ok(v) => v,
+                            Err(e) => return Err(e),
+                        }
                     };
                     new_values.push((cd.position, new_val));
                 }
@@ -18760,7 +18949,10 @@ impl QueryExecutor {
                     let new_val = if let Expr::Literal(v) = expr {
                         v.clone()
                     } else {
-                        Self::eval_expr_on_row(expr, &row, schema).unwrap_or(Value::Null)
+                        match Self::eval_expr_on_row(expr, &row, schema) {
+                            Ok(v) => v,
+                            Err(e) => return Err(e),
+                        }
                     };
                     while new_row.len() <= cd.position {
                         new_row.push(Value::Null);
