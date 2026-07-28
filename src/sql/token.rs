@@ -202,6 +202,10 @@ pub enum TokenType {
 
     // Literals
     Number(f64),
+    /// A pure integer literal that fits in i64 (e.g. 42, -7).
+    /// Distinct from Number to preserve Integer type for type-sensitive
+    /// operations (7/2 = Integer(3) vs 7.0/2 = Float(3.5)).
+    PureInteger(i64),
     /// A pure integer literal that overflows i64 (e.g. 9223372036854775808 = 2^63).
     /// Kept as i128 to preserve exact value distinction that f64 loses.
     /// Without this, `-9223372036854775808` (i64::MIN) parsed as f64 and

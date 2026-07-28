@@ -452,7 +452,7 @@ impl<'a> Lexer<'a> {
         let is_pure_int = !value.contains('.') && !value.contains('e') && !value.contains('E');
         if is_pure_int {
             if let Ok(i) = value.parse::<i64>() {
-                return Ok(TokenType::Number(i as f64));
+                return Ok(TokenType::PureInteger(i));
             }
             if let Ok(big) = value.parse::<i128>() {
                 return Ok(TokenType::OverflowInteger(big));

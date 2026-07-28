@@ -1247,28 +1247,44 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Value::Float(big as f64)))
             }
+            TokenType::PureInteger(i) => {
+                let i = *i;
+                self.advance();
+                Ok(Expr::Literal(Value::Integer(i)))
+            }
             TokenType::Number(n) => {
                 let n = *n;
                 self.advance();
-                // Integer if no fraction and within i64 range (beware f64 precision loss).
-                // f64 cannot exactly represent i64::MAX/MIN, so clamp the f64
-                // boundaries 9223372036854775808.0 (=2^63, the value i64::MAX
-                // rounds to) to i64::MAX, and -9223372036854775808.0 to i64::MIN,
-                // so the extreme values round-trip as Integer instead of Float.
-                if n.fract() == 0.0 {
-                    if n == 9223372036854775808.0 {
-                        return Ok(Expr::Literal(Value::Integer(i64::MAX)));
-                    }
-                    if n == -9223372036854775808.0 {
-                        return Ok(Expr::Literal(Value::Integer(i64::MIN)));
-                    }
-                    if n > i64::MIN as f64 && n < 9223372036854775808.0 {
-                        let v = n as i64;
-                        if (v as f64 - n).abs() < 0.5 {
-                            return Ok(Expr::Literal(Value::Integer(v)));
-                        }
-                    }
-                }
+                // 🔑 The lexer already determined whether this is a pure integer
+                // (no '.' or 'e' in the source) via is_pure_int, and emitted it
+                // as Number(i as f64) for integers or Number(f64) for floats.
+                // For pure integers, the lexer stored i as f64 — recover the
+                // Integer type. For floats (7.0, 1e15), keep as Float.
+                //
+                // Detection: the lexer stores pure integers as exact i64→f64
+                // casts. We can distinguish them from genuine float literals by
+                // checking if the f64 round-trips exactly through i64 and is
+                // in range — BUT only for values that don't have a fractional
+                // part (fract() == 0). The key insight: the lexer already
+                // separated them; pure-int Number tokens have their value set
+                // via `i as f64` (exact for |i| < 2^53), while float tokens
+                // have the raw parse. We can't tell them apart by value alone.
+                //
+                // Solution: rely on the lexer's OverflowInteger for large ints,
+                // and for Number tokens, convert to Integer only if the value
+                // fits i64 and is an exact integer (no fractional part). This
+                // means 7.0 stays Float (correct — user wrote a float literal),
+                // while 42 (pure int from lexer) becomes Integer.
+                //
+                // But wait — the lexer already did `i as f64` for pure ints.
+                // Both 42 and 7.0 arrive as Number(f64). We can't distinguish.
+                //
+                // The real fix: change the lexer to emit a distinct token for
+                // pure integers vs floats. But that's a large change. Instead,
+                // accept that 7.0 == 42.0 are both stored as Float here, and
+                // let downstream integer coercion (row_converter) handle INT
+                // column storage. This matches Postgres behavior: SELECT 7.0
+                // returns numeric/float, not integer.
                 Ok(Expr::Literal(Value::Float(n)))
             }
             TokenType::String(s) => {
@@ -1319,9 +1335,17 @@ impl Parser {
                                 self.advance();
                                 n as f32
                             }
+                            TokenType::PureInteger(i) => {
+                                let i = *i;
+                                self.advance();
+                                i as f32
+                            }
                             TokenType::Minus => {
                                 self.advance();
-                                if let TokenType::Number(n) = self.current().token_type {
+                                if let TokenType::PureInteger(i) = self.current().token_type {
+                                    self.advance();
+                                    -(i as f32)
+                                } else if let TokenType::Number(n) = self.current().token_type {
                                     self.advance();
                                     -(n as f32)
                                 } else {
@@ -2124,7 +2148,13 @@ impl Parser {
     }
 
     fn parse_usize(&mut self) -> Result<usize> {
-        if let TokenType::Number(n) = self.current().token_type {
+        if let TokenType::PureInteger(i) = self.current().token_type {
+            if i < 0 {
+                return Err(self.error("Expected non-negative integer"));
+            }
+            self.advance();
+            Ok(i as usize)
+        } else if let TokenType::Number(n) = self.current().token_type {
             if n < 0.0 || n.fract() != 0.0 {
                 return Err(self.error("Expected non-negative integer"));
             }
@@ -2144,7 +2174,10 @@ impl Parser {
 
     /// 🚀 Phase 4: Parse i64 (支持负数)
     fn parse_i64(&mut self) -> Result<i64> {
-        if let TokenType::Number(n) = self.current().token_type {
+        if let TokenType::PureInteger(i) = self.current().token_type {
+            self.advance();
+            Ok(i)
+        } else if let TokenType::Number(n) = self.current().token_type {
             if n.fract() != 0.0 {
                 return Err(self.error("Expected integer"));
             }
@@ -2252,13 +2285,13 @@ impl Parser {
                 self.advance();
                 // Parse a literal: number, string, true/false, null
                 let val = match &self.current().token_type {
+                    TokenType::PureInteger(i) => {
+                        let v = crate::types::Value::Integer(*i);
+                        self.advance();
+                        v
+                    }
                     TokenType::Number(n) => {
-                        let f = *n;
-                        let v = if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
-                            crate::types::Value::Integer(f as i64)
-                        } else {
-                            crate::types::Value::Float(f)
-                        };
+                        let v = crate::types::Value::Float(*n);
                         self.advance();
                         v
                     }
