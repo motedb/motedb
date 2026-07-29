@@ -125,3 +125,38 @@ fn test_update_simple_where() {
     assert_eq!(r[0], vec![Value::Integer(1), Value::Integer(99)]);
     assert_eq!(r[1], vec![Value::Integer(2), Value::Integer(20)]);
 }
+
+// =========================================================================
+// UPDATE SET with scalar subquery (PK fast path)
+// =========================================================================
+
+#[test]
+fn test_update_set_subquery_pk() {
+    // `UPDATE t SET v = (SELECT MAX(v) FROM t) WHERE id = 2` on the PK
+    // fast path. Previously failed: execute_update_pk didn't materialize
+    // subqueries in SET expressions.
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    db.execute("UPDATE t SET v = (SELECT MAX(v) FROM t) WHERE id = 2").unwrap();
+    let r = q(&db, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(r, vec![
+        vec![Value::Integer(1), Value::Integer(10)],
+        vec![Value::Integer(2), Value::Integer(30)],
+        vec![Value::Integer(3), Value::Integer(30)],
+    ]);
+}
+
+#[test]
+fn test_update_set_subquery_scan() {
+    // Same but on the scan path (non-PK WHERE).
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, g INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10, 1), (2, 20, 1)").unwrap();
+    db.execute("UPDATE t SET v = (SELECT MAX(v) FROM t) WHERE g = 1").unwrap();
+    let r = q(&db, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(r, vec![
+        vec![Value::Integer(1), Value::Integer(20)],
+        vec![Value::Integer(2), Value::Integer(20)],
+    ]);
+}

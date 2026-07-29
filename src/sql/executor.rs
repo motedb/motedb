@@ -19085,6 +19085,19 @@ impl QueryExecutor {
                 if let Some(cd) = schema.get_column(col_name) {
                     let new_val = if let Expr::Literal(v) = expr {
                         v.clone()
+                    } else if Self::expr_contains_subquery(expr) {
+                        // 🔑 Resolve scalar subqueries in SET expression (same
+                        // fix as execute_update scan path). Without this,
+                        // eval_expr_on_row fails on Subquery nodes.
+                        let materialized = self.materialize_subqueries(expr)?;
+                        if let Expr::Literal(v) = materialized {
+                            v
+                        } else {
+                            match Self::eval_expr_on_row(&materialized, &row, schema) {
+                                Ok(v) => v,
+                                Err(e) => return Err(e),
+                            }
+                        }
                     } else {
                         match Self::eval_expr_on_row(expr, &row, schema) {
                             Ok(v) => v,
