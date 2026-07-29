@@ -2120,6 +2120,8 @@ impl Parser {
             TokenType::Star => Some(BinaryOperator::Mul),
             TokenType::Slash => Some(BinaryOperator::Div),
             TokenType::Percent => Some(BinaryOperator::Mod),
+            // 🔑 SQL string concatenation operator.
+            TokenType::DoublePipe => Some(BinaryOperator::Concat),
             // E-SQL Vector Distance Operators
             TokenType::L2Distance => Some(BinaryOperator::L2Distance),
             TokenType::CosineDistance => Some(BinaryOperator::CosineDistance),

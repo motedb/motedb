@@ -185,6 +185,8 @@ pub enum TokenType {
     Star,    // *
     Slash,   // /
     Percent, // %
+    /// String concatenation operator `||` (SQL standard).
+    DoublePipe,
 
     // E-SQL Vector Distance Operators
     L2Distance,     // <-> (Euclidean distance)

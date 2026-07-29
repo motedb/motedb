@@ -27,6 +27,21 @@ fn coerce_bool_int(lv: Value, rv: Value) -> (Value, Value) {
     }
 }
 
+/// Convert a Value to its string representation for GROUP_CONCAT.
+/// Integers print without decimal point; floats print naturally; booleans
+/// print as 1/0 (matching SQLite's GROUP_CONCAT behavior for TRUE/FALSE).
+fn value_to_concat_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Text(t) => t.to_string(),
+        Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        Value::Timestamp(t) => t.as_micros().to_string(),
+        _ => format!("{:?}", v),
+    }
+}
+
 /// Wrapper around f32 that implements Ord (for use in BinaryHeap top-K).
 /// NaN is treated as +∞ so it never wins a "smallest distance" comparison.
 #[derive(Debug, Clone, Copy)]
@@ -1077,9 +1092,11 @@ impl StreamingQueryResult {
 /// Used by the positional GROUP BY fast path.
 #[derive(Clone)]
 struct AggregateInfo {
-    func: String,           // COUNT, SUM, AVG, MIN, MAX
+    func: String,           // COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT
     col_pos: Option<usize>, // Column position; None means COUNT(*) or COUNT(1)
     distinct: bool,
+    /// Extra parameter (e.g., GROUP_CONCAT separator).
+    extra: Option<String>,
 }
 
 /// Pre-compiled WHERE clause — column names resolved to positions once.
@@ -10324,6 +10341,19 @@ impl QueryExecutor {
         }
     }
 
+    /// 🔑 String concatenation `||` for the positional path (eval_expr_on_row).
+    /// NULL propagates (NULL || x = NULL). Non-text values are stringified.
+    fn positional_concat(l: &Value, r: &Value) -> Result<Value> {
+        if matches!(l, Value::Null) || matches!(r, Value::Null) {
+            return Ok(Value::Null);
+        }
+        Ok(Value::text(format!(
+            "{}{}",
+            value_to_concat_string(l),
+            value_to_concat_string(r)
+        )))
+    }
+
     fn extract_f32_slice(v: &Value) -> Option<Vec<f32>> {
         match v {
             Value::Vector(vec) => Some(vec.iter().copied().collect()),
@@ -10832,6 +10862,7 @@ impl QueryExecutor {
                     BinaryOperator::Mul => Self::positional_mul(&lv, &rv),
                     BinaryOperator::Div => Self::positional_div(&lv, &rv),
                     BinaryOperator::Mod => Self::positional_mod(&lv, &rv),
+                    BinaryOperator::Concat => Self::positional_concat(&lv, &rv),
                     BinaryOperator::L2Distance => Self::positional_vector_l2(&lv, &rv),
                     BinaryOperator::CosineDistance => Self::positional_vector_cosine(&lv, &rv),
                     BinaryOperator::DotProduct => Self::positional_vector_dot(&lv, &rv),
@@ -11818,6 +11849,7 @@ impl QueryExecutor {
                     BinaryOperator::Mul => Self::positional_mul(&lv, &rv),
                     BinaryOperator::Div => Self::positional_div(&lv, &rv),
                     BinaryOperator::Mod => Self::positional_mod(&lv, &rv),
+                    BinaryOperator::Concat => Self::positional_concat(&lv, &rv),
                     BinaryOperator::L2Distance => Self::positional_vector_l2(&lv, &rv),
                     BinaryOperator::CosineDistance => Self::positional_vector_cosine(&lv, &rv),
                     BinaryOperator::DotProduct => Self::positional_vector_dot(&lv, &rv),
@@ -16193,6 +16225,37 @@ impl QueryExecutor {
                         }
                         Ok(max_val.unwrap_or(Value::Null))
                     }
+                    "GROUP_CONCAT" => {
+                        // 🔑 GROUP_CONCAT(expr [, separator]) — concatenates
+                        // non-NULL values with a separator (default ',').
+                        if args.is_empty() {
+                            return Err(MoteDBError::InvalidArgument(
+                                "GROUP_CONCAT requires an argument".to_string(),
+                            ));
+                        }
+                        // Determine separator (2nd arg, if a literal).
+                        let sep = if args.len() >= 2 {
+                            if let Ok(s) = self.evaluator.eval(&args[1], &SqlRow::new()) {
+                                if let Value::Text(t) = s { t.to_string() } else { ",".to_string() }
+                            } else {
+                                ",".to_string()
+                            }
+                        } else {
+                            ",".to_string()
+                        };
+                        let mut parts: Vec<String> = Vec::new();
+                        for row in rows {
+                            let val = self.evaluator.eval(&args[0], row)?;
+                            if !matches!(val, Value::Null) {
+                                parts.push(value_to_concat_string(&val));
+                            }
+                        }
+                        if parts.is_empty() {
+                            Ok(Value::Null)
+                        } else {
+                            Ok(Value::text(parts.join(&sep)))
+                        }
+                    }
                     _ => Err(MoteDBError::UnknownFunction(name.clone())),
                 }
             }
@@ -16578,7 +16641,9 @@ impl QueryExecutor {
                     // to the aggregate path, and VARIANCE/STDDEV evaluate
                     // per-row (returning NULL for every row instead of one
                     // aggregated value).
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                    // 🔑 GROUP_CONCAT also — otherwise it's evaluated per-row
+                    // and returns NULL for every input row.
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE" | "GROUP_CONCAT"
                 );
                 if is_agg_top {
                     return true;
@@ -16626,6 +16691,7 @@ impl QueryExecutor {
                 if matches!(
                     name.to_uppercase().as_str(),
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                        | "GROUP_CONCAT"
                 ) =>
             {
                 out.push(expr.clone());
@@ -16717,6 +16783,40 @@ impl QueryExecutor {
                             func,
                             col_pos,
                             distinct: *distinct,
+                            extra: None,
+                        })
+                    }
+                    "GROUP_CONCAT" => {
+                        // GROUP_CONCAT(expr [, separator])
+                        if args.is_empty() {
+                            return None;
+                        }
+                        let col_pos = match &args[0] {
+                            Expr::Column(col_name) => {
+                                let bare = if col_name.contains('.') {
+                                    col_name.rsplit('.').next().unwrap_or(col_name)
+                                } else {
+                                    col_name
+                                };
+                                schema.get_column_position(bare)
+                            }
+                            _ => return None,
+                        };
+                        // Parse separator (2nd arg, if a string literal).
+                        let sep = if args.len() >= 2 {
+                            if let Expr::Literal(Value::Text(t)) = &args[1] {
+                                Some(t.to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        Some(AggregateInfo {
+                            func,
+                            col_pos,
+                            distinct: *distinct,
+                            extra: sep,
                         })
                     }
                     _ => None,
@@ -17178,8 +17278,11 @@ impl QueryExecutor {
                 .iter()
                 .any(|(_, _, agg)| agg.as_ref().is_some_and(|a| a.distinct))
             && !select_col_info.iter().any(|(_, _, agg)| {
-                agg.as_ref()
-                    .is_some_and(|a| matches!(a.func.as_str(), "STDDEV" | "VARIANCE"))
+                agg.as_ref().is_some_and(|a| {
+                    // 🔑 STDDEV/VARIANCE/GROUP_CONCAT need the materialized path
+                    // (single_pass_group_by's AggAccumulator doesn't support them).
+                    matches!(a.func.as_str(), "STDDEV" | "VARIANCE" | "GROUP_CONCAT")
+                })
             });
 
         if can_single_pass {
@@ -17970,6 +18073,27 @@ impl QueryExecutor {
                     Ok(Value::Float(variance.sqrt()))
                 } else {
                     Ok(Value::Float(variance))
+                }
+            }
+            "GROUP_CONCAT" => {
+                // 🔑 GROUP_CONCAT: concat non-NULL values with separator.
+                // agg.col_pos is the value column; separator comes from
+                // agg.extra (set by try_parse_aggregate).
+                let sep = agg.extra.as_deref().unwrap_or(",");
+                let mut parts: Vec<String> = Vec::new();
+                for row in rows {
+                    if let Some(pos) = agg.col_pos {
+                        if let Some(val) = row.get(pos) {
+                            if !matches!(val, Value::Null) {
+                                parts.push(value_to_concat_string(val));
+                            }
+                        }
+                    }
+                }
+                if parts.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::text(parts.join(sep)))
                 }
             }
             _ => Ok(Value::Null),

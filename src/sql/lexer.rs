@@ -162,6 +162,19 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 TokenType::Percent
             }
+            '|' => {
+                // 🔑 `||` = SQL string concatenation operator.
+                self.advance();
+                if self.current_char() == '|' {
+                    self.advance();
+                    TokenType::DoublePipe
+                } else {
+                    return Err(crate::error::StorageError::InvalidData(format!(
+                        "Unexpected character '|' at {}:{} (did you mean '||' for concatenation?)",
+                        self.line, self.column
+                    )));
+                }
+            }
             '(' => {
                 self.advance();
                 TokenType::LParen

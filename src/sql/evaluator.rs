@@ -577,12 +577,13 @@ impl ExprEvaluator {
                     // One or both NULL with no TRUE → unknown
                     return Ok(Value::Null);
                 }
-                // Arithmetic/distance: NULL propagates
+                // Arithmetic/distance/concat: NULL propagates
                 BinaryOperator::Add
                 | BinaryOperator::Sub
                 | BinaryOperator::Mul
                 | BinaryOperator::Div
                 | BinaryOperator::Mod
+                | BinaryOperator::Concat
                 | BinaryOperator::L2Distance
                 | BinaryOperator::CosineDistance
                 | BinaryOperator::DotProduct => {
@@ -628,6 +629,33 @@ impl ExprEvaluator {
             BinaryOperator::Mul => self.mul_values(left, right),
             BinaryOperator::Div => self.div_values(left, right),
             BinaryOperator::Mod => self.mod_values(left, right),
+
+            // 🔑 String concatenation: NULL propagates (NULL || x = NULL, like
+            // most databases; SQLite returns NULL too).
+            BinaryOperator::Concat => {
+                if matches!(&left, Value::Null) || matches!(&right, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let l = match &left {
+                    Value::Text(t) => t.to_string(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                    _ => return Err(MoteDBError::TypeError(format!(
+                        "Cannot concatenate {:?} with ||", left
+                    ))),
+                };
+                let r = match &right {
+                    Value::Text(t) => t.to_string(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                    _ => return Err(MoteDBError::TypeError(format!(
+                        "Cannot concatenate {:?} with ||", right
+                    ))),
+                };
+                Ok(Value::text(format!("{}{}", l, r)))
+            }
 
             // E-SQL Vector Distance Operators
             BinaryOperator::L2Distance => self.l2_distance(left, right),
@@ -709,7 +737,8 @@ impl ExprEvaluator {
             }
 
             // Aggregate functions: look up pre-computed value in row (for HAVING)
-            "count" | "sum" | "avg" | "min" | "max" | "stddev" | "variance" => {
+            "count" | "sum" | "avg" | "min" | "max" | "stddev" | "variance"
+            | "group_concat" => {
                 // Build the column name that matches how the executor stored it
                 let arg_str = if args.is_empty() {
                     "*".to_string()

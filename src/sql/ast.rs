@@ -449,6 +449,8 @@ pub enum BinaryOperator {
     Mul, // *
     Div, // /
     Mod, // %
+    /// String concatenation `||` (SQL standard).
+    Concat,
 
     // E-SQL Vector Distance Operators
     L2Distance,     // <-> (Euclidean distance)
@@ -481,6 +483,9 @@ impl BinaryOperator {
             | BinaryOperator::DotProduct => 3,
             BinaryOperator::Add | BinaryOperator::Sub => 4,
             BinaryOperator::Mul | BinaryOperator::Div | BinaryOperator::Mod => 5,
+            // 🔑 || concatenation binds tighter than comparison (3) so
+            // `a || b = 'xy'` parses as `(a || b) = 'xy'`.
+            BinaryOperator::Concat => 5,
         }
     }
 }
