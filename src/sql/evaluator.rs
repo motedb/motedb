@@ -180,6 +180,18 @@ impl ExprEvaluator {
 
     /// Convert days since Unix epoch to (year, month, day).
     /// Uses the civil calendar algorithm (correct for all dates).
+    /// 🔑 Extract microseconds from a Value, accepting both Timestamp and
+    /// Integer (treating Integer as epoch microseconds). Timestamp columns
+    /// are stored as i64 micros and may read back as Integer, so date functions
+    /// must coerce. Returns None for non-numeric types.
+    fn value_to_micros(val: &Value) -> Option<i64> {
+        match val {
+            Value::Timestamp(ts) => Some(ts.as_micros()),
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
     fn days_to_date(days_since_epoch: i64) -> (i64, i64, i64) {
         // Shift from Unix epoch (1970-01-01) to Gregorian epoch (0000-03-01)
         // The algorithm works with a year starting on March 1 to simplify leap year handling.
@@ -1588,12 +1600,12 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let (y, _, _) = Self::days_to_date(ts.as_micros() / 1_000_000 / 86400);
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let (y, _, _) = Self::days_to_date(micros / 1_000_000 / 86400);
                         Ok(Value::Integer(y))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "YEAR() requires timestamp argument".to_string(),
                     )),
                 }
@@ -1606,12 +1618,12 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let (_, m, _) = Self::days_to_date(ts.as_micros() / 1_000_000 / 86400);
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let (_, m, _) = Self::days_to_date(micros / 1_000_000 / 86400);
                         Ok(Value::Integer(m))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "MONTH() requires timestamp argument".to_string(),
                     )),
                 }
@@ -1624,12 +1636,12 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let (_, _, d) = Self::days_to_date(ts.as_micros() / 1_000_000 / 86400);
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let (_, _, d) = Self::days_to_date(micros / 1_000_000 / 86400);
                         Ok(Value::Integer(d))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "DAY() requires timestamp argument".to_string(),
                     )),
                 }
@@ -1643,13 +1655,13 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let secs = ts.as_micros() / 1_000_000;
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let secs = micros / 1_000_000;
                         let hour = (secs % 86400) / 3600;
                         Ok(Value::Integer(hour))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "HOUR() requires timestamp argument".to_string(),
                     )),
                 }
@@ -1663,13 +1675,13 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let secs = ts.as_micros() / 1_000_000;
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let secs = micros / 1_000_000;
                         let minute = (secs % 3600) / 60;
                         Ok(Value::Integer(minute))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "MINUTE() requires timestamp argument".to_string(),
                     )),
                 }
@@ -1683,13 +1695,13 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let secs = ts.as_micros() / 1_000_000;
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let secs = micros / 1_000_000;
                         let second = secs % 60;
                         Ok(Value::Integer(second))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "SECOND() requires timestamp argument".to_string(),
                     )),
                 }
@@ -1704,6 +1716,7 @@ impl ExprEvaluator {
                 }
                 let ts = match self.eval(&args[0], row)? {
                     Value::Timestamp(ts) => ts,
+                    Value::Integer(i) => crate::types::Timestamp::from_micros(i),
                     _ => {
                         return Err(MoteDBError::TypeError(
                             "DATE_ADD() first argument must be timestamp".to_string(),
@@ -1738,6 +1751,7 @@ impl ExprEvaluator {
                 }
                 let ts1 = match self.eval(&args[0], row)? {
                     Value::Timestamp(ts) => ts,
+                    Value::Integer(i) => crate::types::Timestamp::from_micros(i),
                     _ => {
                         return Err(MoteDBError::TypeError(
                             "DATE_DIFF() first argument must be timestamp".to_string(),
@@ -1746,6 +1760,7 @@ impl ExprEvaluator {
                 };
                 let ts2 = match self.eval(&args[1], row)? {
                     Value::Timestamp(ts) => ts,
+                    Value::Integer(i) => crate::types::Timestamp::from_micros(i),
                     _ => {
                         return Err(MoteDBError::TypeError(
                             "DATE_DIFF() second argument must be timestamp".to_string(),
@@ -1807,16 +1822,16 @@ impl ExprEvaluator {
                     ));
                 }
                 let val = self.eval(&args[0], row)?;
-                match val {
-                    Value::Timestamp(ts) => {
-                        let secs = ts.as_micros() / 1_000_000;
+                match Self::value_to_micros(&val) {
+                    Some(micros) => {
+                        let secs = micros / 1_000_000;
                         let days = secs / 86400;
                         // Unix epoch (1970-01-01) was Thursday (day 4)
                         // Calculate day of week: (days + 4) % 7, then map to 1-7
                         let dow = ((days + 3).rem_euclid(7)) + 1; // rem_euclid handles negative days
                         Ok(Value::Integer(dow))
                     }
-                    _ => Err(MoteDBError::TypeError(
+                    None => Err(MoteDBError::TypeError(
                         "DAY_OF_WEEK() requires timestamp argument".to_string(),
                     )),
                 }

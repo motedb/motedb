@@ -7,7 +7,18 @@ pub fn row_to_sql_row(row: &Row, schema: &TableSchema) -> Result<SqlRow> {
     let mut sql_row = SqlRow::with_capacity(schema.columns.len());
     for (i, col_def) in schema.columns.iter().enumerate() {
         let value = row.get(i).cloned().unwrap_or(Value::Null);
-        sql_row.insert(col_def.name.clone(), value);
+        // 🔑 Coerce Integer → Timestamp for TIMESTAMP columns: the columnar
+        // store decodes TIMESTAMP columns as Integer (shared 8-byte fixed-width
+        // storage). Without this, date functions (YEAR/MONTH/DAY/etc.) that
+        // check for Value::Timestamp fail on column references (return NULL),
+        // even though they work on integer literals.
+        let coerced = match (&col_def.col_type, &value) {
+            (ColumnType::Timestamp, Value::Integer(i)) => {
+                Value::Timestamp(crate::types::Timestamp::from_micros(*i))
+            }
+            _ => value,
+        };
+        sql_row.insert(col_def.name.clone(), coerced);
     }
     Ok(sql_row)
 }
