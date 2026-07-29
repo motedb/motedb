@@ -18772,13 +18772,28 @@ impl QueryExecutor {
         // 🚀 Use真正的流式扫描 (O(1) memory)
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
 
+        // 🔑 Materialize subqueries in WHERE (e.g. `WHERE id IN (SELECT ...)`)
+        // BEFORE the per-row eval. Without this, eval_expr_on_row sees a raw
+        // Subquery node in the WHERE clause and returns NULL for every row
+        // (UPDATE matches nothing). materialize_subqueries converts
+        // IN (SELECT...) → INHashset for O(1) per-row lookup.
+        let resolved_where = if let Some(ref wc) = stmt.where_clause {
+            if Self::expr_contains_subquery(wc) {
+                Some(self.materialize_subqueries(wc)?)
+            } else {
+                stmt.where_clause.clone()
+            }
+        } else {
+            None
+        };
+
         let mut affected_rows = 0;
 
         for result in row_iter {
             let (row_id, row) = result?;
 
             // WHERE filter using positional evaluation (no HashMap)
-            let should_update = if let Some(ref where_clause) = stmt.where_clause {
+            let should_update = if let Some(ref where_clause) = resolved_where {
                 Self::eval_expr_on_row(where_clause, &row, &schema)
                     .map(|v| Self::is_truthy(&v))
                     .unwrap_or(false)
