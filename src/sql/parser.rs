@@ -220,16 +220,47 @@ impl Parser {
     /// `QueryExecutor::apply_ctes`.
     /// Parse OVER (...) for window functions. Converts FunctionCall → WindowFunction.
     fn parse_window_spec(&mut self, fc: Expr) -> Result<Expr> {
-        let name = match &fc {
-            Expr::FunctionCall { name, .. } => name.clone(),
+        let (name, args) = match &fc {
+            Expr::FunctionCall { name, args, .. } => (name.clone(), args.clone()),
             _ => return Ok(fc),
         };
         let func = match name.to_uppercase().as_str() {
             "ROW_NUMBER" => crate::sql::ast::WindowFunc::RowNumber,
             "RANK" => crate::sql::ast::WindowFunc::Rank,
             "DENSE_RANK" => crate::sql::ast::WindowFunc::DenseRank,
+            // 🔑 LAG(expr [, offset [, default]]) — offset defaults to 1,
+            // default defaults to NULL. LEAD is the mirror (next row).
+            "LAG" | "LEAD" => {
+                if args.is_empty() {
+                    return Err(self.error(&format!(
+                        "{} requires at least 1 argument (expr)", name
+                    )));
+                }
+                let expr = Box::new(args[0].clone());
+                let offset = if args.len() >= 2 {
+                    // offset must be an integer literal
+                    match &args[1] {
+                        Expr::Literal(Value::Integer(i)) => Some(*i as usize),
+                        _ => return Err(self.error(&format!(
+                            "{} offset must be an integer literal", name
+                        ))),
+                    }
+                } else {
+                    None
+                };
+                let default = if args.len() >= 3 {
+                    Some(Box::new(args[2].clone()))
+                } else {
+                    None
+                };
+                if name.eq_ignore_ascii_case("LAG") {
+                    crate::sql::ast::WindowFunc::Lag { expr, offset, default }
+                } else {
+                    crate::sql::ast::WindowFunc::Lead { expr, offset, default }
+                }
+            }
             other => return Err(self.error(&format!(
-                "Unsupported window function '{}' (supported: ROW_NUMBER, RANK, DENSE_RANK)", other
+                "Unsupported window function '{}' (supported: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD)", other
             ))),
         };
         self.expect(TokenType::Over)?;

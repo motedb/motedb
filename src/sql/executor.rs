@@ -4461,10 +4461,44 @@ impl QueryExecutor {
                         prev_key = Some(cur_key);
                     }
                 }
-                _ => {
-                    // LAG/LEAD not yet supported — append NULL
-                    for &idx in &indices {
-                        rows[idx].push(Value::Null);
+                WindowFunc::Lag { expr, offset, default } => {
+                    // 🔑 LAG(expr, offset, default): value from `offset` rows
+                    // before the current row (default 1). If no such row, use
+                    // default (or NULL).
+                    let off = offset.unwrap_or(1);
+                    // Pre-compute the expr value for each row in partition order.
+                    let vals: Vec<Value> = indices.iter().map(|&idx| {
+                        Self::eval_expr_on_row(expr, &rows[idx], schema)
+                            .unwrap_or(Value::Null)
+                    }).collect();
+                    for (pos, &idx) in indices.iter().enumerate() {
+                        let v = if pos >= off {
+                            vals[pos - off].clone()
+                        } else {
+                            default.as_ref().and_then(|d| {
+                                Self::eval_expr_on_row(d, &rows[idx], schema).ok()
+                            }).unwrap_or(Value::Null)
+                        };
+                        rows[idx].push(v);
+                    }
+                }
+                WindowFunc::Lead { expr, offset, default } => {
+                    // 🔑 LEAD(expr, offset, default): value from `offset` rows
+                    // after the current row (default 1).
+                    let off = offset.unwrap_or(1);
+                    let vals: Vec<Value> = indices.iter().map(|&idx| {
+                        Self::eval_expr_on_row(expr, &rows[idx], schema)
+                            .unwrap_or(Value::Null)
+                    }).collect();
+                    for (pos, &idx) in indices.iter().enumerate() {
+                        let v = if pos + off < vals.len() {
+                            vals[pos + off].clone()
+                        } else {
+                            default.as_ref().and_then(|d| {
+                                Self::eval_expr_on_row(d, &rows[idx], schema).ok()
+                            }).unwrap_or(Value::Null)
+                        };
+                        rows[idx].push(v);
                     }
                 }
             }
