@@ -823,6 +823,17 @@ impl ColSegmentStore {
                                         .ok()
                                         .and_then(|f| f.get_bool(i))
                                         .map(Value::Bool),
+                                    // 🔑 Timestamp: decode as Value::Timestamp, not Integer.
+                                    ColumnType::Timestamp => seg
+                                        .sst
+                                        .read_fixed_i64(pc)
+                                        .ok()
+                                        .and_then(|f| f.get_i64(i))
+                                        .map(|micros| {
+                                            Value::Timestamp(
+                                                crate::types::Timestamp::from_micros(micros),
+                                            )
+                                        }),
                                     _ => seg
                                         .sst
                                         .read_fixed_i64(pc)
@@ -858,6 +869,15 @@ impl ColSegmentStore {
                                 }
                                 (Some(Some(f)), _, ColumnType::Boolean) => {
                                     f.get_bool(i).map(Value::Bool)
+                                }
+                                // 🔑 Timestamp columns are stored as fixed-width
+                                // i64 micros but were decoded as NULL here (the `_`
+                                // arm) — breaking SELECT YEAR(ts_col), date functions,
+                                // and direct timestamp projection in scans.
+                                (Some(Some(f)), _, ColumnType::Timestamp) => {
+                                    f.get_i64(i).map(|micros| {
+                                        Value::Timestamp(crate::types::Timestamp::from_micros(micros))
+                                    })
                                 }
                                 (_, _, ColumnType::Spatial) => pspatial
                                     .get(pi)
