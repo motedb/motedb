@@ -12644,8 +12644,17 @@ impl QueryExecutor {
                                         || !self.db.is_async_index_pipeline_active() =>
                                 {
                                     let count = row_ids.len() as i64;
+                                    // 🔑 Use the user-provided alias if present (e.g.
+                                    // `SELECT COUNT(*) as c FROM t`), so derived
+                                    // tables / CTEs can reference it by name.
+                                    let col_name = stmt.columns.first()
+                                        .and_then(|c| match c {
+                                            SelectColumn::Expr(_, Some(alias)) => Some(alias.clone()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_else(|| "COUNT(*)".to_string());
                                     return Ok(QueryResult::Select {
-                                        columns: vec!["COUNT(*)".to_string()],
+                                        columns: vec![col_name],
                                         rows: vec![vec![Value::Integer(count)]],
                                     });
                                 }
@@ -12680,8 +12689,15 @@ impl QueryExecutor {
                         c
                     };
 
+                    // 🔑 Use user alias if present (for derived table / CTE).
+                    let col_name = stmt.columns.first()
+                        .and_then(|c| match c {
+                            SelectColumn::Expr(_, Some(alias)) => Some(alias.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "COUNT(*)".to_string());
                     return Ok(QueryResult::Select {
-                        columns: vec!["COUNT(*)".to_string()],
+                        columns: vec![col_name],
                         rows: vec![vec![Value::Integer(count)]],
                     });
                 }
