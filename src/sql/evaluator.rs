@@ -507,6 +507,20 @@ impl ExprEvaluator {
     }
 
     pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+        // 🔑 Bool/Int coercion for comparisons and arithmetic: in SQL, TRUE=1
+        // and FALSE=0. When one side is Bool and the other is Integer/Float,
+        // coerce Bool to Integer so `1 = TRUE`, `TRUE + 0`, etc. work.
+        let (left, right) = match (&left, &right) {
+            (Value::Bool(b), Value::Integer(_)) => (Value::Integer(if *b { 1 } else { 0 }), right),
+            (Value::Integer(_), Value::Bool(b)) => (left, Value::Integer(if *b { 1 } else { 0 })),
+            (Value::Bool(b), Value::Float(_)) => (Value::Float(if *b { 1.0 } else { 0.0 }), right),
+            (Value::Float(_), Value::Bool(b)) => (left, Value::Float(if *b { 1.0 } else { 0.0 })),
+            (Value::Bool(a), Value::Bool(b)) => {
+                (Value::Integer(if *a { 1 } else { 0 }), Value::Integer(if *b { 1 } else { 0 }))
+            }
+            _ => (left, right),
+        };
+
         // SQL NULL semantics: NULL comparison → false (for WHERE filtering),
         // NULL arithmetic → NULL (for SELECT projection correctness).
         let either_null = matches!(&left, Value::Null) || matches!(&right, Value::Null);

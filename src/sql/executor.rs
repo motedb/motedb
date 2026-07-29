@@ -10,6 +10,23 @@ use crate::StorageError;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// 🔑 Module-level Bool/Int coercion (TRUE=1, FALSE=0). Used by both the
+/// QueryExecutor method and the CompiledWhere enum's match method (which
+/// can't call associated functions on QueryExecutor).
+fn coerce_bool_int(lv: Value, rv: Value) -> (Value, Value) {
+    match (&lv, &rv) {
+        (Value::Bool(b), Value::Integer(_)) => (Value::Integer(if *b { 1 } else { 0 }), rv),
+        (Value::Integer(_), Value::Bool(b)) => (lv, Value::Integer(if *b { 1 } else { 0 })),
+        (Value::Bool(b), Value::Float(_)) => (Value::Float(if *b { 1.0 } else { 0.0 }), rv),
+        (Value::Float(_), Value::Bool(b)) => (lv, Value::Float(if *b { 1.0 } else { 0.0 })),
+        (Value::Bool(a), Value::Bool(b)) => (
+            Value::Integer(if *a { 1 } else { 0 }),
+            Value::Integer(if *b { 1 } else { 0 }),
+        ),
+        _ => (lv, rv),
+    }
+}
+
 /// Wrapper around f32 that implements Ord (for use in BinaryHeap top-K).
 /// NaN is treated as +∞ so it never wins a "smallest distance" comparison.
 #[derive(Debug, Clone, Copy)]
@@ -1095,7 +1112,11 @@ impl CompiledWhere {
         match self {
             CompiledWhere::Eq(pos, val) => {
                 // SQL: NULL = val → NULL (false). Value PartialEq already returns false for Null==NonNull.
-                Some(row.get(*pos) == Some(val))
+                // 🔑 Bool/Int coercion: `flag = 1` should match a BOOLEAN TRUE.
+                Some(row.get(*pos).is_some_and(|v| {
+                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                    a == b
+                }))
             }
             CompiledWhere::Ne(pos, val) => {
                 // SQL: NULL <> val → NULL (false). Must check NULL explicitly.
@@ -1103,7 +1124,8 @@ impl CompiledWhere {
                     if matches!(v, Value::Null) {
                         return false;
                     }
-                    v != val
+                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                    a != b
                 }))
             }
             CompiledWhere::Lt(pos, val) => Some(
@@ -1251,7 +1273,10 @@ impl CompiledWhere {
         match self {
             CompiledWhere::Eq(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
-                Some(row.get(*idx) == Some(val))
+                Some(row.get(*idx).is_some_and(|v| {
+                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                    a == b
+                }))
             }
             CompiledWhere::Ne(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
@@ -1259,7 +1284,8 @@ impl CompiledWhere {
                     if matches!(v, Value::Null) {
                         return false;
                     }
-                    v != val
+                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                    a != b
                 }))
             }
             CompiledWhere::Lt(pos, val) => {
@@ -9662,7 +9688,12 @@ impl QueryExecutor {
                         }
                         (
                             Some(pos),
-                            Box::new(move |fv: Option<&Value>| fv == Some(&val)),
+                            Box::new(move |fv: Option<&Value>| {
+                                fv.is_some_and(|fv| {
+                                    let (a, b) = coerce_bool_int(fv.clone(), val.clone());
+                                    a == b
+                                })
+                            }),
                         )
                     }
                     _ => {
@@ -10181,6 +10212,14 @@ impl QueryExecutor {
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
             _ => false,
         }
+    }
+
+    /// 🔑 Coerce Bool/Int for comparison and arithmetic: TRUE→1, FALSE→0.
+    /// Applied when one side is Bool and the other is Integer/Float (or both
+    /// are Bool). This makes `1 = TRUE`, `flag = 1` (BOOLEAN col vs INT lit),
+    /// and `TRUE + 0` work per SQL semantics.
+    fn coerce_bool_int(lv: Value, rv: Value) -> (Value, Value) {
+        coerce_bool_int(lv, rv)
     }
 
     /// Simple LIKE pattern matching: % = any sequence, _ = single char
@@ -11730,6 +11769,9 @@ impl QueryExecutor {
             Expr::BinaryOp { left, op, right } => {
                 let lv = Self::eval_expr_on_row(left, row, schema)?;
                 let rv = Self::eval_expr_on_row(right, row, schema)?;
+                // 🔑 Bool/Int coercion (TRUE=1, FALSE=0) so `flag = 1` matches
+                // a BOOLEAN column with TRUE, and `1 = TRUE` is true.
+                let (lv, rv) = Self::coerce_bool_int(lv, rv);
                 match op {
                     BinaryOperator::Eq => {
                         if matches!(&lv, Value::Null) || matches!(&rv, Value::Null) {
@@ -12221,16 +12263,23 @@ impl QueryExecutor {
         // → Evaluate expressions directly without table scan
         if stmt.from.is_none() {
             let empty_row = SqlRow::new();
-            let mut result_row = Vec::new();
-            let mut column_names = Vec::new();
 
+            // 🔑 Apply WHERE clause for scalar SELECT (e.g., `SELECT 1 WHERE 0`
+            // should return 0 rows). Previously this path ignored WHERE entirely.
+            let passes_where = if let Some(ref where_clause) = stmt.where_clause {
+                let val = self.evaluator.eval(where_clause, &empty_row)?;
+                self.to_bool(&val)?
+            } else {
+                true
+            };
+
+            // Always compute column names (even when 0 rows) for metadata consistency.
+            let mut column_names = Vec::new();
             for col in &stmt.columns {
                 match col {
                     SelectColumn::Expr(expr, alias) => {
-                        let value = self.evaluator.eval(expr, &empty_row)?;
                         let col_name = alias.clone().unwrap_or_else(|| format!("{:?}", expr));
                         column_names.push(col_name);
-                        result_row.push(value);
                     }
                     SelectColumn::Star => {
                         return Err(MoteDBError::InvalidArgument(
@@ -12243,6 +12292,21 @@ impl QueryExecutor {
                             name
                         )));
                     }
+                }
+            }
+
+            if !passes_where {
+                return Ok(QueryResult::Select {
+                    columns: column_names,
+                    rows: vec![],
+                });
+            }
+
+            let mut result_row = Vec::new();
+            for col in &stmt.columns {
+                if let SelectColumn::Expr(expr, _) = col {
+                    let value = self.evaluator.eval(expr, &empty_row)?;
+                    result_row.push(value);
                 }
             }
 
