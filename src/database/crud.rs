@@ -751,11 +751,19 @@ impl MoteDB {
         // Arithmetic like val + 100 when val is near i64::MAX promotes to Float;
         // if the Float is a whole number, cast it back to Integer so it stores
         // correctly (otherwise the f64 bit pattern is stored as i64 = garbage).
+        // 🔑 BUT only if the value fits in i64 range — `as i64` saturates,
+        // silently truncating values > i64::MAX back to i64::MAX. Values
+        // outside i64 range are kept as Float (the column is Integer, so this
+        // will fail validation below with a clear error).
         let col_types = schema.col_types();
         for (i, ct) in col_types.iter().enumerate() {
             if matches!(ct, crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp) {
                 if let Some(crate::types::Value::Float(f)) = new_row.get(i) {
-                    if f.is_finite() && f.fract() == 0.0 {
+                    // 🔑 Check f64 fits in i64 precisely. `i64::MAX as f64` rounds
+                    // UP to 2^63 (the next representable f64), so a direct `<=`
+                    // comparison lets 2^63 through (which overflows `as i64`).
+                    // Use checked conversion: try_cast via the f64 → i64 path.
+                    if f.is_finite() && f.fract() == 0.0 && *f < 9223372036854775808.0 && *f > -9223372036854775809.0 {
                         new_row[i] = crate::types::Value::Integer(*f as i64);
                     }
                 }

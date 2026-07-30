@@ -1823,7 +1823,14 @@ impl Database {
     fn positional_fast_add(a: &Value, b: &Value) -> Option<Value> {
         use crate::types::Value;
         match (a, b) {
-            (Value::Integer(a), Value::Integer(b)) => a.checked_add(*b).map(Value::Integer),
+            // 🔑 On overflow, promote to Float (matches eval_expr_on_row behavior).
+            // Previously returned None, which caused try_fast_update to fall through
+            // to the full parser — but the full parser's PK path silently kept the
+            // old value (the Float→Integer coercion saturated back to i64::MAX).
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_add(*b) {
+                Some(v) => Some(Value::Integer(v)),
+                None => Some(Value::Float(*a as f64 + *b as f64)),
+            },
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(*a as f64 + b)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(a + *b as f64)),
