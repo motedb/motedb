@@ -268,6 +268,17 @@ impl Database {
             return Ok(());
         }
 
+        // 🔑 Rollback any active transaction before closing. Without this,
+        // uncommitted UPDATEs (which write directly to storage + record an
+        // undo delta) persist on reopen — a crash recovery / data integrity
+        // bug. The undo delta is replayed to restore the original values.
+        let active_txn = self.query_executor.current_txn_id();
+        if let Some(txn_id) = active_txn {
+            warn_log!("[close] Active transaction {} not committed — rolling back", txn_id);
+            self.query_executor.replay_undo_log(txn_id);
+            self.query_executor.clear_txn_context();
+        }
+
         // Signal background threads to stop
         self.inner.signal_background_threads_stop();
 
