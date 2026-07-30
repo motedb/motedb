@@ -225,6 +225,31 @@ impl ExprEvaluator {
         *self.params.write().unwrap() = params;
     }
 
+    /// 🔑 Generate a column name for an expression, matching the executor's
+    /// expr_to_column_name format. Used for aggregate key construction so
+    /// SUM(q * p) builds the same key in both the executor and evaluator.
+    fn expr_to_name(expr: &Expr) -> String {
+        match expr {
+            Expr::Column(name) => name.clone(),
+            Expr::Literal(v) => format!("{:?}", v),
+            Expr::FunctionCall { name, args, .. } => {
+                let arg_str = if args.is_empty() {
+                    "*".to_string()
+                } else {
+                    args.iter().map(Self::expr_to_name).collect::<Vec<_>>().join(", ")
+                };
+                format!("{}({})", name.to_uppercase(), arg_str)
+            }
+            Expr::BinaryOp { left, op, right } => {
+                format!("{} {:?} {}", Self::expr_to_name(left), op, Self::expr_to_name(right))
+            }
+            Expr::UnaryOp { op, expr } => {
+                format!("{:?}{}", op, Self::expr_to_name(expr))
+            }
+            _ => format!("{:?}", expr),
+        }
+    }
+
     pub fn get_params(&self) -> Vec<Value> {
         self.params.read().unwrap().clone()
     }
@@ -751,14 +776,19 @@ impl ExprEvaluator {
             // Aggregate functions: look up pre-computed value in row (for HAVING)
             "count" | "sum" | "avg" | "min" | "max" | "stddev" | "variance"
             | "group_concat" => {
-                // Build the column name that matches how the executor stored it
+                // Build the column name that matches how the executor stored it.
+                // 🔑 Must match expr_to_column_name's format exactly. For
+                // expression args (e.g. q * p in SUM(q * p)), use the same
+                // format as expr_to_column_name: "q Mul p", not Debug format.
                 let arg_str = if args.is_empty() {
                     "*".to_string()
                 } else {
                     args.iter()
                         .map(|a| match a {
                             Expr::Column(c) => c.clone(),
-                            _ => format!("{:?}", a),
+                            Expr::Literal(v) => format!("{:?}", v),
+                            // BinaryOp/other: match expr_to_column_name format
+                            _ => Self::expr_to_name(a),
                         })
                         .collect::<Vec<_>>()
                         .join(", ")

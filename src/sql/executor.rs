@@ -16784,7 +16784,12 @@ impl QueryExecutor {
                 args.iter()
                     .map(|a| match a {
                         Expr::Column(c) => c.clone(),
-                        _ => format!("{:?}", a),
+                        // 🔑 Use expr_to_column_name (not {:?}) so the key matches
+                        // how expr_to_column_name generates the SELECT column name.
+                        // Previously used format!("{:?}", a) which produced Debug
+                        // output like `BinaryOp { ... }`, mismatching the SELECT
+                        // name `q Mul p` — breaking HAVING with SUM(q * p).
+                        _ => Self::expr_to_column_name(a),
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
