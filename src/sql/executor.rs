@@ -18964,9 +18964,12 @@ impl QueryExecutor {
         let schema = self.db.get_table_schema(&stmt.table)?;
 
         // 🚀 PK fast path: skip full table scan for WHERE pk = value
-        if let Some(ref where_clause) = stmt.where_clause {
-            if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
-                let is_pk = schema
+        // 🔑 Skip PK fast path in transaction mode (same reason as execute_update:
+        // the row may exist only in write_set, invisible to resolve_pk_row_ids).
+        if !self.is_in_transaction() {
+            if let Some(ref where_clause) = stmt.where_clause {
+                if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
+                    let is_pk = schema
                     .primary_key()
                     .map(|pk| pk == col_name)
                     .unwrap_or(false);
@@ -19000,11 +19003,19 @@ impl QueryExecutor {
                 }
             }
         }
+        }
 
         // 🚀 Use真正的流式扫描 (O(1) memory)
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
 
         let mut affected_rows = 0;
+
+        // 🔑 In transaction mode, also process write_set rows (same as execute_update).
+        let txn_rows = if self.is_in_transaction() {
+            self.txn_write_set_rows(&stmt.table)
+        } else {
+            Vec::new()
+        };
 
         for result in row_iter {
             let (row_id, row) = result?;
@@ -19039,6 +19050,30 @@ impl QueryExecutor {
 
             // Delete row - 底层已实现增量索引维护，传入 old_row 避免重复加载
             self.db.delete_row_from_table(&stmt.table, row_id, row)?;
+            affected_rows += 1;
+        }
+
+        // 🔑 Process write_set rows (uncommitted INSERTs in this txn).
+        // If a DELETE matches a write_set row, remove it from the write_set
+        // (so COMMIT doesn't flush it). The row was never written to storage.
+        for (ws_row_id, ws_row) in &txn_rows {
+            let sql_row = row_to_sql_row(ws_row, &schema)?;
+            let should_delete = if let Some(ref where_clause) = stmt.where_clause {
+                self.evaluator
+                    .eval(where_clause, &sql_row)
+                    .and_then(|val| self.to_bool(&val))
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            if !should_delete {
+                continue;
+            }
+            // Remove from write_set (the row was never committed to storage).
+            if let Some(tid) = self.current_txn_id() {
+                let ctx = self.db.txn_coordinator.get_context(tid)?;
+                ctx.write_set.write().remove(&(stmt.table.clone(), *ws_row_id));
+            }
             affected_rows += 1;
         }
 

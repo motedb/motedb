@@ -225,3 +225,107 @@ fn test_txn_update_precommitted_row() {
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r[0][0], Value::Integer(50), "committed UPDATE on pre-existing row");
 }
+
+// =========================================================================
+// DELETE in transaction: write_set merge
+// =========================================================================
+
+#[test]
+fn test_txn_delete_uncommitted_insert() {
+    // INSERT then DELETE in same txn, COMMIT — row should be gone.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        let r = q(&db, "SELECT COUNT(*) FROM t");
+        assert_eq!(r[0][0], Value::Integer(0), "row should be deleted in-txn");
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT COUNT(*) FROM t");
+    assert_eq!(r[0][0], Value::Integer(0), "deleted INSERT must not persist");
+}
+
+#[test]
+fn test_txn_delete_some_inserts() {
+    // INSERT 3 rows, DELETE 1, COMMIT — 2 should remain.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT id FROM t ORDER BY id");
+    assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
+}
+
+#[test]
+fn test_txn_delete_precommitted_row() {
+    // DELETE a row committed before the transaction.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        db.flush().unwrap();
+        db.checkpoint().unwrap();
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT id FROM t");
+    assert_eq!(r, vec![vec![Value::Integer(2)]]);
+}
+
+#[test]
+fn test_txn_mixed_insert_update_delete_commit() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        db.flush().unwrap();
+        db.checkpoint().unwrap();
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        db.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(r, vec![
+        vec![Value::Integer(1), Value::Integer(99)],
+        vec![Value::Integer(3), Value::Integer(30)],
+    ]);
+}
