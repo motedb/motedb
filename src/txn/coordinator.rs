@@ -277,6 +277,28 @@ impl TransactionCoordinator {
         }
         Ok(())
     }
+
+    /// 🔑 Update the write_set entry for a row that was INSERTed in this
+    /// transaction and is now being UPDATEd. Without this, COMMIT flushes
+    /// the stale INSERT value (overwriting the UPDATE). Returns true if
+    /// the write_set was updated (row was found in it).
+    pub fn update_write_set_row(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        row_id: RowId,
+        new_row: Row,
+    ) -> Result<bool> {
+        let ctx = self.get_context(txn_id)?;
+        let mut write_set = ctx.write_set.write();
+        let key = (table_name.to_string(), row_id);
+        if write_set.contains_key(&key) {
+            write_set.insert(key, new_row);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
     /// Rollback to a savepoint (Delta Snapshot optimized)
     ///
     /// 🚀 Memory Optimization: Instead of restoring full snapshot,

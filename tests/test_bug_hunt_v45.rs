@@ -147,3 +147,81 @@ fn test_no_active_transaction_close_normal() {
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r[0][0], Value::Integer(42));
 }
+
+// =========================================================================
+// UPDATE in transaction: INSERT + UPDATE + COMMIT persistence
+// =========================================================================
+
+#[test]
+fn test_txn_insert_then_update_persists() {
+    // INSERT then UPDATE in same transaction, COMMIT, reopen.
+    // Previously: COMMIT flushed the stale INSERT value (overwriting UPDATE).
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
+        // Read-your-writes: should see 99
+        let r = q(&db, "SELECT v FROM t WHERE id = 1");
+        assert_eq!(r[0][0], Value::Integer(99), "read-your-writes after UPDATE in txn");
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(r[0][0], Value::Integer(99), "committed INSERT+UPDATE must persist");
+}
+
+#[test]
+fn test_txn_insert_then_update_multiple() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        db.execute("UPDATE t SET v = v + 100 WHERE id > 0").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(r, vec![
+        vec![Value::Integer(1), Value::Integer(110)],
+        vec![Value::Integer(2), Value::Integer(120)],
+    ]);
+}
+
+#[test]
+fn test_txn_update_precommitted_row() {
+    // UPDATE a row that was committed BEFORE the transaction.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = Database::create(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.flush().unwrap();
+        db.checkpoint().unwrap();
+    }
+    {
+        let db = Database::open(&path).unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE t SET v = 50 WHERE id = 1").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.close().unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let r = q(&db, "SELECT v FROM t WHERE id = 1");
+    assert_eq!(r[0][0], Value::Integer(50), "committed UPDATE on pre-existing row");
+}

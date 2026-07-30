@@ -18748,16 +18748,20 @@ impl QueryExecutor {
         }
 
         // 🚀 PK fast path: skip full table scan for WHERE pk = value
-        if let Some(ref where_clause) = stmt.where_clause {
-            if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
-                let is_pk = schema
-                    .primary_key()
-                    .map(|pk| pk == col_name)
-                    .unwrap_or(false);
+        // 🔑 Skip PK fast path when in a transaction — the row may exist only
+        // in the write_set (uncommitted INSERT), and resolve_pk_row_ids reads
+        // storage (wouldn't find it). The scan path merges write_set + storage.
+        if !self.is_in_transaction() {
+            if let Some(ref where_clause) = stmt.where_clause {
+                if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
+                    let is_pk = schema
+                        .primary_key()
+                        .map(|pk| pk == col_name)
+                        .unwrap_or(false);
 
-                if is_pk {
-                    return self.execute_update_pk(&stmt, &schema, &target_value);
-                }
+                    if is_pk {
+                        return self.execute_update_pk(&stmt, &schema, &target_value);
+                    }
 
                 // Column index fast path: use index to find matching rows
                 if let Some(index_name) = self.db.index_registry.find_by_column(
@@ -18784,6 +18788,7 @@ impl QueryExecutor {
                 }
             }
         }
+        }
 
         // 🚀 Use真正的流式扫描 (O(1) memory)
         let row_iter = self.db.scan_table_rows_streaming(&stmt.table)?;
@@ -18804,6 +18809,17 @@ impl QueryExecutor {
         };
 
         let mut affected_rows = 0;
+
+        // 🔑 In transaction mode, also process rows from the write_set
+        // (uncommitted INSERTs). These rows are NOT in storage yet, so the
+        // scan above doesn't see them. Without this, `UPDATE t SET v=99
+        // WHERE id=1` after `INSERT INTO t VALUES (1, 10)` in the same txn
+        // would match 0 rows.
+        let txn_rows = if self.is_in_transaction() {
+            self.txn_write_set_rows(&stmt.table)
+        } else {
+            Vec::new()
+        };
 
         for result in row_iter {
             let (row_id, row) = result?;
@@ -18859,19 +18875,71 @@ impl QueryExecutor {
             // 🔑 Record undo delta for transactional UPDATE (so ROLLBACK can restore).
             let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
-                let _ = self.db.txn_coordinator.record_write_delta(
-                    tid,
-                    crate::txn::coordinator::DeltaOperation::Update(
-                        row_id,
-                        stmt.table.clone(),
-                        Arc::new(row.clone()),
-                    ),
-                );
+                // 🔑 If row was INSERTed in this txn, update write_set (prevents
+                // COMMIT overwriting the UPDATE with the stale INSERT value).
+                let updated = self.db.txn_coordinator.update_write_set_row(
+                    tid, &stmt.table, row_id, new_row.clone(),
+                )?;
+                if !updated {
+                    let _ = self.db.txn_coordinator.record_write_delta(
+                        tid,
+                        crate::txn::coordinator::DeltaOperation::Update(
+                            row_id,
+                            stmt.table.clone(),
+                            Arc::new(row.clone()),
+                        ),
+                    );
+                }
             }
 
             self.db
                 .update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, &schema)?;
 
+            affected_rows += 1;
+        }
+
+        // 🔑 Process write_set rows (uncommitted INSERTs in this txn).
+        for (ws_row_id, ws_row) in &txn_rows {
+            let row = ws_row.clone();
+            let should_update = if let Some(ref where_clause) = resolved_where {
+                Self::eval_expr_on_row(where_clause, &row, &schema)
+                    .map(|v| Self::is_truthy(&v))
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            if !should_update {
+                continue;
+            }
+            let mut new_row = row.clone();
+            for (col_name, expr) in &stmt.assignments {
+                if let Some(cd) = schema.get_column(col_name) {
+                    let new_val = if let Expr::Literal(v) = expr {
+                        v.clone()
+                    } else if Self::expr_contains_subquery(expr) {
+                        let materialized = self.materialize_subqueries(expr)?;
+                        if let Expr::Literal(v) = materialized { v }
+                        else {
+                            Self::eval_expr_on_row(&materialized, &row, &schema).unwrap_or(Value::Null)
+                        }
+                    } else {
+                        match Self::eval_expr_on_row(expr, &row, &schema) {
+                            Ok(v) => v,
+                            Err(e) => return Err(e),
+                        }
+                    };
+                    while new_row.len() <= cd.position {
+                        new_row.push(Value::Null);
+                    }
+                    new_row[cd.position] = new_val;
+                }
+            }
+            // 🔑 Update the write_set entry (not storage — the row isn't committed yet).
+            if let Some(tid) = self.current_txn_id() {
+                let _ = self.db.txn_coordinator.update_write_set_row(
+                    tid, &stmt.table, *ws_row_id, new_row,
+                );
+            }
             affected_rows += 1;
         }
 
@@ -19120,14 +19188,21 @@ impl QueryExecutor {
             // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
             let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
-                let _ = self.db.txn_coordinator.record_write_delta(
-                    tid,
-                    crate::txn::coordinator::DeltaOperation::Update(
-                        row_id,
-                        stmt.table.clone(),
-                        Arc::new(row.clone()),
-                    ),
-                );
+                // 🔑 If row was INSERTed in this txn, update write_set (prevents
+                // COMMIT overwriting the UPDATE with the stale INSERT value).
+                let updated = self.db.txn_coordinator.update_write_set_row(
+                    tid, &stmt.table, row_id, new_row.clone(),
+                )?;
+                if !updated {
+                    let _ = self.db.txn_coordinator.record_write_delta(
+                        tid,
+                        crate::txn::coordinator::DeltaOperation::Update(
+                            row_id,
+                            stmt.table.clone(),
+                            Arc::new(row.clone()),
+                        ),
+                    );
+                }
             }
 
             self.db
@@ -19226,14 +19301,21 @@ impl QueryExecutor {
             // 🔑 Record undo delta for transactional UPDATE (PK/index fast path).
             let txn_id = self.current_txn_id();
             if let Some(tid) = txn_id {
-                let _ = self.db.txn_coordinator.record_write_delta(
-                    tid,
-                    crate::txn::coordinator::DeltaOperation::Update(
-                        row_id,
-                        stmt.table.clone(),
-                        Arc::new(row.clone()),
-                    ),
-                );
+                // 🔑 If row was INSERTed in this txn, update write_set (prevents
+                // COMMIT overwriting the UPDATE with the stale INSERT value).
+                let updated = self.db.txn_coordinator.update_write_set_row(
+                    tid, &stmt.table, row_id, new_row.clone(),
+                )?;
+                if !updated {
+                    let _ = self.db.txn_coordinator.record_write_delta(
+                        tid,
+                        crate::txn::coordinator::DeltaOperation::Update(
+                            row_id,
+                            stmt.table.clone(),
+                            Arc::new(row.clone()),
+                        ),
+                    );
+                }
             }
 
             self.db
