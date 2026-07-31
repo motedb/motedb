@@ -1691,9 +1691,12 @@ impl QueryExecutor {
                 all,
                 ctes,
             } => {
-                // Apply CTEs to the right (always a SelectStmt).
+                // Apply CTEs to the right (always a SelectStmt) and thread them
+                // into the recursive execution so the left branch (which may be
+                // a nested SetOp whose own `ctes` is empty — the parser only
+                // attaches CTEs to the outermost SetOp) also sees them.
                 let right_stmt = self.apply_ctes_for_select(*right, &ctes)?;
-                self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), all)
+                self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), all, &ctes)
             }
             Statement::Insert(i) => self.execute_insert(i),
             Statement::Update(u) => self.execute_update(u),
@@ -1892,7 +1895,7 @@ impl QueryExecutor {
             } => {
                 let right_stmt = self.apply_ctes_for_select((**right).clone(), &ctes)?;
                 let result =
-                    self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), *all)?;
+                    self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), *all, &ctes)?;
                 return Ok(match result {
                     QueryResult::Select { columns, rows } => {
                         StreamingQueryResult::SelectReady { columns, rows }
@@ -2249,13 +2252,32 @@ impl QueryExecutor {
         right: &SelectStmt,
         op: crate::sql::ast::SetOp,
         all: bool,
+        inherited_ctes: &[CteDef],
     ) -> Result<QueryResult> {
         // left can be a nested SetOp (chained) or a Select — execute accordingly.
         let left_result = match left {
-            Statement::SetOp { left: l, right: r, op: o, all: a, ctes: _ } => {
-                self.execute_set_op(l, r, o.clone(), *a)?
+            Statement::SetOp { left: l, right: r, op: o, all: a, ctes } => {
+                // Chained set op: a nested SetOp may carry its own CTEs (when
+                // it's the outermost in a WITH) or none (parser only attaches
+                // CTEs to the outermost). Prefer the nested SetOp's own CTEs if
+                // non-empty; otherwise inherit from the parent.
+                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
+                let r_stmt = self.apply_ctes_for_select(*r.clone(), effective_ctes)?;
+                self.execute_set_op(l, &r_stmt, o.clone(), *a, effective_ctes)?
             }
-            Statement::Select { stmt, .. } => self.execute_select_internal(stmt)?,
+            Statement::Select { stmt, ctes } => {
+                // 🔑 Apply CTEs to the left Select too. Previously this called
+                // execute_select_internal directly, skipping CTE rewriting — so
+                // `WITH a, b SELECT FROM a UNION SELECT FROM b` lost table 'b'
+                // and `WITH x SELECT FROM x UNION SELECT FROM x` could not see
+                // 'x' on the left branch.
+                // Prefer the Select's own CTEs (parser clones the full WITH list
+                // into the leftmost Select); fall back to inherited for chained
+                // unions where intermediate Selects have empty ctes.
+                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
+                let s = self.apply_ctes_for_select(stmt.clone(), effective_ctes)?;
+                self.execute_select_internal(&s)?
+            }
             _ => return Err(MoteDBError::Query("Left side of set op must be SELECT".into())),
         };
         let right_result = self.execute_select_internal(&right)?;
@@ -4759,8 +4781,17 @@ impl QueryExecutor {
                 if self.db.has_col_segment_store(table_name) {
                     if let Ok(store) = self.db.get_or_create_col_segment_store(table_name, &[]) {
                         let _ = store.flush_buffer();
-                        // ORDER BY LIMIT (no aggregate): full scan + in-memory sort.
-                        if stmt.order_by.is_some() && !self.has_aggregates(&stmt.columns) {
+                        // ORDER BY LIMIT (no aggregate, no GROUP BY/HAVING): full scan + in-memory sort.
+                        // 🚨 Must exclude GROUP BY/HAVING: a query like
+                        // `SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat`
+                        // has no aggregate in the SELECT list but MUST go through
+                        // the GROUP BY path. Without these guards this fast path
+                        // ignored GROUP BY/HAVING entirely → returned all rows.
+                        if stmt.order_by.is_some()
+                            && !self.has_aggregates(&stmt.columns)
+                            && stmt.group_by.is_none()
+                            && stmt.having.is_none()
+                        {
                             let schema = self.db.get_table_schema(table_name)?;
                             let result = self.execute_full_scan_via_col_segment(
                                 stmt, table_name, &schema, &store,
@@ -4769,9 +4800,11 @@ impl QueryExecutor {
                             store.release_pages_only();
                             return Ok(result);
                         }
-                        // DISTINCT (no aggregate): multi-segment scan + dedup.
+                        // DISTINCT (no aggregate, no GROUP BY/HAVING): multi-segment scan + dedup.
                         if stmt.distinct
                             && !self.has_aggregates(&stmt.columns)
+                            && stmt.group_by.is_none()
+                            && stmt.having.is_none()
                             // 🚨 ORDER BY / LIMIT must be applied AFTER dedup.
                             // This fast path returns rows without sorting/limiting,
                             // so for `SELECT DISTINCT v ORDER BY v LIMIT 2` it would
@@ -11932,9 +11965,9 @@ impl QueryExecutor {
                 expr: inner,
             } => {
                 let v = Self::eval_expr_on_row(inner, row, schema)?;
-                // NOT NULL should be false (NULL), not true
+                // SQL three-valued logic: NOT UNKNOWN → UNKNOWN (NULL)
                 if matches!(v, Value::Null) {
-                    Ok(Value::Bool(false))
+                    Ok(Value::Null)
                 } else {
                     Ok(Value::Bool(!Self::is_truthy(&v)))
                 }

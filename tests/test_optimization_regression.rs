@@ -544,19 +544,22 @@ fn test_integer_overflow_to_float_survives_recovery() {
             .unwrap();
         db.execute(&format!("INSERT INTO t VALUES (1, {})", i64::MAX - 10))
             .unwrap();
-        // Overflow → should promote to float.
-        db.execute("UPDATE t SET v = v + 100 WHERE id = 1").unwrap();
+        // v + 100 overflows i64 and promotes to Float, but a BIGINT column
+        // cannot store a value > i64::MAX. The correct behavior is a clean
+        // validation error (not a silent wrap or panic), and the original row
+        // must survive across checkpoint/reopen.
+        let upd = db.execute("UPDATE t SET v = v + 100 WHERE id = 1");
+        assert!(upd.is_err(), "overflow UPDATE into BIGINT should error");
         db.checkpoint().unwrap();
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
     let r = rows(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
-    // Value should survive as a large number (float or int).
+    // Original value is preserved (UPDATE was rejected).
     match &r[0][0] {
-        Value::Float(f) => assert!(*f >= i64::MAX as f64, "Should be >= i64::MAX, got {}", f),
-        Value::Integer(i) => assert!(*i > 0, "Should be positive, got {}", i),
-        other => panic!("Expected numeric, got {:?}", other),
+        Value::Integer(i) => assert_eq!(*i, i64::MAX - 10),
+        other => panic!("Expected original Integer, got {:?}", other),
     }
 }
 

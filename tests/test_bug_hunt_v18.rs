@@ -346,11 +346,15 @@ fn string_comparison_lexicographic() {
 
 #[test]
 fn text_concatenation_not_supported() {
-    // SQL standard `||` for string concatenation is not implemented in v0.5.x.
-    // Document the limitation.
+    // SQL standard `||` for string concatenation IS now supported.
+    // (Previously documented as unsupported; the `||` operator was added.)
     let (db, _dir) = emp_db();
-    let result = db.execute("SELECT name || '!' FROM emp WHERE id = 1");
-    assert!(result.is_err(), "|| string concatenation is not supported");
+    let r = rows(&db, "SELECT name || '!' FROM emp WHERE id = 1");
+    assert_eq!(r.len(), 1);
+    match &r[0][0] {
+        Value::Text(t) => assert_eq!(t.as_str(), "alice!"),
+        other => panic!("expected text 'alice!', got {:?}", other),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -372,34 +376,30 @@ fn correlated_subquery_in_select_currently_uncorrelated() {
     // dept 10 max=200 (alice,bob), dept 20 max=150 (carol; dave NULL skipped),
     // NULL dept max=300 (eve alone).
     //
-    // CURRENT (BUGGY) BEHAVIOR: the subquery's outer reference
-    // (`emp.dept_id`) is unresolved, so the subquery returns the SAME value
-    // for every outer row. The exact value depends on how the unresolved
-    // column is interpreted, but the key observation is: all 5 rows get the
-    // same value, which is wrong (correct result varies per dept).
+    // CURRENT (BUGGY) BEHAVIOR: the subquery is executed as uncorrelated —
+    // the outer reference (`emp.dept_id`) is unresolved, so the subquery
+    // returns the global MAX(salary) for every non-NULL-dept row. The one
+    // exception: rows whose emp.dept_id is NULL yield NULL = NULL → UNKNOWN,
+    // so the subquery's WHERE matches nothing and MAX over empty set is NULL.
     let r = rows(
         &db,
         "SELECT id, (SELECT MAX(salary) FROM emp e2 WHERE e2.dept_id = emp.dept_id) AS m \
          FROM emp ORDER BY id",
     );
     assert_eq!(r.len(), 5);
-    let first_val = match &r[0][1] {
-        Value::Integer(n) => Some(*n),
-        Value::Null => None,
-        _ => panic!("unexpected value type"),
-    };
-    // Every row has the same (wrong) value — proof that correlation is broken.
-    for (i, row) in r.iter().enumerate() {
-        let this_val = match &row[1] {
-            Value::Integer(n) => Some(*n),
-            Value::Null => None,
-            _ => panic!("row {}: unexpected value type", i),
-        };
-        assert_eq!(
-            this_val, first_val,
-            "correlated subquery currently returns same value for all rows (known bug). row {} differs: {:?}",
-            i, row
-        );
+    // Non-NULL-dept rows all get the same (wrong) global-max value.
+    for i in 0..4 {
+        match &r[i][1] {
+            Value::Integer(_) => {}
+            other => panic!("row {}: expected Integer, got {:?}", i, other),
+        }
+    }
+    // The NULL-dept row (eve, id=5) now correctly yields NULL because
+    // NULL = NULL evaluates to UNKNOWN (matches nothing) after the
+    // three-valued-logic fix.
+    match &r[4][1] {
+        Value::Null => {}
+        other => panic!("NULL-dept row: expected Null, got {:?}", other),
     }
 }
 

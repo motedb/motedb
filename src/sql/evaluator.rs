@@ -558,19 +558,22 @@ impl ExprEvaluator {
             _ => (left, right),
         };
 
-        // SQL NULL semantics: NULL comparison → false (for WHERE filtering),
-        // NULL arithmetic → NULL (for SELECT projection correctness).
+        // SQL three-valued logic: NULL comparison → UNKNOWN → NULL (not
+        // Bool(false)).  WHERE/HAVING filtering treats NULL predicate results as
+        // "not matched" at every call site (e.g. `Ok(_) => {}` skips), so this
+        // is safe and gives correct projection results: `SELECT NULL = NULL`
+        // yields NULL, not FALSE.
         let either_null = matches!(&left, Value::Null) || matches!(&right, Value::Null);
         if either_null {
             match op {
-                // Comparison: NULL → UNKNOWN → false for filtering
+                // Comparison: NULL → UNKNOWN (NULL), per SQL standard
                 BinaryOperator::Eq
                 | BinaryOperator::Ne
                 | BinaryOperator::Lt
                 | BinaryOperator::Gt
                 | BinaryOperator::Le
                 | BinaryOperator::Ge => {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
                 // AND: FALSE AND anything = FALSE; TRUE AND NULL = NULL
                 BinaryOperator::And => {
@@ -704,6 +707,10 @@ impl ExprEvaluator {
     fn eval_unary_op(&self, op: &UnaryOperator, val: Value) -> Result<Value> {
         match op {
             UnaryOperator::Not => {
+                // SQL three-valued logic: NOT UNKNOWN → UNKNOWN (NULL), not TRUE.
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let b = self.to_bool(&val)?;
                 Ok(Value::Bool(!b))
             }
@@ -2557,13 +2564,14 @@ mod tests {
     #[test]
     fn test_eval_eq_null() {
         let r = row(&[]);
-        // Full evaluator: NULL = anything → false (WHERE-style filtering)
+        // SQL three-valued logic: NULL = anything → UNKNOWN (NULL).
+        // WHERE filtering treats NULL predicate results as "no match".
         let eq = Expr::BinaryOp {
             left: Box::new(lit_null()),
             op: BinaryOperator::Eq,
             right: Box::new(lit_int(1)),
         };
-        assert_eq!(eval(&eq, &r).unwrap(), Value::Bool(false));
+        assert_eq!(eval(&eq, &r).unwrap(), Value::Null);
     }
 
     // ━━━ Logic ━━━
