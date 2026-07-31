@@ -268,3 +268,41 @@ fn test_searched_case_still_works() {
         vec![vec![Value::text("ten".into())], vec![Value::text("other".into())]]
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Nested BEGIN TRANSACTION — must error (was silently starting a new txn,
+// discarding the outer txn's buffered writes → data loss).
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_nested_begin_errors() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute("BEGIN TRANSACTION").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    // Nested BEGIN must error, not silently reset the transaction.
+    let r = db.execute("BEGIN TRANSACTION");
+    assert!(r.is_err(), "nested BEGIN should error");
+    // Outer transaction is still active — rollback undoes both inserts.
+    db.execute("ROLLBACK").unwrap();
+    let r = q(&db, "SELECT * FROM t ORDER BY id");
+    assert_eq!(r, vec![vec![Value::Integer(1), Value::Integer(10)]]);
+}
+
+#[test]
+fn test_begin_after_commit_ok() {
+    // After COMMIT, a new BEGIN should work (not treated as nested).
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY)").unwrap();
+    db.execute("BEGIN TRANSACTION").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("COMMIT").unwrap();
+    // New transaction after commit — must succeed.
+    let r = db.execute("BEGIN TRANSACTION");
+    assert!(r.is_ok(), "BEGIN after COMMIT should succeed");
+    db.execute("INSERT INTO t VALUES (2)").unwrap();
+    db.execute("COMMIT").unwrap();
+    let r = q(&db, "SELECT * FROM t ORDER BY id");
+    assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+}

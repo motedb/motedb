@@ -1985,6 +1985,12 @@ impl QueryExecutor {
                 }
             }
             Statement::BeginTransaction => {
+                // 🚨 Reject nested transactions (see execute_begin_transaction).
+                if self.current_txn_id().is_some() {
+                    return Err(MoteDBError::Query(
+                        "Nested transactions are not supported; COMMIT or ROLLBACK the current transaction first".to_string(),
+                    ));
+                }
                 let txn_id = self.db.begin_transaction()?;
                 self.begin_txn_context(txn_id);
                 StreamingQueryResult::Definition {
@@ -20159,6 +20165,15 @@ impl QueryExecutor {
 
     /// Execute BEGIN [TRANSACTION]
     fn execute_begin_transaction(&self) -> Result<QueryResult> {
+        // 🚨 Reject nested transactions. MoteDB does not support SAVEPOINTs or
+        // nested BEGIN. Silently starting a new transaction would discard the
+        // outer transaction's buffered writes (write_set is reset), causing
+        // data loss. Error out so the caller can COMMIT/ROLLBACK first.
+        if self.current_txn_id().is_some() {
+            return Err(MoteDBError::Query(
+                "Nested transactions are not supported; COMMIT or ROLLBACK the current transaction first".to_string(),
+            ));
+        }
         let txn_id = self.db.begin_transaction()?;
         self.begin_txn_context(txn_id);
         Ok(QueryResult::Definition {
