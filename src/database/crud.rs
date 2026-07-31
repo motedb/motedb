@@ -122,6 +122,30 @@ impl MoteDB {
             ))
         })?;
 
+        // 🚨 Critical: coerce whole-number Floats into Integer/Timestamp columns.
+        // validate_row ALLOWS Float(3.0) for an Integer column (to support
+        // overflow promotion from arithmetic like val + 100 near i64::MAX), but
+        // if we store the Float as-is its f64 bit pattern is reinterpreted as
+        // i64 on read → silent data corruption (3.0 → 4613937818241073152).
+        // Convert valid whole-number Floats back to Integer here. Fractional
+        // floats are rejected by validate_row above.
+        let col_types = schema.col_types();
+        for (i, ct) in col_types.iter().enumerate() {
+            if matches!(ct, crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp) {
+                if let Some(crate::types::Value::Float(f)) = row.get(i) {
+                    // Same bounds as the UPDATE path: strict < 2^63 because
+                    // `i64::MAX as f64` rounds up to 2^63.
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && *f < 9223372036854775808.0
+                        && *f > -9223372036854775809.0
+                    {
+                        row[i] = crate::types::Value::Integer(*f as i64);
+                    }
+                }
+            }
+        }
+
         let row_id = if schema.is_primary_key_auto_increment() {
             // Check if the user provided an explicit PK value.
             let explicit_id = schema
@@ -2404,6 +2428,31 @@ impl MoteDB {
             }
         }
 
+        // 🚨 Critical: coerce whole-number Floats into Integer/Timestamp columns
+        // (same fix as insert_row_to_table — prevents f64 bit pattern corruption).
+        {
+            let col_types = schema.col_types();
+            for row in rows.iter_mut() {
+                for (i, ct) in col_types.iter().enumerate() {
+                    if matches!(
+                        ct,
+                        crate::types::ColumnType::Integer
+                            | crate::types::ColumnType::Timestamp
+                    ) {
+                        if let Some(crate::types::Value::Float(f)) = row.get(i) {
+                            if f.is_finite()
+                                && f.fract() == 0.0
+                                && *f < 9223372036854775808.0
+                                && *f > -9223372036854775809.0
+                            {
+                                row[i] = crate::types::Value::Integer(*f as i64);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if auto_inc {
             // Use per-table AUTO_INCREMENT counter (consistent with insert_row_to_table)
             let counter = {
@@ -2801,6 +2850,28 @@ impl MoteDB {
                     row.push(Value::Null);
                 }
                 row[pk_pos] = Value::Integer(row_ids[i] as i64);
+            }
+        }
+
+        // 🚨 Critical: coerce whole-number Floats into Integer/Timestamp columns.
+        // fast_batch_insert skips validate_row, so without this a Float(3.0)
+        // written to an Integer column corrupts data (f64 bits read back as i64).
+        for row in rows.iter_mut() {
+            for (i, ct) in col_types.iter().enumerate() {
+                if matches!(
+                    ct,
+                    crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp
+                ) {
+                    if let Some(crate::types::Value::Float(f)) = row.get(i) {
+                        if f.is_finite()
+                            && f.fract() == 0.0
+                            && *f < 9223372036854775808.0
+                            && *f > -9223372036854775809.0
+                        {
+                            row[i] = crate::types::Value::Integer(*f as i64);
+                        }
+                    }
+                }
             }
         }
 

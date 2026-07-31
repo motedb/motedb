@@ -47,6 +47,27 @@ pub fn sql_row_to_row(sql_row: &SqlRow, schema: &TableSchema) -> Result<Row> {
             }
             // Integer to Float conversion
             (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+            // 🚨 Float to Integer: convert whole-number floats (prevents f64
+            // bit-pattern corruption when stored). Fractional floats fall
+            // through unchanged and are rejected by validate_row downstream.
+            (ColumnType::Integer, Value::Float(f))
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f < 9223372036854775808.0
+                    && *f > -9223372036854775809.0 =>
+            {
+                Value::Integer(*f as i64)
+            }
+            // 🚨 Float to Timestamp (micros): same whole-number coercion.
+            (ColumnType::Timestamp, Value::Float(f))
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f < 9223372036854775808.0
+                    && *f > -9223372036854775809.0 =>
+            {
+                use crate::types::Timestamp;
+                Value::Timestamp(Timestamp::from_micros(*f as i64))
+            }
             // Pass through
             _ => value,
         };
@@ -111,6 +132,25 @@ pub fn values_to_row_by_columns(
                     Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
                 }
                 (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
+                // 🚨 Float to Integer: convert whole-number floats (prevents
+                // f64 bit-pattern corruption). Fractional floats fall through
+                // and are rejected by validate_row.
+                (ColumnType::Integer, Value::Float(f))
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && *f < 9223372036854775808.0
+                        && *f > -9223372036854775809.0 =>
+                {
+                    Value::Integer(*f as i64)
+                }
+                (ColumnType::Timestamp, Value::Float(f))
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && *f < 9223372036854775808.0
+                        && *f > -9223372036854775809.0 =>
+                {
+                    Value::Timestamp(crate::types::Timestamp::from_micros(*f as i64))
+                }
                 _ => val,
             };
             row[col_def.position] = coerced;

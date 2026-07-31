@@ -16443,6 +16443,22 @@ impl QueryExecutor {
         })
     }
 
+    /// Check if an expression is a compile-time constant (can be evaluated with
+    /// an empty row). Used by INSERT VALUES to constant-fold negative literals
+    /// (`-1e15`, `-(5.0)`) and other constant expressions into Values without
+    /// requiring column references. The parser represents leading-minus numbers
+    /// as `UnaryOp(Minus, Literal)`, not as negative Literals.
+    fn is_constant_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(_) | Expr::Parameter(_) => true,
+            Expr::UnaryOp { expr: inner, .. } => Self::is_constant_expr(inner),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::is_constant_expr(left) && Self::is_constant_expr(right)
+            }
+            _ => false,
+        }
+    }
+
     /// Check if the SELECT list contains any *computed* expression — i.e. an
     /// `Expr` that is not a bare column reference or literal. The columnar scan
     /// fast paths only project raw columns/literals; computed expressions
@@ -18681,6 +18697,12 @@ impl QueryExecutor {
                     Expr::Parameter(_) => {
                         let empty_row = SqlRow::new();
                         self.evaluator.eval(expr, &empty_row)
+                    }
+                    // 🚨 Constant-fold negative literals (`-1e15`, `-(5.0)`)
+                    // which the parser represents as UnaryOp(Minus, Literal).
+                    other if Self::is_constant_expr(other) => {
+                        let empty_row = SqlRow::new();
+                        self.evaluator.eval(other, &empty_row)
                     }
                     other => Err(MoteDBError::InvalidArgument(format!(
                         "INSERT VALUES must be literals or parameters, got {:?}",
@@ -22481,6 +22503,15 @@ impl QueryExecutor {
                     Expr::Parameter(_) => {
                         let empty_row = SqlRow::new();
                         self.evaluator.eval(&value_row[i], &empty_row)?
+                    }
+                    // 🚨 Constant-fold negative literals and other constant
+                    // unary expressions. The parser represents `-1e15` and
+                    // `-(5.0)` as `UnaryOp(Minus, Literal(...))`, not as a
+                    // negative Literal. Without this arm, INSERT VALUES
+                    // rejected any value with a leading minus sign.
+                    expr if Self::is_constant_expr(expr) => {
+                        let empty_row = SqlRow::new();
+                        self.evaluator.eval(expr, &empty_row)?
                     }
                     expr => {
                         return Err(MoteDBError::InvalidArgument(format!(
