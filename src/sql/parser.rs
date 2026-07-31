@@ -21,6 +21,12 @@ const MAX_RECURSION_DEPTH: usize = 64;
 /// Maximum identifier length (table/column names) — prevents DoS via memory exhaustion
 const MAX_IDENTIFIER_LENGTH: usize = 4096;
 
+/// Precedence of postfix operators (IS NULL, IN, LIKE, BETWEEN). Per SQL
+/// standard these bind at the same level as comparison operators (=, <, >),
+/// lower than arithmetic (Add/Sub=4, Mul/Div/Mod=5) and higher than NOT/AND/OR.
+/// This makes `a + b IS NULL` parse as `(a + b) IS NULL`, not `a + (b IS NULL)`.
+const POSTFIX_PRECEDENCE: u8 = 3;
+
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -1176,8 +1182,13 @@ impl Parser {
                 continue;
             }
 
-            // Try postfix operators (IS NULL, IN, LIKE, BETWEEN, NOT IN/LIKE/BETWEEN)
-            if self.can_parse_postfix() {
+            // Try postfix operators (IS NULL, IN, LIKE, BETWEEN, NOT IN/LIKE/BETWEEN).
+            // 🔑 These bind at comparison precedence (3) — same as =, <, >, etc.
+            // and LOWER than arithmetic (Add/Sub=4, Mul/Div/Mod=5). Without this
+            // precedence check, `a + b IS NULL` would parse as `a + (b IS NULL)`
+            // (the IS NULL postfix gets consumed inside the right operand of `+`)
+            // instead of the correct `(a + b) IS NULL`.
+            if self.can_parse_postfix() && POSTFIX_PRECEDENCE >= min_precedence {
                 left = self.parse_single_postfix(left)?;
                 continue;
             }

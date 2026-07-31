@@ -9140,6 +9140,18 @@ impl QueryExecutor {
             }
         }
 
+        // 🚨 WHERE clause columns: must be included in scan_positions so that
+        // col_segment_general_scan's eval_expr_on_row can resolve them. Without
+        // this, `SELECT id FROM t WHERE a + b IS NULL` scans only the `id`
+        // column — eval_expr_on_row can't find `a`/`b` → wrong/empty results.
+        if let Some(ref wc) = where_clause {
+            for p in Self::expr_referenced_columns(wc, schema) {
+                if !scan_positions.contains(&p) {
+                    scan_positions.push(p);
+                }
+            }
+        }
+
         // 🚀 TEXT eq SelectColumnar fast path: for `WHERE text_col = 'literal'`
         // on a ColSegmentStore table. The old path (col_segment_projected_scan →
         // scan_projected_filtered) pre-interns the ENTIRE text column into
