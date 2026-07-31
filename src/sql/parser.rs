@@ -1202,12 +1202,33 @@ impl Parser {
     fn parse_prefix_expr(&mut self) -> Result<Expr> {
         match &self.current().token_type {
             // CASE WHEN ... THEN ... [WHEN ... THEN ...] [ELSE ...] END
+            //   (searched form)
+            // CASE expr WHEN val THEN ... [WHEN val THEN ...] [ELSE ...] END
+            //   (simple form — equivalent to CASE WHEN expr = val THEN ...)
             TokenType::Case => {
                 self.advance(); // consume CASE
+                // 🚨 Simple CASE: if the next token isn't WHEN, parse the test
+                // expression and rewrite each `WHEN val THEN res` into the
+                // searched form `WHEN test_expr = val THEN res`.
+                let test_expr = if !matches!(self.current().token_type, TokenType::When) {
+                    Some(self.parse_expr(0)?)
+                } else {
+                    None
+                };
                 let mut whens = Vec::new();
                 while matches!(self.current().token_type, TokenType::When) {
                     self.advance(); // consume WHEN
-                    let cond = self.parse_expr(0)?;
+                    let val = self.parse_expr(0)?;
+                    // For simple CASE, build `test_expr = val` as the condition.
+                    let cond = if let Some(ref te) = test_expr {
+                        Expr::BinaryOp {
+                            left: Box::new(te.clone()),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(val),
+                        }
+                    } else {
+                        val
+                    };
                     // expect() already calls advance() — don't double-advance.
                     self.expect(TokenType::Then)?;
                     let result = self.parse_expr(0)?;

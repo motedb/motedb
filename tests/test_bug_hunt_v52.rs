@@ -185,3 +185,86 @@ fn test_arith_between() {
     let r = q(&db, "SELECT id FROM nulls WHERE a + b BETWEEN 1 AND 100 ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(4)]]);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Simple CASE (CASE expr WHEN val THEN ...) — was a parse error.
+// The parser only supported the searched form (CASE WHEN cond THEN ...).
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_simple_case_with_else() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 5)").unwrap();
+    let r = q(
+        &db,
+        "SELECT CASE a WHEN 10 THEN 'ten' ELSE 'other' END FROM t ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![vec![Value::text("ten".into())], vec![Value::text("other".into())]]
+    );
+}
+
+#[test]
+fn test_simple_case_no_else() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 5)").unwrap();
+    // No ELSE: row 2 (a=5) doesn't match → NULL.
+    let r = q(&db, "SELECT CASE a WHEN 10 THEN 'ten' END FROM t ORDER BY id");
+    assert_eq!(
+        r,
+        vec![vec![Value::text("ten".into())], vec![Value::Null]]
+    );
+}
+
+#[test]
+fn test_simple_case_multi_when() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    let r = q(
+        &db,
+        "SELECT CASE a WHEN 10 THEN 'A' WHEN 20 THEN 'B' ELSE 'C' END FROM t ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::text("A".into())],
+            vec![Value::text("B".into())],
+            vec![Value::text("C".into())],
+        ]
+    );
+}
+
+#[test]
+fn test_simple_case_with_text() {
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'cat'), (2, 'dog')").unwrap();
+    let r = q(
+        &db,
+        "SELECT CASE s WHEN 'cat' THEN 1 WHEN 'dog' THEN 2 ELSE 0 END FROM t ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+    );
+}
+
+#[test]
+fn test_searched_case_still_works() {
+    // Regression: the searched form (CASE WHEN cond ...) must still work.
+    let (db, _d) = db();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 5)").unwrap();
+    let r = q(
+        &db,
+        "SELECT CASE WHEN a = 10 THEN 'ten' ELSE 'other' END FROM t ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![vec![Value::text("ten".into())], vec![Value::text("other".into())]]
+    );
+}
