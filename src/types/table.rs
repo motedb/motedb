@@ -357,14 +357,33 @@ impl TableSchema {
         self.indexes.push(index);
     }
 
-    /// Get column by name
+    /// Get column by name (case-insensitive fallback for identifiers).
+    /// Standard SQL column identifiers are case-insensitive, so after an
+    /// exact match fails we fall back to a case-insensitive comparison.
     pub fn get_column(&self, name: &str) -> Option<&ColumnDef> {
-        self.columns.iter().find(|c| c.name == name)
+        if let Some(c) = self.columns.iter().find(|c| c.name == name) {
+            return Some(c);
+        }
+        let nl = name.to_lowercase();
+        let mut found: Option<&ColumnDef> = None;
+        for c in &self.columns {
+            if c.name.to_lowercase() == nl {
+                if found.is_some() {
+                    return None; // ambiguous → treat as not found
+                }
+                found = Some(c);
+            }
+        }
+        found
     }
 
-    /// Get column position by name
+    /// Get column position by name (case-insensitive fallback).
+    /// Standard SQL column identifiers are case-insensitive.
     pub fn get_column_position(&self, name: &str) -> Option<usize> {
-        self.column_map.get(name).copied()
+        if let Some(pos) = self.column_map.get(name).copied() {
+            return Some(pos);
+        }
+        self.get_column(name).map(|c| c.position)
     }
 
     /// Get number of columns

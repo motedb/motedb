@@ -42,6 +42,28 @@ fn value_to_concat_string(v: &Value) -> String {
     }
 }
 
+/// Normalize a value for IN-list matching so Bool↔Int coercion works the same
+/// way `=` does (TRUE matches 1, FALSE matches 0). Bool is mapped to Integer;
+/// all other types (including Null) are returned unchanged. Applied to both
+/// the IN-list members (at compile time) and the column value (at match time)
+/// so `b IN (1)` (BOOLEAN column) and `x IN (TRUE)` (INTEGER column) both match.
+fn normalize_for_in(v: &Value) -> Value {
+    match v {
+        Value::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
+        // 🔑 Parse ISO-date text into Timestamp so a TIMESTAMP column matches
+        // an IN list of string literals (e.g. `WHERE ts IN ('2024-01-15T00:00:00')`).
+        // Value::eq already treats Timestamp==ISO-Text as equal, but HashSet
+        // matching requires matching Hash too — Timestamp and Text hash
+        // differently, so we normalize the set members (and the column value,
+        // which stays Timestamp) to the same Timestamp representation.
+        // Non-date text (parse_iso returns None) is left as Text.
+        Value::Text(s) => crate::types::Timestamp::parse_iso(s.as_str())
+            .map(Value::Timestamp)
+            .unwrap_or_else(|| v.clone()),
+        other => other.clone(),
+    }
+}
+
 /// Wrapper around f32 that implements Ord (for use in BinaryHeap top-K).
 /// NaN is treated as +∞ so it never wins a "smallest distance" comparison.
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +308,10 @@ pub enum StreamingQueryResult {
         row_indices: Option<Vec<usize>>,
         num_rows: usize,
         row_map: crate::storage::lsm::columnar::RowMap,
+        /// ORDER BY clauses to apply during materialization (None = no sort).
+        /// Carried here so the zero-copy columnar scan path can still honor
+        /// ORDER BY (expression/alias/ordinal) at materialize time.
+        order_by: Option<Vec<OrderByExpr>>,
     },
 
     /// INSERT/UPDATE/DELETE result
@@ -321,6 +347,7 @@ impl StreamingQueryResult {
                 row_indices,
                 num_rows,
                 row_map,
+                order_by,
             } => {
                 // Convert columnar to row-based lazily — only when materialize() called
                 let ncols = segments.len();
@@ -376,6 +403,17 @@ impl StreamingQueryResult {
                                         crate::types::ColumnType::Boolean => {
                                             f.get_bool(idx).map(Value::Bool)
                                         }
+                                        // 🚨 Timestamp: decode as Timestamp (micros),
+                                        // not Integer. Without this, TIMESTAMP columns
+                                        // read back as Integer → date string comparisons
+                                        // in WHERE fail (Integer vs Text → None).
+                                        crate::types::ColumnType::Timestamp => {
+                                            f.get_i64(idx).map(|m| {
+                                                Value::Timestamp(
+                                                    crate::types::Timestamp::from_micros(m),
+                                                )
+                                            })
+                                        }
                                         _ => f.get_i64(idx).map(Value::Integer),
                                     }
                                     .unwrap_or(Value::Null),
@@ -397,6 +435,15 @@ impl StreamingQueryResult {
                         }
                     }
                     rows.push(row);
+                }
+                // 🔑 Apply ORDER BY to the materialized columnar rows. The
+                // zero-copy SelectColumnar path skips sorting; clauses carried
+                // on the variant are applied here (handles expression/alias/
+                // ordinal ORDER BY, which the columnar scan can't evaluate).
+                if let Some(order_clauses) = order_by {
+                    if !order_clauses.is_empty() {
+                        Self::apply_order_by(&mut rows, &columns, &order_clauses)?;
+                    }
                 }
                 Ok(QueryResult::Select { columns, rows })
             }
@@ -574,6 +621,7 @@ impl StreamingQueryResult {
                 row_indices,
                 num_rows,
                 row_map,
+                order_by: _,
             } => {
                 let limit = max_rows.unwrap_or(usize::MAX);
                 let mut count = 0;
@@ -617,6 +665,14 @@ impl StreamingQueryResult {
                                         }
                                         crate::types::ColumnType::Boolean => {
                                             f.get_bool(idx).map(Value::Bool)
+                                        }
+                                        // 🚨 Timestamp: decode as Timestamp (micros).
+                                        crate::types::ColumnType::Timestamp => {
+                                            f.get_i64(idx).map(|m| {
+                                                Value::Timestamp(
+                                                    crate::types::Timestamp::from_micros(m),
+                                                )
+                                            })
                                         }
                                         _ => f.get_i64(idx).map(Value::Integer),
                                     }
@@ -1072,6 +1128,82 @@ impl StreamingQueryResult {
         Ok(())
     }
 
+    /// Best-effort ORDER BY over a StreamingQueryResult's projected columns.
+    /// Only sorts when EVERY ORDER BY key resolves to a projected output column
+    /// (by name, alias, or 1-based ordinal). If any key can't be resolved against
+    /// the projected columns, does nothing — the caller's underlying scan path is
+    /// responsible for non-projected-column ORDER BY. This makes
+    /// `SELECT id, v*2 AS dbl ... ORDER BY dbl` and `ORDER BY 2` work on the
+    /// col-segment fast path without breaking non-projected ORDER BY.
+    /// Never errors: unresolvable keys are silently skipped (no sort).
+    fn try_sort_projected(
+        result: &mut StreamingQueryResult,
+        order_clauses: &[crate::sql::ast::OrderByExpr],
+    ) {
+        let (columns, rows): (&[String], &mut Vec<Vec<Value>>) = match result {
+            StreamingQueryResult::SelectReady { columns, rows } => (columns.as_slice(), rows),
+            StreamingQueryResult::SelectColumnar { .. } => {
+                // For SelectColumnar we carry the clauses; materialize() sorts.
+                if let StreamingQueryResult::SelectColumnar {
+                    order_by: ref mut ob,
+                    ..
+                } = result
+                {
+                    *ob = Some(order_clauses.to_vec());
+                }
+                return;
+            }
+            _ => return,
+        };
+        // Resolve every key against the projected columns.
+        let mut specs: Vec<(usize, bool)> = Vec::new();
+        for clause in order_clauses {
+            let idx = match &clause.expr {
+                crate::sql::ast::Expr::Column(name) => {
+                    // Match against output column names (which include aliases).
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    columns
+                        .iter()
+                        .position(|c| c == name || c.rsplit('.').next().unwrap_or(c) == bare)
+                }
+                crate::sql::ast::Expr::Literal(Value::Integer(n)) => {
+                    let i = (*n as usize).wrapping_sub(1);
+                    if i < columns.len() {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            match idx {
+                Some(i) => specs.push((i, clause.asc)),
+                None => return, // a key can't be resolved against projected cols → bail
+            }
+        }
+        if specs.is_empty() {
+            return;
+        }
+        rows.sort_by(|a, b| {
+            for &(idx, asc) in &specs {
+                if idx >= a.len() || idx >= b.len() {
+                    continue;
+                }
+                let cmp = match (&a[idx], &b[idx]) {
+                    (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                    (Value::Null, _) => std::cmp::Ordering::Less,
+                    (_, Value::Null) => std::cmp::Ordering::Greater,
+                    (x, y) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+                };
+                let cmp = if asc { cmp } else { cmp.reverse() };
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
     fn apply_distinct(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
         use std::collections::HashSet;
 
@@ -1171,7 +1303,10 @@ impl CompiledWhere {
                     if matches!(v, Value::Null) {
                         return false;
                     }
-                    set.contains(v)
+                    // 🔑 Bool↔Int coercion: normalize the column value the same
+                    // way the set was normalized at compile time so a BOOLEAN
+                    // column matches an integer IN list (TRUE IN (1)).
+                    set.contains(&normalize_for_in(v))
                 }))
             }
             CompiledWhere::Like(pos, pattern, negated) => {
@@ -1343,7 +1478,8 @@ impl CompiledWhere {
                     if matches!(v, Value::Null) {
                         return false;
                     }
-                    set.contains(v)
+                    // 🔑 Bool↔Int coercion (see CompiledWhere::InHash above).
+                    set.contains(&normalize_for_in(v))
                 }))
             }
             CompiledWhere::Like(pos, pattern, negated) => {
@@ -1690,13 +1826,24 @@ impl QueryExecutor {
                 op,
                 all,
                 ctes,
+                order_by,
+                limit,
+                offset,
             } => {
-                // Apply CTEs to the right (always a SelectStmt) and thread them
-                // into the recursive execution so the left branch (which may be
-                // a nested SetOp whose own `ctes` is empty — the parser only
-                // attaches CTEs to the outermost SetOp) also sees them.
-                let right_stmt = self.apply_ctes_for_select(*right, &ctes)?;
-                self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), all, &ctes)
+                // Execute the outermost set op, then apply the trailing
+                // ORDER BY / LIMIT / OFFSET carried by this node (per SQL
+                // standard these apply to the whole set result).
+                let mut result =
+                    self.execute_set_op(left.as_ref(), right.as_ref(), op.clone(), all, &ctes)?;
+                if order_by.is_some() || limit.is_some() || offset.is_some() {
+                    result = self.apply_set_op_trailing(
+                        result,
+                        &order_by,
+                        limit,
+                        offset,
+                    )?;
+                }
+                Ok(result)
             }
             Statement::Insert(i) => self.execute_insert(i),
             Statement::Update(u) => self.execute_update(u),
@@ -1892,10 +2039,15 @@ impl QueryExecutor {
                 op,
                 all,
                 ctes,
+                order_by,
+                limit,
+                offset,
             } => {
-                let right_stmt = self.apply_ctes_for_select((**right).clone(), &ctes)?;
-                let result =
-                    self.execute_set_op(left.as_ref(), &right_stmt, op.clone(), *all, &ctes)?;
+                let mut result =
+                    self.execute_set_op(left.as_ref(), right.as_ref(), op.clone(), *all, &ctes)?;
+                if order_by.is_some() || limit.is_some() || offset.is_some() {
+                    result = self.apply_set_op_trailing(result, order_by, *limit, *offset)?;
+                }
                 return Ok(match result {
                     QueryResult::Select { columns, rows } => {
                         StreamingQueryResult::SelectReady { columns, rows }
@@ -2136,7 +2288,82 @@ impl QueryExecutor {
             Self::rewrite_from_cte_refs(from, &visible, &None, "");
         }
 
+        // 🔑 Rewrite CTE references inside subqueries that appear in the
+        // WHERE / SELECT-list / HAVING (e.g. `WHERE v IN (SELECT ... FROM x)`).
+        // These Expr::Subquery nodes have their own FROM that must see the
+        // outer CTEs per SQL scoping. The FROM-level rewrite above only
+        // touches the main FROM clause, not expression subqueries.
+        if let Some(wc) = stmt.where_clause.as_mut() {
+            Self::rewrite_subquery_cte_refs(wc, &visible);
+        }
+        if let Some(hv) = stmt.having.as_mut() {
+            Self::rewrite_subquery_cte_refs(hv, &visible);
+        }
+        for col in stmt.columns.iter_mut() {
+            if let crate::sql::ast::SelectColumn::Expr(e, _) = col {
+                Self::rewrite_subquery_cte_refs(e, &visible);
+            }
+        }
+
         Ok(stmt)
+    }
+
+    /// Recursively walk an expression and rewrite CTE references inside any
+    /// `Expr::Subquery`'s FROM clause (so subqueries in WHERE/SELECT/HAVING
+    /// can reference outer-query CTEs).
+    fn rewrite_subquery_cte_refs(expr: &mut Expr, visible: &[(String, CteDef)]) {
+        match expr {
+            Expr::Subquery(sub) => {
+                if let Some(inner_from) = sub.from.as_mut() {
+                    Self::rewrite_from_cte_refs(inner_from, visible, &None, "");
+                }
+                // Recurse into the subquery's own WHERE/SELECT for nested subs.
+                if let Some(wc) = sub.where_clause.as_mut() {
+                    Self::rewrite_subquery_cte_refs(wc, visible);
+                }
+                for col in sub.columns.iter_mut() {
+                    if let crate::sql::ast::SelectColumn::Expr(e, _) = col {
+                        Self::rewrite_subquery_cte_refs(e, visible);
+                    }
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::rewrite_subquery_cte_refs(left, visible);
+                Self::rewrite_subquery_cte_refs(right, visible);
+            }
+            Expr::UnaryOp { expr, .. } => Self::rewrite_subquery_cte_refs(expr, visible),
+            Expr::In { expr, list, .. } => {
+                Self::rewrite_subquery_cte_refs(expr, visible);
+                for item in list.iter_mut() {
+                    Self::rewrite_subquery_cte_refs(item, visible);
+                }
+            }
+            Expr::Between { expr, low, high, .. } => {
+                Self::rewrite_subquery_cte_refs(expr, visible);
+                Self::rewrite_subquery_cte_refs(low, visible);
+                Self::rewrite_subquery_cte_refs(high, visible);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                Self::rewrite_subquery_cte_refs(expr, visible);
+                Self::rewrite_subquery_cte_refs(pattern, visible);
+            }
+            Expr::IsNull { expr, .. } => Self::rewrite_subquery_cte_refs(expr, visible),
+            Expr::FunctionCall { args, .. } => {
+                for a in args.iter_mut() {
+                    Self::rewrite_subquery_cte_refs(a, visible);
+                }
+            }
+            Expr::Case { whens, else_expr } => {
+                for (c, v) in whens.iter_mut() {
+                    Self::rewrite_subquery_cte_refs(c, visible);
+                    Self::rewrite_subquery_cte_refs(v, visible);
+                }
+                if let Some(e) = else_expr.as_mut() {
+                    Self::rewrite_subquery_cte_refs(e, visible);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Walk a `TableRef` tree and replace `Table { name: cte_name, .. }` with
@@ -2161,10 +2388,15 @@ impl QueryExecutor {
                 }
             }
             TableRef::Subquery { query, .. } => {
-                // v1: do not rewrite inside nested subqueries. A CTE name
-                // referenced inside a derived table is out of scope.
-                // (Avoids surprising re-execution semantics.)
-                let _ = query;
+                // 🔑 Rewrite CTE references inside nested subqueries too. Per
+                // SQL scoping, a CTE defined in the outer query is visible to
+                // subqueries (e.g. `WITH x AS (...) SELECT ... WHERE v IN
+                // (SELECT MAX(s) FROM x)`). Previously this was skipped, so the
+                // inner `FROM x` raised "Table 'x' not found". We recurse into
+                // the subquery's own FROM clause with the same visible CTEs.
+                if let Some(inner_from) = query.from.as_mut() {
+                    Self::rewrite_from_cte_refs(inner_from, visible, &None, "");
+                }
             }
             TableRef::Join {
                 left,
@@ -2252,41 +2484,134 @@ impl QueryExecutor {
 
 
     /// Execute UNION / UNION ALL set operation.
+    /// Execute one branch of a set operation. The branch is either a Select or
+    /// a nested SetOp (e.g. an INTERSECT chain appearing as the right operand
+    /// of a UNION). Applies inherited CTEs, then dispatches. Nested SetOps with
+    /// their own (non-empty) CTEs take precedence over the inherited ones.
+    fn execute_set_op_branch(
+        &self,
+        branch: &Statement,
+        inherited_ctes: &[CteDef],
+    ) -> Result<QueryResult> {
+        match branch {
+            Statement::SetOp {
+                left: l,
+                right: r,
+                op: o,
+                all: a,
+                ctes,
+                order_by,
+                limit,
+                offset,
+            } => {
+                // A nested SetOp may carry its own CTEs (when it's the
+                // outermost in a WITH) or none (the parser only attaches CTEs
+                // to the outermost). Prefer the nested SetOp's own CTEs if
+                // non-empty; otherwise inherit from the parent.
+                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
+                let mut result =
+                    self.execute_set_op(l, r, o.clone(), *a, effective_ctes)?;
+                // Apply this node's own trailing ORDER BY/LIMIT/OFFSET (only the
+                // outermost carries them; nested nodes have None).
+                if order_by.is_some() || limit.is_some() || offset.is_some() {
+                    result = self.apply_set_op_trailing(result, order_by, *limit, *offset)?;
+                }
+                Ok(result)
+            }
+            Statement::Select { stmt, ctes } => {
+                // 🔑 Apply CTEs to the Select. Prefer the Select's own CTEs
+                // (parser clones the full WITH list into branches); fall back to
+                // inherited for chained unions where branches have empty ctes.
+                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
+                let s = self.apply_ctes_for_select(stmt.clone(), effective_ctes)?;
+                self.execute_select_internal(&s)
+            }
+            _ => Err(MoteDBError::Query("Operands of set op must be SELECT".into())),
+        }
+    }
+
+    /// Apply ORDER BY / LIMIT / OFFSET to the combined rows of an outermost
+    /// set operation. ORDER BY references output column names or ordinals.
+    fn apply_set_op_trailing(
+        &self,
+        result: QueryResult,
+        order_by: &Option<Vec<crate::sql::ast::OrderByExpr>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<QueryResult> {
+        let (columns, mut rows) = match result {
+            QueryResult::Select { columns, rows } => (columns, rows),
+            other => return Ok(other),
+        };
+        if let Some(order_by) = order_by {
+            // Resolve each ORDER BY key against the output columns (by name) or
+            // by ordinal (1-based). Build a comparator that handles NULLs.
+            let col_names: Vec<String> = columns.clone();
+            rows.sort_by(|a, b| {
+                for obe in order_by {
+                    let (av, bv) = self.resolve_order_key(&obe.expr, &col_names, a, b);
+                    let ord = av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = if obe.asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if let Some(off) = offset {
+            if off >= rows.len() {
+                rows.clear();
+            } else {
+                rows.drain(0..off);
+            }
+        }
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
+        Ok(QueryResult::Select { columns, rows })
+    }
+
+    /// Resolve an ORDER BY key expression against output columns of a set op,
+    /// returning the (a_value, b_value) pair for two rows. Supports column-name
+    /// and ordinal (Literal Integer) references.
+    fn resolve_order_key<'a>(
+        &self,
+        expr: &crate::sql::ast::Expr,
+        col_names: &[String],
+        a: &'a [Value],
+        b: &'a [Value],
+    ) -> (Value, Value) {
+        use crate::sql::ast::Expr;
+        let idx = match expr {
+            Expr::Column(name) => col_names.iter().position(|c| c.eq_ignore_ascii_case(name)),
+            Expr::Literal(Value::Integer(i)) => {
+                // 1-based ordinal.
+                if *i >= 1 {
+                    Some((*i as usize) - 1)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match idx {
+            Some(i) if i < a.len() && i < b.len() => (a[i].clone(), b[i].clone()),
+            _ => (Value::Null, Value::Null),
+        }
+    }
+
     fn execute_set_op(
         &self,
         left: &Statement,
-        right: &SelectStmt,
+        right: &Statement,
         op: crate::sql::ast::SetOp,
         all: bool,
         inherited_ctes: &[CteDef],
     ) -> Result<QueryResult> {
         // left can be a nested SetOp (chained) or a Select — execute accordingly.
-        let left_result = match left {
-            Statement::SetOp { left: l, right: r, op: o, all: a, ctes } => {
-                // Chained set op: a nested SetOp may carry its own CTEs (when
-                // it's the outermost in a WITH) or none (parser only attaches
-                // CTEs to the outermost). Prefer the nested SetOp's own CTEs if
-                // non-empty; otherwise inherit from the parent.
-                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
-                let r_stmt = self.apply_ctes_for_select(*r.clone(), effective_ctes)?;
-                self.execute_set_op(l, &r_stmt, o.clone(), *a, effective_ctes)?
-            }
-            Statement::Select { stmt, ctes } => {
-                // 🔑 Apply CTEs to the left Select too. Previously this called
-                // execute_select_internal directly, skipping CTE rewriting — so
-                // `WITH a, b SELECT FROM a UNION SELECT FROM b` lost table 'b'
-                // and `WITH x SELECT FROM x UNION SELECT FROM x` could not see
-                // 'x' on the left branch.
-                // Prefer the Select's own CTEs (parser clones the full WITH list
-                // into the leftmost Select); fall back to inherited for chained
-                // unions where intermediate Selects have empty ctes.
-                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
-                let s = self.apply_ctes_for_select(stmt.clone(), effective_ctes)?;
-                self.execute_select_internal(&s)?
-            }
-            _ => return Err(MoteDBError::Query("Left side of set op must be SELECT".into())),
-        };
-        let right_result = self.execute_select_internal(&right)?;
+        let left_result = self.execute_set_op_branch(left, inherited_ctes)?;
+        let right_result = self.execute_set_op_branch(right, inherited_ctes)?;
         let (columns, left_rows) = match left_result {
             QueryResult::Select { columns, rows } => (columns, rows),
             _ => {
@@ -2295,23 +2620,26 @@ impl QueryExecutor {
                 ))
             }
         };
-        let right_rows = match right_result {
-            QueryResult::Select { rows, .. } => rows,
+        let (right_cols, right_rows) = match right_result {
+            QueryResult::Select { columns, rows } => (columns, rows),
             _ => {
                 return Err(MoteDBError::Query(
                     "Right side of set op must be SELECT".into(),
                 ))
             }
         };
-        // 🔑 Verify column counts match (SQL standard requires this).
-        if !left_rows.is_empty() && !right_rows.is_empty() {
-            if left_rows[0].len() != right_rows[0].len() {
-                return Err(MoteDBError::Query(format!(
-                    "UNION: column count mismatch ({} vs {})",
-                    left_rows[0].len(),
-                    right_rows[0].len()
-                )));
-            }
+        // 🔑 Verify column counts match (SQL standard requires this). Check
+        // against the column metadata (lengths), NOT the rows — previously
+        // this was skipped when either side had 0 rows, so
+        // `SELECT x FROM a UNION SELECT x,y FROM b` (empty b) silently
+        // succeeded with mismatched widths.
+        let left_width = columns.len();
+        let right_width = right_cols.len();
+        if left_width != right_width {
+            return Err(MoteDBError::Query(format!(
+                "UNION: column count mismatch ({} vs {})",
+                left_width, right_width,
+            )));
         }
         match op {
             crate::sql::ast::SetOp::Union => {
@@ -2479,14 +2807,18 @@ impl QueryExecutor {
                                     // NOT IN: count rows whose value is NOT in set
                                     // (and non-NULL). This needs a full scan.
                                     let _ = store.flush_buffer();
-                                    let pred_set = set.clone();
+                                    // 🔑 Normalize Bool→Int for coerced matching.
+                                    let pred_set: std::collections::HashSet<Value> =
+                                        set.iter().map(|v| normalize_for_in(v)).collect();
                                     let scanned = store.scan_projected_filtered(
                                         Some(pos),
                                         &[pos],
                                         &move |fv: Option<&Value>| {
                                             match fv {
                                                 Some(Value::Null) | None => false,
-                                                Some(v) => !pred_set.contains(v),
+                                                Some(v) => {
+                                                    !pred_set.contains(&normalize_for_in(v))
+                                                }
                                             }
                                         },
                                     );
@@ -2503,7 +2835,10 @@ impl QueryExecutor {
                             } else {
                                 // Non-text column: fall back to projected scan.
                                 let _ = store.flush_buffer();
-                                let pred_set = set.clone();
+                                // 🔑 Normalize Bool→Int so a BOOLEAN column
+                                // matches an integer subquery set.
+                                let pred_set: std::collections::HashSet<Value> =
+                                    set.iter().map(|v| normalize_for_in(v)).collect();
                                 let neg = *negated;
                                 let scanned = store.scan_projected_filtered(
                                     Some(pos),
@@ -2512,7 +2847,7 @@ impl QueryExecutor {
                                         match fv {
                                             Some(Value::Null) | None => false,
                                             Some(v) => {
-                                                let found = pred_set.contains(v);
+                                                let found = pred_set.contains(&normalize_for_in(v));
                                                 if neg {
                                                     !found
                                                 } else {
@@ -2933,20 +3268,65 @@ impl QueryExecutor {
                                     // 🔑 Single-pass: count_sum_min_max does COUNT+SUM+MIN+MAX
                                     // in one scan. Was previously two separate scans
                                     // (count_min_max_text_filter + count_sum_text_filter).
-                                    let (count, sum, min, max) =
-                                        store.count_sum_min_max_text_filter(fc, s.as_str(), ac);
+                                    // Pass the agg column type so the store reads the
+                                    // column with the correct decoder (i64 vs f64) —
+                                    // previously it always used get_f64, reinterpreting
+                                    // integer bytes as a garbage float (data corruption).
+                                    let agg_type = schema
+                                        .col_types()
+                                        .get(ac)
+                                        .cloned()
+                                        .unwrap_or(ColumnType::Float);
+                                    let stats =
+                                        store.count_sum_min_max_text_filter(fc, s.as_str(), ac, agg_type);
+                                    let is_int = stats.is_int;
+                                    let empty = stats.count == 0;
                                     let mut row: Vec<Value> = Vec::new();
                                     for a in &aggs {
                                         match a.func.as_str() {
-                                            "COUNT" => row.push(Value::Integer(count)),
-                                            "SUM" => row.push(Value::Float(sum)),
-                                            "MIN" => row.push(Value::Float(min)),
-                                            "MAX" => row.push(Value::Float(max)),
-                                            "AVG" => row.push(Value::Float(if count > 0 {
-                                                sum / count as f64
-                                            } else {
-                                                0.0
-                                            })),
+                                            "COUNT" => row.push(Value::Integer(stats.count)),
+                                            // 🔑 Empty set: SUM/MIN/MAX/AVG → NULL.
+                                            // SUM of an empty set is NULL (per SQL).
+                                            "SUM" => {
+                                                if empty {
+                                                    row.push(Value::Null);
+                                                } else if is_int {
+                                                    row.push(Value::Integer(stats.sum_i));
+                                                } else {
+                                                    row.push(Value::Float(stats.sum_f));
+                                                }
+                                            }
+                                            "MIN" => {
+                                                if empty {
+                                                    row.push(Value::Null);
+                                                } else if is_int {
+                                                    row.push(Value::Integer(stats.min_i));
+                                                } else {
+                                                    row.push(Value::Float(stats.min_f));
+                                                }
+                                            }
+                                            "MAX" => {
+                                                if empty {
+                                                    row.push(Value::Null);
+                                                } else if is_int {
+                                                    row.push(Value::Integer(stats.max_i));
+                                                } else {
+                                                    row.push(Value::Float(stats.max_f));
+                                                }
+                                            }
+                                            "AVG" => {
+                                                if empty {
+                                                    row.push(Value::Null);
+                                                } else if is_int {
+                                                    row.push(Value::Float(
+                                                        stats.sum_i as f64 / stats.count as f64,
+                                                    ));
+                                                } else {
+                                                    row.push(Value::Float(
+                                                        stats.sum_f / stats.count as f64,
+                                                    ));
+                                                }
+                                            }
                                             _ => row.push(Value::Null),
                                         }
                                     }
@@ -3063,7 +3443,20 @@ impl QueryExecutor {
                                 } else if agg.has_float {
                                     row.push(Value::Float(agg.min_float));
                                 } else {
-                                    row.push(Value::Integer(agg.min_int));
+                                    // 🔑 Preserve Timestamp type: a TIMESTAMP
+                                    // column's MIN must return Value::Timestamp,
+                                    // not Value::Integer (raw micros).
+                                    let is_ts = matches!(
+                                        schema.col_types().get(ac),
+                                        Some(ColumnType::Timestamp)
+                                    );
+                                    if is_ts {
+                                        row.push(Value::Timestamp(
+                                            crate::types::Timestamp::from_micros(agg.min_int),
+                                        ));
+                                    } else {
+                                        row.push(Value::Integer(agg.min_int));
+                                    }
                                 }
                             }
                             "MAX" => {
@@ -3072,7 +3465,18 @@ impl QueryExecutor {
                                 } else if agg.has_float {
                                     row.push(Value::Float(agg.max_float));
                                 } else {
-                                    row.push(Value::Integer(agg.max_int));
+                                    // 🔑 Preserve Timestamp type (see MIN above).
+                                    let is_ts = matches!(
+                                        schema.col_types().get(ac),
+                                        Some(ColumnType::Timestamp)
+                                    );
+                                    if is_ts {
+                                        row.push(Value::Timestamp(
+                                            crate::types::Timestamp::from_micros(agg.max_int),
+                                        ));
+                                    } else {
+                                        row.push(Value::Integer(agg.max_int));
+                                    }
                                 }
                             }
                             _ => return Ok(None),
@@ -3378,13 +3782,21 @@ impl QueryExecutor {
                         result_row.push(Value::Null);
                     } else {
                         // Return Integer for all-integer columns (consistency), else Float.
-                        let all_int = non_null.iter().all(|v| matches!(v, Value::Integer(_)));
+                        // 🔑 Treat BOOLEAN as numeric (TRUE=1, FALSE=0) so
+                        // SUM over a BOOLEAN column sums 1s/0s instead of
+                        // silently dropping every Bool value (which yielded
+                        // Float(-0.0) / wrong NULL for AVG/MIN/MAX).
+                        let all_int = non_null
+                            .iter()
+                            .all(|v| matches!(v, Value::Integer(_) | Value::Bool(_)));
                         if all_int {
                             let s: i64 = non_null
                                 .iter()
                                 .filter_map(|v| {
                                     if let Value::Integer(i) = v {
                                         Some(*i)
+                                    } else if let Value::Bool(b) = v {
+                                        Some(if *b { 1 } else { 0 })
                                     } else {
                                         None
                                     }
@@ -3400,6 +3812,8 @@ impl QueryExecutor {
                                         Some(*f)
                                     } else if let Value::Integer(i) = v {
                                         Some(*i as f64)
+                                    } else if let Value::Bool(b) = v {
+                                        Some(if *b { 1.0 } else { 0.0 })
                                     } else {
                                         None
                                     }
@@ -3412,6 +3826,8 @@ impl QueryExecutor {
                 "MIN" => {
                     // 🔑 Handle Integer columns too (was Float-only, so Integer
                     // MIN returned the INFINITY fold seed). Decode by value type.
+                    // 🔑 BOOLEAN values are folded into the integer collection
+                    // (TRUE=1, FALSE=0) so MIN/MAX over a BOOLEAN column works.
                     let ints: Vec<i64> = scanned
                         .iter()
                         .filter_map(|(_, row)| {
@@ -3420,6 +3836,8 @@ impl QueryExecutor {
                                 .and_then(|v| {
                                     if let Value::Integer(i) = v {
                                         Some(*i)
+                                    } else if let Value::Bool(b) = v {
+                                        Some(if *b { 1 } else { 0 })
                                     } else {
                                         None
                                     }
@@ -3476,6 +3894,8 @@ impl QueryExecutor {
                                 .and_then(|v| {
                                     if let Value::Integer(i) = v {
                                         Some(*i)
+                                    } else if let Value::Bool(b) = v {
+                                        Some(if *b { 1 } else { 0 })
                                     } else {
                                         None
                                     }
@@ -3525,6 +3945,7 @@ impl QueryExecutor {
                 }
                 "AVG" => {
                     // AVG ignores NULLs; AVG over zero non-NULL values is NULL.
+                    // 🔑 Treat BOOLEAN as numeric (TRUE=1, FALSE=0).
                     let nums: Vec<f64> = scanned
                         .iter()
                         .filter_map(|(_, row)| {
@@ -3533,6 +3954,8 @@ impl QueryExecutor {
                                     Some(*f)
                                 } else if let Value::Integer(i) = v {
                                     Some(*i as f64)
+                                } else if let Value::Bool(b) = v {
+                                    Some(if *b { 1.0 } else { 0.0 })
                                 } else {
                                     None
                                 }
@@ -3617,6 +4040,20 @@ impl QueryExecutor {
         // scan order without sorting or truncating. Fall back to the path that
         // applies ORDER BY (including on aggregates) and LIMIT correctly.
         if stmt.order_by.is_some() || stmt.limit.is_some() {
+            return Ok(None);
+        }
+        // 🔑 DISTINCT aggregates (COUNT(DISTINCT col), SUM(DISTINCT col), ...)
+        // require per-group dedup which this fast path doesn't implement — it
+        // would silently count/sum all values without dedup (e.g.
+        // COUNT(DISTINCT v) returned the non-distinct count). Fall back to the
+        // materialized path (compute_aggregate_positional handles DISTINCT).
+        let has_distinct_agg = stmt.columns.iter().any(|c| {
+            matches!(
+                c,
+                SelectColumn::Expr(Expr::FunctionCall { distinct: true, .. }, _)
+            )
+        });
+        if has_distinct_agg {
             return Ok(None);
         }
 
@@ -4543,7 +4980,7 @@ impl QueryExecutor {
         let result = self.execute_select_internal(stmt)?;
         match result {
             QueryResult::Select { columns, rows } => {
-                // execute_select_internal already applies ORDER BY, LIMIT, OFFSET, DISTINCT,
+                // execute_select_internal applies ORDER BY, LIMIT, OFFSET, DISTINCT,
                 // so we pass None/defaults here to avoid double-application.
                 Ok(StreamingQueryResult::SelectStreaming {
                     columns,
@@ -4593,20 +5030,31 @@ impl QueryExecutor {
             return self.execute_window_query(stmt);
         }
 
-        // 🚀 Pre-resolve scalar/IN subqueries in WHERE clause BEFORE any routing.
+        // 🚀 Pre-resolve scalar/IN subqueries in WHERE/HAVING BEFORE any routing.
         // This converts `WHERE col > (SELECT ...)` / `WHERE col IN (SELECT ...)`
-        // into literal forms early, so every downstream path (columnar scan,
-        // ORDER BY, DISTINCT, optimizer) sees resolvable WHERE predicates.
+        // (and the HAVING equivalents) into literal forms early, so every
+        // downstream path (columnar scan, ORDER BY, DISTINCT, optimizer) sees
+        // resolvable predicates.
         let resolved_subq_stmt;
-        let stmt: &SelectStmt = if let Some(ref where_clause) = stmt.where_clause {
-            if Self::expr_contains_subquery(where_clause) {
+        let stmt: &SelectStmt = {
+            let where_has_subq = stmt
+                .where_clause
+                .as_ref()
+                .is_some_and(|w| Self::expr_contains_subquery(w));
+            let having_has_subq = stmt
+                .having
+                .as_ref()
+                .is_some_and(|h| Self::expr_contains_subquery(h));
+            let order_has_subq = stmt
+                .order_by
+                .as_ref()
+                .is_some_and(|ob| ob.iter().any(|o| Self::expr_contains_subquery(&o.expr)));
+            if where_has_subq || having_has_subq || order_has_subq {
                 resolved_subq_stmt = self.resolve_subqueries_stmt(stmt)?;
                 &resolved_subq_stmt
             } else {
                 stmt
             }
-        } else {
-            stmt
         };
 
         // Validate bare SELECT column references against the table schema.
@@ -4634,14 +5082,18 @@ impl QueryExecutor {
             }
         }
 
-        // 🔑 Pre-resolve scalar subqueries in SELECT columns (e.g.
-        // SELECT id, (SELECT MAX(v) FROM t) FROM t). eval_expr_on_row can't
-        // execute subqueries — resolve them once here and replace with Literal.
+        // 🔑 Pre-resolve subqueries in SELECT columns. eval_expr_on_row can't
+        // execute subqueries, so we resolve them up front:
+        //   - A direct scalar subquery `(SELECT ...)` → Literal.
+        //   - An IN (SELECT ...) inside a larger expression → InHashset
+        //     (materialize_subqueries handles the rewrite).
+        // Detect ANY column whose expression contains a Subquery node, then
+        // materialize/resolve that column's expression.
         let resolved_select_stmt;
         let stmt: &SelectStmt = if stmt.columns.iter().any(|c| {
             matches!(
                 c,
-                crate::sql::ast::SelectColumn::Expr(crate::sql::ast::Expr::Subquery(_), _)
+                crate::sql::ast::SelectColumn::Expr(e, _) if Self::expr_contains_subquery(e)
             )
         }) {
             resolved_select_stmt = {
@@ -4688,6 +5140,16 @@ impl QueryExecutor {
                                 }
                                 Ok(_) => {}
                                 Err(_) => { /* leave node; eval surfaces error */ }
+                            }
+                        } else {
+                            // 🔑 Not a direct scalar subquery, but the expression
+                            // contains a subquery somewhere (e.g. `x IN (SELECT...)`).
+                            // materialize_subqueries rewrites IN (SELECT...) into an
+                            // InHashset so eval_expr_on_row can evaluate it per row.
+                            // Errors during materialization (e.g. correlated) leave
+                            // the node intact for the normal eval path to surface.
+                            if let Ok(materialized) = self.materialize_subqueries(expr) {
+                                *expr = materialized;
                             }
                         }
                     }
@@ -4799,10 +5261,21 @@ impl QueryExecutor {
                             && stmt.having.is_none()
                         {
                             let schema = self.db.get_table_schema(table_name)?;
-                            let result = self.execute_full_scan_via_col_segment(
+                            let mut result = self.execute_full_scan_via_col_segment(
                                 stmt, table_name, &schema, &store,
                             )?;
-                            // Release column data pages after heavy scan.
+                            // 🔑 Apply ORDER BY for projected-column keys (aliases,
+                            // projected expressions, ordinals). The col-segment scan
+                            // returns unsorted SelectReady/SelectColumnar. We sort
+                            // against the projected columns ONLY when every ORDER BY
+                            // key resolves to a projected column — otherwise we leave
+                            // the result as-is (the underlying scan path handles
+                            // non-projected-column ORDER BY via its own sort).
+                            if let Some(order_clauses) = &stmt.order_by {
+                                if !order_clauses.is_empty() {
+                                    StreamingQueryResult::try_sort_projected(&mut result, order_clauses);
+                                }
+                            }
                             store.release_pages_only();
                             return Ok(result);
                         }
@@ -5148,6 +5621,12 @@ impl QueryExecutor {
                 Self::expr_contains_subquery(expr) || Self::expr_contains_subquery(pattern)
             }
             Expr::IsNull { expr, .. } => Self::expr_contains_subquery(expr),
+            Expr::FunctionCall { args, .. } => args.iter().any(Self::expr_contains_subquery),
+            Expr::Case { whens, else_expr } => {
+                whens.iter().any(|(c, v)| {
+                    Self::expr_contains_subquery(c) || Self::expr_contains_subquery(v)
+                }) || else_expr.as_ref().is_some_and(|e| Self::expr_contains_subquery(e))
+            }
             _ => false,
         }
     }
@@ -5166,16 +5645,39 @@ impl QueryExecutor {
             Some(w) => Some(self.materialize_subqueries_checked(w, outer_schema.as_deref())?),
             None => None,
         };
+        // 🔑 Also pre-resolve non-correlated subqueries in HAVING. A HAVING
+        // clause like `HAVING SUM(v) > (SELECT AVG(v) FROM t)` references a
+        // scalar subquery that doesn't depend on the group; resolve it once
+        // here so the per-group HAVING evaluation can compare against a
+        // Literal (the evaluator/HAVING path can't execute subqueries).
+        let having = match &stmt.having {
+            Some(h) => Some(self.materialize_subqueries_checked(h, outer_schema.as_deref())?),
+            None => None,
+        };
+        // 🔑 Pre-resolve non-correlated subqueries in ORDER BY expressions
+        // (e.g. ORDER BY ABS(v - (SELECT AVG(v) FROM t))). The sort-key
+        // computation can't execute subqueries; resolve them to Literals.
+        let order_by = match &stmt.order_by {
+            Some(ob) => {
+                let mut new_ob = Vec::with_capacity(ob.len());
+                for o in ob {
+                    let resolved_expr = self.materialize_subqueries_checked(&o.expr, outer_schema.as_deref())?;
+                    new_ob.push(OrderByExpr { expr: resolved_expr, asc: o.asc });
+                }
+                Some(new_ob)
+            }
+            None => None,
+        };
         Ok(SelectStmt {
             columns: stmt.columns.clone(),
             from: stmt.from.clone(),
             where_clause,
-            order_by: stmt.order_by.clone(),
+            order_by,
             limit: stmt.limit,
             offset: stmt.offset,
             distinct: stmt.distinct,
             group_by: stmt.group_by.clone(),
-            having: stmt.having.clone(),
+            having,
             latest_by: stmt.latest_by.clone(),
         })
     }
@@ -8004,6 +8506,7 @@ impl QueryExecutor {
                         row_indices: None,
                         num_rows: col_sst.num_rows,
                         row_map: col_sst.row_map.clone(),
+                        order_by: None,
                     });
                 }
             }
@@ -8139,6 +8642,7 @@ impl QueryExecutor {
                                     row_indices: Some(indices),
                                     num_rows: col_sst.num_rows,
                                     row_map: col_sst.row_map.clone(),
+                                    order_by: None,
                                 });
                             }
                         }
@@ -8230,6 +8734,7 @@ impl QueryExecutor {
                                         row_indices: Some(matches),
                                         num_rows: col_sst.num_rows,
                                         row_map: col_sst.row_map.clone(),
+                                        order_by: None,
                                     });
                                 }
                             }
@@ -8276,6 +8781,7 @@ impl QueryExecutor {
                                                 row_indices: Some(indices),
                                                 num_rows: col_sst.num_rows,
                                                 row_map: col_sst.row_map.clone(),
+                                                order_by: None,
                                             });
                                         }
                                     }
@@ -8485,9 +8991,18 @@ impl QueryExecutor {
                     if !matches {
                         return None;
                     }
-                    let projected =
-                        Self::project_row_direct(&row, &select_cols, &columns_clone, &schema_clone);
-                    Some(Ok(projected))
+                    // 🔑 Use the checked variant so hard errors (e.g.
+                    // DivisionByZero on `SELECT 1/0`) surface instead of
+                    // becoming silent NULLs.
+                    match Self::project_row_direct_checked(
+                        &row,
+                        &select_cols,
+                        &columns_clone,
+                        &schema_clone,
+                    ) {
+                        Ok(projected) => Some(Ok(projected)),
+                        Err(e) => Some(Err(e)),
+                    }
                 }
                 Err(e) => Some(Err(e)),
             });
@@ -8583,7 +9098,24 @@ impl QueryExecutor {
         }
         let col_types = schema.col_types().to_vec();
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
-        let where_clause = stmt.where_clause.clone();
+        // 🔑 Materialize non-correlated subqueries in the WHERE clause before
+        // scanning. The col-segment scan evaluates WHERE via compile_where /
+        // eval_expr_on_row, neither of which can execute subqueries. Without
+        // this, a WHERE like `v > (SELECT MIN(v) FROM t WHERE v > (SELECT
+        // MIN(v) FROM t))` (nested subqueries) silently returns no rows
+        // (eval_expr_on_row errors on the Subquery node → row skipped). We
+        // resolve non-correlated subqueries to Literals once here so the
+        // per-row comparison works. Correlated subqueries are left in place
+        // (they can't be pre-resolved).
+        let where_clause = match &stmt.where_clause {
+            Some(wc) => {
+                let resolved = self
+                    .materialize_subqueries_checked(wc, Some(schema))
+                    .unwrap_or_else(|_| wc.clone());
+                resolved.into()
+            }
+            None => None,
+        };
 
         let limit = stmt.limit.unwrap_or(usize::MAX);
         let offset = stmt.offset.unwrap_or(0);
@@ -8882,6 +9414,7 @@ impl QueryExecutor {
                         row_indices: None,
                         num_rows: sst.num_rows,
                         row_map: sst.row_map.clone(),
+                        order_by: None,
                     });
                 }
             }
@@ -8953,6 +9486,7 @@ impl QueryExecutor {
                         row_indices: None,
                         num_rows: sst.num_rows,
                         row_map: sst.row_map.clone(),
+                        order_by: None,
                     });
                 }
             }
@@ -9227,6 +9761,7 @@ impl QueryExecutor {
                                             row_indices: Some(row_idx),
                                             num_rows: segs[0].sst.num_rows,
                                             row_map: segs[0].sst.row_map.clone(),
+                                            order_by: None,
                                         });
                                     }
                                     // Multi-segment: materialize matched rows
@@ -9362,6 +9897,7 @@ impl QueryExecutor {
                                                 row_indices: Some(row_idx),
                                                 num_rows: segs[0].sst.num_rows,
                                                 row_map: segs[0].sst.row_map.clone(),
+                                                order_by: None,
                                             });
                                         }
                                         // Multi-segment: fall through to projected scan
@@ -9605,6 +10141,12 @@ impl QueryExecutor {
                 .collect();
             let star_expanded = stmt_columns.iter().any(|c| matches!(c, SelectColumn::Star));
 
+            // 🔑 Propagate hard evaluation errors that indicate a real query
+            // fault (e.g. DivisionByZero on `SELECT 1/0`) instead of masking
+            // them as NULL. We still mask "unsupported expression" style
+            // errors (e.g. spatial functions not handled by eval_expr_on_row)
+            // to preserve existing behavior for those feature-gap paths.
+            let mut eval_err: Option<MoteDBError> = None;
             for row in &mut result_rows {
                 // Build full-schema positional row from scan_positions.
                 let mut full: Vec<Value> = vec![Value::Null; ncol];
@@ -9619,24 +10161,46 @@ impl QueryExecutor {
                     // SELECT * : emit all schema columns in order.
                     full.clone()
                 } else {
-                    out_plan
-                        .iter()
-                        .map(|oc| match oc {
+                    let mut built: Vec<Value> = Vec::with_capacity(out_plan.len());
+                    for oc in &out_plan {
+                        let v = match oc {
                             OutCol::CopySchema(p) => full.get(*p).cloned().unwrap_or(Value::Null),
                             OutCol::Expr(e) => {
                                 // 🔑 Correlated subquery: substitute outer column
                                 // references with current row values, then execute.
                                 if Self::expr_contains_subquery(e) {
                                     let bound = Self::bind_outer_columns(e, &full, schema);
-                                    self.eval_correlated_expr(&bound, &full, schema).unwrap_or(Value::Null)
+                                    self.eval_correlated_expr(&bound, &full, schema)
+                                        .unwrap_or(Value::Null)
                                 } else {
-                                    Self::eval_expr_on_row(e, &full, schema).unwrap_or(Value::Null)
+                                    match Self::eval_expr_on_row(e, &full, schema) {
+                                        Ok(v) => v,
+                                        Err(err) => {
+                                            // Hard errors (DivisionByZero, type
+                                            // errors) must surface; other failures
+                                            // (e.g. unsupported spatial expr) are
+                                            // masked to NULL to preserve behavior.
+                                            if matches!(err, MoteDBError::DivisionByZero) {
+                                                eval_err = Some(err);
+                                                break;
+                                            }
+                                            Value::Null
+                                        }
+                                    }
                                 }
                             }
-                        })
-                        .collect()
+                        };
+                        built.push(v);
+                    }
+                    if eval_err.is_some() {
+                        break;
+                    }
+                    built
                 };
                 *row = new_row;
+            }
+            if let Some(e) = eval_err {
+                return Err(e);
             }
         } else if keep_indices.len() < scan_positions.len() {
             // Project down to the requested output columns (strip order-by-only cols).
@@ -9782,10 +10346,28 @@ impl QueryExecutor {
             } => {
                 match (left.as_ref(), right.as_ref()) {
                     (Expr::Column(cn), Expr::Literal(v)) => {
-                        let pos = schema.get_column_position(cn).unwrap_or(0);
+                        // Strip an optional table qualifier (e.g. "t.v" → "v")
+                        // before schema lookup. The old code used
+                        // `.unwrap_or(0)`, which silently rewrote a missing
+                        // qualified column to position 0 (e.g. `WHERE t.v = 20`
+                        // filtered on `id` instead of `v` → empty result).
+                        let bare = cn.rsplit('.').next().unwrap_or(cn);
+                        let pos = match schema.get_column_position(bare) {
+                            Some(p) => p,
+                            None => {
+                                return self.col_segment_general_scan(
+                                    store,
+                                    wc,
+                                    schema,
+                                    out_positions,
+                                    offset,
+                                    limit,
+                                );
+                            }
+                        };
                         let val = v.clone();
                         // If filtering on PK, at most 1 row matches → early-stop.
-                        if schema.primary_key() == Some(cn.as_str()) {
+                        if schema.primary_key().as_deref() == Some(bare) {
                             early_stop_at = 1;
                         }
                         (
@@ -9820,7 +10402,8 @@ impl QueryExecutor {
                     let pat = s.as_str();
                     if pat.ends_with('%') && !pat[..pat.len() - 1].contains('%') {
                         let prefix = pat[..pat.len() - 1].to_string();
-                        let pos = schema.get_column_position(cn).unwrap_or(0);
+                        let bare = cn.rsplit('.').next().unwrap_or(cn);
+                        let pos = schema.get_column_position(bare).unwrap_or(0);
                         (
                             Some(pos),
                             Box::new(move |fv: Option<&Value>| match fv {
@@ -9856,12 +10439,14 @@ impl QueryExecutor {
                 negated: false,
             } if list.iter().all(|e| matches!(e, Expr::Literal(_))) => match expr.as_ref() {
                 Expr::Column(cn) => {
-                    let pos = schema.get_column_position(cn).unwrap_or(0);
+                    let bare = cn.rsplit('.').next().unwrap_or(cn);
+                    let pos = schema.get_column_position(bare).unwrap_or(0);
+                    // 🔑 Normalize Bool→Int for coerced matching.
                     let set: std::collections::HashSet<Value> = list
                         .iter()
                         .filter_map(|e| {
                             if let Expr::Literal(v) = e {
-                                Some(v.clone())
+                                Some(normalize_for_in(v))
                             } else {
                                 None
                             }
@@ -9870,7 +10455,8 @@ impl QueryExecutor {
                     (
                         Some(pos),
                         Box::new(move |fv: Option<&Value>| {
-                            fv.map(|v| set.contains(v)).unwrap_or(false)
+                            fv.map(|v| set.contains(&normalize_for_in(v)))
+                                .unwrap_or(false)
                         }),
                     )
                 }
@@ -9893,11 +10479,16 @@ impl QueryExecutor {
                 ..
             } => match expr.as_ref() {
                 Expr::Column(cn) => {
-                    let pos = schema.get_column_position(cn).unwrap_or(0);
+                    let bare = cn.rsplit('.').next().unwrap_or(cn);
+                    let pos = schema.get_column_position(bare).unwrap_or(0);
+                    // 🔑 Normalize Bool→Int for coerced matching.
+                    let set: std::collections::HashSet<Value> =
+                        set.iter().map(|v| normalize_for_in(v)).collect();
                     (
                         Some(pos),
                         Box::new(move |fv: Option<&Value>| {
-                            fv.map(|v| set.contains(v)).unwrap_or(false)
+                            fv.map(|v| set.contains(&normalize_for_in(v)))
+                                .unwrap_or(false)
                         }),
                     )
                 }
@@ -10536,7 +11127,8 @@ impl QueryExecutor {
                             use std::fmt::Write;
                             let _ = write!(result, "{}", f);
                         }
-                        Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
+                        // 🔑 Bool → "1"/"0" (consistent with || and CONCAT).
+                        Value::Bool(b) => result.push_str(if b { "1" } else { "0" }),
                         Value::Null => return Ok(Value::Null), /* NULL propagates */
                         other => result.push_str(&format!("{:?}", other)),
                     }
@@ -11012,7 +11604,8 @@ impl QueryExecutor {
                                     use std::fmt::Write;
                                     let _ = write!(result, "{}", f);
                                 }
-                                Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
+                                // 🔑 Bool → "1"/"0" (consistent with || and CONCAT).
+                                Value::Bool(b) => result.push_str(if b { "1" } else { "0" }),
                                 Value::Null => return Ok(Value::Null), /* NULL propagates */
                                 other => result.push_str(&format!("{:?}", other)),
                             }
@@ -11410,7 +12003,7 @@ impl QueryExecutor {
                             .iter()
                             .filter_map(|e| {
                                 if let Expr::Literal(v) = e {
-                                    Some(v.clone())
+                                    Some(normalize_for_in(v))
                                 } else {
                                     None
                                 }
@@ -11438,7 +12031,11 @@ impl QueryExecutor {
                     } else {
                         col_name
                     })?;
-                    Some(CompiledWhere::InHash(pos, set.clone()))
+                    // 🔑 Normalize Bool→Int so a BOOLEAN column matches an
+                    // integer-valued subquery set (and vice versa).
+                    let set: std::collections::HashSet<Value> =
+                        set.iter().map(|v| normalize_for_in(v)).collect();
+                    Some(CompiledWhere::InHash(pos, set))
                 } else {
                     None
                 }
@@ -12022,19 +12619,21 @@ impl QueryExecutor {
                 // path (Expr::In with Vec<Literal>) iterated the full list per
                 // row — O(rows × list_len).
                 let val = Self::eval_expr_on_row(expr, row, schema)?;
+                // 🔑 Three-valued logic, matching the evaluator's Expr::InHashset
+                // arm: NULL IN (...) → UNKNOWN (NULL). WHERE filtering treats
+                // NULL as "not matched" (is_truthy(Null) == false).
                 if matches!(val, Value::Null) {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
                 let found = set.contains(&val);
-                if *negated {
-                    // NOT IN with NULL in subquery → UNKNOWN (false) for all rows.
-                    if *has_null {
-                        Ok(Value::Bool(false))
-                    } else {
-                        Ok(Value::Bool(!found))
-                    }
+                // 🔑 found → IN=TRUE/NOT IN=FALSE; not found + NULL in set →
+                // UNKNOWN (NULL); not found + no NULL → IN=FALSE/NOT IN=TRUE.
+                if found {
+                    Ok(Value::Bool(!*negated))
+                } else if *has_null {
+                    Ok(Value::Null)
                 } else {
-                    Ok(Value::Bool(found))
+                    Ok(Value::Bool(*negated))
                 }
             }
             Expr::In {
@@ -12043,8 +12642,9 @@ impl QueryExecutor {
                 negated,
             } => {
                 let val = Self::eval_expr_on_row(expr, row, schema)?;
+                // 🔑 Three-valued logic: NULL IN (...) → UNKNOWN (NULL).
                 if matches!(val, Value::Null) {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
                 let mut found = false;
                 let mut has_null = false;
@@ -12059,10 +12659,15 @@ impl QueryExecutor {
                         break;
                     }
                 }
-                if *negated && !found && has_null {
-                    return Ok(Value::Bool(false));
+                // 🔑 found → TRUE/!negated; not found + NULL → UNKNOWN (NULL);
+                // not found + no NULL → FALSE/negated.
+                if found {
+                    Ok(Value::Bool(!*negated))
+                } else if has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(*negated))
                 }
-                Ok(Value::Bool(if *negated { !found } else { found }))
             }
             Expr::Between {
                 expr,
@@ -12073,11 +12678,12 @@ impl QueryExecutor {
                 let val = Self::eval_expr_on_row(expr, row, schema)?;
                 let low_val = Self::eval_expr_on_row(low, row, schema)?;
                 let high_val = Self::eval_expr_on_row(high, row, schema)?;
+                // 🔑 Three-valued logic: any NULL operand → UNKNOWN (NULL).
                 if matches!(val, Value::Null)
                     || matches!(low_val, Value::Null)
                     || matches!(high_val, Value::Null)
                 {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
                 let in_range = val >= low_val && val <= high_val;
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
@@ -12089,9 +12695,9 @@ impl QueryExecutor {
             } => {
                 let val = Self::eval_expr_on_row(expr, row, schema)?;
                 let pat = Self::eval_expr_on_row(pattern, row, schema)?;
-                // NULL LIKE anything = false, NULL NOT LIKE anything = false (SQL NULL semantics)
+                // 🔑 Three-valued logic: any NULL operand → UNKNOWN (NULL).
                 if matches!(val, Value::Null) || matches!(pat, Value::Null) {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
                 let matches = match (&val, &pat) {
                     (Value::Text(s), Value::Text(p)) => Self::simple_like_match(s, p),
@@ -12234,40 +12840,60 @@ impl QueryExecutor {
         columns: &[String],
         schema: &TableSchema,
     ) -> Vec<Value> {
+        Self::project_row_direct_checked(row, select_cols, columns, schema)
+            // 🔑 Historically this swallowed evaluation errors as NULL.
+            // The streaming/collected-row paths that still call this
+            // function cannot easily short-circuit on a single bad row,
+            // so they retain NULL-on-error semantics. Paths that MUST
+            // surface errors (e.g. constant `1/0`) call
+            // project_row_direct_checked directly.
+            .unwrap_or_else(|_| {
+                // Best-effort: produce a NULL-filled row so the count
+                // stays consistent (matches the old swallow behavior).
+                vec![Value::Null; columns.len().max(1)]
+            })
+    }
+
+    /// Same as project_row_direct but propagates evaluation errors
+    /// (e.g. DivisionByZero on `SELECT 1/0`) instead of converting them
+    /// to NULL. Use this on paths where a hard error must surface to the
+    /// caller.
+    fn project_row_direct_checked(
+        row: &Row,
+        select_cols: &[SelectColumn],
+        columns: &[String],
+        schema: &TableSchema,
+    ) -> Result<Vec<Value>> {
         if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::Star) {
             // SELECT * — return all columns in schema order (cheap clone)
-            row.to_vec()
+            Ok(row.to_vec())
         } else {
             // Explicit columns — use column position as index into Vec
-            columns
-                .iter()
-                .zip(select_cols.iter())
-                .map(|(_alias, col_spec)| {
-                    let col_name = match col_spec {
-                        SelectColumn::Column(name) => name,
-                        SelectColumn::ColumnWithAlias(name, _) => name,
-                        SelectColumn::Star => return Value::Null,
-                        SelectColumn::Expr(expr, _) => {
-                            return match Self::eval_expr_on_row(expr, row, schema) {
-                                Ok(v) => v,
-                                Err(_) => Value::Null,
-                            };
-                        }
-                    };
-                    // Look up column position in schema (O(1) via column_map HashMap)
-                    // Handle table-qualified names: "users.id" → "id"
-                    let lookup_name = if col_name.contains('.') {
-                        col_name.rsplit('.').next().unwrap_or(col_name)
-                    } else {
-                        col_name
-                    };
-                    if let Some(pos) = schema.get_column_position(lookup_name) {
-                        row.get(pos).cloned().unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
+            let mut out: Vec<Value> = Vec::with_capacity(columns.len());
+            for (_alias, col_spec) in columns.iter().zip(select_cols.iter()) {
+                let v = match col_spec {
+                    SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                        // Handle table-qualified names: "users.id" → "id"
+                        let lookup_name = if name.contains('.') {
+                            name.rsplit('.').next().unwrap_or(name)
+                        } else {
+                            name
+                        };
+                        schema
+                            .get_column_position(lookup_name)
+                            .and_then(|pos| row.get(pos).cloned())
+                            .unwrap_or(Value::Null)
                     }
-                })
-                .collect()
+                    SelectColumn::Star => Value::Null,
+                    // 🔑 Propagate evaluation errors instead of silently
+                    // converting them to NULL. A constant `1/0` in the
+                    // SELECT list must surface as a DivisionByZero error,
+                    // not a NULL value (silent wrong results).
+                    SelectColumn::Expr(expr, _) => Self::eval_expr_on_row(expr, row, schema)?,
+                };
+                out.push(v);
+            }
+            Ok(out)
         }
     }
 
@@ -12351,6 +12977,52 @@ impl QueryExecutor {
             }
         } else {
             stmt
+        };
+
+        // 🔑 Pre-resolve non-correlated subqueries in the WHERE clause before
+        // any routing. execute_select_internal is called for subqueries (via
+        // materialize_subqueries), and a subquery's own WHERE may itself
+        // contain nested subqueries (e.g. `SELECT MIN(v) FROM t WHERE v >
+        // (SELECT MIN(v) FROM t)`). Without this pre-resolution, the aggregate
+        // / col-segment routing paths evaluate the WHERE via eval_expr_on_row
+        // which cannot execute subqueries → empty result → the outer scalar
+        // subquery materializes to NULL → silent wrong results for 3+-level
+        // nesting. This mirrors the pre-resolution in execute_select_streaming_ref.
+        // Also covers HAVING (a subquery in HAVING has the same problem).
+        let resolved_subq_stmt;
+        let stmt = {
+            let needs_where = stmt
+                .where_clause
+                .as_ref()
+                .is_some_and(|w| Self::expr_contains_subquery(w));
+            let needs_having = stmt
+                .having
+                .as_ref()
+                .is_some_and(|h| Self::expr_contains_subquery(h));
+            if needs_where || needs_having {
+                let outer_schema = stmt.from.as_ref().and_then(|f| {
+                    if let TableRef::Table { name, .. } = f {
+                        self.db.get_table_schema(name).ok()
+                    } else {
+                        None
+                    }
+                });
+                let mut cloned = stmt.clone();
+                if let Some(w) = cloned.where_clause.take() {
+                    cloned.where_clause = Some(
+                        self.materialize_subqueries_checked(&w, outer_schema.as_deref())?,
+                    );
+                }
+                if let Some(h) = cloned.having.take() {
+                    cloned.having = Some(
+                        self.materialize_subqueries_checked(&h, outer_schema.as_deref())?,
+                    );
+                }
+                resolved_subq_stmt = cloned;
+                &resolved_subq_stmt as &SelectStmt
+            } else {
+                stmt
+            }
         };
 
         // Validate SELECT column references against the table schema (when a
@@ -13327,8 +13999,15 @@ impl QueryExecutor {
                             .filter(|(_, row)| fast_filter(row))
                             .collect()
                     } else {
-                        // Slow path: Full expression evaluation with subquery support
-                        let materialized_where = self.materialize_subqueries(where_clause)?;
+                        // Slow path: Full expression evaluation with subquery support.
+                        // 🔑 Use the correlation-aware variant: correlated
+                        // subqueries (referencing outer columns, e.g.
+                        // `WHERE (SELECT SUM(o.amt) ... WHERE o.cust = c.id) > 100`)
+                        // must be kept as Subquery nodes and re-executed per row,
+                        // NOT materialized once with an empty outer binding.
+                        let materialized_where =
+                            self.materialize_subqueries_checked(where_clause, Some(&combined_schema))?;
+                        let has_correlated_subquery = Self::expr_contains_subquery(&materialized_where);
 
                         // IN hash set optimization: precompute HashSet for large literal IN lists
                         if let Expr::In {
@@ -13384,6 +14063,35 @@ impl QueryExecutor {
                                     })
                                     .collect()
                             }
+                        } else if has_correlated_subquery {
+                            // 🔑 Correlated subquery: bind outer column refs to
+                            // each row's values, then re-execute the subquery.
+                            // Build a positional Vec<Value> for this row so
+                            // bind_outer_columns/eval_correlated_expr work.
+                            let ncols = combined_schema.columns.len();
+                            all_sql_rows
+                                .into_iter()
+                                .filter(|(_, row)| {
+                                    let pos_row: Vec<Value> = (0..ncols)
+                                        .map(|i| {
+                                            combined_schema
+                                                .columns
+                                                .get(i)
+                                                .and_then(|c| row.get(&c.name))
+                                                .cloned()
+                                                .unwrap_or(Value::Null)
+                                        })
+                                        .collect();
+                                    let bound = Self::bind_outer_columns(
+                                        &materialized_where,
+                                        &pos_row,
+                                        &combined_schema,
+                                    );
+                                    self.eval_correlated_expr(&bound, &pos_row, &combined_schema)
+                                        .and_then(|val| self.to_bool(&val))
+                                        .unwrap_or(false)
+                                })
+                                .collect()
                         } else {
                             all_sql_rows
                                 .into_iter()
@@ -13505,6 +14213,27 @@ impl QueryExecutor {
                                         k.rsplit('.').next().unwrap_or(k) == col_name
                                     }) {
                                         return Ok(val.clone());
+                                    }
+                                }
+                            }
+                            // 🔑 ORDER BY an aggregate function call (e.g.
+                            // ORDER BY SUM(v) DESC) on a GROUP BY query: the
+                            // projected row already holds the aggregated value
+                            // at the matching output column. Build the same
+                            // canonical name the SELECT-list uses (e.g.
+                            // "SUM(v)") and look it up in column_names. Without
+                            // this, the fall-through below evaluated SUM(v)
+                            // against an arbitrary input row → wrong/constant
+                            // sort key → non-deterministic group order.
+                            if let Expr::FunctionCall { name, args, .. } = &order.expr {
+                                let arg_str = args.iter().map(|a| match a {
+                                    Expr::Column(c) => c.clone(),
+                                    e => format!("{:?}", e),
+                                }).collect::<Vec<_>>().join(", ");
+                                let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
+                                if let Some(idx) = column_names.iter().position(|cn| cn == &ob_name) {
+                                    if idx < proj_row.len() {
+                                        return Ok(proj_row[idx].clone());
                                     }
                                 }
                             }
@@ -13685,15 +14414,24 @@ impl QueryExecutor {
     #[allow(clippy::only_used_in_recursion)]
     fn expr_has_aggregates(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::FunctionCall { name, .. } => {
+            Expr::FunctionCall { name, args, .. } => {
                 matches!(
                     name.to_uppercase().as_str(),
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
-                )
+                ) || args.iter().any(|a| self.expr_has_aggregates(a))
             }
             Expr::BinaryOp { left, right, .. } => {
                 self.expr_has_aggregates(left) || self.expr_has_aggregates(right)
             }
+            // 🔑 CASE can wrap aggregates in its WHEN/THEN/ELSE (e.g.
+            // `CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END`). Recurse so such
+            // expressions are correctly classified as containing aggregates.
+            Expr::Case { whens, else_expr } => {
+                whens.iter().any(|(c, v)| {
+                    self.expr_has_aggregates(c) || self.expr_has_aggregates(v)
+                }) || else_expr.as_ref().is_some_and(|e| self.expr_has_aggregates(e))
+            }
+            Expr::UnaryOp { expr, .. } => self.expr_has_aggregates(expr),
             _ => false,
         }
     }
@@ -15419,6 +16157,29 @@ impl QueryExecutor {
                 })
             }
 
+            // 🔑 CASE can contain subqueries in its WHEN conditions or
+            // THEN/ELSE values (e.g. `CASE WHEN v = (SELECT MAX(v) ...) ...`).
+            // Recurse so those subqueries are materialized — previously Case
+            // was treated as a leaf and nested subqueries were left as
+            // Subquery nodes, which eval_expr_on_row cannot evaluate → NULL.
+            Expr::Case { whens, else_expr } => {
+                let mut new_whens: Vec<(Expr, Expr)> = Vec::with_capacity(whens.len());
+                for (cond, val) in whens {
+                    new_whens.push((
+                        self.materialize_subqueries(cond)?,
+                        self.materialize_subqueries(val)?,
+                    ));
+                }
+                let new_else = match else_expr {
+                    Some(e) => Some(Box::new(self.materialize_subqueries(e)?)),
+                    None => None,
+                };
+                Ok(Expr::Case {
+                    whens: new_whens,
+                    else_expr: new_else,
+                })
+            }
+
             // Leaf nodes - no subqueries to materialize
             Expr::Column(_)
             | Expr::Literal(_)
@@ -15430,8 +16191,7 @@ impl QueryExecutor {
             | Expr::StDistance3D { .. }
             | Expr::StKnn3D { .. }
             | Expr::StRadius3D { .. }
-            | Expr::WindowFunction { .. }
-            | Expr::Case { .. } => Ok(expr.clone()),
+            | Expr::WindowFunction { .. } => Ok(expr.clone()),
         }
     }
 
@@ -16074,6 +16834,17 @@ impl QueryExecutor {
                 for (i, name) in column_names.iter().enumerate() {
                     temp_row.insert(name.clone(), result_row[i].clone());
                 }
+                // 🚨 Compute aggregates referenced in HAVING but NOT in the
+                // SELECT list (e.g. JOIN: `SELECT c.name, SUM(o.amt) AS total
+                // ... HAVING SUM(o.amt) > 100`). Without this, the evaluator's
+                // aggregate lookup fails → every group skipped (empty result).
+                for agg_expr in Self::collect_aggregate_calls(having_expr) {
+                    let key = Self::aggregate_expr_key(&agg_expr);
+                    if !temp_row.contains_key(&key) {
+                        let val = self.eval_aggregate(&agg_expr, &group_rows)?;
+                        temp_row.insert(key, val);
+                    }
+                }
 
                 // HAVING evaluation: propagate errors instead of silently
                 // treating them as "group doesn't pass" (which hides bugs).
@@ -16403,6 +17174,7 @@ impl QueryExecutor {
                 if matches!(
                     name.to_uppercase().as_str(),
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                    | "GROUP_CONCAT"
                 ) =>
             {
                 let val = self.eval_aggregate(expr, rows)?;
@@ -16737,6 +17509,32 @@ impl QueryExecutor {
                     }
                 }
             }
+            // 🔑 CASE can reference columns in its WHEN conditions and
+            // THEN/ELSE values (e.g. ORDER BY CASE WHEN v = 30 THEN 0 ELSE 1).
+            // Collect those columns so projected scans decode them — previously
+            // Case fell through to `_ => {}`, so the referenced column stayed
+            // NULL during ORDER BY key computation → no sort applied.
+            Expr::Case { whens, else_expr } => {
+                for (cond, val) in whens {
+                    for p in Self::expr_referenced_columns(cond, schema) {
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                    for p in Self::expr_referenced_columns(val, schema) {
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                }
+                if let Some(e) = else_expr {
+                    for p in Self::expr_referenced_columns(e, schema) {
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         out
@@ -16893,7 +17691,18 @@ impl QueryExecutor {
                                     };
                                     schema.get_column_position(bare)
                                 }
-                                Expr::Literal(Value::Integer(1)) => None, // COUNT(1) ≡ COUNT(*)
+                                // 🔑 COUNT(1) ≡ COUNT(*) — counts all rows.
+                                // But this equivalence is ONLY valid for COUNT.
+                                // For SUM(1)/AVG(1)/MIN(1)/MAX(1) the literal 1 is
+                                // a real per-row value that must be accumulated
+                                // (SUM(1) over 3 rows = 3, not NULL). Mapping it to
+                                // col_pos=None here made the SUM/MIN/MAX accumulators
+                                // iterate nothing → silently return NULL. So only
+                                // apply the COUNT(1)≡COUNT(*) shortcut for COUNT;
+                                // other aggregates with a literal arg fall back to
+                                // the materialized path (which evaluates the
+                                // expression per row).
+                                Expr::Literal(Value::Integer(1)) if func == "COUNT" => None,
                                 _ => return None,
                             }
                         } else if args.is_empty() && func == "COUNT" {
@@ -17405,7 +18214,31 @@ impl QueryExecutor {
                     // (single_pass_group_by's AggAccumulator doesn't support them).
                     matches!(a.func.as_str(), "STDDEV" | "VARIANCE" | "GROUP_CONCAT")
                 })
-            });
+            })
+            // 🔑 ORDER BY referencing an aggregate NOT in the SELECT list
+            // (e.g. `SELECT cat, SUM(v) ... ORDER BY MAX(w)`) requires per-group
+            // computation of the extra aggregate. single_pass_group_by only
+            // accumulates the SELECT-list aggregates, so it can't resolve such
+            // an ORDER BY key → falls back to two-pass which computes it.
+            && stmt.order_by.as_ref().map(|ob| {
+                ob.iter().all(|oe| {
+                    // Only aggregate function calls are at risk here (bare
+                    // columns resolve against group columns; output-matching
+                    // aggregates resolve by name).
+                    match &oe.expr {
+                        Expr::FunctionCall { name, args, .. } => {
+                            let arg_str = args.iter().map(|a| match a {
+                                Expr::Column(c) => c.clone(),
+                                e => format!("{:?}", e),
+                            }).collect::<Vec<_>>().join(", ");
+                            let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
+                            // If the aggregate IS in the SELECT list (by name), single-pass is fine.
+                            select_col_info.iter().any(|(cn, _, _)| cn == &ob_name)
+                        }
+                        _ => true,
+                    }
+                })
+            }).unwrap_or(true);
 
         if can_single_pass {
             return self.single_pass_group_by(
@@ -17420,6 +18253,17 @@ impl QueryExecutor {
 
         // Fallback: materialize rows then group
         let raw_rows: Vec<Row> = if let Some(ref where_clause) = stmt.where_clause {
+            // 🔑 Materialize non-correlated subqueries in the WHERE clause
+            // before row-wise evaluation. eval_expr_on_row cannot execute
+            // subqueries — without this, a WHERE like `v > (SELECT MIN(v)
+            // FROM t WHERE v > (SELECT MIN(v) FROM t))` (nested subqueries)
+            // fails to evaluate → empty result / wrong aggregate. Materializing
+            // here collapses the subqueries to Literals so eval_expr_on_row
+            // can compare against the resolved value.
+            let resolved_where = self
+                .materialize_subqueries_checked(where_clause, Some(schema))
+                .unwrap_or_else(|_| where_clause.clone());
+            let where_clause = &resolved_where;
             let mut matching = Vec::new();
             for result in row_iter {
                 let (_row_id, row) = result?;
@@ -17479,6 +18323,31 @@ impl QueryExecutor {
             .collect();
         let mut result_rows: Vec<Vec<Value>> = Vec::new();
 
+        // 🔑 Collect ORDER BY aggregates that are NOT in the SELECT list.
+        // These need per-group computation (e.g. `SELECT cat, SUM(v) ... ORDER
+        // BY MAX(w)` where MAX(w) isn't selected). We compute them per group
+        // and append as trailing sort-only columns (stripped before output).
+        let mut extra_order_aggs: Vec<(AggregateInfo, bool)> = Vec::new();
+        if let Some(ref order_by) = stmt.order_by {
+            for ob in order_by {
+                if let Expr::FunctionCall { name, args, .. } = &ob.expr {
+                    let arg_str = args.iter().map(|a| match a {
+                        Expr::Column(c) => c.clone(),
+                        e => format!("{:?}", e),
+                    }).collect::<Vec<_>>().join(", ");
+                    let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
+                    // Only if NOT already in the SELECT output.
+                    if !select_col_info.iter().any(|(cn, _, _)| cn == &ob_name) {
+                        // Parse the aggregate so we can compute it per group.
+                        if let Some(agg) = self.try_parse_aggregate(&ob.expr, schema) {
+                            extra_order_aggs.push((agg, ob.asc));
+                        }
+                    }
+                }
+            }
+        }
+        let extra_order_offset = select_col_info.len();
+
         for (_group_key, group_rows) in groups {
             let mut result_row = Vec::new();
             for (_col_name, col_pos, agg_info) in &select_col_info {
@@ -17495,6 +18364,11 @@ impl QueryExecutor {
                     Value::Null
                 };
                 result_row.push(value);
+            }
+            // 🔑 Append the extra ORDER BY aggregates (sort-only columns).
+            for (agg, _) in &extra_order_aggs {
+                let v = self.compute_aggregate_positional(agg, &group_rows)?;
+                result_row.push(v);
             }
 
             // Apply HAVING filter
@@ -17543,15 +18417,39 @@ impl QueryExecutor {
 
         // Apply ORDER BY if present
         if let Some(ref order_by) = stmt.order_by {
+            // 🔑 Build the ORDER BY plan. For each ORDER BY clause:
+            //  - bare column → resolve against output column_names.
+            //  - aggregate in SELECT → resolve by canonical name (e.g. "SUM(v)").
+            //  - aggregate NOT in SELECT → use the corresponding extra slot
+            //    (extra_order_aggs were appended per group, in the order the
+            //    non-selected ORDER BY aggregates were encountered).
+            let mut extra_cursor = 0usize; // index into extra_order_aggs
             let order_specs: Vec<(usize, bool)> = order_by
                 .iter()
                 .filter_map(|ob| {
                     if let Expr::Column(ref col_name) = ob.expr {
-                        let idx = column_names.iter().position(|c| c == col_name)?;
-                        Some((idx, ob.asc))
-                    } else {
-                        None
+                        return column_names.iter().position(|c| c == col_name).map(|idx| (idx, ob.asc));
                     }
+                    if let Expr::FunctionCall { name, args, .. } = &ob.expr {
+                        let arg_str = args.iter().map(|a| match a {
+                            Expr::Column(c) => c.clone(),
+                            e => format!("{:?}", e),
+                        }).collect::<Vec<_>>().join(", ");
+                        let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
+                        // In SELECT list?
+                        if let Some(idx) = column_names.iter().position(|c| c == &ob_name) {
+                            return Some((idx, ob.asc));
+                        }
+                        // Not in SELECT — use the next extra slot (they were
+                        // collected in ORDER BY clause order for non-selected
+                        // aggregates).
+                        if extra_cursor < extra_order_aggs.len() {
+                            let idx = extra_order_offset + extra_cursor;
+                            extra_cursor += 1;
+                            return Some((idx, ob.asc));
+                        }
+                    }
+                    None
                 })
                 .collect();
 
@@ -17567,6 +18465,12 @@ impl QueryExecutor {
                 }
                 std::cmp::Ordering::Equal
             });
+            // 🔑 Strip the extra sort-only columns from each output row.
+            if !extra_order_aggs.is_empty() {
+                for row in &mut result_rows {
+                    row.truncate(extra_order_offset);
+                }
+            }
         }
 
         // Apply LIMIT/OFFSET
@@ -20266,8 +21170,14 @@ impl QueryExecutor {
                         };
 
                         if let (Some(c1), Some(c2)) = (&col1, &col2) {
-                            if c1 == c2 {
-                                let col_name = (*c1).clone();
+                            // Compare on the bare column name so that a
+                            // qualified reference like "t.v" on both sides
+                            // still matches, and an unqualified "v" also
+                            // matches "t.v".
+                            let bare1 = Self::strip_qualifier(c1);
+                            let bare2 = Self::strip_qualifier(c2);
+                            if bare1 == bare2 {
+                                let col_name = bare1.to_string();
 
                                 // Extract bounds with operators
                                 let (val1, is_lower1, op1_normalized) =
@@ -20356,6 +21266,14 @@ impl QueryExecutor {
         }
     }
 
+    /// Strip an optional table qualifier from a (possibly qualified) column
+    /// reference. `"t.v"` -> `"v"`, `"v"` -> `"v"`. Index keys are always built
+    /// as `"table.col"` from the bare column name, so a qualified reference
+    /// passed through verbatim would produce a wrong key like `"t.t.v"`.
+    fn strip_qualifier(col: &str) -> &str {
+        col.rsplit('.').next().unwrap_or(col)
+    }
+
     /// 🎯 Try to extract a simple point query pattern: WHERE column = value
     ///
     /// Returns Some((column_name, value)) if the WHERE clause is a simple equality,
@@ -20372,12 +21290,14 @@ impl QueryExecutor {
                     {
                         // 注意: 列名可能没有表前缀 (例如 "id"),但 SqlRow 中的键有前缀 ("users.id")
                         // 我们返回不带前缀的列名,在过滤时需要匹配任何表前缀
-                        return Some((col.clone(), val.clone()));
+                        let bare = Self::strip_qualifier(col).to_string();
+                        return Some((bare, val.clone()));
                     }
                     // Pattern 2: Literal = Column (reversed)
                     if let (Expr::Literal(val), Expr::Column(col)) = (left.as_ref(), right.as_ref())
                     {
-                        return Some((col.clone(), val.clone()));
+                        let bare = Self::strip_qualifier(col).to_string();
+                        return Some((bare, val.clone()));
                     }
                 }
                 None
@@ -20404,7 +21324,8 @@ impl QueryExecutor {
                         if let (Expr::Column(col), Expr::Literal(val)) =
                             (left.as_ref(), right.as_ref())
                         {
-                            return Some((col.clone(), op.clone(), val.clone()));
+                            let bare = Self::strip_qualifier(col).to_string();
+                            return Some((bare, op.clone(), val.clone()));
                         }
                         // Pattern 2: Literal op Column (reversed, need to flip operator)
                         if let (Expr::Literal(val), Expr::Column(col)) =
@@ -20417,7 +21338,8 @@ impl QueryExecutor {
                                 BinaryOperator::Ge => BinaryOperator::Le,
                                 _ => return None,
                             };
-                            return Some((col.clone(), flipped_op, val.clone()));
+                            let bare = Self::strip_qualifier(col).to_string();
+                            return Some((bare, flipped_op, val.clone()));
                         }
                     }
                     _ => {}

@@ -49,17 +49,21 @@ impl Parser {
 
         let stmt = match &self.current().token_type {
             TokenType::Select => {
-                let select = self.parse_select()?;
-                // Check for set operators: UNION / UNION ALL / INTERSECT / EXCEPT.
-                // Supports chaining: A UNION B INTERSECT C (left-associative).
+                // 🔑 SQL set-op precedence: INTERSECT binds tighter than
+                // UNION/EXCEPT. So `A UNION B INTERSECT C` parses as
+                // `A UNION (B INTERSECT C)`, not `(A UNION B) INTERSECT C`.
+                //
+                // Strategy: parse the first operand as an INTERSECT-chain
+                // (parse_intersect_seq handles `SELECT [INTERSECT SELECT]*`),
+                // then left-associatively fold UNION/EXCEPT over it, where each
+                // right operand is again an INTERSECT-chain. Trailing ORDER BY /
+                // LIMIT / OFFSET are attached to the outermost node.
+                let first = self.parse_intersect_seq()?;
                 if matches!(
                     self.current().token_type,
-                    TokenType::Union | TokenType::Intersect | TokenType::Except
+                    TokenType::Union | TokenType::Except
                 ) {
-                    let mut left_stmt: Statement = Statement::Select {
-                        stmt: select,
-                        ctes: ctes.clone(),
-                    };
+                    let mut left_stmt: Statement = first;
                     loop {
                         let (op, all) = match self.current().token_type {
                             TokenType::Union => {
@@ -67,35 +71,77 @@ impl Parser {
                                 let all = if matches!(self.current().token_type, TokenType::All) {
                                     self.advance();
                                     true
-                                } else { false };
+                                } else {
+                                    false
+                                };
                                 (SetOp::Union, all)
                             }
-                            TokenType::Intersect => { self.advance(); (SetOp::Intersect, false) }
-                            TokenType::Except => { self.advance(); (SetOp::Except, false) }
+                            TokenType::Except => {
+                                self.advance();
+                                (SetOp::Except, false)
+                            }
                             _ => break,
                         };
-                        if !matches!(self.current().token_type, TokenType::Select) {
-                            return Err(self.error("Expected SELECT after set operator"));
-                        }
-                        let right = self.parse_select()?;
+                        // Right operand: an INTERSECT chain (higher precedence).
+                        let right = self.parse_intersect_seq()?;
                         left_stmt = Statement::SetOp {
                             left: Box::new(left_stmt),
                             right: Box::new(right),
                             op,
                             all,
                             ctes: Vec::new(),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
                         };
                     }
-                    // Attach CTEs to the outermost SetOp.
-                    if let Statement::SetOp { ctes: ref mut c, .. } = &mut left_stmt {
+                    // Attach CTEs + trailing clauses to the outermost SetOp.
+                    let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+                    if let Statement::SetOp {
+                        ctes: ref mut c,
+                        order_by: ref mut o,
+                        limit: ref mut l,
+                        offset: ref mut off,
+                        ..
+                    } = &mut left_stmt
+                    {
                         *c = std::mem::take(&mut ctes);
+                        *o = order_by;
+                        *l = limit;
+                        *off = offset;
                     }
                     left_stmt
-                } else {
+                } else if let Statement::Select { stmt, .. } = &first {
+                    // No UNION/EXCEPT followed. If the first was just a plain
+                    // SELECT (no INTERSECT), attach trailing clauses to it.
+                    let mut select = stmt.clone();
+                    let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+                    select.order_by = order_by;
+                    select.limit = limit;
+                    select.offset = offset;
                     Statement::Select {
                         stmt: select,
                         ctes: std::mem::take(&mut ctes),
                     }
+                } else {
+                    // First was an INTERSECT chain (no UNION/EXCEPT): attach
+                    // CTEs + trailing clauses to the outermost INTERSECT SetOp.
+                    let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+                    let mut left_stmt = first;
+                    if let Statement::SetOp {
+                        ctes: ref mut c,
+                        order_by: ref mut o,
+                        limit: ref mut l,
+                        offset: ref mut off,
+                        ..
+                    } = &mut left_stmt
+                    {
+                        *c = std::mem::take(&mut ctes);
+                        *o = order_by;
+                        *l = limit;
+                        *off = offset;
+                    }
+                    left_stmt
                 }
             }
             TokenType::Insert => Statement::Insert(self.parse_insert()?),
@@ -133,8 +179,12 @@ impl Parser {
         Ok(stmt)
     }
 
-    /// Parse SELECT statement
-    fn parse_select(&mut self) -> Result<SelectStmt> {
+    /// Parse SELECT statement (without trailing ORDER BY/LIMIT/OFFSET — those
+    /// are handled by parse_select which calls this then appends trailing
+    /// clauses). Splitting lets the set-op parser consume the trailing clauses
+    /// once at the outermost level (per SQL standard) instead of attaching them
+    /// to the rightmost branch.
+    fn parse_select_core(&mut self) -> Result<SelectStmt> {
         self.expect(TokenType::Select)?;
 
         // Parse DISTINCT (optional)
@@ -172,28 +222,6 @@ impl Parser {
             None
         };
 
-        // ORDER BY clause (optional)
-        let order_by = if self.match_token(TokenType::Order) {
-            self.expect(TokenType::By)?;
-            Some(self.parse_order_by()?)
-        } else {
-            None
-        };
-
-        // LIMIT clause (optional)
-        let limit = if self.match_token(TokenType::Limit) {
-            Some(self.parse_usize()?)
-        } else {
-            None
-        };
-
-        // OFFSET clause (optional)
-        let offset = if self.match_token(TokenType::Offset) {
-            Some(self.parse_usize()?)
-        } else {
-            None
-        };
-
         // LATEST BY clause (optional)
         let latest_by = if self.match_token(TokenType::Latest) {
             self.expect(TokenType::By)?;
@@ -209,11 +237,87 @@ impl Parser {
             where_clause,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: None,
+            limit: None,
+            offset: None,
             latest_by,
         })
+    }
+
+    /// Parse a SELECT including its trailing ORDER BY / LIMIT / OFFSET.
+    /// Used for standalone SELECTs (no set operator).
+    fn parse_select(&mut self) -> Result<SelectStmt> {
+        let mut s = self.parse_select_core()?;
+        let (order_by, limit, offset) = self.parse_trailing_clauses()?;
+        s.order_by = order_by;
+        s.limit = limit;
+        s.offset = offset;
+        Ok(s)
+    }
+
+    /// Parse a single INTERSECT chain as a right operand for UNION/EXCEPT.
+    /// Returns a Statement that is either a plain SelectStmt or a nested
+    /// SetOp (INTERSECT chain). INTERSECT binds tighter than UNION/EXCEPT, so
+    /// it is parsed as the operand of the UNION/EXCEPT loop rather than at the
+    /// same level. Trailing ORDER BY/LIMIT/OFFSET are NOT consumed here (they
+    /// belong to the outermost node).
+    fn parse_intersect_seq(&mut self) -> Result<Statement> {
+        if !matches!(self.current().token_type, TokenType::Select) {
+            return Err(self.error("Expected SELECT after set operator"));
+        }
+        let mut right: Statement = Statement::Select {
+            stmt: self.parse_select_core()?,
+            ctes: Vec::new(),
+        };
+        // INTERSECT is left-associative within its own precedence level.
+        while matches!(self.current().token_type, TokenType::Intersect) {
+            self.advance();
+            if !matches!(self.current().token_type, TokenType::Select) {
+                return Err(self.error("Expected SELECT after INTERSECT"));
+            }
+            let next = self.parse_select_core()?;
+            right = Statement::SetOp {
+                left: Box::new(right),
+                right: Box::new(Statement::Select {
+                    stmt: next,
+                    ctes: Vec::new(),
+                }),
+                op: SetOp::Intersect,
+                all: false,
+                ctes: Vec::new(),
+                order_by: None,
+                limit: None,
+                offset: None,
+            };
+        }
+        Ok(right)
+    }
+
+    /// Parse the trailing ORDER BY / LIMIT / OFFSET clauses (each optional).
+    /// Returns (order_by, limit, offset). Used both by parse_select (standalone
+    /// SELECT) and by the set-op parser (to attach these to the outermost node).
+    fn parse_trailing_clauses(&mut self) -> Result<(
+        Option<Vec<OrderByExpr>>,
+        Option<usize>,
+        Option<usize>,
+    )> {
+        let order_by = if self.match_token(TokenType::Order) {
+            self.expect(TokenType::By)?;
+            Some(self.parse_order_by()?)
+        } else {
+            None
+        };
+        let limit = if self.match_token(TokenType::Limit) {
+            Some(self.parse_usize()?)
+        } else {
+            None
+        };
+        let offset = if self.match_token(TokenType::Offset) {
+            Some(self.parse_usize()?)
+        } else {
+            None
+        };
+        Ok((order_by, limit, offset))
     }
 
     /// Parse a WITH clause: `WITH [RECURSIVE] name [(col, ...)] AS ( SELECT ... ), ...`

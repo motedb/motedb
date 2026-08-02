@@ -16,11 +16,19 @@ pub enum Statement {
     SetOp {
         /// Left operand — either a SelectStmt or a nested SetOp (for chaining).
         left: Box<Statement>,
-        right: Box<SelectStmt>,
+        /// Right operand — either a SelectStmt or a nested SetOp (e.g. an
+        /// INTERSECT chain, which binds tighter than UNION/EXCEPT).
+        right: Box<Statement>,
         op: SetOp,
         all: bool,
         /// WITH clause CTEs — visible to both `left` and `right`.
         ctes: Vec<CteDef>,
+        /// Trailing ORDER BY / LIMIT / OFFSET that apply to the entire set
+        /// result (only on the outermost SetOp). Per SQL standard these clauses
+        /// belong to the whole query, not to the rightmost SELECT.
+        order_by: Option<Vec<OrderByExpr>>,
+        limit: Option<usize>,
+        offset: Option<usize>,
     },
     Insert(InsertStmt),
     Update(UpdateStmt),

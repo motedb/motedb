@@ -26,6 +26,22 @@ pub struct AggregateResult {
     pub max_float: f64,
 }
 
+/// Aggregated stats over a (possibly empty) filtered set, used by the
+/// `COUNT(*) + SUM/MIN/MAX WHERE textcol = 'val'` fast path. Carries both the
+/// integer and float accumulators; the caller selects based on `is_int`.
+/// When `count == 0`, the min/max fields hold their sentinels (i64::MAX/MIN or
+/// ±∞) so callers can map an empty set to NULL rather than 0.
+pub struct AggStats {
+    pub count: i64,
+    pub is_int: bool,
+    pub sum_i: i64,
+    pub min_i: i64,
+    pub max_i: i64,
+    pub sum_f: f64,
+    pub min_f: f64,
+    pub max_f: f64,
+}
+
 // ── Comparison helpers for count_filtered (zero-allocation) ──────────
 #[inline]
 fn cmp_opt<T: Copy + PartialEq + PartialOrd>(
@@ -781,6 +797,12 @@ impl ColSegmentStore {
                             Some(ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
                             Some(ColumnType::Float) => f.get_f64(i).map(Value::Float),
                             Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
+                            // 🚨 Timestamp: decode as Timestamp (micros), not Integer.
+                            // Without this, WHERE filters on TIMESTAMP columns got
+                            // None → predicate always false → empty results.
+                            Some(ColumnType::Timestamp) => f
+                                .get_i64(i)
+                                .map(|m| Value::Timestamp(crate::types::Timestamp::from_micros(m))),
                             _ => None,
                         }
                     } else if let Some(ref t) = fcol_text {
@@ -2365,12 +2387,22 @@ impl ColSegmentStore {
     /// Combined COUNT + SUM + MIN + MAX with a text filter in a SINGLE pass.
     /// Returns (count, sum, min, max). Replaces the old 2-scan approach
     /// (count_min_max_text_filter + count_sum_text_filter) which doubled latency.
+    /// COUNT + SUM + MIN + MAX over an aggregate column, filtered by
+    /// `filter_col = filter_val` (a TEXT equality). Returns
+    /// `(count, sum, min, max)` where sum/min/max are accumulated in **i64**
+    /// for integer aggregate columns and **f64** for float columns, depending
+    /// on `agg_type`.
+    ///
+    /// For an empty result set (count == 0), `min_i/max_i/min_f/max_f` are
+    /// returned as their sentinels so the caller can distinguish "empty" from
+    /// "real zero" (callers map empty → NULL).
     pub fn count_sum_min_max_text_filter(
         &self,
         filter_col: usize,
         filter_val: &str,
         agg_col: usize,
-    ) -> (i64, f64, f64, f64) {
+        agg_type: ColumnType,
+    ) -> AggStats {
         let segs = self.segments_snapshot();
         let single_seg = segs.len() <= 1;
         let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
@@ -2378,10 +2410,14 @@ impl ColSegmentStore {
         } else {
             Some(std::collections::HashSet::new())
         };
+        let is_int = matches!(agg_type, ColumnType::Integer);
         let mut count = 0i64;
-        let mut sum = 0.0f64;
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
+        let mut sum_i = 0i64;
+        let mut min_i = i64::MAX;
+        let mut max_i = i64::MIN;
+        let mut sum_f = 0.0f64;
+        let mut min_f = f64::INFINITY;
+        let mut max_f = f64::NEG_INFINITY;
         for seg in segs.iter().rev() {
             let n = seg.sst.num_rows;
             let _ = seg.sst.load_full_keys();
@@ -2401,24 +2437,43 @@ impl ColSegmentStore {
                     if tseg.get_str(i) == Some(filter_val) {
                         count += 1;
                         if let Some(ref f) = fagg {
-                            let v = f
-                                .get_f64(i)
-                                .unwrap_or_else(|| f.get_i64(i).map(|i| i as f64).unwrap_or(0.0));
-                            sum += v;
-                            if v < min {
-                                min = v;
-                            }
-                            if v > max {
-                                max = v;
+                            if is_int {
+                                // 🔑 Integer column: read as i64. Previously
+                                // this called get_f64 first, reinterpreting the
+                                // integer's bytes as a garbage float.
+                                if let Some(v) = f.get_i64(i) {
+                                    sum_i = sum_i.saturating_add(v);
+                                    if v < min_i {
+                                        min_i = v;
+                                    }
+                                    if v > max_i {
+                                        max_i = v;
+                                    }
+                                }
+                            } else if let Some(v) = f.get_f64(i) {
+                                sum_f += v;
+                                if v < min_f {
+                                    min_f = v;
+                                }
+                                if v > max_f {
+                                    max_f = v;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        let min = if count == 0 { 0.0 } else { min };
-        let max = if count == 0 { 0.0 } else { max };
-        (count, sum, min, max)
+        AggStats {
+            count,
+            is_int,
+            sum_i,
+            min_i,
+            max_i,
+            sum_f,
+            min_f,
+            max_f,
+        }
     }
 
     /// Find the row indices of the top-K rows by a single fixed (numeric)

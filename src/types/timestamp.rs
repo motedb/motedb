@@ -72,6 +72,67 @@ impl Timestamp {
     pub fn in_range(&self, start: Timestamp, end: Timestamp) -> bool {
         self.micros >= start.micros && self.micros <= end.micros
     }
+
+    /// Parse an ISO 8601 date/datetime string into a Timestamp.
+    /// Supports: "2024-01-15", "2024-01-15 10:30:00", "2024-01-15T10:30:00",
+    /// and integer microseconds. Returns None if the string doesn't match.
+    /// Used for comparing TIMESTAMP columns against text literals in WHERE
+    /// clauses (e.g. `WHERE ts > '2024-01-01'`).
+    pub fn parse_iso(s: &str) -> Option<Timestamp> {
+        // Try parsing as integer microseconds first (numeric timestamp).
+        if let Ok(micros) = s.parse::<i64>() {
+            return Some(Timestamp::from_micros(micros));
+        }
+        // Split date and optional time.
+        let (date_part, time_part) = if let Some(idx) = s.find(['T', ' ']) {
+            (&s[..idx], Some(&s[idx + 1..]))
+        } else {
+            (s, None)
+        };
+        // Parse date: YYYY-MM-DD
+        let dparts: Vec<&str> = date_part.split('-').collect();
+        if dparts.len() != 3 {
+            return None;
+        }
+        let year: i32 = dparts[0].parse().ok()?;
+        let month: u32 = dparts[1].parse().ok()?;
+        let day: u32 = dparts[2].parse().ok()?;
+        if month < 1 || month > 12 || day < 1 || day > 31 {
+            return None;
+        }
+        // Parse time: HH:MM:SS (seconds optional)
+        let (hour, min, sec) = if let Some(tp) = time_part {
+            let tparts: Vec<&str> = tp.split(':').collect();
+            let h: u32 = tparts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let m: u32 = tparts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let s: u32 = tparts
+                .get(2)
+                .and_then(|s| s.split('.').next().and_then(|n| n.parse().ok()))
+                .unwrap_or(0);
+            (h, m, s)
+        } else {
+            (0, 0, 0)
+        };
+        // Convert to Unix epoch microseconds using Howard Hinnant's algorithm.
+        let days = days_from_civil(year, month, day)?;
+        let micros = days as i64 * 86_400_000_000
+            + hour as i64 * 3_600_000_000
+            + min as i64 * 60_000_000
+            + sec as i64 * 1_000_000;
+        Some(Timestamp::from_micros(micros))
+    }
+}
+
+/// Howard Hinnant's days_from_civil algorithm — converts (y, m, d) to days
+/// since the Unix epoch (1970-01-01). Returns None for invalid dates.
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era as i64 * 146_097 + doe as i64 - 719_468;
+    Some(days)
 }
 
 impl Default for Timestamp {

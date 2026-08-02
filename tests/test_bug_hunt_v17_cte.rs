@@ -406,23 +406,27 @@ fn err_malformed_with_no_paren() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 9. v1 limitation: CTE not visible inside nested subquery in FROM
+// 9. CTE visible inside nested subquery (fixed: was a v1 limitation)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn cte_nested_subquery_reference_v1_limitation() {
+fn cte_nested_subquery_reference() {
     let (db, _dir) = sales_db();
-    // `SELECT * FROM (SELECT * FROM cte)` — v1 does not rewrite inside
-    // nested subqueries. This should error (cte is out of scope inside the
-    // derived table).
+    // `SELECT * FROM (SELECT * FROM cte)` — a CTE referenced inside a nested
+    // derived table is in scope per SQL scoping. Previously this errored; now
+    // it works.
     let result = db.execute(
         "WITH x AS (SELECT id FROM sales) \
          SELECT * FROM (SELECT * FROM x) AS sub",
     );
-    assert!(
-        result.is_err(),
-        "v1 limitation: CTE reference inside nested subquery should error"
-    );
+    let r = result.expect("CTE reference inside nested subquery should resolve");
+    use motedb::QueryResult;
+    let rows = match r.materialize().unwrap() {
+        QueryResult::Select { rows, .. } => rows,
+        _ => vec![],
+    };
+    // x = all sales ids; wrapped subquery returns the same.
+    assert!(!rows.is_empty(), "nested CTE reference should return rows");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

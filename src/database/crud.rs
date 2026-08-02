@@ -116,6 +116,28 @@ impl MoteDB {
 
         // 3. Validate row (before allocating AUTO_INCREMENT to avoid ID waste)
         schema.validate_row(&row).map_err(|e| {
+            // 🔑 Roll back the PK reservation made above (insert_if_absent at
+            // step 1.5). A validation failure (e.g. type mismatch) must NOT
+            // leave a phantom PK entry in the cache — otherwise a later valid
+            // INSERT with the same PK fails with "Duplicate primary key" even
+            // though no row was ever stored.
+            if !schema.is_primary_key_auto_increment() {
+                if let Some(pk_name) = schema.primary_key() {
+                    if let Some(pk_col) = schema.get_column(pk_name) {
+                        if let Some(pk_value) = row.get(pk_col.position) {
+                            let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+                            if let Some(lookup) = self.pk_lookup.get(table_name) {
+                                // Only remove if it still maps to the placeholder
+                                // row_id we inserted (0). If a concurrent insert
+                                // replaced it with a real row, leave it alone.
+                                if lookup.get_pk(&pk_key) == Some(0) {
+                                    lookup.remove_pk(&pk_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             StorageError::InvalidData(format!(
                 "Row validation failed for table '{}': {}",
                 table_name, e
@@ -2339,7 +2361,22 @@ impl MoteDB {
             })?;
         }
 
-        // 2.5 Check primary key uniqueness for non-AUTO_INCREMENT tables
+        // 2.5 Check primary key uniqueness for non-AUTO_INCREMENT tables.
+        // 🔑 Track reserved PKs so we can roll them back if validation (step 3)
+        // fails — otherwise a failed batch leaves phantom PK entries in the
+        // cache, blocking future inserts with the same PK.
+        let mut reserved_pks: Vec<crate::database::pk_cache::PkKey> = Vec::new();
+        let rollback_reserved = |reserved: &[crate::database::pk_cache::PkKey]| {
+            if let Some(lookup) = self.pk_lookup.get(table_name) {
+                for pk in reserved {
+                    // Only remove placeholder entries (row_id 0) we inserted;
+                    // a concurrent real insert may have replaced one.
+                    if lookup.get_pk(pk) == Some(0) {
+                        lookup.remove_pk(pk);
+                    }
+                }
+            }
+        };
         if !schema.is_primary_key_auto_increment() {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
@@ -2349,6 +2386,7 @@ impl MoteDB {
                         if let Some(pk_value) = row.get(pk_col.position) {
                             // NULL primary key is invalid per SQL standard
                             if matches!(pk_value, Value::Null) {
+                                rollback_reserved(&reserved_pks);
                                 return Err(StorageError::InvalidData(format!(
                                     "Batch row {}: NULL primary key is not allowed for table '{}'",
                                     idx, table_name
@@ -2357,6 +2395,7 @@ impl MoteDB {
                             let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
                             // Intra-batch duplicate check
                             if !batch_pks.insert(pk_key.clone()) {
+                                rollback_reserved(&reserved_pks);
                                 return Err(StorageError::InvalidData(format!(
                                     "Batch row {}: duplicate primary key {:?} within batch for table '{}'", idx, pk_value, table_name
                                 )));
@@ -2365,9 +2404,12 @@ impl MoteDB {
                             // This reserves the PK key, preventing concurrent inserts
                             // from using the same key (eliminates TOCTOU race).
                             if let Some(lookup) = self.pk_lookup.get(table_name) {
-                                match lookup.insert_if_absent(pk_key, 0 /* placeholder */) {
-                                    Ok(()) => {} // Reserved successfully
+                                match lookup.insert_if_absent(pk_key.clone(), 0 /* placeholder */) {
+                                    Ok(()) => {
+                                        reserved_pks.push(pk_key); // track for rollback
+                                    }
                                     Err(_) => {
+                                        rollback_reserved(&reserved_pks);
                                         return Err(StorageError::InvalidData(format!(
                                             "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
                                         )));
@@ -2385,6 +2427,7 @@ impl MoteDB {
                                             }
                                         }
                                         if has_live {
+                                            rollback_reserved(&reserved_pks);
                                             return Err(StorageError::InvalidData(format!(
                                                 "Batch row {}: duplicate primary key {:?} for table '{}'", idx, pk_value, table_name
                                             )));
@@ -2419,12 +2462,15 @@ impl MoteDB {
         // Pre-validate all rows before allocating IDs (avoid wasting AUTO_INCREMENT IDs on invalid rows)
         {
             for (idx, row) in rows.iter().enumerate() {
-                schema.validate_row(row).map_err(|e| {
-                    StorageError::InvalidData(format!(
+                if let Err(e) = schema.validate_row(row) {
+                    // 🔑 Roll back reserved PKs — a validation failure must not
+                    // leave phantom PK entries (same fix as insert_row_to_table).
+                    rollback_reserved(&reserved_pks);
+                    return Err(StorageError::InvalidData(format!(
                         "Row {} validation failed for table '{}': {}",
                         idx, table_name, e
-                    ))
-                })?;
+                    )));
+                }
             }
         }
 

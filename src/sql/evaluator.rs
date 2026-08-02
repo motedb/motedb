@@ -289,7 +289,34 @@ impl ExprEvaluator {
                     )));
                 }
 
-                // Try 3: Case-insensitive match (for robustness).
+                // Try 3: Strip a table qualifier from the requested name
+                // (e.g. "t.v") and match the bare column name ("v") against
+                // row keys that may be stored unqualified. Collect matches to
+                // detect ambiguity.
+                if let Some(bare) = name.rsplit('.').next() {
+                    if bare != name {
+                        let mut matches: Vec<&str> = Vec::new();
+                        for key in row.keys() {
+                            // Match against either the bare key or the
+                            // qualifier-stripped tail of a qualified key.
+                            let key_tail = key.rsplit('.').next().unwrap_or(key);
+                            if key_tail == bare {
+                                matches.push(key.as_str());
+                            }
+                        }
+                        if matches.len() == 1 {
+                            return Ok(row[matches[0]].clone());
+                        } else if matches.len() > 1 {
+                            return Err(MoteDBError::ColumnNotFound(format!(
+                                "Ambiguous column '{}' matches: {}",
+                                name,
+                                matches.join(", ")
+                            )));
+                        }
+                    }
+                }
+
+                // Try 4: Case-insensitive match (for robustness).
                 // Collect all matches to detect ambiguity — picking the first
                 // match silently could return the wrong column on collision.
                 let name_lower = name.to_lowercase();
@@ -355,22 +382,39 @@ impl ExprEvaluator {
             } => {
                 let val = self.eval(expr, row)?;
 
-                // SQL NULL semantics: NULL IN (...) returns false (unknown)
+                // 🔑 SQL three-valued logic: NULL IN (...) → UNKNOWN (NULL),
+                // not FALSE. WHERE filtering treats NULL as "not matched"
+                // (is_truthy(Null) == false), so projections now correctly
+                // yield NULL while WHERE behavior is unchanged.
                 if matches!(val, Value::Null) {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
 
                 // Fast path: when all items are literals, use O(1) hash comparison
                 let all_literals = list.iter().all(|e| matches!(e, Expr::Literal(_)));
                 if all_literals {
+                    // 🔑 Track NULL presence for three-valued logic: if not found
+                    // but a NULL is in the list, result is UNKNOWN (NULL).
+                    let mut has_null = false;
                     let found = list.iter().any(|item| {
                         if let Expr::Literal(v) = item {
-                            val == *v
+                            if matches!(v, Value::Null) {
+                                has_null = true;
+                            }
+                            Self::values_equal_coerced(&val, v)
                         } else {
                             false
                         }
                     });
-                    return Ok(Value::Bool(if *negated { !found } else { found }));
+                    // 🔑 Three-valued logic: if found → TRUE/FALSE per negated.
+                    // If not found and a NULL is in the list → UNKNOWN (NULL).
+                    if found {
+                        return Ok(Value::Bool(!*negated));
+                    }
+                    if has_null {
+                        return Ok(Value::Null);
+                    }
+                    return Ok(Value::Bool(*negated));
                 }
 
                 let mut found = false;
@@ -382,16 +426,19 @@ impl ExprEvaluator {
                         has_null = true;
                         continue;
                     }
-                    if val == item_val {
+                    if Self::values_equal_coerced(&val, &item_val) {
                         found = true;
                         break;
                     }
                 }
-                // SQL: NOT IN (list with NULL) → unknown → false if no match
-                if *negated && !found && has_null {
-                    return Ok(Value::Bool(false));
+                // 🔑 Three-valued logic (see literal path above).
+                if found {
+                    Ok(Value::Bool(!*negated))
+                } else if has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(*negated))
                 }
-                Ok(Value::Bool(if *negated { !found } else { found }))
             }
 
             Expr::Between {
@@ -404,13 +451,14 @@ impl ExprEvaluator {
                 let low_val = self.eval(low, row)?;
                 let high_val = self.eval(high, row)?;
 
-                // SQL NULL semantics: if any operand is NULL, exclude the row
-                // This correctly handles NOT BETWEEN too (returns false, not true)
+                // 🔑 SQL three-valued logic: if any operand is NULL → UNKNOWN
+                // (NULL). WHERE filtering treats NULL as "not matched", so this
+                // is safe for filtering while projections now yield NULL.
                 if matches!(val, Value::Null)
                     || matches!(low_val, Value::Null)
                     || matches!(high_val, Value::Null)
                 {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
 
                 let in_range = val >= low_val && val <= high_val;
@@ -425,9 +473,10 @@ impl ExprEvaluator {
                 let val = self.eval(expr, row)?;
                 let pattern_val = self.eval(pattern, row)?;
 
-                // SQL NULL semantics: LIKE NULL = UNKNOWN → false for filtering
+                // 🔑 SQL three-valued logic: LIKE with a NULL operand → UNKNOWN
+                // (NULL). WHERE filtering treats NULL as "not matched".
                 if matches!(val, Value::Null) || matches!(pattern_val, Value::Null) {
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
 
                 let matches = if let (Value::Text(s), Value::Text(p)) = (val, pattern_val) {
@@ -516,21 +565,32 @@ impl ExprEvaluator {
             } => {
                 // 🚀 Pre-built HashSet from subquery materialization: O(1) per row.
                 let val = self.eval(expr, row)?;
+                // 🔑 Three-valued logic, matching Expr::In: NULL IN anything →
+                // UNKNOWN (NULL). WHERE filtering treats NULL as "not matched".
                 if matches!(val, Value::Null) {
-                    // NULL IN anything → UNKNOWN (treated as false in WHERE).
-                    return Ok(Value::Bool(false));
+                    return Ok(Value::Null);
                 }
-                let found = set.contains(&val);
-                if *negated {
-                    // NOT IN: per SQL standard, if the subquery produced any NULL,
-                    // NOT IN is UNKNOWN (false) for every row.
-                    if *has_null {
-                        Ok(Value::Bool(false))
-                    } else {
-                        Ok(Value::Bool(!found))
-                    }
+                // 🔑 Use coerced equality so a BOOLEAN column matches an
+                // integer-valued subquery set (TRUE IN (1)) the same way `=`
+                // would. HashSet.contains uses raw Value::eq which doesn't
+                // coerce Bool↔Int, so we fall back to a coerced scan.
+                let found = if matches!(val, Value::Bool(_)) {
+                    set.iter().any(|s| Self::values_equal_coerced(&val, s))
                 } else {
-                    Ok(Value::Bool(found))
+                    // Fast path: only Bool values need coercion (Integer/Float/
+                    // Text already hash/eq consistently across the set type).
+                    set.contains(&val)
+                };
+                // 🔑 Three-valued logic:
+                //   - found     → IN=TRUE, NOT IN=FALSE
+                //   - not found, no NULL in set → IN=FALSE, NOT IN=TRUE
+                //   - not found, NULL in set    → UNKNOWN (NULL) for both
+                if found {
+                    Ok(Value::Bool(!*negated))
+                } else if *has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(*negated))
                 }
             }
 
@@ -543,11 +603,11 @@ impl ExprEvaluator {
         }
     }
 
-    pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
-        // 🔑 Bool/Int coercion for comparisons and arithmetic: in SQL, TRUE=1
-        // and FALSE=0. When one side is Bool and the other is Integer/Float,
-        // coerce Bool to Integer so `1 = TRUE`, `TRUE + 0`, etc. work.
-        let (left, right) = match (&left, &right) {
+    /// Coerce a pair of values for Bool/numeric equality, mirroring the
+    /// coercion in `eval_binary_op`. Used by IN / InHashset so that
+    /// `b IN (1)` matches a BOOLEAN column the same way `b = 1` does.
+    pub(crate) fn coerce_bool_numeric(left: Value, right: Value) -> (Value, Value) {
+        match (&left, &right) {
             (Value::Bool(b), Value::Integer(_)) => (Value::Integer(if *b { 1 } else { 0 }), right),
             (Value::Integer(_), Value::Bool(b)) => (left, Value::Integer(if *b { 1 } else { 0 })),
             (Value::Bool(b), Value::Float(_)) => (Value::Float(if *b { 1.0 } else { 0.0 }), right),
@@ -556,7 +616,22 @@ impl ExprEvaluator {
                 (Value::Integer(if *a { 1 } else { 0 }), Value::Integer(if *b { 1 } else { 0 }))
             }
             _ => (left, right),
-        };
+        }
+    }
+
+    /// Equality with the same Bool/numeric coercion as `=`. Returns true when
+    /// the two values are equal after coercion. Used by IN-list matching so
+    /// `TRUE IN (1)` and `b IN (1)` (BOOLEAN column) behave like `=`.
+    pub(crate) fn values_equal_coerced(a: &Value, b: &Value) -> bool {
+        let (a2, b2) = Self::coerce_bool_numeric(a.clone(), b.clone());
+        a2 == b2
+    }
+
+    pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
+        // 🔑 Bool/Int coercion for comparisons and arithmetic: in SQL, TRUE=1
+        // and FALSE=0. When one side is Bool and the other is Integer/Float,
+        // coerce Bool to Integer so `1 = TRUE`, `TRUE + 0`, etc. work.
+        let (left, right) = Self::coerce_bool_numeric(left, right);
 
         // SQL three-valued logic: NULL comparison → UNKNOWN → NULL (not
         // Bool(false)).  WHERE/HAVING filtering treats NULL predicate results as
@@ -879,7 +954,10 @@ impl ExprEvaluator {
                             use std::fmt::Write;
                             let _ = write!(result, "{}", f);
                         }
-                        Value::Bool(b) => result.push_str(if b { "true" } else { "false" }),
+                        // 🔑 Bool → "1"/"0" to match the `||` operator and
+                        // value_to_concat_string (GROUP_CONCAT). Previously
+                        // CONCAT used "true"/"false", inconsistent with `||`.
+                        Value::Bool(b) => result.push_str(if b { "1" } else { "0" }),
                         Value::Null => return Ok(Value::Null),
                         _ => {
                             use std::fmt::Write;
@@ -1190,7 +1268,25 @@ impl ExprEvaluator {
                         let multiplier = 10_f64.powi(decimals);
                         Ok(Value::Float((f * multiplier).round() / multiplier))
                     }
-                    Value::Integer(i) => Ok(Value::Integer(i)),
+                    Value::Integer(i) => {
+                        // 🔑 Bug fix: decimals was ignored for Integer input.
+                        // ROUND(15, -1) = 20, ROUND(15, 2) = 15, ROUND(14, -1) = 10.
+                        // Standard half-away-from-zero rounding, matching the float path.
+                        if decimals >= 0 {
+                            Ok(Value::Integer(i))
+                        } else {
+                            // Round to the nearest 10^|decimals|.
+                            let factor = 10_i64.pow((-decimals) as u32);
+                            // Round half away from zero:
+                            let half = factor / 2;
+                            let rounded = if i >= 0 {
+                                ((i + half) / factor) * factor
+                            } else {
+                                -(((-i) + half) / factor) * factor
+                            };
+                            Ok(Value::Integer(rounded))
+                        }
+                    }
                     _ => Err(MoteDBError::TypeError(
                         "round() requires numeric argument".to_string(),
                     )),
@@ -1695,7 +1791,13 @@ impl ExprEvaluator {
                 match Self::value_to_micros(&val) {
                     Some(micros) => {
                         let secs = micros / 1_000_000;
-                        let hour = (secs % 86400) / 3600;
+                        // 🔑 Use rem_euclid so pre-epoch (negative) timestamps
+                        // yield the correct wall-clock hour (0-23). Rust's `%`
+                        // truncates toward zero, giving negative remainders for
+                        // negative inputs (e.g. -1 sec → hour -1/3600 == 0 but
+                        // SECOND would be -1). DAY_OF_WEEK already does this.
+                        let day_secs = secs.rem_euclid(86400);
+                        let hour = day_secs / 3600;
                         Ok(Value::Integer(hour))
                     }
                     None => Err(MoteDBError::TypeError(
@@ -1715,7 +1817,9 @@ impl ExprEvaluator {
                 match Self::value_to_micros(&val) {
                     Some(micros) => {
                         let secs = micros / 1_000_000;
-                        let minute = (secs % 3600) / 60;
+                        // 🔑 rem_euclid for pre-epoch correctness (see HOUR).
+                        let day_secs = secs.rem_euclid(86400);
+                        let minute = (day_secs % 3600) / 60;
                         Ok(Value::Integer(minute))
                     }
                     None => Err(MoteDBError::TypeError(
@@ -1735,7 +1839,8 @@ impl ExprEvaluator {
                 match Self::value_to_micros(&val) {
                     Some(micros) => {
                         let secs = micros / 1_000_000;
-                        let second = secs % 60;
+                        // 🔑 rem_euclid for pre-epoch correctness (see HOUR).
+                        let second = secs.rem_euclid(60);
                         Ok(Value::Integer(second))
                     }
                     None => Err(MoteDBError::TypeError(

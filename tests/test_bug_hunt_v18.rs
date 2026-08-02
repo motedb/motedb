@@ -157,7 +157,8 @@ fn cte_referenced_in_subquery_where() {
     // v1: should error because nested subquery can't see CTE.
     match result {
         Ok(_) => {
-            // If it works, must return correct result (ids 2, 3, 5 have salary > 150).
+            // If it works, must return correct result (ids 2 and 5 have
+            // salary strictly > 150: bob=200, eve=300. carol=150 is NOT > 150).
             let r = result.unwrap().materialize().unwrap();
             if let QueryResult::Select { rows, .. } = r {
                 let ids: Vec<i64> = rows
@@ -169,7 +170,7 @@ fn cte_referenced_in_subquery_where() {
                     .collect();
                 let mut ids_sorted = ids.clone();
                 ids_sorted.sort();
-                assert_eq!(ids_sorted, vec![2, 3, 5]);
+                assert_eq!(ids_sorted, vec![2, 5]);
             }
         }
         Err(_) => {
