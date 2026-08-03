@@ -843,6 +843,13 @@ impl MoteDB {
             }
         }
 
+        // 🔑 收集已提交的 DELETE 记录，供 ColSegmentStore 重建后回放 tombstone。
+        // 旧代码 DeleteRaw/Delete 只写 LSM，但 ColSegmentStore（现代表 source of truth）
+        // 的扫描路径不读 LSM tombstone —— 重启后从 columnar_ms/ 重建时没有删除标记，
+        // 导致已删除行"复活"。这里先收集，待 ColSegmentStore 创建后回放。
+        // 字段：(table_name, composite_key)
+        let mut recovered_deletes: Vec<(String, u64)> = Vec::new();
+
         for records in recovered_records.values() {
             for record in records {
                 match record {
@@ -953,6 +960,7 @@ impl MoteDB {
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         lsm_engine.delete(composite_key, ts)?;
+                        recovered_deletes.push((table_name.clone(), composite_key));
                         _recovered_count += 1;
                     }
                     WALRecord::Delete {
@@ -969,6 +977,7 @@ impl MoteDB {
 
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         lsm_engine.delete(composite_key, ts)?;
+                        recovered_deletes.push((table_name.clone(), composite_key));
                         _recovered_count += 1;
                     }
                     _ => {}
@@ -1221,6 +1230,33 @@ impl MoteDB {
             if max_seg_row_id + 1 > current {
                 db.next_row_id
                     .store(max_seg_row_id + 1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // 🔑 回放 WAL recovery 收集的 DELETE tombstone 到 ColSegmentStore。
+        // ColSegmentStore 现在已从 columnar_ms/ 恢复（上面的块），但 WAL 里的删除
+        // 记录还没反映到 columnar_ms 的 segment 中（运行时 DELETE 已改为延迟 flush，
+        // tombstone 可能还在内存 write_buf，未落盘就崩溃）。这里把已提交的删除
+        // 重放为 tombstone 并立即 flush，确保重启后已删除行不复活。
+        // 正确性：用单调递增的 write_lsn 作为 tombstone timestamp，大于所有已存在行。
+        if !recovered_deletes.is_empty() {
+            // 按表分组，减少 flush 次数。
+            let mut by_table: std::collections::HashMap<String, Vec<u64>> =
+                std::collections::HashMap::new();
+            for (tbl, key) in recovered_deletes.drain(..) {
+                by_table.entry(tbl).or_default().push(key);
+            }
+            for (tbl, keys) in by_table {
+                if let Some(store) = db.col_segment_stores.get(&tbl) {
+                    for key in keys {
+                        let ts = db
+                            .write_lsn
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = store.append_tombstone(key, ts);
+                    }
+                    // tombstone 进 write_buf 后立即 flush，保证落盘。
+                    let _ = store.flush_buffer();
+                }
             }
         }
 

@@ -1236,25 +1236,28 @@ impl MoteDB {
         // see the deletion (legacy columnar_write_bufs tombstone is not read
         // by ColSegmentStore scan paths).
         //
-        // Flush the tombstone to its own segment immediately. This guarantees
-        // ALL read paths observe the deletion — including materialize_as_streaming
-        // (the LSM/SELECT * path), aggregate scans, and ColSegmentStore scans.
-        // 🔑 PERF: single flush (was two). The tombstone is appended to the
-        // write buffer after the existing rows, so it has a higher index (newer
-        // version) within the same segment. Newest-version-wins scans and the
-        // binary-search get() both see the tombstone correctly. The old code
-        // flushed twice (before + after tombstone) — two segment writes + two
-        // manifest fsyncs per DELETE. Now we flush existing data first (so the
-        // tombstone segment is strictly newer), then append the tombstone; the
-        // tombstone flushes lazily on the next query's flush_buffer call.
+        // 🔑 PERF: tombstone 写入 write_buf 即可，无需每行 flush。
+        // 旧代码每行 DELETE 都 flush_buffer()（= 1 次 segment 写盘 + 1 次 manifest
+        // fsync），导致 DELETE 比 UPDATE 慢 ~875×。现在 tombstone 留在 write_buf，
+        // 由两条路径保证可见性：
+        //   1. 同表查询前 ensure_query_visibility() 会 flush write_buf（含 tombstone）
+        //   2. 缓冲超 8MB 时触发阈值 flush（与 INSERT 路径一致）
+        // 正确性依据：newest-version-wins 按 timestamp 比较，tombstone 的 timestamp
+        // 来自单调递增的 write_lsn，天然大于所有已写入行，无需靠 flush 保证顺序。
+        // 重启正确性由 WAL recovery 的 DeleteRaw/Delete 重建 tombstone 保证（core.rs）。
         if self.col_segment_stores.contains_key(table_name) {
             if let Some(store) = self.col_segment_stores.get(table_name) {
-                let _ = store.flush_buffer();
                 let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
                 let key = (table_id << 32) | (row_id & 0xFFFFFFFF);
                 store.append_tombstone(key, timestamp)?;
-                // No second flush — tombstone stays in buffer, flushed lazily
-                // by the next query path (flush_buffer at scan start).
+                // 阈值 flush（同 INSERT 路径）：缓冲超 8MB 才落盘，避免逐行 fsync。
+                if store.buffered_bytes() >= 8 * 1024 * 1024 {
+                    let _ = store.flush_buffer();
+                    for entry in self.col_segment_stores.iter() {
+                        entry.release_query_memory();
+                    }
+                    crate::purge_memory_to_os();
+                }
             }
         }
 
