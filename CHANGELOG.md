@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.3] — 2026-08-03
+
+### Performance
+
+- **DELETE: 9195µs/op → 3.5µs/op (2627× 提速)** — 每行 DELETE 不再触发
+  `flush_buffer()`（segment 写盘 + manifest fsync），改为 tombstone 留
+  write_buf、靠查询路径延迟 flush + 8MB 阈值（与 INSERT 一致）。
+- **mixed_crud DELETE: 63638ms → 17ms (3743×)**；mixed_crud 总体
+  64112ms → 220ms (291×)。
+- bench_comprehensive 套件总耗时 126.75s → 7.55s（DELETE 慢是主因）。
+
+### Bug Fixes
+
+- **重启正确性**: WAL recovery 的 `DeleteRaw`/`Delete` 旧代码只写 LSM
+  tombstone，不重建 ColSegmentStore tombstone（现代表 source of truth），
+  导致重启后已删除行"复活"。改为 recovery 收集已提交 delete，在
+  ColSegmentStore 重建后回放 tombstone。
+
 ## [0.5.0] — 2026-06-26
 
 ### Performance (vs SQLite, 300K rows — MoteDB wins 7/11)
