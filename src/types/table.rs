@@ -445,8 +445,10 @@ impl TableSchema {
                     // 🔑 Also reject floats outside i64 range — `as i64` saturates,
                     // silently truncating the value. Use strict bounds because
                     // i64::MAX as f64 rounds up to 2^63.
-                    f.is_finite() && f.fract() == 0.0
-                        && *f < 9223372036854775808.0 && *f > -9223372036854775809.0
+                    f.is_finite()
+                        && f.fract() == 0.0
+                        && *f < 9223372036854775808.0
+                        && *f > -9223372036854775809.0
                 }
                 (ColumnType::Float, crate::types::Value::Float(_)) => true,
                 (ColumnType::Float, crate::types::Value::Integer(_)) => true, // Allow integer to float conversion

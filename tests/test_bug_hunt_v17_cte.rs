@@ -64,12 +64,15 @@ fn sales_db() -> (Database, TempDir) {
         &db,
         "CREATE TABLE sales (id INT PRIMARY KEY, cat TEXT, region TEXT, qty INT)",
     );
-    exec(&db, "INSERT INTO sales VALUES \
+    exec(
+        &db,
+        "INSERT INTO sales VALUES \
         (1, 'a', 'east', 10), \
         (2, 'a', 'west', 20), \
         (3, 'b', 'east', 30), \
         (4, 'b', 'west', 40), \
-        (5, 'c', 'east', 50)");
+        (5, 'c', 'east', 50)",
+    );
     (db, dir)
 }
 
@@ -103,10 +106,13 @@ fn cte_from_table_filter() {
          SELECT id FROM big ORDER BY id",
     );
     // qty > 25 → ids 3, 4, 5
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![3, 4, 5]);
 }
 
@@ -123,10 +129,13 @@ fn cte_multiple_independent() {
                   b AS (SELECT id FROM sales WHERE cat = 'b') \
          SELECT id FROM a UNION SELECT id FROM b ORDER BY id",
     );
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![1, 2, 3, 4]);
 }
 
@@ -158,10 +167,13 @@ fn cte_chained_three_levels() {
          SELECT id FROM lvl3 ORDER BY id",
     );
     // east: ids 1(10), 3(30), 5(50). qty>=30: 3, 5. id>1: 3, 5.
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![3, 5]);
 }
 
@@ -211,10 +223,13 @@ fn cte_join_with_alias() {
         "WITH big AS (SELECT id, qty FROM sales WHERE qty > 15) \
          SELECT b.id FROM big b ORDER BY b.id",
     );
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![2, 3, 4, 5]);
 }
 
@@ -277,10 +292,13 @@ fn cte_visible_to_both_union_branches() {
          SELECT id FROM x UNION SELECT id FROM x ORDER BY id",
     );
     // UNION dedupes; x has ids 3,4,5
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![3, 4, 5]);
 }
 
@@ -402,7 +420,10 @@ fn err_malformed_with_no_as() {
 fn err_malformed_with_no_paren() {
     let (db, _dir) = sales_db();
     let result = db.execute("WITH x AS SELECT 1 SELECT * FROM x");
-    assert!(result.is_err(), "missing parentheses should be a parse error");
+    assert!(
+        result.is_err(),
+        "missing parentheses should be a parse error"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -499,7 +520,10 @@ fn cte_referenced_three_times_self_join() {
 #[test]
 fn cte_with_count_in_main() {
     let (db, _dir) = sales_db();
-    let n = scalar_i64(&db, "WITH x AS (SELECT id FROM sales) SELECT COUNT(*) FROM x");
+    let n = scalar_i64(
+        &db,
+        "WITH x AS (SELECT id FROM sales) SELECT COUNT(*) FROM x",
+    );
     assert_eq!(n, 5);
 }
 
@@ -516,10 +540,13 @@ fn cte_with_case_in_projection() {
          SELECT id, sz FROM x WHERE sz = 'big' ORDER BY id",
     );
     // qty >= 30: ids 3, 4, 5
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![3, 4, 5]);
 }
 
@@ -536,10 +563,13 @@ fn cte_body_contains_independent_subquery() {
          SELECT id FROM x ORDER BY id",
     );
     // AVG(qty) = (10+20+30+40+50)/5 = 30. qty > 30 → ids 4, 5
-    let ids: Vec<i64> = r.iter().map(|row| match row[0] {
-        Value::Integer(n) => n,
-        _ => panic!(),
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Integer(n) => n,
+            _ => panic!(),
+        })
+        .collect();
     assert_eq!(ids, vec![4, 5]);
 }
 

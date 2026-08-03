@@ -228,24 +228,34 @@ fn parse_datetime(s: &str) -> Option<Value> {
     };
     // Parse date: YYYY-MM-DD
     let dparts: Vec<&str> = date_part.split('-').collect();
-    if dparts.len() != 3 { return None; }
+    if dparts.len() != 3 {
+        return None;
+    }
     let year: i32 = dparts[0].parse().ok()?;
     let month: u32 = dparts[1].parse().ok()?;
     let day: u32 = dparts[2].parse().ok()?;
-    if month < 1 || month > 12 || day < 1 || day > 31 { return None; }
+    if month < 1 || month > 12 || day < 1 || day > 31 {
+        return None;
+    }
     // Parse time: HH:MM:SS (seconds optional)
     let (hour, min, sec) = if let Some(tp) = time_part {
         let tparts: Vec<&str> = tp.split(':').collect();
         let h: u32 = tparts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let m: u32 = tparts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let s: u32 = tparts.get(2).and_then(|s| s.split('.').next().and_then(|n| n.parse().ok())).unwrap_or(0);
+        let s: u32 = tparts
+            .get(2)
+            .and_then(|s| s.split('.').next().and_then(|n| n.parse().ok()))
+            .unwrap_or(0);
         (h, m, s)
     } else {
         (0, 0, 0)
     };
     // Convert to Unix epoch microseconds using Howard Hinnant's algorithm.
     let days = days_from_civil(year, month, day)?;
-    let micros = days as i64 * 86_400_000_000 + hour as i64 * 3_600_000_000 + min as i64 * 60_000_000 + sec as i64 * 1_000_000;
+    let micros = days as i64 * 86_400_000_000
+        + hour as i64 * 3_600_000_000
+        + min as i64 * 60_000_000
+        + sec as i64 * 1_000_000;
     Some(Value::Timestamp(Timestamp::from_micros(micros)))
 }
 

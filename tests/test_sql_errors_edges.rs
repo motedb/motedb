@@ -510,25 +510,34 @@ fn test_double_quote_identifier() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
     // Reserved word as column name via double quotes
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, \"order\" INT)").unwrap();
-    db.execute("INSERT INTO t (id, \"order\") VALUES (1, 42)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, \"order\" INT)")
+        .unwrap();
+    db.execute("INSERT INTO t (id, \"order\") VALUES (1, 42)")
+        .unwrap();
     let r = db.execute("SELECT \"order\" FROM t WHERE id = 1").unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("expected select"),
     };
-    assert_eq!(rows[0][0], motedb::types::Value::Integer(42),
-        "double-quoted identifier should reference the column, not a string literal");
+    assert_eq!(
+        rows[0][0],
+        motedb::types::Value::Integer(42),
+        "double-quoted identifier should reference the column, not a string literal"
+    );
 }
 
 #[test]
 fn test_double_quote_identifier_with_spaces() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, \"my column\" TEXT)").unwrap();
-    db.execute("INSERT INTO t (id, \"my column\") VALUES (1, 'hello')").unwrap();
-    let r = db.execute("SELECT \"my column\" FROM t WHERE id = 1").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, \"my column\" TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t (id, \"my column\") VALUES (1, 'hello')")
+        .unwrap();
+    let r = db
+        .execute("SELECT \"my column\" FROM t WHERE id = 1")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
@@ -547,7 +556,9 @@ fn test_single_quote_still_string_literal() {
     db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     // Single quotes = string literal (constant), not column ref
-    let r = db.execute("SELECT 'not a column' FROM t WHERE id = 1").unwrap();
+    let r = db
+        .execute("SELECT 'not a column' FROM t WHERE id = 1")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,

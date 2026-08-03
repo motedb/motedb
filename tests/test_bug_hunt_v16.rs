@@ -14,19 +14,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -39,8 +49,13 @@ fn crash_recovery_auto_increment_counter() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)");
-        for _ in 0..10 { exec(&db, "INSERT INTO t (v) VALUES (1)"); } // ids 1-10
+        exec(
+            &db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)",
+        );
+        for _ in 0..10 {
+            exec(&db, "INSERT INTO t (v) VALUES (1)");
+        } // ids 1-10
         db.checkpoint().unwrap();
         db.close().unwrap();
     }
@@ -63,7 +78,10 @@ fn crash_recovery_auto_increment_counter() {
 #[test]
 fn multi_col_group_by_with_null() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT, v INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT, v INT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 'x', 'y', 10)");
     exec(&db, "INSERT INTO t VALUES (2, 'x', NULL, 20)");
     exec(&db, "INSERT INTO t VALUES (3, 'x', 'y', 30)");
@@ -90,9 +108,13 @@ fn float_order_by_ties() {
     let r = rows(&db, "SELECT id, v FROM t ORDER BY v ASC");
     assert_eq!(r.len(), 5);
     // Verify ascending order.
-    let vals: Vec<f64> = r.iter().filter_map(|row| match &row[1] {
-        Value::Float(f) => Some(*f), _ => None
-    }).collect();
+    let vals: Vec<f64> = r
+        .iter()
+        .filter_map(|row| match &row[1] {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        })
+        .collect();
     assert!(vals.windows(2).all(|w| w[0] <= w[1]), "must be ascending");
 }
 
@@ -101,12 +123,19 @@ fn order_by_float_desc_correct() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
     for i in 1..=20 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {:.3})", i, (i as f64) * 1.1));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {:.3})", i, (i as f64) * 1.1),
+        );
     }
     let r = rows(&db, "SELECT v FROM t ORDER BY v DESC LIMIT 5");
-    let vals: Vec<f64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Float(f)) => Some(*f), _ => None
-    }).collect();
+    let vals: Vec<f64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Float(f)) => Some(*f),
+            _ => None,
+        })
+        .collect();
     // Top 5 should be values of ids 20,19,18,17,16: 22.0, 20.9, 19.8, 18.7, 17.6.
     assert!(vals.windows(2).all(|w| w[0] >= w[1]), "must be descending");
 }
@@ -119,17 +148,27 @@ fn order_by_float_desc_correct() {
 fn update_changes_sort_order() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    for i in 1..=10 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10)); }
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
+    }
     // Update id=1 to v=999 (should now be last in ascending order).
     exec(&db, "UPDATE t SET v = 999 WHERE id = 1");
     // Verify the updated value is correct.
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 999);
     // ORDER BY must reflect the UPDATE immediately (no checkpoint needed).
     let after = rows(&db, "SELECT id FROM t ORDER BY v ASC LIMIT 3");
-    let ids: Vec<i64> = after.iter().filter_map(|r| match &r[0] {
-        Value::Integer(n) => Some(*n), _ => None
-    }).collect();
-    assert_eq!(ids, vec![2, 3, 4], "ORDER BY must reflect UPDATE without checkpoint");
+    let ids: Vec<i64> = after
+        .iter()
+        .filter_map(|r| match &r[0] {
+            Value::Integer(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![2, 3, 4],
+        "ORDER BY must reflect UPDATE without checkpoint"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -140,9 +179,13 @@ fn update_changes_sort_order() {
 fn massive_delete_then_scan() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    for i in 1..=500 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i)); }
+    for i in 1..=500 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
+    }
     // Delete 50% randomly.
-    for i in 1..=250 { exec(&db, &format!("DELETE FROM t WHERE id = {}", i * 2)); }
+    for i in 1..=250 {
+        exec(&db, &format!("DELETE FROM t WHERE id = {}", i * 2));
+    }
     // Remaining: 250 odd IDs.
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 250);
     let r = rows(&db, "SELECT id FROM t ORDER BY id");
@@ -166,10 +209,16 @@ fn group_by_single_row_per_group() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=10 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'g{}', {})", i, i, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'g{}', {})", i, i, i * 10),
+        );
     }
     // Each group has exactly 1 row.
-    let r = rows(&db, "SELECT cat, COUNT(*), SUM(v), MIN(v), MAX(v) FROM t GROUP BY cat ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*), SUM(v), MIN(v), MAX(v) FROM t GROUP BY cat ORDER BY cat",
+    );
     assert_eq!(r.len(), 10);
     for row in &r {
         match (&row[1], &row[2], &row[3], &row[4]) {
@@ -196,7 +245,7 @@ fn distinct_with_null_in_combo() {
     exec(&db, "INSERT INTO t VALUES (3, 1, 2)");
     exec(&db, "INSERT INTO t VALUES (4, 2, NULL)");
     exec(&db, "INSERT INTO t VALUES (5, 1, 2)"); // dup of (1, 2)
-    // DISTINCT a, b → (1,NULL), (1,2), (2,NULL) = 3 unique.
+                                                 // DISTINCT a, b → (1,NULL), (1,2), (2,NULL) = 3 unique.
     let r = rows(&db, "SELECT DISTINCT a, b FROM t");
     assert_eq!(r.len(), 3, "distinct including NULL combos");
 }
@@ -210,11 +259,17 @@ fn where_between_float_column() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
     for i in 1..=20 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {:.1})", i, i as f64 * 0.5));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {:.1})", i, i as f64 * 0.5),
+        );
     }
     // v BETWEEN 3.0 AND 7.0 → ids 6,7,...,14 (v=3.0,3.5,...,7.0).
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE v BETWEEN 3.0 AND 7.0");
-    match r[0][0] { Value::Integer(n) => assert_eq!(n, 9), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert_eq!(n, 9),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -230,14 +285,24 @@ fn reopen_after_complex_sequence() {
         exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
         // Insert.
         for i in 1..=50 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 3, i));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 3, i),
+            );
         }
         db.checkpoint().unwrap();
         // Update half.
-        for i in 1..=25 { exec(&db, &format!("UPDATE t SET v = {} WHERE id = {}", i * 100, i)); }
+        for i in 1..=25 {
+            exec(
+                &db,
+                &format!("UPDATE t SET v = {} WHERE id = {}", i * 100, i),
+            );
+        }
         db.checkpoint().unwrap();
         // Delete some.
-        for i in 26..=35 { exec(&db, &format!("DELETE FROM t WHERE id = {}", i)); }
+        for i in 26..=35 {
+            exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
+        }
         db.checkpoint().unwrap();
         // Insert more.
         for i in 51..=60 {
@@ -254,9 +319,15 @@ fn reopen_after_complex_sequence() {
     // Non-updated rows (id 36-50): v = original.
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 40"), 40);
     // Deleted rows gone.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE id BETWEEN 26 AND 35"), 0);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE id BETWEEN 26 AND 35"),
+        0
+    );
     // New rows present.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'new'"), 10);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'new'"),
+        10
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -268,7 +339,10 @@ fn sum_float_where_exact() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
     for i in 1..=20 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {:.1})", i, i as f64 * 1.5));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {:.1})", i, i as f64 * 1.5),
+        );
     }
     // SUM(v) WHERE v >= 15.0 → ids 10-20 (v=15.0,16.5,...,30.0).
     // Sum = 1.5*(10+11+...+20) = 1.5 * 165 = 247.5.
@@ -287,9 +361,9 @@ fn sum_float_where_exact() {
 fn group_by_empty_string_vs_null() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, '')");     // empty string
-    exec(&db, "INSERT INTO t VALUES (2, '')");     // dup empty
-    exec(&db, "INSERT INTO t VALUES (3, NULL)");   // NULL
+    exec(&db, "INSERT INTO t VALUES (1, '')"); // empty string
+    exec(&db, "INSERT INTO t VALUES (2, '')"); // dup empty
+    exec(&db, "INSERT INTO t VALUES (3, NULL)"); // NULL
     exec(&db, "INSERT INTO t VALUES (4, 'a')");
     // GROUP BY cat → 3 groups: '', NULL, 'a'.
     let r = rows(&db, "SELECT cat, COUNT(*) FROM t GROUP BY cat");
@@ -305,17 +379,27 @@ fn order_by_with_indexed_where() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=100 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, 100 - i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, 100 - i),
+        );
     }
     exec(&db, "CREATE INDEX t_cat ON t(cat)");
     db.checkpoint().unwrap();
     db.wait_for_indexes_ready();
     // ORDER BY v DESC LIMIT 5 WHERE cat = 'c0'.
-    let r = rows(&db, "SELECT v FROM t WHERE cat = 'c0' ORDER BY v DESC LIMIT 5");
+    let r = rows(
+        &db,
+        "SELECT v FROM t WHERE cat = 'c0' ORDER BY v DESC LIMIT 5",
+    );
     assert_eq!(r.len(), 5);
-    let vals: Vec<i64> = r.iter().filter_map(|row| match &row[0] {
-        Value::Integer(n) => Some(*n), _ => None
-    }).collect();
+    let vals: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match &row[0] {
+            Value::Integer(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
     // cat='c0': ids 5,10,15,...,100 → v=95,90,85,...,0. Top 5: 95,90,85,80,75.
     assert_eq!(vals, vec![95, 90, 85, 80, 75]);
 }
@@ -354,11 +438,18 @@ fn where_not_like() {
     exec(&db, "INSERT INTO t VALUES (3, 'apricot')");
     exec(&db, "INSERT INTO t VALUES (4, 'cherry')");
     // NOT LIKE 'ap%' → banana, cherry (exclude apple, apricot).
-    let r = rows(&db, "SELECT id FROM t WHERE name NOT LIKE 'ap%' ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE name NOT LIKE 'ap%' ORDER BY id",
+    );
     assert_eq!(r.len(), 2);
-    let ids: Vec<i64> = r.iter().filter_map(|row| match &row[0] {
-        Value::Integer(n) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match &row[0] {
+            Value::Integer(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids, vec![2, 4]);
 }
 
@@ -370,9 +461,14 @@ fn where_not_like() {
 fn all_six_aggregates_one_query() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    for i in 1..=20 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i)); }
+    for i in 1..=20 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
+    }
     // All six aggregates in one SELECT.
-    let r = rows(&db, "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v), STDDEV(v) FROM t");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v), STDDEV(v) FROM t",
+    );
     assert_eq!(r.len(), 1);
     match (&r[0][0], &r[0][1], &r[0][3], &r[0][4]) {
         (Value::Integer(c), Value::Integer(s), Value::Integer(mn), Value::Integer(mx)) => {
@@ -410,9 +506,18 @@ fn distinct_with_limit_and_index() {
 
     // Without index this already worked; with the index it returned 3 rows.
     let r = rows(&db, "SELECT DISTINCT cat FROM t LIMIT 2");
-    assert_eq!(r.len(), 2, "DISTINCT cat LIMIT 2 must return 2 rows, got {}", r.len());
+    assert_eq!(
+        r.len(),
+        2,
+        "DISTINCT cat LIMIT 2 must return 2 rows, got {}",
+        r.len()
+    );
 
     // OFFSET must also be respected over the deduplicated set.
     let r = rows(&db, "SELECT DISTINCT cat FROM t LIMIT 2 OFFSET 1");
-    assert_eq!(r.len(), 2, "DISTINCT cat LIMIT 2 OFFSET 1 must return 2 rows");
+    assert_eq!(
+        r.len(),
+        2,
+        "DISTINCT cat LIMIT 2 OFFSET 1 must return 2 rows"
+    );
 }

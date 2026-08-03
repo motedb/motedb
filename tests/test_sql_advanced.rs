@@ -434,15 +434,24 @@ fn test_intersect() {
     db.execute("CREATE TABLE b (v INT)").unwrap();
     db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
-    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b").unwrap();
+    let r = db
+        .execute("SELECT v FROM a INTERSECT SELECT v FROM b")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("expected select"),
     };
-    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
-    }).collect();
+    let mut vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(i) = &r[0] {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .collect();
     vals.sort();
     assert_eq!(vals, vec![2, 3], "INTERSECT should return common values");
 }
@@ -455,17 +464,30 @@ fn test_except() {
     db.execute("CREATE TABLE b (v INT)").unwrap();
     db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
-    let r = db.execute("SELECT v FROM a EXCEPT SELECT v FROM b").unwrap();
+    let r = db
+        .execute("SELECT v FROM a EXCEPT SELECT v FROM b")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("expected select"),
     };
-    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
-    }).collect();
+    let mut vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(i) = &r[0] {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .collect();
     vals.sort();
-    assert_eq!(vals, vec![1], "EXCEPT should return values only in left side");
+    assert_eq!(
+        vals,
+        vec![1],
+        "EXCEPT should return values only in left side"
+    );
 }
 
 #[test]
@@ -474,10 +496,13 @@ fn test_intersect_except_with_duplicates() {
     let db = Database::create(dir.path()).unwrap();
     db.execute("CREATE TABLE a (v INT)").unwrap();
     db.execute("CREATE TABLE b (v INT)").unwrap();
-    db.execute("INSERT INTO a VALUES (1),(1),(2),(2),(3)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(1),(2),(2),(3)")
+        .unwrap();
     db.execute("INSERT INTO b VALUES (2),(2),(3),(4)").unwrap();
     // INTERSECT dedups: {2,3}
-    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b").unwrap();
+    let r = db
+        .execute("SELECT v FROM a INTERSECT SELECT v FROM b")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
@@ -485,7 +510,9 @@ fn test_intersect_except_with_duplicates() {
     };
     assert_eq!(rows.len(), 2, "INTERSECT dedups to 2,3");
     // EXCEPT dedups: {1}
-    let r = db.execute("SELECT v FROM a EXCEPT SELECT v FROM b").unwrap();
+    let r = db
+        .execute("SELECT v FROM a EXCEPT SELECT v FROM b")
+        .unwrap();
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("expected select"),
@@ -503,10 +530,14 @@ fn test_intersect_except_with_duplicates() {
 fn test_correlated_subquery_in_select() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE dept (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, salary INT)").unwrap();
-    db.execute("INSERT INTO dept VALUES (1,'Eng'),(2,'Sales')").unwrap();
-    db.execute("INSERT INTO emp VALUES (1,1,90),(2,1,110),(3,2,80)").unwrap();
+    db.execute("CREATE TABLE dept (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE emp (id INT PRIMARY KEY, dept_id INT, salary INT)")
+        .unwrap();
+    db.execute("INSERT INTO dept VALUES (1,'Eng'),(2,'Sales')")
+        .unwrap();
+    db.execute("INSERT INTO emp VALUES (1,1,90),(2,1,110),(3,2,80)")
+        .unwrap();
 
     let r = db.execute("SELECT d.name, (SELECT MAX(e.salary) FROM emp e WHERE e.dept_id = d.id) FROM dept d ORDER BY d.id").unwrap();
     use motedb::QueryResult;
@@ -516,18 +547,30 @@ fn test_correlated_subquery_in_select() {
     };
     assert_eq!(rows.len(), 2);
     // Eng max salary = 110, Sales max salary = 80
-    assert_eq!(rows[0][1], motedb::types::Value::Integer(110), "Eng max should be 110");
-    assert_eq!(rows[1][1], motedb::types::Value::Integer(80), "Sales max should be 80");
+    assert_eq!(
+        rows[0][1],
+        motedb::types::Value::Integer(110),
+        "Eng max should be 110"
+    );
+    assert_eq!(
+        rows[1][1],
+        motedb::types::Value::Integer(80),
+        "Sales max should be 80"
+    );
 }
 
 #[test]
 fn test_non_correlated_subquery_still_works() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     // Non-correlated: global AVG, same for all rows
-    let r = db.execute("SELECT id, (SELECT AVG(v) FROM t) FROM t ORDER BY id").unwrap();
+    let r = db
+        .execute("SELECT id, (SELECT AVG(v) FROM t) FROM t ORDER BY id")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
@@ -536,8 +579,8 @@ fn test_non_correlated_subquery_still_works() {
     // AVG(10,20,30) = 20 for all rows
     for row in &rows {
         match &row[1] {
-            motedb::types::Value::Integer(20) => {},
-            motedb::types::Value::Float(f) if (*f as i64) == 20 => {},
+            motedb::types::Value::Integer(20) => {}
+            motedb::types::Value::Float(f) if (*f as i64) == 20 => {}
             o => panic!("expected 20, got {:?}", o),
         }
     }
@@ -549,17 +592,29 @@ fn test_non_correlated_subquery_still_works() {
 fn test_row_number() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,90),(2,85),(3,90),(4,70),(5,80)").unwrap();
-    let r = db.execute("SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM s ORDER BY rn").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,90),(2,85),(3,90),(4,70),(5,80)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS rn FROM s ORDER BY rn")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
     assert_eq!(rows.len(), 5);
-    let rns: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(n) = &r[1] { Some(*n) } else { None }
-    }).collect();
+    let rns: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(n) = &r[1] {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert_eq!(rns, vec![1, 2, 3, 4, 5], "ROW_NUMBER should be 1-5");
 }
 
@@ -567,16 +622,28 @@ fn test_row_number() {
 fn test_rank_with_ties() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,90),(2,90),(3,85),(4,70)").unwrap();
-    let r = db.execute("SELECT id, RANK() OVER (ORDER BY score DESC) AS rk FROM s ORDER BY rk, id").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,90),(2,90),(3,85),(4,70)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id, RANK() OVER (ORDER BY score DESC) AS rk FROM s ORDER BY rk, id")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
-    let rks: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(n) = &r[1] { Some(*n) } else { None }
-    }).collect();
+    let rks: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(n) = &r[1] {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert_eq!(rks, vec![1, 1, 3, 4], "RANK: ties share rank, gap after");
 }
 
@@ -584,16 +651,28 @@ fn test_rank_with_ties() {
 fn test_dense_rank() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,90),(2,90),(3,85),(4,70)").unwrap();
-    let r = db.execute("SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM s ORDER BY dr, id").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, score INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,90),(2,90),(3,85),(4,70)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM s ORDER BY dr, id")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
-    let drs: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(n) = &r[1] { Some(*n) } else { None }
-    }).collect();
+    let drs: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(n) = &r[1] {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert_eq!(drs, vec![1, 1, 2, 3], "DENSE_RANK: no gap after ties");
 }
 
@@ -601,17 +680,29 @@ fn test_dense_rank() {
 fn test_row_number_partitioned() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE s (id INT PRIMARY KEY, cat TEXT, score INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,'a',90),(2,'a',85),(3,'b',70),(4,'b',80)").unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, cat TEXT, score INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,'a',90),(2,'a',85),(3,'b',70),(4,'b',80)")
+        .unwrap();
     let r = db.execute("SELECT id, cat, ROW_NUMBER() OVER (PARTITION BY cat ORDER BY score DESC) AS rn FROM s ORDER BY cat, rn").unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
     assert_eq!(rows.len(), 4);
     // cat 'a': rn 1,2. cat 'b': rn 1,2.
-    let a_rns: Vec<i64> = rows.iter().filter(|r| matches!(&r[1], motedb::types::Value::Text(t) if t.as_str()=="a"))
-        .filter_map(|r| if let motedb::types::Value::Integer(n)=&r[2]{Some(*n)}else{None}).collect();
+    let a_rns: Vec<i64> = rows
+        .iter()
+        .filter(|r| matches!(&r[1], motedb::types::Value::Text(t) if t.as_str()=="a"))
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(n) = &r[2] {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert_eq!(a_rns, vec![1, 2]);
 }
 
@@ -627,14 +718,24 @@ fn test_chained_union() {
     db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
     db.execute("INSERT INTO c VALUES (3),(4),(5)").unwrap();
-    let r = db.execute("SELECT v FROM a UNION SELECT v FROM b UNION SELECT v FROM c").unwrap();
+    let r = db
+        .execute("SELECT v FROM a UNION SELECT v FROM b UNION SELECT v FROM c")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
-    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
-    }).collect();
+    let mut vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(i) = &r[0] {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .collect();
     vals.sort();
     assert_eq!(vals, vec![1, 2, 3, 4, 5], "3-way UNION should dedup all");
 }
@@ -649,10 +750,13 @@ fn test_chained_intersect() {
     db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
     db.execute("INSERT INTO c VALUES (3),(4),(5)").unwrap();
-    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b INTERSECT SELECT v FROM c").unwrap();
+    let r = db
+        .execute("SELECT v FROM a INTERSECT SELECT v FROM b INTERSECT SELECT v FROM c")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
     assert_eq!(rows.len(), 1, "3-way INTERSECT => only 3");
 }
@@ -668,14 +772,28 @@ fn test_mixed_set_ops_left_assoc() {
     db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
     db.execute("INSERT INTO c VALUES (3),(4),(5)").unwrap();
     // Left-assoc: (a INTERSECT b) UNION c = {2,3} UNION {3,4,5} = {2,3,4,5}
-    let r = db.execute("SELECT v FROM a INTERSECT SELECT v FROM b UNION SELECT v FROM c").unwrap();
+    let r = db
+        .execute("SELECT v FROM a INTERSECT SELECT v FROM b UNION SELECT v FROM c")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
-        QueryResult::Select { rows, .. } => rows, _ => panic!("expected select"),
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("expected select"),
     };
-    let mut vals: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
-    }).collect();
+    let mut vals: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(i) = &r[0] {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .collect();
     vals.sort();
-    assert_eq!(vals, vec![2, 3, 4, 5], "left-assoc (a intersect b) union c = 2,3,4,5");
+    assert_eq!(
+        vals,
+        vec![2, 3, 4, 5],
+        "left-assoc (a intersect b) union c = 2,3,4,5"
+    );
 }

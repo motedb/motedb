@@ -35,11 +35,10 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 
 fn setup() -> (Database, TempDir) {
     let (db, dir) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, v INT)").unwrap();
-    db.execute(
-        "INSERT INTO t VALUES (1,'b',30),(2,'a',10),(3,'c',20),(4,'a',40),(5,'b',NULL)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'b',30),(2,'a',10),(3,'c',20),(4,'a',40),(5,'b',NULL)")
+        .unwrap();
     (db, dir)
 }
 
@@ -51,7 +50,10 @@ fn setup() -> (Database, TempDir) {
 fn test_groupby_having_count_gt_orderby() {
     let (db, _d) = setup();
     // cat a (2 rows), b (2 rows), c (1 row). HAVING COUNT(*) > 1 → a, b
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat",
+    );
     assert_eq!(
         r,
         vec![vec![Value::text("a".into())], vec![Value::text("b".into())]]
@@ -62,7 +64,10 @@ fn test_groupby_having_count_gt_orderby() {
 fn test_groupby_having_count_eq_orderby() {
     let (db, _d) = setup();
     // HAVING COUNT(*) = 1 → only c
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) = 1 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) = 1 ORDER BY cat",
+    );
     assert_eq!(r, vec![vec![Value::text("c".into())]]);
 }
 
@@ -70,7 +75,10 @@ fn test_groupby_having_count_eq_orderby() {
 fn test_groupby_having_count_ne_orderby() {
     let (db, _d) = setup();
     // HAVING COUNT(*) <> 2 → c (1 row)
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) <> 2 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) <> 2 ORDER BY cat",
+    );
     assert_eq!(r, vec![vec![Value::text("c".into())]]);
 }
 
@@ -78,7 +86,10 @@ fn test_groupby_having_count_ne_orderby() {
 fn test_groupby_having_count_gte_orderby() {
     let (db, _d) = setup();
     // HAVING COUNT(*) >= 2 → a, b
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) >= 2 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) >= 2 ORDER BY cat",
+    );
     assert_eq!(
         r,
         vec![vec![Value::text("a".into())], vec![Value::text("b".into())]]
@@ -92,7 +103,10 @@ fn test_groupby_having_count_gte_orderby() {
 #[test]
 fn test_groupby_having_no_orderby() {
     let (db, _d) = setup();
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat",
+    );
     let cats: Vec<String> = r
         .into_iter()
         .map(|row| match &row[0] {
@@ -111,7 +125,10 @@ fn test_groupby_having_no_orderby() {
 fn test_groupby_having_sum_not_in_select_orderby() {
     let (db, _d) = setup();
     // SUM per cat (ignoring NULL): a=50, b=30, c=20. HAVING SUM(v) > 25 → a, b
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING SUM(v) > 25 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING SUM(v) > 25 ORDER BY cat",
+    );
     assert_eq!(
         r,
         vec![vec![Value::text("a".into())], vec![Value::text("b".into())]]
@@ -126,7 +143,10 @@ fn test_groupby_having_sum_not_in_select_orderby() {
 fn test_groupby_having_after_checkpoint() {
     let (db, _d) = setup();
     db.checkpoint().unwrap();
-    let r = q(&db, "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat");
+    let r = q(
+        &db,
+        "SELECT cat FROM t GROUP BY cat HAVING COUNT(*) > 1 ORDER BY cat",
+    );
     assert_eq!(
         r,
         vec![vec![Value::text("a".into())], vec![Value::text("b".into())]]

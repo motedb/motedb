@@ -149,7 +149,10 @@ fn timestamp_year_month_day() {
 fn date_add_basic() {
     // DATE_ADD adds SECONDS (per the evaluator).
     let (db, _dir) = new_db();
-    let r = rows(&db, "SELECT TO_MICROS(DATE_ADD(TIMESTAMP_MICROS(1700000000000000), 100))");
+    let r = rows(
+        &db,
+        "SELECT TO_MICROS(DATE_ADD(TIMESTAMP_MICROS(1700000000000000), 100))",
+    );
     // 1700000000000000 micros + 100 seconds = +100_000_000 micros.
     match &r[0][0] {
         Value::Integer(n) => assert_eq!(*n, 1700000100000000, "DATE_ADD +100s"),
@@ -161,7 +164,10 @@ fn date_add_basic() {
 fn date_diff_basic() {
     // DATE_DIFF returns difference in SECONDS.
     let (db, _dir) = new_db();
-    let r = rows(&db, "SELECT DATE_DIFF(TIMESTAMP_MICROS(1700000100000000), TIMESTAMP_MICROS(1700000000000000))");
+    let r = rows(
+        &db,
+        "SELECT DATE_DIFF(TIMESTAMP_MICROS(1700000100000000), TIMESTAMP_MICROS(1700000000000000))",
+    );
     // 100_000_000 micros diff / 1_000_000 = 100 seconds.
     match &r[0][0] {
         Value::Integer(n) => assert_eq!(*n, 100, "DATE_DIFF = 100s"),
@@ -222,10 +228,7 @@ fn timestamp_min_max_current_limitation() {
     // micros), just the type wrapper differs. Document either behavior.
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)");
-    exec(
-        &db,
-        "INSERT INTO t VALUES (1, 1000), (2, 5000), (3, 3000)",
-    );
+    exec(&db, "INSERT INTO t VALUES (1, 1000), (2, 5000), (3, 3000)");
     let r = rows(&db, "SELECT MIN(ts) FROM t");
     match &r[0][0] {
         Value::Timestamp(_) => {} // correct (future fix)
@@ -267,10 +270,13 @@ fn ambiguous_bare_column_in_group_by_after_join() {
     exec(&db, "INSERT INTO a VALUES (1, 'x')");
     exec(&db, "INSERT INTO b VALUES (1, 'y')");
     // GROUP BY bare cat — ambiguous. Document no crash.
-    let r = try_rows(&db, "SELECT cat, COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY cat");
+    let r = try_rows(
+        &db,
+        "SELECT cat, COUNT(*) FROM a JOIN b ON a.id = b.id GROUP BY cat",
+    );
     match r {
         Ok(rows) => assert!(!rows.is_empty() || rows.is_empty()), // any result OK
-        Err(_) => {} // error is acceptable
+        Err(_) => {}                                              // error is acceptable
     }
 }
 
@@ -301,7 +307,10 @@ fn or_with_is_null_in_where() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 20)");
     // v = 10 OR v IS NULL → rows 1, 2.
-    let r = rows(&db, "SELECT id FROM t WHERE v = 10 OR v IS NULL ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE v = 10 OR v IS NULL ORDER BY id",
+    );
     let ids: Vec<i64> = r
         .iter()
         .filter_map(|row| match row[0] {
@@ -394,7 +403,10 @@ fn create_table_if_not_exists_idempotent() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
     // CREATE TABLE IF NOT EXISTS should be no-op.
-    exec(&db, "CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY, v INT)");
+    exec(
+        &db,
+        "CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY, v INT)",
+    );
     // Data must still be there.
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1);
 }
@@ -430,7 +442,10 @@ fn batch_insert_mixed_nulls() {
 #[test]
 fn partial_column_insert() {
     let (db, _dir) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c TEXT)",
+    );
     // Insert with explicit column list, omitting some.
     exec(&db, "INSERT INTO t (id, a) VALUES (1, 10)");
     let r = rows(&db, "SELECT a, b, c FROM t WHERE id = 1");
@@ -572,7 +587,10 @@ fn cast_null_propagates() {
 fn min_max_on_text() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')",
+    );
     // MIN/MAX on text — alphabetical.
     let r = rows(&db, "SELECT MIN(s) FROM t");
     match &r[0][0] {
@@ -594,7 +612,10 @@ fn group_by_with_multiple_aggregates() {
         &db,
         "INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 40)",
     );
-    let r = rows(&db, "SELECT cat, COUNT(*), SUM(v), MIN(v), MAX(v) FROM t GROUP BY cat ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*), SUM(v), MIN(v), MAX(v) FROM t GROUP BY cat ORDER BY cat",
+    );
     assert_eq!(r.len(), 2);
     // 'a': count=2, sum=30, min=10, max=20.
     match &r[0][0] {
@@ -630,7 +651,8 @@ fn savepoint_basic() {
     let tx = db.begin_transaction().expect("begin");
     db.savepoint(tx, "sp1").expect("sp1");
     exec_txn(&db, tx, "INSERT INTO t VALUES (1, 10)");
-    db.rollback_to_savepoint(tx, "sp1").expect("rollback to sp1");
+    db.rollback_to_savepoint(tx, "sp1")
+        .expect("rollback to sp1");
     db.commit_transaction(tx).expect("commit");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 0);
 }

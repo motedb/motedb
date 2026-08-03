@@ -84,9 +84,9 @@ fn test_null_column_comparison_is_null() {
     assert_eq!(
         r,
         vec![
-            vec![Value::Null], // NULL = NULL
-            vec![Value::Null], // NULL = 1
-            vec![Value::Null], // 1 = NULL
+            vec![Value::Null],       // NULL = NULL
+            vec![Value::Null],       // NULL = 1
+            vec![Value::Null],       // 1 = NULL
             vec![Value::Bool(true)], // 1 = 1
         ]
     );
@@ -147,7 +147,10 @@ fn test_where_with_null_rows() {
 #[test]
 fn test_is_null_predicates() {
     let (db, _d) = db();
-    let r = q(&db, "SELECT NULL IS NULL, 1 IS NULL, NULL IS NOT NULL, 1 IS NOT NULL");
+    let r = q(
+        &db,
+        "SELECT NULL IS NULL, 1 IS NULL, NULL IS NOT NULL, 1 IS NOT NULL",
+    );
     assert_eq!(
         r,
         vec![vec![
@@ -184,10 +187,8 @@ fn test_and_or_null_three_valued() {
 
 fn sales_db() -> (Database, TempDir) {
     let (db, dir) = db();
-    db.execute(
-        "CREATE TABLE sales (id INT PRIMARY KEY, cat TEXT, qty INT, region TEXT)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE sales (id INT PRIMARY KEY, cat TEXT, qty INT, region TEXT)")
+        .unwrap();
     db.execute(
         "INSERT INTO sales VALUES \
          (1,'a',10,'east'), (2,'a',20,'west'), (3,'b',30,'east'), \

@@ -37,10 +37,15 @@ fn f_of(v: &Value) -> f64 {
 #[test]
 fn test_rank_with_ties() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s(id INT PRIMARY KEY, score INT)").unwrap();
+    db.execute("CREATE TABLE s(id INT PRIMARY KEY, score INT)")
+        .unwrap();
     // scores: 100, 90, 90, 80
-    db.execute("INSERT INTO s VALUES (1,100),(2,90),(3,90),(4,80)").unwrap();
-    let r = q(&db, "SELECT id, RANK() OVER (ORDER BY score DESC) AS rk FROM s ORDER BY id");
+    db.execute("INSERT INTO s VALUES (1,100),(2,90),(3,90),(4,80)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, RANK() OVER (ORDER BY score DESC) AS rk FROM s ORDER BY id",
+    );
     // rank: 100→1, 90→2, 90→2, 80→4
     assert_eq!(
         r,
@@ -56,9 +61,14 @@ fn test_rank_with_ties() {
 #[test]
 fn test_dense_rank_with_ties() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s(id INT PRIMARY KEY, score INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,100),(2,90),(3,90),(4,80)").unwrap();
-    let r = q(&db, "SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM s ORDER BY id");
+    db.execute("CREATE TABLE s(id INT PRIMARY KEY, score INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,100),(2,90),(3,90),(4,80)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM s ORDER BY id",
+    );
     // dense_rank: 100→1, 90→2, 90→2, 80→3
     assert_eq!(
         r,
@@ -74,8 +84,10 @@ fn test_dense_rank_with_ties() {
 #[test]
 fn test_row_number_partitioned() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s(id INT PRIMARY KEY, g INT, v INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,1,30),(2,1,10),(3,2,20),(4,2,40)").unwrap();
+    db.execute("CREATE TABLE s(id INT PRIMARY KEY, g INT, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,1,30),(2,1,10),(3,2,20),(4,2,40)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v DESC) AS rn FROM s ORDER BY id",
@@ -95,8 +107,10 @@ fn test_row_number_partitioned() {
 #[test]
 fn test_lag_lead() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO s VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE s(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT id, LAG(v) OVER (ORDER BY id) AS prev, LEAD(v) OVER (ORDER BY id) AS nxt FROM s ORDER BY id",
@@ -119,20 +133,24 @@ fn test_lag_lead() {
 #[test]
 fn test_cte_basic() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
-    let r = q(&db, "WITH x AS (SELECT * FROM t WHERE v > 15) SELECT v FROM x ORDER BY v");
-    assert_eq!(
-        r,
-        vec![vec![Value::Integer(20)], vec![Value::Integer(30)]]
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
+    let r = q(
+        &db,
+        "WITH x AS (SELECT * FROM t WHERE v > 15) SELECT v FROM x ORDER BY v",
     );
+    assert_eq!(r, vec![vec![Value::Integer(20)], vec![Value::Integer(30)]]);
 }
 
 #[test]
 fn test_cte_referencing_cte() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     let r = q(
         &db,
         "WITH a AS (SELECT * FROM t WHERE v > 10), b AS (SELECT * FROM a WHERE v < 30) SELECT v FROM b ORDER BY v",
@@ -145,7 +163,8 @@ fn test_cte_referencing_cte() {
 fn test_cte_with_aggregate() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(g INT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(1,20),(2,5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(1,20),(2,5)")
+        .unwrap();
     let r = q(
         &db,
         "WITH agg AS (SELECT g, SUM(v) AS s FROM t GROUP BY g) SELECT g, s FROM agg WHERE s > 10 ORDER BY g",
@@ -187,7 +206,10 @@ fn test_leftstr_rightstr() {
     match res {
         Ok(r) => {
             let got = rows(r.materialize().unwrap());
-            assert_eq!(got, vec![vec![Value::text("he".into()), Value::text("lo".into())]]);
+            assert_eq!(
+                got,
+                vec![vec![Value::text("he".into()), Value::text("lo".into())]]
+            );
         }
         Err(_) => { /* unsupported: acceptable */ }
     }
@@ -255,7 +277,14 @@ fn test_modulo_basic() {
 fn test_negative_arithmetic() {
     let (db, _d) = db();
     let r = q(&db, "SELECT -5 + 3, 10 - -3, -2 * -4");
-    assert_eq!(r, vec![vec![Value::Integer(-2), Value::Integer(13), Value::Integer(8)]]);
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Integer(-2),
+            Value::Integer(13),
+            Value::Integer(8)
+        ]]
+    );
 }
 
 #[test]
@@ -297,8 +326,10 @@ fn test_case_with_else() {
 #[test]
 fn test_searched_case_multiple_when() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,5),(2,15),(3,25)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,5),(2,15),(3,25)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT id, CASE WHEN v < 10 THEN 'low' WHEN v < 20 THEN 'mid' ELSE 'high' END AS bucket FROM t ORDER BY id",
@@ -317,8 +348,10 @@ fn test_searched_case_multiple_when() {
 fn test_simple_case_expr() {
     // CASE expr WHEN val THEN ... (simple form)
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, code INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,1),(2,2),(3,3)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, code INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,1),(2,2),(3,3)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT id, CASE code WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END AS name FROM t ORDER BY id",
@@ -336,9 +369,14 @@ fn test_simple_case_expr() {
 #[test]
 fn test_case_in_where() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,5),(2,15),(3,25)").unwrap();
-    let r = q(&db, "SELECT id FROM t WHERE CASE WHEN v > 10 THEN 1 ELSE 0 END = 1 ORDER BY id");
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,5),(2,15),(3,25)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id FROM t WHERE CASE WHEN v > 10 THEN 1 ELSE 0 END = 1 ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]);
 }
 
@@ -370,8 +408,14 @@ fn test_nullif_equal() {
 #[test]
 fn test_ifnull() {
     let (db, _d) = db();
-    let r = q(&db, "SELECT IFNULL(NULL, 'default'), IFNULL('x', 'default')");
-    assert_eq!(r, vec![vec![Value::text("default".into()), Value::text("x".into())]]);
+    let r = q(
+        &db,
+        "SELECT IFNULL(NULL, 'default'), IFNULL('x', 'default')",
+    );
+    assert_eq!(
+        r,
+        vec![vec![Value::text("default".into()), Value::text("x".into())]]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -381,9 +425,14 @@ fn test_ifnull() {
 #[test]
 fn test_scalar_subquery_in_select() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
-    let r = q(&db, "SELECT id, (SELECT MAX(v) FROM t) AS mx FROM t ORDER BY id");
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, (SELECT MAX(v) FROM t) AS mx FROM t ORDER BY id",
+    );
     assert_eq!(
         r,
         vec![
@@ -397,20 +446,29 @@ fn test_scalar_subquery_in_select() {
 #[test]
 fn test_subquery_in_where_comparison() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     // rows where v > average (avg=20) → id 3
-    let r = q(&db, "SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(3)]]);
 }
 
 #[test]
 fn test_correlated_subquery() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE orders(id INT PRIMARY KEY, cust INT, amt INT)").unwrap();
-    db.execute("CREATE TABLE customers(id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50)").unwrap();
-    db.execute("INSERT INTO customers VALUES (1,'Alice'),(2,'Bob')").unwrap();
+    db.execute("CREATE TABLE orders(id INT PRIMARY KEY, cust INT, amt INT)")
+        .unwrap();
+    db.execute("CREATE TABLE customers(id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50)")
+        .unwrap();
+    db.execute("INSERT INTO customers VALUES (1,'Alice'),(2,'Bob')")
+        .unwrap();
     // customers whose total orders > 100 → Alice (300)
     let r = q(
         &db,
@@ -445,7 +503,8 @@ fn test_limit_zero() {
 fn test_limit_with_offset() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(id INT PRIMARY KEY)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2");
     assert_eq!(r, vec![vec![Value::Integer(3)], vec![Value::Integer(4)]]);
 }

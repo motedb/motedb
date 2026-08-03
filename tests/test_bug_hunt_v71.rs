@@ -29,7 +29,8 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn test_select_nonexistent_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let res = db.execute("SELECT nonexistent FROM t");
     assert!(res.is_err(), "nonexistent column should error");
 }
@@ -100,7 +101,8 @@ fn test_unknown_function() {
 #[test]
 fn test_insert_text_into_int_errors() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     let res = db.execute("INSERT INTO t VALUES (1, 'not a number')");
     // Non-numeric text into INT should error.
     assert!(res.is_err(), "text into INT column should error");
@@ -113,7 +115,8 @@ fn test_insert_int_into_bool_strict() {
     // that strictness — consistent with `INSERT INTO int_col VALUES (TRUE)`
     // also being rejected.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, b BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, b BOOLEAN)")
+        .unwrap();
     let res = db.execute("INSERT INTO t VALUES (1, 1)");
     assert!(res.is_err(), "INSERT int into BOOLEAN is strict (rejected)");
     // But TRUE works.
@@ -131,7 +134,8 @@ fn test_failed_insert_does_not_block_same_pk() {
     // phantom entry in the PK cache, so a subsequent valid INSERT with the same
     // PK failed with "Duplicate primary key" even though no row was stored.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, b BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, b BOOLEAN)")
+        .unwrap();
     // First insert: rejected (type mismatch).
     let bad = db.execute("INSERT INTO t VALUES (1, 1)");
     assert!(bad.is_err());
@@ -139,9 +143,8 @@ fn test_failed_insert_does_not_block_same_pk() {
     let r0 = q(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(r0, vec![vec![Value::Integer(0)]]);
     // Second insert with same PK: must succeed (phantom PK was cleaned up).
-    db.execute("INSERT INTO t VALUES (1, TRUE)").expect(
-        "valid INSERT with same PK as a prior FAILED insert must succeed",
-    );
+    db.execute("INSERT INTO t VALUES (1, TRUE)")
+        .expect("valid INSERT with same PK as a prior FAILED insert must succeed");
     let r1 = q(&db, "SELECT id, b FROM t");
     assert_eq!(r1, vec![vec![Value::Integer(1), Value::Bool(true)]]);
 }
@@ -250,10 +253,20 @@ fn test_expression_with_functions_nested() {
 fn test_empty_table_aggregates_all() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(v INT)").unwrap();
-    let r = q(&db, "SELECT COUNT(*), COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM t");
+    let r = q(
+        &db,
+        "SELECT COUNT(*), COUNT(v), SUM(v), AVG(v), MIN(v), MAX(v) FROM t",
+    );
     assert_eq!(
         r,
-        vec![vec![Value::Integer(0), Value::Integer(0), Value::Null, Value::Null, Value::Null, Value::Null]]
+        vec![vec![
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]]
     );
 }
 
@@ -264,8 +277,10 @@ fn test_empty_table_aggregates_all() {
 #[test]
 fn test_index_simple_equality() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     // Equality lookup via index.
     let r = q(&db, "SELECT id FROM t WHERE v = 20");

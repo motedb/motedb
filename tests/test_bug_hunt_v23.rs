@@ -104,9 +104,13 @@ fn savepoint_basic_rollback_to() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (1, 10)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (1, 10)")
+        .and_then(|r| r.materialize());
     db.savepoint(tx, "sp1").expect("savepoint");
-    let _ = db.execute("INSERT INTO t VALUES (2, 20)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .and_then(|r| r.materialize());
     db.rollback_to_savepoint(tx, "sp1").expect("rb to sp");
     db.commit_transaction(tx).expect("commit");
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t");
@@ -118,9 +122,13 @@ fn savepoint_release_then_no_rollback() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (1, 10)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (1, 10)")
+        .and_then(|r| r.materialize());
     db.savepoint(tx, "sp1").expect("savepoint");
-    let _ = db.execute("INSERT INTO t VALUES (2, 20)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .and_then(|r| r.materialize());
     db.release_savepoint(tx, "sp1").expect("release");
     // After release, rollback_to should fail (savepoint gone).
     let r = db.rollback_to_savepoint(tx, "sp1");
@@ -135,11 +143,17 @@ fn savepoint_nested() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (1, 10)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (1, 10)")
+        .and_then(|r| r.materialize());
     db.savepoint(tx, "outer").expect("outer");
-    let _ = db.execute("INSERT INTO t VALUES (2, 20)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .and_then(|r| r.materialize());
     db.savepoint(tx, "inner").expect("inner");
-    let _ = db.execute("INSERT INTO t VALUES (3, 30)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (3, 30)")
+        .and_then(|r| r.materialize());
     db.rollback_to_savepoint(tx, "inner").expect("rb inner");
     db.commit_transaction(tx).expect("commit");
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t");
@@ -152,11 +166,17 @@ fn savepoint_rollback_to_outer_after_inner() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (1, 10)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (1, 10)")
+        .and_then(|r| r.materialize());
     db.savepoint(tx, "outer").expect("outer");
-    let _ = db.execute("INSERT INTO t VALUES (2, 20)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .and_then(|r| r.materialize());
     db.savepoint(tx, "inner").expect("inner");
-    let _ = db.execute("INSERT INTO t VALUES (3, 30)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (3, 30)")
+        .and_then(|r| r.materialize());
     // Rollback to outer — should discard both 2 and 3.
     db.rollback_to_savepoint(tx, "outer").expect("rb outer");
     db.commit_transaction(tx).expect("commit");
@@ -174,9 +194,15 @@ fn txn_rollback_after_multiple_writes() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (4, 40)").and_then(|r| r.materialize());
-    let _ = db.execute("UPDATE t SET v = 999 WHERE id = 1").and_then(|r| r.materialize());
-    let _ = db.execute("DELETE FROM t WHERE id = 2").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (4, 40)")
+        .and_then(|r| r.materialize());
+    let _ = db
+        .execute("UPDATE t SET v = 999 WHERE id = 1")
+        .and_then(|r| r.materialize());
+    let _ = db
+        .execute("DELETE FROM t WHERE id = 2")
+        .and_then(|r| r.materialize());
     db.rollback_transaction(tx).expect("rollback");
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(n, 3, "rollback should undo all writes");
@@ -189,8 +215,12 @@ fn txn_commit_persists() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (1, 10)").and_then(|r| r.materialize());
-    let _ = db.execute("INSERT INTO t VALUES (2, 20)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (1, 10)")
+        .and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .and_then(|r| r.materialize());
     db.commit_transaction(tx).expect("commit");
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(n, 2);
@@ -257,7 +287,10 @@ fn in_subquery_with_null_in_inner() {
     // NOT IN (NULL, 20): for v not in list, NULL in list → unknown → no match.
     let n_in = scalar_i64(&db, "SELECT COUNT(*) FROM a WHERE v IN (SELECT v FROM b)");
     assert_eq!(n_in, 1, "only v=20 matches");
-    let n_not_in = scalar_i64(&db, "SELECT COUNT(*) FROM a WHERE v NOT IN (SELECT v FROM b)");
+    let n_not_in = scalar_i64(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE v NOT IN (SELECT v FROM b)",
+    );
     // NULL in inner list makes NOT IN return unknown for ALL rows.
     assert_eq!(n_not_in, 0, "NOT IN with NULL in inner list returns 0 rows");
 }
@@ -273,7 +306,8 @@ fn update_with_subquery_in_set() {
     exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20)");
     // UPDATE t SET v = (SELECT MAX(v) FROM t) — scalar subquery evaluated
     // once, result (20) applied to every matching row.
-    db.execute("UPDATE t SET v = (SELECT MAX(v) FROM t)").unwrap();
+    db.execute("UPDATE t SET v = (SELECT MAX(v) FROM t)")
+        .unwrap();
     let r = rows(&db, "SELECT v FROM t ORDER BY id");
     assert!(matches!(&r[0][0], Value::Integer(20)), "got {:?}", r[0][0]);
     assert!(matches!(&r[1][0], Value::Integer(20)));
@@ -287,7 +321,8 @@ fn delete_with_subquery_returned_ids() {
     exec(&db, "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)");
     exec(&db, "INSERT INTO b VALUES (1, 1), (2, 3)");
     // Delete a rows that have a matching b.a_id.
-    db.execute("DELETE FROM a WHERE id IN (SELECT a_id FROM b)").unwrap();
+    db.execute("DELETE FROM a WHERE id IN (SELECT a_id FROM b)")
+        .unwrap();
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM a");
     // Deleted ids 1 and 3. Remaining: id=2.
     assert_eq!(n, 1);
@@ -379,7 +414,10 @@ fn integer_boundary_i64_min() {
 fn like_case_sensitive() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'Apple'), (2, 'apple'), (3, 'APPLE')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'Apple'), (2, 'apple'), (3, 'APPLE')",
+    );
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE s LIKE 'apple'");
     // SQL standard: LIKE is case-sensitive (in most DBs).
     assert_eq!(n, 1, "LIKE 'apple' matches only exact case");
@@ -486,7 +524,9 @@ fn txn_read_your_writes_visible() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
     let tx = db.begin_transaction().expect("begin");
-    let _ = db.execute("INSERT INTO t VALUES (2, 20)").and_then(|r| r.materialize());
+    let _ = db
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .and_then(|r| r.materialize());
     // Within the txn, both rows are visible (read-your-writes).
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(n, 2, "within txn, uncommitted writes are visible");

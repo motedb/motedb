@@ -81,8 +81,10 @@ fn test_bool_arithmetic() {
 fn test_where_bool_column_eq_int() {
     // BOOLEAN column compared with Integer literal.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, TRUE)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, TRUE)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t WHERE flag = 1 ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
@@ -90,8 +92,10 @@ fn test_where_bool_column_eq_int() {
 #[test]
 fn test_where_bool_column_eq_zero() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, TRUE)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, TRUE)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t WHERE flag = 0");
     assert_eq!(r, vec![vec![Value::Integer(2)]]);
 }
@@ -99,8 +103,10 @@ fn test_where_bool_column_eq_zero() {
 #[test]
 fn test_where_int_column_eq_true() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, 1)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, 1)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t WHERE v = TRUE ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
@@ -108,8 +114,10 @@ fn test_where_int_column_eq_true() {
 #[test]
 fn test_where_bool_column_neq_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, TRUE)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, TRUE)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t WHERE flag != 1 ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(2)]]);
 }
@@ -117,7 +125,8 @@ fn test_where_bool_column_neq_int() {
 #[test]
 fn test_where_pk_eq_true() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
     let r = q(&db, "SELECT id FROM t WHERE id = TRUE");
     assert_eq!(r, vec![vec![Value::Integer(1)]]);

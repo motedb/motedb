@@ -73,9 +73,15 @@ fn inner_join_reversed_on_operand() {
     exec(&db, "INSERT INTO a VALUES (1, 10), (2, 20)");
     exec(&db, "INSERT INTO b VALUES (10, 1), (20, 2)");
     // Normal order: a.id = b.k
-    let r1 = rows(&db, "SELECT a.id, b.id FROM a JOIN b ON a.id = b.k ORDER BY a.id");
+    let r1 = rows(
+        &db,
+        "SELECT a.id, b.id FROM a JOIN b ON a.id = b.k ORDER BY a.id",
+    );
     // Reversed: b.k = a.id — should produce the same result.
-    let r2 = rows(&db, "SELECT a.id, b.id FROM a JOIN b ON b.k = a.id ORDER BY a.id");
+    let r2 = rows(
+        &db,
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.id ORDER BY a.id",
+    );
     assert_eq!(r1.len(), 2, "normal ON should match 2 rows");
     assert_eq!(
         r2.len(),
@@ -108,11 +114,21 @@ fn left_join_reversed_on_operand() {
     exec(&db, "INSERT INTO a VALUES (1), (2)");
     exec(&db, "INSERT INTO b VALUES (10, 1)");
     // Normal: a LEFT JOIN b ON a.id = b.a_id → (1,10), (2,NULL).
-    let r1 = rows(&db, "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id");
+    let r1 = rows(
+        &db,
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id",
+    );
     // Reversed ON.
-    let r2 = rows(&db, "SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id = a.id ORDER BY a.id");
+    let r2 = rows(
+        &db,
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id = a.id ORDER BY a.id",
+    );
     assert_eq!(r1.len(), 2);
-    assert_eq!(r2.len(), 2, "reversed ON operand in LEFT JOIN must preserve left rows");
+    assert_eq!(
+        r2.len(),
+        2,
+        "reversed ON operand in LEFT JOIN must preserve left rows"
+    );
     // Row 1 should match b.id=10 in both.
     assert_eq!(r1[0][0], Value::Integer(1));
     assert_eq!(r2[0][0], Value::Integer(1));
@@ -135,7 +151,11 @@ fn three_table_join_reversed_middle_on() {
         &db,
         "SELECT a.id, b.id, c.id FROM a JOIN b ON a.id = b.a_id JOIN c ON c.b_id = b.id",
     );
-    assert_eq!(r.len(), 1, "3-table join with reversed middle ON should match 1 row");
+    assert_eq!(
+        r.len(),
+        1,
+        "3-table join with reversed middle ON should match 1 row"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -275,7 +295,11 @@ fn round_half_values() {
     // ROUND(2.5) — half-up gives 3; half-to-even gives 2. Document actual.
     let r = rows(&db, "SELECT ROUND(2.5)");
     match &r[0][0] {
-        Value::Float(f) => assert!(*f == 3.0 || *f == 2.0, "ROUND(2.5) = {}, document actual", f),
+        Value::Float(f) => assert!(
+            *f == 3.0 || *f == 2.0,
+            "ROUND(2.5) = {}, document actual",
+            f
+        ),
         Value::Integer(n) => assert!(*n == 3 || *n == 2, "ROUND(2.5) = {}", n),
         o => panic!("expected numeric, got {:?}", o),
     }
@@ -339,7 +363,9 @@ fn max_i64_literal_roundtrips() {
     let (db, _dir) = new_db();
     let r = rows(&db, "SELECT 9223372036854775807");
     match &r[0][0] {
-        Value::Integer(n) => assert_eq!(*n, 9223372036854775807, "i64::MAX literal should roundtrip"),
+        Value::Integer(n) => {
+            assert_eq!(*n, 9223372036854775807, "i64::MAX literal should roundtrip")
+        }
         o => panic!("expected i64::MAX, got {:?}", o),
     }
 }
@@ -390,7 +416,7 @@ fn division_by_zero_errors() {
     let r = try_rows(&db, "SELECT 10 / 0");
     match r {
         Ok(rows) => match &rows[0][0] {
-            Value::Null => {} // SQLite-style
+            Value::Null => {}                        // SQLite-style
             Value::Float(f) if f.is_infinite() => {} // some engines
             _ => panic!("10/0 returned {:?}", rows[0][0]),
         },
@@ -453,7 +479,11 @@ fn sum_near_i64_max() {
         Value::Integer(_) => {} // exact, no overflow (unexpected but not wrong)
         Value::Float(f) => {
             // Should be ~9.22e18 (2^63). Accept any positive Float.
-            assert!(*f > 1e18, "SUM overflow Float should be ~9.22e18, got {}", f);
+            assert!(
+                *f > 1e18,
+                "SUM overflow Float should be ~9.22e18, got {}",
+                f
+            );
         }
         Value::Null => panic!("SUM of non-null should not be NULL"),
         o => panic!("got {:?}", o),
@@ -480,7 +510,10 @@ fn round_on_aggregate_result_current_limitation() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
     exec(&db, "INSERT INTO t VALUES (1, 1.5), (2, 2.5), (3, 3.5)");
     let r = try_rows(&db, "SELECT ROUND(AVG(v)) FROM t");
-    assert!(r.is_err(), "ROUND(AVG(v)) should error (documented limitation)");
+    assert!(
+        r.is_err(),
+        "ROUND(AVG(v)) should error (documented limitation)"
+    );
 }
 
 #[test]
@@ -634,7 +667,10 @@ fn join_on_multiple_conditions() {
 #[test]
 fn self_join_with_alias() {
     let (db, _dir) = new_db();
-    exec(&db, "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, mgr_id INT)");
+    exec(
+        &db,
+        "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, mgr_id INT)",
+    );
     exec(
         &db,
         "INSERT INTO emp VALUES (1, 'Alice', 0), (2, 'Bob', 1), (3, 'Carol', 1)",

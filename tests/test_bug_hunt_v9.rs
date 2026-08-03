@@ -4,8 +4,8 @@
 use motedb::sql::QueryResult;
 use motedb::types::Value;
 use motedb::Database;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn new_db() -> (Database, TempDir) {
@@ -15,19 +15,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -54,9 +64,15 @@ fn concurrent_reads_during_writes() {
         handles.push(std::thread::spawn(move || {
             let mut reads = 0u64;
             while wd.load(Ordering::Relaxed) == 0 {
-                let r = db.execute("SELECT COUNT(*) FROM t").and_then(|r| r.materialize());
-                if r.is_ok() { reads += 1; }
-                if reads > 50 { break; }
+                let r = db
+                    .execute("SELECT COUNT(*) FROM t")
+                    .and_then(|r| r.materialize());
+                if r.is_ok() {
+                    reads += 1;
+                }
+                if reads > 50 {
+                    break;
+                }
             }
             reads
         }));
@@ -72,10 +88,16 @@ fn concurrent_reads_during_writes() {
         0u64
     }));
 
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     // After all threads done, count must be consistent (>= 200).
     let final_count = scalar_i64(&db, "SELECT COUNT(*) FROM t");
-    assert!(final_count >= 200, "count must be at least 200, got {}", final_count);
+    assert!(
+        final_count >= 200,
+        "count must be at least 200, got {}",
+        final_count
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -99,7 +121,10 @@ fn compaction_preserves_data() {
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t"), 500 * 501);
     // Spot-check rows from different chunks.
     for id in [1, 100, 101, 250, 350, 500].iter() {
-        assert_eq!(scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", id)), id * 2);
+        assert_eq!(
+            scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", id)),
+            id * 2
+        );
     }
 }
 
@@ -119,7 +144,10 @@ fn recovery_after_mixed_ops() {
         }
         // Update half.
         for i in 1..=50 {
-            exec(&db, &format!("UPDATE t SET v = {} WHERE id = {}", i * 100, i));
+            exec(
+                &db,
+                &format!("UPDATE t SET v = {} WHERE id = {}", i * 100, i),
+            );
         }
         // Delete a quarter.
         for i in (1..=25).step_by(1) {
@@ -134,7 +162,7 @@ fn recovery_after_mixed_ops() {
     // id=1..25 deleted, id=26..50 updated (v=id*100), id=51..100 original (v=id).
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE id <= 25"), 0);
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 30"), 3000); // updated
-    assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 60"), 60);   // original
+    assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 60"), 60); // original
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -162,7 +190,11 @@ fn reopen_preserves_cumulative_state() {
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 100, "5 cycles × 20 rows");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        100,
+        "5 cycles × 20 rows"
+    );
     // Each cycle's rows have v=cycle.
     for cycle in 1..=5 {
         let cnt = scalar_i64(&db, &format!("SELECT COUNT(*) FROM t WHERE v = {}", cycle));
@@ -179,7 +211,10 @@ fn index_consistent_after_writes() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=200 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i),
+        );
     }
     exec(&db, "CREATE INDEX t_cat ON t(cat)");
     db.checkpoint().unwrap();
@@ -218,7 +253,12 @@ fn sum_correct_after_repeated_updates() {
         exec(&db, &format!("UPDATE t SET v = {} WHERE id = 1", v));
         // SUM must reflect the latest value, not a stale one.
         let expected = 90 + v; // 9 rows × 10 + current v.
-        assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t"), expected, "after v={}", v);
+        assert_eq!(
+            scalar_i64(&db, "SELECT SUM(v) FROM t"),
+            expected,
+            "after v={}",
+            v
+        );
     }
 }
 
@@ -234,7 +274,10 @@ fn group_by_after_checkpoint_correct() {
     for batch in 0..3 {
         for i in 1..=50 {
             let id = batch * 50 + i;
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'g{}', {})", id, id % 3, id));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'g{}', {})", id, id % 3, id),
+            );
         }
         db.checkpoint().unwrap();
     }
@@ -268,9 +311,13 @@ fn order_by_across_segments() {
     }
     // ORDER BY v ASC — v goes from 200-150=50 down to 200-1=199 reversed → 50,51,...,199.
     let r = rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 5");
-    let vals: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let vals: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(vals, vec![50, 51, 52, 53, 54]);
 }
 
@@ -285,7 +332,10 @@ fn distinct_across_segments() {
     for batch in 0..3 {
         for i in 1..=50 {
             let id = batch * 50 + i;
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'cat{}')", id, id % 5));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'cat{}')", id, id % 5),
+            );
         }
         db.checkpoint().unwrap();
     }
@@ -348,7 +398,10 @@ fn group_by_empty_after_filter() {
     exec(&db, "INSERT INTO t VALUES (1, 'a', 10)");
     exec(&db, "INSERT INTO t VALUES (2, 'b', 20)");
     // WHERE filters all → GROUP BY returns 0 groups.
-    let r = rows(&db, "SELECT cat, COUNT(*) FROM t WHERE v > 1000 GROUP BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*) FROM t WHERE v > 1000 GROUP BY cat",
+    );
     assert_eq!(r.len(), 0, "no matching rows → no groups");
 }
 

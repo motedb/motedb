@@ -43,7 +43,8 @@ fn test_sum_distinct() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     for v in [10, 10, 20, 30] {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     // DISTINCT sum: 10 + 20 + 30 = 60 (NOT 70)
     let r = q(&db, "SELECT SUM(DISTINCT v) FROM t");
@@ -58,7 +59,8 @@ fn test_avg_distinct() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     for v in [10, 10, 20, 30] {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     // DISTINCT avg: (10+20+30)/3 = 20.0 (NOT 17.5)
     let r = q(&db, "SELECT AVG(DISTINCT v) FROM t");
@@ -72,7 +74,8 @@ fn test_count_distinct() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     for v in [10, 10, 20, 30] {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     let r = q(&db, "SELECT COUNT(DISTINCT v) FROM t");
     assert_eq!(r[0][0], Value::Integer(3));
@@ -85,7 +88,8 @@ fn test_min_max_distinct() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     for v in [10, 10, 20, 30] {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     // DISTINCT has no effect on MIN/MAX result, but must not error.
     let r = q(&db, "SELECT MIN(DISTINCT v) FROM t");
@@ -98,7 +102,8 @@ fn test_min_max_distinct() {
 fn test_sum_distinct_with_nulls() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (10), (NULL), (10), (20)").unwrap();
+    db.execute("INSERT INTO t VALUES (10), (NULL), (10), (20)")
+        .unwrap();
     // NULLs are excluded from both DISTINCT and plain SUM.
     let r = q(&db, "SELECT SUM(DISTINCT v) FROM t");
     assert_eq!(r[0][0], Value::Integer(30)); // 10 + 20
@@ -110,7 +115,8 @@ fn test_sum_distinct_with_nulls() {
 fn test_avg_distinct_float_column() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v FLOAT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1.5), (1.5), (2.5), (3.5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1.5), (1.5), (2.5), (3.5)")
+        .unwrap();
     let r = q(&db, "SELECT SUM(DISTINCT v) FROM t");
     assert_eq!(r[0][0], Value::Float(7.5)); // 1.5 + 2.5 + 3.5
     let r = q(&db, "SELECT AVG(DISTINCT v) FROM t");
@@ -121,8 +127,12 @@ fn test_avg_distinct_float_column() {
 fn test_sum_distinct_group_by() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g TEXT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 1), ('A', 2), ('B', 5), ('B', 5)").unwrap();
-    let r = q(&db, "SELECT g, SUM(DISTINCT v) FROM t GROUP BY g ORDER BY g");
+    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 1), ('A', 2), ('B', 5), ('B', 5)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT g, SUM(DISTINCT v) FROM t GROUP BY g ORDER BY g",
+    );
     // A: DISTINCT(1,1,2) = {1,2} → 3
     // B: DISTINCT(5,5) = {5} → 5
     assert_eq!(r[0][0], Value::text("A".to_string()));
@@ -150,7 +160,8 @@ fn test_not_in_list_with_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (x INT)").unwrap();
     for v in 1..=5i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     let r = q(&db, "SELECT COUNT(*) FROM t WHERE x NOT IN (1, 2, NULL)");
     assert_eq!(r[0][0], Value::Integer(0));
@@ -161,7 +172,8 @@ fn test_not_in_list_without_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (x INT)").unwrap();
     for v in 1..=5i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     let r = q(&db, "SELECT COUNT(*) FROM t WHERE x NOT IN (1, 2, 3)");
     assert_eq!(r[0][0], Value::Integer(2)); // 4, 5
@@ -172,7 +184,8 @@ fn test_in_list_with_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (x INT)").unwrap();
     for v in 1..=5i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     let r = q(&db, "SELECT COUNT(*) FROM t WHERE x IN (1, 2, NULL)");
     assert_eq!(r[0][0], Value::Integer(2)); // NULL in list is just ignored for IN
@@ -186,10 +199,14 @@ fn test_not_in_subquery_with_null() {
     db.execute("CREATE TABLE a (id INT)").unwrap();
     db.execute("CREATE TABLE b (uid INT)").unwrap();
     for v in 1..=5i64 {
-        db.execute(&format!("INSERT INTO a VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({})", v))
+            .unwrap();
     }
     db.execute("INSERT INTO b VALUES (2), (3), (NULL)").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(0));
 }
 
@@ -199,10 +216,14 @@ fn test_not_in_subquery_without_null() {
     db.execute("CREATE TABLE a (id INT)").unwrap();
     db.execute("CREATE TABLE b (uid INT)").unwrap();
     for v in 1..=5i64 {
-        db.execute(&format!("INSERT INTO a VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({})", v))
+            .unwrap();
     }
     db.execute("INSERT INTO b VALUES (2), (3)").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(3)); // 1, 4, 5
 }
 
@@ -212,10 +233,14 @@ fn test_in_subquery_with_null() {
     db.execute("CREATE TABLE a (id INT)").unwrap();
     db.execute("CREATE TABLE b (uid INT)").unwrap();
     for v in 1..=5i64 {
-        db.execute(&format!("INSERT INTO a VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({})", v))
+            .unwrap();
     }
     db.execute("INSERT INTO b VALUES (2), (3), (NULL)").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE id IN (SELECT uid FROM b)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE id IN (SELECT uid FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(2)); // 2, 3
 }
 
@@ -227,10 +252,14 @@ fn test_not_in_subquery_count_where() {
     db.execute("CREATE TABLE a (id INT)").unwrap();
     db.execute("CREATE TABLE b (uid INT)").unwrap();
     for v in 1..=10i64 {
-        db.execute(&format!("INSERT INTO a VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({})", v))
+            .unwrap();
     }
     db.execute("INSERT INTO b VALUES (3), (5), (NULL)").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(0)); // NULL present → empty
 }
 
@@ -243,10 +272,8 @@ fn test_group_by_order_by_null_asc() {
     // SQLite default: NULLs sort FIRST in ASC (NULL < everything).
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g TEXT, c INT)").unwrap();
-    db.execute(
-        "INSERT INTO t VALUES ('A', 1), ('A', 2), (NULL, 3), (NULL, 4), ('B', 5)",
-    )
-    .unwrap();
+    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 2), (NULL, 3), (NULL, 4), ('B', 5)")
+        .unwrap();
     let r = q(&db, "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g");
     // ASC: NULL, A, B (NULL first — matches SQLite default)
     assert_eq!(r[0][0], Value::Null);
@@ -259,10 +286,8 @@ fn test_group_by_order_by_null_desc() {
     // SQLite default: NULLs sort LAST in DESC.
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g TEXT, c INT)").unwrap();
-    db.execute(
-        "INSERT INTO t VALUES ('A', 1), ('A', 2), (NULL, 3), (NULL, 4), ('B', 5)",
-    )
-    .unwrap();
+    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 2), (NULL, 3), (NULL, 4), ('B', 5)")
+        .unwrap();
     let r = q(&db, "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC");
     // DESC: B, A, NULL (NULL last)
     assert_eq!(r[0][0], Value::text("B".to_string()));
@@ -276,10 +301,15 @@ fn test_order_by_null_asc_consistency() {
     // SQLite default NULL first in ASC.
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A'), ('B'), (NULL), ('C')").unwrap();
+    db.execute("INSERT INTO t VALUES ('A'), ('B'), (NULL), ('C')")
+        .unwrap();
     let r = q(&db, "SELECT g FROM t ORDER BY g");
     let order: Vec<&Value> = r.iter().map(|row| &row[0]).collect();
-    assert_eq!(order[0], &Value::Null, "NULL must be first in ASC (SQLite default)");
+    assert_eq!(
+        order[0],
+        &Value::Null,
+        "NULL must be first in ASC (SQLite default)"
+    );
     assert_eq!(order[1], &Value::text("A".to_string()));
 }
 
@@ -288,7 +318,8 @@ fn test_group_by_order_by_integer() {
     // Verify GROUP BY ORDER BY works for integer keys.
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g INT, c INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (3, 1), (1, 2), (2, 3), (1, 4)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 1), (1, 2), (2, 3), (1, 4)")
+        .unwrap();
     let r = q(&db, "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g");
     assert_eq!(r[0][0], Value::Integer(1));
     assert_eq!(r[0][1], Value::Integer(2));
@@ -331,9 +362,14 @@ fn test_join_text_keys() {
     let (db, _d) = db();
     db.execute("CREATE TABLE a (k TEXT, v INT)").unwrap();
     db.execute("CREATE TABLE b (k TEXT, w INT)").unwrap();
-    db.execute("INSERT INTO a VALUES ('x', 10), ('y', 20)").unwrap();
-    db.execute("INSERT INTO b VALUES ('x', 100), ('z', 300)").unwrap();
-    let r = q(&db, "SELECT a.v, b.w FROM a JOIN b ON a.k = b.k ORDER BY a.v");
+    db.execute("INSERT INTO a VALUES ('x', 10), ('y', 20)")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES ('x', 100), ('z', 300)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT a.v, b.w FROM a JOIN b ON a.k = b.k ORDER BY a.v",
+    );
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Integer(10));
     assert_eq!(r[0][1], Value::Integer(100));
@@ -348,7 +384,10 @@ fn test_case_when_integer_truthy() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     db.execute("INSERT INTO t VALUES (1), (0), (5)").unwrap();
-    let r = q(&db, "SELECT CASE WHEN v THEN 'yes' ELSE 'no' END FROM t ORDER BY v");
+    let r = q(
+        &db,
+        "SELECT CASE WHEN v THEN 'yes' ELSE 'no' END FROM t ORDER BY v",
+    );
     assert_eq!(r[0][0], Value::text("no".to_string())); // v=0
     assert_eq!(r[1][0], Value::text("yes".to_string())); // v=1
     assert_eq!(r[2][0], Value::text("yes".to_string())); // v=5
@@ -370,7 +409,10 @@ fn test_case_when_negative_is_true() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     db.execute("INSERT INTO t VALUES (-3)").unwrap();
-    let r = q(&db, "SELECT CASE WHEN v THEN 'truthy' ELSE 'falsy' END FROM t");
+    let r = q(
+        &db,
+        "SELECT CASE WHEN v THEN 'truthy' ELSE 'falsy' END FROM t",
+    );
     assert_eq!(r[0][0], Value::text("truthy".to_string())); // -3 != 0
 }
 
@@ -487,7 +529,10 @@ fn test_scalar_subquery_in_where() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
     db.execute("INSERT INTO t VALUES (10), (20), (30)").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM t WHERE v > (SELECT AVG(v) FROM t)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM t WHERE v > (SELECT AVG(v) FROM t)",
+    );
     // AVG = 20; rows > 20: only 30 → 1
     assert_eq!(r[0][0], Value::Integer(1));
 }
@@ -532,7 +577,8 @@ fn test_count_distinct_star_treated_as_count_star() {
 fn test_group_by_with_having_after_distinct_agg() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g TEXT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 1), ('A', 5), ('B', 2), ('B', 2)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 1), ('A', 5), ('B', 2), ('B', 2)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT g, SUM(DISTINCT v) FROM t GROUP BY g HAVING SUM(DISTINCT v) > 2 ORDER BY g",
@@ -549,11 +595,19 @@ fn test_in_subquery_text_column() {
     let (db, _d) = db();
     db.execute("CREATE TABLE a (id INT, name TEXT)").unwrap();
     db.execute("CREATE TABLE b (bname TEXT)").unwrap();
-    db.execute("INSERT INTO a VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')").unwrap();
-    db.execute("INSERT INTO b VALUES ('alice'), ('carol')").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE name IN (SELECT bname FROM b)");
+    db.execute("INSERT INTO a VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES ('alice'), ('carol')")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE name IN (SELECT bname FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(2));
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE name NOT IN (SELECT bname FROM b)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE name NOT IN (SELECT bname FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(1)); // bob
 }
 
@@ -562,8 +616,10 @@ fn test_in_subquery_text_with_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE a (id INT, name TEXT)").unwrap();
     db.execute("CREATE TABLE b (bname TEXT)").unwrap();
-    db.execute("INSERT INTO a VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')").unwrap();
-    db.execute("INSERT INTO b VALUES ('alice'), (NULL)").unwrap();
+    db.execute("INSERT INTO a VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES ('alice'), (NULL)")
+        .unwrap();
     // NOT IN with NULL in subquery → no rows.
     let r = q(
         &db,
@@ -581,10 +637,15 @@ fn test_distinct_in_subquery_inner() {
     db.execute("CREATE TABLE a (id INT)").unwrap();
     db.execute("CREATE TABLE b (uid INT)").unwrap();
     for v in 1..=3i64 {
-        db.execute(&format!("INSERT INTO a VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({})", v))
+            .unwrap();
     }
-    db.execute("INSERT INTO b VALUES (2), (2), (3), (3)").unwrap();
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE id IN (SELECT DISTINCT uid FROM b)");
+    db.execute("INSERT INTO b VALUES (2), (2), (3), (3)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE id IN (SELECT DISTINCT uid FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(2)); // 2, 3
 }
 
@@ -592,7 +653,8 @@ fn test_distinct_in_subquery_inner() {
 fn test_order_by_multiple_columns_with_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 2), (1, NULL), (2, 1)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2), (1, NULL), (2, 1)")
+        .unwrap();
     let r = q(&db, "SELECT a, b FROM t ORDER BY a, b");
     // a=1: (1,NULL), (1,2); a=2: (2,1). NULL first in b (SQLite default).
     assert_eq!(r[0][0], Value::Integer(1));
@@ -621,8 +683,10 @@ fn test_left_join_preserves_left_rows() {
     let (db, _d) = db();
     db.execute("CREATE TABLE a (id INT, va TEXT)").unwrap();
     db.execute("CREATE TABLE b (id INT, vb TEXT)").unwrap();
-    db.execute("INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')").unwrap();
-    db.execute("INSERT INTO b VALUES (1, 'b1'), (3, 'b3')").unwrap();
+    db.execute("INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, 'b1'), (3, 'b3')")
+        .unwrap();
     let r = q(
         &db,
         "SELECT a.id, a.va, b.vb FROM a LEFT JOIN b ON a.id = b.id ORDER BY a.id",
@@ -637,7 +701,8 @@ fn test_left_join_preserves_left_rows() {
 fn test_case_in_aggregate() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (cat TEXT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A', 10), ('A', 20), ('B', 5)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A', 10), ('A', 20), ('B', 5)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT cat, SUM(CASE WHEN v > 10 THEN v ELSE 0 END) FROM t GROUP BY cat ORDER BY cat",
@@ -653,7 +718,8 @@ fn test_case_in_aggregate() {
 fn test_distinct_select_with_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1), (1), (NULL), (2), (NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (1), (NULL), (2), (NULL)")
+        .unwrap();
     let r = q(&db, "SELECT DISTINCT v FROM t ORDER BY v");
     // SQLite default: NULL, 1, 2 (NULL first in ASC)
     assert_eq!(r.len(), 3);
@@ -668,8 +734,10 @@ fn test_sum_distinct_large_set() {
     db.execute("CREATE TABLE t (v INT)").unwrap();
     // Insert 1..100 each twice → DISTINCT is 1..100, sum = 5050.
     for v in 1..=100i64 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
-        db.execute(&format!("INSERT INTO t VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", v))
+            .unwrap();
     }
     let r = q(&db, "SELECT SUM(DISTINCT v) FROM t");
     assert_eq!(r[0][0], Value::Integer(5050));
@@ -696,10 +764,14 @@ fn test_not_in_empty_subquery() {
     db.execute("CREATE TABLE a (id INT)").unwrap();
     db.execute("CREATE TABLE b (uid INT)").unwrap();
     for v in 1..=3i64 {
-        db.execute(&format!("INSERT INTO a VALUES ({})", v)).unwrap();
+        db.execute(&format!("INSERT INTO a VALUES ({})", v))
+            .unwrap();
     }
     // b is empty
-    let r = q(&db, "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)");
+    let r = q(
+        &db,
+        "SELECT COUNT(*) FROM a WHERE id NOT IN (SELECT uid FROM b)",
+    );
     assert_eq!(r[0][0], Value::Integer(3));
 }
 
@@ -707,7 +779,8 @@ fn test_not_in_empty_subquery() {
 fn test_case_when_with_aggregate_condition() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (g TEXT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 2), ('B', 10)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A', 1), ('A', 2), ('B', 10)")
+        .unwrap();
     let r = q(
         &db,
         "SELECT g, CASE WHEN COUNT(*) > 1 THEN 'multi' ELSE 'single' END FROM t GROUP BY g ORDER BY g",
@@ -722,7 +795,8 @@ fn test_case_when_with_aggregate_condition() {
 fn test_avg_distinct_negative_values() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (-1), (-1), (2), (3)").unwrap();
+    db.execute("INSERT INTO t VALUES (-1), (-1), (2), (3)")
+        .unwrap();
     let r = q(&db, "SELECT SUM(DISTINCT v) FROM t");
     assert_eq!(r[0][0], Value::Integer(4)); // -1 + 2 + 3
     let r = q(&db, "SELECT AVG(DISTINCT v) FROM t");
@@ -783,7 +857,8 @@ fn test_cast_string_to_int() {
 fn test_cast_in_where_clause() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (v FLOAT)").unwrap();
-    db.execute("INSERT INTO t VALUES (3.14), (2.71), (3.99)").unwrap();
+    db.execute("INSERT INTO t VALUES (3.14), (2.71), (3.99)")
+        .unwrap();
     // CAST(v AS INT) = 3 should match 3.14 and 3.99 (both truncate to 3).
     let r = q(&db, "SELECT COUNT(*) FROM t WHERE CAST(v AS INT) = 3");
     assert_eq!(r[0][0], Value::Integer(2));
@@ -817,32 +892,59 @@ fn test_cast_lowercase_keyword() {
 #[test]
 fn test_substr_negative_in_range() {
     let (db, _d) = db();
-    assert_eq!(q(&db, "SELECT substr('abc', -1)")[0][0], Value::text("c".to_string()));
-    assert_eq!(q(&db, "SELECT substr('abc', -2)")[0][0], Value::text("bc".to_string()));
-    assert_eq!(q(&db, "SELECT substr('abc', -3)")[0][0], Value::text("abc".to_string()));
+    assert_eq!(
+        q(&db, "SELECT substr('abc', -1)")[0][0],
+        Value::text("c".to_string())
+    );
+    assert_eq!(
+        q(&db, "SELECT substr('abc', -2)")[0][0],
+        Value::text("bc".to_string())
+    );
+    assert_eq!(
+        q(&db, "SELECT substr('abc', -3)")[0][0],
+        Value::text("abc".to_string())
+    );
 }
 
 #[test]
 fn test_substr_negative_out_of_range() {
     // SQLite: substr(s, -n) where n >= length returns the whole string.
     let (db, _d) = db();
-    assert_eq!(q(&db, "SELECT substr('abc', -4)")[0][0], Value::text("abc".to_string()));
-    assert_eq!(q(&db, "SELECT substr('abc', -10)")[0][0], Value::text("abc".to_string()));
+    assert_eq!(
+        q(&db, "SELECT substr('abc', -4)")[0][0],
+        Value::text("abc".to_string())
+    );
+    assert_eq!(
+        q(&db, "SELECT substr('abc', -10)")[0][0],
+        Value::text("abc".to_string())
+    );
 }
 
 #[test]
 fn test_substr_zero_start() {
     // 0 is treated as position 1 (SQL standard).
     let (db, _d) = db();
-    assert_eq!(q(&db, "SELECT substr('abc', 0)")[0][0], Value::text("abc".to_string()));
-    assert_eq!(q(&db, "SELECT substr('abc', 1)")[0][0], Value::text("abc".to_string()));
+    assert_eq!(
+        q(&db, "SELECT substr('abc', 0)")[0][0],
+        Value::text("abc".to_string())
+    );
+    assert_eq!(
+        q(&db, "SELECT substr('abc', 1)")[0][0],
+        Value::text("abc".to_string())
+    );
 }
 
 #[test]
 fn test_substr_with_length() {
     let (db, _d) = db();
-    assert_eq!(q(&db, "SELECT substr('abcdef', 2, 3)")[0][0], Value::text("bcd".to_string()));
-    assert_eq!(q(&db, "SELECT substr('abcdef', -3, 2)")[0][0], Value::text("de".to_string()));
+    assert_eq!(
+        q(&db, "SELECT substr('abcdef', 2, 3)")[0][0],
+        Value::text("bcd".to_string())
+    );
+    assert_eq!(
+        q(&db, "SELECT substr('abcdef', -3, 2)")[0][0],
+        Value::text("de".to_string())
+    );
 }
 
 // =========================================================================
@@ -855,13 +957,16 @@ fn test_update_div_by_zero_pk_path() {
     // Previously, eval_expr_on_row used unwrap_or(Value::Null), swallowing
     // DivisionByZero and silently writing NULL.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
 
     let err = q_err(&db, "UPDATE t SET v = v / 0 WHERE id = 1");
-    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
-           "expected division error, got: {err}");
+    assert!(
+        err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+        "expected division error, got: {err}"
+    );
 
     // Value must be unchanged after the failed update.
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
@@ -872,13 +977,16 @@ fn test_update_div_by_zero_pk_path() {
 fn test_update_div_by_zero_scan_path() {
     // UPDATE ... WHERE <non-PK predicate> takes the scan path in execute_update.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
 
     let err = q_err(&db, "UPDATE t SET v = v / 0 WHERE v > 0");
-    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
-           "expected division error, got: {err}");
+    assert!(
+        err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+        "expected division error, got: {err}"
+    );
 
     let r = q(&db, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(r[0][1], Value::Integer(10));
@@ -889,12 +997,15 @@ fn test_update_div_by_zero_scan_path() {
 fn test_update_div_by_zero_literal_divisor() {
     // Literal divisor 0 (not column reference).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     let err = q_err(&db, "UPDATE t SET v = 100 / 0 WHERE id = 1");
-    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
-           "expected division error, got: {err}");
+    assert!(
+        err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+        "expected division error, got: {err}"
+    );
 
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r[0][0], Value::Integer(10));
@@ -904,14 +1015,17 @@ fn test_update_div_by_zero_literal_divisor() {
 fn test_update_div_by_zero_rowid_path() {
     // Force the row-id path by updating via a non-unique column predicate.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5, 10)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 5, 20)").unwrap();
     db.execute("INSERT INTO t VALUES (3, 6, 30)").unwrap();
 
     let err = q_err(&db, "UPDATE t SET v = v / 0 WHERE g = 5");
-    assert!(err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
-           "expected division error, got: {err}");
+    assert!(
+        err.to_lowercase().contains("division") || err.to_lowercase().contains("divide"),
+        "expected division error, got: {err}"
+    );
 
     let r = q(&db, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(r[0][1], Value::Integer(10));

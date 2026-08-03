@@ -14,25 +14,38 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select: {}", sql) }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select: {}", sql),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row expected: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("not int {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("not int {:?}: {}", o, sql),
+    }
 }
 
 fn scalar_f64(db: &Database, sql: &str) -> f64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1);
-    match r[0].first() { Some(Value::Float(n)) => *n, o => panic!("not float {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Float(n)) => *n,
+        o => panic!("not float {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -58,10 +71,16 @@ fn group_by_count_distinct() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for (id, c, v) in [(1, "a", 1), (2, "a", 1), (3, "a", 2), (4, "b", 1)].iter() {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", id, c, v));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", id, c, v),
+        );
     }
     // COUNT(DISTINCT v) per group.
-    let r = rows(&db, "SELECT cat, COUNT(DISTINCT v) FROM t GROUP BY cat ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(DISTINCT v) FROM t GROUP BY cat ORDER BY cat",
+    );
     assert_eq!(r.len(), 2);
 }
 
@@ -77,7 +96,12 @@ fn float_precision_roundtrip() {
     exec(&db, &format!("INSERT INTO t VALUES (1, {:.17})", precise));
     let r = rows(&db, "SELECT v FROM t WHERE id = 1");
     match r[0][0] {
-        Value::Float(n) => assert!((n - precise).abs() < 1e-15, "precision lost: {} vs {}", n, precise),
+        Value::Float(n) => assert!(
+            (n - precise).abs() < 1e-15,
+            "precision lost: {} vs {}",
+            n,
+            precise
+        ),
         _ => panic!("not float"),
     }
 }
@@ -142,10 +166,13 @@ fn order_by_text() {
         exec(&db, &format!("INSERT INTO t VALUES ({}, '{}')", i, s));
     }
     let r = rows(&db, "SELECT s FROM t ORDER BY s ASC");
-    let names: Vec<String> = r.iter().filter_map(|row| match &row[0] {
-        Value::Text(s) => Some(s.0.to_string()),
-        _ => None,
-    }).collect();
+    let names: Vec<String> = r
+        .iter()
+        .filter_map(|row| match &row[0] {
+            Value::Text(s) => Some(s.0.to_string()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(names, vec!["apple", "banana", "cherry"]);
 }
 
@@ -261,7 +288,10 @@ fn where_not_between() {
     for i in 1..=10 {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
     }
-    let r = rows(&db, "SELECT id FROM t WHERE v NOT BETWEEN 3 AND 7 ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE v NOT BETWEEN 3 AND 7 ORDER BY id",
+    );
     assert_eq!(r.len(), 5);
 }
 
@@ -336,7 +366,10 @@ fn drop_table_then_recreate() {
 #[test]
 fn select_column_order_matches_schema() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 10, 20, 30)");
     // Select in different order than schema.
     let r = rows(&db, "SELECT c, a, b FROM t WHERE id = 1");
@@ -399,7 +432,11 @@ fn repeated_select_after_update() {
     }
     exec(&db, "UPDATE t SET v = 999 WHERE id = 1");
     for _ in 0..5 {
-        assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 999, "stale cache after UPDATE");
+        assert_eq!(
+            scalar_i64(&db, "SELECT v FROM t WHERE id = 1"),
+            999,
+            "stale cache after UPDATE"
+        );
     }
 }
 
@@ -412,9 +449,17 @@ fn repeated_count_after_insert_delete() {
         assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1);
     }
     exec(&db, "INSERT INTO t VALUES (2)");
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 2, "COUNT must update after INSERT");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "COUNT must update after INSERT"
+    );
     exec(&db, "DELETE FROM t WHERE id = 1");
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1, "COUNT must update after DELETE");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        1,
+        "COUNT must update after DELETE"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -642,31 +642,46 @@ fn test_compound_and_both_indexed() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+            .unwrap();
         db.execute("CREATE INDEX t_a ON t(a)").unwrap();
         db.execute("CREATE INDEX t_b ON t(b)").unwrap();
         // Insert rows where a=1 is common but a=1 AND b=2 is rare.
         db.execute("INSERT INTO t VALUES (1, 1, 1)").unwrap();
-        db.execute("INSERT INTO t VALUES (2, 1, 2)").unwrap();  // only this matches a=1 AND b=2
+        db.execute("INSERT INTO t VALUES (2, 1, 2)").unwrap(); // only this matches a=1 AND b=2
         db.execute("INSERT INTO t VALUES (3, 1, 3)").unwrap();
         db.execute("INSERT INTO t VALUES (4, 2, 2)").unwrap();
-        db.execute("INSERT INTO t VALUES (5, 1, 2)").unwrap();  // also matches
+        db.execute("INSERT INTO t VALUES (5, 1, 2)").unwrap(); // also matches
         db.checkpoint().unwrap();
         db.wait_for_indexes_ready();
     }
     let db = Database::open(&path).unwrap();
     // a=1 AND b=2 should return exactly id=2 and id=5 (NOT all a=1 rows).
-    let r = db.execute("SELECT id FROM t WHERE a = 1 AND b = 2").unwrap();
+    let r = db
+        .execute("SELECT id FROM t WHERE a = 1 AND b = 2")
+        .unwrap();
     use motedb::QueryResult;
     let rows = match r.materialize().unwrap() {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("expected select"),
     };
-    let mut ids: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
-    }).collect();
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(i) = &r[0] {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .collect();
     ids.sort();
-    assert_eq!(ids, vec![2, 5], "a=1 AND b=2 must apply both predicates, got {:?}", ids);
+    assert_eq!(
+        ids,
+        vec![2, 5],
+        "a=1 AND b=2 must apply both predicates, got {:?}",
+        ids
+    );
 
     // Single predicate still works.
     let r = db.execute("SELECT id FROM t WHERE a = 1").unwrap();
@@ -689,7 +704,8 @@ fn test_compound_or_both_indexed() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)").unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+            .unwrap();
         db.execute("CREATE INDEX t_a ON t(a)").unwrap();
         db.execute("CREATE INDEX t_b ON t(b)").unwrap();
         // a=0: ids 1,2. b=0: ids 1,3,5. Union => 1,2,3,5
@@ -708,9 +724,21 @@ fn test_compound_or_both_indexed() {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("expected select"),
     };
-    let mut ids: Vec<i64> = rows.iter().filter_map(|r| {
-        if let motedb::types::Value::Integer(i) = &r[0] { Some(*i) } else { None }
-    }).collect();
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| {
+            if let motedb::types::Value::Integer(i) = &r[0] {
+                Some(*i)
+            } else {
+                None
+            }
+        })
+        .collect();
     ids.sort();
-    assert_eq!(ids, vec![1, 2, 3, 5], "a=0 OR b=0 must return union, got {:?}", ids);
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 5],
+        "a=0 OR b=0 must return union, got {:?}",
+        ids
+    );
 }

@@ -29,7 +29,8 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn test_update_change_pk_then_lookup() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (5, 10)").unwrap();
     db.execute("UPDATE t SET id = 6 WHERE id = 5").unwrap();
     let r = q(&db, "SELECT * FROM t WHERE id = 6");
@@ -44,7 +45,8 @@ fn test_update_change_pk_then_lookup() {
 #[test]
 fn test_update_change_pk_old_pk_gone() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (5, 10)").unwrap();
     db.execute("UPDATE t SET id = 6 WHERE id = 5").unwrap();
     let r = q(&db, "SELECT * FROM t WHERE id = 5");
@@ -54,7 +56,8 @@ fn test_update_change_pk_old_pk_gone() {
 #[test]
 fn test_update_change_pk_scan_all() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (5, 10)").unwrap();
     db.execute("UPDATE t SET id = 6 WHERE id = 5").unwrap();
     // Full scan should still see exactly one row with the new PK.
@@ -74,11 +77,10 @@ fn test_update_change_pk_scan_all() {
 
 fn ts_db() -> (Database, TempDir) {
     let (db, dir) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute(
-        "INSERT INTO t VALUES (1, '1969-12-31T23:59:59'), (2, '2024-01-15T10:30:45')",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '1969-12-31T23:59:59'), (2, '2024-01-15T10:30:45')")
+        .unwrap();
     (db, dir)
 }
 
@@ -112,8 +114,18 @@ fn test_hour_pre_epoch() {
 #[test]
 fn test_time_funcs_post_epoch_still_correct() {
     let (db, _d) = ts_db();
-    let r = q(&db, "SELECT HOUR(ts), MINUTE(ts), SECOND(ts) FROM t WHERE id = 2");
-    assert_eq!(r, vec![vec![Value::Integer(10), Value::Integer(30), Value::Integer(45)]]);
+    let r = q(
+        &db,
+        "SELECT HOUR(ts), MINUTE(ts), SECOND(ts) FROM t WHERE id = 2",
+    );
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Integer(10),
+            Value::Integer(30),
+            Value::Integer(45)
+        ]]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -184,7 +196,8 @@ fn test_null_in_literal_vs_subquery_consistent() {
 #[test]
 fn test_delete_then_reinsert_same_pk() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     db.execute("DELETE FROM t WHERE id = 1").unwrap();
     db.execute("INSERT INTO t VALUES (1, 200)").unwrap();
@@ -195,10 +208,12 @@ fn test_delete_then_reinsert_same_pk() {
 #[test]
 fn test_update_self_reference_multi_col() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT, b INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5, 0)").unwrap();
     // SET a=a+1, b=a*2 → a=6, b=10 (both use original a=5).
-    db.execute("UPDATE t SET a = a + 1, b = a * 2 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET a = a + 1, b = a * 2 WHERE id = 1")
+        .unwrap();
     let r = q(&db, "SELECT a, b FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Integer(6), Value::Integer(10)]]);
 }
@@ -206,7 +221,8 @@ fn test_update_self_reference_multi_col() {
 #[test]
 fn test_update_set_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     db.execute("UPDATE t SET v = NULL WHERE id = 1").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");

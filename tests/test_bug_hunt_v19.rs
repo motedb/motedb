@@ -54,13 +54,19 @@ fn ids_sorted(db: &Database, sql: &str) -> Vec<i64> {
 
 fn setup() -> (Database, TempDir) {
     let (db, dir) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, v INT, f FLOAT)");
-    exec(&db, "INSERT INTO t VALUES \
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, v INT, f FLOAT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO t VALUES \
         (1, 'apple',  10, 1.5), \
         (2, 'banana', 20, 2.5), \
         (3, 'cherry', 30, 3.5), \
         (4, 'date',   40, 4.5), \
-        (5, 'egg',    50, 5.5)");
+        (5, 'egg',    50, 5.5)",
+    );
     (db, dir)
 }
 
@@ -93,7 +99,10 @@ fn not_between() {
 fn between_with_column_bounds() {
     let (db, _dir) = setup();
     // WHERE v BETWEEN f AND f*10 — expressions as bounds.
-    let r = rows(&db, "SELECT id FROM t WHERE v BETWEEN f AND f * 10 ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE v BETWEEN f AND f * 10 ORDER BY id",
+    );
     // For each row, check if v is between f and f*10:
     // id=1: v=10, [1.5,15] ✓
     // id=2: v=20, [2.5,25] ✓
@@ -199,10 +208,22 @@ fn not_like() {
 #[test]
 fn three_table_join() {
     let (db, _dir) = setup();
-    exec(&db, "CREATE TABLE u (id INT PRIMARY KEY, t_id INT, name TEXT)");
-    exec(&db, "CREATE TABLE m (id INT PRIMARY KEY, u_id INT, score INT)");
-    exec(&db, "INSERT INTO u VALUES (1, 1, 'u1'), (2, 1, 'u2'), (3, 2, 'u3')");
-    exec(&db, "INSERT INTO m VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300)");
+    exec(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, t_id INT, name TEXT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE m (id INT PRIMARY KEY, u_id INT, score INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO u VALUES (1, 1, 'u1'), (2, 1, 'u2'), (3, 2, 'u3')",
+    );
+    exec(
+        &db,
+        "INSERT INTO m VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300)",
+    );
 
     let n = scalar_i64(
         &db,
@@ -214,8 +235,14 @@ fn three_table_join() {
 #[test]
 fn join_with_where_after_two_joins() {
     let (db, _dir) = setup();
-    exec(&db, "CREATE TABLE u (id INT PRIMARY KEY, t_id INT, name TEXT)");
-    exec(&db, "INSERT INTO u VALUES (1, 1, 'u1'), (2, 1, 'u2'), (3, 2, 'u3')");
+    exec(
+        &db,
+        "CREATE TABLE u (id INT PRIMARY KEY, t_id INT, name TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO u VALUES (1, 1, 'u1'), (2, 1, 'u2'), (3, 2, 'u3')",
+    );
     let r = rows(
         &db,
         "SELECT u.id FROM t JOIN u ON t.id = u.t_id WHERE t.v > 15 ORDER BY u.id",
@@ -269,7 +296,10 @@ fn nested_case_when() {
 #[test]
 fn case_without_else_returns_null() {
     let (db, _dir) = setup();
-    let r = rows(&db, "SELECT CASE WHEN v > 100 THEN 'big' END FROM t WHERE id = 1");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v > 100 THEN 'big' END FROM t WHERE id = 1",
+    );
     // No ELSE, no match → NULL.
     assert!(matches!(&r[0][0], Value::Null));
 }
@@ -419,11 +449,7 @@ fn distinct_with_null() {
     // NULL is distinct from NULL in some DBs (Postgres treats them as
     // equal for DISTINCT), but in others they're separate. Standard says
     // DISTINCT treats NULLs as equal. So 2 rows: NULL, 5.
-    assert!(
-        r.len() <= 3,
-        "DISTINCT NULL handling: got {} rows",
-        r.len()
-    );
+    assert!(r.len() <= 3, "DISTINCT NULL handling: got {} rows", r.len());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -456,7 +482,10 @@ fn count_with_where() {
 fn order_by_two_keys_same_direction() {
     let (db, _dir) = setup();
     exec(&db, "INSERT INTO t VALUES (7, 'apple', 10, 9.9)"); // dupe name+v with id=1
-    let r = rows(&db, "SELECT id FROM t WHERE name = 'apple' ORDER BY v ASC, id ASC");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE name = 'apple' ORDER BY v ASC, id ASC",
+    );
     // Two 'apple' rows: ids 1 and 7. Same v=10. Order by id asc → 1, 7.
     let ids: Vec<i64> = r
         .iter()
@@ -530,7 +559,10 @@ fn case_as_coalesce() {
 fn arithmetic_with_null_in_group() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 10), (2, 1, NULL), (3, 1, 30)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, NULL), (3, 1, 30)",
+    );
     // SUM ignores NULL: 10+30 = 40.
     let n = scalar_i64(&db, "SELECT SUM(v) FROM t WHERE g = 1");
     assert_eq!(n, 40);
@@ -566,7 +598,10 @@ fn reopen_preserves_text_with_special_chars() {
     {
         let db = Database::create(&path).unwrap();
         exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-        exec(&db, "INSERT INTO t VALUES (1, 'hello world'), (2, 'a,b;c'), (3, 'with ''quote''')");
+        exec(
+            &db,
+            "INSERT INTO t VALUES (1, 'hello world'), (2, 'a,b;c'), (3, 'with ''quote''')",
+        );
         db.checkpoint().unwrap();
         db.close().unwrap();
     }

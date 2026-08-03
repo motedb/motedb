@@ -145,8 +145,14 @@ fn pre_alter_rows_new_column_is_null() {
     let r = rows(&db, "SELECT id, name FROM t ORDER BY id");
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Integer(1));
-    assert!(matches!(r[0][1], Value::Null), "pre-ALTER row new col = NULL");
-    assert!(matches!(r[1][1], Value::Null), "pre-ALTER row new col = NULL");
+    assert!(
+        matches!(r[0][1], Value::Null),
+        "pre-ALTER row new col = NULL"
+    );
+    assert!(
+        matches!(r[1][1], Value::Null),
+        "pre-ALTER row new col = NULL"
+    );
     match &r[2][1] {
         Value::Text(s) => assert_eq!(s.as_str(), "c"),
         o => panic!("expected Text 'c', got {:?}", o),
@@ -366,7 +372,10 @@ fn group_by_after_alter() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20)");
     exec(&db, "ALTER TABLE t ADD COLUMN cat TEXT");
-    exec(&db, "INSERT INTO t VALUES (3, 30, 'a'), (4, 40, 'a'), (5, 50, 'b')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (3, 30, 'a'), (4, 40, 'a'), (5, 50, 'b')",
+    );
     // GROUP BY the new column. Verify each group's SUM(v) regardless of row
     // order (ORDER BY cat placement of NULL is implementation-defined).
     let r = rows(&db, "SELECT cat, SUM(v) FROM t GROUP BY cat");
@@ -433,7 +442,10 @@ fn insert_many_then_alter_then_insert_more() {
     exec(&db, "ALTER TABLE t ADD COLUMN tag TEXT");
     // Post-ALTER bulk insert.
     for i in 101..=200 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {}, 'p{}')", i, i * 10, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {}, 'p{}')", i, i * 10, i),
+        );
     }
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 200);
     // Verify a post-ALTER row.
@@ -448,5 +460,8 @@ fn insert_many_then_alter_then_insert_more() {
         100
     );
     // All pre-ALTER rows should have NULL tag.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE tag IS NULL"), 100);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE tag IS NULL"),
+        100
+    );
 }

@@ -134,12 +134,18 @@ fn auto_increment_persists_across_reopen() {
 #[test]
 fn insert_partial_columns_first_omitted() {
     let (db, _dir) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
     // Insert into id, b, c only; a should be NULL.
     exec(&db, "INSERT INTO t (id, b, c) VALUES (1, 1, 2)");
     let r = rows(&db, "SELECT id, a, b, c FROM t");
     assert!(matches!(&r[0][0], Value::Integer(1)));
-    assert!(matches!(&r[0][1], Value::Null), "omitted column a should be NULL");
+    assert!(
+        matches!(&r[0][1], Value::Null),
+        "omitted column a should be NULL"
+    );
     assert!(matches!(&r[0][2], Value::Integer(1)));
     assert!(matches!(&r[0][3], Value::Integer(2)));
 }
@@ -169,7 +175,10 @@ fn insert_partial_columns_reorder() {
 fn insert_partial_columns_batch() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO t (id, a) VALUES (1, 10), (2, 20), (3, 30)");
+    exec(
+        &db,
+        "INSERT INTO t (id, a) VALUES (1, 10), (2, 20), (3, 30)",
+    );
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(n, 3);
     // b should be NULL in all rows.
@@ -264,7 +273,10 @@ fn like_two_underscores() {
 fn like_underscore_then_literal() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'cat'), (2, 'bat'), (3, 'at'), (4, 'chat')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'cat'), (2, 'bat'), (3, 'at'), (4, 'chat')",
+    );
     let ids = ids_sorted(&db, "SELECT id FROM t WHERE s LIKE '_at'");
     // '_at' matches 3-char strings ending in 'at': 'cat', 'bat'.
     assert_eq!(ids, vec![1, 2]);
@@ -274,7 +286,10 @@ fn like_underscore_then_literal() {
 fn like_mixed_underscore_percent() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'hello'), (2, 'hxllo'), (3, 'hxxlo')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'hello'), (2, 'hxllo'), (3, 'hxxlo')",
+    );
     let ids = ids_sorted(&db, "SELECT id FROM t WHERE s LIKE 'h_llo'");
     // 'h_llo': h + 1 char + llo. 'hello' ✓, 'hxllo' ✓, 'hxxlo' ✗ (2 chars).
     assert_eq!(ids, vec![1, 2]);
@@ -302,7 +317,10 @@ fn not_in_with_null_in_column() {
     // Row 2 (NULL): NULL NOT IN (10,30) → unknown → not counted.
     // So 0 rows.
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE v NOT IN (10, 30)");
-    assert_eq!(n, 0, "NOT IN with NULL column returns no rows (3-valued logic)");
+    assert_eq!(
+        n, 0,
+        "NOT IN with NULL column returns no rows (3-valued logic)"
+    );
 }
 
 #[test]
@@ -430,7 +448,10 @@ fn wide_table_select_star() {
 fn order_by_with_ties_count() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 1)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 1)",
+    );
     // 5 rows, group values: 1,1,2,2,1. ORDER BY g should give all 5.
     let r = rows(&db, "SELECT id FROM t ORDER BY g");
     assert_eq!(r.len(), 5);
@@ -440,7 +461,10 @@ fn order_by_with_ties_count() {
 fn order_by_ties_with_secondary() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 1, 20)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 30), (2, 1, 10), (3, 1, 20)",
+    );
     let r = rows(&db, "SELECT id FROM t ORDER BY g ASC, v ASC");
     // g=1 for all. Order by v: 10(id=2), 20(id=3), 30(id=1).
     assert!(matches!(&r[0][0], Value::Integer(2)));

@@ -14,19 +14,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 fn scalar_opt_i64(db: &Database, sql: &str) -> Option<i64> {
@@ -122,7 +132,10 @@ fn compare_float_col_int_literal() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
     for i in 1..=5 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {:.1})", i, i as f64 * 1.5));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {:.1})", i, i as f64 * 1.5),
+        );
     }
     // v = 3.0 (int literal matching float col) → id=2 (3.0).
     let r = rows(&db, "SELECT id FROM t WHERE v = 3");
@@ -168,7 +181,11 @@ fn avg_all_integers_is_float() {
     exec(&db, "INSERT INTO t VALUES (3, 25)");
     // AVG(10, 20, 25) = 55/3 ≈ 18.333 (Float, not integer division).
     let a = scalar_f64(&db, "SELECT AVG(v) FROM t");
-    assert!((a - 18.333).abs() < 0.01, "AVG must be float 18.33, got {}", a);
+    assert!(
+        (a - 18.333).abs() < 0.01,
+        "AVG must be float 18.33, got {}",
+        a
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -197,7 +214,11 @@ fn avg_ignores_nulls_in_count() {
     exec(&db, "INSERT INTO t VALUES (3, 30)");
     // AVG(v) = (10 + 30) / 2 = 20 (count=2, not 3).
     let a = scalar_f64(&db, "SELECT AVG(v) FROM t");
-    assert!((a - 20.0).abs() < 0.001, "AVG ignoring NULL = 20.0, got {}", a);
+    assert!(
+        (a - 20.0).abs() < 0.001,
+        "AVG ignoring NULL = 20.0, got {}",
+        a
+    );
 }
 
 #[test]
@@ -324,10 +345,19 @@ fn group_by_having_count() {
     exec(&db, "INSERT INTO t VALUES (5, 'b')");
     exec(&db, "INSERT INTO t VALUES (6, 'c')");
     // HAVING COUNT(*) >= 2 → 'a' (3), 'b' (2). 'c' (1) excluded.
-    let r = rows(&db, "SELECT cat, COUNT(*) FROM t GROUP BY cat HAVING COUNT(*) >= 2 ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*) FROM t GROUP BY cat HAVING COUNT(*) >= 2 ORDER BY cat",
+    );
     assert_eq!(r.len(), 2);
-    match &r[0][0] { Value::Text(s) => assert_eq!(&*s.0, "a"), _ => panic!() }
-    match &r[1][0] { Value::Text(s) => assert_eq!(&*s.0, "b"), _ => panic!() }
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "a"),
+        _ => panic!(),
+    }
+    match &r[1][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "b"),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -341,7 +371,10 @@ fn five_aggregates_one_query() {
     for i in 1..=100 {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
     }
-    let r = rows(&db, "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t",
+    );
     assert_eq!(r.len(), 1);
     match (&r[0][0], &r[0][1], &r[0][3], &r[0][4]) {
         (Value::Integer(c), Value::Integer(s), Value::Integer(mn), Value::Integer(mx)) => {
@@ -361,12 +394,15 @@ fn five_aggregates_one_query() {
 #[test]
 fn auto_increment_after_delete() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)");
-    exec(&db, "INSERT INTO t (v) VALUES (10)");  // id=1
-    exec(&db, "INSERT INTO t (v) VALUES (20)");  // id=2
-    exec(&db, "INSERT INTO t (v) VALUES (30)");  // id=3
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)",
+    );
+    exec(&db, "INSERT INTO t (v) VALUES (10)"); // id=1
+    exec(&db, "INSERT INTO t (v) VALUES (20)"); // id=2
+    exec(&db, "INSERT INTO t (v) VALUES (30)"); // id=3
     exec(&db, "DELETE FROM t WHERE id = 3");
-    exec(&db, "INSERT INTO t (v) VALUES (40)");  // id should be 4, not reuse 3.
+    exec(&db, "INSERT INTO t (v) VALUES (40)"); // id should be 4, not reuse 3.
     let r = rows(&db, "SELECT id, v FROM t ORDER BY id");
     let last = r.last().unwrap();
     match (&last[0], &last[1]) {
@@ -385,14 +421,20 @@ fn auto_increment_after_delete() {
 #[test]
 fn where_complex_boolean() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 10, 20, 30)");
     exec(&db, "INSERT INTO t VALUES (2, 10, 20, 40)");
     exec(&db, "INSERT INTO t VALUES (3, 10, 30, 30)");
     exec(&db, "INSERT INTO t VALUES (4, 20, 20, 30)");
     // (a = 10 AND b = 20) OR c = 40 → rows 1, 2 (a=10,b=20), row 2 again (c=40).
     // Unique: 1, 2.
-    let r = rows(&db, "SELECT id FROM t WHERE (a = 10 AND b = 20) OR c = 40 ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE (a = 10 AND b = 20) OR c = 40 ORDER BY id",
+    );
     assert_eq!(r.len(), 2);
 }
 
@@ -405,14 +447,23 @@ fn large_batch_selective_query_correct() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, mod5 INT, v INT)");
     for i in 1..=500 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {}, {})", i, i % 5, i * 2));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {}, {})", i, i % 5, i * 2),
+        );
     }
     // Query WHERE mod5 = 0 → ids 5, 10, ..., 500 = 100 rows.
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE mod5 = 0");
-    match r[0][0] { Value::Integer(n) => assert_eq!(n, 100), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert_eq!(n, 100),
+        _ => panic!(),
+    }
     // SUM of v for mod5=0: 2*(5+10+...+500) = 2 * (5+10+...+500).
     // 5+10+...+500 = 5*(1+2+...+100) = 5*5050 = 25250. ×2 = 50500.
-    assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t WHERE mod5 = 0"), 50500);
+    assert_eq!(
+        scalar_i64(&db, "SELECT SUM(v) FROM t WHERE mod5 = 0"),
+        50500
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -426,7 +477,10 @@ fn negative_in_arithmetic() {
     exec(&db, "INSERT INTO t VALUES (1, -10)");
     exec(&db, "INSERT INTO t VALUES (2, 20)");
     let r = rows(&db, "SELECT v + (-5) FROM t WHERE id = 1");
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, -15), o => panic!("{:?}", o) }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, -15),
+        o => panic!("{:?}", o),
+    }
     // WHERE v < 0 → row 1.
     assert_eq!(rows(&db, "SELECT id FROM t WHERE v < 0").len(), 1);
 }
@@ -461,7 +515,10 @@ fn aggregate_after_filtering_all_out() {
     assert!(matches!(r[0][0], Value::Null), "SUM over empty set = NULL");
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE v > 1000");
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Integer(0) => {}, o => panic!("COUNT empty = 0, got {:?}", o) }
+    match &r[0][0] {
+        Value::Integer(0) => {}
+        o => panic!("COUNT empty = 0, got {:?}", o),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -490,11 +547,17 @@ fn delete_reinsert_cycle_correct() {
 #[test]
 fn group_by_multi_agg_diff_cols() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, a INT, b INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, a INT, b INT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 'x', 10, 100)");
     exec(&db, "INSERT INTO t VALUES (2, 'x', 20, 200)");
     exec(&db, "INSERT INTO t VALUES (3, 'y', 30, 300)");
-    let r = rows(&db, "SELECT cat, SUM(a), SUM(b), COUNT(*) FROM t GROUP BY cat ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(a), SUM(b), COUNT(*) FROM t GROUP BY cat ORDER BY cat",
+    );
     assert_eq!(r.len(), 2);
     // x: SUM(a)=30, SUM(b)=300, COUNT=2.
     match (&r[0][0], &r[0][1], &r[0][2], &r[0][3]) {

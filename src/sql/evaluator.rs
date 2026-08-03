@@ -236,12 +236,20 @@ impl ExprEvaluator {
                 let arg_str = if args.is_empty() {
                     "*".to_string()
                 } else {
-                    args.iter().map(Self::expr_to_name).collect::<Vec<_>>().join(", ")
+                    args.iter()
+                        .map(Self::expr_to_name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
                 format!("{}({})", name.to_uppercase(), arg_str)
             }
             Expr::BinaryOp { left, op, right } => {
-                format!("{} {:?} {}", Self::expr_to_name(left), op, Self::expr_to_name(right))
+                format!(
+                    "{} {:?} {}",
+                    Self::expr_to_name(left),
+                    op,
+                    Self::expr_to_name(right)
+                )
             }
             Expr::UnaryOp { op, expr } => {
                 format!("{:?}{}", op, Self::expr_to_name(expr))
@@ -612,9 +620,10 @@ impl ExprEvaluator {
             (Value::Integer(_), Value::Bool(b)) => (left, Value::Integer(if *b { 1 } else { 0 })),
             (Value::Bool(b), Value::Float(_)) => (Value::Float(if *b { 1.0 } else { 0.0 }), right),
             (Value::Float(_), Value::Bool(b)) => (left, Value::Float(if *b { 1.0 } else { 0.0 })),
-            (Value::Bool(a), Value::Bool(b)) => {
-                (Value::Integer(if *a { 1 } else { 0 }), Value::Integer(if *b { 1 } else { 0 }))
-            }
+            (Value::Bool(a), Value::Bool(b)) => (
+                Value::Integer(if *a { 1 } else { 0 }),
+                Value::Integer(if *b { 1 } else { 0 }),
+            ),
             _ => (left, right),
         }
     }
@@ -756,18 +765,24 @@ impl ExprEvaluator {
                     Value::Integer(i) => i.to_string(),
                     Value::Float(f) => f.to_string(),
                     Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-                    _ => return Err(MoteDBError::TypeError(format!(
-                        "Cannot concatenate {:?} with ||", left
-                    ))),
+                    _ => {
+                        return Err(MoteDBError::TypeError(format!(
+                            "Cannot concatenate {:?} with ||",
+                            left
+                        )))
+                    }
                 };
                 let r = match &right {
                     Value::Text(t) => t.to_string(),
                     Value::Integer(i) => i.to_string(),
                     Value::Float(f) => f.to_string(),
                     Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-                    _ => return Err(MoteDBError::TypeError(format!(
-                        "Cannot concatenate {:?} with ||", right
-                    ))),
+                    _ => {
+                        return Err(MoteDBError::TypeError(format!(
+                            "Cannot concatenate {:?} with ||",
+                            right
+                        )))
+                    }
                 };
                 Ok(Value::text(format!("{}{}", l, r)))
             }
@@ -826,13 +841,48 @@ impl ExprEvaluator {
         // skip NULLs per-row at the executor level). Apply this up front so we
         // don't have to add a Null arm to every match in the big dispatch.
         const NULL_PROPAGATING: &[&str] = &[
-            "lower", "upper", "length", "len", "substr", "substring", "trim",
-            "ltrim", "rtrim", "replace", "reverse", "leftstr", "str_left",
-            "rightstr", "str_right", "repeat", "abs", "round", "floor",
-            "ceil", "ceiling", "power", "pow", "sqrt", "exp", "ln", "log",
-            "log10", "mod", "sign", "cast", "year", "month", "day", "hour",
-            "minute", "second", "day_of_week", "to_micros", "date_add",
-            "date_diff", "time_bucket",
+            "lower",
+            "upper",
+            "length",
+            "len",
+            "substr",
+            "substring",
+            "trim",
+            "ltrim",
+            "rtrim",
+            "replace",
+            "reverse",
+            "leftstr",
+            "str_left",
+            "rightstr",
+            "str_right",
+            "repeat",
+            "abs",
+            "round",
+            "floor",
+            "ceil",
+            "ceiling",
+            "power",
+            "pow",
+            "sqrt",
+            "exp",
+            "ln",
+            "log",
+            "log10",
+            "mod",
+            "sign",
+            "cast",
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "day_of_week",
+            "to_micros",
+            "date_add",
+            "date_diff",
+            "time_bucket",
         ];
         if NULL_PROPAGATING.contains(&name_lower.as_str()) {
             // Pre-evaluate args; if any is NULL, short-circuit to NULL.
@@ -856,8 +906,7 @@ impl ExprEvaluator {
             }
 
             // Aggregate functions: look up pre-computed value in row (for HAVING)
-            "count" | "sum" | "avg" | "min" | "max" | "stddev" | "variance"
-            | "group_concat" => {
+            "count" | "sum" | "avg" | "min" | "max" | "stddev" | "variance" | "group_concat" => {
                 // Build the column name that matches how the executor stored it.
                 // 🔑 Must match expr_to_column_name's format exactly. For
                 // expression args (e.g. q * p in SUM(q * p)), use the same

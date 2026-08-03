@@ -13,19 +13,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,7 +55,10 @@ fn nested_in_subqueries() {
     exec(&db, "INSERT INTO c VALUES (1, 1)");
     // a.id IN (SELECT ref FROM b WHERE ref IN (SELECT ref FROM c))
     // c has ref=1, so b.ref IN (1) → b row 1 (ref=1). a.id IN (1) → a row 1.
-    let r = rows(&db, "SELECT id FROM a WHERE id IN (SELECT ref FROM b WHERE ref IN (SELECT ref FROM c))");
+    let r = rows(
+        &db,
+        "SELECT id FROM a WHERE id IN (SELECT ref FROM b WHERE ref IN (SELECT ref FROM c))",
+    );
     assert!(r.len() >= 1);
 }
 
@@ -56,8 +69,14 @@ fn nested_in_subqueries() {
 #[test]
 fn join_with_where_filter() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT, amt INT)");
-    exec(&db, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT, region TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT, amt INT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT, region TEXT)",
+    );
     exec(&db, "INSERT INTO customers VALUES (1, 'Alice', 'US')");
     exec(&db, "INSERT INTO customers VALUES (2, 'Bob', 'EU')");
     exec(&db, "INSERT INTO customers VALUES (3, 'Carol', 'US')");
@@ -77,8 +96,14 @@ fn join_with_where_filter() {
 #[test]
 fn join_with_aggregate() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT, amt INT)");
-    exec(&db, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE orders (id INT PRIMARY KEY, cust_id INT, amt INT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)",
+    );
     exec(&db, "INSERT INTO customers VALUES (1, 'Alice')");
     exec(&db, "INSERT INTO customers VALUES (2, 'Bob')");
     exec(&db, "INSERT INTO orders VALUES (1, 1, 100)");
@@ -129,7 +154,10 @@ fn update_all_with_expression() {
     }
     exec(&db, "UPDATE t SET v = v + 1");
     for i in 1..=5 {
-        assert_eq!(scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", i)), i * 10 + 1);
+        assert_eq!(
+            scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", i)),
+            i * 10 + 1
+        );
     }
 }
 
@@ -147,9 +175,18 @@ fn select_with_case_expression_output() {
     // CASE to categorize.
     let r = rows(&db, "SELECT id, CASE WHEN v < 10 THEN 'low' WHEN v < 20 THEN 'mid' ELSE 'high' END FROM t ORDER BY id");
     assert_eq!(r.len(), 3);
-    match &r[0][1] { Value::Text(s) => assert_eq!(&*s.0, "low"), _ => panic!("5→low") }
-    match &r[1][1] { Value::Text(s) => assert_eq!(&*s.0, "mid"), _ => panic!("15→mid") }
-    match &r[2][1] { Value::Text(s) => assert_eq!(&*s.0, "high"), _ => panic!("25→high") }
+    match &r[0][1] {
+        Value::Text(s) => assert_eq!(&*s.0, "low"),
+        _ => panic!("5→low"),
+    }
+    match &r[1][1] {
+        Value::Text(s) => assert_eq!(&*s.0, "mid"),
+        _ => panic!("15→mid"),
+    }
+    match &r[2][1] {
+        Value::Text(s) => assert_eq!(&*s.0, "high"),
+        _ => panic!("25→high"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -256,9 +293,13 @@ fn order_by_pk_desc() {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
     }
     let r = rows(&db, "SELECT id FROM t ORDER BY id DESC");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids, vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
 }
 
@@ -303,12 +344,21 @@ fn aggregate_with_where_correct() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=20 {
         let cat = if i % 2 == 0 { "even" } else { "odd" };
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i),
+        );
     }
     // SUM of even rows: 2+4+...+20 = 110.
-    assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t WHERE cat = 'even'"), 110);
+    assert_eq!(
+        scalar_i64(&db, "SELECT SUM(v) FROM t WHERE cat = 'even'"),
+        110
+    );
     // COUNT of odd rows: 10.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'odd'"), 10);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'odd'"),
+        10
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -318,13 +368,19 @@ fn aggregate_with_where_correct() {
 #[test]
 fn self_join_basic() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, mgr_id INT)");
+    exec(
+        &db,
+        "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, mgr_id INT)",
+    );
     exec(&db, "INSERT INTO emp VALUES (1, 'CEO', 0)");
     exec(&db, "INSERT INTO emp VALUES (2, 'Alice', 1)");
     exec(&db, "INSERT INTO emp VALUES (3, 'Bob', 1)");
     exec(&db, "INSERT INTO emp VALUES (4, 'Carol', 2)");
     // Self-join: employee + their manager's name.
-    let r = rows(&db, "SELECT e.name FROM emp e INNER JOIN emp m ON e.mgr_id = m.id ORDER BY e.id");
+    let r = rows(
+        &db,
+        "SELECT e.name FROM emp e INNER JOIN emp m ON e.mgr_id = m.id ORDER BY e.id",
+    );
     // CEO has mgr_id=0 (no match), Alice/Bob mgr=1 (CEO), Carol mgr=2 (Alice).
     // Matched: Alice, Bob, Carol = 3 rows.
     assert_eq!(r.len(), 3);

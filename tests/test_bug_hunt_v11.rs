@@ -14,19 +14,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -66,8 +76,14 @@ fn boolean_count() {
         let val = if i % 2 == 0 { "TRUE" } else { "FALSE" };
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, val));
     }
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE active = TRUE"), 5);
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE active = FALSE"), 5);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE active = TRUE"),
+        5
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE active = FALSE"),
+        5
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -153,7 +169,10 @@ fn index_query_after_insert_finds_new_rows() {
     db.checkpoint().unwrap();
     db.wait_for_indexes_ready();
     // Query must find all 60 rows with cat='a'.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'a'"), 60);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'a'"),
+        60
+    );
 }
 
 #[test]
@@ -172,8 +191,14 @@ fn index_query_after_delete_excludes_deleted() {
     db.checkpoint().unwrap();
     db.wait_for_indexes_ready();
     // Query must reflect deletions.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'remove'"), 0);
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'keep'"), 50);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'remove'"),
+        0
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'keep'"),
+        50
+    );
 }
 
 #[test]
@@ -192,8 +217,14 @@ fn index_query_after_update_reflects_change() {
     }
     db.checkpoint().unwrap();
     db.wait_for_indexes_ready();
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'a'"), 10);
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'b'"), 10);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'a'"),
+        10
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'b'"),
+        10
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -204,9 +235,9 @@ fn index_query_after_update_reflects_change() {
 fn where_column_equals_column() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10, 10)");  // a == b
-    exec(&db, "INSERT INTO t VALUES (2, 10, 20)");  // a != b
-    exec(&db, "INSERT INTO t VALUES (3, 20, 20)");  // a == b
+    exec(&db, "INSERT INTO t VALUES (1, 10, 10)"); // a == b
+    exec(&db, "INSERT INTO t VALUES (2, 10, 20)"); // a != b
+    exec(&db, "INSERT INTO t VALUES (3, 20, 20)"); // a == b
     let r = rows(&db, "SELECT id FROM t WHERE a = b ORDER BY id");
     assert_eq!(r.len(), 2, "rows where a equals b");
 }
@@ -215,10 +246,10 @@ fn where_column_equals_column() {
 fn where_column_arithmetic_comparison() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10, 5)");   // a > b
-    exec(&db, "INSERT INTO t VALUES (2, 5, 10)");   // a < b
-    exec(&db, "INSERT INTO t VALUES (3, 10, 10)");  // a = b
-    // WHERE a > b → id 1
+    exec(&db, "INSERT INTO t VALUES (1, 10, 5)"); // a > b
+    exec(&db, "INSERT INTO t VALUES (2, 5, 10)"); // a < b
+    exec(&db, "INSERT INTO t VALUES (3, 10, 10)"); // a = b
+                                                   // WHERE a > b → id 1
     let r = rows(&db, "SELECT id FROM t WHERE a > b");
     assert_eq!(r.len(), 1);
     // WHERE a + b > 15 → ids 2 (15? no), 3 (20). Actually 5+10=15 (not >15), 10+10=20.
@@ -241,7 +272,11 @@ fn sum_int_column_returns_int() {
     let r = rows(&db, "SELECT SUM(v) FROM t");
     match &r[0][0] {
         Value::Integer(n) => assert_eq!(*n, 60),
-        Value::Float(f) => assert!((*f - 60.0).abs() < 0.001, "SUM all-int can be Float, got {}", f),
+        Value::Float(f) => assert!(
+            (*f - 60.0).abs() < 0.001,
+            "SUM all-int can be Float, got {}",
+            f
+        ),
         o => panic!("{:?}", o),
     }
 }
@@ -302,8 +337,13 @@ fn bulk_update_then_select_each() {
     exec(&db, "UPDATE t SET v = id * 100");
     // Verify EVERY row.
     for i in 1..=50 {
-        assert_eq!(scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", i)), i * 100,
-            "row {} should have v = {}", i, i * 100);
+        assert_eq!(
+            scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", i)),
+            i * 100,
+            "row {} should have v = {}",
+            i,
+            i * 100
+        );
     }
 }
 
@@ -314,7 +354,10 @@ fn bulk_update_then_select_each() {
 #[test]
 fn select_star_column_order() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT, score FLOAT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT, score FLOAT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 'Alice', 30, 95.5)");
     let r = rows(&db, "SELECT * FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
@@ -391,7 +434,10 @@ fn reopen_then_create_index() {
         let db = Database::create(&path).unwrap();
         exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
         for i in 1..=50 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i),
+            );
         }
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -401,7 +447,10 @@ fn reopen_then_create_index() {
     exec(&db, "CREATE INDEX t_cat ON t(cat)");
     db.checkpoint().unwrap();
     db.wait_for_indexes_ready();
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'c0'"), 10);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'c0'"),
+        10
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -438,7 +487,10 @@ fn text_primary_key_basic() {
     // Point query by text PK.
     let r = rows(&db, "SELECT name FROM t WHERE code = 'ABC'");
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Text(s) => assert_eq!(&*s.0, "Alpha"), _ => panic!() }
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "Alpha"),
+        _ => panic!(),
+    }
 }
 
 #[test]
@@ -464,16 +516,28 @@ fn pagination_pattern() {
     // Page 1: ids 1-10.
     let p1 = rows(&db, "SELECT id FROM t ORDER BY id ASC LIMIT 10 OFFSET 0");
     assert_eq!(p1.len(), 10);
-    match &p1[0][0] { Value::Integer(n) => assert_eq!(*n, 1), _ => panic!() }
-    match &p1[9][0] { Value::Integer(n) => assert_eq!(*n, 10), _ => panic!() }
+    match &p1[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 1),
+        _ => panic!(),
+    }
+    match &p1[9][0] {
+        Value::Integer(n) => assert_eq!(*n, 10),
+        _ => panic!(),
+    }
     // Page 2: ids 11-20.
     let p2 = rows(&db, "SELECT id FROM t ORDER BY id ASC LIMIT 10 OFFSET 10");
     assert_eq!(p2.len(), 10);
-    match &p2[0][0] { Value::Integer(n) => assert_eq!(*n, 11), _ => panic!() }
+    match &p2[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 11),
+        _ => panic!(),
+    }
     // Last page: ids 91-100.
     let p_last = rows(&db, "SELECT id FROM t ORDER BY id ASC LIMIT 10 OFFSET 90");
     assert_eq!(p_last.len(), 10);
-    match &p_last[9][0] { Value::Integer(n) => assert_eq!(*n, 100), _ => panic!() }
+    match &p_last[9][0] {
+        Value::Integer(n) => assert_eq!(*n, 100),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -485,14 +549,24 @@ fn group_by_order_by_limit_compound() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)");
     // cat 'a': 5 rows, 'b': 3 rows, 'c': 1 row.
-    for i in 1..=5 { exec(&db, &format!("INSERT INTO t VALUES ({}, 'a')", i)); }
-    for i in 6..=8 { exec(&db, &format!("INSERT INTO t VALUES ({}, 'b')", i)); }
+    for i in 1..=5 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, 'a')", i));
+    }
+    for i in 6..=8 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, 'b')", i));
+    }
     exec(&db, "INSERT INTO t VALUES (9, 'c')");
     // Top 2 groups by count DESC: a (5), b (3).
-    let r = rows(&db, "SELECT cat, COUNT(*) FROM t GROUP BY cat ORDER BY COUNT(*) DESC LIMIT 2");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*) FROM t GROUP BY cat ORDER BY COUNT(*) DESC LIMIT 2",
+    );
     assert_eq!(r.len(), 2);
     match (&r[0][0], &r[0][1]) {
-        (Value::Text(c), Value::Integer(n)) => { assert_eq!(&*c.0, "a"); assert_eq!(*n, 5); }
+        (Value::Text(c), Value::Integer(n)) => {
+            assert_eq!(&*c.0, "a");
+            assert_eq!(*n, 5);
+        }
         o => panic!("{:?}", o),
     }
 }

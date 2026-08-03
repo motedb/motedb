@@ -29,7 +29,8 @@ fn test_crash_recovery_update_rollback() {
     // Setup committed data
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.flush().unwrap();
         db.checkpoint().unwrap();
@@ -48,7 +49,11 @@ fn test_crash_recovery_update_rollback() {
     // Reopen — UPDATE should be rolled back
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
-    assert_eq!(r[0][0], Value::Integer(10), "uncommitted UPDATE must rollback on close");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(10),
+        "uncommitted UPDATE must rollback on close"
+    );
 }
 
 #[test]
@@ -58,7 +63,8 @@ fn test_crash_recovery_insert_rollback() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.flush().unwrap();
         db.checkpoint().unwrap();
@@ -76,7 +82,11 @@ fn test_crash_recovery_insert_rollback() {
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT COUNT(*) FROM t");
-    assert_eq!(r[0][0], Value::Integer(1), "uncommitted INSERT must rollback on close");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(1),
+        "uncommitted INSERT must rollback on close"
+    );
 }
 
 #[test]
@@ -86,7 +96,8 @@ fn test_crash_recovery_delete_rollback() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
         db.flush().unwrap();
         db.checkpoint().unwrap();
@@ -104,7 +115,11 @@ fn test_crash_recovery_delete_rollback() {
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT COUNT(*) FROM t");
-    assert_eq!(r[0][0], Value::Integer(2), "uncommitted DELETE must rollback on close");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(2),
+        "uncommitted DELETE must rollback on close"
+    );
 }
 
 #[test]
@@ -118,7 +133,8 @@ fn test_committed_transaction_survives_close() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("BEGIN").unwrap();
         db.execute("INSERT INTO t VALUES (1, 99)").unwrap();
         db.execute("COMMIT").unwrap();
@@ -138,7 +154,8 @@ fn test_no_active_transaction_close_normal() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
         db.close().unwrap();
     }
@@ -161,20 +178,29 @@ fn test_txn_insert_then_update_persists() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("BEGIN").unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
         // Read-your-writes: should see 99
         let r = q(&db, "SELECT v FROM t WHERE id = 1");
-        assert_eq!(r[0][0], Value::Integer(99), "read-your-writes after UPDATE in txn");
+        assert_eq!(
+            r[0][0],
+            Value::Integer(99),
+            "read-your-writes after UPDATE in txn"
+        );
         db.execute("COMMIT").unwrap();
         db.close().unwrap();
     }
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
-    assert_eq!(r[0][0], Value::Integer(99), "committed INSERT+UPDATE must persist");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(99),
+        "committed INSERT+UPDATE must persist"
+    );
 }
 
 #[test]
@@ -184,7 +210,8 @@ fn test_txn_insert_then_update_multiple() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("BEGIN").unwrap();
         db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
         db.execute("UPDATE t SET v = v + 100 WHERE id > 0").unwrap();
@@ -194,10 +221,13 @@ fn test_txn_insert_then_update_multiple() {
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT id, v FROM t ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(110)],
-        vec![Value::Integer(2), Value::Integer(120)],
-    ]);
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(110)],
+            vec![Value::Integer(2), Value::Integer(120)],
+        ]
+    );
 }
 
 #[test]
@@ -208,7 +238,8 @@ fn test_txn_update_precommitted_row() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.flush().unwrap();
         db.checkpoint().unwrap();
@@ -223,7 +254,11 @@ fn test_txn_update_precommitted_row() {
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
-    assert_eq!(r[0][0], Value::Integer(50), "committed UPDATE on pre-existing row");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(50),
+        "committed UPDATE on pre-existing row"
+    );
 }
 
 // =========================================================================
@@ -238,7 +273,8 @@ fn test_txn_delete_uncommitted_insert() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("BEGIN").unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         db.execute("DELETE FROM t WHERE id = 1").unwrap();
@@ -250,7 +286,11 @@ fn test_txn_delete_uncommitted_insert() {
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT COUNT(*) FROM t");
-    assert_eq!(r[0][0], Value::Integer(0), "deleted INSERT must not persist");
+    assert_eq!(
+        r[0][0],
+        Value::Integer(0),
+        "deleted INSERT must not persist"
+    );
 }
 
 #[test]
@@ -261,9 +301,11 @@ fn test_txn_delete_some_inserts() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("BEGIN").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
         db.execute("DELETE FROM t WHERE id = 2").unwrap();
         db.execute("COMMIT").unwrap();
         db.close().unwrap();
@@ -282,7 +324,8 @@ fn test_txn_delete_precommitted_row() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
         db.flush().unwrap();
         db.checkpoint().unwrap();
@@ -307,7 +350,8 @@ fn test_txn_mixed_insert_update_delete_commit() {
 
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
         db.flush().unwrap();
         db.checkpoint().unwrap();
@@ -324,8 +368,11 @@ fn test_txn_mixed_insert_update_delete_commit() {
 
     let db = Database::open(&path).unwrap();
     let r = q(&db, "SELECT id, v FROM t ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(99)],
-        vec![Value::Integer(3), Value::Integer(30)],
-    ]);
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(99)],
+            vec![Value::Integer(3), Value::Integer(30)],
+        ]
+    );
 }

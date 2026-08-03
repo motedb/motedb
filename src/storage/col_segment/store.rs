@@ -359,8 +359,7 @@ impl ColSegmentStore {
         self.col_types.store(Arc::new(new_types));
         // 3. Rebuild write_buf with the widened column layout.
         let buf_path = self.dir.join(".writebuf.tmp");
-        let new_buf =
-            ColumnarSSTableBuilder::new(&buf_path, (**self.col_types.load()).clone());
+        let new_buf = ColumnarSSTableBuilder::new(&buf_path, (**self.col_types.load()).clone());
         *self.write_buf.lock() = new_buf;
         // 4. Rewrite all pre-existing segments to the new N-column layout.
         //    This is critical: many read paths assume col_types.len() equals
@@ -852,9 +851,9 @@ impl ColSegmentStore {
                                         .ok()
                                         .and_then(|f| f.get_i64(i))
                                         .map(|micros| {
-                                            Value::Timestamp(
-                                                crate::types::Timestamp::from_micros(micros),
-                                            )
+                                            Value::Timestamp(crate::types::Timestamp::from_micros(
+                                                micros,
+                                            ))
                                         }),
                                     _ => seg
                                         .sst
@@ -898,7 +897,9 @@ impl ColSegmentStore {
                                 // and direct timestamp projection in scans.
                                 (Some(Some(f)), _, ColumnType::Timestamp) => {
                                     f.get_i64(i).map(|micros| {
-                                        Value::Timestamp(crate::types::Timestamp::from_micros(micros))
+                                        Value::Timestamp(crate::types::Timestamp::from_micros(
+                                            micros,
+                                        ))
                                     })
                                 }
                                 (_, _, ColumnType::Spatial) => pspatial
@@ -1420,10 +1421,8 @@ impl ColSegmentStore {
                     let mut row = Vec::with_capacity(project_cols.len());
                     for (pi, &pc) in project_cols.iter().enumerate() {
                         let v = if pc < col_types.len() {
-                            if matches!(
-                                col_types[pc],
-                                ColumnType::Spatial | ColumnType::Tensor(_)
-                            ) {
+                            if matches!(col_types[pc], ColumnType::Spatial | ColumnType::Tensor(_))
+                            {
                                 Some(Value::Null)
                             } else if let Some(Some(ref f)) = pfixed.get(pi) {
                                 match col_types[pc] {
@@ -3530,9 +3529,7 @@ impl ColSegmentStore {
                                     crate::types::Value::Integer(iv) => {
                                         iv.to_le_bytes().to_vec() // fixed-width 8 bytes, null=false
                                     }
-                                    crate::types::Value::Float(fv) => {
-                                        fv.to_le_bytes().to_vec()
-                                    }
+                                    crate::types::Value::Float(fv) => fv.to_le_bytes().to_vec(),
                                     crate::types::Value::Timestamp(tv) => {
                                         tv.as_micros().to_le_bytes().to_vec()
                                     }

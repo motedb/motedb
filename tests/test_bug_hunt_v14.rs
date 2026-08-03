@@ -13,12 +13,16 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
     match rs {
         QueryResult::Select { rows, .. } => rows,
         _ => panic!("not Select"),
@@ -28,7 +32,10 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -39,12 +46,18 @@ fn scalar_i64(db: &Database, sql: &str) -> i64 {
 fn left_join_unmatched_gets_null() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE a (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, val INT)",
+    );
     exec(&db, "INSERT INTO a VALUES (1, 'Alice')");
-    exec(&db, "INSERT INTO a VALUES (2, 'Bob')");  // no matching b
+    exec(&db, "INSERT INTO a VALUES (2, 'Bob')"); // no matching b
     exec(&db, "INSERT INTO b VALUES (1, 1, 100)");
     // LEFT JOIN: Alice gets val=100, Bob gets val=NULL.
-    let r = rows(&db, "SELECT name, val FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id");
+    let r = rows(
+        &db,
+        "SELECT name, val FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id",
+    );
     assert_eq!(r.len(), 2, "LEFT JOIN keeps unmatched left rows");
     // Bob should have NULL val.
     match &r[1][1] {
@@ -59,12 +72,17 @@ fn left_join_count_includes_unmatched() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE a (id INT PRIMARY KEY)");
     exec(&db, "CREATE TABLE b (id INT PRIMARY KEY, a_id INT)");
-    for i in 1..=5 { exec(&db, &format!("INSERT INTO a VALUES ({})", i)); }
+    for i in 1..=5 {
+        exec(&db, &format!("INSERT INTO a VALUES ({})", i));
+    }
     exec(&db, "INSERT INTO b VALUES (1, 1)"); // only 1 match
     exec(&db, "INSERT INTO b VALUES (2, 2)");
     // LEFT JOIN → 5 rows (3 unmatched get NULL).
     let r = rows(&db, "SELECT COUNT(*) FROM a LEFT JOIN b ON a.id = b.a_id");
-    match r[0][0] { Value::Integer(n) => assert_eq!(n, 5), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert_eq!(n, 5),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -75,14 +93,23 @@ fn left_join_count_includes_unmatched() {
 fn inner_join_where_on_right_table() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE a (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, status TEXT, amt INT)");
+    exec(
+        &db,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, status TEXT, amt INT)",
+    );
     exec(&db, "INSERT INTO a VALUES (1, 'Alice')");
     exec(&db, "INSERT INTO b VALUES (1, 1, 'active', 100)");
     exec(&db, "INSERT INTO b VALUES (2, 1, 'inactive', 200)");
     // INNER JOIN + WHERE status = 'active' → only the active row.
-    let r = rows(&db, "SELECT amt FROM a INNER JOIN b ON a.id = b.a_id WHERE status = 'active'");
+    let r = rows(
+        &db,
+        "SELECT amt FROM a INNER JOIN b ON a.id = b.a_id WHERE status = 'active'",
+    );
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 100), _ => panic!() }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 100),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -150,14 +177,20 @@ fn large_pk_values() {
 fn join_group_by_simple() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE a (id INT PRIMARY KEY, cat TEXT)");
-    exec(&db, "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, amt INT)");
+    exec(
+        &db,
+        "CREATE TABLE b (id INT PRIMARY KEY, a_id INT, amt INT)",
+    );
     exec(&db, "INSERT INTO a VALUES (1, 'x')");
     exec(&db, "INSERT INTO a VALUES (2, 'y')");
     exec(&db, "INSERT INTO b VALUES (1, 1, 10)");
     exec(&db, "INSERT INTO b VALUES (2, 1, 20)");
     exec(&db, "INSERT INTO b VALUES (3, 2, 30)");
     // GROUP BY cat, SUM(amt) via JOIN. x: 30, y: 30.
-    let r = rows(&db, "SELECT cat, SUM(amt) FROM a INNER JOIN b ON a.id = b.a_id GROUP BY cat ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(amt) FROM a INNER JOIN b ON a.id = b.a_id GROUP BY cat ORDER BY cat",
+    );
     assert_eq!(r.len(), 2);
 }
 
@@ -209,7 +242,10 @@ fn reopen_with_indexes_correct() {
         let db = Database::create(&path).unwrap();
         exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
         for i in 1..=100 {
-            exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i));
+            exec(
+                &db,
+                &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i),
+            );
         }
         exec(&db, "CREATE INDEX t_cat ON t(cat)");
         db.checkpoint().unwrap();
@@ -219,7 +255,10 @@ fn reopen_with_indexes_correct() {
     let db = Database::open(&path).unwrap();
     db.wait_for_indexes_ready();
     // Indexed query after reopen.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'c0'"), 20);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'c0'"),
+        20
+    );
     // Non-indexed query after reopen.
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t WHERE v > 50"), 3775); // sum(51..100)
 }
@@ -231,17 +270,38 @@ fn reopen_with_indexes_correct() {
 #[test]
 fn count_multiple_where_conditions() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
     for i in 1..=100 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {}, {}, {})", i, i % 3, i % 5, i % 7));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, {}, {}, {})",
+                i,
+                i % 3,
+                i % 5,
+                i % 7
+            ),
+        );
     }
     // Multiple AND conditions.
-    let r = rows(&db, "SELECT COUNT(*) FROM t WHERE a = 0 AND b = 0 AND c = 0");
+    let r = rows(
+        &db,
+        "SELECT COUNT(*) FROM t WHERE a = 0 AND b = 0 AND c = 0",
+    );
     // a=0 (i%3==0), b=0 (i%5==0), c=0 (i%7==0) → i%105==0 in 1..100 → only i=...none? lcm(3,5,7)=105>100 → 0.
-    match r[0][0] { Value::Integer(n) => assert_eq!(n, 0, "no i in 1..100 divisible by 105"), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert_eq!(n, 0, "no i in 1..100 divisible by 105"),
+        _ => panic!(),
+    }
     // Less restrictive.
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE a = 1 AND b = 1");
-    match r[0][0] { Value::Integer(n) => assert!(n > 0, "should have matches"), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert!(n > 0, "should have matches"),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -260,9 +320,13 @@ fn distinct_order_by_combined() {
     // DISTINCT v ORDER BY v ASC → 10, 20, 30.
     let r = rows(&db, "SELECT DISTINCT v FROM t ORDER BY v ASC");
     assert_eq!(r.len(), 3);
-    let vals: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let vals: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(vals, vec![10, 20, 30]);
 }
 

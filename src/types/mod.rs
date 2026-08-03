@@ -217,14 +217,10 @@ impl PartialOrd for Value {
             // compare. Without this, `WHERE ts > '2024-01-01'` always returned
             // empty (Text falls through to None → comparison fails). This makes
             // date-range queries on TIMESTAMP columns work correctly.
-            (Value::Timestamp(a), Value::Text(s)) => {
-                crate::types::Timestamp::parse_iso(s.as_str())
-                    .and_then(|t| a.as_micros().partial_cmp(&t.as_micros()))
-            }
-            (Value::Text(s), Value::Timestamp(b)) => {
-                crate::types::Timestamp::parse_iso(s.as_str())
-                    .and_then(|t| t.as_micros().partial_cmp(&b.as_micros()))
-            }
+            (Value::Timestamp(a), Value::Text(s)) => crate::types::Timestamp::parse_iso(s.as_str())
+                .and_then(|t| a.as_micros().partial_cmp(&t.as_micros())),
+            (Value::Text(s), Value::Timestamp(b)) => crate::types::Timestamp::parse_iso(s.as_str())
+                .and_then(|t| t.as_micros().partial_cmp(&b.as_micros())),
             _ => None,
         }
     }
@@ -281,14 +277,10 @@ impl PartialEq for Value {
             (Value::Float(a), Value::Timestamp(b)) => float_eq(*a, b.as_micros() as f64),
             // 🚨 Timestamp vs Text: parse text as ISO date and compare (so
             // `WHERE ts = '2024-01-15'` works on TIMESTAMP columns).
-            (Value::Timestamp(a), Value::Text(s)) => {
-                crate::types::Timestamp::parse_iso(s.as_str())
-                    .is_some_and(|t| a.as_micros() == t.as_micros())
-            }
-            (Value::Text(s), Value::Timestamp(b)) => {
-                crate::types::Timestamp::parse_iso(s.as_str())
-                    .is_some_and(|t| t.as_micros() == b.as_micros())
-            }
+            (Value::Timestamp(a), Value::Text(s)) => crate::types::Timestamp::parse_iso(s.as_str())
+                .is_some_and(|t| a.as_micros() == t.as_micros()),
+            (Value::Text(s), Value::Timestamp(b)) => crate::types::Timestamp::parse_iso(s.as_str())
+                .is_some_and(|t| t.as_micros() == b.as_micros()),
             _ => false,
         }
     }

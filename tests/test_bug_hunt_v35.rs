@@ -42,8 +42,10 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn test_group_concat_default_separator() {
     // Default separator is comma.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 2), (2, 4), (3, 6)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2), (2, 4), (3, 6)")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v) FROM t");
     assert_eq!(r, vec![vec![Value::text("2,4,6".into())]]);
 }
@@ -51,8 +53,10 @@ fn test_group_concat_default_separator() {
 #[test]
 fn test_group_concat_custom_separator() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 2), (2, 4), (3, 6)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2), (2, 4), (3, 6)")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v, '-') FROM t");
     assert_eq!(r, vec![vec![Value::text("2-4-6".into())]]);
 }
@@ -60,8 +64,10 @@ fn test_group_concat_custom_separator() {
 #[test]
 fn test_group_concat_text() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(name) FROM t");
     assert_eq!(r, vec![vec![Value::text("alice,bob".into())]]);
 }
@@ -69,8 +75,10 @@ fn test_group_concat_text() {
 #[test]
 fn test_group_concat_text_custom_sep() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(name, ', ') FROM t");
     assert_eq!(r, vec![vec![Value::text("alice, bob".into())]]);
 }
@@ -83,8 +91,10 @@ fn test_group_concat_text_custom_sep() {
 fn test_group_concat_skips_null() {
     // NULL values are skipped (not included as empty strings).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1), (2, NULL), (3, 3)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, NULL), (3, 3)")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v) FROM t");
     assert_eq!(r, vec![vec![Value::text("1,3".into())]]);
 }
@@ -92,8 +102,10 @@ fn test_group_concat_skips_null() {
 #[test]
 fn test_group_concat_all_null_returns_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, NULL), (2, NULL)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL), (2, NULL)")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v) FROM t");
     assert_eq!(r, vec![vec![Value::Null]]);
 }
@@ -101,7 +113,8 @@ fn test_group_concat_all_null_returns_null() {
 #[test]
 fn test_group_concat_empty_table_returns_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v) FROM t");
     assert_eq!(r, vec![vec![Value::Null]]);
 }
@@ -109,7 +122,8 @@ fn test_group_concat_empty_table_returns_null() {
 #[test]
 fn test_group_concat_single_value() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v) FROM t");
     assert_eq!(r, vec![vec![Value::text("42".into())]]);
@@ -122,21 +136,31 @@ fn test_group_concat_single_value() {
 #[test]
 fn test_group_concat_with_group_by() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)").unwrap();
-    let r = q(&db, "SELECT k, GROUP_CONCAT(v) FROM t GROUP BY k ORDER BY k");
-    assert_eq!(r, vec![
-        vec![Value::text("a".into()), Value::text("1,2".into())],
-        vec![Value::text("b".into()), Value::text("3".into())],
-    ]);
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 3)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT k, GROUP_CONCAT(v) FROM t GROUP BY k ORDER BY k",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::text("a".into()), Value::text("1,2".into())],
+            vec![Value::text("b".into()), Value::text("3".into())],
+        ]
+    );
 }
 
 #[test]
 fn test_group_concat_mixed_types() {
     // Integers and text in same column.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')")
+        .unwrap();
     let r = q(&db, "SELECT GROUP_CONCAT(v, '|') FROM t");
     assert_eq!(r, vec![vec![Value::text("x|y|z".into())]]);
 }
@@ -179,23 +203,33 @@ fn test_concat_operator_null_propagates() {
 #[test]
 fn test_concat_operator_with_columns() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
     let r = q(&db, "SELECT name || '!' FROM t ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::text("alice!".into())],
-        vec![Value::text("bob!".into())],
-    ]);
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::text("alice!".into())],
+            vec![Value::text("bob!".into())],
+        ]
+    );
 }
 
 #[test]
 fn test_concat_operator_multi_columns() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
     let r = q(&db, "SELECT id || '-' || name FROM t ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::text("1-alice".into())],
-        vec![Value::text("2-bob".into())],
-    ]);
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::text("1-alice".into())],
+            vec![Value::text("2-bob".into())],
+        ]
+    );
 }

@@ -44,11 +44,16 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn test_update_overflow_errors() {
     // UPDATE v = v + 1 where v = i64::MAX should error (not silently keep old value).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .unwrap();
     let err = q_err(&db, "UPDATE t SET v = v + 1 WHERE id = 1");
-    assert!(err.contains("Type mismatch") || err.contains("Integer"),
-           "expected type error, got: {}", err);
+    assert!(
+        err.contains("Type mismatch") || err.contains("Integer"),
+        "expected type error, got: {}",
+        err
+    );
     // Value unchanged.
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r[0][0], Value::Integer(9223372036854775807));
@@ -57,8 +62,10 @@ fn test_update_overflow_errors() {
 #[test]
 fn test_update_overflow_mul_errors() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .unwrap();
     let err = q_err(&db, "UPDATE t SET v = v * 2 WHERE id = 1");
     assert!(err.contains("Type mismatch") || err.contains("Integer"));
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
@@ -69,7 +76,8 @@ fn test_update_overflow_mul_errors() {
 fn test_update_normal_add_works() {
     // Regression: normal UPDATE v = v + N still works.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     db.execute("UPDATE t SET v = v + 50 WHERE id = 1").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
@@ -80,8 +88,10 @@ fn test_update_normal_add_works() {
 fn test_update_near_max_add() {
     // v = i64::MAX - 10, add 5 → should work (no overflow).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 9223372036854775797)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775797)")
+        .unwrap();
     db.execute("UPDATE t SET v = v + 5 WHERE id = 1").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r[0][0], Value::Integer(9223372036854775802));
@@ -91,8 +101,10 @@ fn test_update_near_max_add() {
 fn test_select_overflow_promotes_to_float() {
     // SELECT v + 1 should still promote to Float (read path unaffected).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .unwrap();
     let r = q(&db, "SELECT v + 1 FROM t WHERE id = 1");
     match &r[0][0] {
         Value::Float(_) => {} // correct: promoted

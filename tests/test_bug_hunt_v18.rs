@@ -67,20 +67,26 @@ fn emp_db() -> (Database, TempDir) {
         &db,
         "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT, dept_id INT, salary INT)",
     );
-    exec(&db, "INSERT INTO emp VALUES \
+    exec(
+        &db,
+        "INSERT INTO emp VALUES \
         (1, 'alice', 10, 100), \
         (2, 'bob',   10, 200), \
         (3, 'carol', 20, 150), \
         (4, 'dave',  20, NULL), \
-        (5, 'eve',   NULL, 300)");
+        (5, 'eve',   NULL, 300)",
+    );
     exec(
         &db,
         "CREATE TABLE dept (id INT PRIMARY KEY, name TEXT, budget INT)",
     );
-    exec(&db, "INSERT INTO dept VALUES \
+    exec(
+        &db,
+        "INSERT INTO dept VALUES \
         (10, 'eng', 1000), \
         (20, 'sales', 500), \
-        (30, 'hr', 200)");
+        (30, 'hr', 200)",
+    );
     (db, dir)
 }
 
@@ -101,7 +107,10 @@ fn cte_empty_result() {
 #[test]
 fn cte_count_zero() {
     let (db, _dir) = emp_db();
-    let n = scalar_i64(&db, "WITH x AS (SELECT id FROM emp WHERE salary > 9999) SELECT COUNT(*) FROM x");
+    let n = scalar_i64(
+        &db,
+        "WITH x AS (SELECT id FROM emp WHERE salary > 9999) SELECT COUNT(*) FROM x",
+    );
     assert_eq!(n, 0);
 }
 
@@ -182,9 +191,7 @@ fn cte_referenced_in_subquery_where() {
 #[test]
 fn cte_used_in_update_rejected() {
     let (db, _dir) = emp_db();
-    let result = db.execute(
-        "WITH x AS (SELECT 1) UPDATE emp SET salary = 0 WHERE id = 1",
-    );
+    let result = db.execute("WITH x AS (SELECT 1) UPDATE emp SET salary = 0 WHERE id = 1");
     assert!(result.is_err(), "WITH before UPDATE should be rejected");
 }
 
@@ -253,10 +260,7 @@ fn null_in_in_list() {
     let (db, _dir) = emp_db();
     // SQL standard: x IN (a, NULL) where x not in {a} → NULL (unknown).
     // For COUNT, unknown is not counted. So 0.
-    let n = scalar_i64(
-        &db,
-        "SELECT COUNT(*) FROM emp WHERE salary IN (999, NULL)",
-    );
+    let n = scalar_i64(&db, "SELECT COUNT(*) FROM emp WHERE salary IN (999, NULL)");
     assert_eq!(n, 0);
 }
 
@@ -425,7 +429,11 @@ fn correlated_subquery_in_where_currently_uncorrelated() {
     let mut ids_sorted = ids.clone();
     ids_sorted.sort();
     // Document current bug: returns global-AVG-based filter, not per-dept.
-    assert_eq!(ids_sorted, vec![2, 5], "correlated subquery in WHERE returns global-AVG result (known bug)");
+    assert_eq!(
+        ids_sorted,
+        vec![2, 5],
+        "correlated subquery in WHERE returns global-AVG result (known bug)"
+    );
 }
 
 /// Sanity check: UNCORRELATED subqueries (no outer reference) DO work
@@ -434,7 +442,10 @@ fn correlated_subquery_in_where_currently_uncorrelated() {
 #[test]
 fn uncorrelated_subquery_in_where_works() {
     let (db, _dir) = emp_db();
-    let r = rows(&db, "SELECT id FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)");
+    let r = rows(
+        &db,
+        "SELECT id FROM emp WHERE salary > (SELECT AVG(salary) FROM emp)",
+    );
     let ids: Vec<i64> = r
         .iter()
         .filter_map(|row| match row.first() {
@@ -576,14 +587,16 @@ fn delete_where_is_null() {
 #[test]
 fn update_set_null_explicit() {
     let (db, _dir) = emp_db();
-    db.execute("UPDATE emp SET salary = NULL WHERE id = 1").unwrap();
+    db.execute("UPDATE emp SET salary = NULL WHERE id = 1")
+        .unwrap();
     assert!(scalar_is_null(&db, "SELECT salary FROM emp WHERE id = 1"));
 }
 
 #[test]
 fn update_where_no_match_zero_rows() {
     let (db, _dir) = emp_db();
-    db.execute("UPDATE emp SET salary = 0 WHERE id = 99999").unwrap();
+    db.execute("UPDATE emp SET salary = 0 WHERE id = 99999")
+        .unwrap();
     // No row should have changed.
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM emp WHERE salary = 0");
     assert_eq!(n, 0);
@@ -744,8 +757,12 @@ fn insert_duplicate_pk_errors() {
 #[test]
 fn insert_explicit_null() {
     let (db, _dir) = emp_db();
-    db.execute("INSERT INTO emp VALUES (99, 'x', NULL, NULL)").unwrap();
-    let n = scalar_i64(&db, "SELECT COUNT(*) FROM emp WHERE salary IS NULL AND dept_id IS NULL");
+    db.execute("INSERT INTO emp VALUES (99, 'x', NULL, NULL)")
+        .unwrap();
+    let n = scalar_i64(
+        &db,
+        "SELECT COUNT(*) FROM emp WHERE salary IS NULL AND dept_id IS NULL",
+    );
     assert_eq!(n, 1);
 }
 

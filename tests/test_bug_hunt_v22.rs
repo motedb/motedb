@@ -64,7 +64,10 @@ fn show_tables_empty_succeeds() {
 #[test]
 fn describe_table_returns_columns() {
     let (db, _dir) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT)",
+    );
     let result = db.execute("DESCRIBE t");
     assert!(result.is_ok(), "DESCRIBE should succeed");
 }
@@ -154,10 +157,7 @@ fn prepared_with_null_param() {
     exec(&db, "INSERT INTO t VALUES (1, NULL), (2, 5)");
 
     // WHERE v = ? with NULL param should match nothing (= NULL is unknown).
-    let r = match db.execute_prepared(
-        "SELECT COUNT(*) FROM t WHERE v = ?",
-        vec![Value::Null],
-    ) {
+    let r = match db.execute_prepared("SELECT COUNT(*) FROM t WHERE v = ?", vec![Value::Null]) {
         Ok(r) => r.materialize().unwrap(),
         Err(e) => panic!("prepared failed: {}", e),
     };
@@ -173,7 +173,10 @@ fn prepared_with_null_param() {
 fn prepared_with_multiple_params() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
+    );
 
     let r = match db.execute_prepared(
         "SELECT id FROM t WHERE a > ? AND b < ?",
@@ -360,7 +363,10 @@ fn sql_injection_extra_statement_rejected() {
 fn order_by_asc_with_nulls_deterministic() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 30), (2, NULL), (3, 10), (4, NULL), (5, 20)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 30), (2, NULL), (3, 10), (4, NULL), (5, 20)",
+    );
     // Run multiple times — order must be deterministic.
     let mut prev: Vec<i64> = Vec::new();
     for _ in 0..5 {
@@ -391,7 +397,10 @@ fn min_max_on_text_lexicographic_currently_null() {
     // aggregate fast paths. The materialized path now handles TEXT correctly.)
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')",
+    );
     let r = rows(&db, "SELECT MIN(s) FROM t");
     assert_eq!(r.len(), 1);
     match &r[0][0] {
@@ -433,7 +442,10 @@ fn min_max_with_null_ignored() {
 fn count_distinct_with_nulls() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, NULL), (5, NULL)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, NULL), (5, NULL)",
+    );
     let n = scalar_i64(&db, "SELECT COUNT(DISTINCT v) FROM t");
     // DISTINCT ignores NULLs. Distinct non-NULL values: 10, 20. → 2.
     assert_eq!(n, 2);
@@ -443,7 +455,10 @@ fn count_distinct_with_nulls() {
 fn count_distinct_text() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b')",
+    );
     let n = scalar_i64(&db, "SELECT COUNT(DISTINCT s) FROM t");
     assert_eq!(n, 3); // a, b, c
 }
@@ -485,7 +500,10 @@ fn where_column_arithmetic_equality() {
 #[test]
 fn where_column_arithmetic_with_parens() {
     let (db, _dir) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
     exec(&db, "INSERT INTO t VALUES (1, 10, 3, 4), (2, 5, 2, 3)");
     // WHERE (a + b) * c > 50
     let n = scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE (a + b) * c > 50");

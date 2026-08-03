@@ -100,12 +100,18 @@ fn qualified_column_select_after_join_resolves_correctly() {
     exec(&db, "INSERT INTO emp VALUES (1, 'Alice')");
     exec(&db, "INSERT INTO dept VALUES (1, 'Sales')");
     // Qualified — must resolve to the right table.
-    let r = rows(&db, "SELECT emp.name FROM emp JOIN dept ON emp.id = dept.id");
+    let r = rows(
+        &db,
+        "SELECT emp.name FROM emp JOIN dept ON emp.id = dept.id",
+    );
     match &r[0][0] {
         Value::Text(s) => assert_eq!(s.as_str(), "Alice"),
         o => panic!("expected 'Alice', got {:?}", o),
     }
-    let r = rows(&db, "SELECT dept.name FROM emp JOIN dept ON emp.id = dept.id");
+    let r = rows(
+        &db,
+        "SELECT dept.name FROM emp JOIN dept ON emp.id = dept.id",
+    );
     match &r[0][0] {
         Value::Text(s) => assert_eq!(s.as_str(), "Sales"),
         o => panic!("expected 'Sales', got {:?}", o),
@@ -189,10 +195,7 @@ fn left_join_where_on_matched_and_unmatched() {
 fn order_by_expression() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(
-        &db,
-        "INSERT INTO t VALUES (1, 10, 5), (2, 3, 8), (3, 1, 1)",
-    );
+    exec(&db, "INSERT INTO t VALUES (1, 10, 5), (2, 3, 8), (3, 1, 1)");
     // ORDER BY a + b DESC: 15, 11, 2 → ids 1, 2, 3.
     let r = rows(&db, "SELECT id FROM t ORDER BY a + b DESC");
     let ids: Vec<i64> = r
@@ -424,7 +427,7 @@ fn subquery_in_select_column_current_limitation() {
     // t.id=2 has no match — should be NULL, but current impl returns 100
     // (stale cache). Document either behavior.
     match &r[1][1] {
-        Value::Null => {} // correct
+        Value::Null => {}         // correct
         Value::Integer(100) => {} // documented limitation (stale cache)
         o => panic!("expected NULL or stale 100, got {:?}", o),
     }
@@ -457,7 +460,11 @@ fn txn_rollback_discards_insert() {
     exec(&db, "INSERT INTO t VALUES (2, 20)");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 2);
     exec(&db, "ROLLBACK");
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1, "ROLLBACK discards insert");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        1,
+        "ROLLBACK discards insert"
+    );
 }
 
 #[test]
@@ -469,7 +476,11 @@ fn txn_rollback_discards_update() {
     exec(&db, "UPDATE t SET v = 999");
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t"), 1998);
     exec(&db, "ROLLBACK");
-    assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t"), 30, "ROLLBACK restores old values");
+    assert_eq!(
+        scalar_i64(&db, "SELECT SUM(v) FROM t"),
+        30,
+        "ROLLBACK restores old values"
+    );
 }
 
 #[test]
@@ -481,7 +492,11 @@ fn txn_rollback_discards_delete() {
     exec(&db, "DELETE FROM t WHERE id = 1");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1);
     exec(&db, "ROLLBACK");
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 2, "ROLLBACK restores deleted row");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "ROLLBACK restores deleted row"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -497,7 +512,10 @@ fn group_by_having_count_filter() {
         "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'a'), (4, 'b'), (5, 'b')",
     );
     // HAVING COUNT(*) > 2 → only 'a' (3 rows).
-    let r = rows(&db, "SELECT cat, COUNT(*) FROM t GROUP BY cat HAVING COUNT(*) > 2");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*) FROM t GROUP BY cat HAVING COUNT(*) > 2",
+    );
     assert_eq!(r.len(), 1);
     match &r[0][0] {
         Value::Text(s) => assert_eq!(s.as_str(), "a"),
@@ -536,7 +554,10 @@ fn group_by_having_with_where() {
     );
     // WHERE v > 5 → rows 1 (a,10), 3 (b,20). Then GROUP BY: a→10, b→20.
     // HAVING SUM(v) > 15 → b only.
-    let r = rows(&db, "SELECT cat FROM t WHERE v > 5 GROUP BY cat HAVING SUM(v) > 15");
+    let r = rows(
+        &db,
+        "SELECT cat FROM t WHERE v > 5 GROUP BY cat HAVING SUM(v) > 15",
+    );
     assert_eq!(r.len(), 1);
     match &r[0][0] {
         Value::Text(s) => assert_eq!(s.as_str(), "b"),
@@ -573,7 +594,10 @@ fn distinct_count_via_subquery_workaround() {
     // Can't do COUNT(DISTINCT) in all contexts; test the direct form.
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+    );
     assert_eq!(scalar_i64(&db, "SELECT COUNT(DISTINCT v) FROM t"), 3);
 }
 
@@ -586,7 +610,10 @@ fn where_text_comparison_case_sensitive() {
     // SQL default: text comparison is case-sensitive (except in MySQL).
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'Hello'), (2, 'hello'), (3, 'HELLO')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'Hello'), (2, 'hello'), (3, 'HELLO')",
+    );
     let r = rows(&db, "SELECT id FROM t WHERE s = 'Hello'");
     assert_eq!(r.len(), 1, "case-sensitive equality");
     assert_eq!(r[0][0], Value::Integer(1));
@@ -596,7 +623,10 @@ fn where_text_comparison_case_sensitive() {
 fn where_text_ordering_alphabetical() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'banana'), (2, 'apple'), (3, 'cherry')",
+    );
     let r = rows(&db, "SELECT s FROM t ORDER BY s");
     let vals: Vec<String> = r
         .iter()

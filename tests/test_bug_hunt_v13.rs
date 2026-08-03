@@ -13,19 +13,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -62,13 +72,23 @@ fn float_order_by_correct() {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {:.4})", i + 1, v));
     }
     let r = rows(&db, "SELECT v FROM t ORDER BY v ASC");
-    let got: Vec<f64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Float(f)) => Some(*f), _ => None
-    }).collect();
+    let got: Vec<f64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Float(f)) => Some(*f),
+            _ => None,
+        })
+        .collect();
     let mut expected = vals.to_vec();
     expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
     for (i, (&e, &g)) in expected.iter().zip(got.iter()).enumerate() {
-        assert!((e - g).abs() < 0.001, "pos {}: expected {}, got {}", i, e, g);
+        assert!(
+            (e - g).abs() < 0.001,
+            "pos {}: expected {}, got {}",
+            i,
+            e,
+            g
+        );
     }
 }
 
@@ -83,10 +103,19 @@ fn case_in_select_with_arithmetic() {
     exec(&db, "INSERT INTO t VALUES (1, 5)");
     exec(&db, "INSERT INTO t VALUES (2, 15)");
     // CASE + arithmetic in SELECT.
-    let r = rows(&db, "SELECT CASE WHEN v > 10 THEN v * 2 ELSE v END FROM t ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v > 10 THEN v * 2 ELSE v END FROM t ORDER BY id",
+    );
     assert_eq!(r.len(), 2);
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 5), o => panic!("{:?}", o) }
-    match &r[1][0] { Value::Integer(n) => assert_eq!(*n, 30), o => panic!("{:?}", o) }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 5),
+        o => panic!("{:?}", o),
+    }
+    match &r[1][0] {
+        Value::Integer(n) => assert_eq!(*n, 30),
+        o => panic!("{:?}", o),
+    }
 }
 
 #[test]
@@ -95,9 +124,15 @@ fn case_with_else_null() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
     exec(&db, "INSERT INTO t VALUES (2, 20)");
-    let r = rows(&db, "SELECT CASE WHEN v = 10 THEN 'ten' END FROM t ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v = 10 THEN 'ten' END FROM t ORDER BY id",
+    );
     assert_eq!(r.len(), 2);
-    match &r[0][0] { Value::Text(s) => assert_eq!(&*s.0, "ten"), _ => panic!() }
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "ten"),
+        _ => panic!(),
+    }
     assert!(matches!(r[1][0], Value::Null), "no ELSE → NULL");
 }
 
@@ -105,7 +140,9 @@ fn case_with_else_null() {
 fn case_multiple_conditions() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    for i in 1..=10 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10)); }
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
+    }
     // Categorize into tiers.
     let r = rows(&db,
         "SELECT CASE WHEN v >= 80 THEN 'A' WHEN v >= 50 THEN 'B' WHEN v >= 20 THEN 'C' ELSE 'D' END FROM t ORDER BY id");
@@ -128,21 +165,31 @@ fn case_multiple_conditions() {
 fn scalar_subquery_max() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    for i in 1..=10 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10)); }
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
+    }
     // WHERE v = (SELECT MAX(v) FROM t) → v=100, id=10.
     let r = rows(&db, "SELECT id FROM t WHERE v = (SELECT MAX(v) FROM t)");
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 10), o => panic!("{:?}", o) }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 10),
+        o => panic!("{:?}", o),
+    }
 }
 
 #[test]
 fn scalar_subquery_min() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    for i in 1..=10 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10)); }
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
+    }
     let r = rows(&db, "SELECT id FROM t WHERE v = (SELECT MIN(v) FROM t)");
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 1), o => panic!("{:?}", o) }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 1),
+        o => panic!("{:?}", o),
+    }
 }
 
 #[test]
@@ -166,7 +213,10 @@ fn auto_increment_after_reopen() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)");
+        exec(
+            &db,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)",
+        );
         exec(&db, "INSERT INTO t (v) VALUES (10)"); // id=1
         exec(&db, "INSERT INTO t (v) VALUES (20)"); // id=2
         db.checkpoint().unwrap();
@@ -188,7 +238,10 @@ fn auto_increment_after_reopen() {
 #[test]
 fn auto_increment_explicit_id_skips() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)",
+    );
     exec(&db, "INSERT INTO t (v) VALUES (10)"); // id=1
     exec(&db, "INSERT INTO t VALUES (100, 20)"); // explicit id=100
     exec(&db, "INSERT INTO t (v) VALUES (30)"); // should be id=101 or id=2
@@ -227,7 +280,10 @@ fn update_set_to_literal_string() {
     exec(&db, "INSERT INTO t VALUES (1, 'old')");
     exec(&db, "UPDATE t SET s = 'new' WHERE id = 1");
     let r = rows(&db, "SELECT s FROM t WHERE id = 1");
-    match &r[0][0] { Value::Text(s) => assert_eq!(&*s.0, "new"), _ => panic!() }
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "new"),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -237,7 +293,10 @@ fn update_set_to_literal_string() {
 #[test]
 fn group_where_having_order_all_combined() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, dept TEXT, level INT, salary INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, dept TEXT, level INT, salary INT)",
+    );
     // eng: 3 seniors (100,200,300), 2 juniors (50,60).
     // sales: 1 senior (150), 2 juniors (40,70).
     exec(&db, "INSERT INTO t VALUES (1, 'eng', 3, 100)");
@@ -253,7 +312,10 @@ fn group_where_having_order_all_combined() {
     let r = rows(&db, "SELECT dept, SUM(salary) FROM t WHERE level = 3 GROUP BY dept HAVING SUM(salary) > 250 ORDER BY SUM(salary) DESC");
     assert_eq!(r.len(), 1, "only eng passes HAVING > 250");
     match (&r[0][0], &r[0][1]) {
-        (Value::Text(d), Value::Integer(s)) => { assert_eq!(&*d.0, "eng"); assert_eq!(*s, 600); }
+        (Value::Text(d), Value::Integer(s)) => {
+            assert_eq!(&*d.0, "eng");
+            assert_eq!(*s, 600);
+        }
         o => panic!("{:?}", o),
     }
 }
@@ -267,7 +329,9 @@ fn delete_where_not_in_subquery() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "CREATE TABLE keep (id INT PRIMARY KEY, tid INT)");
-    for i in 1..=10 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10)); }
+    for i in 1..=10 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
+    }
     // Keep only ids referenced in keep table.
     exec(&db, "INSERT INTO keep VALUES (1, 1)");
     exec(&db, "INSERT INTO keep VALUES (2, 3)");
@@ -276,9 +340,13 @@ fn delete_where_not_in_subquery() {
     exec(&db, "DELETE FROM t WHERE id NOT IN (SELECT tid FROM keep)");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 3);
     let r = rows(&db, "SELECT id FROM t ORDER BY id");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids, vec![1, 3, 5]);
 }
 
@@ -290,7 +358,10 @@ fn delete_where_not_in_subquery() {
 fn wide_row_mixed_types_select_specific() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, age INT, score FLOAT, active BOOLEAN, code TEXT)");
-    exec(&db, "INSERT INTO t VALUES (1, 'Alice', 30, 95.5, TRUE, 'X1')");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 'Alice', 30, 95.5, TRUE, 'X1')",
+    );
     // Select non-contiguous columns.
     let r = rows(&db, "SELECT code, age, name FROM t WHERE id = 1");
     assert_eq!(r.len(), 1);
@@ -313,15 +384,21 @@ fn checkpoint_interleaved_queries_correct() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     // Round 1.
-    for i in 1..=50 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i)); }
+    for i in 1..=50 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
+    }
     db.checkpoint().unwrap();
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t"), 1275); // sum(1..50)
-    // Round 2.
-    for i in 51..=100 { exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i)); }
+                                                               // Round 2.
+    for i in 51..=100 {
+        exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
+    }
     db.checkpoint().unwrap();
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t"), 5050); // sum(1..100)
-    // Round 3 — delete some.
-    for i in 1..=25 { exec(&db, &format!("DELETE FROM t WHERE id = {}", i)); }
+                                                               // Round 3 — delete some.
+    for i in 1..=25 {
+        exec(&db, &format!("DELETE FROM t WHERE id = {}", i));
+    }
     db.checkpoint().unwrap();
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 75);
     // sum(26..100) = 5050 - sum(1..25) = 5050 - 325 = 4725.
@@ -341,7 +418,11 @@ fn count_distinct_text_column() {
     exec(&db, "INSERT INTO t VALUES (3, 'a')");
     exec(&db, "INSERT INTO t VALUES (4, 'c')");
     exec(&db, "INSERT INTO t VALUES (5, 'b')");
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(DISTINCT cat) FROM t"), 3, "distinct: a, b, c");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(DISTINCT cat) FROM t"),
+        3,
+        "distinct: a, b, c"
+    );
 }
 
 #[test]
@@ -353,7 +434,10 @@ fn count_distinct_with_where_text() {
     exec(&db, "INSERT INTO t VALUES (3, 'b', 30)");
     exec(&db, "INSERT INTO t VALUES (4, 'c', 40)");
     // WHERE v > 15 → ids 2(a), 3(b), 4(c) → distinct cat = {a, b, c} = 3.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(DISTINCT cat) FROM t WHERE v > 15"), 3);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(DISTINCT cat) FROM t WHERE v > 15"),
+        3
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -419,13 +503,17 @@ fn order_by_computed_expression() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10, 1)"); // a-b=9
-    exec(&db, "INSERT INTO t VALUES (2, 5, 5)");  // a-b=0
-    exec(&db, "INSERT INTO t VALUES (3, 3, 1)");  // a-b=2
-    // ORDER BY a - b ASC → id 2 (0), id 3 (2), id 1 (9).
+    exec(&db, "INSERT INTO t VALUES (2, 5, 5)"); // a-b=0
+    exec(&db, "INSERT INTO t VALUES (3, 3, 1)"); // a-b=2
+                                                 // ORDER BY a - b ASC → id 2 (0), id 3 (2), id 1 (9).
     let r = rows(&db, "SELECT id FROM t ORDER BY a - b ASC");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids, vec![2, 3, 1]);
 }
 
@@ -441,7 +529,10 @@ fn delete_already_deleted_row() {
     exec(&db, "DELETE FROM t WHERE id = 1");
     // Delete again — should be no-op, no error.
     let result = db.execute("DELETE FROM t WHERE id = 1");
-    assert!(result.is_ok(), "deleting already-deleted row should succeed");
+    assert!(
+        result.is_ok(),
+        "deleting already-deleted row should succeed"
+    );
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 0);
 }
 
@@ -457,5 +548,8 @@ fn select_qualified_column_name() {
     // SELECT t.v FROM t — table-qualified column.
     let r = rows(&db, "SELECT t.v FROM t WHERE t.id = 1");
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 42), o => panic!("{:?}", o) }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 42),
+        o => panic!("{:?}", o),
+    }
 }

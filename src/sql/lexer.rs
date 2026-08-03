@@ -420,7 +420,9 @@ impl<'a> Lexer<'a> {
             self.advance_utf8();
         }
         if self.is_eof() {
-            return Err(MoteDBError::ParseError("Unterminated quoted identifier".to_string()));
+            return Err(MoteDBError::ParseError(
+                "Unterminated quoted identifier".to_string(),
+            ));
         }
         self.advance(); // skip closing "
         Ok(TokenType::Identifier(value))

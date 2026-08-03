@@ -721,7 +721,11 @@ fn stddev_with_group_by() {
     let rs = rows(&db, "SELECT cat, STDDEV(v) FROM t GROUP BY cat");
     assert_eq!(rs.len(), 1, "GROUP BY cat yields 1 group");
     match &rs[0][1] {
-        Value::Float(f) => assert!((f - 10.0).abs() < 1e-9, "STDDEV(10,20,30) = 10.0, got {}", f),
+        Value::Float(f) => assert!(
+            (f - 10.0).abs() < 1e-9,
+            "STDDEV(10,20,30) = 10.0, got {}",
+            f
+        ),
         Value::Null => panic!("group STDDEV returned NULL"),
         other => panic!("expected Float, got {:?}", other),
     }

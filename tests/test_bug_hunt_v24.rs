@@ -99,11 +99,11 @@ fn union_dedups_all_identical() {
 fn groupby_with_min_max() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 30), (3, 1, 20), (4, 2, 50), (5, 2, 40)");
-    let r = rows(
+    exec(
         &db,
-        "SELECT g, MIN(v), MAX(v) FROM t GROUP BY g ORDER BY g",
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 30), (3, 1, 20), (4, 2, 50), (5, 2, 40)",
     );
+    let r = rows(&db, "SELECT g, MIN(v), MAX(v) FROM t GROUP BY g ORDER BY g");
     assert_eq!(r.len(), 2);
     assert!(matches!(&r[0][0], Value::Integer(1)));
     assert!(matches!(&r[0][1], Value::Integer(10)));
@@ -117,7 +117,10 @@ fn groupby_with_min_max() {
 fn groupby_min_with_null_in_group() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 10), (2, 1, NULL), (3, 1, 5)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, NULL), (3, 1, 5)",
+    );
     // MIN(v) over g=1: ignores NULL → min(10, 5) = 5.
     let r = rows(&db, "SELECT MIN(v) FROM t WHERE g = 1");
     assert!(matches!(&r[0][0], Value::Integer(5)));
@@ -289,7 +292,10 @@ fn delete_then_reinsert_same_pk() {
 fn where_same_column_two_ranges() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    );
     // v > 10 AND v < 30 → 15, 25 → ids 2, 3.
     let ids = ids_sorted(&db, "SELECT id FROM t WHERE v > 10 AND v < 30");
     assert_eq!(ids, vec![2, 3]);
@@ -312,9 +318,12 @@ fn where_or_same_column() {
 fn count_distinct_with_groupby() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, cat TEXT)");
-    exec(&db, "INSERT INTO t VALUES \
+    exec(
+        &db,
+        "INSERT INTO t VALUES \
         (1, 1, 'a'), (2, 1, 'a'), (3, 1, 'b'), \
-        (4, 2, 'x'), (5, 2, 'x')");
+        (4, 2, 'x'), (5, 2, 'x')",
+    );
     let r = rows(
         &db,
         "SELECT g, COUNT(DISTINCT cat) FROM t GROUP BY g ORDER BY g",
@@ -335,7 +344,10 @@ fn count_distinct_with_groupby() {
 fn sum_with_some_nulls() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 20), (4, NULL), (5, 30)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 20), (4, NULL), (5, 30)",
+    );
     let n = scalar_i64(&db, "SELECT SUM(v) FROM t");
     assert_eq!(n, 60); // 10+20+30
 }

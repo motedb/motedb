@@ -80,7 +80,10 @@ fn sum_floats_exact() {
 fn avg_float_exact() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, f FLOAT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)",
+    );
     let f = scalar_f64(&db, "SELECT AVG(f) FROM t");
     assert!((f - 2.5).abs() < 1e-6);
 }
@@ -181,7 +184,10 @@ fn batch_insert_with_nulls() {
 fn count_after_batch_insert_with_nulls() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)",
+    );
     let star = scalar_i64(&db, "SELECT COUNT(*) FROM t");
     let col = scalar_i64(&db, "SELECT COUNT(v) FROM t");
     assert_eq!(star, 4);
@@ -196,7 +202,10 @@ fn count_after_batch_insert_with_nulls() {
 fn and_binds_tighter_than_or() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 1), (2, 1, 0), (3, 0, 1), (4, 0, 0)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 1), (2, 1, 0), (3, 0, 1), (4, 0, 0)",
+    );
     // a = 1 OR a = 0 AND b = 0  →  a = 1 OR (a = 0 AND b = 0)
     // id=1 (a=1) ✓; id=2 (a=1) ✓; id=3 (a=0,b=1) ✗; id=4 (a=0,b=0) ✓.
     let ids = ids_sorted(&db, "SELECT id FROM t WHERE a = 1 OR a = 0 AND b = 0");
@@ -207,7 +216,10 @@ fn and_binds_tighter_than_or() {
 fn or_with_parens() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 1), (2, 1, 0), (3, 0, 1), (4, 0, 0)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 1), (2, 1, 0), (3, 0, 1), (4, 0, 0)",
+    );
     // (a = 1 OR a = 0) AND b = 0  → all rows where b=0.
     // id=2 (b=0) ✓; id=4 (b=0) ✓.
     let ids = ids_sorted(&db, "SELECT id FROM t WHERE (a = 1 OR a = 0) AND b = 0");
@@ -217,12 +229,18 @@ fn or_with_parens() {
 #[test]
 fn nested_and_or() {
     let (db, _dir) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)");
-    exec(&db, "INSERT INTO t VALUES \
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO t VALUES \
         (1, 1, 1, 1), \
         (2, 1, 1, 0), \
         (3, 0, 1, 1), \
-        (4, 0, 0, 1)");
+        (4, 0, 0, 1)",
+    );
     // (a = 1 AND b = 1) OR (c = 1 AND a = 0)
     // id=1 (a=1,b=1) ✓; id=2 (a=1,b=1) ✓; id=3 (c=1,a=0) ✓; id=4 (c=1,a=0) ✓.
     let ids = ids_sorted(
@@ -285,7 +303,10 @@ fn create_table_if_not_exists_idempotent() {
     let r2 = db.execute("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)");
     // First succeeds; second with IF NOT EXISTS should also succeed (no-op).
     assert!(r1.is_ok());
-    assert!(r2.is_ok(), "CREATE TABLE IF NOT EXISTS should be idempotent");
+    assert!(
+        r2.is_ok(),
+        "CREATE TABLE IF NOT EXISTS should be idempotent"
+    );
 }
 
 #[test]
@@ -300,7 +321,10 @@ fn create_table_duplicate_errors() {
 fn drop_table_if_exists() {
     let (db, _dir) = new_db();
     let r = db.execute("DROP TABLE IF EXISTS nonexistent");
-    assert!(r.is_ok(), "DROP TABLE IF EXISTS should be no-op for missing table");
+    assert!(
+        r.is_ok(),
+        "DROP TABLE IF EXISTS should be no-op for missing table"
+    );
 }
 
 #[test]
@@ -348,7 +372,7 @@ fn multiplication_overflow_does_not_crash() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 2000000000)"); // ~2 billion
-    // 2e9 * 2e9 overflows i64? Actually i64 max is ~9.2e18, 2e9*2e9 = 4e18, fits.
+                                                       // 2e9 * 2e9 overflows i64? Actually i64 max is ~9.2e18, 2e9*2e9 = 4e18, fits.
     let r = db.execute("SELECT v * v FROM t WHERE id = 1");
     // Should not panic. May wrap if implementation uses i32 internally.
     assert!(r.is_ok(), "large multiplication must not crash");
@@ -362,7 +386,10 @@ fn multiplication_overflow_does_not_crash() {
 fn group_by_with_multiple_aggregates() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40)",
+    );
     let r = rows(
         &db,
         "SELECT g, COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v) FROM t GROUP BY g ORDER BY g",
@@ -385,7 +412,10 @@ fn group_by_with_multiple_aggregates() {
 fn group_by_with_having_and_multiple_aggregates() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, g INT, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 5)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 5)",
+    );
     let r = rows(
         &db,
         "SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) > 25 ORDER BY g",
@@ -420,7 +450,10 @@ fn order_by_limit_larger_than_count() {
 fn order_by_with_offset() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+    );
     let r = rows(&db, "SELECT id FROM t ORDER BY v OFFSET 2");
     // Skip first 2 (v=10,20), return v=30,40 → ids 3,4.
     assert_eq!(r.len(), 2);
@@ -438,7 +471,10 @@ fn order_by_with_offset() {
 fn order_by_with_limit_and_offset() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+    );
     let r = rows(&db, "SELECT id FROM t ORDER BY v LIMIT 2 OFFSET 1");
     // Skip 1 (v=10), take 2 (v=20,30) → ids 2,3.
     assert_eq!(r.len(), 2);
@@ -494,7 +530,8 @@ fn update_with_expression() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
-    db.execute("UPDATE t SET v = v * 2 + 1 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET v = v * 2 + 1 WHERE id = 1")
+        .unwrap();
     let n = scalar_i64(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(n, 21);
 }
@@ -514,7 +551,8 @@ fn update_multiple_columns() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10, 20)");
-    db.execute("UPDATE t SET a = 100, b = 200 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET a = 100, b = 200 WHERE id = 1")
+        .unwrap();
     let r = rows(&db, "SELECT a, b FROM t WHERE id = 1");
     assert!(matches!(&r[0][0], Value::Integer(100)));
     assert!(matches!(&r[0][1], Value::Integer(200)));

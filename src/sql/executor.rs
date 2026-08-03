@@ -1046,9 +1046,7 @@ impl StreamingQueryResult {
                                 // name itself (e.g., "t.id" → "id").
                                 if let Some(dot_pos) = name.rfind('.') {
                                     let base = &name[dot_pos + 1..];
-                                    if let Some(idx) =
-                                        columns.iter().position(|c| c == base)
-                                    {
+                                    if let Some(idx) = columns.iter().position(|c| c == base) {
                                         return Some((idx, clause.asc));
                                     }
                                 }
@@ -1059,9 +1057,10 @@ impl StreamingQueryResult {
                                 // This makes `WITH x AS (...) SELECT ... FROM x
                                 // ORDER BY col` sort correctly.
                                 if !name.contains('.') {
-                                    if let Some(idx) = columns.iter().position(|c| {
-                                        c.rsplit('.').next().unwrap_or(c) == name
-                                    }) {
+                                    if let Some(idx) = columns
+                                        .iter()
+                                        .position(|c| c.rsplit('.').next().unwrap_or(c) == name)
+                                    {
                                         return Some((idx, clause.asc));
                                     }
                                 }
@@ -1836,12 +1835,7 @@ impl QueryExecutor {
                 let mut result =
                     self.execute_set_op(left.as_ref(), right.as_ref(), op.clone(), all, &ctes)?;
                 if order_by.is_some() || limit.is_some() || offset.is_some() {
-                    result = self.apply_set_op_trailing(
-                        result,
-                        &order_by,
-                        limit,
-                        offset,
-                    )?;
+                    result = self.apply_set_op_trailing(result, &order_by, limit, offset)?;
                 }
                 Ok(result)
             }
@@ -1919,8 +1913,8 @@ impl QueryExecutor {
         for delta in undo_log.into_iter().rev() {
             match delta {
                 crate::txn::coordinator::DeltaOperation::Update(row_id, table_name, old_value) => {
-                    let old_row = std::sync::Arc::try_unwrap(old_value)
-                        .unwrap_or_else(|arc| (*arc).clone());
+                    let old_row =
+                        std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
                     if let Ok(schema) = self.db.get_table_schema(&table_name) {
                         let _ = self.db.update_row_in_table_with_schema(
                             &table_name,
@@ -1932,8 +1926,8 @@ impl QueryExecutor {
                     }
                 }
                 crate::txn::coordinator::DeltaOperation::Delete(_row_id, table_name, old_value) => {
-                    let old_row = std::sync::Arc::try_unwrap(old_value)
-                        .unwrap_or_else(|arc| (*arc).clone());
+                    let old_row =
+                        std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
                     let _ = self.db.insert_row_to_table(&table_name, old_row);
                 }
                 crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
@@ -2276,11 +2270,14 @@ impl QueryExecutor {
                 Self::apply_cte_column_aliases(&mut body, cols);
             }
 
-            visible.push((cte.name.clone(), CteDef {
-                name: cte.name.clone(),
-                columns: cte.columns.clone(),
-                query: body,
-            }));
+            visible.push((
+                cte.name.clone(),
+                CteDef {
+                    name: cte.name.clone(),
+                    columns: cte.columns.clone(),
+                    query: body,
+                },
+            ));
         }
 
         // Rewrite the main statement's FROM against all CTEs.
@@ -2338,7 +2335,9 @@ impl QueryExecutor {
                     Self::rewrite_subquery_cte_refs(item, visible);
                 }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 Self::rewrite_subquery_cte_refs(expr, visible);
                 Self::rewrite_subquery_cte_refs(low, visible);
                 Self::rewrite_subquery_cte_refs(high, visible);
@@ -2453,11 +2452,7 @@ impl QueryExecutor {
         if body.columns.len() != aliases.len() {
             return;
         }
-        if body
-            .columns
-            .iter()
-            .any(|c| matches!(c, SelectColumn::Star))
-        {
+        if body.columns.iter().any(|c| matches!(c, SelectColumn::Star)) {
             return;
         }
         for (col, alias) in body.columns.iter_mut().zip(aliases.iter()) {
@@ -2481,7 +2476,6 @@ impl QueryExecutor {
             }
         }
     }
-
 
     /// Execute UNION / UNION ALL set operation.
     /// Execute one branch of a set operation. The branch is either a Select or
@@ -2508,9 +2502,12 @@ impl QueryExecutor {
                 // outermost in a WITH) or none (the parser only attaches CTEs
                 // to the outermost). Prefer the nested SetOp's own CTEs if
                 // non-empty; otherwise inherit from the parent.
-                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
-                let mut result =
-                    self.execute_set_op(l, r, o.clone(), *a, effective_ctes)?;
+                let effective_ctes = if ctes.is_empty() {
+                    inherited_ctes
+                } else {
+                    ctes
+                };
+                let mut result = self.execute_set_op(l, r, o.clone(), *a, effective_ctes)?;
                 // Apply this node's own trailing ORDER BY/LIMIT/OFFSET (only the
                 // outermost carries them; nested nodes have None).
                 if order_by.is_some() || limit.is_some() || offset.is_some() {
@@ -2522,11 +2519,17 @@ impl QueryExecutor {
                 // 🔑 Apply CTEs to the Select. Prefer the Select's own CTEs
                 // (parser clones the full WITH list into branches); fall back to
                 // inherited for chained unions where branches have empty ctes.
-                let effective_ctes = if ctes.is_empty() { inherited_ctes } else { ctes };
+                let effective_ctes = if ctes.is_empty() {
+                    inherited_ctes
+                } else {
+                    ctes
+                };
                 let s = self.apply_ctes_for_select(stmt.clone(), effective_ctes)?;
                 self.execute_select_internal(&s)
             }
-            _ => Err(MoteDBError::Query("Operands of set op must be SELECT".into())),
+            _ => Err(MoteDBError::Query(
+                "Operands of set op must be SELECT".into(),
+            )),
         }
     }
 
@@ -2659,23 +2662,31 @@ impl QueryExecutor {
                 // Rows present in BOTH left and right (deduplicated).
                 let right_set: std::collections::HashSet<Vec<Value>> =
                     right_rows.iter().cloned().collect();
-                let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<Vec<Value>> =
+                    std::collections::HashSet::new();
                 let result: Vec<Vec<Value>> = left_rows
                     .into_iter()
                     .filter(|row| right_set.contains(row) && seen.insert(row.clone()))
                     .collect();
-                Ok(QueryResult::Select { columns, rows: result })
+                Ok(QueryResult::Select {
+                    columns,
+                    rows: result,
+                })
             }
             crate::sql::ast::SetOp::Except => {
                 // Rows in left but NOT in right (deduplicated).
                 let right_set: std::collections::HashSet<Vec<Value>> =
                     right_rows.iter().cloned().collect();
-                let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<Vec<Value>> =
+                    std::collections::HashSet::new();
                 let result: Vec<Vec<Value>> = left_rows
                     .into_iter()
                     .filter(|row| !right_set.contains(row) && seen.insert(row.clone()))
                     .collect();
-                Ok(QueryResult::Select { columns, rows: result })
+                Ok(QueryResult::Select {
+                    columns,
+                    rows: result,
+                })
             }
         }
     }
@@ -2813,13 +2824,9 @@ impl QueryExecutor {
                                     let scanned = store.scan_projected_filtered(
                                         Some(pos),
                                         &[pos],
-                                        &move |fv: Option<&Value>| {
-                                            match fv {
-                                                Some(Value::Null) | None => false,
-                                                Some(v) => {
-                                                    !pred_set.contains(&normalize_for_in(v))
-                                                }
-                                            }
+                                        &move |fv: Option<&Value>| match fv {
+                                            Some(Value::Null) | None => false,
+                                            Some(v) => !pred_set.contains(&normalize_for_in(v)),
                                         },
                                     );
                                     count = scanned.len() as i64;
@@ -2843,16 +2850,14 @@ impl QueryExecutor {
                                 let scanned = store.scan_projected_filtered(
                                     Some(pos),
                                     &[pos],
-                                    &move |fv: Option<&Value>| {
-                                        match fv {
-                                            Some(Value::Null) | None => false,
-                                            Some(v) => {
-                                                let found = pred_set.contains(&normalize_for_in(v));
-                                                if neg {
-                                                    !found
-                                                } else {
-                                                    found
-                                                }
+                                    &move |fv: Option<&Value>| match fv {
+                                        Some(Value::Null) | None => false,
+                                        Some(v) => {
+                                            let found = pred_set.contains(&normalize_for_in(v));
+                                            if neg {
+                                                !found
+                                            } else {
+                                                found
                                             }
                                         }
                                     },
@@ -3198,8 +3203,7 @@ impl QueryExecutor {
                 // expression per row.
                 let is_no_arg = args.is_empty()
                     || (args.len() == 1 && matches!(args[0], Expr::Column(ref c) if c == "*"));
-                let arg_is_bare_col =
-                    args.len() == 1 && matches!(args[0], Expr::Column(_));
+                let arg_is_bare_col = args.len() == 1 && matches!(args[0], Expr::Column(_));
                 if !is_no_arg && !arg_is_bare_col {
                     return Ok(None);
                 }
@@ -3277,8 +3281,12 @@ impl QueryExecutor {
                                         .get(ac)
                                         .cloned()
                                         .unwrap_or(ColumnType::Float);
-                                    let stats =
-                                        store.count_sum_min_max_text_filter(fc, s.as_str(), ac, agg_type);
+                                    let stats = store.count_sum_min_max_text_filter(
+                                        fc,
+                                        s.as_str(),
+                                        ac,
+                                        agg_type,
+                                    );
                                     let is_int = stats.is_int;
                                     let empty = stats.count == 0;
                                     let mut row: Vec<Value> = Vec::new();
@@ -4094,8 +4102,10 @@ impl QueryExecutor {
                     // group_counts. But COUNT(col) needs a per-agg nn_count
                     // tracker to count non-NULL values — treat it like other
                     // aggs by adding it to gb_aggs.
-                    if fname == "COUNT" && (args.is_empty()
-                        || (args.len() == 1 && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*")))
+                    if fname == "COUNT"
+                        && (args.is_empty()
+                            || (args.len() == 1
+                                && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*")))
                     {
                         continue;
                     }
@@ -4139,7 +4149,10 @@ impl QueryExecutor {
             }
             // 🔑 STDDEV/VARIANCE need sum-of-squared-deviations — this fast path
             // only tracks sum/min/max. Fall back to compute_aggregate_positional.
-            if gb_aggs.iter().any(|a| matches!(a.func.as_str(), "STDDEV" | "VARIANCE")) {
+            if gb_aggs
+                .iter()
+                .any(|a| matches!(a.func.as_str(), "STDDEV" | "VARIANCE"))
+            {
                 return Ok(None);
             }
             // 🔑 Use TextSegment::for_each_str which iterates raw &str without
@@ -4305,7 +4318,9 @@ impl QueryExecutor {
                             let raw = fs.raw_f64_typed_slice();
                             if need_minmax {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v.is_nan() { continue; } // NULL sentinel
+                                    if v.is_nan() {
+                                        continue;
+                                    } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     group_sums[ai][gi] += v;
                                     group_nn_counts[ai][gi] += 1;
@@ -4318,7 +4333,9 @@ impl QueryExecutor {
                                 }
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v.is_nan() { continue; } // NULL sentinel
+                                    if v.is_nan() {
+                                        continue;
+                                    } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     group_sums[ai][gi] += v;
                                     group_nn_counts[ai][gi] += 1;
@@ -4331,7 +4348,9 @@ impl QueryExecutor {
                             let raw = fs.raw_i64_slice();
                             if need_minmax {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v == i64::MIN { continue; } // NULL sentinel
+                                    if v == i64::MIN {
+                                        continue;
+                                    } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     let vf = v as f64;
                                     group_sums[ai][gi] += vf;
@@ -4345,7 +4364,9 @@ impl QueryExecutor {
                                 }
                             } else {
                                 for (i, &v) in raw.iter().enumerate().take(n) {
-                                    if v == i64::MIN { continue; } // NULL sentinel
+                                    if v == i64::MIN {
+                                        continue;
+                                    } // NULL sentinel
                                     let gi = row_groups[i] as usize;
                                     let vf = v as f64;
                                     group_sums[ai][gi] += vf;
@@ -4396,16 +4417,24 @@ impl QueryExecutor {
                                         if let Some(v) = fs.get_f64(i) {
                                             null_sum[ai] += v;
                                             null_nn[ai] += 1;
-                                            if v < null_min[ai] { null_min[ai] = v; }
-                                            if v > null_max[ai] { null_max[ai] = v; }
+                                            if v < null_min[ai] {
+                                                null_min[ai] = v;
+                                            }
+                                            if v > null_max[ai] {
+                                                null_max[ai] = v;
+                                            }
                                         }
                                     } else {
                                         if let Some(v) = fs.get_i64(i) {
                                             let vf = v as f64;
                                             null_sum[ai] += vf;
                                             null_nn[ai] += 1;
-                                            if vf < null_min[ai] { null_min[ai] = vf; }
-                                            if vf > null_max[ai] { null_max[ai] = vf; }
+                                            if vf < null_min[ai] {
+                                                null_min[ai] = vf;
+                                            }
+                                            if vf > null_max[ai] {
+                                                null_max[ai] = vf;
+                                            }
                                         }
                                     }
                                 }
@@ -4515,7 +4544,9 @@ impl QueryExecutor {
                                         // COUNT(col) is the only agg on this col — but
                                         // gb_aggs skips COUNT, so there's no tracker.
                                         // Fall back to scanning for a matching nn_count.
-                                        let any_agg = gb_aggs.iter().enumerate()
+                                        let any_agg = gb_aggs
+                                            .iter()
+                                            .enumerate()
                                             .find(|(_, a)| a.col == agg_col);
                                         if let Some((ai2, _)) = any_agg {
                                             row.push(Value::Integer(group_nn_counts[ai2][gi]));
@@ -4623,12 +4654,16 @@ impl QueryExecutor {
                                     }
                                 })
                                 .next();
-                            let is_count_star = fname == "COUNT" && (args.is_empty()
-                                || (args.len() == 1 && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*")));
+                            let is_count_star = fname == "COUNT"
+                                && (args.is_empty()
+                                    || (args.len() == 1
+                                        && matches!(args[0], crate::sql::ast::Expr::Column(ref cn) if cn == "*")));
                             if is_count_star {
                                 null_row.push(Value::Integer(null_count));
                             } else {
-                                let ai = gb_aggs.iter().position(|a| a.func == fname && a.col == agg_col);
+                                let ai = gb_aggs
+                                    .iter()
+                                    .position(|a| a.func == fname && a.col == agg_col);
                                 match fname.as_str() {
                                     "COUNT" => {
                                         // COUNT(col) over NULL-key group → non-NULL count.
@@ -4654,7 +4689,9 @@ impl QueryExecutor {
                                     "AVG" => {
                                         if let Some(ai) = ai {
                                             if null_nn[ai] > 0 {
-                                                null_row.push(Value::Float(null_sum[ai] / null_nn[ai] as f64));
+                                                null_row.push(Value::Float(
+                                                    null_sum[ai] / null_nn[ai] as f64,
+                                                ));
                                             } else {
                                                 null_row.push(Value::Null);
                                             }
@@ -4708,12 +4745,25 @@ impl QueryExecutor {
     /// Strategy: build a base stmt (window cols → NULL placeholder), execute it
     /// to get all data rows, then compute window values in-place.
     fn execute_window_query(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
-        use crate::sql::ast::{Expr, SelectColumn, WindowFunc, OrderByExpr};
+        use crate::sql::ast::{Expr, OrderByExpr, SelectColumn, WindowFunc};
         // Collect window column specs and build base stmt (replace window cols with NULL).
         let mut base_stmt = stmt.clone();
-        let mut win_specs: Vec<(usize, WindowFunc, Option<Vec<String>>, Option<Vec<OrderByExpr>>)> = Vec::new();
+        let mut win_specs: Vec<(
+            usize,
+            WindowFunc,
+            Option<Vec<String>>,
+            Option<Vec<OrderByExpr>>,
+        )> = Vec::new();
         for (i, col) in base_stmt.columns.iter_mut().enumerate() {
-            if let SelectColumn::Expr(Expr::WindowFunction { func, partition_by, order_by }, alias) = col {
+            if let SelectColumn::Expr(
+                Expr::WindowFunction {
+                    func,
+                    partition_by,
+                    order_by,
+                },
+                alias,
+            ) = col
+            {
                 win_specs.push((i, func.clone(), partition_by.clone(), order_by.clone()));
                 *col = SelectColumn::Expr(Expr::Literal(Value::Null), alias.clone());
             }
@@ -4734,7 +4784,9 @@ impl QueryExecutor {
         // The base query's rows only have the SELECT columns, not all schema columns.
         // We need the full row data for partition/order columns that may not be in SELECT.
         // Re-scan to get full rows, compute windows, then project.
-        let store = self.db.get_or_create_col_segment_store(&table_name, schema.col_types())?;
+        let store = self
+            .db
+            .get_or_create_col_segment_store(&table_name, schema.col_types())?;
         let _ = store.flush_buffer();
         let scan_pos: Vec<usize> = (0..schema.columns.len()).collect();
         let scanned = store.scan_projected_filtered(None, &scan_pos, &|_| true);
@@ -4753,55 +4805,82 @@ impl QueryExecutor {
         }
         // Compute each window function, appending result as extra column.
         for (_col_idx, func, partition_by, order_by) in &win_specs {
-            Self::compute_window(&mut full_rows, &schema, func, partition_by.as_ref(), order_by.as_ref());
+            Self::compute_window(
+                &mut full_rows,
+                &schema,
+                func,
+                partition_by.as_ref(),
+                order_by.as_ref(),
+            );
         }
         // Build output rows: for each SELECT column, pull from schema cols or window cols.
         let num_schema = schema.columns.len();
-        let out_rows: Vec<Vec<Value>> = full_rows.iter().map(|row| {
-            let mut win_idx = 0usize;
-            stmt.columns.iter().map(|c| match c {
-                SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
-                    let bare = name.rsplit('.').next().unwrap_or(name);
-                    schema.get_column_position(bare)
-                        .and_then(|p| row.get(p).cloned())
-                        .unwrap_or(Value::Null)
-                }
-                SelectColumn::Star => row.get(0).cloned().unwrap_or(Value::Null),
-                SelectColumn::Expr(expr, _) => {
-                    if let Expr::WindowFunction { .. } = expr {
-                        let v = row.get(num_schema + win_idx).cloned().unwrap_or(Value::Null);
-                        win_idx += 1;
-                        v
-                    } else {
-                        Self::eval_expr_on_row(expr, row, &schema).unwrap_or(Value::Null)
-                    }
-                }
-            }).collect()
-        }).collect();
-        let final_cols: Vec<String> = stmt.columns.iter().map(|c| match c {
-            SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => n.clone(),
-            SelectColumn::Expr(_, Some(a)) => a.clone(),
-            SelectColumn::Expr(e, None) => format!("{:?}", e),
-            SelectColumn::Star => "*".to_string(),
-        }).collect();
+        let out_rows: Vec<Vec<Value>> = full_rows
+            .iter()
+            .map(|row| {
+                let mut win_idx = 0usize;
+                stmt.columns
+                    .iter()
+                    .map(|c| match c {
+                        SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                            let bare = name.rsplit('.').next().unwrap_or(name);
+                            schema
+                                .get_column_position(bare)
+                                .and_then(|p| row.get(p).cloned())
+                                .unwrap_or(Value::Null)
+                        }
+                        SelectColumn::Star => row.get(0).cloned().unwrap_or(Value::Null),
+                        SelectColumn::Expr(expr, _) => {
+                            if let Expr::WindowFunction { .. } = expr {
+                                let v = row
+                                    .get(num_schema + win_idx)
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                win_idx += 1;
+                                v
+                            } else {
+                                Self::eval_expr_on_row(expr, row, &schema).unwrap_or(Value::Null)
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let final_cols: Vec<String> = stmt
+            .columns
+            .iter()
+            .map(|c| match c {
+                SelectColumn::Column(n) | SelectColumn::ColumnWithAlias(n, _) => n.clone(),
+                SelectColumn::Expr(_, Some(a)) => a.clone(),
+                SelectColumn::Expr(e, None) => format!("{:?}", e),
+                SelectColumn::Star => "*".to_string(),
+            })
+            .collect();
         let mut out_rows = out_rows;
         // Apply outer ORDER BY (resolve column by alias or position in output)
         if let Some(ref ob) = stmt.order_by {
             if !ob.is_empty() {
                 // Build sort keys from output columns (match by alias name)
                 let col_names = &final_cols;
-                let sort_plan: Vec<(usize, bool)> = ob.iter().map(|oe| {
-                    let pos = if let Expr::Column(cn) = &oe.expr {
-                        let bare = cn.rsplit('.').next().unwrap_or(cn);
-                        // Try output column name match
-                        col_names.iter().position(|n| n == bare)
-                            .or_else(|| schema.get_column_position(bare))
-                            .unwrap_or(0)
-                    } else if let Expr::Literal(Value::Integer(n)) = &oe.expr {
-                        (*n as usize).saturating_sub(1)
-                    } else { 0 };
-                    (pos, oe.asc)
-                }).collect();
+                let sort_plan: Vec<(usize, bool)> = ob
+                    .iter()
+                    .map(|oe| {
+                        let pos = if let Expr::Column(cn) = &oe.expr {
+                            let bare = cn.rsplit('.').next().unwrap_or(cn);
+                            // Try output column name match
+                            col_names
+                                .iter()
+                                .position(|n| n == bare)
+                                .or_else(|| schema.get_column_position(bare))
+                                .unwrap_or(0)
+                        } else if let Expr::Literal(Value::Integer(n)) = &oe.expr {
+                            (*n as usize).saturating_sub(1)
+                        } else {
+                            0
+                        };
+                        (pos, oe.asc)
+                    })
+                    .collect();
                 out_rows.sort_by(|a, b| {
                     for &(pos, asc) in &sort_plan {
                         let av = a.get(pos).cloned().unwrap_or(Value::Null);
@@ -4822,8 +4901,11 @@ impl QueryExecutor {
         }
         // Apply OFFSET then LIMIT
         if let Some(off) = stmt.offset {
-            if off >= out_rows.len() { out_rows.clear(); }
-            else { out_rows.drain(..off); }
+            if off >= out_rows.len() {
+                out_rows.clear();
+            } else {
+                out_rows.drain(..off);
+            }
         }
         if let Some(lim) = stmt.limit {
             out_rows.truncate(lim);
@@ -4844,25 +4926,39 @@ impl QueryExecutor {
     ) {
         use crate::sql::ast::WindowFunc;
         // Resolve partition column positions
-        let part_cols: Vec<usize> = partition_by.map(|cols| {
-            cols.iter().filter_map(|c| {
-                let bare = c.rsplit('.').next().unwrap_or(c);
-                schema.get_column_position(bare)
-            }).collect()
-        }).unwrap_or_default();
+        let part_cols: Vec<usize> = partition_by
+            .map(|cols| {
+                cols.iter()
+                    .filter_map(|c| {
+                        let bare = c.rsplit('.').next().unwrap_or(c);
+                        schema.get_column_position(bare)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Resolve order key positions + directions
-        let order_keys: Vec<(usize, bool)> = order_by.map(|ords| {
-            ords.iter().filter_map(|oe| {
-                if let Expr::Column(cn) = &oe.expr {
-                    let bare = cn.rsplit('.').next().unwrap_or(cn);
-                    schema.get_column_position(bare).map(|p| (p, oe.asc))
-                } else { None }
-            }).collect()
-        }).unwrap_or_default();
+        let order_keys: Vec<(usize, bool)> = order_by
+            .map(|ords| {
+                ords.iter()
+                    .filter_map(|oe| {
+                        if let Expr::Column(cn) = &oe.expr {
+                            let bare = cn.rsplit('.').next().unwrap_or(cn);
+                            schema.get_column_position(bare).map(|p| (p, oe.asc))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Group row indices by partition key
-        let mut groups: std::collections::HashMap<Vec<String>, Vec<usize>> = std::collections::HashMap::new();
+        let mut groups: std::collections::HashMap<Vec<String>, Vec<usize>> =
+            std::collections::HashMap::new();
         for (i, row) in rows.iter().enumerate() {
-            let key: Vec<String> = part_cols.iter().map(|&p| format!("{:?}", row.get(p))).collect();
+            let key: Vec<String> = part_cols
+                .iter()
+                .map(|&p| format!("{:?}", row.get(p)))
+                .collect();
             groups.entry(key).or_default().push(i);
         }
         // For each partition: sort by order keys, compute window values
@@ -4890,7 +4986,10 @@ impl QueryExecutor {
                 WindowFunc::RowNumber => {
                     for (rank, &idx) in indices.iter().enumerate() {
                         let r = (rank + 1) as i64;
-                        if rows[idx].len() <= schema.columns.len() + rows[idx].len().saturating_sub(schema.columns.len()) {
+                        if rows[idx].len()
+                            <= schema.columns.len()
+                                + rows[idx].len().saturating_sub(schema.columns.len())
+                        {
                             // append only once per row — ensure capacity
                         }
                         rows[idx].push(Value::Integer(r));
@@ -4902,7 +5001,8 @@ impl QueryExecutor {
                     let mut count = 0i64;
                     for &idx in &indices {
                         count += 1;
-                        let cur_key: Vec<Value> = order_keys.iter()
+                        let cur_key: Vec<Value> = order_keys
+                            .iter()
                             .map(|&(p, _)| rows[idx].get(p).cloned().unwrap_or(Value::Null))
                             .collect();
                         if prev_key.as_ref() != Some(&cur_key) {
@@ -4916,7 +5016,8 @@ impl QueryExecutor {
                     let mut dr = 0i64;
                     let mut prev_key: Option<Vec<Value>> = None;
                     for &idx in &indices {
-                        let cur_key: Vec<Value> = order_keys.iter()
+                        let cur_key: Vec<Value> = order_keys
+                            .iter()
                             .map(|&(p, _)| rows[idx].get(p).cloned().unwrap_or(Value::Null))
                             .collect();
                         if prev_key.as_ref() != Some(&cur_key) {
@@ -4926,42 +5027,56 @@ impl QueryExecutor {
                         prev_key = Some(cur_key);
                     }
                 }
-                WindowFunc::Lag { expr, offset, default } => {
+                WindowFunc::Lag {
+                    expr,
+                    offset,
+                    default,
+                } => {
                     // 🔑 LAG(expr, offset, default): value from `offset` rows
                     // before the current row (default 1). If no such row, use
                     // default (or NULL).
                     let off = offset.unwrap_or(1);
                     // Pre-compute the expr value for each row in partition order.
-                    let vals: Vec<Value> = indices.iter().map(|&idx| {
-                        Self::eval_expr_on_row(expr, &rows[idx], schema)
-                            .unwrap_or(Value::Null)
-                    }).collect();
+                    let vals: Vec<Value> = indices
+                        .iter()
+                        .map(|&idx| {
+                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        })
+                        .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
                         let v = if pos >= off {
                             vals[pos - off].clone()
                         } else {
-                            default.as_ref().and_then(|d| {
-                                Self::eval_expr_on_row(d, &rows[idx], schema).ok()
-                            }).unwrap_or(Value::Null)
+                            default
+                                .as_ref()
+                                .and_then(|d| Self::eval_expr_on_row(d, &rows[idx], schema).ok())
+                                .unwrap_or(Value::Null)
                         };
                         rows[idx].push(v);
                     }
                 }
-                WindowFunc::Lead { expr, offset, default } => {
+                WindowFunc::Lead {
+                    expr,
+                    offset,
+                    default,
+                } => {
                     // 🔑 LEAD(expr, offset, default): value from `offset` rows
                     // after the current row (default 1).
                     let off = offset.unwrap_or(1);
-                    let vals: Vec<Value> = indices.iter().map(|&idx| {
-                        Self::eval_expr_on_row(expr, &rows[idx], schema)
-                            .unwrap_or(Value::Null)
-                    }).collect();
+                    let vals: Vec<Value> = indices
+                        .iter()
+                        .map(|&idx| {
+                            Self::eval_expr_on_row(expr, &rows[idx], schema).unwrap_or(Value::Null)
+                        })
+                        .collect();
                     for (pos, &idx) in indices.iter().enumerate() {
                         let v = if pos + off < vals.len() {
                             vals[pos + off].clone()
                         } else {
-                            default.as_ref().and_then(|d| {
-                                Self::eval_expr_on_row(d, &rows[idx], schema).ok()
-                            }).unwrap_or(Value::Null)
+                            default
+                                .as_ref()
+                                .and_then(|d| Self::eval_expr_on_row(d, &rows[idx], schema).ok())
+                                .unwrap_or(Value::Null)
                         };
                         rows[idx].push(v);
                     }
@@ -5008,7 +5123,10 @@ impl QueryExecutor {
         // whose only rows are uncommitted INSERTs has no store yet, and SELECT
         // returns empty. get_or_create is a no-op if the store already exists.
         if self.is_in_transaction() {
-            if let Some(TableRef::Table { name: table_name, .. }) = stmt.from.as_ref() {
+            if let Some(TableRef::Table {
+                name: table_name, ..
+            }) = stmt.from.as_ref()
+            {
                 if !self.db.has_col_segment_store(table_name) {
                     let ws = self.txn_write_set_rows(table_name);
                     if !ws.is_empty() {
@@ -5023,8 +5141,13 @@ impl QueryExecutor {
         }
         // 🔑 Window functions: route to specialized executor.
         let has_window = stmt.columns.iter().any(|c| {
-            matches!(c, crate::sql::ast::SelectColumn::Expr(
-                crate::sql::ast::Expr::WindowFunction { .. }, _))
+            matches!(
+                c,
+                crate::sql::ast::SelectColumn::Expr(
+                    crate::sql::ast::Expr::WindowFunction { .. },
+                    _
+                )
+            )
         });
         if has_window {
             return self.execute_window_query(stmt);
@@ -5273,7 +5396,10 @@ impl QueryExecutor {
                             // non-projected-column ORDER BY via its own sort).
                             if let Some(order_clauses) = &stmt.order_by {
                                 if !order_clauses.is_empty() {
-                                    StreamingQueryResult::try_sort_projected(&mut result, order_clauses);
+                                    StreamingQueryResult::try_sort_projected(
+                                        &mut result,
+                                        order_clauses,
+                                    );
                                 }
                             }
                             store.release_pages_only();
@@ -5625,7 +5751,9 @@ impl QueryExecutor {
             Expr::Case { whens, else_expr } => {
                 whens.iter().any(|(c, v)| {
                     Self::expr_contains_subquery(c) || Self::expr_contains_subquery(v)
-                }) || else_expr.as_ref().is_some_and(|e| Self::expr_contains_subquery(e))
+                }) || else_expr
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_contains_subquery(e))
             }
             _ => false,
         }
@@ -5661,8 +5789,12 @@ impl QueryExecutor {
             Some(ob) => {
                 let mut new_ob = Vec::with_capacity(ob.len());
                 for o in ob {
-                    let resolved_expr = self.materialize_subqueries_checked(&o.expr, outer_schema.as_deref())?;
-                    new_ob.push(OrderByExpr { expr: resolved_expr, asc: o.asc });
+                    let resolved_expr =
+                        self.materialize_subqueries_checked(&o.expr, outer_schema.as_deref())?;
+                    new_ob.push(OrderByExpr {
+                        expr: resolved_expr,
+                        asc: o.asc,
+                    });
                 }
                 Some(new_ob)
             }
@@ -5819,7 +5951,10 @@ impl QueryExecutor {
                                 if let Some(row) = row_opt {
                                     if Self::row_passes_post_filters(&row, post_filters, &schema) {
                                         kept.push(Self::project_row_direct(
-                                            &row, &stmt.columns, &columns, &schema,
+                                            &row,
+                                            &stmt.columns,
+                                            &columns,
+                                            &schema,
                                         ));
                                     }
                                 }
@@ -7430,9 +7565,10 @@ impl QueryExecutor {
         // fast path doesn't implement — it would emit an empty row (COUNT is
         // a no-op here unless it's COUNT(*) via Star). Fall back.
         let has_distinct_agg = stmt.columns.iter().any(|c| {
-            matches!(c, SelectColumn::Expr(
-                Expr::FunctionCall { distinct: true, .. }, _
-            ))
+            matches!(
+                c,
+                SelectColumn::Expr(Expr::FunctionCall { distinct: true, .. }, _)
+            )
         });
         if has_distinct_agg {
             return Ok(None);
@@ -7685,9 +7821,10 @@ impl QueryExecutor {
         // fast path doesn't implement — it would emit an empty/wrong row.
         // Fall back to compute_aggregate_positional which handles DISTINCT.
         let has_distinct_agg = stmt.columns.iter().any(|c| {
-            matches!(c, SelectColumn::Expr(
-                Expr::FunctionCall { distinct: true, .. }, _
-            ))
+            matches!(
+                c,
+                SelectColumn::Expr(Expr::FunctionCall { distinct: true, .. }, _)
+            )
         });
         if has_distinct_agg {
             return Ok(None);
@@ -7875,7 +8012,13 @@ impl QueryExecutor {
                     has_count_star = true;
                 }
                 SelectColumn::Expr(expr, _) => {
-                    if let Expr::FunctionCall { name, args, distinct, .. } = expr {
+                    if let Expr::FunctionCall {
+                        name,
+                        args,
+                        distinct,
+                        ..
+                    } = expr
+                    {
                         // 🔑 DISTINCT aggregates need dedup — this fast path
                         // counts all rows without dedup. Fall back.
                         if *distinct {
@@ -8250,7 +8393,8 @@ impl QueryExecutor {
         // subquery materialization paths that call this helper.
         let txn_writes = self.txn_write_set_rows(table);
         let txn_deletes = self.txn_deleted_row_ids(table);
-        let in_txn = self.is_in_transaction() && (!txn_writes.is_empty() || !txn_deletes.is_empty());
+        let in_txn =
+            self.is_in_transaction() && (!txn_writes.is_empty() || !txn_deletes.is_empty());
 
         if in_txn && !self.db.has_col_segment_store(table) {
             // Txn-only table (no committed data): just return the write_set rows
@@ -8267,7 +8411,9 @@ impl QueryExecutor {
             let project_cols: Vec<usize> = (0..ncols).collect();
             store.scan_projected_filtered(None, &project_cols, &|_| true)
         } else {
-            self.db.scan_table_rows_streaming(table)?.collect::<Result<_>>()?
+            self.db
+                .scan_table_rows_streaming(table)?
+                .collect::<Result<_>>()?
         };
         if in_txn {
             // Filter out rows the transaction has deleted.
@@ -8368,8 +8514,8 @@ impl QueryExecutor {
             Err(_) => return Ok(None),
         };
         let _ = store.flush_buffer(); // ensure buffered rows are visible
-        // 🔑 Read-your-writes: check transaction write_set / undo_log first.
-        // write_set keys by raw row_id (low 32 bits of composite_key).
+                                      // 🔑 Read-your-writes: check transaction write_set / undo_log first.
+                                      // write_set keys by raw row_id (low 32 bits of composite_key).
         let row_id = composite_key as u32 as RowId;
         let txn_row = self.txn_lookup_row(table_name, row_id);
         let row: Vec<Value> = match txn_row {
@@ -8448,9 +8594,8 @@ impl QueryExecutor {
                     let ws = self.txn_write_set_rows(table);
                     let del = self.txn_deleted_row_ids(table);
                     if !ws.is_empty() || !del.is_empty() {
-                        return self.execute_full_scan_txn_merge(
-                            stmt, table, &schema, &store, ws, del,
-                        );
+                        return self
+                            .execute_full_scan_txn_merge(stmt, table, &schema, &store, ws, del);
                     }
                 }
                 return self.execute_full_scan_via_col_segment(stmt, table, &schema, &store);
@@ -9093,7 +9238,8 @@ impl QueryExecutor {
             let ws_rows = self.txn_write_set_rows(table);
             let deleted = self.txn_deleted_row_ids(table);
             if !ws_rows.is_empty() || !deleted.is_empty() {
-                return self.execute_full_scan_txn_merge(stmt, table, schema, store, ws_rows, deleted);
+                return self
+                    .execute_full_scan_txn_merge(stmt, table, schema, store, ws_rows, deleted);
             }
         }
         let col_types = schema.col_types().to_vec();
@@ -9161,9 +9307,9 @@ impl QueryExecutor {
                     negated: false,
                     ..
                 }) => match expr.as_ref() {
-                    crate::sql::ast::Expr::Column(col_name) => {
-                        schema.get_column_position(col_name).map(|pos| (pos, set.clone()))
-                    }
+                    crate::sql::ast::Expr::Column(col_name) => schema
+                        .get_column_position(col_name)
+                        .map(|pos| (pos, set.clone())),
                     _ => None,
                 },
                 _ => None,
@@ -9285,9 +9431,7 @@ impl QueryExecutor {
                                 } else {
                                     match seg.sst.read_text(pc) {
                                         Ok(t) => (0..seg.sst.num_rows)
-                                            .map(|i| {
-                                                t.get_str(i).map(|s| Value::Text(s.into()))
-                                            })
+                                            .map(|i| t.get_str(i).map(|s| Value::Text(s.into())))
                                             .collect(),
                                         Err(_) => vec![None; seg.sst.num_rows],
                                     }
@@ -9945,11 +10089,11 @@ impl QueryExecutor {
                     .iter()
                     .filter_map(|c| match c {
                         SelectColumn::ColumnWithAlias(name, alias)
-                        | SelectColumn::Expr(
-                            crate::sql::ast::Expr::Column(name), Some(alias),
-                        ) => {
+                        | SelectColumn::Expr(crate::sql::ast::Expr::Column(name), Some(alias)) => {
                             let bare = name.rsplit('.').next().unwrap_or(name);
-                            schema.get_column_position(bare).map(|p| (alias.as_str(), p))
+                            schema
+                                .get_column_position(bare)
+                                .map(|p| (alias.as_str(), p))
                         }
                         _ => None,
                     })
@@ -10089,8 +10233,7 @@ impl QueryExecutor {
                                 // most one row. Multiple rows is an error.
                                 if rows.len() > 1 {
                                     return Err(MoteDBError::Query(
-                                        "Scalar subquery returned more than one row"
-                                            .to_string(),
+                                        "Scalar subquery returned more than one row".to_string(),
                                     ));
                                 }
                                 let scalar = rows
@@ -10263,11 +10406,7 @@ impl QueryExecutor {
         let offset = stmt.offset.unwrap_or(0);
 
         // Collect (row_id, row) pairs from segment scan, filtering deleted.
-        let table_id = self
-            .db
-            .table_registry
-            .get_table_id(table)
-            .unwrap_or(0) as u64;
+        let table_id = self.db.table_registry.get_table_id(table).unwrap_or(0) as u64;
         let mut all_rows: Vec<(RowId, Row)> = Vec::new();
         for (composite_key, _ts, row) in store.scan() {
             let rid = composite_key as u32 as RowId;
@@ -11743,18 +11882,17 @@ impl QueryExecutor {
         }
         fn walk_stmt(stmt: &Statement) -> usize {
             match stmt {
-                Statement::Select { stmt: s, .. } => {
-                    s.where_clause
-                        .as_ref()
-                        .map(walk_expr)
-                        .unwrap_or(0)
-                        .max(s.columns.iter().fold(0, |acc, c| {
-                            acc.max(match c {
-                                SelectColumn::Expr(e, _) => walk_expr(e),
-                                _ => 0,
-                            })
-                        }))
-                }
+                Statement::Select { stmt: s, .. } => s
+                    .where_clause
+                    .as_ref()
+                    .map(walk_expr)
+                    .unwrap_or(0)
+                    .max(s.columns.iter().fold(0, |acc, c| {
+                        acc.max(match c {
+                            SelectColumn::Expr(e, _) => walk_expr(e),
+                            _ => 0,
+                        })
+                    })),
                 Statement::Insert(i) => i.values.iter().fold(0, |acc, row| {
                     acc.max(row.iter().fold(0, |a, e| a.max(walk_expr(e))))
                 }),
@@ -12562,9 +12700,10 @@ impl QueryExecutor {
                 // (e.g. "b.status") but the WHERE references the bare name
                 // ("status"). Match by stripping the table prefix from each
                 // schema column name.
-                let pos = schema.columns.iter().position(|c| {
-                    c.name.rsplit('.').next().unwrap_or(&c.name) == col_name
-                });
+                let pos = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.rsplit('.').next().unwrap_or(&c.name) == col_name);
                 pos.and_then(|p| row.get(p).cloned())
                     .ok_or_else(|| MoteDBError::ColumnNotFound(name.clone()))
             }
@@ -13009,14 +13148,12 @@ impl QueryExecutor {
                 });
                 let mut cloned = stmt.clone();
                 if let Some(w) = cloned.where_clause.take() {
-                    cloned.where_clause = Some(
-                        self.materialize_subqueries_checked(&w, outer_schema.as_deref())?,
-                    );
+                    cloned.where_clause =
+                        Some(self.materialize_subqueries_checked(&w, outer_schema.as_deref())?);
                 }
                 if let Some(h) = cloned.having.take() {
-                    cloned.having = Some(
-                        self.materialize_subqueries_checked(&h, outer_schema.as_deref())?,
-                    );
+                    cloned.having =
+                        Some(self.materialize_subqueries_checked(&h, outer_schema.as_deref())?);
                 }
                 resolved_subq_stmt = cloned;
                 &resolved_subq_stmt as &SelectStmt
@@ -13370,9 +13507,13 @@ impl QueryExecutor {
                                     // 🔑 Use the user-provided alias if present (e.g.
                                     // `SELECT COUNT(*) as c FROM t`), so derived
                                     // tables / CTEs can reference it by name.
-                                    let col_name = stmt.columns.first()
+                                    let col_name = stmt
+                                        .columns
+                                        .first()
                                         .and_then(|c| match c {
-                                            SelectColumn::Expr(_, Some(alias)) => Some(alias.clone()),
+                                            SelectColumn::Expr(_, Some(alias)) => {
+                                                Some(alias.clone())
+                                            }
                                             _ => None,
                                         })
                                         .unwrap_or_else(|| "COUNT(*)".to_string());
@@ -13413,7 +13554,9 @@ impl QueryExecutor {
                     };
 
                     // 🔑 Use user alias if present (for derived table / CTE).
-                    let col_name = stmt.columns.first()
+                    let col_name = stmt
+                        .columns
+                        .first()
                         .and_then(|c| match c {
                             SelectColumn::Expr(_, Some(alias)) => Some(alias.clone()),
                             _ => None,
@@ -14005,9 +14148,10 @@ impl QueryExecutor {
                         // `WHERE (SELECT SUM(o.amt) ... WHERE o.cust = c.id) > 100`)
                         // must be kept as Subquery nodes and re-executed per row,
                         // NOT materialized once with an empty outer binding.
-                        let materialized_where =
-                            self.materialize_subqueries_checked(where_clause, Some(&combined_schema))?;
-                        let has_correlated_subquery = Self::expr_contains_subquery(&materialized_where);
+                        let materialized_where = self
+                            .materialize_subqueries_checked(where_clause, Some(&combined_schema))?;
+                        let has_correlated_subquery =
+                            Self::expr_contains_subquery(&materialized_where);
 
                         // IN hash set optimization: precompute HashSet for large literal IN lists
                         if let Expr::In {
@@ -14226,12 +14370,17 @@ impl QueryExecutor {
                             // against an arbitrary input row → wrong/constant
                             // sort key → non-deterministic group order.
                             if let Expr::FunctionCall { name, args, .. } = &order.expr {
-                                let arg_str = args.iter().map(|a| match a {
-                                    Expr::Column(c) => c.clone(),
-                                    e => format!("{:?}", e),
-                                }).collect::<Vec<_>>().join(", ");
+                                let arg_str = args
+                                    .iter()
+                                    .map(|a| match a {
+                                        Expr::Column(c) => c.clone(),
+                                        e => format!("{:?}", e),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
                                 let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
-                                if let Some(idx) = column_names.iter().position(|cn| cn == &ob_name) {
+                                if let Some(idx) = column_names.iter().position(|cn| cn == &ob_name)
+                                {
                                     if idx < proj_row.len() {
                                         return Ok(proj_row[idx].clone());
                                     }
@@ -14427,9 +14576,12 @@ impl QueryExecutor {
             // `CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END`). Recurse so such
             // expressions are correctly classified as containing aggregates.
             Expr::Case { whens, else_expr } => {
-                whens.iter().any(|(c, v)| {
-                    self.expr_has_aggregates(c) || self.expr_has_aggregates(v)
-                }) || else_expr.as_ref().is_some_and(|e| self.expr_has_aggregates(e))
+                whens
+                    .iter()
+                    .any(|(c, v)| self.expr_has_aggregates(c) || self.expr_has_aggregates(v))
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|e| self.expr_has_aggregates(e))
             }
             Expr::UnaryOp { expr, .. } => self.expr_has_aggregates(expr),
             _ => false,
@@ -14665,11 +14817,15 @@ impl QueryExecutor {
                         // 🔑 combined_cols are table-qualified ("a.name", "b.val").
                         // 1) Try exact match (qualified or bare exact).
                         // 2) Fall back to bare-suffix match, skipping already-claimed.
-                        let pos = combined_cols.iter().enumerate()
+                        let pos = combined_cols
+                            .iter()
+                            .enumerate()
                             .find(|(i, c)| !claimed.contains(i) && (*c == bare || *c == name))
                             .map(|(i, _)| i)
                             .or_else(|| {
-                                combined_cols.iter().enumerate()
+                                combined_cols
+                                    .iter()
+                                    .enumerate()
                                     .find(|(i, c)| {
                                         !claimed.contains(i)
                                             && c.rsplit('.').next().unwrap_or(c) == bare
@@ -14687,11 +14843,15 @@ impl QueryExecutor {
                     }
                     SelectColumn::ColumnWithAlias(name, alias) => {
                         let bare = name.rsplit('.').next().unwrap_or(name);
-                        let pos = combined_cols.iter().enumerate()
+                        let pos = combined_cols
+                            .iter()
+                            .enumerate()
                             .find(|(i, c)| !claimed.contains(i) && (*c == bare || *c == name))
                             .map(|(i, _)| i)
                             .or_else(|| {
-                                combined_cols.iter().enumerate()
+                                combined_cols
+                                    .iter()
+                                    .enumerate()
                                     .find(|(i, c)| {
                                         !claimed.contains(i)
                                             && c.rsplit('.').next().unwrap_or(c) == bare
@@ -15199,7 +15359,8 @@ impl QueryExecutor {
                 return true;
             }
             let suffix = format!(".{}", col);
-            row.keys().any(|k| !k.starts_with("__") && k.ends_with(&suffix))
+            row.keys()
+                .any(|k| !k.starts_with("__") && k.ends_with(&suffix))
         }
         let (left_sample, right_sample) = match (left_rows.first(), right_rows.first()) {
             (Some((_, l)), Some((_, r))) => (l, r),
@@ -15955,7 +16116,11 @@ impl QueryExecutor {
     /// Like materialize_subqueries but detects correlated subqueries in WHERE.
     /// Correlated subqueries (referencing outer columns) are left in place for
     /// per-row evaluation by col_segment_general_scan.
-    fn materialize_subqueries_checked(&self, expr: &Expr, outer_schema: Option<&TableSchema>) -> Result<Expr> {
+    fn materialize_subqueries_checked(
+        &self,
+        expr: &Expr,
+        outer_schema: Option<&TableSchema>,
+    ) -> Result<Expr> {
         match expr {
             Expr::Subquery(subquery) => {
                 if let Some(os) = outer_schema {
@@ -17036,8 +17201,11 @@ impl QueryExecutor {
                         // DISTINCT has no effect on MIN/MAX, but for correctness we
                         // still respect it (dedup is a no-op on the result).
                         let mut min_val: Option<Value> = None;
-                        let mut seen: Option<std::collections::HashSet<Value>> =
-                            if *distinct { Some(std::collections::HashSet::new()) } else { None };
+                        let mut seen: Option<std::collections::HashSet<Value>> = if *distinct {
+                            Some(std::collections::HashSet::new())
+                        } else {
+                            None
+                        };
                         for row in rows {
                             let val = self.evaluator.eval(&args[0], row)?;
                             if matches!(val, Value::Null) {
@@ -17051,9 +17219,7 @@ impl QueryExecutor {
                             min_val = Some(match min_val {
                                 None => val,
                                 Some(current) => {
-                                    if val.partial_cmp(&current)
-                                        == Some(std::cmp::Ordering::Less)
-                                    {
+                                    if val.partial_cmp(&current) == Some(std::cmp::Ordering::Less) {
                                         val
                                     } else {
                                         current
@@ -17070,8 +17236,11 @@ impl QueryExecutor {
                             ));
                         }
                         let mut max_val: Option<Value> = None;
-                        let mut seen: Option<std::collections::HashSet<Value>> =
-                            if *distinct { Some(std::collections::HashSet::new()) } else { None };
+                        let mut seen: Option<std::collections::HashSet<Value>> = if *distinct {
+                            Some(std::collections::HashSet::new())
+                        } else {
+                            None
+                        };
                         for row in rows {
                             let val = self.evaluator.eval(&args[0], row)?;
                             if matches!(val, Value::Null) {
@@ -17108,7 +17277,11 @@ impl QueryExecutor {
                         // Determine separator (2nd arg, if a literal).
                         let sep = if args.len() >= 2 {
                             if let Ok(s) = self.evaluator.eval(&args[1], &SqlRow::new()) {
-                                if let Value::Text(t) = s { t.to_string() } else { ",".to_string() }
+                                if let Value::Text(t) = s {
+                                    t.to_string()
+                                } else {
+                                    ",".to_string()
+                                }
                             } else {
                                 ",".to_string()
                             }
@@ -17173,8 +17346,14 @@ impl QueryExecutor {
             Expr::FunctionCall { name, .. }
                 if matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
-                    | "GROUP_CONCAT"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "STDDEV"
+                        | "VARIANCE"
+                        | "GROUP_CONCAT"
                 ) =>
             {
                 let val = self.eval_aggregate(expr, rows)?;
@@ -17185,8 +17364,10 @@ impl QueryExecutor {
                 args,
                 distinct,
             } => {
-                let resolved_args: Result<Vec<Expr>> =
-                    args.iter().map(|a| self.resolve_aggregates_in_expr(a, rows)).collect();
+                let resolved_args: Result<Vec<Expr>> = args
+                    .iter()
+                    .map(|a| self.resolve_aggregates_in_expr(a, rows))
+                    .collect();
                 Ok(Expr::FunctionCall {
                     name: name.clone(),
                     args: resolved_args?,
@@ -17308,14 +17489,20 @@ impl QueryExecutor {
             }
             Expr::UnaryOp { expr, .. } => Self::collect_column_names(expr, out),
             Expr::FunctionCall { args, .. } => {
-                for a in args { Self::collect_column_names(a, out); }
+                for a in args {
+                    Self::collect_column_names(a, out);
+                }
             }
             Expr::IsNull { expr, .. } => Self::collect_column_names(expr, out),
             Expr::In { expr, list, .. } => {
                 Self::collect_column_names(expr, out);
-                for e in list { Self::collect_column_names(e, out); }
+                for e in list {
+                    Self::collect_column_names(e, out);
+                }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 Self::collect_column_names(expr, out);
                 Self::collect_column_names(low, out);
                 Self::collect_column_names(high, out);
@@ -17329,7 +17516,9 @@ impl QueryExecutor {
                     Self::collect_column_names(cond, out);
                     Self::collect_column_names(val, out);
                 }
-                if let Some(e) = else_expr { Self::collect_column_names(e, out); }
+                if let Some(e) = else_expr {
+                    Self::collect_column_names(e, out);
+                }
             }
             _ => {}
         }
@@ -17363,7 +17552,8 @@ impl QueryExecutor {
                 // Recursively bind outer refs inside the subquery's WHERE.
                 let mut bound = sub.clone();
                 if let Some(wc) = &bound.where_clause {
-                    bound.where_clause = Some(Self::bind_outer_columns(wc, outer_row, outer_schema));
+                    bound.where_clause =
+                        Some(Self::bind_outer_columns(wc, outer_row, outer_schema));
                 }
                 Expr::Subquery(bound)
             }
@@ -17372,9 +17562,16 @@ impl QueryExecutor {
                 op: op.clone(),
                 right: Box::new(Self::bind_outer_columns(right, outer_row, outer_schema)),
             },
-            Expr::FunctionCall { name, args, distinct } => Expr::FunctionCall {
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+            } => Expr::FunctionCall {
                 name: name.clone(),
-                args: args.iter().map(|a| Self::bind_outer_columns(a, outer_row, outer_schema)).collect(),
+                args: args
+                    .iter()
+                    .map(|a| Self::bind_outer_columns(a, outer_row, outer_schema))
+                    .collect(),
                 distinct: *distinct,
             },
             _ => expr.clone(),
@@ -17383,7 +17580,12 @@ impl QueryExecutor {
 
     /// Evaluate an expression that may contain a (now-bound) scalar subquery.
     /// Uses self to execute the subquery.
-    fn eval_correlated_expr(&self, expr: &Expr, row: &[Value], schema: &TableSchema) -> Result<Value> {
+    fn eval_correlated_expr(
+        &self,
+        expr: &Expr,
+        row: &[Value],
+        schema: &TableSchema,
+    ) -> Result<Value> {
         match expr {
             Expr::Subquery(sub) => {
                 let result = self.execute_select_internal(sub)?;
@@ -17394,7 +17596,11 @@ impl QueryExecutor {
                                 "Scalar subquery returned more than one row".to_string(),
                             ));
                         }
-                        Ok(rows.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null))
+                        Ok(rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .cloned()
+                            .unwrap_or(Value::Null))
                     }
                     _ => Ok(Value::Null),
                 }
@@ -17558,7 +17764,14 @@ impl QueryExecutor {
                     // aggregated value).
                     // 🔑 GROUP_CONCAT also — otherwise it's evaluated per-row
                     // and returns NULL for every input row.
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE" | "GROUP_CONCAT"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "STDDEV"
+                        | "VARIANCE"
+                        | "GROUP_CONCAT"
                 );
                 if is_agg_top {
                     return true;
@@ -17575,9 +17788,7 @@ impl QueryExecutor {
             Expr::Case { whens, else_expr } => {
                 whens
                     .iter()
-                    .any(|(cond, val)| {
-                        self.is_aggregate_expr(cond) || self.is_aggregate_expr(val)
-                    })
+                    .any(|(cond, val)| self.is_aggregate_expr(cond) || self.is_aggregate_expr(val))
                     || else_expr
                         .as_ref()
                         .map(|e| self.is_aggregate_expr(e))
@@ -17605,7 +17816,13 @@ impl QueryExecutor {
             Expr::FunctionCall { name, args, .. }
                 if matches!(
                     name.to_uppercase().as_str(),
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "VARIANCE"
+                    "COUNT"
+                        | "SUM"
+                        | "AVG"
+                        | "MIN"
+                        | "MAX"
+                        | "STDDEV"
+                        | "VARIANCE"
                         | "GROUP_CONCAT"
                 ) =>
             {
@@ -18331,10 +18548,14 @@ impl QueryExecutor {
         if let Some(ref order_by) = stmt.order_by {
             for ob in order_by {
                 if let Expr::FunctionCall { name, args, .. } = &ob.expr {
-                    let arg_str = args.iter().map(|a| match a {
-                        Expr::Column(c) => c.clone(),
-                        e => format!("{:?}", e),
-                    }).collect::<Vec<_>>().join(", ");
+                    let arg_str = args
+                        .iter()
+                        .map(|a| match a {
+                            Expr::Column(c) => c.clone(),
+                            e => format!("{:?}", e),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
                     // Only if NOT already in the SELECT output.
                     if !select_col_info.iter().any(|(cn, _, _)| cn == &ob_name) {
@@ -18428,13 +18649,20 @@ impl QueryExecutor {
                 .iter()
                 .filter_map(|ob| {
                     if let Expr::Column(ref col_name) = ob.expr {
-                        return column_names.iter().position(|c| c == col_name).map(|idx| (idx, ob.asc));
+                        return column_names
+                            .iter()
+                            .position(|c| c == col_name)
+                            .map(|idx| (idx, ob.asc));
                     }
                     if let Expr::FunctionCall { name, args, .. } = &ob.expr {
-                        let arg_str = args.iter().map(|a| match a {
-                            Expr::Column(c) => c.clone(),
-                            e => format!("{:?}", e),
-                        }).collect::<Vec<_>>().join(", ");
+                        let arg_str = args
+                            .iter()
+                            .map(|a| match a {
+                                Expr::Column(c) => c.clone(),
+                                e => format!("{:?}", e),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let ob_name = format!("{}({})", name.to_uppercase(), arg_str);
                         // In SELECT list?
                         if let Some(idx) = column_names.iter().position(|c| c == &ob_name) {
@@ -18826,10 +19054,14 @@ impl QueryExecutor {
                     let ob_name = match &ob.expr {
                         Expr::Column(col_name) => col_name.clone(),
                         Expr::FunctionCall { name, args, .. } => {
-                            let arg_str = args.iter().map(|a| match a {
-                                Expr::Column(c) => c.clone(),
-                                e => format!("{:?}", e),
-                            }).collect::<Vec<_>>().join(", ");
+                            let arg_str = args
+                                .iter()
+                                .map(|a| match a {
+                                    Expr::Column(c) => c.clone(),
+                                    e => format!("{:?}", e),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             format!("{}({})", name.to_uppercase(), arg_str)
                         }
                         _ => return None,
@@ -18916,7 +19148,10 @@ impl QueryExecutor {
                 let iter: Box<dyn Iterator<Item = Value>> = if agg.distinct {
                     Box::new(iter_vals)
                 } else {
-                    Box::new(rows.iter().filter_map(|r| agg.col_pos.and_then(|p| r.get(p).cloned())))
+                    Box::new(
+                        rows.iter()
+                            .filter_map(|r| agg.col_pos.and_then(|p| r.get(p).cloned())),
+                    )
                 };
                 for val in iter {
                     match val {
@@ -18966,7 +19201,10 @@ impl QueryExecutor {
                 let iter: Box<dyn Iterator<Item = Value>> = if agg.distinct {
                     Box::new(distinct_vals.into_iter())
                 } else {
-                    Box::new(rows.iter().filter_map(|r| agg.col_pos.and_then(|p| r.get(p).cloned())))
+                    Box::new(
+                        rows.iter()
+                            .filter_map(|r| agg.col_pos.and_then(|p| r.get(p).cloned())),
+                    )
                 };
                 for val in iter {
                     match val {
@@ -18994,8 +19232,11 @@ impl QueryExecutor {
             }
             "MIN" => {
                 let mut min_val: Option<Value> = None;
-                let mut seen: Option<HashSet<Value>> =
-                    if agg.distinct { Some(HashSet::new()) } else { None };
+                let mut seen: Option<HashSet<Value>> = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     if let Some(pos) = agg.col_pos {
                         if let Some(val) = row.get(pos) {
@@ -19010,9 +19251,7 @@ impl QueryExecutor {
                             min_val = Some(match min_val {
                                 None => val.clone(),
                                 Some(current) => {
-                                    if val.partial_cmp(&current)
-                                        == Some(std::cmp::Ordering::Less)
-                                    {
+                                    if val.partial_cmp(&current) == Some(std::cmp::Ordering::Less) {
                                         val.clone()
                                     } else {
                                         current
@@ -19026,8 +19265,11 @@ impl QueryExecutor {
             }
             "MAX" => {
                 let mut max_val: Option<Value> = None;
-                let mut seen: Option<HashSet<Value>> =
-                    if agg.distinct { Some(HashSet::new()) } else { None };
+                let mut seen: Option<HashSet<Value>> = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     if let Some(pos) = agg.col_pos {
                         if let Some(val) = row.get(pos) {
@@ -19745,31 +19987,31 @@ impl QueryExecutor {
                         return self.execute_update_pk(&stmt, &schema, &target_value);
                     }
 
-                // Column index fast path: use index to find matching rows
-                if let Some(index_name) = self.db.index_registry.find_by_column(
-                    &stmt.table,
-                    &col_name,
-                    crate::database::index_metadata::IndexType::Column,
-                ) {
-                    if let Some(index) = self.db.column_indexes.get(&index_name) {
-                        let matching_row_ids = index
-                            .value()
-                            .get_arc(&target_value)
-                            .unwrap_or_else(|_| Arc::new(Vec::new()));
-                        if matching_row_ids.is_empty() {
-                            return Ok(QueryResult::Modification { affected_rows: 0 });
+                    // Column index fast path: use index to find matching rows
+                    if let Some(index_name) = self.db.index_registry.find_by_column(
+                        &stmt.table,
+                        &col_name,
+                        crate::database::index_metadata::IndexType::Column,
+                    ) {
+                        if let Some(index) = self.db.column_indexes.get(&index_name) {
+                            let matching_row_ids = index
+                                .value()
+                                .get_arc(&target_value)
+                                .unwrap_or_else(|_| Arc::new(Vec::new()));
+                            if matching_row_ids.is_empty() {
+                                return Ok(QueryResult::Modification { affected_rows: 0 });
+                            }
+                            return self.execute_update_by_row_ids(
+                                &stmt,
+                                &schema,
+                                &matching_row_ids,
+                                &col_name,
+                                &target_value,
+                            );
                         }
-                        return self.execute_update_by_row_ids(
-                            &stmt,
-                            &schema,
-                            &matching_row_ids,
-                            &col_name,
-                            &target_value,
-                        );
                     }
                 }
             }
-        }
         }
 
         // 🚀 Use真正的流式扫描 (O(1) memory)
@@ -19860,7 +20102,10 @@ impl QueryExecutor {
                 // 🔑 If row was INSERTed in this txn, update write_set (prevents
                 // COMMIT overwriting the UPDATE with the stale INSERT value).
                 let updated = self.db.txn_coordinator.update_write_set_row(
-                    tid, &stmt.table, row_id, new_row.clone(),
+                    tid,
+                    &stmt.table,
+                    row_id,
+                    new_row.clone(),
                 )?;
                 if !updated {
                     let _ = self.db.txn_coordinator.record_write_delta(
@@ -19900,9 +20145,11 @@ impl QueryExecutor {
                         v.clone()
                     } else if Self::expr_contains_subquery(expr) {
                         let materialized = self.materialize_subqueries(expr)?;
-                        if let Expr::Literal(v) = materialized { v }
-                        else {
-                            Self::eval_expr_on_row(&materialized, &row, &schema).unwrap_or(Value::Null)
+                        if let Expr::Literal(v) = materialized {
+                            v
+                        } else {
+                            Self::eval_expr_on_row(&materialized, &row, &schema)
+                                .unwrap_or(Value::Null)
                         }
                     } else {
                         match Self::eval_expr_on_row(expr, &row, &schema) {
@@ -19919,7 +20166,10 @@ impl QueryExecutor {
             // 🔑 Update the write_set entry (not storage — the row isn't committed yet).
             if let Some(tid) = self.current_txn_id() {
                 let _ = self.db.txn_coordinator.update_write_set_row(
-                    tid, &stmt.table, *ws_row_id, new_row,
+                    tid,
+                    &stmt.table,
+                    *ws_row_id,
+                    new_row,
                 );
             }
             affected_rows += 1;
@@ -19952,39 +20202,39 @@ impl QueryExecutor {
             if let Some(ref where_clause) = stmt.where_clause {
                 if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
                     let is_pk = schema
-                    .primary_key()
-                    .map(|pk| pk == col_name)
-                    .unwrap_or(false);
+                        .primary_key()
+                        .map(|pk| pk == col_name)
+                        .unwrap_or(false);
 
-                if is_pk {
-                    return self.execute_delete_pk(&stmt, &schema, &target_value);
-                }
+                    if is_pk {
+                        return self.execute_delete_pk(&stmt, &schema, &target_value);
+                    }
 
-                // 🚀 Column index fast path: use index to find matching rows
-                if let Some(index_name) = self.db.index_registry.find_by_column(
-                    &stmt.table,
-                    &col_name,
-                    crate::database::index_metadata::IndexType::Column,
-                ) {
-                    if let Some(index) = self.db.column_indexes.get(&index_name) {
-                        let matching_row_ids = index
-                            .value()
-                            .get_arc(&target_value)
-                            .unwrap_or_else(|_| Arc::new(Vec::new()));
-                        if matching_row_ids.is_empty() {
-                            return Ok(QueryResult::Modification { affected_rows: 0 });
+                    // 🚀 Column index fast path: use index to find matching rows
+                    if let Some(index_name) = self.db.index_registry.find_by_column(
+                        &stmt.table,
+                        &col_name,
+                        crate::database::index_metadata::IndexType::Column,
+                    ) {
+                        if let Some(index) = self.db.column_indexes.get(&index_name) {
+                            let matching_row_ids = index
+                                .value()
+                                .get_arc(&target_value)
+                                .unwrap_or_else(|_| Arc::new(Vec::new()));
+                            if matching_row_ids.is_empty() {
+                                return Ok(QueryResult::Modification { affected_rows: 0 });
+                            }
+                            return self.execute_delete_by_row_ids(
+                                &stmt,
+                                &schema,
+                                &matching_row_ids,
+                                &col_name,
+                                &target_value,
+                            );
                         }
-                        return self.execute_delete_by_row_ids(
-                            &stmt,
-                            &schema,
-                            &matching_row_ids,
-                            &col_name,
-                            &target_value,
-                        );
                     }
                 }
             }
-        }
         }
 
         // 🚀 Use真正的流式扫描 (O(1) memory)
@@ -20054,7 +20304,9 @@ impl QueryExecutor {
             // Remove from write_set (the row was never committed to storage).
             if let Some(tid) = self.current_txn_id() {
                 let ctx = self.db.txn_coordinator.get_context(tid)?;
-                ctx.write_set.write().remove(&(stmt.table.clone(), *ws_row_id));
+                ctx.write_set
+                    .write()
+                    .remove(&(stmt.table.clone(), *ws_row_id));
             }
             affected_rows += 1;
         }
@@ -20208,7 +20460,10 @@ impl QueryExecutor {
                 // 🔑 If row was INSERTed in this txn, update write_set (prevents
                 // COMMIT overwriting the UPDATE with the stale INSERT value).
                 let updated = self.db.txn_coordinator.update_write_set_row(
-                    tid, &stmt.table, row_id, new_row.clone(),
+                    tid,
+                    &stmt.table,
+                    row_id,
+                    new_row.clone(),
                 )?;
                 if !updated {
                     let _ = self.db.txn_coordinator.record_write_delta(
@@ -20321,7 +20576,10 @@ impl QueryExecutor {
                 // 🔑 If row was INSERTed in this txn, update write_set (prevents
                 // COMMIT overwriting the UPDATE with the stale INSERT value).
                 let updated = self.db.txn_coordinator.update_write_set_row(
-                    tid, &stmt.table, row_id, new_row.clone(),
+                    tid,
+                    &stmt.table,
+                    row_id,
+                    new_row.clone(),
                 )?;
                 if !updated {
                     let _ = self.db.txn_coordinator.record_write_delta(
@@ -20965,7 +21223,12 @@ impl QueryExecutor {
                     message: format!("Table {} AUTO_INCREMENT set to {}", stmt.table, new_value),
                 })
             }
-            AlterTableAction::AddColumn { name, data_type, default_value, nullable } => {
+            AlterTableAction::AddColumn {
+                name,
+                data_type,
+                default_value,
+                nullable,
+            } => {
                 // Convert DataType to ColumnType (same mapping as CREATE TABLE).
                 let col_type = match data_type {
                     super::ast::DataType::Integer => ColumnType::Integer,
@@ -21521,8 +21784,7 @@ impl QueryExecutor {
         let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(scored_results.len());
         for (row_id, _score) in &scored_results {
             if let Some(row) = row_lookup.get(row_id) {
-                let mut projected =
-                    Self::project_row_direct(row, &stmt.columns, &columns, &schema);
+                let mut projected = Self::project_row_direct(row, &stmt.columns, &columns, &schema);
                 // Append MATCH-expr scores for SELECT columns that are
                 // `MATCH(col) AGAINST(...) AS score`.
                 let mut appended_match_score = false;
@@ -21551,7 +21813,11 @@ impl QueryExecutor {
                     .iter()
                     .filter_map(|ob| {
                         if let Expr::Column(ref col_name) = ob.expr {
-                            columns.iter().position(|c| c == col_name || c.ends_with(&format!(".{}", col_name)))
+                            columns
+                                .iter()
+                                .position(|c| {
+                                    c == col_name || c.ends_with(&format!(".{}", col_name))
+                                })
                                 .map(|pos| (pos, ob.asc))
                         } else {
                             None
@@ -22751,16 +23017,26 @@ impl QueryExecutor {
                     // &[f32] slice and call the NEON/AVX2 euclidean_distance_squared.
                     // This is 4-8x faster than the scalar per-element loop.
                     let row_vec: &[f32] = unsafe {
-                        std::slice::from_raw_parts(data[base..base + stride].as_ptr() as *const f32, dim)
+                        std::slice::from_raw_parts(
+                            data[base..base + stride].as_ptr() as *const f32,
+                            dim,
+                        )
                     };
-                    let dist = crate::distance::euclidean::euclidean_distance_squared(query, row_vec);
+                    let dist =
+                        crate::distance::euclidean::euclidean_distance_squared(query, row_vec);
                     // Maintain top-K max-heap.
                     if heap.len() < k {
-                        heap.push(std::cmp::Reverse((OrderedF32(dist), seg.sst.row_map.key(i))));
+                        heap.push(std::cmp::Reverse((
+                            OrderedF32(dist),
+                            seg.sst.row_map.key(i),
+                        )));
                     } else if let Some(&std::cmp::Reverse((worst, _))) = heap.peek() {
                         if OrderedF32(dist) < worst {
                             heap.pop();
-                            heap.push(std::cmp::Reverse((OrderedF32(dist), seg.sst.row_map.key(i))));
+                            heap.push(std::cmp::Reverse((
+                                OrderedF32(dist),
+                                seg.sst.row_map.key(i),
+                            )));
                         }
                     }
                 }
@@ -22770,8 +23046,10 @@ impl QueryExecutor {
             // be visible).
             // (Buffer scan omitted for brevity; index build flushes first, and
             // the brute-force path is only a fallback before first flush.)
-            let mut results: Vec<(RowId, f32)> =
-                heap.into_iter().map(|std::cmp::Reverse((d, id))| (id, d.0)).collect();
+            let mut results: Vec<(RowId, f32)> = heap
+                .into_iter()
+                .map(|std::cmp::Reverse((d, id))| (id, d.0))
+                .collect();
             results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             return Ok(results);
         }

@@ -198,10 +198,9 @@ impl TableRegistry {
             .write()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;
 
-        let schema = meta
-            .tables
-            .get_mut(table_name)
-            .ok_or_else(|| StorageError::InvalidData(format!("Table '{}' not found", table_name)))?;
+        let schema = meta.tables.get_mut(table_name).ok_or_else(|| {
+            StorageError::InvalidData(format!("Table '{}' not found", table_name))
+        })?;
 
         // Don't allow duplicate column names.
         if schema.columns.iter().any(|c| c.name == col_name) {

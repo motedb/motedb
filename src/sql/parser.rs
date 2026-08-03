@@ -41,7 +41,8 @@ impl Parser {
     pub fn parse(&mut self) -> Result<Statement> {
         // 🆕 WITH clause — parsed once at the top so the CTEs are visible to
         // both halves of a UNION. Returns (ctes, is_recursive_marker).
-        let (mut ctes, _recursive_marker) = if matches!(self.current().token_type, TokenType::With) {
+        let (mut ctes, _recursive_marker) = if matches!(self.current().token_type, TokenType::With)
+        {
             self.parse_with_clause()?
         } else {
             (Vec::new(), false)
@@ -161,8 +162,9 @@ impl Parser {
         // Reject WITH attached to a non-query statement. (Also catches the
         // case where the parser advanced past WITH but didn't consume ctes.)
         if !ctes.is_empty() {
-            return Err(self.error(
-                "WITH clause is only valid before SELECT (or SELECT ... UNION ...)"));
+            return Err(
+                self.error("WITH clause is only valid before SELECT (or SELECT ... UNION ...)")
+            );
         }
 
         // Optionally consume semicolon
@@ -296,11 +298,9 @@ impl Parser {
     /// Parse the trailing ORDER BY / LIMIT / OFFSET clauses (each optional).
     /// Returns (order_by, limit, offset). Used both by parse_select (standalone
     /// SELECT) and by the set-op parser (to attach these to the outermost node).
-    fn parse_trailing_clauses(&mut self) -> Result<(
-        Option<Vec<OrderByExpr>>,
-        Option<usize>,
-        Option<usize>,
-    )> {
+    fn parse_trailing_clauses(
+        &mut self,
+    ) -> Result<(Option<Vec<OrderByExpr>>, Option<usize>, Option<usize>)> {
         let order_by = if self.match_token(TokenType::Order) {
             self.expect(TokenType::By)?;
             Some(self.parse_order_by()?)
@@ -386,8 +386,14 @@ impl Parser {
                 if let TokenType::Identifier(col) = self.current().token_type.clone() {
                     cols.push(col);
                     self.advance();
-                    if matches!(self.current().token_type, TokenType::Comma) { self.advance(); } else { break; }
-                } else { return Err(self.error("Expected column after PARTITION BY")); }
+                    if matches!(self.current().token_type, TokenType::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                } else {
+                    return Err(self.error("Expected column after PARTITION BY"));
+                }
             }
             partition_by = Some(cols);
         }
@@ -399,18 +405,29 @@ impl Parser {
             loop {
                 let expr = self.parse_expr(0)?;
                 let asc = if matches!(self.current().token_type, TokenType::Desc) {
-                    self.advance(); false
+                    self.advance();
+                    false
                 } else {
-                    if matches!(self.current().token_type, TokenType::Asc) { self.advance(); }
+                    if matches!(self.current().token_type, TokenType::Asc) {
+                        self.advance();
+                    }
                     true
                 };
                 ords.push(crate::sql::ast::OrderByExpr { expr, asc });
-                if matches!(self.current().token_type, TokenType::Comma) { self.advance(); } else { break; }
+                if matches!(self.current().token_type, TokenType::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
             }
             order_by = Some(ords);
         }
         self.expect(TokenType::RParen)?;
-        Ok(Expr::WindowFunction { func, partition_by, order_by })
+        Ok(Expr::WindowFunction {
+            func,
+            partition_by,
+            order_by,
+        })
     }
 
     fn parse_with_clause(&mut self) -> Result<(Vec<CteDef>, bool)> {
@@ -951,9 +968,18 @@ impl Parser {
                             self.advance();
                             v
                         }
-                        TokenType::True => { self.advance(); crate::types::Value::Bool(true) }
-                        TokenType::False => { self.advance(); crate::types::Value::Bool(false) }
-                        TokenType::Null => { self.advance(); crate::types::Value::Null }
+                        TokenType::True => {
+                            self.advance();
+                            crate::types::Value::Bool(true)
+                        }
+                        TokenType::False => {
+                            self.advance();
+                            crate::types::Value::Bool(false)
+                        }
+                        TokenType::Null => {
+                            self.advance();
+                            crate::types::Value::Null
+                        }
                         _ => return Err(self.error("Expected literal value for DEFAULT")),
                     };
                     default_value = Some(val);
@@ -1311,9 +1337,9 @@ impl Parser {
             //   (simple form — equivalent to CASE WHEN expr = val THEN ...)
             TokenType::Case => {
                 self.advance(); // consume CASE
-                // 🚨 Simple CASE: if the next token isn't WHEN, parse the test
-                // expression and rewrite each `WHEN val THEN res` into the
-                // searched form `WHEN test_expr = val THEN res`.
+                                // 🚨 Simple CASE: if the next token isn't WHEN, parse the test
+                                // expression and rewrite each `WHEN val THEN res` into the
+                                // searched form `WHEN test_expr = val THEN res`.
                 let test_expr = if !matches!(self.current().token_type, TokenType::When) {
                     Some(self.parse_expr(0)?)
                 } else {
@@ -1629,9 +1655,7 @@ impl Parser {
                                 distinct: false,
                             });
                         } else {
-                            return Err(
-                                self.error("Expected AS or ',' in CAST(expr AS type)")
-                            );
+                            return Err(self.error("Expected AS or ',' in CAST(expr AS type)"));
                         }
                     }
 
@@ -2098,7 +2122,11 @@ impl Parser {
                             radius,
                         })
                     } else {
-                        let fc = Expr::FunctionCall { name, args, distinct };
+                        let fc = Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct,
+                        };
                         // Check for OVER (window function)
                         if matches!(self.current().token_type, TokenType::Over) {
                             return self.parse_window_spec(fc);
@@ -2507,9 +2535,18 @@ impl Parser {
                             self.advance();
                             v
                         }
-                        TokenType::True => { self.advance(); crate::types::Value::Bool(true) }
-                        TokenType::False => { self.advance(); crate::types::Value::Bool(false) }
-                        TokenType::Null => { self.advance(); crate::types::Value::Null }
+                        TokenType::True => {
+                            self.advance();
+                            crate::types::Value::Bool(true)
+                        }
+                        TokenType::False => {
+                            self.advance();
+                            crate::types::Value::Bool(false)
+                        }
+                        TokenType::Null => {
+                            self.advance();
+                            crate::types::Value::Null
+                        }
                         _ => return Err(self.error("Expected literal value for DEFAULT")),
                     };
                     default_value = Some(val);
@@ -2550,7 +2587,9 @@ impl Parser {
                 TokenType::Number(n) => {
                     let f = *n;
                     if f < 0.0 || f > i64::MAX as f64 || f.fract() != 0.0 {
-                        return Err(self.error("AUTO_INCREMENT value must be a non-negative integer"));
+                        return Err(
+                            self.error("AUTO_INCREMENT value must be a non-negative integer")
+                        );
                     }
                     let value = f as i64;
                     self.advance();

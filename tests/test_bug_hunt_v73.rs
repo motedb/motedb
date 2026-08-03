@@ -40,7 +40,8 @@ fn test_index_consistent_after_checkpoint_update() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT)").unwrap();
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1,'a'),(2,'b')").unwrap();
         db.execute("CREATE INDEX idx_cat ON t(cat)").unwrap();
         db.execute("UPDATE t SET cat = 'b' WHERE id = 1").unwrap();
@@ -52,7 +53,10 @@ fn test_index_consistent_after_checkpoint_update() {
     let r = q(&db, "SELECT id FROM t WHERE cat = 'b' ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
     let r2 = q(&db, "SELECT id FROM t WHERE cat = 'a'");
-    assert!(r2.is_empty(), "old value 'a' should have no rows after UPDATE");
+    assert!(
+        r2.is_empty(),
+        "old value 'a' should have no rows after UPDATE"
+    );
 }
 
 #[test]
@@ -61,8 +65,10 @@ fn test_index_consistent_after_checkpoint_delete() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a')").unwrap();
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a')")
+            .unwrap();
         db.execute("CREATE INDEX idx_cat ON t(cat)").unwrap();
         db.execute("DELETE FROM t WHERE id = 1").unwrap();
         db.checkpoint().unwrap();
@@ -76,17 +82,22 @@ fn test_index_consistent_after_checkpoint_delete() {
 #[test]
 fn test_index_point_query_after_many_ops() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     // Insert, update, delete in a mix.
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     db.execute("UPDATE t SET v = 10 WHERE id = 3").unwrap();
     db.execute("DELETE FROM t WHERE id = 2").unwrap();
     // v=10 → ids 1, 3.
     let r = q(&db, "SELECT id FROM t WHERE v = 10 ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
     let r2 = q(&db, "SELECT id FROM t WHERE v = 20");
-    assert!(r2.is_empty(), "v=20 (id2 deleted, id3 updated) should be empty");
+    assert!(
+        r2.is_empty(),
+        "v=20 (id2 deleted, id3 updated) should be empty"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -97,7 +108,8 @@ fn test_index_point_query_after_many_ops() {
 fn test_groupby_sum_matches_filtered_sum() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(g INT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(1,20),(2,5),(2,15),(3,100)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(1,20),(2,5),(2,15),(3,100)")
+        .unwrap();
     // SUM for g=1 via GROUP BY.
     let r1 = q(&db, "SELECT SUM(v) FROM t WHERE g = 1");
     // SUM for g=1 via GROUP BY + HAVING.
@@ -108,8 +120,10 @@ fn test_groupby_sum_matches_filtered_sum() {
 #[test]
 fn test_count_star_equals_count_rows() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,NULL),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,NULL),(3,30)")
+        .unwrap();
     let cnt = q(&db, "SELECT COUNT(*) FROM t")[0][0].clone();
     let nrows = q(&db, "SELECT id FROM t").len() as i64;
     assert_eq!(cnt, Value::Integer(nrows));
@@ -119,7 +133,8 @@ fn test_count_star_equals_count_rows() {
 fn test_avg_consistency() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (10),(20),(30),(40)").unwrap();
+    db.execute("INSERT INTO t VALUES (10),(20),(30),(40)")
+        .unwrap();
     // AVG = SUM/COUNT = 100/4 = 25.
     let avg = f_of(&q(&db, "SELECT AVG(v) FROM t")[0][0]);
     let sum = f_of(&q(&db, "SELECT SUM(v) FROM t")[0][0]);
@@ -134,8 +149,10 @@ fn test_avg_consistency() {
 #[test]
 fn test_i64_max_value() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1,{})", i64::MAX)).unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1,{})", i64::MAX))
+        .unwrap();
     let r = q(&db, "SELECT v FROM t");
     assert_eq!(r, vec![vec![Value::Integer(i64::MAX)]]);
 }
@@ -143,8 +160,10 @@ fn test_i64_max_value() {
 #[test]
 fn test_i64_min_value() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute(&format!("INSERT INTO t VALUES (1,{})", i64::MIN)).unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1,{})", i64::MIN))
+        .unwrap();
     let r = q(&db, "SELECT v FROM t");
     assert_eq!(r, vec![vec![Value::Integer(i64::MIN)]]);
 }
@@ -220,7 +239,8 @@ fn test_length_returns_int() {
 #[test]
 fn test_is_null_text_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,'x'),(2,NULL)").unwrap();
     let r = q(&db, "SELECT id FROM t WHERE s IS NULL");
     assert_eq!(r, vec![vec![Value::Integer(2)]]);
@@ -229,7 +249,8 @@ fn test_is_null_text_column() {
 #[test]
 fn test_is_not_null_float_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,1.5),(2,NULL)").unwrap();
     let r = q(&db, "SELECT id FROM t WHERE v IS NOT NULL");
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
@@ -242,12 +263,19 @@ fn test_is_not_null_float_column() {
 #[test]
 fn test_where_or_different_columns() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT, b INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10,0),(2,0,20),(3,10,20)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10,0),(2,0,20),(3,10,20)")
+        .unwrap();
     // a = 10 OR b = 20 → all three
     let r = q(&db, "SELECT id FROM t WHERE a = 10 OR b = 20 ORDER BY id");
     assert_eq!(
-        r.iter().map(|row| match &row[0] { Value::Integer(i) => *i, _ => -1 }).collect::<Vec<_>>(),
+        r.iter()
+            .map(|row| match &row[0] {
+                Value::Integer(i) => *i,
+                _ => -1,
+            })
+            .collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
 }
@@ -272,8 +300,10 @@ fn test_count_star_all_filtered() {
 #[test]
 fn test_distinct_with_limit() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,20),(5,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,20),(5,30)")
+        .unwrap();
     let r = q(&db, "SELECT DISTINCT v FROM t ORDER BY v LIMIT 2");
     assert_eq!(r, vec![vec![Value::Integer(10)], vec![Value::Integer(20)]]);
 }
@@ -285,20 +315,30 @@ fn test_distinct_with_limit() {
 #[test]
 fn test_in_subquery_with_avg() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)")
+        .unwrap();
     // rows where v > AVG(v) (avg=25) → ids 3, 4
-    let r = q(&db, "SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(3)], vec![Value::Integer(4)]]);
 }
 
 #[test]
 fn test_not_in_subquery_with_max() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     // ids where v != MAX(v)=30 → ids 1, 2
-    let r = q(&db, "SELECT id FROM t WHERE v NOT IN (SELECT MAX(v) FROM t) ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM t WHERE v NOT IN (SELECT MAX(v) FROM t) ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
 }
 
@@ -309,8 +349,10 @@ fn test_not_in_subquery_with_max() {
 #[test]
 fn test_order_limit_returns_smallest() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,50),(2,10),(3,30),(4,20)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,50),(2,10),(3,30),(4,20)")
+        .unwrap();
     // ORDER BY v ASC LIMIT 2 → two smallest: 10, 20
     let r = q(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 2");
     assert_eq!(r, vec![vec![Value::Integer(10)], vec![Value::Integer(20)]]);
@@ -319,8 +361,10 @@ fn test_order_limit_returns_smallest() {
 #[test]
 fn test_order_desc_limit_returns_largest() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,50),(2,10),(3,30),(4,20)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,50),(2,10),(3,30),(4,20)")
+        .unwrap();
     let r = q(&db, "SELECT v FROM t ORDER BY v DESC LIMIT 2");
     assert_eq!(r, vec![vec![Value::Integer(50)], vec![Value::Integer(30)]]);
 }

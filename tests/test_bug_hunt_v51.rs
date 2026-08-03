@@ -43,7 +43,8 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn test_insert_float_whole_into_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 3.0)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Integer(3)]]);
@@ -52,7 +53,8 @@ fn test_insert_float_whole_into_int() {
 #[test]
 fn test_insert_float_large_whole_into_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v BIGINT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v BIGINT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1000000.0)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Integer(1000000)]]);
@@ -61,7 +63,8 @@ fn test_insert_float_large_whole_into_int() {
 #[test]
 fn test_insert_float_negative_whole_into_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -42.0)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Integer(-42)]]);
@@ -70,7 +73,8 @@ fn test_insert_float_negative_whole_into_int() {
 #[test]
 fn test_insert_float_fractional_into_int_rejected() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     // 3.14 is fractional — must be rejected, not truncated to 3.
     let r = db.execute("INSERT INTO t VALUES (1, 3.14)");
     assert!(r.is_err(), "fractional float into INT should error");
@@ -83,7 +87,8 @@ fn test_insert_float_fractional_into_int_rejected() {
 #[test]
 fn test_insert_int_into_float() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Float(42.0)]]);
@@ -92,7 +97,8 @@ fn test_insert_int_into_float() {
 #[test]
 fn test_insert_float_into_float() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 3.14)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Float(3.14)]]);
@@ -105,8 +111,10 @@ fn test_insert_float_into_float() {
 #[test]
 fn test_batch_insert_float_into_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1.0), (2, 2.0), (3, 3.0)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1.0), (2, 2.0), (3, 3.0)")
+        .unwrap();
     let r = q(&db, "SELECT v FROM t ORDER BY id");
     assert_eq!(
         r,
@@ -125,7 +133,8 @@ fn test_batch_insert_float_into_int() {
 #[test]
 fn test_fast_batch_insert_float_into_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY AUTO_INCREMENT, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY AUTO_INCREMENT, v INT)")
+        .unwrap();
     // 150 rows triggers fast_batch_insert path
     let mut sql = String::from("INSERT INTO t(v) VALUES ");
     for i in 0..150 {
@@ -159,7 +168,8 @@ fn test_fast_batch_insert_float_into_int() {
 #[test]
 fn test_update_float_to_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     // v + 0.0 promotes to float, should coerce back to int 10
     db.execute("UPDATE t SET v = v + 0.0 WHERE id = 1").unwrap();
@@ -177,7 +187,8 @@ fn test_float_to_int_survives_checkpoint() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 42.0)").unwrap();
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -194,7 +205,8 @@ fn test_float_to_int_survives_checkpoint() {
 #[test]
 fn test_insert_null_after_coercion_fix() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Null]]);
@@ -212,7 +224,8 @@ fn test_insert_null_after_coercion_fix() {
 #[test]
 fn test_insert_negative_float_scientific() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -1e15)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Float(-1e15)]]);
@@ -221,7 +234,8 @@ fn test_insert_negative_float_scientific() {
 #[test]
 fn test_insert_negative_parenthesized() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -(5.0))").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Float(-5.0)]]);
@@ -230,7 +244,8 @@ fn test_insert_negative_parenthesized() {
 #[test]
 fn test_insert_negative_int() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -42)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Integer(-42)]]);
@@ -239,7 +254,8 @@ fn test_insert_negative_int() {
 #[test]
 fn test_insert_constant_arithmetic() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     // Constant expression in VALUES — should be evaluated.
     db.execute("INSERT INTO t VALUES (1, 2 * 3)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
@@ -249,7 +265,8 @@ fn test_insert_constant_arithmetic() {
 #[test]
 fn test_insert_negative_scientific_small() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -2.5e-3)").unwrap();
     let r = q(&db, "SELECT v FROM t WHERE id = 1");
     assert_eq!(r, vec![vec![Value::Float(-0.0025)]]);

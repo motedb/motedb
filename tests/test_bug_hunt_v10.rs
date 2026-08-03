@@ -13,19 +13,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("int? {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("int? {:?}: {}", o, sql),
+    }
 }
 
 fn scalar_f64(db: &Database, sql: &str) -> f64 {
@@ -48,11 +58,20 @@ fn count_where_text_column_correct() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=20 {
         let cat = if i % 2 == 0 { "even" } else { "odd" };
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i),
+        );
     }
     // COUNT(*) WHERE cat = 'even' → 10 rows (ids 2,4,...,20).
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'even'"), 10);
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'odd'"), 10);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'even'"),
+        10
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'odd'"),
+        10
+    );
 }
 
 #[test]
@@ -61,7 +80,10 @@ fn sum_where_correct() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=10 {
         let cat = if i <= 5 { "a" } else { "b" };
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i * 10),
+        );
     }
     // SUM(v) WHERE cat = 'a' → 10+20+30+40+50 = 150.
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t WHERE cat = 'a'"), 150);
@@ -75,12 +97,24 @@ fn min_max_where_correct() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=20 {
         let cat = if i <= 10 { "low" } else { "high" };
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i),
+        );
     }
     assert_eq!(scalar_i64(&db, "SELECT MIN(v) FROM t WHERE cat = 'low'"), 1);
-    assert_eq!(scalar_i64(&db, "SELECT MAX(v) FROM t WHERE cat = 'low'"), 10);
-    assert_eq!(scalar_i64(&db, "SELECT MIN(v) FROM t WHERE cat = 'high'"), 11);
-    assert_eq!(scalar_i64(&db, "SELECT MAX(v) FROM t WHERE cat = 'high'"), 20);
+    assert_eq!(
+        scalar_i64(&db, "SELECT MAX(v) FROM t WHERE cat = 'low'"),
+        10
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT MIN(v) FROM t WHERE cat = 'high'"),
+        11
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT MAX(v) FROM t WHERE cat = 'high'"),
+        20
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -90,7 +124,10 @@ fn min_max_where_correct() {
 #[test]
 fn group_by_where_correct_counts() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, region TEXT, status TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, region TEXT, status TEXT)",
+    );
     // region=US: 3 active, 2 inactive. region=EU: 2 active, 1 inactive.
     exec(&db, "INSERT INTO t VALUES (1, 'US', 'active')");
     exec(&db, "INSERT INTO t VALUES (2, 'US', 'active')");
@@ -101,7 +138,10 @@ fn group_by_where_correct_counts() {
     exec(&db, "INSERT INTO t VALUES (7, 'EU', 'active')");
     exec(&db, "INSERT INTO t VALUES (8, 'EU', 'inactive')");
     // GROUP BY region WHERE status = 'active': US=3, EU=2.
-    let r = rows(&db, "SELECT region, COUNT(*) FROM t WHERE status = 'active' GROUP BY region ORDER BY region");
+    let r = rows(
+        &db,
+        "SELECT region, COUNT(*) FROM t WHERE status = 'active' GROUP BY region ORDER BY region",
+    );
     assert_eq!(r.len(), 2);
     match (&r[0][0], &r[0][1]) {
         (Value::Text(reg), Value::Integer(cnt)) => {
@@ -129,14 +169,23 @@ fn group_by_where_sum_correct() {
     exec(&db, "INSERT INTO t VALUES (4, 'b', 100)");
     exec(&db, "INSERT INTO t VALUES (5, 'b', 200)");
     // SUM per cat WHERE v >= 10: a → 10+20=30 (5 excluded), b → 100+200=300.
-    let r = rows(&db, "SELECT cat, SUM(v) FROM t WHERE v >= 10 GROUP BY cat ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(v) FROM t WHERE v >= 10 GROUP BY cat ORDER BY cat",
+    );
     assert_eq!(r.len(), 2);
     match (&r[0][0], &r[0][1]) {
-        (Value::Text(c), Value::Integer(s)) => { assert_eq!(&*c.0, "a"); assert_eq!(*s, 30); }
+        (Value::Text(c), Value::Integer(s)) => {
+            assert_eq!(&*c.0, "a");
+            assert_eq!(*s, 30);
+        }
         o => panic!("{:?}", o),
     }
     match (&r[1][0], &r[1][1]) {
-        (Value::Text(c), Value::Integer(s)) => { assert_eq!(&*c.0, "b"); assert_eq!(*s, 300); }
+        (Value::Text(c), Value::Integer(s)) => {
+            assert_eq!(&*c.0, "b");
+            assert_eq!(*s, 300);
+        }
         o => panic!("{:?}", o),
     }
 }
@@ -148,7 +197,10 @@ fn group_by_where_empty_result() {
     exec(&db, "INSERT INTO t VALUES (1, 'a', 10)");
     exec(&db, "INSERT INTO t VALUES (2, 'b', 20)");
     // WHERE filters all → no groups.
-    let r = rows(&db, "SELECT cat, COUNT(*) FROM t WHERE v > 1000 GROUP BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*) FROM t WHERE v > 1000 GROUP BY cat",
+    );
     assert_eq!(r.len(), 0, "WHERE filtering all → 0 groups");
 }
 
@@ -195,9 +247,15 @@ fn count_distinct_with_where() {
     exec(&db, "INSERT INTO t VALUES (4, 'b', 10)");
     exec(&db, "INSERT INTO t VALUES (5, 'b', 30)");
     // COUNT(DISTINCT v) WHERE cat = 'a': distinct {10, 20} = 2.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(DISTINCT v) FROM t WHERE cat = 'a'"), 2);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(DISTINCT v) FROM t WHERE cat = 'a'"),
+        2
+    );
     // WHERE cat = 'b': distinct {10, 30} = 2.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(DISTINCT v) FROM t WHERE cat = 'b'"), 2);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(DISTINCT v) FROM t WHERE cat = 'b'"),
+        2
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -225,7 +283,10 @@ fn where_and_two_cols_correct() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)");
     for i in 1..=20 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {}, {})", i, i, i * 2));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, {}, {})", i, i, i * 2),
+        );
     }
     // WHERE a > 5 AND b < 30: a in 6..14 (b=12..28), so a=6..14 (9 rows).
     // a>5: ids 6..20 (15). b<30: b=2*id<30 → id<15 → ids 1..14 (14).
@@ -248,9 +309,13 @@ fn order_by_where_limit_combined() {
     // WHERE v > 80 → v=81..99 → ids where 100-id>80 → id<20 → ids 1..19 (19 rows).
     // ORDER BY v DESC LIMIT 3 → top 3: v=99,98,97 → ids 1,2,3.
     let r = rows(&db, "SELECT id FROM t WHERE v > 80 ORDER BY v DESC LIMIT 3");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids, vec![1, 2, 3]);
 }
 
@@ -280,7 +345,10 @@ fn delete_where_then_aggregate() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=20 {
         let cat = if i % 3 == 0 { "x" } else { "y" };
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i),
+        );
     }
     // Initial: 20 rows. cat 'x': ids 3,6,9,12,15,18 = 6 rows.
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'x'"), 6);
@@ -288,7 +356,10 @@ fn delete_where_then_aggregate() {
     exec(&db, "DELETE FROM t WHERE cat = 'x'");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 14);
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'x'"), 0);
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'y'"), 14);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'y'"),
+        14
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -301,7 +372,10 @@ fn update_where_then_sum() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=10 {
         let cat = if i <= 5 { "a" } else { "b" };
-        exec(&db, &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i * 10));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, '{}', {})", i, cat, i * 10),
+        );
     }
     // SUM(v) WHERE cat = 'a' = 10+20+30+40+50 = 150.
     assert_eq!(scalar_i64(&db, "SELECT SUM(v) FROM t WHERE cat = 'a'"), 150);
@@ -329,7 +403,10 @@ fn where_negative_range() {
     // WHERE v >= 0 → 11 rows (v=0..10).
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE v >= 0"), 11);
     // WHERE v BETWEEN -5 AND 5 → 11 rows (-5..5).
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE v BETWEEN -5 AND 5"), 11);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE v BETWEEN -5 AND 5"),
+        11
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -368,7 +445,11 @@ fn aggregate_all_same_values() {
     assert!((a - 42.0).abs() < 0.001);
     // STDDEV of all-same = 0.
     let sd = scalar_f64(&db, "SELECT STDDEV(v) FROM t");
-    assert!(sd.abs() < 0.001, "STDDEV of identical values = 0, got {}", sd);
+    assert!(
+        sd.abs() < 0.001,
+        "STDDEV of identical values = 0, got {}",
+        sd
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -383,7 +464,10 @@ fn group_by_single_group_with_where() {
     exec(&db, "INSERT INTO t VALUES (2, 'a', 20)");
     exec(&db, "INSERT INTO t VALUES (3, 'a', 30)");
     // GROUP BY cat WHERE v >= 20: only 'a', count=2, sum=50.
-    let r = rows(&db, "SELECT cat, COUNT(*), SUM(v) FROM t WHERE v >= 20 GROUP BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, COUNT(*), SUM(v) FROM t WHERE v >= 20 GROUP BY cat",
+    );
     assert_eq!(r.len(), 1);
     match (&r[0][0], &r[0][1], &r[0][2]) {
         (Value::Text(c), Value::Integer(cnt), Value::Integer(s)) => {
@@ -408,5 +492,8 @@ fn where_or_diff_cols_then_count() {
     exec(&db, "INSERT INTO t VALUES (3, 30, 100)");
     exec(&db, "INSERT INTO t VALUES (4, 10, 300)");
     // a = 10 OR b = 200 → ids 1 (a=10), 2 (b=200), 4 (a=10) = 3.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE a = 10 OR b = 200"), 3);
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE a = 10 OR b = 200"),
+        3
+    );
 }

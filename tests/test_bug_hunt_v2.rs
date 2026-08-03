@@ -16,7 +16,8 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  error: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  error: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
@@ -84,8 +85,16 @@ fn agg_count_null_excluded() {
     exec(&db, "INSERT INTO t VALUES (2, NULL)");
     exec(&db, "INSERT INTO t VALUES (3, 30)");
     // COUNT(v) excludes NULL → 2. COUNT(*) includes all → 3.
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(v) FROM t"), 2, "COUNT(col) excludes NULL");
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 3, "COUNT(*) includes NULL rows");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(v) FROM t"),
+        2,
+        "COUNT(col) excludes NULL"
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        3,
+        "COUNT(*) includes NULL rows"
+    );
 }
 
 #[test]
@@ -96,8 +105,16 @@ fn agg_min_max_with_nulls() {
     exec(&db, "INSERT INTO t VALUES (2, 5)");
     exec(&db, "INSERT INTO t VALUES (3, NULL)");
     exec(&db, "INSERT INTO t VALUES (4, 15)");
-    assert_eq!(scalar_i64(&db, "SELECT MIN(v) FROM t"), 5, "MIN ignores NULL");
-    assert_eq!(scalar_i64(&db, "SELECT MAX(v) FROM t"), 15, "MAX ignores NULL");
+    assert_eq!(
+        scalar_i64(&db, "SELECT MIN(v) FROM t"),
+        5,
+        "MIN ignores NULL"
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT MAX(v) FROM t"),
+        15,
+        "MAX ignores NULL"
+    );
 }
 
 #[test]
@@ -123,10 +140,13 @@ fn where_null_not_equal() {
     exec(&db, "INSERT INTO t VALUES (3, 30)");
     // WHERE v != 10 — NULL row must NOT match (NULL != 10 is unknown, not true).
     let r = rows(&db, "SELECT id FROM t WHERE v != 10");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n),
-        _ => None,
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids, vec![3], "WHERE v != 10 must exclude NULL row (id=2)");
 }
 
@@ -203,7 +223,10 @@ fn update_set_null() {
     exec(&db, "INSERT INTO t VALUES (1, 10)");
     exec(&db, "UPDATE t SET v = NULL WHERE id = 1");
     let r = rows(&db, "SELECT v FROM t WHERE id = 1");
-    assert!(matches!(r[0][0], Value::Null), "UPDATE to NULL must produce NULL");
+    assert!(
+        matches!(r[0][0], Value::Null),
+        "UPDATE to NULL must produce NULL"
+    );
 }
 
 #[test]
@@ -229,7 +252,10 @@ fn update_all_rows_no_where() {
     }
     exec(&db, "UPDATE t SET v = 0");
     for i in 1..=5 {
-        assert_eq!(scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", i)), 0);
+        assert_eq!(
+            scalar_i64(&db, &format!("SELECT v FROM t WHERE id = {}", i)),
+            0
+        );
     }
 }
 
@@ -294,12 +320,18 @@ fn order_by_asc_desc() {
     }
     let asc: Vec<i64> = rows(&db, "SELECT v FROM t ORDER BY v ASC")
         .into_iter()
-        .filter_map(|r| match r.get(0) { Some(Value::Integer(n)) => Some(*n), _ => None })
+        .filter_map(|r| match r.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
         .collect();
     assert_eq!(asc, vec![10, 20, 30]);
     let desc: Vec<i64> = rows(&db, "SELECT v FROM t ORDER BY v DESC")
         .into_iter()
-        .filter_map(|r| match r.get(0) { Some(Value::Integer(n)) => Some(*n), _ => None })
+        .filter_map(|r| match r.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
         .collect();
     assert_eq!(desc, vec![30, 20, 10]);
 }
@@ -312,9 +344,13 @@ fn order_by_limit_offset() {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
     }
     let r = rows(&db, "SELECT v FROM t ORDER BY v ASC LIMIT 3 OFFSET 2");
-    let vals: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let vals: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     assert_eq!(vals, vec![3, 4, 5], "LIMIT 3 OFFSET 2");
 }
 
@@ -341,7 +377,10 @@ fn group_by_with_having() {
     exec(&db, "INSERT INTO t VALUES (4, 'b', 5)");
     exec(&db, "INSERT INTO t VALUES (5, 'c', 100)");
     // HAVING SUM(v) > 25 → only 'a' (30) and 'c' (100).
-    let r = rows(&db, "SELECT cat, SUM(v) FROM t GROUP BY cat HAVING SUM(v) > 25 ORDER BY cat");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(v) FROM t GROUP BY cat HAVING SUM(v) > 25 ORDER BY cat",
+    );
     assert_eq!(r.len(), 2, "HAVING must filter groups");
 }
 
@@ -432,8 +471,16 @@ fn reopen_after_mixed_ops() {
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 2, "2 rows after reopen");
-    assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 999, "UPDATE persisted");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "2 rows after reopen"
+    );
+    assert_eq!(
+        scalar_i64(&db, "SELECT v FROM t WHERE id = 1"),
+        999,
+        "UPDATE persisted"
+    );
     // id=2 deleted, id=3 present.
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE id = 2"), 0);
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE id = 3"), 1);
@@ -445,7 +492,10 @@ fn reopen_preserves_schema() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)");
+        exec(
+            &db,
+            "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)",
+        );
         exec(&db, "INSERT INTO t VALUES (1, 'x', 1.5)");
         db.checkpoint().unwrap();
         db.close().unwrap();
@@ -511,7 +561,11 @@ fn txn_insert_rollback_count_restored() {
         exec(&db, &format!("INSERT INTO t VALUES ({})", i));
     }
     db.rollback_transaction(tx).unwrap();
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 1, "rollback restores count");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        1,
+        "rollback restores count"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -45,7 +45,8 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 
 fn events_db() -> (Database, TempDir) {
     let (db, dir) = db();
-    db.execute("CREATE TABLE events(id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE events(id INT PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
     db.execute(
         "INSERT INTO events VALUES \
          (1, '2024-01-15T10:30:00'), \
@@ -63,28 +64,40 @@ fn events_db() -> (Database, TempDir) {
 #[test]
 fn test_timestamp_gt_string() {
     let (db, _d) = events_db();
-    let r = q(&db, "SELECT id FROM events WHERE ts > '2024-01-01T00:00:00' ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM events WHERE ts > '2024-01-01T00:00:00' ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
 }
 
 #[test]
 fn test_timestamp_lt_string() {
     let (db, _d) = events_db();
-    let r = q(&db, "SELECT id FROM events WHERE ts < '2024-01-01T00:00:00' ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM events WHERE ts < '2024-01-01T00:00:00' ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(3)]]);
 }
 
 #[test]
 fn test_timestamp_eq_string() {
     let (db, _d) = events_db();
-    let r = q(&db, "SELECT id FROM events WHERE ts = '2024-01-15T10:30:00'");
+    let r = q(
+        &db,
+        "SELECT id FROM events WHERE ts = '2024-01-15T10:30:00'",
+    );
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
 }
 
 #[test]
 fn test_timestamp_gte_string() {
     let (db, _d) = events_db();
-    let r = q(&db, "SELECT id FROM events WHERE ts >= '2023-12-25T08:00:00' ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM events WHERE ts >= '2023-12-25T08:00:00' ORDER BY id",
+    );
     assert_eq!(
         r,
         vec![
@@ -98,7 +111,10 @@ fn test_timestamp_gte_string() {
 #[test]
 fn test_timestamp_ne_string() {
     let (db, _d) = events_db();
-    let r = q(&db, "SELECT id FROM events WHERE ts <> '2024-01-15T10:30:00' ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM events WHERE ts <> '2024-01-15T10:30:00' ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]);
 }
 
@@ -127,7 +143,11 @@ fn test_timestamp_order_by() {
     // chronologically: 2023-12-25 (3), 2024-01-15 (1), 2024-06-20 (2)
     assert_eq!(
         r,
-        vec![vec![Value::Integer(3)], vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        vec![
+            vec![Value::Integer(3)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)]
+        ]
     );
 }
 
@@ -151,7 +171,8 @@ fn test_timestamp_after_checkpoint() {
     let path = dir.path().to_path_buf();
     {
         let db = Database::create(&path).unwrap();
-        db.execute("CREATE TABLE events(id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
+        db.execute("CREATE TABLE events(id INT PRIMARY KEY, ts TIMESTAMP)")
+            .unwrap();
         db.execute(
             "INSERT INTO events VALUES (1, '2024-01-15T10:30:00'), (2, '2023-12-25T08:00:00')",
         )
@@ -160,7 +181,10 @@ fn test_timestamp_after_checkpoint() {
         db.close().unwrap();
     }
     let db = Database::open(&path).unwrap();
-    let r = q(&db, "SELECT id FROM events WHERE ts > '2024-01-01' ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM events WHERE ts > '2024-01-01' ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
 }
 
@@ -170,13 +194,14 @@ fn test_timestamp_after_checkpoint() {
 
 fn join_db() -> (Database, TempDir) {
     let (db, dir) = db();
-    db.execute("CREATE TABLE customers(id INT PRIMARY KEY, name TEXT, region TEXT)").unwrap();
-    db.execute("CREATE TABLE orders(id INT PRIMARY KEY, cust_id INT, amt INT)").unwrap();
-    db.execute(
-        "INSERT INTO customers VALUES (1,'Alice','US'),(2,'Bob','EU'),(3,'Carol','US')",
-    )
-    .unwrap();
-    db.execute("INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50),(4,3,75)").unwrap();
+    db.execute("CREATE TABLE customers(id INT PRIMARY KEY, name TEXT, region TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders(id INT PRIMARY KEY, cust_id INT, amt INT)")
+        .unwrap();
+    db.execute("INSERT INTO customers VALUES (1,'Alice','US'),(2,'Bob','EU'),(3,'Carol','US')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1,1,100),(2,1,200),(3,2,50),(4,3,75)")
+        .unwrap();
     (db, dir)
 }
 
@@ -190,7 +215,10 @@ fn test_join_having_sum_agg() {
          FROM customers c JOIN orders o ON c.id = o.cust_id \
          GROUP BY c.name HAVING SUM(o.amt) > 100 ORDER BY c.name",
     );
-    assert_eq!(r, vec![vec![Value::text("Alice".into()), Value::Integer(300)]]);
+    assert_eq!(
+        r,
+        vec![vec![Value::text("Alice".into()), Value::Integer(300)]]
+    );
 }
 
 #[test]
@@ -203,7 +231,10 @@ fn test_join_having_count_agg() {
          FROM customers c JOIN orders o ON c.id = o.cust_id \
          GROUP BY c.name HAVING COUNT(o.id) > 1 ORDER BY c.name",
     );
-    assert_eq!(r, vec![vec![Value::text("Alice".into()), Value::Integer(2)]]);
+    assert_eq!(
+        r,
+        vec![vec![Value::text("Alice".into()), Value::Integer(2)]]
+    );
 }
 
 #[test]
@@ -216,7 +247,10 @@ fn test_join_having_avg_agg() {
          FROM customers c JOIN orders o ON c.id = o.cust_id \
          GROUP BY c.name HAVING AVG(o.amt) > 100 ORDER BY c.name",
     );
-    assert_eq!(r, vec![vec![Value::text("Alice".into()), Value::Float(150.0)]]);
+    assert_eq!(
+        r,
+        vec![vec![Value::text("Alice".into()), Value::Float(150.0)]]
+    );
 }
 
 #[test]

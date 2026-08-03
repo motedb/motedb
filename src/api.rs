@@ -274,7 +274,10 @@ impl Database {
         // bug. The undo delta is replayed to restore the original values.
         let active_txn = self.query_executor.current_txn_id();
         if let Some(txn_id) = active_txn {
-            warn_log!("[close] Active transaction {} not committed — rolling back", txn_id);
+            warn_log!(
+                "[close] Active transaction {} not committed — rolling back",
+                txn_id
+            );
             self.query_executor.replay_undo_log(txn_id);
             self.query_executor.clear_txn_context();
         }
@@ -446,10 +449,16 @@ impl Database {
         // 🔑 Serialize autocommit writes (INSERT/UPDATE/DELETE) to prevent
         // lost-update races (concurrent v=v+1 reading same old value).
         // Explicit transactions are NOT serialized (they use MVCC isolation).
-        let is_autocommit_write = !in_txn && matches!(
-            trimmed.as_bytes().get(0..6),
-            Some(b"INSERT") | Some(b"insert") | Some(b"UPDATE") | Some(b"update") | Some(b"DELETE") | Some(b"delete")
-        );
+        let is_autocommit_write = !in_txn
+            && matches!(
+                trimmed.as_bytes().get(0..6),
+                Some(b"INSERT")
+                    | Some(b"insert")
+                    | Some(b"UPDATE")
+                    | Some(b"update")
+                    | Some(b"DELETE")
+                    | Some(b"delete")
+            );
         let _write_guard = if is_autocommit_write {
             Some(self.inner.write_lock.lock())
         } else {
@@ -1147,7 +1156,10 @@ impl Database {
         // PK fast path below checks the write_set even when no committed
         // data exists yet (txn-only INSERTs).
         let has_txn_writes = self.query_executor.is_in_transaction()
-            && !self.query_executor.txn_write_set_rows(table_name).is_empty();
+            && !self
+                .query_executor
+                .txn_write_set_rows(table_name)
+                .is_empty();
         if !has_col_seg && !has_txn_writes {
             // Legacy single-SSTable tables: finalize write buffer so the
             // columnar paths below see all data.
@@ -1191,7 +1203,10 @@ impl Database {
         // treats this as a single SELECT, which would silently drop the right
         // side of the query. Check the tail after the parsed value for set-op
         // keywords and fall through to the full parser if present.
-        let after_val_pos = after_where[eq_pos + 1..].find(val_str).map(|p| eq_pos + 1 + p + val_str.len()).unwrap_or(after_where.len());
+        let after_val_pos = after_where[eq_pos + 1..]
+            .find(val_str)
+            .map(|p| eq_pos + 1 + p + val_str.len())
+            .unwrap_or(after_where.len());
         let after_val = after_where[after_val_pos..].trim_start();
         if Self::starts_with_set_op(after_val) {
             return Ok(None);
@@ -1368,7 +1383,8 @@ impl Database {
                                     .map(|s| s.trim().to_string())
                                     .collect()
                             };
-                            let rows: Vec<Vec<Value>> = scanned.into_iter().map(|(_, r)| r).collect();
+                            let rows: Vec<Vec<Value>> =
+                                scanned.into_iter().map(|(_, r)| r).collect();
                             return Ok(Some(StreamingQueryResult::SelectReady {
                                 columns: column_names,
                                 rows,
@@ -1647,15 +1663,23 @@ impl Database {
         // without a store lookup — even if no store exists yet (txn-only data).
         if let Some(opt_row) = &txn_row {
             let row: Vec<Value> = match opt_row {
-                Some(r) => r.clone(),     // transaction inserted this row
-                None => {                  // transaction deleted this row → empty
+                Some(r) => r.clone(), // transaction inserted this row
+                None => {
+                    // transaction deleted this row → empty
                     return Ok(Some(StreamingQueryResult::SelectReady {
                         columns: column_names,
                         rows: vec![],
                     }));
                 }
             };
-            return self.finish_fast_pk_select(table_name, &schema, row, select_part, is_star, column_names);
+            return self.finish_fast_pk_select(
+                table_name,
+                &schema,
+                row,
+                select_part,
+                is_star,
+                column_names,
+            );
         }
         // No transactional info — consult storage.
         let store = match self.inner.get_col_segment_store(table_name) {
@@ -1744,7 +1768,11 @@ impl Database {
         let s = s.trim_start();
         for kw in &["UNION", "INTERSECT", "EXCEPT"] {
             let kb = kw.as_bytes();
-            if s.as_bytes().get(..kb.len()).map(|b| b.eq_ignore_ascii_case(kb)).unwrap_or(false) {
+            if s.as_bytes()
+                .get(..kb.len())
+                .map(|b| b.eq_ignore_ascii_case(kb))
+                .unwrap_or(false)
+            {
                 // Word boundary: next char is whitespace or end.
                 let after = s.get(kb.len()..).unwrap_or("");
                 if after.is_empty() || after.as_bytes()[0].is_ascii_whitespace() {

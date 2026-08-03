@@ -14,19 +14,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "expected 1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("not int {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("not int {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -40,10 +50,11 @@ fn prepared_select_with_params() {
     for i in 1..=5 {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i * 10));
     }
-    let r = db.execute_prepared(
-        "SELECT v FROM t WHERE id = ?",
-        vec![Value::Integer(3)],
-    ).unwrap().materialize().unwrap();
+    let r = db
+        .execute_prepared("SELECT v FROM t WHERE id = ?", vec![Value::Integer(3)])
+        .unwrap()
+        .materialize()
+        .unwrap();
     if let QueryResult::Select { rows, .. } = r {
         assert_eq!(rows.len(), 1);
         match &rows[0][0] {
@@ -60,8 +71,13 @@ fn prepared_insert_with_params() {
     for i in 1..=3 {
         db.execute_prepared(
             "INSERT INTO t VALUES (?, ?, ?)",
-            vec![Value::Integer(i), Value::Text(format!("user{}", i).into()), Value::Integer(i * 100)],
-        ).unwrap();
+            vec![
+                Value::Integer(i),
+                Value::Text(format!("user{}", i).into()),
+                Value::Integer(i * 100),
+            ],
+        )
+        .unwrap();
     }
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 3);
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 2"), 200);
@@ -77,13 +93,12 @@ fn prepared_update_delete() {
     db.execute_prepared(
         "UPDATE t SET v = ? WHERE id = ?",
         vec![Value::Integer(999), Value::Integer(3)],
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 3"), 999);
 
-    db.execute_prepared(
-        "DELETE FROM t WHERE id = ?",
-        vec![Value::Integer(2)],
-    ).unwrap();
+    db.execute_prepared("DELETE FROM t WHERE id = ?", vec![Value::Integer(2)])
+        .unwrap();
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 4);
 }
 
@@ -94,10 +109,14 @@ fn prepared_multiple_params() {
     exec(&db, "INSERT INTO t VALUES (1, 10, 20)");
     exec(&db, "INSERT INTO t VALUES (2, 30, 40)");
     // WHERE a > ? AND b < ?
-    let r = db.execute_prepared(
-        "SELECT id FROM t WHERE a > ? AND b < ?",
-        vec![Value::Integer(20), Value::Integer(50)],
-    ).unwrap().materialize().unwrap();
+    let r = db
+        .execute_prepared(
+            "SELECT id FROM t WHERE a > ? AND b < ?",
+            vec![Value::Integer(20), Value::Integer(50)],
+        )
+        .unwrap()
+        .materialize()
+        .unwrap();
     if let QueryResult::Select { rows, .. } = r {
         assert_eq!(rows.len(), 1, "only id=2 matches a>20 AND b<50");
     }
@@ -144,10 +163,15 @@ fn concurrent_reads_multi_thread() {
             let mut ok = 0;
             for i in 1..=50 {
                 let pid = (t * 25 + i) % 100 + 1;
-                let r = db.execute(&format!("SELECT v FROM t WHERE id = {}", pid)).unwrap()
-                    .materialize().unwrap();
+                let r = db
+                    .execute(&format!("SELECT v FROM t WHERE id = {}", pid))
+                    .unwrap()
+                    .materialize()
+                    .unwrap();
                 if let QueryResult::Select { rows, .. } = r {
-                    if rows.len() == 1 { ok += 1; }
+                    if rows.len() == 1 {
+                        ok += 1;
+                    }
                 }
             }
             ok
@@ -162,7 +186,10 @@ fn concurrent_reads_with_background_index_build() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=500 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i),
+        );
     }
     exec(&db, "CREATE INDEX t_cat ON t(cat)");
     db.checkpoint().unwrap();
@@ -174,12 +201,15 @@ fn concurrent_reads_with_background_index_build() {
         let db = Arc::clone(&db);
         handles.push(std::thread::spawn(move || {
             for _ in 0..20 {
-                let _ = db.execute("SELECT COUNT(*) FROM t WHERE cat = 'c1'")
+                let _ = db
+                    .execute("SELECT COUNT(*) FROM t WHERE cat = 'c1'")
                     .and_then(|r| r.materialize());
             }
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -206,9 +236,15 @@ fn mixed_case_keywords() {
 #[test]
 fn extra_whitespace() {
     let (db, _d) = new_db();
-    exec(&db, "  CREATE   TABLE   t   (  id   INT   PRIMARY KEY  ,  v   INT  )  ");
+    exec(
+        &db,
+        "  CREATE   TABLE   t   (  id   INT   PRIMARY KEY  ,  v   INT  )  ",
+    );
     exec(&db, "  INSERT   INTO   t   VALUES   (  1  ,   10  )  ");
-    assert_eq!(scalar_i64(&db, "  SELECT   v   FROM   t   WHERE   id   =   1  "), 10);
+    assert_eq!(
+        scalar_i64(&db, "  SELECT   v   FROM   t   WHERE   id   =   1  "),
+        10
+    );
 }
 
 #[test]
@@ -273,9 +309,18 @@ fn case_when_simple() {
     let r = rows(&db,
         "SELECT id, CASE WHEN v > 25 THEN 'big' WHEN v > 15 THEN 'mid' ELSE 'small' END FROM t ORDER BY id");
     assert_eq!(r.len(), 3);
-    match &r[0][1] { Value::Text(s) => assert_eq!(&*s.0, "small"), _ => panic!("10→small") }
-    match &r[1][1] { Value::Text(s) => assert_eq!(&*s.0, "mid"), _ => panic!("20→mid") }
-    match &r[2][1] { Value::Text(s) => assert_eq!(&*s.0, "big"), _ => panic!("30→big") }
+    match &r[0][1] {
+        Value::Text(s) => assert_eq!(&*s.0, "small"),
+        _ => panic!("10→small"),
+    }
+    match &r[1][1] {
+        Value::Text(s) => assert_eq!(&*s.0, "mid"),
+        _ => panic!("20→mid"),
+    }
+    match &r[2][1] {
+        Value::Text(s) => assert_eq!(&*s.0, "big"),
+        _ => panic!("30→big"),
+    }
 }
 
 #[test]
@@ -284,7 +329,10 @@ fn case_when_no_else_returns_null() {
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10)");
     exec(&db, "INSERT INTO t VALUES (2, 30)");
-    let r = rows(&db, "SELECT CASE WHEN v > 20 THEN 'big' END FROM t ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v > 20 THEN 'big' END FROM t ORDER BY id",
+    );
     // id=1: no match, no ELSE → NULL. id=2: 'big'.
     assert!(matches!(r[0][0], Value::Null), "no ELSE → NULL");
     assert!(matches!(r[1][0], Value::Text(_)));
@@ -316,7 +364,10 @@ fn union_all_keeps_dups() {
     exec(&db, "INSERT INTO a VALUES (2)");
     exec(&db, "INSERT INTO b VALUES (2)");
     exec(&db, "INSERT INTO b VALUES (3)");
-    let r = rows(&db, "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM a UNION ALL SELECT id FROM b ORDER BY id",
+    );
     assert_eq!(r.len(), 4, "UNION ALL keeps dups: 1,2,2,3");
 }
 
@@ -335,10 +386,16 @@ fn variance_and_stddev() {
     // Sample variance of [2,4,4,4,5,5,7,9] = 32/7 ≈ 4.571 (n-1 denominator,
     // the SQL standard / SQLite VARIANCE convention). Stddev ≈ 2.138.
     let var = match &rows(&db, "SELECT VARIANCE(v) FROM t")[0][0] {
-        Value::Float(f) => *f, Value::Integer(i) => *i as f64,
-        Value::Null => panic!("VARIANCE returned NULL"), o => panic!("{:?}", o),
+        Value::Float(f) => *f,
+        Value::Integer(i) => *i as f64,
+        Value::Null => panic!("VARIANCE returned NULL"),
+        o => panic!("{:?}", o),
     };
-    assert!((var - 4.5714).abs() < 0.01, "sample VARIANCE should be ~4.571, got {}", var);
+    assert!(
+        (var - 4.5714).abs() < 0.01,
+        "sample VARIANCE should be ~4.571, got {}",
+        var
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -353,7 +410,10 @@ fn scalar_subquery_in_where() {
         exec(&db, &format!("INSERT INTO t VALUES ({}, {})", i, i));
     }
     // WHERE v > (SELECT AVG(v) FROM t) → AVG=5.5, so v>5.5 → 6,7,8,9,10 = 5 rows
-    let r = rows(&db, "SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id",
+    );
     assert_eq!(r.len(), 5, "5 rows have v > AVG(5.5)");
 }
 
@@ -368,7 +428,10 @@ fn in_subquery() {
     exec(&db, "INSERT INTO b VALUES (1, 2)");
     exec(&db, "INSERT INTO b VALUES (2, 3)");
     // a.id IN (SELECT ref FROM b) → ids 2, 3.
-    let r = rows(&db, "SELECT id FROM a WHERE id IN (SELECT ref FROM b) ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT id FROM a WHERE id IN (SELECT ref FROM b) ORDER BY id",
+    );
     assert_eq!(r.len(), 2);
 }
 
@@ -379,17 +442,28 @@ fn in_subquery() {
 #[test]
 fn auto_increment_basic() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)",
+    );
     exec(&db, "INSERT INTO t (v) VALUES (10)");
     exec(&db, "INSERT INTO t (v) VALUES (20)");
     exec(&db, "INSERT INTO t (v) VALUES (30)");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 3);
     // IDs should be 1, 2, 3.
     let r = rows(&db, "SELECT id FROM t ORDER BY id");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
-    assert_eq!(ids, vec![1, 2, 3], "AUTO_INCREMENT generates sequential IDs");
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "AUTO_INCREMENT generates sequential IDs"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -401,7 +475,10 @@ fn create_index_then_query() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)");
     for i in 1..=100 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i));
+        exec(
+            &db,
+            &format!("INSERT INTO t VALUES ({}, 'c{}', {})", i, i % 5, i),
+        );
     }
     exec(&db, "CREATE INDEX t_cat ON t(cat)");
     db.checkpoint().unwrap();
@@ -409,7 +486,10 @@ fn create_index_then_query() {
     // Query on indexed column.
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE cat = 'c1'");
     // cat = 'c1' → ids where i%5==1: 1,6,11,...,96 → 20 rows
-    match r[0][0] { Value::Integer(n) => assert_eq!(n, 20), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert_eq!(n, 20),
+        _ => panic!(),
+    }
 }
 
 #[test]
@@ -425,5 +505,8 @@ fn drop_index_query_still_works() {
     let _ = db.execute("DROP INDEX t_cat");
     // Query must still return correct results (falls back to scan).
     let r = rows(&db, "SELECT COUNT(*) FROM t WHERE cat = 'c0'");
-    match r[0][0] { Value::Integer(n) => assert!(n > 0, "should find c0 rows"), _ => panic!() }
+    match r[0][0] {
+        Value::Integer(n) => assert!(n > 0, "should find c0 rows"),
+        _ => panic!(),
+    }
 }

@@ -13,19 +13,29 @@ fn new_db() -> (Database, TempDir) {
 }
 
 fn exec(db: &Database, sql: &str) {
-    db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
+    db.execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
-    let rs = db.execute(sql).unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
-        .materialize().unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
-    match rs { QueryResult::Select { rows, .. } => rows, _ => panic!("not Select") }
+    let rs = db
+        .execute(sql)
+        .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e))
+        .materialize()
+        .unwrap_or_else(|e| panic!("mat failed: {}\n  err: {}", sql, e));
+    match rs {
+        QueryResult::Select { rows, .. } => rows,
+        _ => panic!("not Select"),
+    }
 }
 
 fn scalar_i64(db: &Database, sql: &str) -> i64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1, "expected 1 row: {}", sql);
-    match r[0].first() { Some(Value::Integer(n)) => *n, o => panic!("not int {:?}: {}", o, sql) }
+    match r[0].first() {
+        Some(Value::Integer(n)) => *n,
+        o => panic!("not int {:?}: {}", o, sql),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -63,7 +73,10 @@ fn alter_add_column_works() {
 #[test]
 fn alter_auto_increment_supported() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INT)",
+    );
     exec(&db, "INSERT INTO t (v) VALUES (10)");
     // ALTER TABLE ... AUTO_INCREMENT = 100 is supported.
     let result = db.execute("ALTER TABLE t AUTO_INCREMENT = 100");
@@ -73,7 +86,11 @@ fn alter_auto_increment_supported() {
         // Next id should be >= 100 (if the ALTER took effect).
         let r = rows(&db, "SELECT id FROM t WHERE v = 20");
         if let Some(Value::Integer(id)) = r.first().and_then(|row| row.first()) {
-            assert!(*id >= 100, "AUTO_INCREMENT=100 should take effect, got {}", id);
+            assert!(
+                *id >= 100,
+                "AUTO_INCREMENT=100 should take effect, got {}",
+                id
+            );
         }
     }
 }
@@ -86,7 +103,10 @@ fn alter_auto_increment_supported() {
 fn drop_nonexistent_table_errors() {
     let (db, _d) = new_db();
     let result = db.execute("DROP TABLE nonexistent");
-    assert!(result.is_err(), "dropping a non-existent table should error");
+    assert!(
+        result.is_err(),
+        "dropping a non-existent table should error"
+    );
 }
 
 #[test]
@@ -158,9 +178,15 @@ fn wide_table_20_columns() {
     let (db, _d) = new_db();
     let cols: Vec<String> = (0..20).map(|i| format!("c{} INT", i)).collect();
     let col_names: Vec<String> = (0..20).map(|i| format!("c{}", i)).collect();
-    exec(&db, &format!("CREATE TABLE t (id INT PRIMARY KEY, {})", cols.join(", ")));
+    exec(
+        &db,
+        &format!("CREATE TABLE t (id INT PRIMARY KEY, {})", cols.join(", ")),
+    );
     let vals: Vec<String> = (0..20).map(|i| (i * 10).to_string()).collect();
-    exec(&db, &format!("INSERT INTO t VALUES (1, {})", vals.join(", ")));
+    exec(
+        &db,
+        &format!("INSERT INTO t VALUES (1, {})", vals.join(", ")),
+    );
     // Read back each column.
     for (i, cn) in col_names.iter().enumerate() {
         let v = scalar_i64(&db, &format!("SELECT {} FROM t WHERE id = 1", cn));
@@ -182,9 +208,13 @@ fn order_by_two_columns() {
     }
     // ORDER BY a ASC, b ASC.
     let r = rows(&db, "SELECT id FROM t ORDER BY a ASC, b ASC");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     // a=1: b=1,2,3 → ids 1,2,4. a=2: b=1,2 → ids 3,5.
     assert_eq!(ids, vec![1, 2, 4, 3, 5]);
 }
@@ -199,9 +229,13 @@ fn order_by_two_columns_mixed_direction() {
     }
     // ORDER BY a ASC, b DESC.
     let r = rows(&db, "SELECT id FROM t ORDER BY a ASC, b DESC");
-    let ids: Vec<i64> = r.iter().filter_map(|row| match row.get(0) {
-        Some(Value::Integer(n)) => Some(*n), _ => None
-    }).collect();
+    let ids: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row.get(0) {
+            Some(Value::Integer(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
     // a=1: b=30,20,10 → ids 4,2,1. a=2: b=5 → id 3.
     assert_eq!(ids, vec![4, 2, 1, 3]);
 }
@@ -218,11 +252,20 @@ fn group_by_with_order_by() {
     exec(&db, "INSERT INTO t VALUES (2, 'a', 20)");
     exec(&db, "INSERT INTO t VALUES (3, 'b', 30)");
     exec(&db, "INSERT INTO t VALUES (4, 'a', 40)");
-    let r = rows(&db, "SELECT cat, SUM(v) FROM t GROUP BY cat ORDER BY cat ASC");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(v) FROM t GROUP BY cat ORDER BY cat ASC",
+    );
     assert_eq!(r.len(), 2);
     // a first (alphabetical), then b.
-    match &r[0][0] { Value::Text(s) => assert_eq!(&*s.0, "a"), _ => panic!() }
-    match &r[1][0] { Value::Text(s) => assert_eq!(&*s.0, "b"), _ => panic!() }
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "a"),
+        _ => panic!(),
+    }
+    match &r[1][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "b"),
+        _ => panic!(),
+    }
 }
 
 #[test]
@@ -234,9 +277,15 @@ fn group_by_order_by_aggregate() {
     exec(&db, "INSERT INTO t VALUES (3, 'b', 100)");
     exec(&db, "INSERT INTO t VALUES (4, 'b', 200)");
     // ORDER BY SUM(v) DESC → b (300) first, then a (30).
-    let r = rows(&db, "SELECT cat, SUM(v) FROM t GROUP BY cat ORDER BY SUM(v) DESC");
+    let r = rows(
+        &db,
+        "SELECT cat, SUM(v) FROM t GROUP BY cat ORDER BY SUM(v) DESC",
+    );
     assert_eq!(r.len(), 2);
-    match &r[0][0] { Value::Text(s) => assert_eq!(&*s.0, "b"), _ => panic!("b first") }
+    match &r[0][0] {
+        Value::Text(s) => assert_eq!(&*s.0, "b"),
+        _ => panic!("b first"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -276,7 +325,10 @@ fn empty_string_distinct_from_null() {
     // '' IS NULL must be false; '' = '' must be true.
     let r = rows(&db, "SELECT id FROM t WHERE s IS NULL");
     assert_eq!(r.len(), 1, "only the NULL row matches IS NULL");
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 2), _ => panic!() }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 2),
+        _ => panic!(),
+    }
     // Empty string row is findable.
     let r = rows(&db, "SELECT id FROM t WHERE s = ''");
     assert_eq!(r.len(), 1, "empty string is findable");
@@ -347,9 +399,21 @@ fn delete_all_rows() {
 #[test]
 fn multiple_indexes_one_table() {
     let (db, _d) = new_db();
-    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c TEXT)",
+    );
     for i in 1..=100 {
-        exec(&db, &format!("INSERT INTO t VALUES ({}, {}, {}, 'val{}')", i, i % 5, i % 3, i % 7));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({}, {}, {}, 'val{}')",
+                i,
+                i % 5,
+                i % 3,
+                i % 7
+            ),
+        );
     }
     exec(&db, "CREATE INDEX idx_a ON t(a)");
     exec(&db, "CREATE INDEX idx_b ON t(b)");
@@ -414,7 +478,11 @@ fn multiple_savepoints_stack() {
     // Rollback to sp2 → undo id=3 only.
     db.rollback_to_savepoint(tx, "sp2").unwrap();
     db.commit_transaction(tx).unwrap();
-    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t"), 2, "rollback to sp2 keeps id=1,2");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) FROM t"),
+        2,
+        "rollback to sp2 keeps id=1,2"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -425,11 +493,17 @@ fn multiple_savepoints_stack() {
 fn many_tables() {
     let (db, _d) = new_db();
     for i in 0..20 {
-        exec(&db, &format!("CREATE TABLE t{} (id INT PRIMARY KEY, v INT)", i));
+        exec(
+            &db,
+            &format!("CREATE TABLE t{} (id INT PRIMARY KEY, v INT)", i),
+        );
         exec(&db, &format!("INSERT INTO t{} VALUES (1, {})", i, i));
     }
     for i in 0..20 {
-        assert_eq!(scalar_i64(&db, &format!("SELECT v FROM t{} WHERE id = 1", i)), i);
+        assert_eq!(
+            scalar_i64(&db, &format!("SELECT v FROM t{} WHERE id = 1", i)),
+            i
+        );
     }
 }
 
@@ -447,7 +521,10 @@ fn where_null_and_condition() {
     // WHERE a > 5 AND b > 150 → row 3 only (row 2 has NULL a, unknown).
     let r = rows(&db, "SELECT id FROM t WHERE a > 5 AND b > 150 ORDER BY id");
     assert_eq!(r.len(), 1);
-    match &r[0][0] { Value::Integer(n) => assert_eq!(*n, 3), _ => panic!() }
+    match &r[0][0] {
+        Value::Integer(n) => assert_eq!(*n, 3),
+        _ => panic!(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -125,7 +125,8 @@ fn test_upper_lower_empty() {
 #[test]
 fn test_concat_with_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,NULL)").unwrap();
     // 'a' || NULL — SQL standard: NULL concatenation → NULL.
     let r = q(&db, "SELECT 'a' || s FROM t");
@@ -138,20 +139,30 @@ fn test_concat_with_null() {
 #[test]
 fn test_in_int_literals() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     let mut r = q(&db, "SELECT id FROM t WHERE v IN (10, 30)");
-    r.sort_by_key(|row| match row[0] { Value::Integer(i) => i, _ => 999 });
+    r.sort_by_key(|row| match row[0] {
+        Value::Integer(i) => i,
+        _ => 999,
+    });
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
 
 #[test]
 fn test_not_in_int_literals() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     let mut r = q(&db, "SELECT id FROM t WHERE v NOT IN (10, 30)");
-    r.sort_by_key(|row| match row[0] { Value::Integer(i) => i, _ => 999 });
+    r.sort_by_key(|row| match row[0] {
+        Value::Integer(i) => i,
+        _ => 999,
+    });
     assert_eq!(r, vec![vec![Value::Integer(2)]]);
 }
 
@@ -162,8 +173,10 @@ fn test_not_in_int_literals() {
 #[test]
 fn test_sum_via_where_matches_unfiltered() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)")
+        .unwrap();
     let total = q(&db, "SELECT SUM(v) FROM t");
     let filtered = q(&db, "SELECT SUM(v) FROM t WHERE v > 15");
     // total = 100, filtered (20+30+40) = 90.
@@ -174,15 +187,23 @@ fn test_sum_via_where_matches_unfiltered() {
 #[test]
 fn test_count_via_indexed_vs_scan() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b'),(5,'b')").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b'),(5,'b')")
+        .unwrap();
     // GROUP BY cat — count must be consistent regardless of internal path.
     let mut r = q(&db, "SELECT cat, COUNT(*) FROM t GROUP BY cat");
-    r.sort_by_key(|row| match &row[0] { Value::Text(s) => s.as_str().to_string(), _ => "zzz".into() });
-    assert_eq!(r, vec![
-        vec![Value::Text("a".into()), Value::Integer(2)],
-        vec![Value::Text("b".into()), Value::Integer(3)],
-    ]);
+    r.sort_by_key(|row| match &row[0] {
+        Value::Text(s) => s.as_str().to_string(),
+        _ => "zzz".into(),
+    });
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Text("a".into()), Value::Integer(2)],
+            vec![Value::Text("b".into()), Value::Integer(3)],
+        ]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -191,7 +212,8 @@ fn test_count_via_indexed_vs_scan() {
 #[test]
 fn test_update_then_aggregate() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,10),(2,20)").unwrap();
     db.execute("UPDATE t SET v = 100 WHERE id = 1").unwrap();
     let r = q(&db, "SELECT SUM(v) FROM t");
@@ -201,8 +223,10 @@ fn test_update_then_aggregate() {
 #[test]
 fn test_delete_then_count() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     db.execute("DELETE FROM t WHERE v >= 20").unwrap();
     let r = q(&db, "SELECT COUNT(*) FROM t");
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
@@ -232,10 +256,18 @@ fn test_subtraction_to_negative() {
 #[test]
 fn test_negative_in_order_by() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,-5),(2,3),(3,-10),(4,0)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,-5),(2,3),(3,-10),(4,0)")
+        .unwrap();
     let r = q(&db, "SELECT v FROM t ORDER BY v ASC");
-    let vals: Vec<i64> = r.iter().filter_map(|row| match row[0] { Value::Integer(i) => Some(i), _ => None }).collect();
+    let vals: Vec<i64> = r
+        .iter()
+        .filter_map(|row| match row[0] {
+            Value::Integer(i) => Some(i),
+            _ => None,
+        })
+        .collect();
     assert_eq!(vals, vec![-10, -5, 0, 3]);
 }
 
@@ -245,18 +277,25 @@ fn test_negative_in_order_by() {
 #[test]
 fn test_boolean_column_where() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,TRUE),(2,FALSE),(3,TRUE)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,TRUE),(2,FALSE),(3,TRUE)")
+        .unwrap();
     let mut r = q(&db, "SELECT id FROM t WHERE flag = TRUE");
-    r.sort_by_key(|row| match row[0] { Value::Integer(i) => i, _ => 999 });
+    r.sort_by_key(|row| match row[0] {
+        Value::Integer(i) => i,
+        _ => 999,
+    });
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
 
 #[test]
 fn test_boolean_column_count() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,TRUE),(2,FALSE),(3,TRUE)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,TRUE),(2,FALSE),(3,TRUE)")
+        .unwrap();
     let r = q(&db, "SELECT COUNT(*) FROM t WHERE flag");
     assert_eq!(r, vec![vec![Value::Integer(2)]]);
 }
@@ -267,8 +306,10 @@ fn test_boolean_column_count() {
 #[test]
 fn test_distinct_count_consistency() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,20),(5,20),(6,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,20),(5,20),(6,30)")
+        .unwrap();
     let distinct = q(&db, "SELECT DISTINCT v FROM t");
     assert_eq!(distinct.len(), 3, "3 distinct values; got {:?}", distinct);
 }
@@ -279,8 +320,10 @@ fn test_distinct_count_consistency() {
 #[test]
 fn test_group_by_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a',10),(2,NULL,20),(3,'a',30),(4,NULL,40)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a',10),(2,NULL,20),(3,'a',30),(4,NULL,40)")
+        .unwrap();
     let r = q(&db, "SELECT cat, COUNT(*) FROM t GROUP BY cat");
     // 2 groups: 'a' (count 2), NULL (count 2).
     assert_eq!(r.len(), 2, "NULL should form its own group; got {:?}", r);
@@ -292,8 +335,10 @@ fn test_group_by_null() {
 #[test]
 fn test_like_case_sensitive() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'Apple'),(2,'apple')").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'Apple'),(2,'apple')")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t WHERE s LIKE 'Apple'");
     assert_eq!(r, vec![vec![Value::Integer(1)]], "LIKE is case-sensitive");
 }
@@ -304,8 +349,10 @@ fn test_like_case_sensitive() {
 #[test]
 fn test_like_percent_middle() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'hello world'),(2,'hello'),(3,'world hello')").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'hello world'),(2,'hello'),(3,'world hello')")
+        .unwrap();
     let r = q(&db, "SELECT id FROM t WHERE s LIKE 'hello%world'");
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
 }
@@ -316,11 +363,19 @@ fn test_like_percent_middle() {
 #[test]
 fn test_complex_where() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT, b INT, c INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,1,2,3),(2,1,2,4),(3,1,5,3),(4,2,2,3)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,1,2,3),(2,1,2,4),(3,1,5,3),(4,2,2,3)")
+        .unwrap();
     // (a=1 AND b=2) AND (c=3 OR c=4)
-    let mut r = q(&db, "SELECT id FROM t WHERE (a = 1 AND b = 2) AND (c = 3 OR c = 4)");
-    r.sort_by_key(|row| match row[0] { Value::Integer(i) => i, _ => 999 });
+    let mut r = q(
+        &db,
+        "SELECT id FROM t WHERE (a = 1 AND b = 2) AND (c = 3 OR c = 4)",
+    );
+    r.sort_by_key(|row| match row[0] {
+        Value::Integer(i) => i,
+        _ => 999,
+    });
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
 }
 
@@ -330,13 +385,29 @@ fn test_complex_where() {
 #[test]
 fn test_aggregate_single_row() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,42)").unwrap();
-    assert_eq!(q(&db, "SELECT SUM(v) FROM t"), vec![vec![Value::Integer(42)]]);
-    assert_eq!(q(&db, "SELECT MIN(v) FROM t"), vec![vec![Value::Integer(42)]]);
-    assert_eq!(q(&db, "SELECT MAX(v) FROM t"), vec![vec![Value::Integer(42)]]);
-    assert_eq!(q(&db, "SELECT AVG(v) FROM t"), vec![vec![Value::Integer(42)]]);
-    assert_eq!(q(&db, "SELECT COUNT(v) FROM t"), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        q(&db, "SELECT SUM(v) FROM t"),
+        vec![vec![Value::Integer(42)]]
+    );
+    assert_eq!(
+        q(&db, "SELECT MIN(v) FROM t"),
+        vec![vec![Value::Integer(42)]]
+    );
+    assert_eq!(
+        q(&db, "SELECT MAX(v) FROM t"),
+        vec![vec![Value::Integer(42)]]
+    );
+    assert_eq!(
+        q(&db, "SELECT AVG(v) FROM t"),
+        vec![vec![Value::Integer(42)]]
+    );
+    assert_eq!(
+        q(&db, "SELECT COUNT(v) FROM t"),
+        vec![vec![Value::Integer(1)]]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -345,11 +416,16 @@ fn test_aggregate_single_row() {
 #[test]
 fn test_self_equality_non_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,NULL),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,NULL),(3,30)")
+        .unwrap();
     // v = v is TRUE for non-NULL, NULL (unknown) for NULL → NULL row excluded.
     let mut r = q(&db, "SELECT id FROM t WHERE v = v");
-    r.sort_by_key(|row| match row[0] { Value::Integer(i) => i, _ => 999 });
+    r.sort_by_key(|row| match row[0] {
+        Value::Integer(i) => i,
+        _ => 999,
+    });
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
 
@@ -359,17 +435,23 @@ fn test_self_equality_non_null() {
 #[test]
 fn test_not_equal_operator() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     let mut r = q(&db, "SELECT id FROM t WHERE v <> 20");
-    r.sort_by_key(|row| match row[0] { Value::Integer(i) => i, _ => 999 });
+    r.sort_by_key(|row| match row[0] {
+        Value::Integer(i) => i,
+        _ => 999,
+    });
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
 
 #[test]
 fn test_not_equal_with_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,10),(2,NULL)").unwrap();
     // v <> 10: id=1 is FALSE, id=2 (NULL) is UNKNOWN → neither matches.
     let r = q(&db, "SELECT id FROM t WHERE v <> 10");

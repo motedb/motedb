@@ -153,7 +153,10 @@ impl MoteDB {
         // floats are rejected by validate_row above.
         let col_types = schema.col_types();
         for (i, ct) in col_types.iter().enumerate() {
-            if matches!(ct, crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp) {
+            if matches!(
+                ct,
+                crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp
+            ) {
                 if let Some(crate::types::Value::Float(f)) = row.get(i) {
                     // Same bounds as the UPDATE path: strict < 2^63 because
                     // `i64::MAX as f64` rounds up to 2^63.
@@ -803,13 +806,20 @@ impl MoteDB {
         // will fail validation below with a clear error).
         let col_types = schema.col_types();
         for (i, ct) in col_types.iter().enumerate() {
-            if matches!(ct, crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp) {
+            if matches!(
+                ct,
+                crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp
+            ) {
                 if let Some(crate::types::Value::Float(f)) = new_row.get(i) {
                     // 🔑 Check f64 fits in i64 precisely. `i64::MAX as f64` rounds
                     // UP to 2^63 (the next representable f64), so a direct `<=`
                     // comparison lets 2^63 through (which overflows `as i64`).
                     // Use checked conversion: try_cast via the f64 → i64 path.
-                    if f.is_finite() && f.fract() == 0.0 && *f < 9223372036854775808.0 && *f > -9223372036854775809.0 {
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && *f < 9223372036854775808.0
+                        && *f > -9223372036854775809.0
+                    {
                         new_row[i] = crate::types::Value::Integer(*f as i64);
                     }
                 }
@@ -1928,9 +1938,7 @@ impl MoteDB {
             // shorter). Indexing directly would panic; reading via read_text/
             // read_fixed would OOB column_index. Emit an all-NULL segment.
             let seg = match col_sst.column_tags.get(col_idx) {
-                Some(t) if t.is_fixed() => {
-                    ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?)
-                }
+                Some(t) if t.is_fixed() => ColumnarSegment::Fixed(col_sst.read_fixed_i64(col_idx)?),
                 Some(_) => ColumnarSegment::Text(col_sst.read_text(col_idx)?),
                 None => ColumnarSegment::null_for(col_sst.num_rows),
             };
@@ -2407,7 +2415,9 @@ impl MoteDB {
                             // This reserves the PK key, preventing concurrent inserts
                             // from using the same key (eliminates TOCTOU race).
                             if let Some(lookup) = self.pk_lookup.get(table_name) {
-                                match lookup.insert_if_absent(pk_key.clone(), 0 /* placeholder */) {
+                                match lookup
+                                    .insert_if_absent(pk_key.clone(), 0 /* placeholder */)
+                                {
                                     Ok(()) => {
                                         reserved_pks.push(pk_key); // track for rollback
                                     }
@@ -2485,8 +2495,7 @@ impl MoteDB {
                 for (i, ct) in col_types.iter().enumerate() {
                     if matches!(
                         ct,
-                        crate::types::ColumnType::Integer
-                            | crate::types::ColumnType::Timestamp
+                        crate::types::ColumnType::Integer | crate::types::ColumnType::Timestamp
                     ) {
                         if let Some(crate::types::Value::Float(f)) = row.get(i) {
                             if f.is_finite()

@@ -196,18 +196,10 @@ fn time_sqlite(conn: &rusqlite::Connection, sql: &str, iters: u32) -> u64 {
 #[test]
 #[ignore = "benchmark: run with --ignored"]
 fn bench_vs_sqlite_100k() {
-    println!(
-        "\n╔══════════════════════════════════════════════════════════════════════╗"
-    );
-    println!(
-        "║   MoteDB vs SQLite WAL  —  100K-row Head-to-Head Benchmark         ║"
-    );
-    println!(
-        "║   Same schema, same data, same queries  ·  Release build           ║"
-    );
-    println!(
-        "╚══════════════════════════════════════════════════════════════════════╝\n"
-    );
+    println!("\n╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║   MoteDB vs SQLite WAL  —  100K-row Head-to-Head Benchmark         ║");
+    println!("║   Same schema, same data, same queries  ·  Release build           ║");
+    println!("╚══════════════════════════════════════════════════════════════════════╝\n");
 
     println!("── Setup (INSERT 100K rows) ──");
     let (mdb, mote_disk_path) = setup_motedb();
@@ -268,7 +260,12 @@ fn bench_vs_sqlite_100k() {
     // ── 1. Point Query (PK lookup) ──
     // Both engines re-parse the SQL each call here (MoteDB has stmt cache,
     // SQLite also re-parses raw execute). Fair apples-to-apples.
-    run!("Point Query (PK lookup)", "WHERE id = 50000 (raw SQL)", "SELECT id FROM t WHERE id = 50000", fast);
+    run!(
+        "Point Query (PK lookup)",
+        "WHERE id = 50000 (raw SQL)",
+        "SELECT id FROM t WHERE id = 50000",
+        fast
+    );
 
     // ── 1b. Point query latency distribution (200 random PKs) ──
     println!("\n── Point Query Latency Distribution (200 random PKs) ──");
@@ -277,10 +274,7 @@ fn bench_vs_sqlite_100k() {
         let mut mote_prep_lat = Vec::with_capacity(200);
         let mut sqlite_lat = Vec::with_capacity(200);
         // Pre-warm execute_prepared (first call parses + caches)
-        let _ = mdb.execute_prepared(
-            "SELECT id FROM t WHERE id = ?",
-            vec![Value::Integer(1)],
-        );
+        let _ = mdb.execute_prepared("SELECT id FROM t WHERE id = ?", vec![Value::Integer(1)]);
         for i in 0..200i64 {
             let pid = (i * 977 + 50000) % N as i64 + 1;
             // MoteDB raw SQL (format! every call — measures parse + lookup)
@@ -290,10 +284,8 @@ fn bench_vs_sqlite_100k() {
             mote_lat.push(t.elapsed().as_micros() as u64);
             // MoteDB execute_prepared (cache hit — measures lookup only)
             let t = Instant::now();
-            let _ = mdb.execute_prepared(
-                "SELECT id FROM t WHERE id = ?",
-                vec![Value::Integer(pid)],
-            );
+            let _ =
+                mdb.execute_prepared("SELECT id FROM t WHERE id = ?", vec![Value::Integer(pid)]);
             mote_prep_lat.push(t.elapsed().as_micros() as u64);
             // SQLite (parameterized — its fast path)
             let mut stmt = sdb.prepare("SELECT id FROM t WHERE id = ?").unwrap();
@@ -307,36 +299,72 @@ fn bench_vs_sqlite_100k() {
         let n = mote_lat.len();
         println!(
             "  MoteDB execute()          p50: {:>5}  p95: {:>5}  p99: {:>5}  (µs, raw SQL)",
-            mote_lat[n / 2], mote_lat[n * 95 / 100], mote_lat[n * 99 / 100]
+            mote_lat[n / 2],
+            mote_lat[n * 95 / 100],
+            mote_lat[n * 99 / 100]
         );
         println!(
             "  MoteDB execute_prepared() p50: {:>5}  p95: {:>5}  p99: {:>5}  (µs, cache hit)",
-            mote_prep_lat[n / 2], mote_prep_lat[n * 95 / 100], mote_prep_lat[n * 99 / 100]
+            mote_prep_lat[n / 2],
+            mote_prep_lat[n * 95 / 100],
+            mote_prep_lat[n * 99 / 100]
         );
         println!(
             "  SQLite  prepared stmt     p50: {:>5}  p95: {:>5}  p99: {:>5}  (µs)",
-            sqlite_lat[n / 2], sqlite_lat[n * 95 / 100], sqlite_lat[n * 99 / 100]
+            sqlite_lat[n / 2],
+            sqlite_lat[n * 95 / 100],
+            sqlite_lat[n * 99 / 100]
         );
     }
 
     // ── 2. Aggregate (no GROUP BY) ──
     run!("Aggregate", "COUNT(*)", "SELECT COUNT(*) FROM t", fast);
-    run!("Aggregate", "SUM(qty), AVG(score), MIN, MAX", "SELECT SUM(qty), AVG(score), MIN(score), MAX(score) FROM t", med);
+    run!(
+        "Aggregate",
+        "SUM(qty), AVG(score), MIN, MAX",
+        "SELECT SUM(qty), AVG(score), MIN(score), MAX(score) FROM t",
+        med
+    );
 
     // ── 3. WHERE filter ──
-    run!("WHERE filter", "WHERE region = 'north'", "SELECT id FROM t WHERE region = 'north'", med);
+    run!(
+        "WHERE filter",
+        "WHERE region = 'north'",
+        "SELECT id FROM t WHERE region = 'north'",
+        med
+    );
 
     // ── 4. LIKE prefix ──
-    run!("LIKE prefix", "WHERE name LIKE 'item_1%'", "SELECT COUNT(*) FROM t WHERE name LIKE 'item_1%'", med);
+    run!(
+        "LIKE prefix",
+        "WHERE name LIKE 'item_1%'",
+        "SELECT COUNT(*) FROM t WHERE name LIKE 'item_1%'",
+        med
+    );
 
     // ── 5. ORDER BY LIMIT (top-K) ──
-    run!("ORDER BY LIMIT", "ORDER BY score DESC LIMIT 10", "SELECT id FROM t ORDER BY score DESC LIMIT 10", fast);
+    run!(
+        "ORDER BY LIMIT",
+        "ORDER BY score DESC LIMIT 10",
+        "SELECT id FROM t ORDER BY score DESC LIMIT 10",
+        fast
+    );
 
     // ── 6. GROUP BY ──
-    run!("GROUP BY", "GROUP BY region (5 groups)", "SELECT region, COUNT(*), SUM(qty), AVG(score) FROM t GROUP BY region", med);
+    run!(
+        "GROUP BY",
+        "GROUP BY region (5 groups)",
+        "SELECT region, COUNT(*), SUM(qty), AVG(score) FROM t GROUP BY region",
+        med
+    );
 
     // ── 7. DISTINCT ──
-    run!("DISTINCT", "SELECT DISTINCT region", "SELECT DISTINCT region FROM t", fast);
+    run!(
+        "DISTINCT",
+        "SELECT DISTINCT region",
+        "SELECT DISTINCT region FROM t",
+        fast
+    );
 
     // ── 8. Full scan ──
     run!("Full scan", "SELECT * FROM t", "SELECT * FROM t", slow);
@@ -346,7 +374,10 @@ fn bench_vs_sqlite_100k() {
     println!("\n── Peak RSS (process) ──");
     println!("  MoteDB:  {:>7.1} MB", mote_rss as f64 / 1024.0);
     // SQLite runs in same process; its RSS contribution is the file size it mmaps/caches.
-    println!("  SQLite:  {:>7.1} MB (in-process, see disk footprint)", sqlite_disk_mb);
+    println!(
+        "  SQLite:  {:>7.1} MB (in-process, see disk footprint)",
+        sqlite_disk_mb
+    );
 
     // ── Summary ──
     println!("\n{}", "═".repeat(72));
@@ -373,7 +404,10 @@ fn bench_vs_sqlite_100k() {
     }
 
     // Disk comparison
-    println!("\n  💾 Disk: MoteDB {:.2} MB vs SQLite {:.2} MB", mote_disk_mb, sqlite_disk_mb);
+    println!(
+        "\n  💾 Disk: MoteDB {:.2} MB vs SQLite {:.2} MB",
+        mote_disk_mb, sqlite_disk_mb
+    );
     if mote_disk_mb < sqlite_disk_mb {
         println!(
             "     MoteDB uses {:.2}x less disk",

@@ -104,8 +104,10 @@ fn test_year_cast_timestamp() {
 #[test]
 fn test_year_in_where() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000), (2, 1600000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000), (2, 1600000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM ev WHERE YEAR(ts) = 2023");
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
 }
@@ -113,8 +115,10 @@ fn test_year_in_where() {
 #[test]
 fn test_year_in_where_no_match() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM ev WHERE YEAR(ts) = 1999");
     assert!(r.is_empty());
 }
@@ -126,9 +130,11 @@ fn test_year_in_where_no_match() {
 #[test]
 fn test_update_concat_operator() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
-    db.execute("UPDATE t SET name = 'pre_' || name WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET name = 'pre_' || name WHERE id = 1")
+        .unwrap();
     let r = q(&db, "SELECT name FROM t WHERE id = 1");
     assert_eq!(r[0][0], Value::text("pre_alice".into()));
 }
@@ -142,20 +148,27 @@ fn test_year_timestamp_column() {
     // Previously returned NULL: scan_projected_filtered decoded TIMESTAMP
     // columns via the `_ => NULL` arm (no Timestamp match case).
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000), (2, 1600000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000), (2, 1600000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT id, YEAR(ts) FROM ev ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(2023)],
-        vec![Value::Integer(2), Value::Integer(2020)],
-    ]);
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(2023)],
+            vec![Value::Integer(2), Value::Integer(2020)],
+        ]
+    );
 }
 
 #[test]
 fn test_month_timestamp_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT MONTH(ts) FROM ev");
     assert_eq!(r[0][0], Value::Integer(11));
 }
@@ -163,8 +176,10 @@ fn test_month_timestamp_column() {
 #[test]
 fn test_day_timestamp_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT DAY(ts) FROM ev");
     assert_eq!(r[0][0], Value::Integer(14));
 }
@@ -176,8 +191,10 @@ fn test_select_timestamp_column_type() {
     // both are acceptable as long as the value is correct. The key test is
     // that date functions work (test_year_timestamp_column etc.).
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT ts FROM ev");
     // Accept either Integer(micros) or Timestamp(micros) — both carry the value.
     let micros = match &r[0][0] {
@@ -191,8 +208,10 @@ fn test_select_timestamp_column_type() {
 #[test]
 fn test_to_micros_timestamp_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT TO_MICROS(ts) FROM ev");
     assert_eq!(r[0][0], Value::Integer(1700000000000000));
 }
@@ -200,8 +219,10 @@ fn test_to_micros_timestamp_column() {
 #[test]
 fn test_date_add_timestamp_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT DATE_ADD(ts, 86400) FROM ev");
     match &r[0][0] {
         Value::Timestamp(t) => assert_eq!(t.as_micros(), 1700086400000000),
@@ -212,8 +233,10 @@ fn test_date_add_timestamp_column() {
 #[test]
 fn test_year_in_where_on_column() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO ev VALUES (1, 1700000000000000), (2, 1600000000000000)").unwrap();
+    db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO ev VALUES (1, 1700000000000000), (2, 1600000000000000)")
+        .unwrap();
     let r = q(&db, "SELECT id FROM ev WHERE YEAR(ts) = 2023");
     assert_eq!(r, vec![vec![Value::Integer(1)]]);
     let r = q(&db, "SELECT id FROM ev WHERE YEAR(ts) = 2020");

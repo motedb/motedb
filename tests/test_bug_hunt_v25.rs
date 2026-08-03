@@ -126,7 +126,10 @@ fn delete_with_complex_where() {
 fn delete_with_in_clause() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+    );
     let n = affected(&db, "DELETE FROM t WHERE id IN (2, 4)");
     assert_eq!(n, 2);
     let remaining = ids_sorted(&db, "SELECT id FROM t");
@@ -137,7 +140,10 @@ fn delete_with_in_clause() {
 fn delete_with_not_in_clause() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+    );
     let n = affected(&db, "DELETE FROM t WHERE id NOT IN (1, 2)");
     assert_eq!(n, 2);
     let remaining = ids_sorted(&db, "SELECT id FROM t");
@@ -198,10 +204,7 @@ fn count_after_update_with_index() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT)");
     exec(&db, "CREATE INDEX idx_cat ON t (cat)");
-    exec(
-        &db,
-        "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')",
-    );
+    exec(&db, "INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')");
     assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM t WHERE cat = 'a'"), 2);
     // Update one row from 'a' to 'b'
     affected(&db, "UPDATE t SET cat = 'b' WHERE id = 1");
@@ -248,7 +251,10 @@ fn avg_ignores_null() {
 fn count_column_ignores_null() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)",
+    );
     // COUNT(v) counts non-NULL values only
     assert_eq!(scalar_i64(&db, "SELECT COUNT(v) FROM t"), 2);
     // COUNT(*) counts all rows
@@ -259,7 +265,10 @@ fn count_column_ignores_null() {
 fn min_max_ignore_null() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 5)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 5)",
+    );
     assert_eq!(scalar_i64(&db, "SELECT MIN(v) FROM t"), 5);
     assert_eq!(scalar_i64(&db, "SELECT MAX(v) FROM t"), 30);
 }
@@ -307,7 +316,10 @@ fn count_empty_table_returns_zero() {
 fn order_by_asc_nulls_first_or_last_documented() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 5), (4, NULL), (5, 20)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 5), (4, NULL), (5, 20)",
+    );
     let r = rows(&db, "SELECT v FROM t ORDER BY v ASC");
     // Document current behavior: NULLs sort first in ASC (less than everything)
     // Capture the observed ordering to lock in the behavior.
@@ -333,7 +345,10 @@ fn order_by_asc_nulls_first_or_last_documented() {
 fn order_by_desc_with_nulls() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 5), (4, NULL), (5, 20)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, NULL), (3, 5), (4, NULL), (5, 20)",
+    );
     let r = rows(&db, "SELECT v FROM t ORDER BY v DESC");
     let observed: Vec<String> = r
         .iter()
@@ -467,7 +482,11 @@ fn substr_start_zero_treated_as_one() {
     exec(&db, "INSERT INTO t VALUES (1, 'hello')");
     let r = rows(&db, "SELECT substr(s, 0, 3) FROM t WHERE id = 1");
     match &r[0][0] {
-        Value::Text(s) => assert_eq!(s.as_str(), "hel", "substr(s, 0, 3) should behave like substr(s, 1, 3)"),
+        Value::Text(s) => assert_eq!(
+            s.as_str(),
+            "hel",
+            "substr(s, 0, 3) should behave like substr(s, 1, 3)"
+        ),
         o => panic!("expected text, got {:?}", o),
     }
 }
@@ -582,7 +601,9 @@ fn group_by_null_key() {
     // NULL should form its own group.
     let r = rows(&db, "SELECT cat, SUM(v) FROM t GROUP BY cat ORDER BY cat");
     // Groups: 'a' → 40, NULL → 60
-    let sum_a = r.iter().find(|row| matches!(&row[0], Value::Text(s) if s.as_str() == "a"));
+    let sum_a = r
+        .iter()
+        .find(|row| matches!(&row[0], Value::Text(s) if s.as_str() == "a"));
     let sum_null = r.iter().find(|row| matches!(&row[0], Value::Null));
     assert!(sum_a.is_some(), "missing group 'a'");
     assert!(sum_null.is_some(), "missing NULL group");
@@ -686,7 +707,10 @@ fn update_set_to_null() {
     exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20)");
     affected(&db, "UPDATE t SET v = NULL WHERE id = 1");
     let r = rows(&db, "SELECT v FROM t WHERE id = 1");
-    assert!(matches!(r[0][0], Value::Null), "expected NULL after SET v = NULL");
+    assert!(
+        matches!(r[0][0], Value::Null),
+        "expected NULL after SET v = NULL"
+    );
 }
 
 #[test]
@@ -719,7 +743,10 @@ fn case_with_no_else_returns_null() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20)");
-    let r = rows(&db, "SELECT CASE WHEN v > 15 THEN 'big' END FROM t WHERE id = 1");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v > 15 THEN 'big' END FROM t WHERE id = 1",
+    );
     assert!(
         matches!(r[0][0], Value::Null),
         "CASE with no ELSE and no match → NULL"
@@ -731,7 +758,10 @@ fn case_multiple_when_branches() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
     exec(&db, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25)");
-    let r = rows(&db, "SELECT CASE WHEN v < 10 THEN 'a' WHEN v < 20 THEN 'b' ELSE 'c' END FROM t ORDER BY id");
+    let r = rows(
+        &db,
+        "SELECT CASE WHEN v < 10 THEN 'a' WHEN v < 20 THEN 'b' ELSE 'c' END FROM t ORDER BY id",
+    );
     let labels: Vec<&str> = r
         .iter()
         .map(|row| match &row[0] {
@@ -750,9 +780,15 @@ fn case_in_aggregate_context() {
     // accumulator skipped it (counts stayed 0 → SUM returned NULL).
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    );
     // SUM(CASE ...) — counts how many are >= 20
-    let r = rows(&db, "SELECT SUM(CASE WHEN v >= 20 THEN 1 ELSE 0 END) FROM t");
+    let r = rows(
+        &db,
+        "SELECT SUM(CASE WHEN v >= 20 THEN 1 ELSE 0 END) FROM t",
+    );
     match &r[0][0] {
         Value::Integer(n) => assert_eq!(*n, 2, "two rows have v >= 20"),
         o => panic!("expected int 2, got {:?}", o),
@@ -763,7 +799,10 @@ fn case_in_aggregate_context() {
 fn case_in_aggregate_count() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    );
     // COUNT(CASE WHEN v >= 20 THEN 1 END) — counts non-null CASE results
     let r = rows(&db, "SELECT COUNT(CASE WHEN v >= 20 THEN 1 END) FROM t");
     match &r[0][0] {
@@ -776,7 +815,10 @@ fn case_in_aggregate_count() {
 fn case_in_aggregate_sum_arithmetic() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    );
     // SUM(v + 10) — arithmetic arg, not bare column
     // (5+10) + (15+10) + (25+10) + (35+10) = 15+25+35+45 = 120
     let r = rows(&db, "SELECT SUM(v + 10) FROM t");
@@ -791,9 +833,15 @@ fn case_in_aggregate_sum_arithmetic() {
 fn case_in_aggregate_with_where() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    );
     // SUM(CASE ...) WITH a WHERE clause — must still evaluate CASE per row.
-    let r = rows(&db, "SELECT SUM(CASE WHEN v >= 20 THEN 1 ELSE 0 END) FROM t WHERE v > 10");
+    let r = rows(
+        &db,
+        "SELECT SUM(CASE WHEN v >= 20 THEN 1 ELSE 0 END) FROM t WHERE v > 10",
+    );
     // After WHERE: rows 2,3,4 (v=15,25,35). Of those, v>=20 → 25,35 → 2 rows.
     match &r[0][0] {
         Value::Integer(n) => assert_eq!(*n, 2),
@@ -827,7 +875,10 @@ fn limit_larger_than_table() {
 fn limit_with_offset() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)",
+    );
     let r = rows(&db, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 2");
     let ids: Vec<i64> = r
         .iter()
@@ -856,7 +907,10 @@ fn offset_beyond_end_returns_empty() {
 fn distinct_single_column() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
-    exec(&db, "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)");
+    exec(
+        &db,
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)",
+    );
     let r = rows(&db, "SELECT DISTINCT v FROM t ORDER BY v");
     let vals: Vec<i64> = r
         .iter()

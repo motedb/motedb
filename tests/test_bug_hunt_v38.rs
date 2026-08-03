@@ -37,54 +37,85 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn test_lag_basic() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)").unwrap();
-    let r = q(&db, "SELECT id, LAG(v, 1) OVER (ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Null],
-        vec![Value::Integer(2), Value::Integer(10)],
-        vec![Value::Integer(3), Value::Integer(20)],
-    ]);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, LAG(v, 1) OVER (ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(10)],
+            vec![Value::Integer(3), Value::Integer(20)],
+        ]
+    );
 }
 
 #[test]
 fn test_lag_default_value() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO s VALUES (1, 10), (2, 20)").unwrap();
-    let r = q(&db, "SELECT id, LAG(v, 1, -1) OVER (ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(-1)],
-        vec![Value::Integer(2), Value::Integer(10)],
-    ]);
+    let r = q(
+        &db,
+        "SELECT id, LAG(v, 1, -1) OVER (ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(-1)],
+            vec![Value::Integer(2), Value::Integer(10)],
+        ]
+    );
 }
 
 #[test]
 fn test_lag_offset_2() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40)").unwrap();
-    let r = q(&db, "SELECT id, LAG(v, 2) OVER (ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Null],
-        vec![Value::Integer(2), Value::Null],
-        vec![Value::Integer(3), Value::Integer(10)],
-        vec![Value::Integer(4), Value::Integer(20)],
-    ]);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, LAG(v, 2) OVER (ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Null],
+            vec![Value::Integer(3), Value::Integer(10)],
+            vec![Value::Integer(4), Value::Integer(20)],
+        ]
+    );
 }
 
 #[test]
 fn test_lag_partition() {
     // LAG resets at partition boundaries.
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30)").unwrap();
-    let r = q(&db, "SELECT id, LAG(v, 1) OVER (PARTITION BY k ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Null],
-        vec![Value::Integer(2), Value::Integer(10)],
-        vec![Value::Integer(3), Value::Null], // partition 'b' resets
-    ]);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, LAG(v, 1) OVER (PARTITION BY k ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(10)],
+            vec![Value::Integer(3), Value::Null], // partition 'b' resets
+        ]
+    );
 }
 
 // =========================================================================
@@ -94,40 +125,63 @@ fn test_lag_partition() {
 #[test]
 fn test_lead_basic() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)").unwrap();
-    let r = q(&db, "SELECT id, LEAD(v, 1) OVER (ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(20)],
-        vec![Value::Integer(2), Value::Integer(30)],
-        vec![Value::Integer(3), Value::Null],
-    ]);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, LEAD(v, 1) OVER (ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(20)],
+            vec![Value::Integer(2), Value::Integer(30)],
+            vec![Value::Integer(3), Value::Null],
+        ]
+    );
 }
 
 #[test]
 fn test_lead_default_value() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("INSERT INTO s VALUES (1, 10), (2, 20)").unwrap();
-    let r = q(&db, "SELECT id, LEAD(v, 1, 0) OVER (ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(20)],
-        vec![Value::Integer(2), Value::Integer(0)],
-    ]);
+    let r = q(
+        &db,
+        "SELECT id, LEAD(v, 1, 0) OVER (ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(20)],
+            vec![Value::Integer(2), Value::Integer(0)],
+        ]
+    );
 }
 
 #[test]
 fn test_lead_offset_2() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40)").unwrap();
-    let r = q(&db, "SELECT id, LEAD(v, 2) OVER (ORDER BY id) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(30)],
-        vec![Value::Integer(2), Value::Integer(40)],
-        vec![Value::Integer(3), Value::Null],
-        vec![Value::Integer(4), Value::Null],
-    ]);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, LEAD(v, 2) OVER (ORDER BY id) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(30)],
+            vec![Value::Integer(2), Value::Integer(40)],
+            vec![Value::Integer(3), Value::Null],
+            vec![Value::Integer(4), Value::Null],
+        ]
+    );
 }
 
 // =========================================================================
@@ -137,12 +191,20 @@ fn test_lead_offset_2() {
 #[test]
 fn test_mixed_window_functions() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
-    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)").unwrap();
-    let r = q(&db, "SELECT id, ROW_NUMBER() OVER (ORDER BY id), RANK() OVER (ORDER BY v) FROM s ORDER BY id");
-    assert_eq!(r, vec![
-        vec![Value::Integer(1), Value::Integer(1), Value::Integer(1)],
-        vec![Value::Integer(2), Value::Integer(2), Value::Integer(2)],
-        vec![Value::Integer(3), Value::Integer(3), Value::Integer(3)],
-    ]);
+    db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let r = q(
+        &db,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id), RANK() OVER (ORDER BY v) FROM s ORDER BY id",
+    );
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(2), Value::Integer(2)],
+            vec![Value::Integer(3), Value::Integer(3), Value::Integer(3)],
+        ]
+    );
 }

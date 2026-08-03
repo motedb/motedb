@@ -372,11 +372,13 @@ fn test_wide_table() {
 fn test_oversized_text_is_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
 
     // A value just under the limit (65534 bytes) stores and round-trips fine.
     let near_max = "a".repeat(65534);
-    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", near_max)).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", near_max))
+        .unwrap();
     let r = row(db.execute("SELECT length(s) FROM t WHERE id = 1").unwrap());
     assert_eq!(r[0], Value::Integer(65534));
 
@@ -397,9 +399,11 @@ fn test_normal_text_unaffected_by_cap() {
     // Typical text sizes (up to a few KB) must work normally after the cap fix.
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
     let s = "héllo 世界 🎉 ".repeat(100); // ~1800 bytes, multibyte
-    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", s)).unwrap();
+    db.execute(&format!("INSERT INTO t VALUES (1, '{}')", s))
+        .unwrap();
     let r = row(db.execute("SELECT length(s) FROM t WHERE id = 1").unwrap());
     // length() counts chars, not bytes
     match &r[0] {
@@ -421,16 +425,28 @@ fn test_cast_float_to_int_boundaries() {
     db.execute("INSERT INTO t VALUES (1)").unwrap();
 
     // Large integers should round-trip through FLOAT without overflow errors.
-    for v in [-9223372036854775807i64, 9223372036854775806, 9223372036854775807] {
+    for v in [
+        -9223372036854775807i64,
+        9223372036854775806,
+        9223372036854775807,
+    ] {
         let sql = format!("SELECT CAST(CAST({} AS FLOAT) AS INT)", v);
         let r = row(db.execute(&sql).unwrap());
         match &r[0] {
             Value::Integer(got) => {
                 // f64 rounding means the result may be off by 1 at the boundary,
                 // but it must NOT error and must be very close to the input.
-                assert!(((*got as i128) - (v as i128)).abs() <= 1, "CAST round-trip {} got {}", v, got);
+                assert!(
+                    ((*got as i128) - (v as i128)).abs() <= 1,
+                    "CAST round-trip {} got {}",
+                    v,
+                    got
+                );
             }
-            o => panic!("CAST(CAST({} AS FLOAT) AS INT) returned {:?}, expected Integer", v, o),
+            o => panic!(
+                "CAST(CAST({} AS FLOAT) AS INT) returned {:?}, expected Integer",
+                v, o
+            ),
         }
     }
 
@@ -439,8 +455,14 @@ fn test_cast_float_to_int_boundaries() {
     assert!(r.is_err(), "1e30 should overflow INTEGER");
 
     // Fractional truncation (toward zero, SQL standard).
-    assert_eq!(row(db.execute("SELECT CAST(3.7 AS INT)").unwrap())[0], Value::Integer(3));
-    assert_eq!(row(db.execute("SELECT CAST(-3.7 AS INT)").unwrap())[0], Value::Integer(-3));
+    assert_eq!(
+        row(db.execute("SELECT CAST(3.7 AS INT)").unwrap())[0],
+        Value::Integer(3)
+    );
+    assert_eq!(
+        row(db.execute("SELECT CAST(-3.7 AS INT)").unwrap())[0],
+        Value::Integer(-3)
+    );
 }
 
 // === i64::MIN literal parsing (regression) ===
@@ -457,7 +479,11 @@ fn test_i64_min_literal_parsing() {
 
     // The critical case: -i64::MIN must be exact, not MIN+1.
     let r = row(db.execute("SELECT -9223372036854775808").unwrap());
-    assert_eq!(r[0], Value::Integer(-9223372036854775808), "i64::MIN literal must be exact");
+    assert_eq!(
+        r[0],
+        Value::Integer(-9223372036854775808),
+        "i64::MIN literal must be exact"
+    );
 
     // -i64::MAX must NOT be collapsed to i64::MIN.
     let r = row(db.execute("SELECT -9223372036854775807").unwrap());
@@ -477,12 +503,17 @@ fn test_i64_min_literal_parsing() {
 fn test_float_into_int_column_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     // 3.9 stored as Integer(4615964438073389875) before fix — now rejected.
     let r = db.execute("INSERT INTO t VALUES (1, 3.9)");
-    assert!(r.is_err(), "float into INT column should be rejected, not silently corrupted");
+    assert!(
+        r.is_err(),
+        "float into INT column should be rejected, not silently corrupted"
+    );
     // Integer into FLOAT still works (safe promotion).
-    db.execute("CREATE TABLE tf (id INT PRIMARY KEY, f FLOAT)").unwrap();
+    db.execute("CREATE TABLE tf (id INT PRIMARY KEY, f FLOAT)")
+        .unwrap();
     let r = db.execute("INSERT INTO tf VALUES (1, 42)");
     assert!(r.is_ok(), "int into FLOAT should work");
 }
@@ -493,7 +524,10 @@ fn test_multiple_primary_key_rejected() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
     let r = db.execute("CREATE TABLE bad (a INT PRIMARY KEY, b INT PRIMARY KEY)");
-    assert!(r.is_err(), "multiple PRIMARY KEY columns should be rejected");
+    assert!(
+        r.is_err(),
+        "multiple PRIMARY KEY columns should be rejected"
+    );
     // Single PK still works.
     let r = db.execute("CREATE TABLE ok (a INT PRIMARY KEY, b INT)");
     assert!(r.is_ok());
@@ -505,26 +539,47 @@ fn test_multiple_primary_key_rejected() {
 fn test_timestamp_string_insert() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP)")
+        .unwrap();
     // Date only
-    db.execute("INSERT INTO t VALUES (1, '2024-01-15')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, '2024-01-15')")
+        .unwrap();
     // Datetime with space separator
-    db.execute("INSERT INTO t VALUES (2, '2024-06-01 10:30:00')").unwrap();
+    db.execute("INSERT INTO t VALUES (2, '2024-06-01 10:30:00')")
+        .unwrap();
     // Datetime with T separator
-    db.execute("INSERT INTO t VALUES (3, '2024-12-31T23:59:59')").unwrap();
+    db.execute("INSERT INTO t VALUES (3, '2024-12-31T23:59:59')")
+        .unwrap();
 
     // YEAR should work on all
-    assert_eq!(row(db.execute("SELECT YEAR(ts) FROM t WHERE id=1").unwrap())[0], Value::Integer(2024));
-    assert_eq!(row(db.execute("SELECT YEAR(ts) FROM t WHERE id=2").unwrap())[0], Value::Integer(2024));
-    assert_eq!(row(db.execute("SELECT YEAR(ts) FROM t WHERE id=3").unwrap())[0], Value::Integer(2024));
+    assert_eq!(
+        row(db.execute("SELECT YEAR(ts) FROM t WHERE id=1").unwrap())[0],
+        Value::Integer(2024)
+    );
+    assert_eq!(
+        row(db.execute("SELECT YEAR(ts) FROM t WHERE id=2").unwrap())[0],
+        Value::Integer(2024)
+    );
+    assert_eq!(
+        row(db.execute("SELECT YEAR(ts) FROM t WHERE id=3").unwrap())[0],
+        Value::Integer(2024)
+    );
 
     // MONTH and DAY
-    assert_eq!(row(db.execute("SELECT MONTH(ts) FROM t WHERE id=1").unwrap())[0], Value::Integer(1));
-    assert_eq!(row(db.execute("SELECT DAY(ts) FROM t WHERE id=3").unwrap())[0], Value::Integer(31));
+    assert_eq!(
+        row(db.execute("SELECT MONTH(ts) FROM t WHERE id=1").unwrap())[0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        row(db.execute("SELECT DAY(ts) FROM t WHERE id=3").unwrap())[0],
+        Value::Integer(31)
+    );
 
     // Raw timestamp value is stored correctly (as microseconds)
     assert_eq!(
-        row(db.execute("SELECT CAST(ts AS INT) FROM t WHERE id=1").unwrap())[0],
+        row(db
+            .execute("SELECT CAST(ts AS INT) FROM t WHERE id=1")
+            .unwrap())[0],
         Value::Integer(1705276800000000) // 2024-01-15 00:00:00 UTC
     );
 }

@@ -353,11 +353,15 @@ fn test_coalesce_with_column() {
 fn test_substr_null_propagates() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'hello'), (2, NULL)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello'), (2, NULL)")
+        .unwrap();
 
     // text arg NULL -> NULL
-    let r = row(db.execute("SELECT SUBSTR(s, 1, 2) FROM t WHERE id = 2").unwrap());
+    let r = row(db
+        .execute("SELECT SUBSTR(s, 1, 2) FROM t WHERE id = 2")
+        .unwrap());
     assert_eq!(r[0], Value::Null, "SUBSTR(NULL,1,2) should be NULL");
 
     // start arg NULL -> NULL
@@ -369,7 +373,9 @@ fn test_substr_null_propagates() {
     assert_eq!(r[0], Value::Null, "SUBSTR('hello',1,NULL) should be NULL");
 
     // Non-NULL still works correctly.
-    let r = row(db.execute("SELECT SUBSTR(s, 2, 3) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT SUBSTR(s, 2, 3) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(r[0], Value::text("ell".to_string()));
 }
 
@@ -382,7 +388,8 @@ fn test_substr_null_propagates() {
 fn test_round_decimals_on_column() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, f FLOAT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, f FLOAT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 3.14159)").unwrap();
 
     // Literal path (always worked):
@@ -390,14 +397,24 @@ fn test_round_decimals_on_column() {
     assert_eq!(r[0], Value::Float(3.14));
 
     // Column path (was broken — returned 3.0):
-    let r = row(db.execute("SELECT ROUND(f, 2) FROM t WHERE id = 1").unwrap());
-    assert_eq!(r[0], Value::Float(3.14), "ROUND(col, 2) must respect decimals");
+    let r = row(db
+        .execute("SELECT ROUND(f, 2) FROM t WHERE id = 1")
+        .unwrap());
+    assert_eq!(
+        r[0],
+        Value::Float(3.14),
+        "ROUND(col, 2) must respect decimals"
+    );
 
     // Different decimal counts
-    let r = row(db.execute("SELECT ROUND(f, 4) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT ROUND(f, 4) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(r[0], Value::Float(3.1416));
 
-    let r = row(db.execute("SELECT ROUND(f, 0) FROM t WHERE id = 1").unwrap());
+    let r = row(db
+        .execute("SELECT ROUND(f, 0) FROM t WHERE id = 1")
+        .unwrap());
     assert_eq!(r[0], Value::Float(3.0));
 }
 
@@ -406,7 +423,8 @@ fn test_sqrt_negative_column_returns_null_not_nan() {
     // SQRT of a negative column value must not return Float(NaN).
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, -4)").unwrap();
     let r = row(db.execute("SELECT SQRT(v) FROM t WHERE id = 1").unwrap());
     // NULL is acceptable (SQLite-like); NaN/-inf is not.

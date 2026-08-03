@@ -29,7 +29,8 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn test_sum_int_returns_int_simple() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,10),(2,20)").unwrap();
     let r = q(&db, "SELECT SUM(v) FROM t");
     assert_eq!(
@@ -43,8 +44,10 @@ fn test_sum_int_returns_int_simple() {
 #[test]
 fn test_min_max_int_returns_int_simple() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,5)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,5)")
+        .unwrap();
     let r = q(&db, "SELECT MIN(v), MAX(v) FROM t");
     assert_eq!(
         r,
@@ -58,8 +61,10 @@ fn test_min_max_int_returns_int_simple() {
 fn test_sum_int_with_count_and_text_filter() {
     // Triggers the count_sum_min_max_text_filter fast path (Bug A).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, amt INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'x',10),(2,'x',20),(3,'y',5)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, amt INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'x',10),(2,'x',20),(3,'y',5)")
+        .unwrap();
     let r = q(&db, "SELECT COUNT(*), SUM(amt) FROM t WHERE cat='x'");
     assert_eq!(
         r,
@@ -72,8 +77,10 @@ fn test_sum_int_with_count_and_text_filter() {
 #[test]
 fn test_min_max_int_with_text_filter() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, amt INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'x',10),(2,'x',20),(3,'x',5)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, amt INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'x',10),(2,'x',20),(3,'x',5)")
+        .unwrap();
     let r = q(&db, "SELECT MIN(amt), MAX(amt) FROM t WHERE cat='x'");
     assert_eq!(
         r,
@@ -90,9 +97,13 @@ fn test_min_max_int_with_text_filter() {
 #[test]
 fn test_agg_empty_set_returns_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,10)").unwrap();
-    let r = q(&db, "SELECT COUNT(*), MIN(v), MAX(v), AVG(v), SUM(v) FROM t WHERE v > 100");
+    let r = q(
+        &db,
+        "SELECT COUNT(*), MIN(v), MAX(v), AVG(v), SUM(v) FROM t WHERE v > 100",
+    );
     assert_eq!(
         r,
         vec![vec![
@@ -111,12 +122,21 @@ fn test_agg_empty_set_returns_null() {
 fn test_agg_empty_set_with_text_filter() {
     // Triggers count_sum_min_max_text_filter with no matches (Bug B).
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, amt INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, cat TEXT, amt INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,'x',10)").unwrap();
-    let r = q(&db, "SELECT COUNT(*), MIN(amt), MAX(amt), AVG(amt) FROM t WHERE cat='nope'");
+    let r = q(
+        &db,
+        "SELECT COUNT(*), MIN(amt), MAX(amt), AVG(amt) FROM t WHERE cat='nope'",
+    );
     assert_eq!(
         r,
-        vec![vec![Value::Integer(0), Value::Null, Value::Null, Value::Null,]],
+        vec![vec![
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]],
         "empty-set aggregates with text filter must be NULL; got {:?}",
         r
     );
@@ -213,7 +233,10 @@ fn test_where_not_in_subquery_with_null_yields_no_rows() {
     db.execute("CREATE TABLE excl(v INT)").unwrap();
     db.execute("INSERT INTO main VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO excl VALUES (2),(NULL)").unwrap();
-    let r = q(&db, "SELECT id FROM main WHERE id NOT IN (SELECT v FROM excl) ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM main WHERE id NOT IN (SELECT v FROM excl) ORDER BY id",
+    );
     assert!(r.is_empty(), "NOT IN with NULL in set must yield no rows");
 }
 
@@ -225,7 +248,10 @@ fn test_where_in_subquery_with_null_still_matches() {
     db.execute("CREATE TABLE excl(v INT)").unwrap();
     db.execute("INSERT INTO main VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO excl VALUES (2),(NULL)").unwrap();
-    let r = q(&db, "SELECT id FROM main WHERE id IN (SELECT v FROM excl) ORDER BY id");
+    let r = q(
+        &db,
+        "SELECT id FROM main WHERE id IN (SELECT v FROM excl) ORDER BY id",
+    );
     assert_eq!(r, vec![vec![Value::Integer(2)]]);
 }
 
@@ -233,7 +259,8 @@ fn test_where_in_subquery_with_null_still_matches() {
 fn test_where_between_null_bound_matches_nothing() {
     // x BETWEEN NULL AND 5 → UNKNOWN → no rows.
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,3),(2,7)").unwrap();
     let r = q(&db, "SELECT id FROM t WHERE v BETWEEN NULL AND 5");
     assert!(r.is_empty());
@@ -264,7 +291,14 @@ fn test_count_distinct_int_vs_float_consistent() {
     let (db, _d) = db();
     // Cross-type numeric equality holds.
     let r = q(&db, "SELECT 5 = 5.0, 5 < 5.1, 5 > 4.9");
-    assert_eq!(r, vec![vec![Value::Bool(true), Value::Bool(true), Value::Bool(true)]]);
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true)
+        ]]
+    );
     // IN dedups across types too.
     let r2 = q(&db, "SELECT 5 IN (5.0, 6.0)");
     assert_eq!(r2, vec![vec![Value::Bool(true)]]);
@@ -284,8 +318,10 @@ fn test_null_arithmetic_returns_null() {
 #[test]
 fn test_sum_all_null_returns_null() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,NULL),(2,NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,NULL),(2,NULL)")
+        .unwrap();
     let r = q(&db, "SELECT SUM(v), AVG(v), MIN(v), MAX(v) FROM t");
     assert_eq!(
         r,
@@ -298,8 +334,14 @@ fn test_sum_all_null_returns_null() {
 #[test]
 fn test_count_null_column_returns_zero() {
     let (db, _d) = db();
-    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,NULL),(2,NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,NULL),(2,NULL)")
+        .unwrap();
     let r = q(&db, "SELECT COUNT(v) FROM t");
-    assert_eq!(r, vec![vec![Value::Integer(0)]], "COUNT of all-NULL column is 0");
+    assert_eq!(
+        r,
+        vec![vec![Value::Integer(0)]],
+        "COUNT of all-NULL column is 0"
+    );
 }
