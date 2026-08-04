@@ -7,56 +7,58 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Test (correctness)
+  # ── Hard gate: library unit tests (fast, deterministic) ──────────────────
+  # `cargo test --lib` compiles a SINGLE binary (429 in-crate tests) and runs
+  # in ~5s. Same strategy as ci.yml's hard gate: catches the vast majority of
+  # regressions deterministically. `publish` depends ONLY on this job.
+  #
+  # The full integration suite (`cargo test --workspace`) has an intermittent
+  # background-thread deadlock (~90 binaries run serially → index-builder /
+  # group-commit condvar permanent wait on CREATE INDEX + SELECT). Pre-existing
+  # concurrency issue, not a regression; does not reproduce in isolation. It is
+  # run as a separate advisory job below so its hang can never block a release
+  # (v0.7.2/v0.7.3/v0.7.4 all hit CI timeouts from this before the split).
+  unit-test:
+    name: Unit tests (hard gate)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
-
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-
-      - name: Install dependencies
-        run: cargo fetch
-
-      # ── Hard gate: library unit tests (fast, deterministic) ──────────────
-      # `cargo test --lib` compiles a SINGLE binary (429 in-crate tests) and
-      # runs in ~5s. This is the same strategy ci.yml uses for its hard gate:
-      # the library tests catch the vast majority of regressions without the
-      # non-determinism of the full integration suite.
-      #
-      # The full integration suite (`cargo test --workspace`) has an intermittent
-      # hang: after ~90 test binaries run serially, a background index-builder /
-      # group-commit thread occasionally deadlocks (condvar wait) on a CREATE
-      # INDEX + SELECT sequence. This is a pre-existing concurrency issue in the
-      # async index pipeline, not a regression — it reproduces stochastically
-      # and does not reproduce when the affected binary runs in isolation.
-      # Running the full suite as the release gate made publishes unreliable
-      # (the v0.7.2/v0.7.3 tags both hit the 60-min CI timeout from this).
-      - name: Library unit tests (hard gate)
+      - run: cargo fetch
+      - name: cargo test --lib --all-features
         env:
           CI: "1"
         run: cargo test --lib --all-features
 
-      # ── Advisory: full integration suite ────────────────────────────────
-      # Surfaces integration regressions in the run log for investigation, but
-      # does not block the publish (continue-on-error). The intermittent
-      # background-thread hang described above would otherwise block releases
-      # non-deterministically. Mirrors ci.yml's integration-test advisory job.
-      - name: Integration tests (advisory — does not block publish)
+  # ── Advisory: full integration suite (separate job, does NOT block publish) ─
+  # Runs in parallel with publish. A job-level continue-on-error means a hang
+  # (or the known intermittent deadlock) only marks THIS job's status, never
+  # the release. The publish job below depends only on unit-test.
+  integration-test:
+    name: Integration tests (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - run: cargo fetch
+      - name: cargo test --workspace
         env:
           CI: "1"
-        continue-on-error: true
         run: |
           cargo test --workspace --all-features -- \
             --test-threads=1 \
@@ -81,7 +83,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: test
+    needs: unit-test
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:

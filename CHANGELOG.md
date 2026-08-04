@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.5] — 2026-08-04
+
+### CI
+
+- **publish.yml: 拆分 test 为独立 job**。v0.7.4 把 integration 放成同一 job
+  的 advisory step，但 cargo test 挂起会触发 job 级 timeout，仍阻塞 publish。
+  现在拆成：
+  - `unit-test`（hard gate，publish 仅依赖它，timeout 15min）
+  - `integration-test`（advisory，job 级 `continue-on-error`，与 publish 并行，
+    即使间歇死锁卡满 60min timeout 也只影响自身状态）
+
 ## [0.7.4] — 2026-08-04
 
 ### CI
