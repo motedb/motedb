@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.6] — 2026-08-05
+
+### CI
+
+- **ci.yml/publish.yml: integration-test 加 30 分钟 timeout**。ci.yml 的
+  integration-test job 缺 `timeout-minutes`，用 GitHub 默认的 360 分钟。
+  `cargo test --workspace` 的间歇死锁让它卡满 6 小时（×2 matrix = 2 个 job
+  各 6h）。现在 ci.yml + publish.yml 的 integration 均设 30min timeout，
+  死锁时快速失败而非空转 6h。publish（仅依赖 unit-test）不受影响。
+
 ## [0.7.5] — 2026-08-04
 
 ### CI
