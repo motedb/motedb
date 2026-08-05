@@ -9439,7 +9439,7 @@ impl QueryExecutor {
                                 col_data.push(decoded);
                             }
                             // Materialize matched rows from pre-decoded data.
-                            for &local_row in row_indices.iter().skip(0).take(limit) {
+                            for &local_row in row_indices.iter().take(limit) {
                                 let row: Vec<Value> = col_data
                                     .iter()
                                     .map(|col| {
