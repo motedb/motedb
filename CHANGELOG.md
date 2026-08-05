@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.8] — 2026-08-06
+
+### Bug Fixes
+
+- **修复 v0.7.7 的 close() 回归**（CI unit-test 卡 15min）。
+  v0.7.7 的 `close()` 无条件调用 `wait_for_indexes_ready_timeout(10s)`，导致
+  每个 Database drop 都最多等 10 秒。lib 测试大量创建/销毁 Database，累积成
+  几百秒延迟，CI `--lib` 卡满 15min timeout。
+  修复：仅在 `has_pending_index_batches()` 为 true（确有索引在构建）时才等，
+  且超时从 10s 降到 2s。无索引的 close 秒回（恢复 v0.7.6 速度）。
+  新增 `pub(crate) fn has_pending_index_batches()` accessor（避免 api.rs 访问
+  私有字段）。
+
 ## [0.7.7] — 2026-08-05
 
 ### Bug Fixes

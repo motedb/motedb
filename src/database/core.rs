@@ -489,6 +489,13 @@ impl MoteDB {
         self.wait_for_indexes_ready_timeout(std::time::Duration::from_secs(10))
     }
 
+    /// 是否有 pending index batch（供 close() 判断是否需要等）。
+    pub(crate) fn has_pending_index_batches(&self) -> bool {
+        self.pending_index_batches
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
     /// Wait for index readiness with a custom timeout.
     pub fn wait_for_indexes_ready_timeout(&self, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
