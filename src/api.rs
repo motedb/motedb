@@ -294,6 +294,15 @@ impl Database {
             warn_log!("[close] Background threads did not stop within timeout");
         }
 
+        // 🔑 关键：等所有 pending index batch 处理完再 checkpoint。
+        // batch_build_table_indexes_raw 会 spawn 4 个子线程（column/timestamp/
+        // vector/text index），它们持有索引写锁。如果 close 不等它们完成就
+        // 跑 checkpoint（checkpoint 的 flush_all_indexes 要索引写锁），会死锁。
+        // 这也修了 CI 的间歇卡死：索引子线程残留 → checkpoint 等锁 → 死锁。
+        // wait_for_indexes_ready 内部轮询 pending_index_batches，最多等 10s。
+        self.inner
+            .wait_for_indexes_ready_timeout(std::time::Duration::from_secs(10));
+
         // 🚀 Flush ColSegmentStore buffers BEFORE checkpoint. Without this,
         // in-memory INSERT data (the write buffer) is lost on close — the
         // large_batch_durability bug (10000 rows → 5000 after reopen). The

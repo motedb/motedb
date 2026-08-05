@@ -1667,42 +1667,46 @@ impl MoteDB {
             .name("index-builder".into())
             .spawn(move || {
                 debug_log!("[IndexBuilder] Background thread started");
+
+                // 🔑 处理一个 index batch。BatchGuard 确保 pending_index_batches
+                // 始终递减（即使 batch_build_table_indexes_raw panic），避免 orphan
+                // batch 导致 close() 死锁（等 pending 归零）。定义在 thread 内，
+                // 主循环和 shutdown drain 复用。
+                let process_index_batch = |batch: &IndexBuildBatch| {
+                    struct BatchGuard {
+                        pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                    }
+                    impl Drop for BatchGuard {
+                        fn drop(&mut self) {
+                            self.pending
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let _guard = BatchGuard {
+                        pending: db.pending_index_batches.clone(),
+                    };
+                    for (table_name, raw_rows) in &batch.tables_data {
+                        if let Err(e) = db.batch_build_table_indexes_raw(table_name, raw_rows) {
+                            warn_log!(
+                                "[IndexBuilder] Index build failed for '{}': {:?}",
+                                table_name,
+                                e
+                            );
+                            db.index_build_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    debug_log!(
+                        "[IndexBuilder] Processed batch ({} tables)",
+                        batch.tables_data.len()
+                    );
+                };
+
                 while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                             Ok(batch) => {
-                                // Drop guard ensures pending_index_batches is ALWAYS decremented,
-                                // even if batch_build_table_indexes_raw panics.
-                                struct BatchGuard {
-                                    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                                }
-                                impl Drop for BatchGuard {
-                                    fn drop(&mut self) {
-                                        self.pending
-                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                let _guard = BatchGuard {
-                                    pending: db.pending_index_batches.clone(),
-                                };
-
-                                for (table_name, raw_rows) in &batch.tables_data {
-                                    if let Err(e) =
-                                        db.batch_build_table_indexes_raw(table_name, raw_rows)
-                                    {
-                                        warn_log!(
-                                            "[IndexBuilder] Index build failed for '{}': {:?}",
-                                            table_name,
-                                            e
-                                        );
-                                        db.index_build_errors
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                debug_log!(
-                                    "[IndexBuilder] Processed batch ({} tables)",
-                                    batch.tables_data.len()
-                                );
+                                process_index_batch(&batch);
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1724,6 +1728,16 @@ impl MoteDB {
                             }
                         }
                     }
+                }
+                // 🔑 Shutdown drain: should_stop 被设置后，channel 里可能还有
+                // 未处理的 batch（close() → signal_stop → 但 flush/checkpoint 刚
+                // send 了新 batch）。如果直接退出，这些 orphan batch 的
+                // pending_index_batches 永不归零，且数据丢失（索引没建）。
+                // 用 try_recv 非阻塞 drain 剩余 batch。BatchGuard 在 process 里
+                // 保证 pending 正确递减。
+                debug_log!("[IndexBuilder] Draining remaining batches on shutdown...");
+                while let Ok(batch) = rx.try_recv() {
+                    process_index_batch(&batch);
                 }
                 debug_log!("[IndexBuilder] Background thread stopped");
             })

@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.7] — 2026-08-05
+
+### Bug Fixes
+
+- **修复 close()/checkpoint 与 index-builder 的间歇死锁**（CI 卡 30min+ 根因）。
+  - 根因：`batch_build_table_indexes_raw` 在 index-builder 后台线程里 spawn 4 个
+    子线程（column/timestamp/vector/text index）并 join，子线程持有索引写锁。
+    `close()` 的 `signal_background_threads_stop` 设 should_stop 后，index-builder
+    主线程**立即退出循环**，不处理 channel 里剩余 batch——但这些 batch 的
+    `pending_index_batches` 永不归零，且其子线程可能仍在持锁。随后 `checkpoint` 的
+    `flush_all_indexes` 等索引锁 → 死锁。
+  - 修复 1（core.rs）：index-builder 主线程在 should_stop 后、退出前，用 `try_recv`
+    非阻塞 drain channel 里剩余 batch（BatchGuard 保证 pending 正确递减）。
+  - 修复 2（api.rs）：`close()` 在 checkpoint 前，用 `wait_for_indexes_ready_timeout`
+    等 pending_index_batches 归零（最多 10s），确保子线程释放索引锁后再 checkpoint。
+  - 提取 `process_index_batch` 闭包复用（主循环 + drain 共用，消除重复）。
+
 ## [0.7.6] — 2026-08-05
 
 ### CI
