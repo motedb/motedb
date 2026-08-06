@@ -276,7 +276,19 @@ impl MoteDB {
 
         self.lsm_engine.flush()?;
 
-        if rebuild_indexes {
+        // 🔑 等 index-builder 处理完所有 pending batch 再碰索引。
+        // LSM flush 上面触发了 flush callback，往 index-builder channel send 了
+        // 新 batch。index-builder 处理 batch 时会 spawn 子线程（insert_batch 持
+        // 索引写锁）。如果下面的 rebuild_timestamp_index / flush_all_indexes 在
+        // 子线程持锁时获取索引锁，会死锁（CI 卡死根因）。
+        // wait_for_indexes_ready 内部轮询 pending_index_batches，pending==0 时秒回。
+        if self.has_pending_index_batches() {
+            self.wait_for_indexes_ready_timeout(std::time::Duration::from_secs(10));
+        }
+
+        // 🔑 async pipeline 激活时跳过 rebuild_timestamp_index —— 它获取
+        // timestamp_index 写锁，会和 index-builder 子线程竞争（同 flush_all_indexes）。
+        if rebuild_indexes && !self.is_async_index_pipeline_active() {
             self.rebuild_timestamp_index()?;
         }
 
@@ -369,16 +381,18 @@ impl MoteDB {
     pub fn flush_all_indexes(&self) -> Result<()> {
         let async_pipeline = self.is_async_index_pipeline_active();
 
+        // 🔑 async pipeline 激活时，所有索引由后台 index-builder 线程增量构建
+        //（batch_build spawn 子线程，insert_batch 持索引内部写锁）。如果这里同时
+        // flush 任何索引，都会和子线程竞争锁 → 死锁（close/checkpoint 卡死根因）。
+        // async 模式下索引是可重建的派生数据，flush 多余（重启从数据重建），
+        // 全部跳过。这一致地覆盖 timestamp/vector/text/ioctree/column 全部索引。
+        if async_pipeline {
+            return Ok(());
+        }
+
         self.timestamp_index.write().flush()?;
-
-        if !async_pipeline {
-            self.flush_vector_indexes()?;
-        }
-
-        if !async_pipeline {
-            self.flush_text_indexes()?;
-        }
-
+        self.flush_vector_indexes()?;
+        self.flush_text_indexes()?;
         self.flush_ioctree_indexes()?;
 
         let indexes_to_flush: Vec<_> = self

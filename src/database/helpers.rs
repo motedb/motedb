@@ -6,7 +6,7 @@
 //! lazily in the builder thread to minimize flush latency.
 
 use crate::types::{Row, RowId, TableSchema, Value};
-use crate::{Result, StorageError};
+use crate::Result;
 
 use super::core::MoteDB;
 
@@ -87,84 +87,33 @@ impl MoteDB {
         );
 
         let rows = Arc::new(rows);
-        let mut handles = vec![];
 
-        // 1. Column indexes
-        {
-            let db = self.clone_for_callback();
-            let table_name = table_name.to_string();
-            let schema = schema.clone();
-            let rows = Arc::clone(&rows);
-            handles.push(
-                std::thread::Builder::new()
-                    .spawn(move || db.batch_build_column_indexes(&table_name, &schema, &rows)),
-            );
+        // 🔑 顺序构建所有索引类型（不再 spawn 子线程）。
+        // 旧代码 spawn 4 个子线程并 join，每个 clone_for_callback() 持 Database Arc，
+        // 子线程的 insert_batch 持索引写锁。这导致 close/checkpoint 时间歇死锁：
+        //   - 子线程持索引锁 + join 等子线程 → index-builder 主线程不退出
+        //   - close/checkpoint 的索引操作等同一把锁 → 死锁
+        // 改成顺序调用后，index-builder 单线程跑完所有构建，无游离子线程，
+        // close 时 join index-builder 即可保证不持任何锁。
+        // 索引构建本身是批量操作，顺序 vs 并行的差异在典型批量下可忽略。
+        if let Err(e) = self.batch_build_column_indexes(table_name, &schema, &rows) {
+            debug_log!("[BatchIndexBuilder] ⚠️  Column index build failed: {}", e);
+            return Err(e);
         }
-
-        // 2. Timestamp indexes
-        {
-            let db = self.clone_for_callback();
-            let schema = schema.clone();
-            let rows = Arc::clone(&rows);
-            handles.push(
-                std::thread::Builder::new()
-                    .spawn(move || db.batch_build_timestamp_indexes(&schema, &rows)),
+        if let Err(e) = self.batch_build_timestamp_indexes(&schema, &rows) {
+            debug_log!(
+                "[BatchIndexBuilder] ⚠️  Timestamp index build failed: {}",
+                e
             );
+            return Err(e);
         }
-
-        // 3. Vector indexes
-        {
-            let db = self.clone_for_callback();
-            let table_name = table_name.to_string();
-            let schema = schema.clone();
-            let rows = Arc::clone(&rows);
-            handles.push(
-                std::thread::Builder::new()
-                    .spawn(move || db.batch_build_vector_indexes(&table_name, &schema, &rows)),
-            );
+        if let Err(e) = self.batch_build_vector_indexes(table_name, &schema, &rows) {
+            debug_log!("[BatchIndexBuilder] ⚠️  Vector index build failed: {}", e);
+            return Err(e);
         }
-
-        // 4. Text indexes
-        {
-            let db = self.clone_for_callback();
-            let table_name = table_name.to_string();
-            let schema = schema.clone();
-            let rows = Arc::clone(&rows);
-            handles.push(
-                std::thread::Builder::new()
-                    .spawn(move || db.batch_build_text_indexes(&table_name, &schema, &rows)),
-            );
-        }
-
-        // Wait for all threads
-        for (idx, handle_result) in handles.into_iter().enumerate() {
-            let handle = match handle_result {
-                Ok(h) => h,
-                Err(e) => {
-                    debug_log!(
-                        "[BatchIndexBuilder] ⚠️  Index type {} thread spawn failed: {}",
-                        idx,
-                        e
-                    );
-                    continue;
-                }
-            };
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    debug_log!(
-                        "[BatchIndexBuilder] ⚠️  Index type {} build failed: {}",
-                        idx,
-                        e
-                    );
-                    return Err(e);
-                }
-                Err(_) => {
-                    return Err(StorageError::Index(
-                        "Thread panicked during index build".into(),
-                    ));
-                }
-            }
+        if let Err(e) = self.batch_build_text_indexes(table_name, &schema, &rows) {
+            debug_log!("[BatchIndexBuilder] ⚠️  Text index build failed: {}", e);
+            return Err(e);
         }
 
         debug_log!(

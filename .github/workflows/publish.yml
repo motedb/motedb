@@ -37,49 +37,10 @@ jobs:
           CI: "1"
         run: cargo test --lib --all-features
 
-  # ── Advisory: full integration suite (separate job, does NOT block publish) ─
-  # Runs in parallel with publish. A job-level continue-on-error means a hang
-  # (or the known intermittent deadlock) only marks THIS job's status, never
-  # the release. The publish job below depends only on unit-test.
-  integration-test:
-    name: Integration tests (advisory)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-      - run: cargo fetch
-      - name: cargo test --workspace
-        env:
-          CI: "1"
-        run: |
-          cargo test --workspace --all-features -- \
-            --test-threads=1 \
-            --skip bench_ --skip stress_ --skip perf_ \
-            --skip test_memory_linear \
-            --skip test_memory_leak \
-            --skip test_memory_does_not_grow_unbounded \
-            --skip test_disk_usage \
-            --skip test_no_bloat \
-            --skip test_perf_ \
-            --skip test_scan_latency_bounded \
-            --skip test_insert_latency_bounded \
-            --skip test_aggregate_latency_bounded \
-            --skip test_distinct_latency_bounded \
-            --skip test_where_latency_bounded \
-            --skip test_pk_select_latency_stable \
-            --skip test_latency_growth_sublinear \
-            --skip test_scalability_latency \
-            --skip test_scalability_memory \
-            --skip test_durability_large_dataset_checkpoint_recovery \
-            --skip test_performance_guarantees
+  # 注：integration 测试由 ci.yml 的 integration-test job 覆盖（advisory，
+  # 30min timeout）。publish.yml 不再重复跑 integration —— 全量 workspace 有
+  # 间歇并发 race（深层、概率性），即使 advisory 也会让 Actions 页面长时间
+  # 显示 in_progress。publish 仅依赖确定性的 unit-test（--lib，~5s）。
 
   publish:
     name: Publish to crates.io

@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.7.9] — 2026-08-06
+
+### Performance / Concurrency
+
+- **index-builder 改为顺序构建索引**（不再 spawn 4 个子线程）。旧代码在
+  `batch_build_table_indexes_raw` 里 spawn column/timestamp/vector/text 4 个
+  子线程并 join，每个 clone Database Arc + insert_batch 持索引锁，是间歇死锁
+  的主要来源。改成顺序调用后，index-builder 单线程跑完，无游离子线程。
+- **checkpoint/close 在 async pipeline 激活时跳过所有索引 flush**
+  （flush_all_indexes + rebuild_timestamp_index）。索引是可重建的派生数据，
+  async 模式下 flush 多余且会与 index-builder 竞争锁。
+- **checkpoint 在碰索引前等 pending_index_batches 归零**（最多 10s）。
+
+### CI
+
+- **publish.yml 删除 integration job**。全量 workspace 有间歇并发 race
+  （深层、概率性，本地难稳定复现），即使 advisory 也让 Actions 页面长时间
+  in_progress。publish 现在只跑 unit-test（--lib，确定性）→ publish。
+  integration 由 ci.yml 覆盖（advisory + 30min timeout）。
+
 ## [0.7.8] — 2026-08-06
 
 ### Bug Fixes
