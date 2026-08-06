@@ -46,7 +46,7 @@ jobs:
     name: Publish to crates.io
     needs: unit-test
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -87,7 +87,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
