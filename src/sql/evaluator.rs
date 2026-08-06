@@ -2295,7 +2295,7 @@ impl ExprEvaluator {
 
     /// L2 Distance (Euclidean): <->
     fn l2_distance(&self, left: Value, right: Value) -> Result<Value> {
-        let (v1, v2) = self.extract_vectors(left, right)?;
+        let (v1, v2) = self.extract_vector_slices(&left, &right)?;
 
         if v1.len() != v2.len() {
             return Err(MoteDBError::TypeError(format!(
@@ -2306,14 +2306,14 @@ impl ExprEvaluator {
         }
 
         // 🚀 SIMD 加速（AVX2/SSE/NEON），替代标量循环（4-8x 提速）
-        let dist = crate::distance::euclidean_distance(&v1, &v2);
+        let dist = crate::distance::euclidean_distance(v1, v2);
         Ok(Value::Float(dist as f64))
     }
 
     /// Cosine Distance: <=>
     /// Returns 1 - cosine_similarity, range [0, 2]
     fn cosine_distance(&self, left: Value, right: Value) -> Result<Value> {
-        let (v1, v2) = self.extract_vectors(left, right)?;
+        let (v1, v2) = self.extract_vector_slices(&left, &right)?;
 
         if v1.len() != v2.len() {
             return Err(MoteDBError::TypeError(format!(
@@ -2325,13 +2325,13 @@ impl ExprEvaluator {
 
         // 🚀 SIMD 加速。零向量行为：cosine_distance 内部 cosine_similarity 对零
         // 向量返回 0.0 相似度 → distance = 1.0（与旧标量实现一致）。
-        let dist = crate::distance::cosine_distance(&v1, &v2);
+        let dist = crate::distance::cosine_distance(v1, v2);
         Ok(Value::Float(dist as f64))
     }
 
     /// Dot Product (Inner Product): <#>
     fn dot_product(&self, left: Value, right: Value) -> Result<Value> {
-        let (v1, v2) = self.extract_vectors(left, right)?;
+        let (v1, v2) = self.extract_vector_slices(&left, &right)?;
 
         if v1.len() != v2.len() {
             return Err(MoteDBError::TypeError(format!(
@@ -2342,15 +2342,21 @@ impl ExprEvaluator {
         }
 
         // 🚀 SIMD 加速（AVX2 FMA / NEON vfmaq）
-        let dot = crate::distance::dot_product(&v1, &v2);
+        let dot = crate::distance::dot_product(v1, v2);
         Ok(Value::Float(dot as f64))
     }
 
-    /// Extract vectors from Value types
-    fn extract_vectors(&self, left: Value, right: Value) -> Result<(Vec<f32>, Vec<f32>)> {
+    /// Extract vector slices from Value types (zero-copy: borrows from Value,
+    /// no to_vec clone). Vector 路径借 ArcVec 内部 &[f32]，Tensor 路径借
+    /// Tensor::as_f32() 的 &[f32]。
+    fn extract_vector_slices<'a>(
+        &self,
+        left: &'a Value,
+        right: &'a Value,
+    ) -> Result<(&'a [f32], &'a [f32])> {
         let v1 = match left {
-            Value::Vector(v) => v.to_vec(),
-            Value::Tensor(t) => t.as_f32().to_vec(),
+            Value::Vector(v) => v.as_slice(),
+            Value::Tensor(t) => t.as_f32(),
             _ => {
                 return Err(MoteDBError::TypeError(format!(
                     "Left operand is not a vector: {:?}",
@@ -2360,8 +2366,8 @@ impl ExprEvaluator {
         };
 
         let v2 = match right {
-            Value::Vector(v) => v.to_vec(),
-            Value::Tensor(t) => t.as_f32().to_vec(),
+            Value::Vector(v) => v.as_slice(),
+            Value::Tensor(t) => t.as_f32(),
             _ => {
                 return Err(MoteDBError::TypeError(format!(
                     "Right operand is not a vector: {:?}",

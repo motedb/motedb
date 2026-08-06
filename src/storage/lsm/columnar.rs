@@ -1484,6 +1484,17 @@ impl ColumnarSSTable {
         }
     }
 
+    /// Hint OS to read-ahead sequentially (MADV_SEQUENTIAL). Call before bulk
+    /// sequential scans (compaction/merge) so the kernel prefetches pages,
+    /// reducing page-fault stalls. No-op for heap-backed segments.
+    pub fn advise_sequential(&self) {
+        if let Some(ref m) = self.mmap {
+            unsafe {
+                libc::madvise(m.as_ptr() as *mut _, m.len(), libc::MADV_SEQUENTIAL);
+            }
+        }
+    }
+
     /// Check if a file is a columnar SSTable by reading its magic.
     pub fn is_columnar<P: AsRef<Path>>(path: P) -> bool {
         let path = path.as_ref();
@@ -3014,7 +3025,7 @@ impl ColumnarSSTableBuilder {
                                         ]));
                                     }
                                     found = Some(Value::Vector(crate::types::ArcVec(
-                                        std::sync::Arc::new(v),
+                                        std::sync::Arc::from(v),
                                     )));
                                 } else {
                                     found = Some(Value::Null);

@@ -397,7 +397,7 @@ impl SchemaDecodeContext {
                         var_data[o + 3],
                     ]));
                 }
-                return Ok(Value::Vector(crate::types::ArcVec(std::sync::Arc::new(
+                return Ok(Value::Vector(crate::types::ArcVec(std::sync::Arc::from(
                     vec,
                 ))));
             }
@@ -2072,7 +2072,7 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
                                         var_data[o + 3],
                                     ]));
                                 }
-                                row.push(Value::Vector(ArcVec(std::sync::Arc::new(vec))));
+                                row.push(Value::Vector(ArcVec(std::sync::Arc::from(vec))));
                                 continue;
                             }
                         }
@@ -2166,7 +2166,7 @@ fn decode_var_with_pool(
                             bytes[off + 3],
                         ]));
                     }
-                    return Ok(Value::Vector(ArcVec(std::sync::Arc::new(vec))));
+                    return Ok(Value::Vector(ArcVec(std::sync::Arc::from(vec))));
                 }
             }
             // Fallback: bincode
@@ -2286,7 +2286,7 @@ mod tests {
     fn test_vector_column() {
         let row = vec![
             Value::Integer(1),
-            Value::Vector(ArcVec(std::sync::Arc::new(vec![1.0, 2.0, 3.0, 4.0]))),
+            Value::Vector(ArcVec(std::sync::Arc::from(vec![1.0, 2.0, 3.0, 4.0]))),
         ];
         let schema = vec![ColumnType::Integer, ColumnType::Tensor(4)];
         let encoded = encode(&row, &schema).unwrap();

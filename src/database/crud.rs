@@ -2775,8 +2775,8 @@ impl MoteDB {
                         if let Some(crate::types::Value::Vector(arc_vec)) =
                             row.get(col_def.position)
                         {
-                            // ArcVec 是 Arc<Vec<f32>> 的包装，需要解引用
-                            vectors.push((*row_id, (*arc_vec.0).clone()));
+                            // ArcVec 是 Arc<[f32]> 的包装，to_vec 复制为 Vec<f32>
+                            vectors.push((*row_id, arc_vec.to_vec()));
                         }
                     }
 
@@ -3469,7 +3469,7 @@ impl Iterator for TableRowStreamingIterator {
                                 .flatten()
                                 .map(|f32s| {
                                     crate::types::Value::Vector(crate::types::ArcVec(
-                                        std::sync::Arc::new(f32s),
+                                        std::sync::Arc::from(f32s),
                                     ))
                                 })
                                 .unwrap_or(crate::types::Value::Null),
@@ -3733,7 +3733,7 @@ impl ColumnarScanIterator {
                     .cloned()
                     .flatten()
                     .map(|v| {
-                        crate::types::Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v)))
+                        crate::types::Value::Vector(crate::types::ArcVec(std::sync::Arc::from(v)))
                     })
                     .unwrap_or(crate::types::Value::Null),
                 ColumnarSegment::Spatial(cols) => cols

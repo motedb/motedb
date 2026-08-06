@@ -195,6 +195,12 @@ impl Segment {
         self.sst.release_pages();
     }
 
+    /// Hint sequential read-ahead (MADV_SEQUENTIAL). Call before compaction/
+    /// merge so the kernel prefetches pages, reducing page-fault stalls.
+    pub fn advise_sequential(&self) {
+        self.sst.advise_sequential();
+    }
+
     pub fn open(path: &std::path::Path, id: u64) -> crate::Result<Self> {
         let sst = ColumnarSSTable::open(path)?;
         let row_count = sst.num_rows;

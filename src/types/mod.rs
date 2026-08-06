@@ -15,13 +15,17 @@ pub use timestamp::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 
-/// Wrapper for Arc<Vec<f32>> with custom serde implementation
+/// Wrapper for Arc<[f32]> with custom serde implementation.
+///
+/// 使用 `Arc<[f32]>` 而非 `Arc<Vec<f32>>`：单次堆分配（Arc 内联长度），
+/// 每个向量省 8 字节 + 一次 malloc。向量在 DB 行级 clone 频繁，原子递增
+/// Arc 引用计数即可，无需深拷贝。
 #[derive(Debug, Clone, PartialEq)]
-pub struct ArcVec(pub Arc<Vec<f32>>);
+pub struct ArcVec(pub Arc<[f32]>);
 
 impl ArcVec {
     pub fn new(vec: Vec<f32>) -> Self {
-        ArcVec(Arc::new(vec))
+        ArcVec(Arc::from(vec))
     }
 
     pub fn len(&self) -> usize {
@@ -37,11 +41,11 @@ impl ArcVec {
     }
 
     pub fn to_vec(&self) -> Vec<f32> {
-        (*self.0).clone()
+        self.0.to_vec()
     }
 
     pub fn as_slice(&self) -> &[f32] {
-        self.0.as_ref()
+        &self.0
     }
 }
 
@@ -50,7 +54,7 @@ impl Serialize for ArcVec {
     where
         S: Serializer,
     {
-        self.0.as_ref().serialize(serializer)
+        self.0.serialize(serializer)
     }
 }
 
@@ -60,7 +64,7 @@ impl<'de> Deserialize<'de> for ArcVec {
         D: Deserializer<'de>,
     {
         let vec = Vec::<f32>::deserialize(deserializer)?;
-        Ok(ArcVec(Arc::new(vec)))
+        Ok(ArcVec(Arc::from(vec)))
     }
 }
 

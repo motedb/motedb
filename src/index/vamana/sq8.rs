@@ -22,6 +22,8 @@ use std::path::Path;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// SQ8 quantizer (per-vector min/max scaling)
 #[derive(Debug, Clone)]
@@ -361,6 +363,119 @@ impl SQ8Quantizer {
             }
 
             let cosine_sim = dot_product / (query_norm * data_norm);
+            1.0 - cosine_sim.clamp(-1.0, 1.0)
+        }
+    }
+
+    /// 🚀 x86 AVX2 optimized asymmetric SQ8 L2 (squared Euclidean) distance.
+    ///
+    /// 每次 8 个 u8 code：_mm256_cvtepu8_epi32 (u8→i32) → cvtepi32_ps (i32→f32)
+    /// → 反量化 → diff² 累加。替代 x86 标量 fallback（diskann_index.rs 的
+    /// not(aarch64) 分支），给 x86 部署的 DiskANN 查询 SIMD 加速。
+    #[cfg(target_arch = "x86_64")]
+    pub fn asymmetric_distance_l2_avx2(&self, query: &[f32], data: &QuantizedVector) -> f32 {
+        if query.len() != self.dimension || data.codes.len() != self.dimension {
+            return f32::MAX;
+        }
+        let range = data.max - data.min;
+        if range < 1e-8 {
+            return self.asymmetric_distance_l2(query, data);
+        }
+
+        let scale = range / 255.0;
+        let n = self.dimension;
+        let chunks = n / 8;
+
+        let scale_vec = unsafe { _mm256_set1_ps(scale) };
+        let min_vec = unsafe { _mm256_set1_ps(data.min) };
+        let mut sum = unsafe { _mm256_setzero_ps() };
+
+        unsafe {
+            for i in 0..chunks {
+                let offset = i * 8;
+                // 8 u8 → 8 i32 → 8 f32
+                let codes_u8 = _mm_loadl_epi64(data.codes.as_ptr().add(offset) as *const __m128i);
+                let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
+                let d_f32 = _mm256_cvtepi32_ps(codes_i32);
+                // 反量化: d = code * scale + min
+                let d = _mm256_fmadd_ps(d_f32, scale_vec, min_vec);
+                let q = _mm256_loadu_ps(query.as_ptr().add(offset));
+                let diff = _mm256_sub_ps(q, d);
+                sum = _mm256_fmadd_ps(diff, diff, sum);
+            }
+
+            // 水平求和 8 lanes
+            let mut tmp = sum;
+            tmp = _mm256_add_ps(tmp, _mm256_permute2f128_ps(tmp, tmp, 1));
+            tmp = _mm256_hadd_ps(tmp, tmp);
+            tmp = _mm256_hadd_ps(tmp, tmp);
+            let mut result = _mm256_cvtss_f32(_mm256_castps256_ps128(tmp));
+
+            // 标量尾部 (< 8)
+            for (&q, &code) in query[chunks * 8..].iter().zip(&data.codes[chunks * 8..]) {
+                let d = code as f32 * scale + data.min;
+                let diff = q - d;
+                result += diff * diff;
+            }
+            result
+        }
+    }
+
+    /// 🚀 x86 AVX2 optimized asymmetric SQ8 cosine distance.
+    #[cfg(target_arch = "x86_64")]
+    pub fn asymmetric_distance_cosine_avx2(&self, query: &[f32], data: &QuantizedVector) -> f32 {
+        if query.len() != self.dimension || data.codes.len() != self.dimension {
+            return f32::MAX;
+        }
+        let range = data.max - data.min;
+        if range < 1e-8 {
+            return self.asymmetric_distance_cosine(query, data);
+        }
+
+        let scale = range / 255.0;
+        let n = self.dimension;
+        let chunks = n / 8;
+
+        let scale_vec = unsafe { _mm256_set1_ps(scale) };
+        let min_vec = unsafe { _mm256_set1_ps(data.min) };
+        let mut dot = unsafe { _mm256_setzero_ps() };
+        let mut norm_q = unsafe { _mm256_setzero_ps() };
+        let mut norm_d = unsafe { _mm256_setzero_ps() };
+
+        unsafe {
+            for i in 0..chunks {
+                let offset = i * 8;
+                let codes_u8 = _mm_loadl_epi64(data.codes.as_ptr().add(offset) as *const __m128i);
+                let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
+                let d_f32 = _mm256_cvtepi32_ps(codes_i32);
+                let d = _mm256_fmadd_ps(d_f32, scale_vec, min_vec);
+                let q = _mm256_loadu_ps(query.as_ptr().add(offset));
+                dot = _mm256_fmadd_ps(q, d, dot);
+                norm_q = _mm256_fmadd_ps(q, q, norm_q);
+                norm_d = _mm256_fmadd_ps(d, d, norm_d);
+            }
+
+            let hsum = |v: __m256| -> f32 {
+                let mut t = _mm256_add_ps(v, _mm256_permute2f128_ps(v, v, 1));
+                t = _mm256_hadd_ps(t, t);
+                t = _mm256_hadd_ps(t, t);
+                _mm256_cvtss_f32(_mm256_castps256_ps128(t))
+            };
+            let mut dp = hsum(dot);
+            let mut nq = hsum(norm_q);
+            let mut nd = hsum(norm_d);
+
+            for (&q, &code) in query[chunks * 8..].iter().zip(&data.codes[chunks * 8..]) {
+                let d = code as f32 * scale + data.min;
+                dp += q * d;
+                nq += q * q;
+                nd += d * d;
+            }
+
+            if nq < 1e-8 || nd < 1e-8 {
+                return 1.0;
+            }
+            let cosine_sim = dp / (nq.sqrt() * nd.sqrt());
             1.0 - cosine_sim.clamp(-1.0, 1.0)
         }
     }

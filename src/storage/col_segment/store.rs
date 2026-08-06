@@ -914,7 +914,7 @@ impl ColSegmentStore {
                                     .cloned()
                                     .flatten()
                                     .map(|v| {
-                                        Value::Vector(crate::types::ArcVec(std::sync::Arc::new(v)))
+                                        Value::Vector(crate::types::ArcVec(std::sync::Arc::from(v)))
                                     }),
                                 (_, Some(Some(t)), ColumnType::Text) => {
                                     if !ptext_interned.is_empty() {
@@ -3225,6 +3225,11 @@ impl ColSegmentStore {
     ) -> Result<()> {
         if old_segs.is_empty() {
             return Ok(());
+        }
+        // 🚀 顺序读提示：merge 会顺序扫描所有 old segment 的列数据。
+        // MADV_SEQUENTIAL 让内核预读 page，减少 merge 时的 page-fault 停顿。
+        for seg in &old_segs {
+            seg.advise_sequential();
         }
         let col_types = self.col_types.load();
         let old_ids: Vec<u64> = old_segs.iter().map(|s| s.id).collect();

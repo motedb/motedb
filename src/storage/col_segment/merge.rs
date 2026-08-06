@@ -173,7 +173,7 @@ impl SegmentCursor {
                     .get(i)
                     .cloned()
                     .flatten()
-                    .map(|v| Value::Vector(crate::types::ArcVec(Arc::new(v)))),
+                    .map(|v| Value::Vector(crate::types::ArcVec(Arc::from(v)))),
                 Some(ColData::Spatial(cols)) => cols
                     .get(i)
                     .cloned()

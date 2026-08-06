@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.8.1] — 2026-08-06
+
+### Performance — 向量数据结构 + 磁盘 IO + x86 SIMD
+
+四项优化（评估报告建议，按 ROI 依次实施）：
+
+- **`ArcVec`: `Arc<Vec<f32>>` → `Arc<[f32]>`**（`src/types/mod.rs`）。单次堆分配
+  （Arc 内联长度），每个向量省 8 字节 + 一次 malloc。全栈受益（向量在 DB 行级
+  clone 频繁，原子 Arc 引用计数即可）。同步更新所有构造点（row_format/columnar/
+  crud/store/merge 共 9 处 `Arc::new` → `Arc::from`）。
+- **`extract_vectors` 零拷贝**（`src/sql/evaluator.rs`）。旧实现每次 `to_vec()`
+  深拷贝向量（对大 embedding 很贵）。改为 `extract_vector_slices` 借用 Value
+  内部 `&[f32]`，零分配。Vector/Tensor 路径都走借用。
+- **compaction 路径 `madvise(SEQUENTIAL)`**（`src/storage/col_segment/store.rs`）。
+  merge 前对所有 old segment 调 `advise_sequential`，提示内核预读 page，减少
+  merge 时的 page-fault 停顿。新增 `ColumnarSSTable::advise_sequential` +
+  `Segment::advise_sequential`。
+- **x86 AVX2 SQ8 ADC 路径**（`src/index/vamana/sq8.rs`）。之前 x86 上 DiskANN
+  的 SQ8 量化距离计算退化为标量（只有 NEON 版）。新增 `asymmetric_distance_l2_avx2`
+  + `asymmetric_distance_cosine_avx2`，用 `_mm256_cvtepu8_epi32`（u8→i32）+
+  `cvtepi32_ps`（i32→f32）+ FMA 链。diskann_index.rs 分发改为三级
+  （aarch64→neon / x86_64→avx2 / else→scalar）。
+
 ## [0.8.0] — 2026-08-06
 
 ### Performance — 向量距离计算 SIMD 化（4-8x 加速）

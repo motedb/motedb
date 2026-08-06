@@ -96,7 +96,11 @@ impl VectorStorage {
                     {
                         self.quantizer.asymmetric_distance_l2_neon(query, &qvec)
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        self.quantizer.asymmetric_distance_l2_avx2(query, &qvec)
+                    }
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     {
                         self.quantizer.asymmetric_distance_l2(query, &qvec)
                     }
@@ -106,7 +110,11 @@ impl VectorStorage {
                     {
                         self.quantizer.asymmetric_distance_cosine_neon(query, &qvec)
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        self.quantizer.asymmetric_distance_cosine_avx2(query, &qvec)
+                    }
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     {
                         self.quantizer.asymmetric_distance_cosine(query, &qvec)
                     }
