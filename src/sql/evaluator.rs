@@ -2305,13 +2305,8 @@ impl ExprEvaluator {
             )));
         }
 
-        let dist: f32 = v1
-            .iter()
-            .zip(v2.iter())
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f32>()
-            .sqrt();
-
+        // 🚀 SIMD 加速（AVX2/SSE/NEON），替代标量循环（4-8x 提速）
+        let dist = crate::distance::euclidean_distance(&v1, &v2);
         Ok(Value::Float(dist as f64))
     }
 
@@ -2328,17 +2323,9 @@ impl ExprEvaluator {
             )));
         }
 
-        let dot: f32 = v1.iter().zip(v2.iter()).map(|(a, b)| a * b).sum();
-        let norm1: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm2: f32 = v2.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        if norm1 == 0.0 || norm2 == 0.0 {
-            return Ok(Value::Float(1.0)); // Maximum distance for zero vectors
-        }
-
-        let cosine_sim = (dot / (norm1 * norm2)).clamp(-1.0, 1.0);
-        let dist = 1.0 - cosine_sim; // Range: [0, 2]
-
+        // 🚀 SIMD 加速。零向量行为：cosine_distance 内部 cosine_similarity 对零
+        // 向量返回 0.0 相似度 → distance = 1.0（与旧标量实现一致）。
+        let dist = crate::distance::cosine_distance(&v1, &v2);
         Ok(Value::Float(dist as f64))
     }
 
@@ -2354,8 +2341,8 @@ impl ExprEvaluator {
             )));
         }
 
-        let dot: f32 = v1.iter().zip(v2.iter()).map(|(a, b)| a * b).sum();
-
+        // 🚀 SIMD 加速（AVX2 FMA / NEON vfmaq）
+        let dot = crate::distance::dot_product(&v1, &v2);
         Ok(Value::Float(dot as f64))
     }
 

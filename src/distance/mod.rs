@@ -5,7 +5,7 @@
 pub mod cosine;
 pub mod euclidean;
 
-pub use cosine::{cosine_distance, cosine_similarity};
+pub use cosine::{cosine_distance, cosine_similarity, dot_product};
 pub use euclidean::euclidean_distance;
 
 /// Distance metric trait
@@ -76,5 +76,28 @@ mod tests {
         let b = vec![1.0, 0.0, 0.0];
         let dist = metric.distance(&a, &b);
         assert!(dist < 0.01); // Same vector should have ~0 distance
+    }
+
+    #[test]
+    fn test_dot_product() {
+        // 正交向量 dot = 0
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        assert!(dot_product(&a, &b).abs() < 1e-6);
+
+        // 相同向量 dot = 模长平方
+        let a = vec![3.0, 4.0];
+        assert!((dot_product(&a, &a) - 25.0).abs() < 1e-5);
+
+        // 一般情况 [1,2,3]·[4,5,6] = 4+10+18 = 32
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        assert!((dot_product(&a, &b) - 32.0).abs() < 1e-5);
+
+        // 大向量（触发 SIMD 主循环 + remainder）
+        let a: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..100).map(|i| (i + 1) as f32).collect();
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert!((dot_product(&a, &b) - expected).abs() < 1e-2);
     }
 }

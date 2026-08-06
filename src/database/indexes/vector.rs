@@ -358,22 +358,11 @@ impl MoteDB {
                 if let Ok(row_values) = crate::storage::row_format::decode_any(row_bytes) {
                     if let Some(Value::Vector(vec_data)) = row_values.get(col_position) {
                         if vec_data.len() == query.len() {
-                            let distance = match metric {
-                                crate::distance::DistanceKind::Cosine => {
-                                    let dot: f32 =
-                                        vec_data.iter().zip(query.iter()).map(|(a, b)| a * b).sum();
-                                    let norm_a: f32 =
-                                        vec_data.iter().map(|a| a * a).sum::<f32>().sqrt();
-                                    let norm_b: f32 =
-                                        query.iter().map(|b| b * b).sum::<f32>().sqrt();
-                                    1.0 - dot / (norm_a * norm_b).max(1e-10)
-                                }
-                                crate::distance::DistanceKind::Euclidean => vec_data
-                                    .iter()
-                                    .zip(query.iter())
-                                    .map(|(a, b)| (a - b).powi(2))
-                                    .sum::<f32>(),
-                            };
+                            // 🚀 SIMD 加速（AVX2/SSE/NEON），替代标量循环。
+                            // 🔑 顺带修 bug：旧 Euclidean 分支返回平方距离（无 sqrt），
+                            // 与 DiskANN 结果（真实距离）混排时排序错误。现在统一用
+                            // metric.distance()（真实距离），与 DiskANN 一致。
+                            let distance = metric.distance(vec_data.as_slice(), query);
                             memtable_results.push((row_id, distance));
                         }
                     }

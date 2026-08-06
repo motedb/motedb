@@ -354,6 +354,193 @@ unsafe fn horizontal_sum_sse(v: __m128) -> f32 {
     _mm_cvtss_f32(sum2)
 }
 
+/// Compute dot product (inner product) of two vectors with SIMD optimization.
+///
+/// 复用 cosine 的 dot 累加逻辑（去掉 norm_a/norm_b）。供 SQL `<#>` 操作符使用。
+#[inline]
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "Vector dimensions must match");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let features = get_cpu_features();
+        if features.has_avx2 && a.len() >= 8 {
+            unsafe { dot_product_avx2(a, b) }
+        } else if features.has_sse && a.len() >= 4 {
+            unsafe { dot_product_sse(a, b) }
+        } else {
+            dot_product_scalar(a, b)
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if a.len() >= 4 {
+            unsafe { dot_product_neon(a, b) }
+        } else {
+            dot_product_scalar(a, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        dot_product_scalar(a, b)
+    }
+}
+
+/// AVX2 optimized dot product (4-way unroll + FMA)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let chunks = n / 32;
+    let remainder = n % 32;
+
+    let mut dot_sum1 = _mm256_setzero_ps();
+    let mut dot_sum2 = _mm256_setzero_ps();
+    let mut dot_sum3 = _mm256_setzero_ps();
+    let mut dot_sum4 = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let offset = i * 32;
+        dot_sum1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(offset)),
+            _mm256_loadu_ps(b.as_ptr().add(offset)),
+            dot_sum1,
+        );
+        dot_sum2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(offset + 8)),
+            _mm256_loadu_ps(b.as_ptr().add(offset + 8)),
+            dot_sum2,
+        );
+        dot_sum3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(offset + 16)),
+            _mm256_loadu_ps(b.as_ptr().add(offset + 16)),
+            dot_sum3,
+        );
+        dot_sum4 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(offset + 24)),
+            _mm256_loadu_ps(b.as_ptr().add(offset + 24)),
+            dot_sum4,
+        );
+    }
+
+    let dot_sum = _mm256_add_ps(
+        _mm256_add_ps(dot_sum1, dot_sum2),
+        _mm256_add_ps(dot_sum3, dot_sum4),
+    );
+    let mut dot = horizontal_sum_avx2(dot_sum);
+
+    // Remainder (8 at a time)
+    let offset_r = chunks * 32;
+    let rem_chunks = remainder / 8;
+    let mut dot_rem = _mm256_setzero_ps();
+    for i in 0..rem_chunks {
+        let offset = offset_r + i * 8;
+        dot_rem = _mm256_fmadd_ps(
+            _mm256_loadu_ps(a.as_ptr().add(offset)),
+            _mm256_loadu_ps(b.as_ptr().add(offset)),
+            dot_rem,
+        );
+    }
+    dot += horizontal_sum_avx2(dot_rem);
+
+    // Scalar tail (< 8)
+    for i in (offset_r + rem_chunks * 8)..n {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
+/// SSE optimized dot product
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse")]
+unsafe fn dot_product_sse(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let chunks = n / 4;
+    let mut dot_sum = _mm_setzero_ps();
+
+    for i in 0..chunks {
+        let offset = i * 4;
+        let a_vec = _mm_loadu_ps(a.as_ptr().add(offset));
+        let b_vec = _mm_loadu_ps(b.as_ptr().add(offset));
+        dot_sum = _mm_add_ps(dot_sum, _mm_mul_ps(a_vec, b_vec));
+    }
+    let mut dot = horizontal_sum_sse(dot_sum);
+
+    for i in (chunks * 4)..n {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
+/// ARM NEON optimized dot product (4-way unroll, 16 floats/iteration)
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len();
+    let chunks = n / 16;
+    let remainder = n % 16;
+
+    let mut dot_sum1 = vdupq_n_f32(0.0);
+    let mut dot_sum2 = vdupq_n_f32(0.0);
+    let mut dot_sum3 = vdupq_n_f32(0.0);
+    let mut dot_sum4 = vdupq_n_f32(0.0);
+
+    for i in 0..chunks {
+        let offset = i * 16;
+        dot_sum1 = vfmaq_f32(
+            dot_sum1,
+            vld1q_f32(a.as_ptr().add(offset)),
+            vld1q_f32(b.as_ptr().add(offset)),
+        );
+        dot_sum2 = vfmaq_f32(
+            dot_sum2,
+            vld1q_f32(a.as_ptr().add(offset + 4)),
+            vld1q_f32(b.as_ptr().add(offset + 4)),
+        );
+        dot_sum3 = vfmaq_f32(
+            dot_sum3,
+            vld1q_f32(a.as_ptr().add(offset + 8)),
+            vld1q_f32(b.as_ptr().add(offset + 8)),
+        );
+        dot_sum4 = vfmaq_f32(
+            dot_sum4,
+            vld1q_f32(a.as_ptr().add(offset + 12)),
+            vld1q_f32(b.as_ptr().add(offset + 12)),
+        );
+    }
+
+    let dot_sum = vaddq_f32(vaddq_f32(dot_sum1, dot_sum2), vaddq_f32(dot_sum3, dot_sum4));
+    let mut dot = vaddvq_f32(dot_sum);
+
+    // Remainder (4 at a time)
+    let offset_r = chunks * 16;
+    let rem_chunks = remainder / 4;
+    let mut dot_rem = vdupq_n_f32(0.0);
+    for i in 0..rem_chunks {
+        let offset = offset_r + i * 4;
+        dot_rem = vfmaq_f32(
+            dot_rem,
+            vld1q_f32(a.as_ptr().add(offset)),
+            vld1q_f32(b.as_ptr().add(offset)),
+        );
+    }
+    dot += vaddvq_f32(dot_rem);
+
+    for i in (offset_r + rem_chunks * 4)..n {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
+/// Scalar fallback dot product
+fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+    }
+    dot
+}
+
 /// Compute cosine distance (1 - cosine_similarity)
 ///
 /// # Arguments

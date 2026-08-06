@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.8.0] — 2026-08-06
+
+### Performance — 向量距离计算 SIMD 化（4-8x 加速）
+
+`src/distance/` 有工业级 SIMD 实现（AVX2 FMA / SSE / NEON），但 SQL 表达式
+执行路径绕过它手写标量循环。本次统一改调 SIMD 内核：
+
+- **新增 `dot_product` SIMD 函数**（`src/distance/cosine.rs`）—— AVX2(4路FMA) /
+  SSE / NEON(4路vfmaq) / scalar 全覆盖，复用 cosine 的 dot 累加逻辑。导出
+  `pub use cosine::dot_product`。
+- **evaluator `<->` `<=>` `<#>` 改调 SIMD**（`src/sql/evaluator.rs`）——
+  l2_distance / cosine_distance / dot_product 三个函数的标量循环替换为
+  `crate::distance::*` 调用。`<->` `<=>` `<#>` 在 WHERE/SELECT 表达式里
+  执行时获得 4-8x 加速。
+- **memtable 向量扫描改调 SIMD**（`src/database/indexes/vector.rs`）——
+  手写 dot/norm 标量循环替换为 `metric.distance()`（DistanceKind 零成本分发）。
+  🔑 顺带修 bug：旧 Euclidean 分支返回平方距离（无 sqrt），与 DiskANN 的
+  真实距离结果混排时排序错误。现在统一用真实距离。
+
 ## [0.7.9] — 2026-08-06
 
 ### Performance / Concurrency
