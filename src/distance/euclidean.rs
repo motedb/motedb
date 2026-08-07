@@ -102,7 +102,7 @@ unsafe fn euclidean_distance_squared_sse(a: &[f32], b: &[f32]) -> f32 {
     let chunks = n / 4;
     let remainder = n % 4;
 
-    let mut sum_squared = 0.0f32;
+    let mut sum_squared;
 
     // SSE并行处理4个元素
     let mut sum_vec = _mm_setzero_ps();

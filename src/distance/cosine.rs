@@ -168,9 +168,9 @@ unsafe fn cosine_similarity_sse(a: &[f32], b: &[f32]) -> f32 {
     let chunks = n / 4;
     let remainder = n % 4;
 
-    let mut dot_product = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
+    let mut dot_product;
+    let mut norm_a;
+    let mut norm_b;
 
     // SSE并行处理4个元素
     let mut dot_sum = _mm_setzero_ps();
