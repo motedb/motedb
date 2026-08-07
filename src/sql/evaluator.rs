@@ -284,12 +284,14 @@ impl ExprEvaluator {
                 }
 
                 // Try 2: Match with table prefix (e.g., "id" matches "test.id")
+                // 🚀 suffix 提到循环外，避免每个 key 一次 format! 堆分配。
+                let suffix = format!(".{}", name);
                 let mut prefix_matches: Vec<&str> = Vec::new();
                 for key in row.keys() {
                     if key.starts_with("__") {
                         continue;
                     }
-                    if key.ends_with(&format!(".{}", name)) {
+                    if key.ends_with(&suffix) {
                         prefix_matches.push(key.as_str());
                     }
                 }
@@ -333,10 +335,10 @@ impl ExprEvaluator {
                 // Try 4: Case-insensitive match (for robustness).
                 // Collect all matches to detect ambiguity — picking the first
                 // match silently could return the wrong column on collision.
-                let name_lower = name.to_lowercase();
+                // 🚀 用 eq_ignore_ascii_case（零分配），替代 key.to_lowercase() == name_lower（每 key 一次分配）。
                 let mut matches: Vec<&str> = Vec::new();
                 for key in row.keys() {
-                    if key.to_lowercase() == name_lower {
+                    if key.eq_ignore_ascii_case(name) {
                         matches.push(key.as_str());
                     }
                 }
@@ -637,9 +639,15 @@ impl ExprEvaluator {
     /// Equality with the same Bool/numeric coercion as `=`. Returns true when
     /// the two values are equal after coercion. Used by IN-list matching so
     /// `TRUE IN (1)` and `b IN (1)` (BOOLEAN column) behave like `=`.
+    /// 🚀 快速路径：绝大多数 IN 匹配不涉及 Bool，直接比较（零 clone）。
+    ///    仅当任一方是 Bool 时才 coerce（TRUE↔1 场景）。
     pub(crate) fn values_equal_coerced(a: &Value, b: &Value) -> bool {
-        let (a2, b2) = Self::coerce_bool_numeric(a.clone(), b.clone());
-        a2 == b2
+        if matches!(a, Value::Bool(_)) || matches!(b, Value::Bool(_)) {
+            let (a2, b2) = Self::coerce_bool_numeric(a.clone(), b.clone());
+            a2 == b2
+        } else {
+            a == b
+        }
     }
 
     pub fn eval_binary_op(&self, op: &BinaryOperator, left: Value, right: Value) -> Result<Value> {
