@@ -27,6 +27,14 @@ fn coerce_bool_int(lv: Value, rv: Value) -> (Value, Value) {
     }
 }
 
+/// 判断两个 Value 之间是否需要 Bool/Int 跨类型 coerce。
+/// 绝大多数 WHERE 等值比较是 Int=Int / Text=Text / Float=Float，不涉及 Bool，
+/// 调用此函数短路可直接用 == 比较（零 clone）。
+#[inline]
+fn needs_bool_coerce(a: &Value, b: &Value) -> bool {
+    matches!(a, Value::Bool(_)) || matches!(b, Value::Bool(_))
+}
+
 /// Convert a Value to its string representation for GROUP_CONCAT.
 /// Integers print without decimal point; floats print naturally; booleans
 /// print as 1/0 (matching SQLite's GROUP_CONCAT behavior for TRUE/FALSE).
@@ -1261,9 +1269,15 @@ impl CompiledWhere {
             CompiledWhere::Eq(pos, val) => {
                 // SQL: NULL = val → NULL (false). Value PartialEq already returns false for Null==NonNull.
                 // 🔑 Bool/Int coercion: `flag = 1` should match a BOOLEAN TRUE.
+                // 🚀 快速路径：绝大多数列非 Bool，直接比较（零 clone）。
+                //    仅当任一方是 Bool 时才 coerce（flag=1 ↔ TRUE 场景）。
                 Some(row.get(*pos).is_some_and(|v| {
-                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                    a == b
+                    if needs_bool_coerce(v, val) {
+                        let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                        a == b
+                    } else {
+                        v == val
+                    }
                 }))
             }
             CompiledWhere::Ne(pos, val) => {
@@ -1272,8 +1286,12 @@ impl CompiledWhere {
                     if matches!(v, Value::Null) {
                         return false;
                     }
-                    let (a, b) = coerce_bool_int(v.clone(), val.clone());
-                    a != b
+                    if needs_bool_coerce(v, val) {
+                        let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                        a != b
+                    } else {
+                        v != val
+                    }
                 }))
             }
             CompiledWhere::Lt(pos, val) => Some(

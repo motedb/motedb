@@ -822,51 +822,39 @@ impl ColSegmentStore {
                 let mut row = Vec::with_capacity(project_cols.len());
                 if lazy_project {
                     // Lazy mode: decode each column on-demand for this single row.
+                    // 🚀 用 read_fixed_cached / read_text_cached（带 col_cache），
+                    // 替代无缓存的 read_fixed_i64 / read_text。同 segment 内首次
+                    // 读取后缓存命中，避免每个匹配行每列都重读整段（3-10× 提速）。
                     for &pc in project_cols.iter() {
                         let v = if pc < col_types.len() && pc < seg.sst.column_tags.len() {
                             if seg.sst.column_tags[pc].is_fixed() {
+                                let fopt = seg.read_fixed_cached(pc);
                                 match col_types[pc] {
-                                    ColumnType::Integer => seg
-                                        .sst
-                                        .read_fixed_i64(pc)
-                                        .ok()
-                                        .and_then(|f| f.get_i64(i))
-                                        .map(Value::Integer),
-                                    ColumnType::Float => seg
-                                        .sst
-                                        .read_fixed_i64(pc)
-                                        .ok()
-                                        .and_then(|f| f.get_f64(i))
-                                        .map(Value::Float),
-                                    ColumnType::Boolean => seg
-                                        .sst
-                                        .read_fixed_i64(pc)
-                                        .ok()
-                                        .and_then(|f| f.get_bool(i))
-                                        .map(Value::Bool),
+                                    ColumnType::Integer => {
+                                        fopt.as_ref().and_then(|f| f.get_i64(i)).map(Value::Integer)
+                                    }
+                                    ColumnType::Float => {
+                                        fopt.as_ref().and_then(|f| f.get_f64(i)).map(Value::Float)
+                                    }
+                                    ColumnType::Boolean => {
+                                        fopt.as_ref().and_then(|f| f.get_bool(i)).map(Value::Bool)
+                                    }
                                     // 🔑 Timestamp: decode as Value::Timestamp, not Integer.
-                                    ColumnType::Timestamp => seg
-                                        .sst
-                                        .read_fixed_i64(pc)
-                                        .ok()
-                                        .and_then(|f| f.get_i64(i))
-                                        .map(|micros| {
+                                    ColumnType::Timestamp => {
+                                        fopt.as_ref().and_then(|f| f.get_i64(i)).map(|micros| {
                                             Value::Timestamp(crate::types::Timestamp::from_micros(
                                                 micros,
                                             ))
-                                        }),
-                                    _ => seg
-                                        .sst
-                                        .read_fixed_i64(pc)
-                                        .ok()
-                                        .and_then(|f| f.get_i64(i))
-                                        .map(Value::Integer),
+                                        })
+                                    }
+                                    _ => {
+                                        fopt.as_ref().and_then(|f| f.get_i64(i)).map(Value::Integer)
+                                    }
                                 }
                             } else {
                                 match seg
-                                    .sst
-                                    .read_text(pc)
-                                    .ok()
+                                    .read_text_cached(pc)
+                                    .as_ref()
                                     .and_then(|t| t.get_str(i).map(|s| s.to_string()))
                                 {
                                     Some(s) => Some(Value::Text(s.into())),

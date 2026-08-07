@@ -3,6 +3,7 @@ use super::ast::{BinaryOperator, Expr, UnaryOperator};
 use crate::database::MoteDB;
 use crate::error::{MoteDBError, Result};
 use crate::types::{SqlRow, Value};
+use parking_lot::RwLock as PlRwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -161,8 +162,10 @@ impl CompiledPattern {
 
 pub struct ExprEvaluator {
     /// ⚡ Pattern cache: pattern string -> compiled pattern
-    /// RwLock for concurrent read access (common case)
-    pattern_cache: Arc<RwLock<HashMap<String, CompiledPattern>>>,
+    /// RwLock for concurrent read access (common case).
+    /// 🚀 用 parking_lot::RwLock（无 poison，读路径更短），替代 std::sync::RwLock。
+    /// LIKE 扫描每行调 read()，parking_lot 省 ~15-40ns/call。
+    pattern_cache: Arc<PlRwLock<HashMap<String, CompiledPattern>>>,
     /// Store the last AUTO_INCREMENT value inserted (AtomicI64, i64::MIN = None)
     pub(crate) last_insert_id: AtomicI64,
     /// Bind parameters for parameterized queries (?1, ?2, ...)
@@ -172,7 +175,7 @@ pub struct ExprEvaluator {
 impl ExprEvaluator {
     pub fn new() -> Self {
         Self {
-            pattern_cache: Arc::new(RwLock::new(HashMap::new())),
+            pattern_cache: Arc::new(PlRwLock::new(HashMap::new())),
             last_insert_id: AtomicI64::new(i64::MIN),
             params: RwLock::new(Vec::new()),
         }
@@ -214,7 +217,7 @@ impl ExprEvaluator {
 
     pub fn with_db(_db: Arc<MoteDB>) -> Self {
         Self {
-            pattern_cache: Arc::new(RwLock::new(HashMap::new())),
+            pattern_cache: Arc::new(PlRwLock::new(HashMap::new())),
             last_insert_id: AtomicI64::new(i64::MIN),
             params: RwLock::new(Vec::new()),
         }
@@ -267,7 +270,10 @@ impl ExprEvaluator {
         self.params.write().unwrap().clear();
     }
 
-    /// Evaluate an expression against a row
+    /// Evaluate an expression against a row.
+    /// 🚀 #[inline]：eval 是最热的递归函数，内联简单分支（Column/Literal）
+    /// 减少调用开销。编译器会权衡大函数只内联热分支。
+    #[inline]
     pub fn eval(&self, expr: &Expr, row: &SqlRow) -> Result<Value> {
         match expr {
             Expr::Column(name) => {
@@ -2265,12 +2271,12 @@ impl ExprEvaluator {
     /// Caches compiled patterns for repeated use
     #[inline]
     fn like_match_cached(&self, text: &str, pattern: &str) -> bool {
-        // Fast path: check read-only cache first
+        // Fast path: check read-only cache first.
+        // 🚀 parking_lot::RwLock read 直接返回 guard（无 poison 检查）。
         {
-            if let Ok(cache) = self.pattern_cache.read() {
-                if let Some(compiled) = cache.get(pattern) {
-                    return compiled.matches(text);
-                }
+            let cache = self.pattern_cache.read();
+            if let Some(compiled) = cache.get(pattern) {
+                return compiled.matches(text);
             }
         }
 
@@ -2280,11 +2286,10 @@ impl ExprEvaluator {
 
         // Insert into cache (write lock)
         {
-            if let Ok(mut cache) = self.pattern_cache.write() {
-                // Limit cache size to prevent memory bloat
-                if cache.len() < 1000 {
-                    cache.insert(pattern.to_string(), compiled);
-                }
+            let mut cache = self.pattern_cache.write();
+            // Limit cache size to prevent memory bloat
+            if cache.len() < 1000 {
+                cache.insert(pattern.to_string(), compiled);
             }
         }
 
