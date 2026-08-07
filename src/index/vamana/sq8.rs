@@ -411,7 +411,7 @@ impl SQ8Quantizer {
             tmp = _mm256_add_ps(tmp, _mm256_permute2f128_ps(tmp, tmp, 1));
             tmp = _mm256_hadd_ps(tmp, tmp);
             tmp = _mm256_hadd_ps(tmp, tmp);
-            let mut result = _mm256_cvtss_f32(_mm256_castps256_ps128(tmp));
+            let mut result = _mm256_cvtss_f32(tmp);
 
             // 标量尾部 (< 8)
             for (&q, &code) in query[chunks * 8..].iter().zip(&data.codes[chunks * 8..]) {
@@ -462,7 +462,7 @@ impl SQ8Quantizer {
                 let mut t = _mm256_add_ps(v, _mm256_permute2f128_ps(v, v, 1));
                 t = _mm256_hadd_ps(t, t);
                 t = _mm256_hadd_ps(t, t);
-                _mm256_cvtss_f32(_mm256_castps256_ps128(t))
+                _mm256_cvtss_f32(t)
             };
             let mut dp = hsum(dot);
             let mut nq = hsum(norm_q);
