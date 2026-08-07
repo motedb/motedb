@@ -393,8 +393,10 @@ impl SQ8Quantizer {
         unsafe {
             for i in 0..chunks {
                 let offset = i * 8;
-                // 8 u8 → 8 i32 → 8 f32
-                let codes_u8 = _mm_loadl_epi64(data.codes.as_ptr().add(offset) as *const __m128i);
+                // 8 u8 → 8 i32 → 8 f32。读 8 字节为 u64 再 _mm_set_epi64x（避免
+                // *const u8 as *const __m128i 的指针转换问题）。
+                let bits = std::ptr::read_unaligned(data.codes.as_ptr().add(offset) as *const u64);
+                let codes_u8 = _mm_set_epi64x(0, bits as i64);
                 let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
                 let d_f32 = _mm256_cvtepi32_ps(codes_i32);
                 // 反量化: d = code * scale + min
@@ -445,7 +447,8 @@ impl SQ8Quantizer {
         unsafe {
             for i in 0..chunks {
                 let offset = i * 8;
-                let codes_u8 = _mm_loadl_epi64(data.codes.as_ptr().add(offset) as *const __m128i);
+                let bits = std::ptr::read_unaligned(data.codes.as_ptr().add(offset) as *const u64);
+                let codes_u8 = _mm_set_epi64x(0, bits as i64);
                 let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
                 let d_f32 = _mm256_cvtepi32_ps(codes_i32);
                 let d = _mm256_fmadd_ps(d_f32, scale_vec, min_vec);
