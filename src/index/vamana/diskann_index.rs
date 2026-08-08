@@ -756,11 +756,19 @@ impl DiskANNIndex {
         let search_list_size = self.config.search_list_size.max(k * 2);
         let candidates = self.greedy_search(query, medoid, search_list_size)?;
 
-        // Return top k
+        // Return top k.
+        // 🔑 L2 metric: greedy_search 内部用 asymmetric_distance_l2（SQ8 平方距离，
+        // 无 sqrt）比较节点，效率高。但返回给调用方（vector_search）时必须统一为
+        // 真实距离——否则与 memtable 结果（真实距离）混合排序时 top-k 错排。
+        // Cosine 不受影响（asymmetric_distance_cosine 返回的已是 1-sim 真实距离）。
+        let is_l2 = self.metric == DistanceKind::Euclidean;
         let mut results: Vec<(RowId, f32)> = candidates
             .into_iter()
             .take(k)
-            .map(|c| (c.id, c.distance))
+            .map(|c| {
+                let dist = if is_l2 { c.distance.sqrt() } else { c.distance };
+                (c.id, dist)
+            })
             .collect();
 
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
