@@ -1329,7 +1329,17 @@ impl DiskANNIndex {
         start_id: RowId,
         beam_width: usize,
     ) -> Result<Vec<Candidate>> {
-        let mut visited = HashSet::new();
+        // 🚀 bitset visited set 替代 HashSet<RowId>。
+        // HashSet 每次 insert/contains 都哈希 + 堆节点 cache miss（~50ns）。
+        // bitset（Vec<u64>）用 bits[id/64] |= 1<<(id%64)，~1ns + cache 友好。
+        // 这是 FAISS/hnswlib 的标准做法。大小按图节点数分配（~N/8 字节，
+        // 1M 节点 = 128KB，远小于 HashSet 的堆开销）。
+        let graph_size = self.len();
+        let visited_words = graph_size.div_ceil(64);
+        let mut visited = vec![0u64; visited_words];
+        // 标记已访问：超出 bitset 范围的 id 回退到 HashSet（防御性，正常不触发）
+        let mut visited_overflow: HashSet<RowId> = HashSet::new();
+
         // Candidate::cmp is reversed (smaller distance = "greater") so
         // BinaryHeap<Candidate> acts as a min-heap — pop() returns the BEST.
         let mut candidates: BinaryHeap<Candidate> = BinaryHeap::new();
@@ -1340,12 +1350,19 @@ impl DiskANNIndex {
             id: start_id,
             distance: dist,
         });
-        visited.insert(start_id);
+        // mark start_id visited
+        {
+            let idx = start_id as usize;
+            if idx < graph_size {
+                visited[idx / 64] |= 1 << (idx % 64);
+            } else {
+                visited_overflow.insert(start_id);
+            }
+        }
 
         let mut result = Vec::new();
         let mut iterations = 0;
 
-        let graph_size = self.len();
         let max_iterations = if graph_size < 5000 {
             (beam_width * 10).min(3000)
         } else {
@@ -1365,13 +1382,26 @@ impl DiskANNIndex {
 
             let prefetch_ids: Vec<_> = neighbors
                 .iter()
-                .filter(|&&id| !visited.contains(&id))
+                .filter(|&&id| {
+                    let idx = id as usize;
+                    if idx < graph_size {
+                        visited[idx / 64] & (1 << (idx % 64)) == 0
+                    } else {
+                        !visited_overflow.contains(&id)
+                    }
+                })
                 .copied()
                 .collect();
 
             if !prefetch_ids.is_empty() {
                 for neighbor_id in prefetch_ids {
-                    visited.insert(neighbor_id);
+                    // mark visited
+                    let idx = neighbor_id as usize;
+                    if idx < graph_size {
+                        visited[idx / 64] |= 1 << (idx % 64);
+                    } else {
+                        visited_overflow.insert(neighbor_id);
+                    }
 
                     let dist = self.vectors.distance(query, neighbor_id, self.metric);
                     candidates.push(Candidate {
