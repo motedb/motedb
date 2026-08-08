@@ -1425,17 +1425,18 @@ impl DiskANNIndex {
                     });
                 }
 
-                // Limit to beam_width best candidates. The heap gives
-                // the BEST on pop, so we drain, sort, and rebuild.
+                // Limit to beam_width best candidates.
+                // 🚀 用 select_nth_unstable_by（O(W)）替代 drain+sort+truncate
+                // （O(W log W)）。select_nth 把前 beam_width 小的元素划到左边，
+                // 无需全排序。每轮贪心迭代调用一次，累积省 O(W log W) → O(W)。
                 if candidates.len() > beam_width * 2 {
                     let mut all: Vec<Candidate> = candidates.drain().collect();
-                    all.sort_by(|a, b| {
+                    let (before, _, _) = all.select_nth_unstable_by(beam_width, |a, b| {
                         a.distance
                             .partial_cmp(&b.distance)
                             .unwrap_or(Ordering::Equal)
                     });
-                    all.truncate(beam_width);
-                    candidates.extend(all);
+                    candidates.extend(before.iter().cloned());
                 }
             }
         }

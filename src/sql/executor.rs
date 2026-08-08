@@ -938,6 +938,8 @@ impl StreamingQueryResult {
     }
 
     /// Sort rows by pre-computed sort specs (shared by materialize and for_each)
+    /// 🚀 #[inline]：sort_rows 是 ORDER BY 的热路径，内联比较逻辑减少闭包开销。
+    #[inline]
     fn sort_rows(rows: &mut [Vec<Value>], sort_specs: &[(usize, bool)]) {
         use std::cmp::Ordering;
         rows.sort_by(|a, b| {
@@ -955,6 +957,7 @@ impl StreamingQueryResult {
         });
     }
 
+    #[inline]
     fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (a, b) {
