@@ -26,22 +26,35 @@ const MAX_CONSECUTIVE_FLUSH_ERRORS: u32 = 5;
 struct CachedSSTable {
     bloom: Arc<BloomFilter>,
     handle: Arc<RwLock<SSTable>>,
+    /// 估算内存（mmap 文件大小），用于 SSTableCache 的内存上限淘汰。
+    estimated_bytes: usize,
 }
 
 /// LRU cache for SSTable handles with memory-aware eviction.
+/// 🚀 P0-2: 同时按 entry 数和内存上限淘汰，防止边缘设备 OOM。
 struct SSTableCache {
     cache: RwLock<lru::LruCache<PathBuf, CachedSSTable>>,
     max_entries: usize,
+    /// 内存上限（字节）。0 = 不限制（向后兼容）。
+    max_memory_bytes: usize,
+    /// 当前缓存条目的估算总内存（mmap 大小之和）。
+    current_memory: std::sync::atomic::AtomicUsize,
 }
 
 impl SSTableCache {
     fn new(max_size: usize) -> Self {
+        Self::with_memory_limit(max_size, 0)
+    }
+
+    fn with_memory_limit(max_size: usize, max_memory_mb: usize) -> Self {
         use std::num::NonZeroUsize;
         Self {
             cache: RwLock::new(lru::LruCache::new(
                 NonZeroUsize::new(max_size.max(1)).unwrap(),
             )),
             max_entries: max_size,
+            max_memory_bytes: max_memory_mb.saturating_mul(1024 * 1024),
+            current_memory: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -53,6 +66,7 @@ impl SSTableCache {
                 return Ok(CachedSSTable {
                     bloom: cached.bloom.clone(),
                     handle: cached.handle.clone(),
+                    estimated_bytes: cached.estimated_bytes,
                 });
             }
         }
@@ -63,33 +77,62 @@ impl SSTableCache {
             return Ok(CachedSSTable {
                 bloom: cached.bloom.clone(),
                 handle: cached.handle.clone(),
+                estimated_bytes: cached.estimated_bytes,
             });
         }
 
         // Open new SSTable
         let sstable = SSTable::open(path)?;
+        // 估算内存：用文件大小（mmap 按需分页，但 RSS 受文件大小影响）
+        let estimated_bytes = std::fs::metadata(path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let bloom = Arc::new(sstable.bloom_filter().clone());
         let sstable_arc = Arc::new(RwLock::new(sstable));
 
-        let cached = CachedSSTable {
-            bloom: bloom.clone(),
-            handle: sstable_arc.clone(),
-        };
-
-        // Evict old entries if at capacity
+        // 🚀 Evict old entries — 同时按 entry 数和内存上限淘汰。
+        if self.max_memory_bytes > 0 {
+            while self
+                .current_memory
+                .load(std::sync::atomic::Ordering::Relaxed)
+                + estimated_bytes
+                > self.max_memory_bytes
+            {
+                if let Some((_, evicted)) = cache.pop_lru() {
+                    self.current_memory.fetch_sub(
+                        evicted.estimated_bytes,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                } else {
+                    break;
+                }
+            }
+        }
         while cache.len() >= self.max_entries {
-            cache.pop_lru();
+            if let Some((_, evicted)) = cache.pop_lru() {
+                self.current_memory.fetch_sub(
+                    evicted.estimated_bytes,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
 
+        self.current_memory
+            .fetch_add(estimated_bytes, std::sync::atomic::Ordering::Relaxed);
         cache.put(
             path.clone(),
             CachedSSTable {
-                bloom,
-                handle: sstable_arc,
+                bloom: bloom.clone(),
+                handle: sstable_arc.clone(),
+                estimated_bytes,
             },
         );
 
-        Ok(cached)
+        Ok(CachedSSTable {
+            bloom,
+            handle: sstable_arc,
+            estimated_bytes,
+        })
     }
 
     fn clear(&self) {
@@ -335,7 +378,10 @@ impl LSMEngine {
             flush_lock: Arc::new(Mutex::new(())),
             flush_in_progress: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
-            sstable_cache: Arc::new(SSTableCache::new(config.sstable_cache_size)),
+            sstable_cache: Arc::new(SSTableCache::with_memory_limit(
+                config.sstable_cache_size,
+                config.sstable_cache_memory_limit_mb.unwrap_or(0),
+            )),
             storage_dir,
             config: config.clone(),
             next_sst_id: Arc::new(std::sync::atomic::AtomicU64::new(max_existing_id + 1)),

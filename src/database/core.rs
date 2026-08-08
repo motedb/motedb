@@ -1210,11 +1210,11 @@ impl MoteDB {
                                     )
                                 {
                                     store.recover_from_disk();
-                                    // Pre-compact to single segment so queries
-                                    // use fast SelectColumnar path (zero-copy).
-                                    while store.segment_count() >= 2 {
-                                        let _ = store.force_compact_all();
-                                    }
+                                    // 🚀 P0-1: 不在启动时强制 compaction。
+                                    // prepare_for_query()（store.rs:474）会在首次查询时
+                                    // 按需 compaction（segment_count >= 3 触发）+ 预加载单
+                                    // segment file_data。启动时强制全量合并是 O(N) 写放大，
+                                    // 是冷启动最大开销，且查询路径已能自动处理多 segment。
                                     db.col_segment_stores.insert(table_name, store);
                                 }
                             }
@@ -1339,8 +1339,26 @@ impl MoteDB {
                 }
                 db.table_row_count.insert(table_name.clone(), row_counter);
             } else if let Some(pk_col) = schema.primary_key() {
-                // Pre-warm PK lookup cache from SSTable data
-                db.warm_pk_cache(&table_name, &schema, pk_col);
+                // 🚀 P0-1: ColSegmentStore 表（现代默认）的数据不在 LSM，PK cache
+                // 预热扫 LSM 是无效的全表扫描。跳过——PK 查询走 segment fence-index
+                // （O(log N)，segment.rs:221），row_count 从 segment 恢复（下面）。
+                // 仅 legacy LSM-backed 表预热（数据确实在 LSM）。
+                let is_col_segment = db.col_segment_stores.contains_key(&table_name);
+                if !is_col_segment {
+                    db.warm_pk_cache(&table_name, &schema, pk_col);
+                } else {
+                    // ColSegmentStore: 初始化 PK cache（空）+ 从 segment 恢复 row_count
+                    let pk_cache = Arc::new(crate::database::pk_cache::PkLookupCache::new(
+                        db.pk_lookup_capacity,
+                    ));
+                    db.pk_lookup.insert(table_name.clone(), pk_cache);
+                    let row_counter = Arc::new(AtomicU64::new(0));
+                    if let Some(store) = db.col_segment_stores.get(&table_name) {
+                        let cnt = store.count_live_rows() as u64;
+                        row_counter.store(cnt, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    db.table_row_count.insert(table_name.clone(), row_counter);
+                }
             }
         }
 

@@ -476,7 +476,7 @@ impl Default for DBConfig {
             row_cache_size: Some(2000), // Limit cache (was unlimited 10000)
             pk_lookup_capacity: 5_000,  // was 10_000 — halve for memory
             column_index_buffer_size: 4 * 1024 * 1024, // was 8MB — halve for memory
-            max_result_rows: None,      // No limit
+            max_result_rows: Some(100_000), // 🚀 P0-2: OOM 防护，默认 100K 行上限
             index_update_strategy: IndexUpdateStrategy::default(), // BatchOnly
             query_timeout_secs: Some(30), // 30-second timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
