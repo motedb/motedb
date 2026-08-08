@@ -1,7 +1,7 @@
 /// Query executor - executes SQL statements against storage engine
 use super::ast::*;
 use super::evaluator::ExprEvaluator;
-use super::row_converter::{row_to_sql_row, rows_to_sql_rows, sql_row_to_row};
+use super::row_converter::{row_to_sql_row, rows_to_sql_rows};
 use crate::database::MoteDB;
 use crate::error::{MoteDBError, Result};
 use crate::storage::row_format;
@@ -8531,9 +8531,11 @@ impl QueryExecutor {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
-        let _ = store.flush_buffer(); // ensure buffered rows are visible
-                                      // 🔑 Read-your-writes: check transaction write_set / undo_log first.
-                                      // write_set keys by raw row_id (low 32 bits of composite_key).
+        // 🚀 P1-1: 不在点查前 flush_buffer。store.get() 已支持读 write_buf
+        //（store.rs:509-531 先查 buffer newest version 再查 segment），
+        // 同步 flush 会触发 segment 写盘 + manifest fsync，阻塞点查。
+        // 🔑 Read-your-writes: check transaction write_set / undo_log first.
+        // write_set keys by raw row_id (low 32 bits of composite_key).
         let row_id = composite_key as u32 as RowId;
         let txn_row = self.txn_lookup_row(table_name, row_id);
         let row: Vec<Value> = match txn_row {
@@ -23740,36 +23742,30 @@ impl QueryExecutor {
                 )));
             }
 
-            // Build SqlRow first (reuses existing type coercion via sql_row_to_row)
-            let mut sql_row = SqlRow::new();
-            for (i, col_name) in columns.iter().enumerate() {
-                let val = match &value_row[i] {
-                    Expr::Literal(v) => v.clone(),
+            // 🚀 P1-2: 直接构造 Row（跳过 SqlRow HashMap 中转）。
+            // 旧代码每行每列 sql_row.insert(col_name.clone(), val) —— HashMap 分配
+            // + String clone，对 IMU 1kHz 时序写入是显著开销。直接用
+            // values_to_row_by_columns（和普通 INSERT 同路径，零 HashMap）。
+            let resolved: Vec<crate::types::Value> = value_row
+                .iter()
+                .map(|expr| match expr {
+                    Expr::Literal(v) => Ok(v.clone()),
                     Expr::Parameter(_) => {
                         let empty_row = SqlRow::new();
-                        self.evaluator.eval(&value_row[i], &empty_row)?
+                        self.evaluator.eval(expr, &empty_row)
                     }
-                    // 🚨 Constant-fold negative literals and other constant
-                    // unary expressions. The parser represents `-1e15` and
-                    // `-(5.0)` as `UnaryOp(Minus, Literal(...))`, not as a
-                    // negative Literal. Without this arm, INSERT VALUES
-                    // rejected any value with a leading minus sign.
-                    expr if Self::is_constant_expr(expr) => {
+                    other if Self::is_constant_expr(other) => {
                         let empty_row = SqlRow::new();
-                        self.evaluator.eval(expr, &empty_row)?
+                        self.evaluator.eval(other, &empty_row)
                     }
-                    expr => {
-                        return Err(MoteDBError::InvalidArgument(format!(
-                            "INSERT VALUES must be literals or parameters, got {:?}",
-                            expr
-                        )))
-                    }
-                };
-                sql_row.insert(col_name.clone(), val);
-            }
+                    _ => Err(MoteDBError::InvalidArgument(format!(
+                        "INSERT VALUES must be literals or parameters"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-            // Convert to storage Row (handles type coercion)
-            let row = sql_row_to_row(&sql_row, schema)?;
+            let row =
+                crate::sql::row_converter::values_to_row_by_columns(&resolved, columns, schema)?;
             rows.push(row);
         }
 
