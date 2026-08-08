@@ -87,6 +87,13 @@ impl VectorStorage {
         self.vectors.get(row_id)
     }
 
+    /// 🚀 预加载 quantized 向量到 LRU cache（触发 mmap page fault）。
+    /// 用于 greedy_search 两阶段访存优化：先批量预加载，再串行算距离，
+    /// 让 distance 第二次调 get_quantized 时 cache 命中（无 page fault stall）。
+    fn prefetch(&self, row_id: RowId) {
+        let _ = self.vectors.get_quantized(row_id);
+    }
+
     /// 🚀 Compute distance using optimized SQ8 asymmetric distance
     fn distance(&self, query: &[f32], row_id: RowId, metric: DistanceKind) -> f32 {
         if let Some(qvec) = self.vectors.get_quantized(row_id) {
@@ -1394,6 +1401,14 @@ impl DiskANNIndex {
                 .collect();
 
             if !prefetch_ids.is_empty() {
+                // 🚀 两阶段预加载：先批量触发所有邻居的 get_quantized（mmap page
+                // fault + LRU cache 填充），再串行算距离。第二阶段 distance 调
+                // get_quantized 时 cache 命中，无 page fault stall。
+                // 这是 DiskANN 论文的核心优化（访存与计算重叠）。
+                for &nid in &prefetch_ids {
+                    self.vectors.prefetch(nid);
+                }
+
                 for neighbor_id in prefetch_ids {
                     // mark visited
                     let idx = neighbor_id as usize;
