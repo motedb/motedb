@@ -10528,6 +10528,8 @@ impl QueryExecutor {
                             }
                         };
                         let val = v.clone();
+                        // 🚀 #1: 仅当涉及 Bool 时才 coerce（99% 的 Int/Text PK 直接比较）
+                        let needs_coerce = matches!(v, Value::Bool(_));
                         // If filtering on PK, at most 1 row matches → early-stop.
                         if schema.primary_key().as_deref() == Some(bare) {
                             early_stop_at = 1;
@@ -10536,8 +10538,12 @@ impl QueryExecutor {
                             Some(pos),
                             Box::new(move |fv: Option<&Value>| {
                                 fv.is_some_and(|fv| {
-                                    let (a, b) = coerce_bool_int(fv.clone(), val.clone());
-                                    a == b
+                                    if needs_coerce {
+                                        let (a, b) = coerce_bool_int(fv.clone(), val.clone());
+                                        a == b
+                                    } else {
+                                        fv == &val
+                                    }
                                 })
                             }),
                         )

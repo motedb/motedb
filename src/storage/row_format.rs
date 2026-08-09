@@ -883,7 +883,8 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
 
     let mut buf = Vec::with_capacity(64 + col_count * 16);
     let mut null_bitmap: u64 = 0;
-    let mut var_entries: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut var_entries: Vec<(usize, u32, u32)> = Vec::new();
+    let mut var_data: Vec<u8> = Vec::new();
 
     // Write header (12 bytes)
     buf.extend_from_slice(&RAWROW_MAGIC.to_le_bytes());
@@ -916,7 +917,9 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
                 buf.extend_from_slice(&ts.as_micros().to_le_bytes());
             }
             (Value::Text(t), ColumnType::Text) => {
-                var_entries.push((i, t.as_bytes().to_vec()));
+                let off = var_data.len() as u32;
+                var_data.extend_from_slice(t.as_bytes());
+                var_entries.push((i, off, t.len() as u32));
             }
             (Value::Vector(v), _) => {
                 if v.len() > u16::MAX as usize {
@@ -927,20 +930,20 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
                     )));
                 }
                 let dim = v.len() as u16;
-                let mut encoded = Vec::with_capacity(2 + v.len() * 4);
-                encoded.extend_from_slice(&dim.to_le_bytes());
+                let off = var_data.len() as u32;
+                var_data.extend_from_slice(&dim.to_le_bytes());
                 for f in v.iter() {
-                    encoded.extend_from_slice(&f.to_le_bytes());
+                    var_data.extend_from_slice(&f.to_le_bytes());
                 }
-                var_entries.push((i, encoded));
+                var_entries.push((i, off, (2 + v.len() * 4) as u32));
             }
             (value, _) => {
-                let mut encoded = vec![0xFF];
-                encoded.extend_from_slice(
-                    &bincode::serialize(value)
-                        .map_err(|e| StorageError::Serialization(e.to_string()))?,
-                );
-                var_entries.push((i, encoded));
+                let off = var_data.len() as u32;
+                var_data.push(0xFF);
+                let serialized = bincode::serialize(value)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                var_data.extend_from_slice(&serialized);
+                var_entries.push((i, off, (1 + serialized.len()) as u32));
             }
         }
     }
@@ -948,22 +951,20 @@ pub fn encode(row: &[Value], col_types: &[ColumnType]) -> Result<Vec<u8>> {
     // Patch null_bitmap in header
     buf[4..12].copy_from_slice(&null_bitmap.to_le_bytes());
 
-    // Var section: count + entries + data
+    // Var section: count + header + data
     buf.extend_from_slice(&(var_entries.len() as u16).to_le_bytes());
 
     let var_header_start = buf.len();
     let var_header_size = var_entries.len() * 10;
     buf.resize(buf.len() + var_header_size, 0);
 
-    let mut var_data_offset: usize = 0;
-    for (entry_idx, (col_idx, data)) in var_entries.iter().enumerate() {
+    for (entry_idx, &(col_idx, offset, len)) in var_entries.iter().enumerate() {
         let h_off = var_header_start + entry_idx * 10;
-        buf[h_off..h_off + 2].copy_from_slice(&(*col_idx as u16).to_le_bytes());
-        buf[h_off + 2..h_off + 6].copy_from_slice(&(var_data_offset as u32).to_le_bytes());
-        buf[h_off + 6..h_off + 10].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        buf.extend_from_slice(data);
-        var_data_offset += data.len();
+        buf[h_off..h_off + 2].copy_from_slice(&(col_idx as u16).to_le_bytes());
+        buf[h_off + 2..h_off + 6].copy_from_slice(&offset.to_le_bytes());
+        buf[h_off + 6..h_off + 10].copy_from_slice(&len.to_le_bytes());
     }
+    buf.extend_from_slice(&var_data);
 
     Ok(buf)
 }

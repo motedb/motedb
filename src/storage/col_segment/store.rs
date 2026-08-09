@@ -641,10 +641,12 @@ impl ColSegmentStore {
             // Descending index order within a segment: rows are appended old→new,
             // so iterating n→0 visits the newest (largest index) version of a key
             // first. Combined with `seen`, this keeps the newest version.
+            // 🚀 #7: no-dedup 路径无需分配 Vec<usize>（2M 行段 = 16MB）——直接迭代。
             let order: Vec<usize> = if need_dedup {
                 (0..n).rev().collect()
             } else {
-                (0..n).collect()
+                // 非空 Vec 占位——实际循环用 0..n 迭代器，不消耗这个 Vec。
+                Vec::new()
             };
 
             // Pre-decode filter column (once per segment).
@@ -777,7 +779,15 @@ impl ColSegmentStore {
 
             let ptext_interned: Vec<Vec<Option<Value>>> = Vec::new();
 
-            for &i in &order {
+            // 🚀 #7: 非 dedup 路径用 0..n 迭代器（零分配），dedup 用 order Vec。
+            // 用 Box<dyn Iterator> 统一两种迭代，避免循环体重复。
+            let row_iter: Box<dyn Iterator<Item = usize>> = if need_dedup {
+                Box::new(order.iter().copied())
+            } else {
+                Box::new(0..n)
+            };
+
+            for i in row_iter {
                 let key = seg.sst.row_map.key(i);
                 // Newest-version-wins dedup: skip if a newer version of this key
                 // was already emitted. Mark seen BEFORE the deleted check so a
@@ -2190,29 +2200,55 @@ impl ColSegmentStore {
                     } else {
                         let raw = af.raw_i64_slice();
                         let nulls = af.null_bitmap_bytes();
+                        // 🚀 #3: i128 wrapping_add + 独立 min/max 累加器。
+                        // checked_add 的溢出分支 + min/max 依赖链阻止自动向量化。
+                        // i128 永不溢出（i64 绝对值之和 < 2^127），wrapping_add 可向量化。
+                        // 循环后一次性提升到 i64/f64。
+                        let mut sum128: i128 = if result.has_float {
+                            result.float_sum as i128
+                        } else {
+                            result.int_sum as i128
+                        };
+                        let mut local_min = if result.count > 0 {
+                            result.min_int
+                        } else {
+                            i64::MAX
+                        };
+                        let mut local_max = if result.count > 0 {
+                            result.max_int
+                        } else {
+                            i64::MIN
+                        };
+                        let mut local_count: i64 = 0;
                         for (i, &v) in raw.iter().enumerate().take(n) {
                             if !nulls.is_empty() && (nulls[i / 8] >> (i % 8)) & 1 != 0 {
                                 result.null_count += 1;
                                 continue;
                             }
-                            result.count += 1;
-                            // 🚨 checked_add + float promotion on overflow
-                            // (see matching site above for rationale).
-                            if result.has_float {
-                                result.float_sum += v as f64;
-                            } else if let Some(s) = result.int_sum.checked_add(v) {
+                            local_count += 1;
+                            sum128 = sum128.wrapping_add(v as i128);
+                            if v < local_min {
+                                local_min = v;
+                            }
+                            if v > local_max {
+                                local_max = v;
+                            }
+                        }
+                        result.count += local_count;
+                        if local_count > 0 {
+                            result.min_int = local_min;
+                            result.max_int = local_max;
+                        }
+                        // 一次性提升：i128 → i64（能放下）或 f64（溢出时）
+                        if !result.has_float {
+                            if let Ok(s) = i64::try_from(sum128) {
                                 result.int_sum = s;
                             } else {
                                 result.has_float = true;
-                                result.float_sum = result.int_sum as f64 + v as f64;
+                                result.float_sum = sum128 as f64;
                             }
-                            if result.count == 1 {
-                                result.min_int = v;
-                                result.max_int = v;
-                            } else {
-                                result.min_int = result.min_int.min(v);
-                                result.max_int = result.max_int.max(v);
-                            }
+                        } else {
+                            result.float_sum += sum128 as f64;
                         }
                     }
                 } else {
