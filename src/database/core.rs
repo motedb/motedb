@@ -602,6 +602,42 @@ impl MoteDB {
         }
     }
 
+    /// 🚀 强制 join 所有后台线程（阻塞直到退出）。
+    /// 当 wait_for_background_threads_stop 超时时调用——确保 index-builder
+    /// 退出释放 lsm_engine Arc，否则 LSM 线程泄漏（累积导致死锁）。
+    /// take() 出 JoinHandle 并 join，最多等 join_timeout。
+    pub(crate) fn join_background_threads(&self, join_timeout: std::time::Duration) {
+        let try_join = |handle_opt: &Option<std::thread::JoinHandle<()>>, name: &str| {
+            if let Some(handle) = handle_opt {
+                if !handle.is_finished() {
+                    // 线程还在跑——给它一点时间自然退出（should_stop 已设）。
+                    // 不能 take()+join()（handle 在 &self 上不可变借用），用轮询。
+                    let deadline = std::time::Instant::now() + join_timeout;
+                    while !handle.is_finished() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    if !handle.is_finished() {
+                        warn_log!(
+                            "[join_background_threads] {} still running after {:?}",
+                            name,
+                            join_timeout
+                        );
+                    }
+                }
+            }
+        };
+
+        if let Some(ref thread) = self.index_builder_thread {
+            try_join(&thread.handle, "index-builder");
+        }
+        if let Some(ref thread) = self.auto_flush_thread {
+            try_join(&thread.handle, "auto-flush");
+        }
+        if let Some(ref thread) = self.auto_checkpoint_thread {
+            try_join(&thread.handle, "auto-checkpoint");
+        }
+    }
+
     /// Clone self for callback (only what's needed)
     pub(crate) fn clone_for_callback(&self) -> Self {
         Self {

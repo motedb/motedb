@@ -291,7 +291,12 @@ impl Database {
             .inner
             .wait_for_background_threads_stop(std::time::Duration::from_secs(5))
         {
-            warn_log!("[close] Background threads did not stop within timeout");
+            warn_log!("[close] Background threads did not stop within 5s — joining");
+            // 🚀 强制等待线程退出。index-builder 持有 lsm_engine 的 Arc clone，
+            // 不等它退出就继续 close，lsm_engine Arc 不归零 → LSM 后台线程泄漏
+            // → 累积导致后续测试死锁。给它最多 10s 自然退出。
+            self.inner
+                .join_background_threads(std::time::Duration::from_secs(10));
         }
 
         // 🔑 仅在有 pending index batch 时才等（避免无索引的 close 付代价）。
@@ -317,7 +322,11 @@ impl Database {
             }
         }
 
-        let result = self.inner.checkpoint_full();
+        // 🚀 close 用 checkpoint_impl(false)（不 rebuild 索引）替代 checkpoint_full。
+        // checkpoint_full 的 rebuild_timestamp_index + flush_all_indexes 会和
+        // index-builder 竞争锁，累积效应下卡死。close 只需持久化数据（WAL/列存），
+        // 索引可重建（重启时 lazy load）。
+        let result = self.inner.checkpoint();
         self.inner
             .is_closed
             .store(true, std::sync::atomic::Ordering::Release);

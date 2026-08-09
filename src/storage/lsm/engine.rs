@@ -1504,7 +1504,14 @@ impl LSMEngine {
                     break;
                 }
 
-                if start_wait.elapsed().as_secs() > 120 {
+                if start_wait.elapsed().as_secs() > 10 {
+                    // 🚀 P1: 120s→10s。close/checkpoint 调 flush 时，如果 lsm-flush
+                    // 线程卡住（累积效应导致），120 秒超时让整个进程卡 2 分钟。
+                    // 10 秒足够正常 flush；超时返回错误让 close 继续（数据在
+                    // ColSegmentStore，LSM 是冗余）。
+                    warn_log!(
+                        "[flush] ⚠️ Flush timeout after 10s — background thread may be stuck"
+                    );
                     return Err(StorageError::Transaction(
                         "Flush timeout: background thread may be stuck".into(),
                     ));
@@ -1682,7 +1689,8 @@ impl LSMEngine {
             thread::sleep(Duration::from_millis(1));
             wait_count += 1;
 
-            if wait_count > 120000 {
+            if wait_count > 10000 {
+                // 🚀 120s→10s：同 flush 超时，防止 close 时长时间卡住。
                 return Err(StorageError::Transaction(
                     "rotate_memtable timeout: deadlock?".into(),
                 ));

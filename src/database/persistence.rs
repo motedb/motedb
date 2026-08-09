@@ -274,7 +274,11 @@ impl MoteDB {
             }
         }
 
-        self.lsm_engine.flush()?;
+        // 🚀 lsm.flush() 可能因后台线程卡住超时（累积效应）。ColSegmentStore 是
+        // source of truth，LSM flush 失败不致命——数据已 WAL + ColSegmentStore。
+        if let Err(e) = self.lsm_engine.flush() {
+            warn_log!("[checkpoint] LSM flush failed (non-fatal): {}", e);
+        }
 
         // 🔑 等 index-builder 处理完所有 pending batch 再碰索引。
         // LSM flush 上面触发了 flush callback，往 index-builder channel send 了

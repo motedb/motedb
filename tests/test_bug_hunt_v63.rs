@@ -145,6 +145,7 @@ fn test_index_range_query() {
     db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
         .unwrap();
     db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    db.wait_for_indexes_ready();
     let r = q(&db, "SELECT id FROM t WHERE v >= 30 ORDER BY id");
     assert_eq!(
         r.iter()
@@ -165,6 +166,7 @@ fn test_index_inequality_both_sides() {
     db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)")
         .unwrap();
     db.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    db.wait_for_indexes_ready();
     let r = q(&db, "SELECT id FROM t WHERE v > 10 AND v < 40 ORDER BY id");
     assert_eq!(
         r.iter()
@@ -185,6 +187,7 @@ fn test_index_on_text_column() {
     db.execute("INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'x'),(4,'z')")
         .unwrap();
     db.execute("CREATE INDEX idx_cat ON t(cat)").unwrap();
+    db.wait_for_indexes_ready();
     let r = q(&db, "SELECT id FROM t WHERE cat = 'x' ORDER BY id");
     assert_eq!(r, vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]);
 }
