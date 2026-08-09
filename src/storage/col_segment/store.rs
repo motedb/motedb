@@ -1489,6 +1489,151 @@ impl ColSegmentStore {
         result
     }
 
+    /// 🚀 High-performance scan with an i64 predicate on the filter column.
+    /// Avoids constructing a Value for the filter column entirely — the predicate
+    /// receives `Option<i64>` directly from FixedSegment::get_i64.
+    /// Fast path for `WHERE int_col > N`, `WHERE id = N`, `WHERE ts <= N`.
+    pub fn scan_i64_filtered_limit(
+        &self,
+        filter_col: usize,
+        project_cols: &[usize],
+        i64_predicate: &dyn Fn(Option<i64>) -> bool,
+        limit: usize,
+    ) -> Vec<(u64, Vec<Value>)> {
+        let col_types = self.col_types.load();
+        let cap = if limit == usize::MAX { 65536 } else { limit };
+        let mut result: Vec<(u64, Vec<Value>)> = Vec::with_capacity(cap.min(65536));
+        let segs = self.segments_snapshot();
+        let single_seg = segs.len() <= 1;
+
+        let mut seen: Option<std::collections::HashSet<u64>> = if single_seg {
+            None
+        } else {
+            let total_rows: usize = segs.iter().map(|s| s.sst.num_rows).sum();
+            Some(std::collections::HashSet::with_capacity(total_rows))
+        };
+
+        'outer: for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            let _ = seg.sst.load_full_keys();
+
+            // Filter column: read fixed segment once, predicate gets i64 directly.
+            let fcol_fixed = seg.sst.read_fixed_i64(filter_col).ok();
+
+            // Pre-read output columns.
+            let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols
+                .iter()
+                .map(|&pc| {
+                    if pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed() {
+                        seg.sst.read_fixed_i64(pc).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let ptext_cols: Vec<Option<crate::storage::lsm::columnar::TextSegment>> = project_cols
+                .iter()
+                .map(|&pc| {
+                    if pc < seg.sst.column_tags.len()
+                        && !seg.sst.column_tags[pc].is_fixed()
+                        && !matches!(
+                            seg.sst.column_tags[pc],
+                            crate::storage::lsm::columnar::ColumnTypeTag::Spatial
+                        )
+                    {
+                        seg.sst.read_text(pc).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let all_fixed_project = project_cols
+                .iter()
+                .all(|&pc| pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed());
+
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+
+            // Inner loop: iterate rows in appropriate order.
+            let order_iter: Box<dyn Iterator<Item = usize>> = if let Some(ref _s) = seen {
+                Box::new((0..n).rev())
+            } else {
+                Box::new(0..n)
+            };
+
+            for i in order_iter {
+                let key = seg.sst.row_map.key(i);
+                if let Some(ref mut s) = seen {
+                    if !s.insert(key) {
+                        continue;
+                    }
+                }
+                if has_deletions && seg.sst.row_map.is_deleted(i) {
+                    continue;
+                }
+
+                // 🚀 Filter: get_i64 directly → predicate(Option<i64>)，零 Value 构造。
+                let fval = fcol_fixed.as_ref().and_then(|f| f.get_i64(i));
+                if !i64_predicate(fval) {
+                    continue;
+                }
+
+                // Decode output columns for matching row only.
+                let mut row = Vec::with_capacity(project_cols.len());
+                if all_fixed_project {
+                    for (pi, &pc) in project_cols.iter().enumerate() {
+                        let v = if let Some(Some(ref f)) = pfixed.get(pi) {
+                            match col_types[pc] {
+                                ColumnType::Integer => f.get_i64(i).map(Value::Integer),
+                                ColumnType::Float => f.get_f64(i).map(Value::Float),
+                                ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
+                                ColumnType::Timestamp => f.get_i64(i).map(|m| {
+                                    Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                                }),
+                                _ => Some(Value::Null),
+                            }
+                        } else {
+                            Some(Value::Null)
+                        };
+                        row.push(v.unwrap_or(Value::Null));
+                    }
+                } else {
+                    for (pi, &pc) in project_cols.iter().enumerate() {
+                        let v = if pc < col_types.len() {
+                            match (&pfixed.get(pi), &ptext_cols.get(pi), &col_types[pc]) {
+                                (Some(Some(f)), _, ColumnType::Integer) => {
+                                    f.get_i64(i).map(Value::Integer)
+                                }
+                                (Some(Some(f)), _, ColumnType::Float) => {
+                                    f.get_f64(i).map(Value::Float)
+                                }
+                                (Some(Some(f)), _, ColumnType::Boolean) => {
+                                    f.get_bool(i).map(Value::Bool)
+                                }
+                                (Some(Some(f)), _, ColumnType::Timestamp) => {
+                                    f.get_i64(i).map(|m| {
+                                        Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                                    })
+                                }
+                                (_, Some(Some(t)), ColumnType::Text) => {
+                                    t.get_str(i).map(|s| Value::Text(s.into()))
+                                }
+                                _ => Some(Value::Null),
+                            }
+                        } else {
+                            Some(Value::Null)
+                        };
+                        row.push(v.unwrap_or(Value::Null));
+                    }
+                }
+                result.push((key, row));
+                if result.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+        result
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.read().len()
     }

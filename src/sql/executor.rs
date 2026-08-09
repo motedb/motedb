@@ -10498,6 +10498,43 @@ impl QueryExecutor {
         use crate::sql::ast::{BinaryOperator, Expr};
         let col_types = store.col_types();
 
+        // 🚀 #5: Int 过滤列专用快速路径。
+        // 检测 WHERE int_col <op> <int_literal> 模式，直接构造 i64 predicate。
+        // 覆盖最高频场景：WHERE id > N, WHERE v = N, WHERE ts <= N。
+        // i64 predicate 不构造 Value——每行省 Value 构造 + 析构。
+        if let Some((fc, i64_op, i64_val)) = Self::try_extract_i64_predicate(wc, schema) {
+            if fc < col_types.len()
+                && matches!(col_types[fc], ColumnType::Integer | ColumnType::Timestamp)
+            {
+                let i64_pred: Box<dyn Fn(Option<i64>) -> bool> = match i64_op {
+                    BinaryOperator::Eq => Box::new(move |fv| fv == Some(i64_val)),
+                    BinaryOperator::Ne => {
+                        Box::new(move |fv| fv.is_some_and(|v| v != i64_val))
+                    }
+                    BinaryOperator::Lt => Box::new(move |fv| fv.is_some_and(|v| v < i64_val)),
+                    BinaryOperator::Le => Box::new(move |fv| fv.is_some_and(|v| v <= i64_val)),
+                    BinaryOperator::Gt => Box::new(move |fv| fv.is_some_and(|v| v > i64_val)),
+                    BinaryOperator::Ge => Box::new(move |fv| fv.is_some_and(|v| v >= i64_val)),
+                    _ => Box::new(|_| true),
+                };
+                let early_stop = if schema.primary_key().is_some()
+                    && schema.get_column_position(schema.primary_key().unwrap()) == Some(fc)
+                {
+                    1
+                } else {
+                    usize::MAX
+                };
+                let take_n = offset.saturating_add(limit).min(early_stop);
+                let scanned = store.scan_i64_filtered_limit(fc, out_positions, &*i64_pred, take_n);
+                return Ok(scanned
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(_, row)| row)
+                    .collect());
+            }
+        }
+
         let mut early_stop_at: usize = usize::MAX;
         let (filter_col, pred_box): (Option<usize>, Box<dyn Fn(Option<&Value>) -> bool>) = match wc
         {
@@ -10956,6 +10993,66 @@ impl QueryExecutor {
             .take(limit)
             .map(|(_, row)| row)
             .collect())
+    }
+
+    /// 🚀 #5: 尝试从 WHERE 表达式提取 (col_position, operator, i64_value)。
+    /// 匹配模式：WHERE col <op> literal 或 WHERE literal <op> col。
+    /// 仅当 literal 是 Integer 或 Timestamp（可转 i64）时返回 Some。
+    fn try_extract_i64_predicate(
+        wc: &crate::sql::ast::Expr,
+        schema: &TableSchema,
+    ) -> Option<(usize, crate::sql::ast::BinaryOperator, i64)> {
+        use crate::sql::ast::{BinaryOperator, Expr};
+        match wc {
+            Expr::BinaryOp { left, op, right } => {
+                let op = op.clone();
+                // col <op> literal
+                if let (Expr::Column(cn), Expr::Literal(v)) = (left.as_ref(), right.as_ref()) {
+                    let bare = cn.rsplit('.').next().unwrap_or(cn);
+                    let pos = schema.get_column_position(bare)?;
+                    let i64_val = match v {
+                        Value::Integer(i) => *i,
+                        Value::Timestamp(t) => t.as_micros(),
+                        Value::Bool(b) => {
+                            if *b {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        _ => return None,
+                    };
+                    return Some((pos, op, i64_val));
+                }
+                // literal <op> col → flip operator
+                if let (Expr::Literal(v), Expr::Column(cn)) = (left.as_ref(), right.as_ref()) {
+                    let bare = cn.rsplit('.').next().unwrap_or(cn);
+                    let pos = schema.get_column_position(bare)?;
+                    let i64_val = match v {
+                        Value::Integer(i) => *i,
+                        Value::Timestamp(t) => t.as_micros(),
+                        Value::Bool(b) => {
+                            if *b {
+                                1
+                            } else {
+                                0
+                            }
+                        }
+                        _ => return None,
+                    };
+                    let flipped = match op {
+                        BinaryOperator::Lt => BinaryOperator::Gt,
+                        BinaryOperator::Le => BinaryOperator::Ge,
+                        BinaryOperator::Gt => BinaryOperator::Lt,
+                        BinaryOperator::Ge => BinaryOperator::Le,
+                        other => other,
+                    };
+                    return Some((pos, flipped, i64_val));
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Fallback: general WHERE eval via MergeCursor (handles complex expressions).
