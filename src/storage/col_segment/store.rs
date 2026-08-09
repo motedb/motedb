@@ -779,6 +779,13 @@ impl ColSegmentStore {
 
             let ptext_interned: Vec<Vec<Option<Value>>> = Vec::new();
 
+            // 🚀 #B: 检测所有投影列是否都是 fixed-width（Int/Float/Bool/Timestamp）。
+            // 这是最高频场景（SELECT id,name FROM t 不含 Text/Spatial/Vector）。
+            // all_fixed 时内循环跳过 text/spatial/vector 的 match 分支。
+            let all_fixed_project = project_cols
+                .iter()
+                .all(|&pc| pc < seg.sst.column_tags.len() && seg.sst.column_tags[pc].is_fixed());
+
             // 🚀 #7: 非 dedup 路径用 0..n 迭代器（零分配），dedup 用 order Vec。
             // 用 Box<dyn Iterator> 统一两种迭代，避免循环体重复。
             let row_iter: Box<dyn Iterator<Item = usize>> = if need_dedup {
@@ -799,33 +806,31 @@ impl ColSegmentStore {
                     continue;
                 }
 
-                // Decode filter value only (cheap: single column lookup).
-                let fval: Option<Value> = if filter_col.is_some() {
-                    let v = if let Some(ref f) = fcol_fixed {
-                        match fcol_type {
-                            Some(ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
-                            Some(ColumnType::Float) => f.get_f64(i).map(Value::Float),
-                            Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
-                            // 🚨 Timestamp: decode as Timestamp (micros), not Integer.
-                            // Without this, WHERE filters on TIMESTAMP columns got
-                            // None → predicate always false → empty results.
-                            Some(ColumnType::Timestamp) => f
-                                .get_i64(i)
-                                .map(|m| Value::Timestamp(crate::types::Timestamp::from_micros(m))),
-                            _ => None,
-                        }
-                    } else if let Some(ref t) = fcol_text {
-                        t.get_str(i).map(|s| Value::Text(s.into()))
-                    } else {
-                        None
+                // 🚀 #A: 无过滤时跳过 fval 构造 + predicate 调用。
+                // 当 filter_col=None（SELECT * 无 WHERE），每行不必构造 Value
+                // 和调 predicate（省 Value 构造 + 闭包间接调用）。
+                if filter_col.is_some() {
+                    let fval: Option<Value> = {
+                        let v = if let Some(ref f) = fcol_fixed {
+                            match fcol_type {
+                                Some(ColumnType::Integer) => f.get_i64(i).map(Value::Integer),
+                                Some(ColumnType::Float) => f.get_f64(i).map(Value::Float),
+                                Some(ColumnType::Boolean) => f.get_bool(i).map(Value::Bool),
+                                Some(ColumnType::Timestamp) => f.get_i64(i).map(|m| {
+                                    Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                                }),
+                                _ => None,
+                            }
+                        } else if let Some(ref t) = fcol_text {
+                            t.get_str(i).map(|s| Value::Text(s.into()))
+                        } else {
+                            None
+                        };
+                        v
                     };
-                    v
-                } else {
-                    None
-                };
-
-                if !predicate(fval.as_ref()) {
-                    continue;
+                    if !predicate(fval.as_ref()) {
+                        continue;
+                    }
                 }
 
                 // Decode output columns for matching row only.
@@ -870,6 +875,25 @@ impl ColSegmentStore {
                                     Some(s) => Some(Value::Text(s.into())),
                                     None => Some(Value::Null),
                                 }
+                            }
+                        } else {
+                            Some(Value::Null)
+                        };
+                        row.push(v.unwrap_or(Value::Null));
+                    }
+                } else if all_fixed_project {
+                    // 🚀 #B: 全 fixed 投影列快速路径——跳过 text/spatial/vector match。
+                    // 直接按 col_type 索引 pfixed，无 Option match 开销。
+                    for (pi, &pc) in project_cols.iter().enumerate() {
+                        let v = if let Some(Some(ref f)) = pfixed.get(pi) {
+                            match col_types[pc] {
+                                ColumnType::Integer => f.get_i64(i).map(Value::Integer),
+                                ColumnType::Float => f.get_f64(i).map(Value::Float),
+                                ColumnType::Boolean => f.get_bool(i).map(Value::Bool),
+                                ColumnType::Timestamp => f.get_i64(i).map(|m| {
+                                    Value::Timestamp(crate::types::Timestamp::from_micros(m))
+                                }),
+                                _ => Some(Value::Null),
                             }
                         } else {
                             Some(Value::Null)
