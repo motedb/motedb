@@ -1741,6 +1741,8 @@ impl MoteDB {
                     table_name,
                     col_types.to_vec(),
                 )?;
+                // 🚀 compact_storage: 从 DBConfig 继承到 store
+                store.set_compact_storage(self.compact_storage);
                 v.insert(store.clone());
                 Ok(store)
             }

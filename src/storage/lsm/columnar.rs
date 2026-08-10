@@ -2433,6 +2433,9 @@ pub struct ColumnarSSTableBuilder {
     // value i64::MIN, and f64::NAN collided with stored NaN).
     pub(crate) null_flags: Vec<Vec<bool>>,
     finished: bool,
+    /// 🚀 compact_storage: finish() 时对 Fixed/Text 列也 zstd 压缩。
+    /// 默认 false（O(1) 点查）。ColSegmentStore 从 DBConfig.compact_storage 传入。
+    pub compact_storage: bool,
 }
 
 impl ColumnarSSTableBuilder {
@@ -2453,6 +2456,7 @@ impl ColumnarSSTableBuilder {
             column_buffers: vec![Vec::new(); num_cols],
             null_flags: vec![Vec::new(); num_cols],
             finished: false,
+            compact_storage: false,
         }
     }
 
@@ -3300,7 +3304,9 @@ impl ColumnarSSTableBuilder {
             let is_fixed = col_idx < self.column_tags.len() && self.column_tags[col_idx].is_fixed();
             let is_text = col_idx < self.column_tags.len()
                 && matches!(self.column_tags[col_idx], ColumnTypeTag::Text);
-            let store_uncompressed = is_fixed || is_text;
+            // 🚀 compact_storage 模式：Fixed/Text 列也尝试 Snappy 压缩。
+            // 默认 false（高性能 O(1) 点查），for_edge/robotics/embodied 设 true。
+            let store_uncompressed = (is_fixed || is_text) && !self.compact_storage;
             let seg_data: Vec<u8> = if store_uncompressed {
                 // Store uncompressed — enables O(1)/page-level reads.
                 let mut out = Vec::with_capacity(1 + seg.len());

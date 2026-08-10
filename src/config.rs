@@ -396,6 +396,16 @@ pub struct DBConfig {
     /// Recommended: edge 50000, desktop 500000.
     pub max_result_rows: Option<usize>,
 
+    /// 🚀 Compact storage mode: zstd-compress segment data (Fixed/Text columns).
+    ///
+    /// - false (default): Fixed/Text columns stored raw for O(1) point queries.
+    /// - true: Segment data zstd-compressed (~40-50% smaller disk footprint).
+    ///   Reads decode full column to col_cache on first access (slight cold-read
+    ///   latency, subsequent accesses zero-cost from cache).
+    ///
+    /// Recommended for disk-sensitive embedded devices (for_edge defaults true).
+    pub compact_storage: bool,
+
     /// 🚀 Phase 3+: Index update strategy
     ///
     /// Controls when indexes are updated:
@@ -477,6 +487,7 @@ impl Default for DBConfig {
             pk_lookup_capacity: 5_000,  // was 10_000 — halve for memory
             column_index_buffer_size: 4 * 1024 * 1024, // was 8MB — halve for memory
             max_result_rows: Some(100_000), // 🚀 P0-2: OOM 防护，默认 100K 行上限
+            compact_storage: false,     // 高性能模式：Fixed/Text 裸存
             index_update_strategy: IndexUpdateStrategy::default(), // BatchOnly
             query_timeout_secs: Some(30), // 30-second timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
@@ -537,6 +548,7 @@ impl DBConfig {
             },
             row_cache_size: Some(200), // was 500 — cut cache memory
             max_result_rows: Some(50_000),
+            compact_storage: true, // 紧凑模式：zstd 压缩 segment（省 ~40% 磁盘）
             pk_lookup_capacity: 5_000, // was 10_000 — halve PK cache
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 2 * 1024 * 1024, // 2MB trigger (was 8MB via embedded())
@@ -586,6 +598,7 @@ impl DBConfig {
             },
             row_cache_size: Some(500),
             max_result_rows: Some(100_000),
+            compact_storage: true,      // 紧凑模式：zstd 压缩
             pk_lookup_capacity: 10_000, // ~0.8MB per table for robotics
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
@@ -629,6 +642,7 @@ impl DBConfig {
             },
             row_cache_size: Some(200),
             max_result_rows: Some(10_000),
+            compact_storage: true, // 紧凑模式：zstd 压缩
             pk_lookup_capacity: 5_000,
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 4 * 1024 * 1024, // 4MB

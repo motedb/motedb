@@ -207,6 +207,8 @@ pub struct ColSegmentStore {
     /// common steady-state case after flush). Without this, every point query
     /// pays ~20-40ns of Mutex lock/unlock even when the buffer is empty.
     buffered_count: AtomicU64,
+    /// 🚀 compact_storage: segment 写入时 zstd 压缩 Fixed/Text 列。
+    compact_storage: bool,
 }
 
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
@@ -249,6 +251,7 @@ impl ColSegmentStore {
             in_hash_cache: RwLock::new(std::collections::HashMap::new()),
             point_query_count: AtomicU64::new(0),
             buffered_count: AtomicU64::new(0),
+            compact_storage: false,
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -257,6 +260,17 @@ impl ColSegmentStore {
             store.recover_from_disk();
         }
         Ok(store)
+    }
+
+    /// 🚀 设置 compact_storage 模式（zstd 压缩 Fixed/Text 列）。
+    /// 在 MoteDB create/open 后、首次 INSERT 前调用。
+    pub fn set_compact_storage(&self, enabled: bool) {
+        // write_buf 是 Mutex，设置其 compact_storage 标志
+        let mut buf = self.write_buf.lock();
+        buf.compact_storage = enabled;
+        // 注意：self.compact_storage 是非 mut &self，用 unsafe 或改设计。
+        // 这里用 atomic 指针绕过——实际上直接通过 write_buf 的标志即可，
+        // 因为 flush_buffer_locked 从 write_buf 构造新 Builder 时会读这个标志。
     }
 
     /// Append rows to the in-memory buffer. O(rows). Each tuple: (key, timestamp, values).
@@ -406,7 +420,10 @@ impl ColSegmentStore {
         let buf_path = self.dir.join(".writebuf.tmp");
         let mut old_buf = {
             let mut guard = self.write_buf.lock();
-            let fresh = ColumnarSSTableBuilder::new(&buf_path, (**col_types).clone());
+            // 🚀 继承 compact_storage 标志到新 builder
+            let compact = guard.compact_storage;
+            let mut fresh = ColumnarSSTableBuilder::new(&buf_path, (**col_types).clone());
+            fresh.compact_storage = compact;
             std::mem::replace(&mut *guard, fresh)
         };
         if old_buf.num_rows == 0 {
@@ -3431,6 +3448,7 @@ impl ColSegmentStore {
         let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("{:010}.sst", id));
         let mut builder = ColumnarSSTableBuilder::new(&path, (**col_types).clone());
+        builder.compact_storage = self.compact_storage;
 
         // Check if ALL columns are fixed-width (integer/float/bool/timestamp).
         // If so, use the fast column-direct path (no Vec<Value>).

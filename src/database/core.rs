@@ -143,6 +143,9 @@ pub struct MoteDB {
     /// Maximum rows a single SELECT may return (prevents OOM).
     pub(crate) max_result_rows: Option<usize>,
 
+    /// 🚀 compact_storage: zstd 压缩 segment 的 Fixed/Text 列。
+    pub(crate) compact_storage: bool,
+
     /// PK lookup cache capacity per table (LRU eviction)
     pub(crate) pk_lookup_capacity: usize,
 
@@ -411,6 +414,7 @@ impl MoteDB {
             pk_lookup_capacity: config.pk_lookup_capacity,
             column_index_buffer_size: config.column_index_buffer_size,
             max_result_rows: config.max_result_rows,
+            compact_storage: config.compact_storage,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -673,6 +677,7 @@ impl MoteDB {
             pk_lookup_capacity: self.pk_lookup_capacity,
             column_index_buffer_size: self.column_index_buffer_size,
             max_result_rows: self.max_result_rows,
+            compact_storage: self.compact_storage,
             is_flushing: self.is_flushing.clone(),
             is_pipeline_active: self.is_pipeline_active.clone(), // shared — clones see true when pipeline runs
             pending_index_batches: self.pending_index_batches.clone(),
@@ -1212,6 +1217,7 @@ impl MoteDB {
             pk_lookup_capacity: config.pk_lookup_capacity,
             column_index_buffer_size: config.column_index_buffer_size,
             max_result_rows: config.max_result_rows,
+            compact_storage: config.compact_storage,
             is_flushing: Arc::new(AtomicBool::new(false)),
             is_pipeline_active: Arc::new(AtomicBool::new(false)),
             pending_index_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
