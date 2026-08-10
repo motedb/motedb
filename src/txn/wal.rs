@@ -152,7 +152,9 @@ const WAL_COMPRESS_THRESHOLD: usize = 128;
 impl WALRecord {
     /// Encode WAL record to native binary format.
     fn encode_native(&self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        // 🚀 预分配 64B：大多数 WAL record（单行 InsertRaw）< 128B，
+        // Vec::new() 会多次 realloc，预分配省 2-3 次。
+        let mut buf = Vec::with_capacity(64);
         match self {
             WALRecord::InsertRaw {
                 table_name,
