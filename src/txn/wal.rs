@@ -835,11 +835,13 @@ impl PartitionWAL {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
 
-        // Build native record inline (TAG + header + data)
+        // 🚀 合并 record_body + write_buf 为一次分配。
+        // 先构造 record body 在栈上（或内联），compress 后直接写入 write_buf。
+        // 对不压缩的 record（<128B，大多数 INSERT），零中间分配。
         let table_bytes = table_name.as_bytes();
         let record_len = 1 + 8 + (2 + table_bytes.len()) + 8 + 2 + 4 + raw_data.len();
 
-        // Build record body first (for potential compression)
+        // 构造 record body（用于 compress 检查 + checksum）
         let mut record_body = Vec::with_capacity(record_len);
         record_body.push(TAG_INSERT_RAW);
         record_body.extend_from_slice(&txn_id.to_le_bytes());
@@ -850,16 +852,18 @@ impl PartitionWAL {
         record_body.extend_from_slice(&(raw_data.len() as u32).to_le_bytes());
         record_body.extend_from_slice(raw_data);
 
-        // Compress if worthwhile
+        // Compress if worthwhile (Cow: 不压缩时零分配)
         let payload = Self::compress_if_worthwhile(&record_body);
 
-        let mut write_buf = Vec::with_capacity(20 + payload.len());
-        write_buf.extend_from_slice(&((20 + payload.len()) as u32).to_le_bytes());
+        // 单次分配：直接在 write_buf 上写 header + payload
+        let payload_len = payload.len();
+        let mut write_buf = Vec::with_capacity(20 + payload_len);
+        write_buf.extend_from_slice(&((20 + payload_len) as u32).to_le_bytes());
         write_buf.extend_from_slice(&lsn.to_le_bytes());
         // checksum placeholder (will patch)
         let checksum_offset = write_buf.len();
         write_buf.extend_from_slice(&0u32.to_le_bytes());
-        write_buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        write_buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
 
         // Record body (possibly compressed)
         let record_start = write_buf.len();
@@ -931,9 +935,10 @@ impl PartitionWAL {
     }
 
     /// Compress record data if beneficial. Returns either compressed or original bytes.
-    fn compress_if_worthwhile(data: &[u8]) -> Vec<u8> {
+    fn compress_if_worthwhile(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         if data.len() < WAL_COMPRESS_THRESHOLD {
-            return data.to_vec();
+            // 🚀 零分配：不压缩时返回借用（省 to_vec 的堆分配 + 拷贝）
+            return std::borrow::Cow::Borrowed(data);
         }
         // Try Zstd level 1 compression
         if let Ok(compressed) = zstd::encode_all(data, 1) {
@@ -944,10 +949,10 @@ impl PartitionWAL {
                 out.push(TAG_COMPRESSED);
                 out.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 out.extend_from_slice(&compressed);
-                return out;
+                return std::borrow::Cow::Owned(out);
             }
         }
-        data.to_vec()
+        std::borrow::Cow::Borrowed(data)
     }
 
     /// Write a pre-serialized record with framing (single buffer).

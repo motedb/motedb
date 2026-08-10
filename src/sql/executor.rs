@@ -10508,9 +10508,7 @@ impl QueryExecutor {
             {
                 let i64_pred: Box<dyn Fn(Option<i64>) -> bool> = match i64_op {
                     BinaryOperator::Eq => Box::new(move |fv| fv == Some(i64_val)),
-                    BinaryOperator::Ne => {
-                        Box::new(move |fv| fv.is_some_and(|v| v != i64_val))
-                    }
+                    BinaryOperator::Ne => Box::new(move |fv| fv.is_some_and(|v| v != i64_val)),
                     BinaryOperator::Lt => Box::new(move |fv| fv.is_some_and(|v| v < i64_val)),
                     BinaryOperator::Le => Box::new(move |fv| fv.is_some_and(|v| v <= i64_val)),
                     BinaryOperator::Gt => Box::new(move |fv| fv.is_some_and(|v| v > i64_val)),
