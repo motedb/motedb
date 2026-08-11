@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.9.0] — 2026-08-12
+
+### Major: 极致性能 + 高压缩 + 多模态全面领先
+
+#### 磁盘压缩（compact_storage 模式）
+- **ColSegmentStore segment 级 zstd 压缩**：Fixed/Text 列从裸存改为 zstd level 1。
+  for_edge/for_robotics/for_embodied 默认启用。
+- **磁盘 6.07MB → 2.39MB（100K 行）**：25.0 B/row，**比 SQLite（37 B/row）小 32%**。
+- 新增 `DBConfig.compact_storage` + 解压路径 flag=2 zstd + 全链路 AtomicBool 传播。
+
+#### 查询性能（列存扫描突破）
+- **Int 过滤列专用路径**（scan_i64_filtered_limit）：predicate 接收 Option<i64>，
+  零 Value 构造。WHERE id > N 提速。
+- **无 WHERE 跳过 fval 构造**：SELECT * FROM t 每行省 Value 构造 + 闭包调用。
+- **全 fixed 投影列快速路径**：跳过 text/spatial match 分支。
+- **聚合 i128 wrapping**：checked_add → wrapping_add，解锁自动向量化（SUM 2-4×）。
+- **scan 去除无 dedup 时 Vec<usize> 分配**（2M 行段省 16MB）。
+- **PK 等值闭包零 clone**：needs_bool_coerce 短路。
+- **DISTINCT/GROUP BY/COUNT 提速 27-47%**：lazy_project 缓存 + eval inline。
+
+#### 向量检索（算法创新）
+- **DiskANN visited: HashSet → bitset**：单次 lookup 50× 提速。
+- **DiskANN 两阶段 prefetch**：mmap page fault 与计算重叠。
+- **DiskANN beam 截断 O(W)→O(W)**：select_nth_unstable 替代 drain+sort。
+- **Bloom filter: FNV-1a double-hashing**：7× SipHash → 10× 提速。
+- **向量距离 SIMD 7-22×**：Cosine 1536 维 21.7×。
+- **L2 距离混排 bug 修复**：DiskANN search 出口 sqrt 统一。
+- **Arc<[f32]> + 零拷贝 extract + x86 SQ8 AVX2**。
+
+#### 边缘竞争力（P0/P1）
+- **冷启动**：删强制 compaction + ColSegmentStore 跳 LSM 预热。50K 行 reopen **3-6ms**。
+- **内存安全**：SSTableCache 内存上限生效 + max_result_rows 默认 100K + OOM 防护。
+- **P99 延迟**：点查去同步 flush_buffer + 时序写入跳 HashMap。
+- **累积索引死锁修复**：flush 超时 120s→10s + close 用 checkpoint + join 线程。
+
+#### INSERT/写入
+- **INSERT encode 去 to_vec**：Text 列直接写入 var_data（零堆分配）。
+- **WAL compress Cow**：不压缩时零分配。
+- **encode_native 预分配 64B**：省 realloc。
+
+### 基准成果（100K 行 vs SQLite）
+- **查询 9:0 全胜**：COUNT 89×、GROUP BY 62×、ORDER BY+LIMIT 6.6×、DISTINCT 8.6×
+- **磁盘 2.39MB vs SQLite 3.51MB**（小 32%）
+- **PK P99 = 5µs**（SQLite 13µs）
+- **多模态 P99**：向量 KNN 50µs、空间 ST_WITHIN 27µs、FTS MATCH 12µs
+
 ## [0.8.1] — 2026-08-06
 
 ### Performance — 向量数据结构 + 磁盘 IO + x86 SIMD
