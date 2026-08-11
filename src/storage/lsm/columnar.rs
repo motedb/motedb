@@ -1996,10 +1996,10 @@ impl ColumnarSSTable {
         } else if !self.file_data.is_empty() {
             let s = &self.file_data[value_offset..value_offset + 8];
             i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
-        } else if flag == 1 {
-            // Snappy compressed — can't do O(1) byte read. Return an error so
-            // the caller falls back to the cached full-column decode path
-            // (decode once, reuse via col_cache for subsequent point queries).
+        } else if flag >= 1 {
+            // 🚀 任何压缩格式（Snappy=1, zstd=2）都不能 O(1) 字节读。
+            // 返回错误，让调用方 fallback 到全列解码路径
+            //（decode 一次，后续通过 col_cache 复用）。
             return Err(StorageError::InvalidData(
                 "compressed segment — use full-column decode".into(),
             ));
@@ -2116,6 +2116,12 @@ impl ColumnarSSTable {
         if raw[0] == 1 {
             // Snappy compressed.
             match snap::raw::Decoder::new().decompress_vec(&raw[1..]) {
+                Ok(decompressed) => Ok(decompressed),
+                Err(_) => Ok(raw[1..].to_vec()),
+            }
+        } else if raw[0] == 2 {
+            // 🚀 zstd compressed（compact_storage 模式）
+            match zstd::decode_all(&raw[1..]) {
                 Ok(decompressed) => Ok(decompressed),
                 Err(_) => Ok(raw[1..].to_vec()),
             }

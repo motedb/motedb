@@ -1257,6 +1257,7 @@ impl MoteDB {
                                     // 按需 compaction（segment_count >= 3 触发）+ 预加载单
                                     // segment file_data。启动时强制全量合并是 O(N) 写放大，
                                     // 是冷启动最大开销，且查询路径已能自动处理多 segment。
+                                    store.set_compact_storage(db.compact_storage);
                                     db.col_segment_stores.insert(table_name, store);
                                 }
                             }
