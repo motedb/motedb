@@ -1915,6 +1915,13 @@ impl ColumnarSSTable {
                     Err(_) => std::borrow::Cow::Borrowed(&data[1..]), // fallback: use as-is
                 }
             }
+            2 => {
+                // 🚀 zstd compressed（compact_storage 模式）
+                match zstd::decode_all(&data[1..]) {
+                    Ok(v) => std::borrow::Cow::Owned(v),
+                    Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
+                }
+            }
             _ => std::borrow::Cow::Borrowed(&data[1..]), // uncompressed, skip flag
         }
     }
@@ -3313,8 +3320,23 @@ impl ColumnarSSTableBuilder {
                 out.push(0u8); // flag: uncompressed
                 out.extend_from_slice(seg);
                 out
+            } else if self.compact_storage {
+                // 🚀 compact 模式：zstd level 1（比 Snappy 压缩率高 ~20-30%）。
+                let compressed =
+                    zstd::encode_all(seg.as_slice(), 1).unwrap_or_else(|_| seg.to_vec());
+                if compressed.len() + 1 < seg.len() {
+                    let mut out = Vec::with_capacity(1 + compressed.len());
+                    out.push(2u8); // flag: zstd compressed
+                    out.extend_from_slice(&compressed);
+                    out
+                } else {
+                    let mut out = Vec::with_capacity(1 + seg.len());
+                    out.push(0u8); // flag: uncompressed
+                    out.extend_from_slice(seg);
+                    out
+                }
             } else {
-                // Try Snappy compression — only use if it saves space.
+                // Vector/Spatial: Snappy compression
                 let compressed = snap::raw::Encoder::new()
                     .compress_vec(seg)
                     .unwrap_or_else(|_| seg.clone());
