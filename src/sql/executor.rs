@@ -23115,6 +23115,7 @@ impl QueryExecutor {
                 let seg_bytes = seg.sst.read_segment_bytes(
                     entry.offset as usize,
                     (entry.offset + entry.size) as usize,
+                    col_pos,
                 );
                 let data = seg_bytes.as_ref();
                 let null_bytes = seg.sst.num_rows.div_ceil(8);

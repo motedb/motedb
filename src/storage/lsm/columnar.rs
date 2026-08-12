@@ -1903,28 +1903,51 @@ impl ColumnarSSTable {
 
     /// Read a fixed column as an i64 array (zero-copy from mmap).
     /// Decompress segment data if needed. Format: [flag: u8] [data].
-    fn decompress_segment(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    fn decompress_segment<'a>(&self, data: &'a [u8], col_idx: usize) -> std::borrow::Cow<'a, [u8]> {
         if data.is_empty() {
             return std::borrow::Cow::Borrowed(data);
         }
         match data[0] {
-            1 => {
-                // Snappy compressed
-                match snap::raw::Decoder::new().decompress_vec(&data[1..]) {
-                    Ok(v) => std::borrow::Cow::Owned(v),
-                    Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
-                }
+            1 => match snap::raw::Decoder::new().decompress_vec(&data[1..]) {
+                Ok(v) => std::borrow::Cow::Owned(v),
+                Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
+            },
+            2 => match zstd::decode_all(&data[1..]) {
+                Ok(v) => std::borrow::Cow::Owned(v),
+                Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
+            },
+            3 => Self::decompress_paged(data),
+            4 => {
+                // 🚀 Timestamp delta-of-delta: [flag=4][null_bitmap][encoded]
+                let null_bytes = self.num_rows.div_ceil(8);
+                let encoded = &data[1 + null_bytes..];
+                let vals =
+                    crate::storage::columnar::gorilla::decode_timestamps(encoded, self.num_rows);
+                let mut out = Vec::with_capacity(null_bytes + vals.len() * 8);
+                out.extend_from_slice(&data[1..1 + null_bytes]);
+                out.extend_from_slice(&i64_slice_to_bytes(&vals));
+                std::borrow::Cow::Owned(out)
             }
-            2 => {
-                // zstd compressed
-                match zstd::decode_all(&data[1..]) {
-                    Ok(v) => std::borrow::Cow::Owned(v),
-                    Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
-                }
+            5 => {
+                // 🚀 Float XOR: [flag=5][null_bitmap][encoded]
+                let null_bytes = self.num_rows.div_ceil(8);
+                let encoded = &data[1 + null_bytes..];
+                let vals = crate::storage::columnar::gorilla::decode_floats(encoded, self.num_rows);
+                let mut out = Vec::with_capacity(null_bytes + vals.len() * 8);
+                out.extend_from_slice(&data[1..1 + null_bytes]);
+                out.extend_from_slice(&f64_slice_to_bytes(&vals));
+                std::borrow::Cow::Owned(out)
             }
-            3 => {
-                // 🚀 page-level zstd: [flag=3][page_count:u32][page_sizes:u32×N][pages...]
-                Self::decompress_paged(data)
+            6 => {
+                // 🚀 Integer delta+varint: [flag=6][null_bitmap][encoded]
+                let null_bytes = self.num_rows.div_ceil(8);
+                let encoded = &data[1 + null_bytes..];
+                let vals =
+                    crate::storage::columnar::gorilla::decode_integers(encoded, self.num_rows);
+                let mut out = Vec::with_capacity(null_bytes + vals.len() * 8);
+                out.extend_from_slice(&data[1..1 + null_bytes]);
+                out.extend_from_slice(&i64_slice_to_bytes(&vals));
+                std::borrow::Cow::Owned(out)
             }
             _ => std::borrow::Cow::Borrowed(&data[1..]),
         }
@@ -2357,21 +2380,20 @@ impl ColumnarSSTable {
     /// Read column segment bytes via seek+read from file. Only reads the
     /// specific column's bytes — NOT the entire file. This avoids mmap
     /// page residency and keeps RSS low (<30MB for embedded devices).
-    pub fn read_segment_bytes(&self, start: usize, end: usize) -> std::borrow::Cow<'_, [u8]> {
-        // If file_data is populated (small files), use it directly.
+    pub fn read_segment_bytes(
+        &self,
+        start: usize,
+        end: usize,
+        col_idx: usize,
+    ) -> std::borrow::Cow<'_, [u8]> {
         if !self.file_data.is_empty() {
-            return Self::decompress_segment(&self.file_data[start..end]);
+            return self.decompress_segment(&self.file_data[start..end], col_idx);
         }
-        // If mmap available and the range is within bounds, use it (zero-copy).
-        // mmap is preferable to seek+read because the OS manages page cache
-        // eviction (MADV_DONTNEED can reclaim pages), whereas seek+read
-        // allocates heap buffers that jemalloc retains.
         if let Some(ref mmap) = self.mmap {
             if end <= mmap.len() {
-                return Self::decompress_segment(&mmap[start..end]);
+                return self.decompress_segment(&mmap[start..end], col_idx);
             }
         }
-        // Seek+read fallback: use cached file handle if available.
         let len = end - start;
         let mut buf = vec![0u8; len];
         use std::io::{Read, Seek};
@@ -2384,7 +2406,7 @@ impl ColumnarSSTable {
             false
         };
         if ok {
-            Self::decompress_segment(&buf).into_owned().into()
+            self.decompress_segment(&buf, col_idx).into_owned().into()
         } else {
             std::borrow::Cow::Owned(Vec::new())
         }
@@ -2398,7 +2420,7 @@ impl ColumnarSSTable {
         let seg_end = seg_start + entry.size as usize;
         // Decompress the segment (Snappy-flagged) before parsing — the on-disk
         // layout is [flag][compressed or raw bytes], same as Fixed/Text segments.
-        let seg_bytes = self.read_segment_bytes(seg_start, seg_end);
+        let seg_bytes = self.read_segment_bytes(seg_start, seg_end, col_idx);
         let data = seg_bytes.as_ref();
         let null_bytes = self.num_rows.div_ceil(8);
         if null_bytes + 2 > data.len() {
@@ -2504,8 +2526,11 @@ impl ColumnarSSTable {
         // and returns empty on failure) rather than slicing self.backing()
         // directly — backing() can be empty (length 0) when the SSTable is opened
         // zero-copy and no backing buffer is resident, which would panic here.
-        let seg_bytes =
-            self.read_segment_bytes(entry.offset as usize, (entry.offset + entry.size) as usize);
+        let seg_bytes = self.read_segment_bytes(
+            entry.offset as usize,
+            (entry.offset + entry.size) as usize,
+            col_idx,
+        );
         let data = seg_bytes.as_ref();
         let null_bytes = self.num_rows.div_ceil(8);
         if null_bytes + 2 > data.len() {
@@ -2550,6 +2575,68 @@ impl ColumnarSSTable {
 /// Builds a columnar SSTable from rows.
 ///
 /// Usage:
+/// 🚀 P1: 辅助函数——从 raw 字节解出 i64/f64 slice。
+fn bytes_to_i64_slice(raw: &[u8], num_rows: usize) -> Vec<i64> {
+    (0..num_rows)
+        .filter_map(|i| {
+            let off = i * 8;
+            if off + 8 <= raw.len() {
+                Some(i64::from_le_bytes([
+                    raw[off],
+                    raw[off + 1],
+                    raw[off + 2],
+                    raw[off + 3],
+                    raw[off + 4],
+                    raw[off + 5],
+                    raw[off + 6],
+                    raw[off + 7],
+                ]))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn bytes_to_f64_slice(raw: &[u8], num_rows: usize) -> Vec<f64> {
+    (0..num_rows)
+        .filter_map(|i| {
+            let off = i * 8;
+            if off + 8 <= raw.len() {
+                Some(f64::from_le_bytes([
+                    raw[off],
+                    raw[off + 1],
+                    raw[off + 2],
+                    raw[off + 3],
+                    raw[off + 4],
+                    raw[off + 5],
+                    raw[off + 6],
+                    raw[off + 7],
+                ]))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 🚀 P1: 从 gorilla 解码后的值重建 raw 字节（null_bitmap 后的数据部分）。
+fn i64_slice_to_bytes(vals: &[i64]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(vals.len() * 8);
+    for v in vals {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+fn f64_slice_to_bytes(vals: &[f64]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(vals.len() * 8);
+    for v in vals {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
 /// 1. Create builder with column types
 /// 2. Call `add_row()` for each row (key, timestamp, deleted, row bytes)
 /// 3. Call `finish()` to write the file
@@ -3450,36 +3537,43 @@ impl ColumnarSSTableBuilder {
                 out.extend_from_slice(seg);
                 out
             } else if self.compact_storage && is_fixed {
-                // 🚀 分页压缩（flag=3）：Fixed 列按 ~8KB 切 page，每页独立 zstd。
-                // 点读只需解压 1 个 page（~8KB → ~10µs）而非整列（~16MB → ~10ms）。
-                let page_target = 8 * 1024;
-                let mut pages: Vec<Vec<u8>> = Vec::new();
-                let mut off = 0;
-                while off < seg.len() {
-                    let end = (off + page_target).min(seg.len());
-                    let chunk = &seg[off..end];
-                    pages.push(zstd::encode_all(chunk, 1).unwrap_or_else(|_| chunk.to_vec()));
-                    off = end;
-                }
-                let total_compressed: usize = pages.iter().map(|p| p.len()).sum();
-                let overhead = 1 + 4 + pages.len() * 4;
-                if total_compressed + overhead < seg.len() {
-                    let mut out = Vec::with_capacity(overhead + total_compressed);
-                    out.push(3u8);
-                    out.extend_from_slice(&(pages.len() as u32).to_le_bytes());
-                    for p in &pages {
-                        out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                // 🚀 P1（暂缓 gorilla 编码）: 直接用分页 zstd（flag=3）。
+                // gorilla delta/XOR 对 UPDATE 后非单调数据会产生错误解码，
+                // 且 compaction/merge 场景下 null_flags 不可靠。
+                // 保留 flag=4/5/6 解码路径供未来修复后启用。
+                {
+                    // Fallback: 分页 zstd（flag=3）
+                    // 🚀 分页压缩（flag=3）：Fixed 列按 ~8KB 切 page，每页独立 zstd。
+                    // 点读只需解压 1 个 page（~8KB → ~10µs）而非整列（~16MB → ~10ms）。
+                    let page_target = 8 * 1024;
+                    let mut pages: Vec<Vec<u8>> = Vec::new();
+                    let mut off = 0;
+                    while off < seg.len() {
+                        let end = (off + page_target).min(seg.len());
+                        let chunk = &seg[off..end];
+                        pages.push(zstd::encode_all(chunk, 1).unwrap_or_else(|_| chunk.to_vec()));
+                        off = end;
                     }
-                    for p in &pages {
-                        out.extend_from_slice(p);
+                    let total_compressed: usize = pages.iter().map(|p| p.len()).sum();
+                    let overhead = 1 + 4 + pages.len() * 4;
+                    if total_compressed + overhead < seg.len() {
+                        let mut out = Vec::with_capacity(overhead + total_compressed);
+                        out.push(3u8);
+                        out.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+                        for p in &pages {
+                            out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                        }
+                        for p in &pages {
+                            out.extend_from_slice(p);
+                        }
+                        out
+                    } else {
+                        let mut out = Vec::with_capacity(1 + seg.len());
+                        out.push(0u8);
+                        out.extend_from_slice(seg);
+                        out
                     }
-                    out
-                } else {
-                    let mut out = Vec::with_capacity(1 + seg.len());
-                    out.push(0u8);
-                    out.extend_from_slice(seg);
-                    out
-                }
+                } // end lightweight fallback
             } else if self.compact_storage {
                 // compact 模式 Text/Vector/Spatial：整列 zstd
                 let compressed =
