@@ -1912,18 +1912,99 @@ impl ColumnarSSTable {
                 // Snappy compressed
                 match snap::raw::Decoder::new().decompress_vec(&data[1..]) {
                     Ok(v) => std::borrow::Cow::Owned(v),
-                    Err(_) => std::borrow::Cow::Borrowed(&data[1..]), // fallback: use as-is
+                    Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
                 }
             }
             2 => {
-                // 🚀 zstd compressed（compact_storage 模式）
+                // zstd compressed
                 match zstd::decode_all(&data[1..]) {
                     Ok(v) => std::borrow::Cow::Owned(v),
                     Err(_) => std::borrow::Cow::Borrowed(&data[1..]),
                 }
             }
-            _ => std::borrow::Cow::Borrowed(&data[1..]), // uncompressed, skip flag
+            3 => {
+                // 🚀 page-level zstd: [flag=3][page_count:u32][page_sizes:u32×N][pages...]
+                Self::decompress_paged(data)
+            }
+            _ => std::borrow::Cow::Borrowed(&data[1..]),
         }
+    }
+
+    /// Decompress page-level zstd data. Concatenates all decompressed pages.
+    fn decompress_paged(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+        if data.len() < 5 {
+            return std::borrow::Cow::Borrowed(&data[1..]);
+        }
+        let page_count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        let header_size = 1 + 4 + page_count * 4;
+        if data.len() < header_size {
+            return std::borrow::Cow::Borrowed(&data[1..]);
+        }
+        // Read page sizes
+        let page_sizes: Vec<usize> = (0..page_count)
+            .map(|i| {
+                let off = 5 + i * 4;
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                    as usize
+            })
+            .collect();
+        // Decompress each page and concatenate
+        let mut offset = header_size;
+        let mut result = Vec::new();
+        for &psize in &page_sizes {
+            if offset + psize > data.len() {
+                break;
+            }
+            match zstd::decode_all(&data[offset..offset + psize]) {
+                Ok(decompressed) => result.extend_from_slice(&decompressed),
+                Err(_) => result.extend_from_slice(&data[offset..offset + psize]),
+            }
+            offset += psize;
+        }
+        std::borrow::Cow::Owned(result)
+    }
+
+    /// 🚀 Read a single page from page-level zstd segment data.
+    /// Returns the decompressed bytes of the page containing `byte_offset`.
+    /// Format: [flag=3][page_count:u32][page_sizes:u32×N][pages...]
+    /// page boundaries are in the DECOMPRESSED domain (byte offsets into the
+    /// original uncompressed segment data).
+    fn decompress_single_page(
+        data: &[u8],
+        page_target: usize,
+        byte_offset_in_col: usize,
+    ) -> Option<Vec<u8>> {
+        if data.len() < 5 || data[0] != 3 {
+            return None;
+        }
+        let page_count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        if page_count == 0 {
+            return None;
+        }
+        // Calculate which page the byte_offset falls in
+        let page_idx = byte_offset_in_col / page_target;
+        if page_idx >= page_count {
+            return None;
+        }
+        // Read page_sizes to find the compressed page data
+        let mut compressed_offset = 1 + 4 + page_count * 4;
+        for i in 0..=page_idx {
+            if 5 + i * 4 + 4 > data.len() {
+                return None;
+            }
+            let off = 5 + i * 4;
+            let psize = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                as usize;
+            if i == page_idx {
+                // Found the target page — decompress it
+                if compressed_offset + psize > data.len() {
+                    return None;
+                }
+                return zstd::decode_all(&data[compressed_offset..compressed_offset + psize]).ok();
+            }
+            compressed_offset += psize;
+        }
+        None
     }
 
     /// Read a single fixed-width column value at a specific row index WITHOUT
@@ -1996,10 +2077,46 @@ impl ColumnarSSTable {
         } else if !self.file_data.is_empty() {
             let s = &self.file_data[value_offset..value_offset + 8];
             i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+        } else if flag == 3 {
+            // 🚀 page-level zstd: 解压包含目标行的单个 page（~8KB），
+            // 而非全列 decode（~16MB）。这是分页压缩的核心优势。
+            let page_target = 8 * 1024;
+            // 读取原始 segment 字节（含 flag header）
+            let seg_end = seg_start + entry.size as usize;
+            let raw_seg: &[u8] = if !self.file_data.is_empty() {
+                &self.file_data[seg_start..seg_end]
+            } else if let Some(ref mmap) = self.mmap {
+                if seg_end <= mmap.len() {
+                    &mmap[seg_start..seg_end]
+                } else {
+                    return Err(StorageError::InvalidData("mmap out of bounds".into()));
+                }
+            } else {
+                // seek+read: fallback to full-column decode (cache will help)
+                return Err(StorageError::InvalidData(
+                    "page segment needs file_data/mmap — use full-column decode".into(),
+                ));
+            };
+            // byte_offset_in_col 是在解压后数据中的偏移（null_bitmap 之后）
+            let col_data_offset = null_bytes + row_idx * elem_size;
+            if let Some(page_data) =
+                Self::decompress_single_page(raw_seg, page_target, col_data_offset)
+            {
+                // page_data 是 page_target 大小的解压块。计算页内偏移。
+                let page_start = (col_data_offset / page_target) * page_target;
+                let in_page_offset = col_data_offset - page_start;
+                if in_page_offset + 8 <= page_data.len() {
+                    let s = &page_data[in_page_offset..in_page_offset + 8];
+                    let val = i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
+                    return Ok(Some(val));
+                }
+            }
+            // page 解压失败 — fallback
+            return Err(StorageError::InvalidData(
+                "page decompress failed — use full-column decode".into(),
+            ));
         } else if flag >= 1 {
-            // 🚀 任何压缩格式（Snappy=1, zstd=2）都不能 O(1) 字节读。
-            // 返回错误，让调用方 fallback 到全列解码路径
-            //（decode 一次，后续通过 col_cache 复用）。
+            // Snappy=1 or zstd=2: 不能 O(1)，fallback 到全列解码
             return Err(StorageError::InvalidData(
                 "compressed segment — use full-column decode".into(),
             ));
@@ -2120,10 +2237,16 @@ impl ColumnarSSTable {
                 Err(_) => Ok(raw[1..].to_vec()),
             }
         } else if raw[0] == 2 {
-            // 🚀 zstd compressed（compact_storage 模式）
+            // zstd compressed
             match zstd::decode_all(&raw[1..]) {
                 Ok(decompressed) => Ok(decompressed),
                 Err(_) => Ok(raw[1..].to_vec()),
+            }
+        } else if raw[0] == 3 {
+            // 🚀 page-level zstd — decompress all pages and concatenate
+            match Self::decompress_paged(&raw) {
+                std::borrow::Cow::Owned(v) => Ok(v),
+                std::borrow::Cow::Borrowed(b) => Ok(b.to_vec()),
             }
         } else {
             // Uncompressed — skip flag byte via drain (no realloc).
@@ -3326,18 +3449,49 @@ impl ColumnarSSTableBuilder {
                 out.push(0u8); // flag: uncompressed
                 out.extend_from_slice(seg);
                 out
+            } else if self.compact_storage && is_fixed {
+                // 🚀 分页压缩（flag=3）：Fixed 列按 ~8KB 切 page，每页独立 zstd。
+                // 点读只需解压 1 个 page（~8KB → ~10µs）而非整列（~16MB → ~10ms）。
+                let page_target = 8 * 1024;
+                let mut pages: Vec<Vec<u8>> = Vec::new();
+                let mut off = 0;
+                while off < seg.len() {
+                    let end = (off + page_target).min(seg.len());
+                    let chunk = &seg[off..end];
+                    pages.push(zstd::encode_all(chunk, 1).unwrap_or_else(|_| chunk.to_vec()));
+                    off = end;
+                }
+                let total_compressed: usize = pages.iter().map(|p| p.len()).sum();
+                let overhead = 1 + 4 + pages.len() * 4;
+                if total_compressed + overhead < seg.len() {
+                    let mut out = Vec::with_capacity(overhead + total_compressed);
+                    out.push(3u8);
+                    out.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+                    for p in &pages {
+                        out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                    }
+                    for p in &pages {
+                        out.extend_from_slice(p);
+                    }
+                    out
+                } else {
+                    let mut out = Vec::with_capacity(1 + seg.len());
+                    out.push(0u8);
+                    out.extend_from_slice(seg);
+                    out
+                }
             } else if self.compact_storage {
-                // 🚀 compact 模式：zstd level 1（比 Snappy 压缩率高 ~20-30%）。
+                // compact 模式 Text/Vector/Spatial：整列 zstd
                 let compressed =
                     zstd::encode_all(seg.as_slice(), 1).unwrap_or_else(|_| seg.to_vec());
                 if compressed.len() + 1 < seg.len() {
                     let mut out = Vec::with_capacity(1 + compressed.len());
-                    out.push(2u8); // flag: zstd compressed
+                    out.push(2u8);
                     out.extend_from_slice(&compressed);
                     out
                 } else {
                     let mut out = Vec::with_capacity(1 + seg.len());
-                    out.push(0u8); // flag: uncompressed
+                    out.push(0u8);
                     out.extend_from_slice(seg);
                     out
                 }
