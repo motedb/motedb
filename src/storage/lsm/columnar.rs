@@ -1903,7 +1903,11 @@ impl ColumnarSSTable {
 
     /// Read a fixed column as an i64 array (zero-copy from mmap).
     /// Decompress segment data if needed. Format: [flag: u8] [data].
-    fn decompress_segment<'a>(&self, data: &'a [u8], col_idx: usize) -> std::borrow::Cow<'a, [u8]> {
+    fn decompress_segment<'a>(
+        &self,
+        data: &'a [u8],
+        _col_idx: usize,
+    ) -> std::borrow::Cow<'a, [u8]> {
         if data.is_empty() {
             return std::borrow::Cow::Borrowed(data);
         }
@@ -1992,6 +1996,7 @@ impl ColumnarSSTable {
     /// Format: [flag=3][page_count:u32][page_sizes:u32×N][pages...]
     /// page boundaries are in the DECOMPRESSED domain (byte offsets into the
     /// original uncompressed segment data).
+    #[allow(dead_code)]
     fn decompress_single_page(
         data: &[u8],
         page_target: usize,
@@ -2064,6 +2069,18 @@ impl ColumnarSSTable {
             buf[0]
         };
 
+        // 🔑 BUG FIX: 任何压缩格式（flag ≥ 1）的 segment 不能做 O(1) 字节读。
+        // 旧代码把 file_data 检查放在 flag 检查之前，导致 compact 模式（flag=3）
+        // 的 segment 被当作 flag=0 直接按字节读 → 静默返回压缩字节的垃圾值。
+        // 现在在所有字节偏移计算之前就检查 flag，压缩 segment 一律 fallback
+        // 到全列解码 + col_cache（首次 ~ms，后续命中零开销）。
+        if flag >= 1 {
+            return Err(StorageError::InvalidData(
+                "compressed segment — use full-column decode".into(),
+            ));
+        }
+
+        // flag=0: uncompressed — safe to do O(1) byte reads.
         // Data starts after the flag byte.
         let data_start = seg_start + 1;
         // Null bitmap: data_start .. data_start + null_bytes
@@ -2085,8 +2102,9 @@ impl ColumnarSSTable {
         }
 
         // Read the value (elem_size bytes for Bool, 8 for Integer/Float/Timestamp).
+        // flag=0 (uncompressed) guaranteed by the early return above.
         let val = if elem_size == 1 {
-            // Bool: read 1 byte (0=false, 1=true, 2=NULL sentinel).
+            // Bool: read 1 byte (0=false, 1=true).
             let b = if !self.file_data.is_empty() {
                 self.file_data.get(value_offset).copied().unwrap_or(0)
             } else {
@@ -2094,55 +2112,10 @@ impl ColumnarSSTable {
                 self.read_raw(value_offset, &mut buf)?;
                 buf[0]
             };
-            // The NULL sentinel (2) is already caught by the null bitmap above,
-            // but handle it defensively.
             b as i64
         } else if !self.file_data.is_empty() {
             let s = &self.file_data[value_offset..value_offset + 8];
             i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
-        } else if flag == 3 {
-            // 🚀 page-level zstd: 解压包含目标行的单个 page（~8KB），
-            // 而非全列 decode（~16MB）。这是分页压缩的核心优势。
-            let page_target = 8 * 1024;
-            // 读取原始 segment 字节（含 flag header）
-            let seg_end = seg_start + entry.size as usize;
-            let raw_seg: &[u8] = if !self.file_data.is_empty() {
-                &self.file_data[seg_start..seg_end]
-            } else if let Some(ref mmap) = self.mmap {
-                if seg_end <= mmap.len() {
-                    &mmap[seg_start..seg_end]
-                } else {
-                    return Err(StorageError::InvalidData("mmap out of bounds".into()));
-                }
-            } else {
-                // seek+read: fallback to full-column decode (cache will help)
-                return Err(StorageError::InvalidData(
-                    "page segment needs file_data/mmap — use full-column decode".into(),
-                ));
-            };
-            // byte_offset_in_col 是在解压后数据中的偏移（null_bitmap 之后）
-            let col_data_offset = null_bytes + row_idx * elem_size;
-            if let Some(page_data) =
-                Self::decompress_single_page(raw_seg, page_target, col_data_offset)
-            {
-                // page_data 是 page_target 大小的解压块。计算页内偏移。
-                let page_start = (col_data_offset / page_target) * page_target;
-                let in_page_offset = col_data_offset - page_start;
-                if in_page_offset + 8 <= page_data.len() {
-                    let s = &page_data[in_page_offset..in_page_offset + 8];
-                    let val = i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]);
-                    return Ok(Some(val));
-                }
-            }
-            // page 解压失败 — fallback
-            return Err(StorageError::InvalidData(
-                "page decompress failed — use full-column decode".into(),
-            ));
-        } else if flag >= 1 {
-            // Snappy=1 or zstd=2: 不能 O(1)，fallback 到全列解码
-            return Err(StorageError::InvalidData(
-                "compressed segment — use full-column decode".into(),
-            ));
         } else {
             let mut buf = [0u8; 8];
             self.read_raw(value_offset, &mut buf)?;
@@ -2576,6 +2549,7 @@ impl ColumnarSSTable {
 ///
 /// Usage:
 /// 🚀 P1: 辅助函数——从 raw 字节解出 i64/f64 slice。
+#[allow(dead_code)]
 fn bytes_to_i64_slice(raw: &[u8], num_rows: usize) -> Vec<i64> {
     (0..num_rows)
         .filter_map(|i| {
@@ -2598,6 +2572,7 @@ fn bytes_to_i64_slice(raw: &[u8], num_rows: usize) -> Vec<i64> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn bytes_to_f64_slice(raw: &[u8], num_rows: usize) -> Vec<f64> {
     (0..num_rows)
         .filter_map(|i| {

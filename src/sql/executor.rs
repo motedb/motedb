@@ -10504,7 +10504,10 @@ impl QueryExecutor {
         // i64 predicate 不构造 Value——每行省 Value 构造 + 析构。
         if let Some((fc, i64_op, i64_val)) = Self::try_extract_i64_predicate(wc, schema) {
             if fc < col_types.len()
-                && matches!(col_types[fc], ColumnType::Integer | ColumnType::Timestamp)
+                && matches!(
+                    col_types[fc],
+                    ColumnType::Integer | ColumnType::Timestamp | ColumnType::Boolean
+                )
             {
                 let i64_pred: Box<dyn Fn(Option<i64>) -> bool> = match i64_op {
                     BinaryOperator::Eq => Box::new(move |fv| fv == Some(i64_val)),

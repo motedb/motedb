@@ -42,6 +42,7 @@ struct SSTableCache {
 }
 
 impl SSTableCache {
+    #[allow(dead_code)]
     fn new(max_size: usize) -> Self {
         Self::with_memory_limit(max_size, 0)
     }
