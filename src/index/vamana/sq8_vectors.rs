@@ -382,10 +382,37 @@ impl SQ8Vectors {
     /// Batch insert
     pub fn batch_insert(&self, batch: Vec<(RowId, Vec<f32>)>) -> Result<usize> {
         let mut inserted = 0;
+        let mut dup = 0usize;
+        let mut dim_err = 0usize;
+        let mut other_err = 0usize;
+        let mut first_other: Option<String> = None;
         for (row_id, vector) in batch {
-            if self.insert(row_id, vector).is_ok() {
-                inserted += 1;
+            match self.insert(row_id, vector) {
+                Ok(()) => inserted += 1,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("already exists") {
+                        dup += 1;
+                    } else if msg.contains("dimension") {
+                        dim_err += 1;
+                    } else {
+                        other_err += 1;
+                        if first_other.is_none() {
+                            first_other = Some(msg);
+                        }
+                    }
+                }
             }
+        }
+        if dup + dim_err + other_err > 0 {
+            debug_log!(
+                "[SQ8Vectors::batch_insert] inserted={}, dup={}, dim_mismatch={}, other={} ({:?})",
+                inserted,
+                dup,
+                dim_err,
+                other_err,
+                first_other
+            );
         }
         Ok(inserted)
     }

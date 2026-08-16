@@ -162,8 +162,16 @@ impl MoteDB {
                         indexed_count,
                         elapsed
                     );
-                } else if let Some(col_sst) = self.columnar_sstables.get(table_name) {
-                    // Legacy single-SSTable path.
+                } else if let Some(col_sst) = self
+                    .columnar_sstables
+                    .get(table_name)
+                    .map(|r| r.value().clone())
+                {
+                    // 🔒 The Arc is cloned out of the guard — the read Ref is
+                    // dropped immediately. The old code held it across the
+                    // entire index backfill (full-column reads + sort + batch
+                    // insert + flush, seconds on large tables), blocking any
+                    // concurrent columnar_sstables write on the same shard.
                     let num_rows = col_sst.num_rows;
                     let _ = col_sst.load_full_keys();
                     let mut batch: Vec<(crate::types::Value, RowId)> =

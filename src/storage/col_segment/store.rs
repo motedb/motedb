@@ -1535,6 +1535,10 @@ impl ColSegmentStore {
 
             // Filter column: read fixed segment once, predicate gets i64 directly.
             let fcol_fixed = seg.sst.read_fixed_i64(filter_col).ok();
+            // Boolean columns store 1 byte/row — get_i64 would slice 8 bytes and
+            // panic. Read via get_bool and widen to 0/1 instead.
+            let filter_is_bool =
+                matches!(col_types.get(filter_col), Some(ColumnType::Boolean));
 
             // Pre-read output columns.
             let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols
@@ -1588,7 +1592,13 @@ impl ColSegmentStore {
                 }
 
                 // 🚀 Filter: get_i64 directly → predicate(Option<i64>)，零 Value 构造。
-                let fval = fcol_fixed.as_ref().and_then(|f| f.get_i64(i));
+                let fval = if filter_is_bool {
+                    fcol_fixed
+                        .as_ref()
+                        .and_then(|f| f.get_bool(i).map(|b| if b { 1 } else { 0 }))
+                } else {
+                    fcol_fixed.as_ref().and_then(|f| f.get_i64(i))
+                };
                 if !i64_predicate(fval) {
                     continue;
                 }

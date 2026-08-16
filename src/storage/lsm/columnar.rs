@@ -2259,7 +2259,25 @@ impl ColumnarSSTable {
     pub fn read_text_at(&self, col_idx: usize, row_idx: usize) -> Result<Option<String>> {
         let entry = &self.column_index[col_idx];
         let null_bytes = self.num_rows.div_ceil(8);
-        let data_base = entry.offset as usize + 1; // skip flag byte
+
+        // 🔑 Check the compression flag BEFORE any offset math — same class of
+        // bug as read_fixed_i64_at: compressed segments (flag ≥ 1) can't be
+        // read by raw byte offsets. Fall back to full-column decode.
+        let seg_start = entry.offset as usize;
+        let flag = if !self.file_data.is_empty() {
+            self.file_data.get(seg_start).copied().unwrap_or(0)
+        } else {
+            let mut buf = [0u8; 1];
+            self.read_raw(seg_start, &mut buf)?;
+            buf[0]
+        };
+        if flag >= 1 {
+            return Err(StorageError::InvalidData(
+                "compressed segment — use full-column decode".into(),
+            ));
+        }
+
+        let data_base = seg_start + 1; // skip flag byte
         let offsets_region = data_base + null_bytes;
         let strings_region = offsets_region + (self.num_rows + 1) * 4;
 

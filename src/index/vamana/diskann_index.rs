@@ -349,6 +349,12 @@ impl DiskANNIndex {
         // 1. Insert all vectors to disk
         let _vector_start = Instant::now();
         self.vectors.batch_insert(vectors.clone())?;
+        // 🔑 Flush BEFORE selecting medoid / building the graph: lookup_offset
+        // falls back to binary search over the sidecar index file, which only
+        // contains flushed entries. Without this, ids evicted from the bounded
+        // in-memory LRU (batch larger than cache capacity) are unfindable —
+        // "Failed to get medoid vector" and broken graph builds.
+        self.vectors.flush()?;
         debug_log!("[DiskANN] Vectors written in {:?}", _vector_start.elapsed());
 
         let ids: Vec<RowId> = vectors.iter().map(|(id, _)| *id).collect();
@@ -432,6 +438,10 @@ impl DiskANNIndex {
         // 1. Batch write vectors (single fsync at the end)
         let _vector_write_start = Instant::now();
         self.vectors.batch_insert(vectors.to_vec())?;
+        // 🔑 Same as build(): flush so the sidecar index file covers all
+        // inserted ids before the graph build reads them (bounded-LRU
+        // eviction otherwise makes recent inserts unfindable).
+        self.vectors.flush()?;
         debug_log!(
             "[DiskANN] Vectors written in {:?}",
             _vector_write_start.elapsed()

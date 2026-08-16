@@ -383,7 +383,12 @@ impl Segment {
             }
             buf[0]
         };
-        if flag == 1 {
+        // 🔑 ANY compressed format (flag ≥ 1: Snappy=1, zstd=2, page-zstd=3)
+        // can't serve raw-offset page reads — the bytes at these offsets are
+        // compressed. The old code only checked flag == 1, so compact mode
+        // (flag=3) point queries read zstd bytes as layout offsets and
+        // silently returned "" / NULL / garbage strings.
+        if flag >= 1 {
             // Compressed text — fall back to full-column cache.
             {
                 let mut cache = self.col_cache.lock();

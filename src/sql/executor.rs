@@ -10518,7 +10518,12 @@ impl QueryExecutor {
                     BinaryOperator::Ge => Box::new(move |fv| fv.is_some_and(|v| v >= i64_val)),
                     _ => Box::new(|_| true),
                 };
-                let early_stop = if schema.primary_key().is_some()
+                // Early-stop at 1 match is only valid for equality on the PK
+                // (unique key). Range predicates (id < N, id <= N, ...) must
+                // scan all rows — the old code early-stopped them and
+                // truncated range queries to a single row.
+                let early_stop = if matches!(i64_op, BinaryOperator::Eq)
+                    && schema.primary_key().is_some()
                     && schema.get_column_position(schema.primary_key().unwrap()) == Some(fc)
                 {
                     1
@@ -21050,9 +21055,12 @@ impl QueryExecutor {
             IndexType::Vector => {
                 // create_vector_index already scans existing data and builds the index
                 if let ColumnType::Tensor(dim) = column.col_type {
-                    self.db
-                        .create_vector_index(&index_name, dim, stmt.metric.as_deref())?;
-
+                    // 🔑 Register metadata BEFORE building: create_vector_index
+                    // resolves table/column from index_registry to find the
+                    // vectors. Registering after meant a custom index name
+                    // (e.g. "idx_emb") couldn't be resolved, fell back to
+                    // splitting the name as "table_column" → wrong table →
+                    // silent empty index → 0 search results.
                     let mut metadata = crate::database::index_metadata::IndexMetadata::new(
                         index_name.clone(),
                         stmt.table.clone(),
@@ -21061,6 +21069,9 @@ impl QueryExecutor {
                     );
                     metadata.metric = stmt.metric.clone();
                     self.db.index_registry.register(metadata)?;
+
+                    self.db
+                        .create_vector_index(&index_name, dim, stmt.metric.as_deref())?;
                 } else {
                     unreachable!("Already validated column type");
                 }
@@ -21140,11 +21151,21 @@ impl QueryExecutor {
                 // This allows WHERE optimization to find the index
                 let standard_name = format!("{}.{}", stmt.table, stmt.column);
                 if index_name != standard_name {
-                    // Clone the index reference and register with standard name
-                    if let Some(index_ref) = self.db.column_indexes.get(&index_name) {
-                        self.db
-                            .column_indexes
-                            .insert(standard_name.clone(), index_ref.clone());
+                    // 🔒 Clone the Arc OUT of the guard first. Holding the
+                    // DashMap read Ref from get() across insert() on the SAME
+                    // map self-deadlocks when both keys hash to the same
+                    // shard (~1/N chance) — the intermittent CREATE INDEX hang
+                    // seen across the whole test suite (idx_score/idx_tag/...
+                    // custom names only; default "{table}.{column}" names
+                    // never triggered it because index_name == standard_name
+                    // skips this branch entirely).
+                    let index_ref = self
+                        .db
+                        .column_indexes
+                        .get(&index_name)
+                        .map(|r| r.value().clone());
+                    if let Some(index_ref) = index_ref {
+                        self.db.column_indexes.insert(standard_name, index_ref);
                     }
                 }
 

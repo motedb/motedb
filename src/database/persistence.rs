@@ -358,17 +358,27 @@ impl MoteDB {
         // force_compact_all merges all segments into one, dropping tombstones
         // and old versions. This is the single most effective disk-reduction
         // operation for ColSegmentStore tables.
-        for entry in self.col_segment_stores.iter() {
-            if let Err(e) = entry.force_compact_all() {
+        // 🔒 Snapshot Arcs BEFORE looping — iter() holds shard read locks
+        // while the loop body runs; force_compact_all can take seconds on
+        // large tables, stalling every concurrent INSERT (entry() write on
+        // this map) for the whole compaction. Snapshot-then-work keeps the
+        // shard locks held only for the Arc clones.
+        let stores: Vec<(String, Arc<crate::storage::col_segment::ColSegmentStore>)> = self
+            .col_segment_stores
+            .iter()
+            .map(|e| (e.key().clone(), Arc::clone(e.value())))
+            .collect();
+        for (table_name, store) in stores {
+            if let Err(e) = store.force_compact_all() {
                 debug_log!(
                     "[Flush] ColSegmentStore compaction failed for {}: {:?}",
-                    entry.key(),
+                    table_name,
                     e
                 );
             }
             // Release pages after compaction (old segments are dropped, their
             // mmap pages should be returned to the OS).
-            entry.release_query_memory();
+            store.release_query_memory();
         }
 
         if let Err(e) = self.table_registry.persist_auto_increment_counters() {

@@ -81,7 +81,13 @@ impl MoteDB {
                 let start_time = std::time::Instant::now();
                 let mut vectors_to_index = Vec::new();
 
-                // 🚀 Columnar fast path: read vectors directly from column segment
+                // 🚀 Columnar fast path: read vectors directly from column segment.
+                // 🔑 SYNC FIRST: rows may still live in ColSegmentStore's write
+                // buffer (never flushed) — without the sync the columnar view is
+                // stale/empty and the build silently indexed 0 vectors.
+                if self.col_segment_stores.contains_key(table_name) {
+                    self.sync_col_segment_to_sstables(table_name);
+                }
                 if let Some(col_sst) = self.columnar_sstables.get(table_name) {
                     match col_sst.read_vectors(col_position) {
                         Ok(vectors) => {
@@ -98,52 +104,37 @@ impl MoteDB {
                     }
                 }
 
-                // Fallback: scan LSM tree
+                // Fallback: streaming scan — covers LSM memtable/SSTables AND
+                // columnar stores (it flushes + syncs internally). The old raw
+                // lsm_engine.scan_range fallback only saw LSM data and returned
+                // nothing for ColSegmentStore-resident tables.
                 if vectors_to_index.is_empty() {
-                    let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
-                    let start_key = table_id << 32;
-                    let end_key = (table_id + 1) << 32;
-                    match self.lsm_engine.scan_range(start_key, end_key) {
-                        Ok(entries) => {
-                            for (composite_key, value) in entries {
-                                let row_id = (composite_key & 0xFFFFFFFF) as RowId;
-
-                                let data_bytes: Vec<u8> = match &value.data {
-                                    crate::storage::lsm::ValueData::Inline(bytes) => bytes.to_vec(),
-                                    crate::storage::lsm::ValueData::Blob(blob_ref) => {
-                                        match self.lsm_engine.resolve_blob(blob_ref) {
-                                            Ok(data) => data,
-                                            Err(e) => {
-                                                debug_log!("[create_vector_index] Failed to resolve blob for row {}: {}", row_id, e);
-                                                continue;
-                                            }
+                    match self.scan_table_rows_streaming(table_name) {
+                        Ok(iter) => {
+                            for result in iter {
+                                match result {
+                                    Ok((row_id, row)) => {
+                                        if let Some(crate::types::Value::Vector(vec_data)) =
+                                            row.get(col_position)
+                                        {
+                                            vectors_to_index
+                                                .push((row_id, vec_data.as_slice().to_vec()));
                                         }
                                     }
-                                };
-
-                                if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes)
-                                {
-                                    if let Some(f32_vec) =
-                                        row.get(col_position).and_then(|v| match v {
-                                            crate::types::Value::Vector(vec_data) => {
-                                                Some(vec_data.to_vec())
-                                            }
-                                            crate::types::Value::Tensor(tensor) => {
-                                                Some(tensor.to_f32())
-                                            }
-                                            _ => None,
-                                        })
-                                    {
-                                        vectors_to_index.push((row_id, f32_vec));
+                                    Err(e) => {
+                                        debug_log!(
+                                            "[create_vector_index] scan error: {}",
+                                            e
+                                        );
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            debug_log!("[create_vector_index] scan_range失败: {}", e);
+                            debug_log!("[create_vector_index] streaming scan失败: {}", e);
                         }
                     }
-                } // end fallback
+                }
 
                 let scan_time = start_time.elapsed();
 

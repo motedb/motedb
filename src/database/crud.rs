@@ -389,8 +389,16 @@ impl MoteDB {
                 store.flush_buffer()?;
                 // Release mmap pages from old segments so RSS stays low.
                 // Pages re-fault from OS page cache on next read.
-                for entry in self.col_segment_stores.iter() {
-                    entry.release_query_memory();
+                // 🔒 Snapshot Arcs BEFORE looping: DashMap::iter() holds shard
+                // read locks while the loop body runs — doing (possibly slow)
+                // release work under those locks stalls writers on this map.
+                let stores: Vec<Arc<crate::storage::col_segment::ColSegmentStore>> = self
+                    .col_segment_stores
+                    .iter()
+                    .map(|e| Arc::clone(e.value()))
+                    .collect();
+                for s in stores {
+                    s.release_query_memory();
                 }
                 // Purge freed heap to OS (jemalloc arena purge on all platforms).
                 crate::purge_memory_to_os();
@@ -1732,20 +1740,36 @@ impl MoteDB {
         // 🔑 Atomic entry-based creation (fixes concurrent INSERT data loss).
         // 🔑 PERF: takes &[ColumnType] so callers don't pay a to_vec() when the
         // store already exists (the common case — every INSERT after the first).
+        //
+        // 🔒 LOCK DISCIPLINE: the Vacant arm used to run ColSegmentStore::create
+        // (directory + file I/O) while HOLDING the shard write lock via the
+        // VacantEntry guard. Any other thread blocked on that shard (iter(),
+        // entry(), insert()) stalled for the whole I/O duration — the signature
+        // of the intermittent full-suite deadlock (thread stuck in
+        // DashMap::_insert with every other thread idle). Create the store
+        // OUTSIDE any map lock, then race-insert via entry(): losers drop their
+        // fresh store and reuse the winner's.
+        if let Some(store) = self.get_col_segment_store(table_name) {
+            return Ok(store);
+        }
+        // Create OUTSIDE any map lock (directory + file I/O). Holding the
+        // shard write lock across I/O stalled every other thread touching
+        // this map — the signature of the intermittent suite-wide deadlock.
+        let store = crate::storage::col_segment::ColSegmentStore::create(
+            &self.path,
+            table_name,
+            col_types.to_vec(),
+        )?;
+        // 🚀 compact_storage: 从 DBConfig 继承到 store
+        store.set_compact_storage(self.compact_storage);
+        // Race-safe publish: winner inserts, loser reuses the winner's store.
         use dashmap::mapref::entry::Entry;
         match self.col_segment_stores.entry(table_name.to_string()) {
-            Entry::Occupied(o) => Ok(o.get().clone()),
             Entry::Vacant(v) => {
-                let store = crate::storage::col_segment::ColSegmentStore::create(
-                    &self.path,
-                    table_name,
-                    col_types.to_vec(),
-                )?;
-                // 🚀 compact_storage: 从 DBConfig 继承到 store
-                store.set_compact_storage(self.compact_storage);
                 v.insert(store.clone());
                 Ok(store)
             }
+            Entry::Occupied(o) => Ok(o.get().clone()),
         }
     }
 
@@ -1775,7 +1799,14 @@ impl MoteDB {
     /// same Arc<ColumnarSSTable> so they observe the data without cloning.
     /// Idempotent: safe to call before any query that uses legacy columnar reads.
     pub fn sync_col_segment_to_sstables(&self, table_name: &str) {
-        if let Some(store) = self.col_segment_stores.get(table_name) {
+        // 🔒 Clone the Arc out of the guard immediately — the old code held the
+        // DashMap read Ref across flush_buffer/force_compact_all (heavy I/O),
+        // blocking any writer on this shard for the whole compaction.
+        let store = match self.get_col_segment_store(table_name) {
+            Some(s) => s,
+            None => return,
+        };
+        {
             let _ = store.flush_buffer();
             // 🔑 PERF: only compact + release pages when there are 2+ segments.
             // The old code always ran clear_cache()+release_pages() even for a
@@ -1983,15 +2014,39 @@ impl MoteDB {
 
         // Find matching row indices by scanning the filter column
         let mut match_indices: Vec<usize> = Vec::new();
+        // Boolean columns store 1 byte/row; get_i64/get_f64 would slice 8 bytes
+        // and panic. Route bool columns through get_bool, comparing against the
+        // integer/bool literal's truthiness (TRUE↔non-zero).
+        let filter_is_bool = matches!(
+            col_types.get(filter_col),
+            Some(crate::types::ColumnType::Boolean)
+        );
         for row_idx in 0..col_sst.num_rows {
             if col_sst.row_map.is_deleted(row_idx) {
                 continue;
             }
             let matches = match &segments[filter_col] {
                 ColumnarSegment::Fixed(f) => match filter_value {
-                    crate::types::Value::Integer(iv) => f.get_i64(row_idx) == Some(*iv),
+                    crate::types::Value::Integer(iv) => {
+                        if filter_is_bool {
+                            f.get_bool(row_idx) == Some(*iv != 0)
+                        } else {
+                            f.get_i64(row_idx) == Some(*iv)
+                        }
+                    }
+                    crate::types::Value::Bool(bv) => {
+                        if filter_is_bool {
+                            f.get_bool(row_idx) == Some(*bv)
+                        } else {
+                            f.get_i64(row_idx) == Some(if *bv { 1 } else { 0 })
+                        }
+                    }
                     crate::types::Value::Float(fv) => {
-                        (f.get_f64(row_idx).unwrap_or(f64::NAN) - fv).abs() < f64::EPSILON
+                        if filter_is_bool {
+                            false
+                        } else {
+                            (f.get_f64(row_idx).unwrap_or(f64::NAN) - fv).abs() < f64::EPSILON
+                        }
                     }
                     _ => false,
                 },

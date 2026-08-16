@@ -312,11 +312,20 @@ impl Database {
         // in-memory INSERT data (the write buffer) is lost on close — the
         // large_batch_durability bug (10000 rows → 5000 after reopen). The
         // second batch was in the buffer, never flushed, dropped on close.
-        for entry in self.inner.col_segment_stores.iter() {
-            let _ = entry.value().flush_buffer();
+        // 🔒 Snapshot Arcs first — iter() holds shard read locks while the loop
+        // runs flush/compaction I/O; that stalls writers on this map (the
+        // intermittent-hang signature).
+        let stores: Vec<Arc<crate::storage::col_segment::ColSegmentStore>> = self
+            .inner
+            .col_segment_stores
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for store in stores {
+            let _ = store.flush_buffer();
             // Compact to a single segment so the reopen sees all data in one place.
-            while entry.value().segment_count() >= 2 {
-                if entry.value().force_compact_all().is_err() {
+            while store.segment_count() >= 2 {
+                if store.force_compact_all().is_err() {
                     break;
                 }
             }
@@ -822,15 +831,36 @@ impl Database {
                 }
             }
         } else {
-            let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-            match self
-                .inner
-                .pk_lookup
-                .get(&meta.table_name)
-                .and_then(|lookup| lookup.get_pk(&pk_key))
-            {
-                Some(rid) => rid,
-                None => return Ok(None), // PK cache miss — fall back to full path
+            match pk_value {
+                // 🔑 Integer PKs have a deterministic row_id mapping (see the
+                // insert path in crud.rs): row_id = pk for ≥ 0, and negatives
+                // map to the high-u32 range. The raw-SQL fast path
+                // (fast_col_segment_pk_select) already relies on this — the
+                // prepared path previously required the lazily-populated
+                // pk_lookup cache and, on miss, fell back to a FULL TABLE SCAN
+                // (1.4ms at 100K rows vs ~1µs).
+                Value::Integer(id) => {
+                    if *id >= 0 {
+                        *id as RowId
+                    } else {
+                        0x8000_0000u64 | (*id as u64 & 0x7FFF_FFFF)
+                    }
+                }
+                // Non-Integer PKs need the pk_lookup cache; a miss does NOT
+                // mean absence — return None so the caller falls back to the
+                // full executor path.
+                _ => {
+                    let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+                    match self
+                        .inner
+                        .pk_lookup
+                        .get(&meta.table_name)
+                        .and_then(|lookup| lookup.get_pk(&pk_key))
+                    {
+                        Some(rid) => rid,
+                        None => return Ok(None), // PK cache miss — fall back to full path
+                    }
+                }
             }
         };
 
