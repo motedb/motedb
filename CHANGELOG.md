@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.9.1] — 2026-08-16
+
+### 全面测试驱动：7 项缺陷修复 + 死锁根治
+
+正确性回归：全套件 **3590 通过 / 0 失败 / 零挂起**（修复前 3538/21/每轮挂 3-4 次）。
+
+#### 正确性
+- **BOOLEAN 列 WHERE panic**（16 个测试）：scan_i64_filtered_limit 对 1 字节/行
+  的 bool 列按 8 字节 get_i64 切片越界；过滤路径 Integer/Bool 过滤值对 bool 列
+  分流到 get_bool（store.rs + crud.rs）。
+- **PK 范围查询被截断为 1 行**：i64 快路径对 PK 列所有算子 early_stop=1（假设
+  等值点查），`WHERE id <= N` / `WHERE id < 0` 只返回 1 行——仅 Eq 允许早停。
+- **compact 模式 TEXT 点查返回垃圾**（flag=3 分页 zstd 漏检）：read_text_paged
+  仅检查 flag==1（Snappy），zstd 段按未压缩布局读压缩字节返回 ""/Null——
+  flag>=1 一律回退全列解码；read_text_at 同修。
+- **负数主键 / DELETE 可见性**随 PK 截断修复一并解决。
+
+#### 向量检索
+- **向量索引永远返回空结果**（3 处叠加）：①元数据注册后置致自定义索引名
+  解析失败、静默建空索引；②构建数据源读不到未 flush 行；③批量插入后
+  sidecar 索引未落盘致 "Failed to get medoid vector"（建图前 flush 重建）。
+  KNN_SEARCH / ORDER BY <-> 全部恢复正常。
+
+#### 并发
+- **CREATE INDEX 间歇自死锁根治**（~1/40 每索引，全套件每轮挂 1-4 次）：
+  column_indexes.get() 读守卫存活期间对同 map insert，自定义索引名与标准名
+  同分片时写锁被自身读锁挡死。验证：300 轮压力 ×2 均 0 挂起。
+- **持 DashMap 锁做重 I/O 全部改为快照 Arc**：flush 全表 compaction /
+  CREATE INDEX 回填 / close compaction / get_or_create 建店 / sync 持 Ref
+  （原会阻塞并发写整个 I/O 时长，表现为秒级"卡死"）。
+
+#### 性能
+- **prepared 点查 p50 1455µs → 0µs**：非自增整型 PK 改用确定性 row_id 映射，
+  不再因 pk_lookup miss 退回全表扫描（现超 SQLite prepared 的 1µs）。
+- **INSERT 390K → 555K rows/s（+42%）**，**并发 INSERT +95%**（锁纪律副产品）。
+
 ## [0.9.0] — 2026-08-12
 
 ### Major: 极致性能 + 高压缩 + 多模态全面领先
