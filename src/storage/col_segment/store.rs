@@ -1537,8 +1537,7 @@ impl ColSegmentStore {
             let fcol_fixed = seg.sst.read_fixed_i64(filter_col).ok();
             // Boolean columns store 1 byte/row — get_i64 would slice 8 bytes and
             // panic. Read via get_bool and widen to 0/1 instead.
-            let filter_is_bool =
-                matches!(col_types.get(filter_col), Some(ColumnType::Boolean));
+            let filter_is_bool = matches!(col_types.get(filter_col), Some(ColumnType::Boolean));
 
             // Pre-read output columns.
             let pfixed: Vec<Option<crate::storage::lsm::columnar::FixedSegment>> = project_cols

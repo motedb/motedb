@@ -122,10 +122,7 @@ impl MoteDB {
                                         }
                                     }
                                     Err(e) => {
-                                        debug_log!(
-                                            "[create_vector_index] scan error: {}",
-                                            e
-                                        );
+                                        debug_log!("[create_vector_index] scan error: {}", e);
                                     }
                                 }
                             }
