@@ -13,7 +13,7 @@
 //! Usage:
 //!   cargo run --release --example bench_vs_sqlite
 
-use motedb::{DBConfig, Database, QueryResult};
+use motedb::{DBConfig, Database};
 use rusqlite::Connection;
 use std::time::Instant;
 use tempfile::TempDir;
@@ -69,7 +69,7 @@ fn gen_data(n: usize) -> Vec<(String, f64, &'static str)> {
 struct MoteDBBench {
     db: Database,
     _dir: TempDir,
-    n: usize,
+    _n: usize,
 }
 
 impl MoteDBBench {
@@ -79,7 +79,11 @@ impl MoteDBBench {
         config.max_result_rows = None;
         let db = Database::create_with_config(dir.path(), config).unwrap();
         db.execute("CREATE TABLE sales (id INT PRIMARY KEY AUTO_INCREMENT, customer TEXT, amount FLOAT, region TEXT)").unwrap();
-        Self { db, _dir: dir, n }
+        Self {
+            db,
+            _dir: dir,
+            _n: n,
+        }
     }
 
     fn insert(&self, data: &[(String, f64, &'static str)]) -> u128 {
@@ -176,7 +180,7 @@ impl MoteDBBench {
 
 struct SQLiteBench {
     conn: Connection,
-    n: usize,
+    _n: usize,
 }
 
 impl SQLiteBench {
@@ -200,7 +204,7 @@ impl SQLiteBench {
         )
         .unwrap();
         conn.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT, amount REAL, region TEXT)", []).unwrap();
-        Self { conn, n }
+        Self { conn, _n: n }
     }
 
     fn insert(&self, data: &[(String, f64, &'static str)]) -> u128 {
@@ -243,25 +247,7 @@ impl SQLiteBench {
                 let mut stmt = self.conn.prepare(sql).unwrap();
                 let mut rows = stmt.query([]).unwrap();
                 let mut count = 0;
-                while let Some(_) = rows.next().unwrap() {
-                    count += 1;
-                }
-                row_count = count;
-            },
-            2,
-            10,
-        );
-        (row_count, us)
-    }
-
-    fn query_prepared(&self, sql: &str) -> (usize, u64) {
-        let mut stmt = self.conn.prepare(sql).unwrap();
-        let mut row_count = 0;
-        let us = bench_us(
-            || {
-                let mut rows = stmt.query([]).unwrap();
-                let mut count = 0;
-                while let Some(_) = rows.next().unwrap() {
+                while rows.next().unwrap().is_some() {
                     count += 1;
                 }
                 row_count = count;
@@ -312,7 +298,7 @@ fn main() {
 
     println!("  ┌─ Setup Phase ──────────────────────────────────────────────────┐");
 
-    let rss_before = get_rss_kb();
+    let _rss_before = get_rss_kb();
 
     // MoteDB setup — SQL INSERT path
     let mote = MoteDBBench::setup(n);
@@ -437,8 +423,8 @@ fn main() {
 
     // PK operations (need special handling)
     let mid = n / 2;
-    let (mote_rows, mote_us) = mote.pk_select(mid);
-    let (sqlite_rows, sqlite_us) = sqlite.pk_select(mid);
+    let (_mote_rows, mote_us) = mote.pk_select(mid);
+    let (_sqlite_rows, sqlite_us) = sqlite.pk_select(mid);
     let ratio = mote_us as f64 / sqlite_us as f64;
     if mote_us <= sqlite_us {
         mote_wins += 1;
@@ -458,8 +444,8 @@ fn main() {
         }
     );
 
-    let (mote_rows, mote_us) = mote.pk_update(mid);
-    let (sqlite_rows, sqlite_us) = sqlite.pk_update(mid);
+    let (_mote_rows, mote_us) = mote.pk_update(mid);
+    let (_sqlite_rows, sqlite_us) = sqlite.pk_update(mid);
     let ratio = mote_us as f64 / sqlite_us as f64;
     if mote_us <= sqlite_us {
         mote_wins += 1;
@@ -482,7 +468,7 @@ fn main() {
     // Row count verification
     println!("  │");
     println!("  │  Row count verification (MoteDB / SQLite):");
-    for (label, mote_us, sqlite_us, mr, sr) in &results {
+    for (label, _mote_us, _sqlite_us, mr, sr) in &results {
         let check = if mr == sr { "✓" } else { "✗ MISMATCH" };
         println!("  │    {:34} {:>6} / {:<6} {}", label, mr, sr, check);
     }

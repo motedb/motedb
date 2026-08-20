@@ -1105,10 +1105,7 @@ impl Database {
                         values.len()
                     )));
                 }
-                match crate::sql::row_converter::values_to_row_schema_order(&values, &schema) {
-                    Ok(r) => r,
-                    Err(e) => return Err(e),
-                }
+                crate::sql::row_converter::values_to_row_schema_order(&values, &schema)?
             };
             rows.push(row);
         }
@@ -1722,7 +1719,7 @@ impl Database {
             };
             return self.finish_fast_pk_select(
                 table_name,
-                &schema,
+                schema,
                 row,
                 select_part,
                 is_star,
@@ -1743,7 +1740,7 @@ impl Database {
                 }));
             }
         };
-        self.finish_fast_pk_select(table_name, &schema, row, select_part, is_star, column_names)
+        self.finish_fast_pk_select(table_name, schema, row, select_part, is_star, column_names)
     }
 
     /// Shared projection tail for fast_col_segment_pk_select — used by both

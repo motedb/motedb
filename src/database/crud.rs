@@ -1569,7 +1569,7 @@ impl MoteDB {
         let has_nullable = schema.columns.iter().any(|c| c.nullable);
         Ok(TableRowStreamingIterator {
             inner: TableRowStreamingInner::Lsm {
-                lsm_iter,
+                lsm_iter: Box::new(lsm_iter),
                 decode_ctx: {
                     let mut ctx = crate::storage::row_format::SchemaDecodeContext::new(col_types);
                     ctx.trust_utf8 = true; // Data encoded by MoteDB, safe to skip UTF-8 validation
@@ -2595,7 +2595,7 @@ impl MoteDB {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if matches!(pk_col.col_type, crate::types::ColumnType::Integer) {
-                        for (_i, row) in rows.iter().enumerate() {
+                        for row in rows.iter() {
                             if let Some(Value::Integer(pk_val)) = row.get(pk_col.position) {
                                 let rid = if *pk_val >= 0 {
                                     *pk_val as u64
@@ -3456,7 +3456,7 @@ pub struct TableRowStreamingIterator {
 enum TableRowStreamingInner {
     /// LSM row-store backed scan.
     Lsm {
-        lsm_iter: crate::storage::lsm::MergingIterator,
+        lsm_iter: Box<crate::storage::lsm::MergingIterator>,
         decode_ctx: Option<crate::storage::row_format::SchemaDecodeContext>,
         use_raw: bool,
     },

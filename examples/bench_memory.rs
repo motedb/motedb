@@ -27,7 +27,7 @@ fn main() {
     let dir = TempDir::new().unwrap();
     let mut config = DBConfig::for_edge();
     config.max_result_rows = None;
-    let rss0 = get_rss_kb();
+    let _rss0 = get_rss_kb();
 
     println!(
         "  {:>12} rows | {:>10} KB | {:>8} B/row | phase",
@@ -201,7 +201,7 @@ fn main() {
     db.execute("UPDATE t SET val = 999.99 WHERE code = 'CD_42'")
         .unwrap();
     let update_ms = t0.elapsed().as_millis();
-    let rss_after_update = get_rss_kb();
+    let _rss_after_update = get_rss_kb();
 
     let t0 = Instant::now();
     db.execute("DELETE FROM t WHERE id BETWEEN 1 AND 100")

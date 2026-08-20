@@ -1504,8 +1504,10 @@ mod tests {
         let (registry, schema) = make_registry_and_schema(&dir);
         let table_id = registry.get_table_id("sensors").unwrap();
 
-        let mut config = ColumnarConfig::default();
-        config.buffer_row_capacity = 10; // small buffer for testing
+        let config = ColumnarConfig {
+            buffer_row_capacity: 10, // small buffer for testing
+            ..Default::default()
+        };
 
         let store = ColumnarStore::create(
             dir.path().join("columnar").as_path(),
@@ -1626,11 +1628,13 @@ mod tests {
         let (registry, schema) = make_registry_and_schema(&dir);
         let table_id = registry.get_table_id("sensors").unwrap();
 
-        let mut config = ColumnarConfig::default();
-        config.buffer_row_capacity = 10; // small buffer → frequent flushes
-        config.enable_merge = true;
-        config.merge_threshold_segments = 4; // merge when >= 4 segments
-        config.segment_target_rows = 100; // merge small segments into one with up to 100 rows
+        let config = ColumnarConfig {
+            buffer_row_capacity: 10, // small buffer → frequent flushes
+            enable_merge: true,
+            merge_threshold_segments: 4, // merge when >= 4 segments
+            segment_target_rows: 100,    // merge small segments into one with up to 100 rows
+            ..Default::default()
+        };
 
         let store = ColumnarStore::create(
             dir.path().join("columnar").as_path(),

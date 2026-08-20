@@ -414,7 +414,7 @@ impl BlobStore {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                if let Ok(file_id) = u32::from_str_radix(name, 10) {
+                if let Ok(file_id) = name.parse::<u32>() {
                     // Never delete the current active file
                     if file_id == current_file_id {
                         continue;

@@ -211,6 +211,10 @@ impl ChunkedDictionary {
         self.metadata.read().total_terms
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Flush all dirty chunks to disk and clear cache to free memory
     pub fn flush(&self) -> Result<()> {
         let mut cache = self.cache.write();

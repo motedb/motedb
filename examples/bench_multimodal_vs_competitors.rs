@@ -9,7 +9,7 @@
 
 use motedb::{DBConfig, Database};
 use rusqlite::{params, Connection};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tempfile::TempDir;
 
 fn get_rss_mb() -> f64 {
@@ -358,13 +358,13 @@ fn bench_text_search() {
     }
 
     // LIKE prefix comparison
-    let (mote_like_p50, _, mote_like_avg) = measure_us(
+    let (mote_like_p50, _, _mote_like_avg) = measure_us(
         || {
             let _ = db.execute("SELECT id FROM docs WHERE title LIKE 'doc_1%' LIMIT 10");
         },
         50,
     );
-    let (sql_like_p50, _, sql_like_avg) = measure_us(
+    let (sql_like_p50, _, _sql_like_avg) = measure_us(
         || {
             let _ = conn.execute("SELECT id FROM docs WHERE title LIKE 'doc_1%' LIMIT 10", []);
         },

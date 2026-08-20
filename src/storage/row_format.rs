@@ -2192,7 +2192,7 @@ mod tests {
 
     fn sensor_row() -> Vec<Value> {
         vec![
-            Value::Timestamp(Timestamp::from_micros(1700000000_000_000)),
+            Value::Timestamp(Timestamp::from_micros(1_700_000_000_000_000)),
             Value::Float(23.5),
             Value::Float(45.2),
             Value::Integer(42),
@@ -2210,7 +2210,7 @@ mod tests {
         assert_eq!(decoded.len(), 5);
         assert_eq!(
             decoded[0],
-            Value::Timestamp(Timestamp::from_micros(1700000000_000_000))
+            Value::Timestamp(Timestamp::from_micros(1_700_000_000_000_000))
         );
         assert_eq!(decoded[1], Value::Float(23.5));
         assert_eq!(decoded[2], Value::Float(45.2));

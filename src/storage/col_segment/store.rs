@@ -565,7 +565,7 @@ impl ColSegmentStore {
                 let count = self
                     .point_query_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count % POINT_QUERY_EVICT_INTERVAL == 0 && count > 0 {
+                if count.is_multiple_of(POINT_QUERY_EVICT_INTERVAL) && count > 0 {
                     for s in segs.iter() {
                         s.clear_cache();
                     }
@@ -2075,9 +2075,11 @@ impl ColSegmentStore {
             // 🚀 Segment-level fast path: text equality with no dedup/deletions.
             // Uses eq_count_matches (batch raw-byte scan) instead of per-row
             // eq_bytes closure dispatch.
-            if is_eq_filter && fcol_text.is_some() && !need_dedup && !has_deletions {
-                if let Some(target_bytes) = target_s.map(|s| s.as_bytes()) {
-                    count += fcol_text.as_ref().unwrap().eq_count_matches(target_bytes);
+            if is_eq_filter && !need_dedup && !has_deletions {
+                if let (Some(fcol), Some(target_bytes)) =
+                    (fcol_text.as_ref(), target_s.map(|s| s.as_bytes()))
+                {
+                    count += fcol.eq_count_matches(target_bytes);
                     continue;
                 }
             }
@@ -2116,8 +2118,8 @@ impl ColSegmentStore {
                 } else if let Some(ref t) = fcol_text {
                     // 🚀 Fast path: for equality on text, use eq_bytes (direct
                     // raw byte comparison, no &str construction or UTF-8 step).
-                    if is_eq_filter && target_s.is_some() {
-                        t.eq_bytes(i, target_s.unwrap().as_bytes())
+                    if let (true, Some(ts)) = (is_eq_filter, target_s) {
+                        t.eq_bytes(i, ts.as_bytes())
                     } else {
                         match t.get_str(i) {
                             Some(s) => cmp_str(Some(s), target_s, op),
@@ -2277,8 +2279,8 @@ impl ColSegmentStore {
                     }
                 } else if let Some(ref t) = fcol_text {
                     // 🚀 Fast path: direct byte comparison for equality filter.
-                    if is_eq_filter && target_s.is_some() {
-                        t.eq_bytes(i, target_s.unwrap().as_bytes())
+                    if let (true, Some(ts)) = (is_eq_filter, target_s) {
+                        t.eq_bytes(i, ts.as_bytes())
                     } else {
                         cmp_str(t.get_str(i), target_s, op)
                     }
@@ -2369,8 +2371,10 @@ impl ColSegmentStore {
                 // Iterate the raw i64 slice directly — skips per-row
                 // get_i64() → slice() → match overhead. For SUM/AVG/MIN/MAX
                 // over 2M rows this is 5-10× faster than the closure path.
-                if no_filter && !has_deletions && agg_fixed.is_some() && agg_col < n {
-                    let af = agg_fixed.as_ref().unwrap();
+                if let Some(af) = agg_fixed
+                    .as_ref()
+                    .filter(|_| no_filter && !has_deletions && agg_col < n)
+                {
                     if agg_is_float {
                         // 🚀 Use typed f64 slice for auto-vectorizable iteration.
                         let raw = af.raw_f64_typed_slice();
@@ -2766,7 +2770,7 @@ impl ColSegmentStore {
                 // 🔑 Use pre-decoded column (decoded once per segment above),
                 // NOT per-row read_fixed_i64/read_text which re-decodes the
                 // entire column on every row (O(N×K) → O(N+K)).
-                let v = if let Some(ref f) = pre_fixed.get(&(seg_idx, ci)) {
+                let v = if let Some(f) = pre_fixed.get(&(seg_idx, ci)) {
                     match col_types.get(ci) {
                         Some(ColumnType::Integer) => f.get_i64(row_idx).map(Value::Integer),
                         Some(ColumnType::Float) => f.get_f64(row_idx).map(Value::Float),
@@ -2776,7 +2780,7 @@ impl ColSegmentStore {
                             .map(|v| Value::Timestamp(crate::types::Timestamp::from_micros(v))),
                         _ => None,
                     }
-                } else if let Some(ref t) = pre_text.get(&(seg_idx, ci)) {
+                } else if let Some(t) = pre_text.get(&(seg_idx, ci)) {
                     t.get_str(row_idx)
                         .map(|s| Value::Text(ArcString(std::sync::Arc::from(s))))
                 } else {

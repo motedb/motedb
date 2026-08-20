@@ -1238,8 +1238,8 @@ mod tests {
         let dl_long = FieldNormTable::decode(fn_long, avg_dl);
 
         // Decoded values should be reasonable approximations
-        assert!(dl_short >= 0.5 && dl_short <= 2.0);
-        assert!(dl_long >= 800.0 && dl_long <= 1200.0);
+        assert!((0.5..=2.0).contains(&dl_short));
+        assert!((800.0..=1200.0).contains(&dl_long));
     }
 
     #[test]

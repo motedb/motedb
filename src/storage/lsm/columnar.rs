@@ -117,8 +117,7 @@ impl ColumnTypeTag {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn to_column_type(&self) -> ColumnType {
+    pub(crate) fn to_column_type(self) -> ColumnType {
         match self {
             Self::Integer => ColumnType::Integer,
             Self::Float => ColumnType::Float,
@@ -2310,10 +2309,8 @@ impl ColumnarSSTable {
             } else {
                 return Ok(None);
             }
-        } else {
-            if self.read_raw(off_pos, &mut off_buf).is_err() {
-                return Ok(None);
-            }
+        } else if self.read_raw(off_pos, &mut off_buf).is_err() {
+            return Ok(None);
         }
         let start = u32::from_le_bytes([off_buf[0], off_buf[1], off_buf[2], off_buf[3]]) as usize;
         let end = u32::from_le_bytes([off_buf[4], off_buf[5], off_buf[6], off_buf[7]]) as usize;
@@ -3814,7 +3811,7 @@ mod tests {
         builder.finish().unwrap();
 
         let col_sst = ColumnarSSTable::open(&path).unwrap();
-        assert_eq!(col_sst.num_rows, n as usize);
+        assert_eq!(col_sst.num_rows, n);
 
         // Spot-check
         let id_seg = col_sst.read_fixed_i64(0).unwrap();

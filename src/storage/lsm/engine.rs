@@ -1845,9 +1845,9 @@ impl LSMEngine {
                             all_entries.push((k, d.clone()));
                         }
                         ValueData::Blob(blob_ref) => {
-                            match self.blob_store.get(blob_ref) {
-                                Ok(data) => all_entries.push((k, std::sync::Arc::new(data))),
-                                Err(_) => {} // blob resolution failed, skip entry
+                            // blob resolution failed → skip entry
+                            if let Ok(data) = self.blob_store.get(blob_ref) {
+                                all_entries.push((k, std::sync::Arc::new(data)));
                             }
                         }
                     }
@@ -1869,9 +1869,9 @@ impl LSMEngine {
                         all_entries.push((k, d.clone()));
                     }
                     ValueData::Blob(blob_ref) => {
-                        match self.blob_store.get(blob_ref) {
-                            Ok(data) => all_entries.push((k, std::sync::Arc::new(data))),
-                            Err(_) => {} // blob resolution failed, skip entry
+                        // blob resolution failed → skip entry
+                        if let Ok(data) = self.blob_store.get(blob_ref) {
+                            all_entries.push((k, std::sync::Arc::new(data)));
                         }
                     }
                 }

@@ -1055,11 +1055,7 @@ impl ExprEvaluator {
                     // (the whole string). Otherwise start at (length - abs(start)).
                     Value::Integer(i) if i < 0 => {
                         let from_end = (-i) as usize;
-                        if from_end >= char_count {
-                            0
-                        } else {
-                            char_count - from_end
-                        }
+                        char_count.saturating_sub(from_end)
                     }
                     _ => return Ok(Value::text(String::new())),
                 };

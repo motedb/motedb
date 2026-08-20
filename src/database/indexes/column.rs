@@ -28,11 +28,13 @@ impl MoteDB {
         std::fs::create_dir_all(&indexes_dir)?;
         let index_path = indexes_dir.join(format!("column_{}.idx", index_name));
 
-        let mut config = ColumnValueIndexConfig::default();
         // During CREATE INDEX, use a larger buffer (32 MB) to reduce BTree flush
         // frequency. With default 1 MB, 300K entries require ~21 flushes.
         // With 32 MB, all entries fit in a single buffer → 1 flush.
-        config.mem_buffer_size = (self.column_index_buffer_size).max(32 * 1024 * 1024);
+        let config = ColumnValueIndexConfig {
+            mem_buffer_size: self.column_index_buffer_size.max(32 * 1024 * 1024),
+            ..Default::default()
+        };
         let index = ColumnValueIndex::create(
             index_path,
             table_name.to_string(),

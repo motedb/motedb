@@ -520,8 +520,10 @@ mod tests {
     #[test]
     fn test_buffer_flush_decision() {
         let schema = make_schema();
-        let mut config = ColumnarConfig::default();
-        config.buffer_row_capacity = 5;
+        let config = ColumnarConfig {
+            buffer_row_capacity: 5,
+            ..Default::default()
+        };
 
         let mut buf = ColumnarWriteBuffer::new(1, &schema, config);
 

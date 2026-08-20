@@ -1011,10 +1011,8 @@ impl Parser {
             }
 
             // 🚨 Reject multiple PRIMARY KEY columns (SQL standard: at most one).
-            if primary_key {
-                if columns[..columns.len() - 1].iter().any(|c| c.primary_key) {
-                    return Err(self.error("Multiple PRIMARY KEY columns are not allowed"));
-                }
+            if primary_key && columns[..columns.len() - 1].iter().any(|c| c.primary_key) {
+                return Err(self.error("Multiple PRIMARY KEY columns are not allowed"));
             }
 
             if !self.match_token(TokenType::Comma) {
@@ -1677,10 +1675,10 @@ impl Parser {
                         }
 
                         // Evaluate arguments to get numeric values (supports negatives)
-                        let x = self.eval_num(&args[0]).map_err(|_| {
+                        let x = Self::eval_num(&args[0]).map_err(|_| {
                             self.error("POINT() arguments must be numeric literals")
                         })?;
-                        let y = self.eval_num(&args[1]).map_err(|_| {
+                        let y = Self::eval_num(&args[1]).map_err(|_| {
                             self.error("POINT() arguments must be numeric literals")
                         })?;
 
@@ -1931,11 +1929,9 @@ impl Parser {
                             }
                         };
 
-                        let x = self
-                            .eval_num(&args[1])
+                        let x = Self::eval_num(&args[1])
                             .map_err(|_| self.error("ST_DISTANCE() x must be a number"))?;
-                        let y = self
-                            .eval_num(&args[2])
+                        let y = Self::eval_num(&args[2])
                             .map_err(|_| self.error("ST_DISTANCE() y must be a number"))?;
 
                         Ok(Expr::StDistance3D {
@@ -2362,12 +2358,12 @@ impl Parser {
         Ok(list)
     }
 
-    fn eval_num(&self, expr: &Expr) -> std::result::Result<f64, ()> {
+    fn eval_num(expr: &Expr) -> std::result::Result<f64, ()> {
         match expr {
             Expr::Literal(Value::Float(f)) => Ok(*f),
             Expr::Literal(Value::Integer(i)) => Ok(*i as f64),
             Expr::UnaryOp { op, expr, .. } => {
-                let v = self.eval_num(expr)?;
+                let v = Self::eval_num(expr)?;
                 match op {
                     UnaryOperator::Minus => Ok(-v),
                     UnaryOperator::Plus => Ok(v),

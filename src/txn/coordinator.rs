@@ -292,8 +292,8 @@ impl TransactionCoordinator {
         let ctx = self.get_context(txn_id)?;
         let mut write_set = ctx.write_set.write();
         let key = (table_name.to_string(), row_id);
-        if write_set.contains_key(&key) {
-            write_set.insert(key, new_row);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = write_set.entry(key) {
+            e.insert(new_row);
             Ok(true)
         } else {
             Ok(false)

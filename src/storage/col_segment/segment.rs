@@ -157,10 +157,8 @@ impl Segment {
     pub fn read_fixed_cached(&self, col_idx: usize) -> Option<FixedSegment> {
         {
             let mut cache = self.col_cache.lock();
-            if let Some(cached) = cache.get(col_idx) {
-                if let CachedCol::Fixed(ref f) = cached {
-                    return Some(f.clone());
-                }
+            if let Some(CachedCol::Fixed(f)) = cache.get(col_idx) {
+                return Some(f.clone());
             }
         }
         let seg = self.sst.read_fixed_i64(col_idx).ok()?;
@@ -175,10 +173,8 @@ impl Segment {
     pub fn read_text_cached(&self, col_idx: usize) -> Option<TextSegment> {
         {
             let mut cache = self.col_cache.lock();
-            if let Some(cached) = cache.get(col_idx) {
-                if let CachedCol::Text(ref t) = cached {
-                    return Some(t.clone());
-                }
+            if let Some(CachedCol::Text(t)) = cache.get(col_idx) {
+                return Some(t.clone());
             }
         }
         let seg = self.sst.read_text(col_idx).ok()?;
@@ -455,8 +451,7 @@ impl Segment {
                         // Try string page cache.
                         if let Some((sdata, sbase)) = cache.get_strings(col_idx) {
                             if start >= sbase as usize && end <= sbase as usize + sdata.len() {
-                                let bytes = &sdata[start as usize - sbase as usize
-                                    ..end as usize - sbase as usize];
+                                let bytes = &sdata[start - sbase as usize..end - sbase as usize];
                                 return Some(String::from_utf8_lossy(bytes).into_owned());
                             }
                         }

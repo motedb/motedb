@@ -97,7 +97,7 @@ impl Timestamp {
         let year: i32 = dparts[0].parse().ok()?;
         let month: u32 = dparts[1].parse().ok()?;
         let day: u32 = dparts[2].parse().ok()?;
-        if month < 1 || month > 12 || day < 1 || day > 31 {
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             return None;
         }
         // Parse time: HH:MM:SS (seconds optional)
