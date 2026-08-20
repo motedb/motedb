@@ -352,6 +352,7 @@ fn test_multiple_tables_interleaved() {
 /// 1000 rows with random-looking data — verify exact values after flush.
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
+#[allow(clippy::approx_constant)] // 3.14159 是普通样例浮点，非 π
 fn test_1000_rows_exact_values() {
     let (db, _d) = mk();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score FLOAT)")

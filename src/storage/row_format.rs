@@ -2257,6 +2257,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
     fn test_bincode_fallback() {
         let row = vec![Value::Integer(42), Value::Float(3.14)];
         let bincode_data = bincode::serialize(&row).unwrap();
@@ -2399,6 +2400,7 @@ mod tests {
     // ━━━ Partial column decode tests ━━━
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
     fn test_partial_decode_select_columns() {
         let col_types = vec![
             ColumnType::Integer,

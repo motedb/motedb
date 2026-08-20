@@ -166,7 +166,10 @@ fn test_log_ln_exp() {
         (Value::Float(log_val), Value::Float(ln_val), Value::Float(exp_val)) => {
             assert!((log_val - 3.0).abs() < 0.01, "LOG(1000) should be ~3");
             assert!((ln_val - 0.693).abs() < 0.01, "LN(2) should be ~0.693");
-            assert!((exp_val - 2.718).abs() < 0.01, "EXP(1) should be ~e");
+            assert!(
+                (exp_val - std::f64::consts::E).abs() < 0.01,
+                "EXP(1) should be ~e"
+            );
         }
         other => panic!("Expected Floats, got {:?}", other),
     }
@@ -385,6 +388,7 @@ fn test_substr_null_propagates() {
 // evaluator which handles decimals correctly.
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14/3.1416 是 ROUND 的期望结果值，非 π
 fn test_round_decimals_on_column() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();

@@ -1193,6 +1193,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
     fn test_value_to_raw_bytes() {
         use crate::types::{ArcString, Timestamp, Value};
         use std::sync::Arc;

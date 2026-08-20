@@ -78,6 +78,7 @@ fn test_select_single_row_exact_values() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_select_column_order_matches_create_table() {
     let (db, _dir) = setup();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, z TEXT, a INT, m FLOAT)")
@@ -1372,6 +1373,7 @@ fn test_coalesce_exact() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14159265 是精度边界样例，非 π
 fn test_float_precision_roundtrip() {
     let (db, _dir) = setup();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)")

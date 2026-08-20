@@ -64,6 +64,7 @@ fn float_arithmetic_equality() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn float_order_by_correct() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
@@ -460,6 +461,7 @@ fn sum_float_column_returns_float() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn min_max_float_column() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");

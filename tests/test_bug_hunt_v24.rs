@@ -396,6 +396,7 @@ fn small_float_literal() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // -3.14 是普通样例浮点，非 π
 fn negative_float_literal() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, f FLOAT)");

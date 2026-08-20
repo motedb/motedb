@@ -357,6 +357,7 @@ fn test_pipe_concat_null_propagates() {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_abs_float() {
     let (db, _d) = db();
     let r = q(&db, "SELECT ABS(-3.14)");

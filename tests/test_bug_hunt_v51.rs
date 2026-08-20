@@ -95,6 +95,7 @@ fn test_insert_int_into_float() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_insert_float_into_float() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(id INT PRIMARY KEY, v FLOAT)")

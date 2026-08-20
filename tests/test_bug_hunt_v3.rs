@@ -92,7 +92,7 @@ fn group_by_count_distinct() {
 fn float_precision_roundtrip() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");
-    let precise = 3.141592653589793_f64;
+    let precise = std::f64::consts::PI;
     exec(&db, &format!("INSERT INTO t VALUES (1, {:.17})", precise));
     let r = rows(&db, "SELECT v FROM t WHERE id = 1");
     match r[0][0] {
@@ -107,6 +107,7 @@ fn float_precision_roundtrip() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // -3.14 是普通样例浮点，非 π
 fn float_zero_and_negative() {
     let (db, _d) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)");

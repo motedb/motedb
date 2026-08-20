@@ -55,6 +55,7 @@ fn test_abs_zero() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是 ROUND 的期望结果值，非 π
 fn test_round_positive_decimals() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t(id INT PRIMARY KEY)").unwrap();

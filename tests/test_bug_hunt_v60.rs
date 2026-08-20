@@ -404,6 +404,7 @@ fn test_cast_bool_to_int() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_cast_text_to_float() {
     let (db, _d) = db();
     let r = q(&db, "SELECT CAST('3.14' AS FLOAT)");

@@ -63,7 +63,7 @@ fn test_float_precision() {
 
     let r = row(db.execute("SELECT val FROM t WHERE id = 1").unwrap());
     match &r[0] {
-        Value::Float(f) => assert!((f - 3.14159265358979).abs() < 1e-10),
+        Value::Float(f) => assert!((f - std::f64::consts::PI).abs() < 1e-10),
         other => panic!("Expected Float, got {:?}", other),
     }
 }
@@ -283,6 +283,7 @@ fn test_timestamp_insert_retrieve() {
 // === Mixed types in one table ===
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_all_types_in_one_table() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();

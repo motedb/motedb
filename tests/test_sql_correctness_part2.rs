@@ -305,6 +305,7 @@ fn test_drop_table_removes_all_data() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_drop_recreate_different_schema() {
     let (db, _dir) = setup();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT)")
@@ -1054,6 +1055,7 @@ fn test_substr_exact() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_all_types_roundtrip() {
     let (db, _dir) = setup();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, i INT, f FLOAT, s TEXT, b BOOLEAN)")

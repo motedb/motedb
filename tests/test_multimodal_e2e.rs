@@ -262,6 +262,7 @@ fn test_mixed_vector_plus_text_plus_scalar() {
 
 #[test]
 #[ignore = "slow in debug, run with --ignored"]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π
 fn test_mixed_all_types_single_table() {
     let (db, _dir) = db();
     db.execute("CREATE TABLE sensors (id INT PRIMARY KEY AUTO_INCREMENT, emb VECTOR(4), loc GEOMETRY, label TEXT, val FLOAT, region TEXT, active INT)").unwrap();

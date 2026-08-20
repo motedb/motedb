@@ -695,7 +695,7 @@ fn test_integrity_numeric_precision() {
         (2, -1, -1.0),
         (3, 999999, 1.23456e10),
         (4, -999999, -999.999),
-        (5, 42, 3.14159265358979),
+        (5, 42, std::f64::consts::PI),
         (6, 0, 0.1 + 0.2), // floating point edge case
     ];
 

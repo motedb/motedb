@@ -102,6 +102,7 @@ fn insert_after_alter_preserves_int_column() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 是普通样例浮点，非 π（容差 1e-9 依赖 3.14 本身）
 fn insert_after_alter_preserves_float_column() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
