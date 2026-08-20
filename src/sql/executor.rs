@@ -9927,43 +9927,69 @@ impl QueryExecutor {
                                 // Multi-segment: materialize matched rows
                                 // directly (skip the full-column pre-intern
                                 // that scan_projected_filtered does).
+                                // 🔑 Multi-segment: pre-decode each output column
+                                // ONCE per segment, then materialize matched rows
+                                // by index. The previous per-row loop called
+                                // read_fixed_i64/read_text for EVERY matched row —
+                                // a full column read per row (and a full zstd
+                                // decompression per call in compact mode):
+                                // O(N²) on 100K matches ≈ 568s in compact mode.
                                 let mut result: Vec<Vec<Value>> = Vec::with_capacity(indices.len());
-                                for (seg_idx, local_row) in indices.iter().skip(offset).take(limit)
+                                let mut by_seg: std::collections::HashMap<usize, Vec<usize>> =
+                                    std::collections::HashMap::new();
+                                for &(seg_idx, local_row) in indices.iter().skip(offset).take(limit)
                                 {
+                                    by_seg.entry(seg_idx).or_default().push(local_row);
+                                }
+                                for (seg_idx, local_rows) in &by_seg {
                                     let seg = match segs.get(*seg_idx) {
                                         Some(s) => s,
                                         None => continue,
                                     };
-                                    let mut row = Vec::with_capacity(out_positions.len());
+                                    let mut col_data: Vec<Vec<Option<Value>>> =
+                                        Vec::with_capacity(out_positions.len());
                                     for &pc in out_positions.iter() {
-                                        let v = if pc < seg.sst.column_tags.len()
+                                        let decoded: Vec<Option<Value>> = if pc
+                                            < seg.sst.column_tags.len()
                                             && seg.sst.column_tags[pc].is_fixed()
                                         {
                                             match seg.sst.read_fixed_i64(pc) {
                                                 Ok(f) => match col_types.get(pc) {
-                                                    Some(ColumnType::Float) => f
-                                                        .get_f64(*local_row)
-                                                        .map(Value::Float)
-                                                        .unwrap_or(Value::Null),
-                                                    _ => f
-                                                        .get_i64(*local_row)
-                                                        .map(Value::Integer)
-                                                        .unwrap_or(Value::Null),
+                                                    Some(ColumnType::Float) => {
+                                                        (0..seg.sst.num_rows)
+                                                            .map(|i| f.get_f64(i).map(Value::Float))
+                                                            .collect()
+                                                    }
+                                                    _ => (0..seg.sst.num_rows)
+                                                        .map(|i| f.get_i64(i).map(Value::Integer))
+                                                        .collect(),
                                                 },
-                                                Err(_) => Value::Null,
+                                                Err(_) => vec![None; seg.sst.num_rows],
                                             }
                                         } else {
                                             match seg.sst.read_text(pc) {
-                                                Ok(t) => t
-                                                    .get_str(*local_row)
-                                                    .map(|s| Value::Text(s.into()))
-                                                    .unwrap_or(Value::Null),
-                                                Err(_) => Value::Null,
+                                                Ok(t) => (0..seg.sst.num_rows)
+                                                    .map(|i| {
+                                                        t.get_str(i).map(|s| Value::Text(s.into()))
+                                                    })
+                                                    .collect(),
+                                                Err(_) => vec![None; seg.sst.num_rows],
                                             }
                                         };
-                                        row.push(v);
+                                        col_data.push(decoded);
                                     }
-                                    result.push(row);
+                                    for &local_row in local_rows {
+                                        let row: Vec<Value> = col_data
+                                            .iter()
+                                            .map(|col| {
+                                                col.get(local_row)
+                                                    .cloned()
+                                                    .flatten()
+                                                    .unwrap_or(Value::Null)
+                                            })
+                                            .collect();
+                                        result.push(row);
+                                    }
                                 }
                                 return Ok(StreamingQueryResult::SelectReady {
                                     columns,
