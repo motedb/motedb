@@ -37,10 +37,8 @@ fn main() {
     let mut config = DBConfig::for_edge();
     config.max_result_rows = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute(
-        "CREATE TABLE sales (id INT PRIMARY KEY, customer TEXT, amount FLOAT, region TEXT)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE sales (id INT PRIMARY KEY, customer TEXT, amount FLOAT, region TEXT)")
+        .unwrap();
     for chunk in 0..(n / 5000) {
         let mut sql = String::from("INSERT INTO sales VALUES ");
         for i in 0..5000 {
@@ -93,7 +91,10 @@ fn main() {
         );
     }
     if failures > 0 {
-        eprintln!("\n{} query shape(s) exceeded their ratio/absolute budget", failures);
+        eprintln!(
+            "\n{} query shape(s) exceeded their ratio/absolute budget",
+            failures
+        );
         std::process::exit(1);
     }
     println!("\nperf smoke: all budgets hold");
