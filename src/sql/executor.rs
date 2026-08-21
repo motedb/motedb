@@ -2825,7 +2825,7 @@ impl QueryExecutor {
                         if let Some(pos) = schema.get_column_position(bare) {
                             if matches!(schema.col_types().get(pos), Some(ColumnType::Text)) {
                                 let _ = store.prepare_for_query();
-                                let byte_set: std::collections::HashSet<&[u8]> = set
+                                let byte_set: crate::storage::lsm::columnar::ByteSet = set
                                     .iter()
                                     .filter_map(|v| {
                                         if let Value::Text(t) = v {
@@ -9399,7 +9399,7 @@ impl QueryExecutor {
             // decodes into 4 sequential column reads + 100K cheap indexed lookups.
             if matches!(col_types.get(col_pos), Some(ColumnType::Text)) && set.len() > 1 {
                 // Build a HashSet<&[u8]> from the Value set (once, not per-row).
-                let byte_set: std::collections::HashSet<&[u8]> = set
+                let byte_set: crate::storage::lsm::columnar::ByteSet = set
                     .iter()
                     .filter_map(|v| {
                         if let Value::Text(t) = v {

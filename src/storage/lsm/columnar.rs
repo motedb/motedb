@@ -80,6 +80,53 @@ use std::sync::Arc;
 #[allow(unused_imports)]
 use memmap2::{Mmap, MmapOptions};
 
+// ── Fast byte-set hashing (IN-list / IN-subquery row matching) ────────────
+//
+// Every row of a column is hashed against the IN set during
+// in_set_match_indices; SipHash dominated that scan's profile (~15% of the
+// IN-subquery query). FxHash (same algorithm family rustc uses internally)
+// is ~4-8× faster on short keys. Hash-flood resistance is irrelevant here —
+// sets come from the query, not attackers, and HashSet's Eq fallback keeps
+// lookups correct under collisions.
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        self.add(u64::from_le_bytes(tail));
+        // Mix length so prefixes don't collide across chunk alignments.
+        self.add(bytes.len() as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// HashSet of byte-slice targets with the fast FxHasher — the set type used
+/// by scan_row_indices_in_set / in_set_match_indices.
+pub type ByteSet<'a> = std::collections::HashSet<&'a [u8], std::hash::BuildHasherDefault<FxHasher>>;
+
 // ── Constants ─────────────────────────────────────────────────────
 
 const COLUMNAR_MAGIC: u32 = 0x434D5442; // "BTMC"
@@ -1091,7 +1138,7 @@ impl TextSegment {
     /// Returns row indices. Zero-alloc: walks raw offsets, checks each row's
     /// bytes against the HashSet of target byte-slices.
     /// Used by `WHERE text_col IN (v1, v2, ...)` to avoid per-row Value alloc.
-    pub fn in_set_match_indices(&self, targets: &std::collections::HashSet<&[u8]>) -> Vec<usize> {
+    pub fn in_set_match_indices(&self, targets: &ByteSet) -> Vec<usize> {
         let n = self.num_rows;
         if n == 0 || targets.is_empty() {
             return Vec::new();

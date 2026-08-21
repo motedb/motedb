@@ -1245,7 +1245,7 @@ impl ColSegmentStore {
     pub fn scan_row_indices_in_set(
         &self,
         filter_col: usize,
-        targets: &std::collections::HashSet<&[u8]>,
+        targets: &crate::storage::lsm::columnar::ByteSet,
         limit: usize,
     ) -> Option<Vec<(usize, usize)>> {
         let segs = self.segments_snapshot();
