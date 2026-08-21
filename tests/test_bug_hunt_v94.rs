@@ -23,18 +23,6 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     rows(db.execute(sql).unwrap().materialize().unwrap())
 }
 
-fn sorted_int(r: &[Vec<Value>]) -> Vec<i64> {
-    let mut v: Vec<i64> = r
-        .iter()
-        .filter_map(|row| match row.get(0) {
-            Some(Value::Integer(i)) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    v.sort();
-    v
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // ORDER BY CASE WHEN referencing a column (verify v93 fix holds).
 // ─────────────────────────────────────────────────────────────────────────

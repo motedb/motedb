@@ -19,13 +19,6 @@ fn exec(db: &Database, sql: &str) {
         .unwrap_or_else(|e| panic!("SQL failed: {}\n  err: {}", sql, e));
 }
 
-fn try_exec(db: &Database, sql: &str) -> Result<(), String> {
-    match db.execute(sql) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("{:?}", e)),
-    }
-}
-
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     let rs = db
         .execute(sql)

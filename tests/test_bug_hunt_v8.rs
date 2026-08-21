@@ -39,16 +39,6 @@ fn scalar_i64(db: &Database, sql: &str) -> i64 {
     }
 }
 
-fn scalar_opt_i64(db: &Database, sql: &str) -> Option<i64> {
-    let r = rows(db, sql);
-    assert_eq!(r.len(), 1);
-    match r[0].first() {
-        Some(Value::Integer(n)) => Some(*n),
-        Some(Value::Null) => None,
-        o => panic!("int/null? {:?}: {}", o, sql),
-    }
-}
-
 fn scalar_f64(db: &Database, sql: &str) -> f64 {
     let r = rows(db, sql);
     assert_eq!(r.len(), 1);

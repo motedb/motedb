@@ -22,14 +22,6 @@ fn q(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     rows(db.execute(sql).unwrap().materialize().unwrap())
 }
 
-fn f_of(v: &Value) -> f64 {
-    match v {
-        Value::Integer(i) => *i as f64,
-        Value::Float(f) => *f,
-        _ => panic!("expected number, got {:?}", v),
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // LIKE with combined wildcards
 // ─────────────────────────────────────────────────────────────────────────
