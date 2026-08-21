@@ -1198,6 +1198,42 @@ impl TextFTSIndex {
         let deleted = self.deleted_docs.read();
         let deleted_term_docs = self.deleted_term_docs.read();
 
+        // 🔥 Bulk shard discovery for large batches (CREATE INDEX / bulk load):
+        // the per-term fallback below pays a full root-to-leaf BTree descent
+        // PER TERM (~5 page deserializes each) — 10K terms ≈ 50K page reads,
+        // and the interleaved inserts keep evicting the page cache so it never
+        // amortizes (profiled: 85% of CREATE TEXT INDEX time). One sequential
+        // keys-only scan reads every page exactly once instead. Threshold
+        // 1024: below it, per-term point lookups are cheaper than a full scan.
+        if pending_data.len() >= 1024 {
+            let mut max_by_base: std::collections::HashMap<u32, u32> =
+                std::collections::HashMap::with_capacity(pending_data.len());
+            if let Ok(keys) = btree.range_keys(&0u32, &u32::MAX) {
+                for key in keys {
+                    let shard_idx = key >> 24;
+                    if shard_idx < 0xFE {
+                        let base = key & 0x00FF_FFFF;
+                        let count = shard_idx + 1;
+                        let e = max_by_base.entry(base).or_insert(0);
+                        if count > *e {
+                            *e = count;
+                        }
+                    }
+                }
+            }
+            for term_id in pending_data.keys() {
+                if !shard_counters.contains(term_id) {
+                    // Absent from disk ⇒ 0 shards — same value discover_shard_count
+                    // would return, without the per-term BTree descent.
+                    let count = max_by_base
+                        .get(&(*term_id & 0x00FF_FFFF))
+                        .copied()
+                        .unwrap_or(0);
+                    shard_counters.put(*term_id, count);
+                }
+            }
+        }
+
         for (term_id, posting) in pending_data.iter() {
             let base_term_id = *term_id & 0x00FFFFFF;
             // If the shard counter was evicted from LRU, discover the actual

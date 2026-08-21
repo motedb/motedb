@@ -1451,6 +1451,39 @@ impl<K: BTreeKey> GenericBTree<K> {
         Ok(results)
     }
 
+    /// Keys-only range scan: returns the keys in [start, end] WITHOUT
+    /// materializing values (no overflow-page reads). One sequential leaf
+    /// pass — use for metadata walks (e.g. FTS shard discovery) instead of N
+    /// point lookups, each of which pays a root-to-leaf descent plus a page
+    /// deserialize that interleaved writes keep evicting from the cache.
+    pub fn range_keys(&self, start: &K, end: &K) -> Result<Vec<K>> {
+        let root_id = *self.root_page_id.read();
+        if root_id == 0 {
+            return Ok(Vec::new());
+        }
+        let first_leaf_id = self.find_leaf_for_key(root_id, start)?;
+        let mut keys = Vec::new();
+        let mut current_leaf_id = first_leaf_id;
+        while current_leaf_id != INVALID_PAGE_ID {
+            let page_arc = self.read_page_arc(current_leaf_id)?;
+            let page = page_arc.read();
+            if !page.is_leaf {
+                return Err(StorageError::Index("Expected leaf node".into()));
+            }
+            for i in 0..page.num_keys {
+                let key = &page.keys[i];
+                if key > end {
+                    return Ok(keys);
+                }
+                if key >= start {
+                    keys.push(key.clone());
+                }
+            }
+            current_leaf_id = page.next_leaf;
+        }
+        Ok(keys)
+    }
+
     /// Scan leaf chain with early termination
     fn scan_leaf_chain_with_limit(
         &self,
