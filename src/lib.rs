@@ -59,10 +59,14 @@
 )]
 
 // 🧠 jemalloc: background thread returns freed memory to OS (RSS plateaus instead of growing forever)
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+// 🚨 not(fuzzing): jemalloc's custom mmap tricks crash under AddressSanitizer
+// on Linux x86_64 (SIGSEGV at startup, before any input runs). cargo-fuzz
+// sets --cfg fuzzing, so fuzz builds fall back to the system allocator and
+// ASAN keeps a clean view of the heap.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc"), not(fuzzing)))]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc"), not(fuzzing)))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
