@@ -991,6 +991,22 @@ fn test_perf_insert_throughput() {
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
 
+    // Machine-relative budget, calibrated BEFORE the insert loop: raw fsync
+    // latency spans 0.1ms (NVMe/ext4) to >10ms (APFS/slow eMMC). ×3 factor
+    // covers contention from other tests running in parallel within this
+    // binary; a real engine regression (pathological slowdown) still trips.
+    let fsync_us = {
+        let f = std::fs::File::create(dir.path().join("fsync_probe")).unwrap();
+        let t = Instant::now();
+        for _ in 0..20 {
+            use std::io::Write;
+            writeln!(&f, "x").unwrap();
+            f.sync_all().unwrap();
+        }
+        t.elapsed().as_micros() as f64 / 20.0
+    };
+    eprintln!("raw fsync: {:.0}µs/op on this machine", fsync_us);
+
     let n = 1000;
     let start = Instant::now();
     for i in 1..=n {
@@ -1029,7 +1045,15 @@ fn test_perf_insert_throughput() {
         n as f64 / elapsed2.as_secs_f64()
     );
     eprintln!("Speedup from NoSync: {:.1}x", us_per / us_per2);
-    assert!(us_per < 10000.0, "INSERT too slow: {:.0}µs/op", us_per);
+    // Budget from the pre-loop calibration (see top of this test): ×3 + 2ms
+    // slack absorbs parallel-test contention; floor 1ms for degenerate probes.
+    let budget = (fsync_us * 3.0 + 2000.0).max(1000.0);
+    assert!(
+        us_per < budget,
+        "INSERT too slow: {:.0}µs/op (fsync-calibrated budget {:.0}µs/op)",
+        us_per,
+        budget
+    );
 }
 
 #[test]
