@@ -38,9 +38,10 @@ fn query_rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 #[ignore = "CI-incompatible: process-exit hang on slow shared runners (verified locally; see git history)"]
 fn test_atomicity_rollback_preserves_data() {
-    // NOTE: MoteDB auto-commit INSERT writes directly to LSM (not through MVCC).
-    // Transaction rollback only undoes writes made via commit_transaction_full.
-    // This test documents current behavior: auto-commit writes survive rollback.
+    // Updated semantics: writes issued while a transaction is active on the
+    // same session JOIN that transaction (standard SQL). Rollback undoes them.
+    // (Old documented behavior — auto-commit writes bypassing MVCC — was fixed;
+    // this assertion was updated to match.)
     let dir = TempDir::new().unwrap();
     let db = setup_db(dir.path());
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
@@ -52,11 +53,11 @@ fn test_atomicity_rollback_preserves_data() {
     db.rollback_transaction(tx).unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t");
-    // Both rows visible — auto-commit writes are durable regardless of tx state
+    // Only the pre-tx write survives; the in-tx write is rolled back.
     assert_eq!(
         rows.len(),
-        2,
-        "Auto-commit writes are durable; rollback does not undo them"
+        1,
+        "In-transaction writes are undone by rollback"
     );
 }
 
@@ -77,11 +78,13 @@ fn test_atomicity_savepoint_rollback_partial() {
 
     let _ = db.commit_transaction(tx);
 
+    // In-tx writes join the transaction: ROLLBACK TO SAVEPOINT undoes writes
+    // made after the savepoint; the commit keeps the pre-savepoint write.
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(
         rows.len(),
-        2,
-        "Auto-commit writes survive savepoint rollback"
+        1,
+        "ROLLBACK TO SAVEPOINT undoes post-savepoint writes"
     );
 }
 
@@ -106,8 +109,8 @@ fn test_atomicity_nested_savepoints() {
     let rows = query_rows(&db, "SELECT * FROM t ORDER BY id");
     assert_eq!(
         rows.len(),
-        3,
-        "Auto-commit writes survive nested savepoint rollback"
+        1,
+        "ROLLBACK TO outer savepoint undoes all nested writes; commit keeps only pre-sp1 write"
     );
 }
 
@@ -348,11 +351,11 @@ fn test_isolation_rolled_back_tx_data_gone() {
     db.rollback_transaction(tx).unwrap();
 
     let rows = query_rows(&db, "SELECT * FROM t WHERE id = 99");
-    // Auto-commit write is visible despite rollback
+    // Rolled-back data is gone — in-tx writes join the transaction.
     assert_eq!(
         rows.len(),
-        1,
-        "Auto-commit writes are durable despite transaction rollback"
+        0,
+        "Rolled-back transaction data must not be visible"
     );
 }
 
