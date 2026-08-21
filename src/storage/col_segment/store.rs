@@ -2978,6 +2978,78 @@ impl ColSegmentStore {
         result
     }
 
+    /// Top-K over a PRE-FILTERED set of row indices (e.g. rows matched by a
+    /// WHERE text-eq via scan_row_indices_eq). Groups indices by segment so the
+    /// sort column is decoded ONCE per segment (critical in compact mode where
+    /// each read_fixed_* is a full-column zstd decompression), then keeps a
+    /// bounded heap of the K best keys. Null sort keys are skipped, matching
+    /// top_k_row_indices_typed's per-row fallback semantics.
+    pub fn top_k_from_indices_typed(
+        &self,
+        order_col: usize,
+        k: usize,
+        desc: bool,
+        is_float: bool,
+        indices: &[(usize, usize)],
+    ) -> Vec<(usize, usize)> {
+        if k == 0 || indices.is_empty() {
+            return Vec::new();
+        }
+        let mut by_seg: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &(seg_idx, local_row) in indices {
+            by_seg.entry(seg_idx).or_default().push(local_row);
+        }
+        let segs = self.segments_snapshot();
+        let mut heap: std::collections::BinaryHeap<(u64, usize, usize)> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        let mut push_capped = |key: u64, s: usize, r: usize| {
+            heap.push((key, s, r));
+            if heap.len() > k {
+                heap.pop();
+            }
+        };
+        for (seg_idx, rows) in &by_seg {
+            let seg = match segs.get(*seg_idx) {
+                Some(s) => s,
+                None => continue,
+            };
+            if order_col >= seg.sst.column_tags.len() {
+                continue;
+            }
+            // Sort column decoded ONCE per segment (compact mode: one zstd
+            // decompression instead of one per row). Per-row typed getters are
+            // null-aware — NULL sort keys are skipped.
+            if is_float {
+                if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
+                    for &i in rows {
+                        if let Some(v) = fseg.get_f64(i) {
+                            let bits = v.to_bits();
+                            let ord = if bits & (1u64 << 63) != 0 {
+                                !bits
+                            } else {
+                                bits ^ (1u64 << 63)
+                            };
+                            push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
+                        }
+                    }
+                }
+            } else if let Ok(iseg) = seg.sst.read_fixed_i64(order_col) {
+                for &i in rows {
+                    if let Some(v) = iseg.get_i64(i) {
+                        // Order-preserving i64 → u64 (sign-flip), no f64
+                        // roundtrip so |v| > 2^53 keeps exact ordering.
+                        let ord = (v as u64) ^ (1u64 << 63);
+                        push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(u64, usize, usize)> = heap.into_vec();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.into_iter().map(|(_, s, r)| (s, r)).collect()
+    }
+
     /// (group_value, count) pairs. Zero Vec<Value> allocation — uses &str from
     /// the text segment directly. Optimized for GROUP BY col, COUNT(*).
     #[allow(dead_code)]

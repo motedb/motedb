@@ -9666,13 +9666,35 @@ impl QueryExecutor {
         }
 
         // 🚀 ORDER BY + LIMIT fast path: if ORDER BY is on a single numeric
-        // column with a small LIMIT and no WHERE, use top_k_row_indices to
-        // scan only the sort column (bounded heap), then fetch only K rows.
-        // This avoids materializing + sorting all 300K rows (49ms → ~2ms).
+        // column with a small LIMIT and no WHERE (or a simple text-eq WHERE),
+        // use top_k_row_indices to scan only the sort column (bounded heap),
+        // then fetch only K rows. This avoids materializing + sorting all
+        // 300K rows (49ms → ~2ms). With a text-eq WHERE, the matched row
+        // indices come from scan_row_indices_eq and top_k_from_indices_typed
+        // keeps the heap bounded over just those rows.
         // Note: OFFSET is only supported here when there's a single ORDER BY
         // key (multi-key or OFFSET-bearing queries fall through to the full
         // scan + sort path below).
-        if where_clause.is_none()
+        let text_eq_filter: Option<(usize, &str)> = match &where_clause {
+            Some(crate::sql::ast::Expr::BinaryOp {
+                left,
+                op: crate::sql::ast::BinaryOperator::Eq,
+                right,
+            }) => match (left.as_ref(), right.as_ref()) {
+                (
+                    crate::sql::ast::Expr::Column(cn),
+                    crate::sql::ast::Expr::Literal(Value::Text(tv)),
+                ) => match schema.get_column_position(cn) {
+                    Some(p) if matches!(schema.col_types().get(p), Some(ColumnType::Text)) => {
+                        Some((p, tv.as_str()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        if (where_clause.is_none() || text_eq_filter.is_some())
             && offset == 0
             && stmt.order_by.as_ref().is_none_or(|o| o.len() <= 1)
             // 🚨 DISTINCT must dedup AFTER sort+limit. The Top-K path below
@@ -9703,12 +9725,29 @@ impl QueryExecutor {
                                     // visible to the Top-K scan. Without this,
                                     // ORDER BY reads stale pre-UPDATE values.
                                     let _ = store.flush_buffer();
-                                    let top_indices = store.top_k_row_indices_typed(
-                                        order_col,
-                                        lim,
-                                        !first_ob.asc,
-                                        is_float,
-                                    );
+                                    let top_indices = if let Some((fc, tv)) = text_eq_filter {
+                                        match store.scan_row_indices_eq(
+                                            fc,
+                                            tv.as_bytes(),
+                                            usize::MAX,
+                                        ) {
+                                            Some(indices) => store.top_k_from_indices_typed(
+                                                order_col,
+                                                lim,
+                                                !first_ob.asc,
+                                                is_float,
+                                                &indices,
+                                            ),
+                                            None => Vec::new(),
+                                        }
+                                    } else {
+                                        store.top_k_row_indices_typed(
+                                            order_col,
+                                            lim,
+                                            !first_ob.asc,
+                                            is_float,
+                                        )
+                                    };
                                     let segs = store.segments_snapshot();
                                     let col_types = store.col_types();
                                     // Cache decoded columns per segment to avoid re-reading.
