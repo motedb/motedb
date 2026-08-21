@@ -1,0 +1,39 @@
+name: Fuzz
+
+# Daily short fuzzing campaign on both targets (SQL parser + WAL recovery).
+# 5 minutes each is enough to re-explore the existing corpus and push a few
+# million new inputs through the parser; crashes upload the artifact for
+# triage. Long campaigns remain a local/nightly concern.
+
+on:
+  schedule:
+    - cron: '0 19 * * *' # daily 19:00 UTC (03:00 +0800)
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: 5min x 2 targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_sql_parser, fuzz_wal_recover]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

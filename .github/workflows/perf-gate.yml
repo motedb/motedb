@@ -1,0 +1,34 @@
+name: Perf Gate
+
+# Performance regression smoke gate.
+# Asserts core query-shape latencies against the full-scan baseline AS A
+# RATIO — machine-independent, so slower CI runners don't flake it. The
+# budgets carry ~2x headroom over measured ratios; they exist to catch
+# complexity-class regressions (e.g. the O(N²) text-eq path that shipped as
+# 568s vs 8ms — a 70,000x blowup), not few-percent noise.
+# Tool: examples/perf_smoke.rs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  perf-smoke:
+    name: Query-shape ratio budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build perf smoke (release)
+        run: cargo build --release --example perf_smoke
+      - name: Run perf smoke
+        run: ./target/release/examples/perf_smoke
