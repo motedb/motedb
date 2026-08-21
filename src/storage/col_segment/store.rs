@@ -1317,9 +1317,9 @@ impl ColSegmentStore {
         let n = seg.sst.num_rows;
         let cap = if limit == usize::MAX { n } else { limit };
         let mut indices: Vec<usize> = Vec::with_capacity(cap.min(65536));
-        let ftext = match seg.sst.read_text(filter_col) {
-            Ok(t) => t,
-            Err(_) => return Some(indices),
+        let ftext = match seg.read_text_cached(filter_col) {
+            Some(t) => t,
+            None => return Some(indices),
         };
         let has_nulls = ftext.has_any_null();
         let has_deletions = seg.sst.row_map.has_any_deleted();
@@ -3017,11 +3017,12 @@ impl ColSegmentStore {
             if order_col >= seg.sst.column_tags.len() {
                 continue;
             }
-            // Sort column decoded ONCE per segment (compact mode: one zstd
-            // decompression instead of one per row). Per-row typed getters are
-            // null-aware — NULL sort keys are skipped.
-            if is_float {
-                if let Ok(fseg) = seg.sst.read_fixed_f64(order_col) {
+            // Sort column via col_cache (cross-query reuse of the decoded
+            // column — in compact mode each miss is a full-column zstd
+            // decompression). FixedSegment supports both get_f64 and get_i64
+            // on the same decoded bytes. Per-row getters are null-aware.
+            if let Some(fseg) = seg.read_fixed_cached(order_col) {
+                if is_float {
                     for &i in rows {
                         if let Some(v) = fseg.get_f64(i) {
                             let bits = v.to_bits();
@@ -3033,14 +3034,14 @@ impl ColSegmentStore {
                             push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
                         }
                     }
-                }
-            } else if let Ok(iseg) = seg.sst.read_fixed_i64(order_col) {
-                for &i in rows {
-                    if let Some(v) = iseg.get_i64(i) {
-                        // Order-preserving i64 → u64 (sign-flip), no f64
-                        // roundtrip so |v| > 2^53 keeps exact ordering.
-                        let ord = (v as u64) ^ (1u64 << 63);
-                        push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
+                } else {
+                    for &i in rows {
+                        if let Some(v) = fseg.get_i64(i) {
+                            // Order-preserving i64 → u64 (sign-flip), no f64
+                            // roundtrip so |v| > 2^53 keeps exact ordering.
+                            let ord = (v as u64) ^ (1u64 << 63);
+                            push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
+                        }
                     }
                 }
             }
