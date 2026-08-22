@@ -6,6 +6,8 @@ Columnar storage engine with ACID transactions, vector search, full-text search,
 [![Rust](https://img.shields.io/badge/rust-1.87+-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![crates.io](https://img.shields.io/crates/v/motedb.svg)](https://crates.io/crates/motedb)
+[![CI](https://github.com/motedb/motedb/actions/workflows/ci.yml/badge.svg)](https://github.com/motedb/motedb/actions/workflows/ci.yml)
+[![Perf Gate](https://github.com/motedb/motedb/actions/workflows/perf-gate.yml/badge.svg)](https://github.com/motedb/motedb/actions/workflows/perf-gate.yml)
 
 > **Status: pre-1.0.** The Rust embedding API and storage engine are stable and
 > heavily tested; the SQL surface and multi-language FFI are still evolving.
@@ -82,14 +84,14 @@ Benchmark: 300K rows × 4 columns on Apple Silicon M-series vs SQLite 3.x WAL mo
 │              Columnar Storage Engine                 │
 │  ┌─────────┐  ┌──────────┐  ┌────────────────────┐ │
 │  │ WAL     │→ │ Columnar │→ │ Columnar SSTable    │ │
-│  │ (fsync) │  │ Buffer   │  │ (mmap + Snappy)     │ │
+│  │ (fsync) │  │ Buffer   │  │ (mmap + zstd)       │ │
 │  └─────────┘  └──────────┘  └────────────────────┘ │
 ├─────────────────────────────────────────────────────┤
 │  MVCC Transaction │ Snapshot Isolation │ Conflict  │
 └─────────────────────────────────────────────────────┘
 ```
 
-- **Storage**: Columnar SSTable with Snappy compression, mmap zero-copy access
+- **Storage**: Columnar SSTable, mmap zero-copy access, optional page-level zstd compression (`compact_storage`, ~40-50% smaller disk; on by default in `for_edge`)
 - **Write Path**: WAL (durability) → columnar buffer → auto-finalize → SSTable
 - **Read Path**: SelectColumnar (zero-materialization), typed array access, predicate pushdown
 - **Transactions**: VersionStore MVCC with snapshot isolation and conflict detection
@@ -135,10 +137,10 @@ See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
 
 ### Embedded Optimized
 
-- **Low memory**: 257 B/row (30% less than SQLite)
+- **Low memory**: 222 B/row (vs SQLite's 335 B — 34% less)
 - **Zero-copy reads**: mmap with on-demand page loading
-- **Fast writes**: Zero-encode columnar INSERT (2.4M rows/s)
-- **Small disk**: Snappy compression (~1.8x, 68 B/row)
+- **Fast writes**: Zero-encode columnar INSERT (2.9M rows/s batch, 1.1M rows/s sustained in `for_edge` mode)
+- **Small disk**: zstd compression in compact mode (~40-50% smaller, 67 B/row on disk)
 - **No daemon**: Single library, embedded directly
 
 ### ACID
@@ -147,6 +149,16 @@ See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
 - **Consistent**: PK uniqueness, NOT NULL, type coercion
 - **Isolated**: MVCC snapshot isolation
 - **Durable**: WAL fsync + auto-finalize
+
+### Quality Gates
+
+Every push runs through three CI workflows:
+
+| Workflow | What it guards |
+|----------|----------------|
+| **CI** | fmt (strict), clippy, cargo-deny supply chain, unit + integration suites on ubuntu/macos, aarch64 cross-compile |
+| **Perf Gate** | Query-shape latency *ratios* vs a full-scan baseline — machine-independent budgets that catch complexity-class regressions (e.g. an O(N²) path that slipped through once) |
+| **Fuzz** (daily) | 5 min × 2 targets (`fuzz_sql_parser`, `fuzz_wal_recover`) under AddressSanitizer — found and fixed a parser stack-overflow on day one |
 
 ## Installation
 
@@ -157,13 +169,13 @@ cargo add motedb
 Or in `Cargo.toml`:
 ```toml
 [dependencies]
-motedb = "0.5"
+motedb = "0.9"
 ```
 
 For minimal edge builds (no tokenizer, no parallelism), disable default features:
 ```toml
 [dependencies]
-motedb = { version = "0.5", default-features = false, features = ["jemalloc"] }
+motedb = { version = "0.9", default-features = false, features = ["jemalloc"] }
 ```
 
 ## Configuration

@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased]
+
+### 性能（剖析器定位的系统性优化）
+
+- **修复 compact 模式 text-eq 多段物化 O(N²)**：多段回退分支对每个匹配行 ×
+  每列调用整列读取（compact 模式下每次为全列 zstd 解压），300K 行实测一条查询
+  568 秒。改为按段分组预解码后 **8.0ms**（同形态查询约为 SQLite 一半）。
+- **WHERE + ORDER BY LIMIT 走有界堆 top-K**：不再全量物化排序；
+  `top_k_from_indices_typed` 在匹配行索引上 O(M log K)，i64 排序键用保序
+  位翻转不经 f64（|v| > 2^53 不失序），结果与全量路径逐行一致。
+- **热路径列读取统一 col_cache**：跨查询复用 zstd 解压结果，
+  WHERE+ORDER+LIMIT 26.9ms → 冷 25.7ms / 热 9.4ms。
+- **IN-set 匹配换 FxHash**：SipHash 占 IN 子查询扫描 ~15%；内置 rustc 同族
+  FxHasher（无新依赖）。IN 子查询对 SQLite 由 1.40x 落后转为 1.27x 领先。
+- **CREATE TEXT INDEX 4.1s → 0.32s（12.8×）**：flush 对每 term 做一次 BTree
+  下沉（1 万 term ≈ 5 万次页反序列化）；新增 `GenericBTree::range_keys` 仅键
+  顺扫 + 大批次（≥1024 term）一次顺扫批量播种分片计数器。
+
+### 正确性 / 安全
+
+- **SQL 解析器无界递归栈溢出（fuzz 发现）**：连续 `[`（向量字面量）或嵌套
+  `CASE` 使递归下降解析器爆栈（crash-d4ff16a9，1572 字节输入）。LBracket /
+  Case 分支补上 `MAX_RECURSION_DEPTH=64` 护栏，超限返回语法错误。
+- **SortKey NaN 排序一致性**：`PartialOrd` 改为 `Some(self.cmp(other))`，
+  与 Ord 全序对齐，消除 NaN 参与 ORDER BY 时的歧义。
+
+### 测试与 CI
+
+- 全量测试矩阵全绿：debug 3590 / release 3590 / ignored 316 / fuzz
+  （SQL 解析器 271 万次本地 + CI 双目标每日 5 分钟）零崩溃。
+- **Perf Gate 上线**：`examples/perf_smoke` 以查询间比值做机器无关断言
+  （预算带 2× 余量，抓复杂度级回归），每次 push 运行。
+- **Fuzz 进 CI**：每日 fuzz_sql_parser / fuzz_wal_recover；ubuntu-22.04
+  runner（24.04 内核 ASLR 布局与 ASAN 冲突），fuzz 构建排除 jemalloc。
+- ACID 原子性测试更新为修复后的事务语义（事务激活期间的写入参与事务并随
+  回滚撤销）；fsync 校准基准与 RSS 增量护栏替代机器相关绝对阈值。
+
+### 内务
+
+- src/ 与 examples/ clippy 警告清零（89 处，含 `&self` 仅递归转关联函数、
+  大枚举 Box 化等）；删除 7 个未使用的测试辅助函数。
+
 ## [0.9.1] — 2026-08-16
 
 ### 全面测试驱动：7 项缺陷修复 + 死锁根治

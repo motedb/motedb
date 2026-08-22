@@ -472,6 +472,13 @@ println!("Total rows: {}", results.row_count());
 4. **Avoid SELECT *** (explicitly specify the columns you need)
 5. **Use transactions** (ensure data consistency)
 
+## Limits
+
+- **Expression nesting**: at most 64 levels of nested parentheses / unary
+  operators / vector literals `[...]` / `CASE` expressions. Deeper input
+  returns a syntax error (`Expression nesting too deep`) instead of
+  overflowing the stack — any realistic SQL stays far below the limit.
+
 ## Next Steps
 
 - [Batch Operations](./04-batch-operations.md) - High-performance batch inserts

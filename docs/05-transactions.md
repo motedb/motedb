@@ -16,6 +16,22 @@ db.execute("UPDATE accounts SET balance = balance + 100 WHERE id = 2")?;
 db.commit_transaction(tx)?;
 ```
 
+## Semantics: writes during an active transaction
+
+Statements executed on the same session/database handle **while a transaction is
+active join that transaction** (standard SQL behavior):
+
+- `ROLLBACK` undoes all writes made since `BEGIN` — including statements issued
+  through `db.execute(...)` without an explicit transaction parameter.
+- `ROLLBACK TO SAVEPOINT sp` undoes writes made after `sp` was created; the
+  commit afterwards keeps only the pre-savepoint writes.
+- Writes made **before** `BEGIN` (plain auto-commit statements) are already
+  durable and are never affected by a later rollback.
+
+> Historical note: releases before 0.9.1 had auto-commit writes bypass MVCC
+> (they survived rollback). That leak was fixed; the atomicity tests in
+> `tests/test_acid_comprehensive.rs` now lock this behavior down.
+
 ## API Reference
 
 | Feature | SQL | Rust API |
