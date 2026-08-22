@@ -15,7 +15,12 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-motedb = { path = ".." }
+# No default features: excludes `jemalloc` — merely LINKING jemalloc's C code
+# (uninstrumented by ASAN) into an AddressSanitizer binary segfaults at
+# startup on Linux x86_64. The lib also gates its global_allocator on
+# not(fuzzing); this goes further and drops the crate entirely from fuzz
+# builds. `rayon` keeps feature-dependent code paths compiled in.
+motedb = { path = "..", default-features = false, features = ["rayon"] }
 libfuzzer-sys = "0.4"
 
 # cargo-fuzz requires the bin crate type for each target.

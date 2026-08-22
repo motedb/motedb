@@ -13,7 +13,10 @@ on:
 jobs:
   fuzz:
     name: 5min x 2 targets
-    runs-on: ubuntu-latest
+    # ubuntu-22.04: the 24.04 kernel's ASLR mmap layout segfaults
+    # AddressSanitizer binaries at startup (even with vm.mmap_rnd_bits=28).
+    # 22.04's older kernel layout runs ASAN cleanly.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
