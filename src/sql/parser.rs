@@ -1335,9 +1335,17 @@ impl Parser {
             //   (simple form — equivalent to CASE WHEN expr = val THEN ...)
             TokenType::Case => {
                 self.advance(); // consume CASE
-                                // 🚨 Simple CASE: if the next token isn't WHEN, parse the test
-                                // expression and rewrite each `WHEN val THEN res` into the
-                                // searched form `WHEN test_expr = val THEN res`.
+                                // 🚨 Depth guard: `CASE CASE CASE ...` recurses via the
+                                // test expression below — same overflow class the
+                                // fuzzer found via `[[[[...` (crash-d4ff16a9).
+                self.recursion_depth += 1;
+                if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    self.recursion_depth -= 1;
+                    return Err(self.error("Expression nesting too deep"));
+                }
+                // 🚨 Simple CASE: if the next token isn't WHEN, parse the test
+                // expression and rewrite each `WHEN val THEN res` into the
+                // searched form `WHEN test_expr = val THEN res`.
                 let test_expr = if !matches!(self.current().token_type, TokenType::When) {
                     Some(self.parse_expr(0)?)
                 } else {
@@ -1369,6 +1377,7 @@ impl Parser {
                     None
                 };
                 self.expect(TokenType::End)?; // consumes END
+                self.recursion_depth -= 1;
                 Ok(Expr::Case { whens, else_expr })
             }
             // Unary operators (with depth guard to prevent stack overflow on chained NOT/-)
@@ -2137,7 +2146,17 @@ impl Parser {
             // Vector literal [1.0, 2.0, 3.0]
             TokenType::LBracket => {
                 self.advance();
-                let values = self.parse_expr_list()?;
+                // 🚨 Depth guard (fuzzer-found crash-d4ff16a9): `[[[[...`
+                // recurses parse_expr_list → parse_expr → parse_prefix_expr
+                // once per byte with no bound — stack overflow under ASAN.
+                self.recursion_depth += 1;
+                if self.recursion_depth > MAX_RECURSION_DEPTH {
+                    self.recursion_depth -= 1;
+                    return Err(self.error("Expression nesting too deep"));
+                }
+                let values = self.parse_expr_list();
+                self.recursion_depth -= 1;
+                let values = values?;
                 self.expect(TokenType::RBracket)?;
 
                 // Convert to Value::Vector
