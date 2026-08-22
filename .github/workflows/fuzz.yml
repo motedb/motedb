@@ -27,6 +27,11 @@ jobs:
           override: true
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      - name: Lower ASLR entropy for ASAN
+        # ubuntu-24.04 runners default vm.mmap_rnd_bits=32, which makes any
+        # AddressSanitizer binary SIGSEGV at startup (silently, before
+        # libFuzzer prints its banner). 28 is the documented workaround.
+        run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
