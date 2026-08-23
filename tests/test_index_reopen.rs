@@ -217,3 +217,41 @@ fn test_vector_index_crash_self_heal() {
         r
     );
 }
+
+#[test]
+fn test_hybrid_clean_then_crash_index_incremental() {
+    // Clean close (index persisted) → reopen → MORE inserts → crash.
+    // The crash reopen must rebuild the text index from data including the
+    // post-clean-close inserts (the replay-aware loader resets only tables
+    // with replayed rows — this table has them).
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("t.mote");
+    {
+        let db = Database::create(&p).unwrap();
+        db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        db.execute("CREATE TEXT INDEX d_body ON d (body)").unwrap();
+        db.execute("INSERT INTO d VALUES (1, 'early doc')").unwrap();
+        let _ = db.close();
+    }
+    {
+        let db = Database::open(&p).unwrap();
+        db.execute("INSERT INTO d VALUES (2, 'late doc')").unwrap();
+        // Early doc still searchable after the clean-reopen load.
+        let r = db.text_search_ranked("d_body", "early", 10).unwrap();
+        assert_eq!(r.len(), 1, "persisted index must be loaded on clean reopen");
+        std::mem::forget(db);
+    }
+    std::fs::remove_file(p.join(".lock")).ok();
+    let db = Database::open(&p).unwrap();
+    let r = db
+        .text_search_ranked("d_body", "late", 10)
+        .unwrap_or_else(|e| panic!("search after crash: {e}"));
+    assert_eq!(
+        r.len(),
+        1,
+        "post-clean-close insert must be in rebuilt index"
+    );
+    let r = db.text_search_ranked("d_body", "early", 10).unwrap();
+    assert_eq!(r.len(), 1);
+}

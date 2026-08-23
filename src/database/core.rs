@@ -1075,6 +1075,46 @@ impl MoteDB {
         let index_registry = Arc::new(crate::database::index_metadata::IndexRegistry::new(
             &db_path,
         ));
+        // 🔑 Tables that got WAL-replayed rows (committed inserts/updates/
+        // deletes). Decides whether on-disk indexes are stale (crash
+        // recovery ⇒ rebuild) or current (clean close flushed them ⇒ load
+        // as-is). Keeps clean reopen O(recovered) instead of O(table).
+        let replayed_tables: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            for records in recovered_records.values() {
+                for record in records {
+                    let table = match record {
+                        WALRecord::Insert {
+                            table_name, txn_id, ..
+                        }
+                        | WALRecord::InsertRaw {
+                            table_name, txn_id, ..
+                        }
+                        | WALRecord::Update {
+                            table_name, txn_id, ..
+                        }
+                        | WALRecord::UpdateRaw {
+                            table_name, txn_id, ..
+                        }
+                        | WALRecord::Delete {
+                            table_name, txn_id, ..
+                        }
+                        | WALRecord::DeleteRaw {
+                            table_name, txn_id, ..
+                        } => {
+                            if *txn_id != 0 && !committed_txns.contains(txn_id) {
+                                continue;
+                            }
+                            table_name.clone()
+                        }
+                        _ => continue,
+                    };
+                    set.insert(table);
+                }
+            }
+            set
+        };
+
         if let Err(e) = index_registry.load() {
             debug_log!(
                 "[database] ⚠️ Failed to load index_metadata: {:?}. Indexes will need rebuild.",
@@ -1087,7 +1127,7 @@ impl MoteDB {
         let vector_indexes = Self::load_vector_indexes(&db_path, &index_registry)?;
 
         // Load existing text indexes
-        let text_indexes = Self::load_text_indexes(&db_path)?;
+        let text_indexes = Self::load_text_indexes(&db_path, &index_registry, &replayed_tables)?;
 
         // Load existing i-Octree indexes
         let ioctree_indexes = Self::load_ioctree_indexes(&db_path)?;
@@ -1559,6 +1599,11 @@ impl MoteDB {
                 .collect();
             for (name, arc) in col_idx {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
+                    // Clean close flushed the index and the loader opened it
+                    // as-is — repopulating would rewrite all N entries.
+                    if !replayed_tables.contains(&table) {
+                        continue;
+                    }
                     if let Err(e) = db.populate_column_index(&arc, &table, &column) {
                         warn_log!(
                             "[Recovery] ⚠️ column index '{}' rebuild failed: {:?}",
@@ -1569,10 +1614,14 @@ impl MoteDB {
                 }
             }
 
-            // Text indexes: backfill from the table's text column.
+            // Text indexes: backfill from the table's text column — ONLY
+            // for tables with replayed rows (others were loaded current).
             let txt_idx: Vec<String> = db.text_indexes.iter().map(|e| e.key().clone()).collect();
             for name in txt_idx {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
+                    if !replayed_tables.contains(&table) {
+                        continue;
+                    }
                     if let Ok(schema) = db.table_registry.get_table(&table) {
                         if let Some(col_def) = schema.columns.iter().find(|c| c.name == column) {
                             let pos = col_def.position;
@@ -1859,7 +1908,11 @@ impl MoteDB {
     }
 
     /// Load existing text indexes from disk
-    fn load_text_indexes(db_path: &Path) -> Result<HashMap<String, Arc<RwLock<TextFTSIndex>>>> {
+    fn load_text_indexes(
+        db_path: &Path,
+        index_registry: &crate::database::index_metadata::IndexRegistry,
+        replayed_tables: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, Arc<RwLock<TextFTSIndex>>>> {
         let mut indexes = HashMap::new();
 
         // 🧹 Clean up legacy text_indexes_metadata.bin (no longer used)
@@ -1908,27 +1961,39 @@ impl MoteDB {
                                 None => continue,
                             };
 
-                            // 🔑 Reopen = rebuild from source data. Under the
-                            // async index pipeline, close() never flushes
-                            // index buffers (derived data, "rebuilt on
-                            // restart"), so the on-disk postings may be
-                            // stale. Remove the old dir and create a fresh
-                            // index; the open path backfills it from the
-                            // table data afterwards.
-                            let _ = std::fs::remove_dir_all(entry.path());
-                            let _ = std::fs::remove_dir_all(
-                                base_path
-                                    .parent()
-                                    .unwrap()
-                                    .join(format!("text_{}.dict.d", index_name)),
-                            );
-                            if let Ok(index) = TextFTSIndex::new(base_path) {
+                            // 🔑 Staleness decision: WAL replay recovered rows
+                            // for this table (crash) → persisted postings are
+                            // stale, reset and let the open path rebuild.
+                            // Otherwise (clean close flushed the index) →
+                            // LOAD the persisted postings as-is. Was:
+                            // unconditional reset — every clean reopen paid a
+                            // full-table re-index.
+                            let table_stale = index_registry
+                                .resolve_index_name(index_name)
+                                .map(|(t, _)| replayed_tables.contains(&t))
+                                .unwrap_or(true); // unknown table → rebuild
+                            if table_stale {
+                                let _ = std::fs::remove_dir_all(entry.path());
+                                let _ = std::fs::remove_dir_all(
+                                    base_path
+                                        .parent()
+                                        .unwrap()
+                                        .join(format!("text_{}.dict.d", index_name)),
+                                );
+                                if let Ok(index) = TextFTSIndex::new(base_path) {
+                                    indexes.insert(
+                                        index_name.to_string(),
+                                        Arc::new(RwLock::new(index)),
+                                    );
+                                    debug_log!(
+                                        "[MoteDB] Text index '{}' reset for rebuild",
+                                        index_name
+                                    );
+                                }
+                            } else if let Ok(index) = TextFTSIndex::new(base_path) {
                                 indexes
                                     .insert(index_name.to_string(), Arc::new(RwLock::new(index)));
-                                debug_log!(
-                                    "[MoteDB] Text index '{}' reset for rebuild",
-                                    index_name
-                                );
+                                debug_log!("[MoteDB] Loaded text index: {}", index_name);
                             }
                         }
                     }
