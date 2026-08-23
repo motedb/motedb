@@ -333,3 +333,35 @@ fn test_upsert_durability_across_reopen() {
         vec![Value::text("r".to_string())]
     );
 }
+
+#[test]
+fn test_concurrent_upsert_accumulate_no_lost_updates() {
+    // 4 threads × 250 autocommit upserts on the SAME pk, each adding 1.
+    // Autocommit writes serialize on the database write lock, so the
+    // read-modify-write inside DO UPDATE must never lose an increment.
+    let (db, _dir) = sensor_db();
+    exec(&db, "INSERT INTO sensors VALUES (1, 'counter', 0)");
+
+    let db = std::sync::Arc::new(db);
+    let mut handles = Vec::new();
+    for _t in 0..4 {
+        let db2 = std::sync::Arc::clone(&db);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..250 {
+                db2.execute(
+                    "INSERT INTO sensors VALUES (1, 'w', 1) \
+                     ON CONFLICT (id) DO UPDATE SET reading = reading + excluded.reading",
+                )
+                .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        scalar_i64(&db, "SELECT reading FROM sensors WHERE id = 1"),
+        1000
+    );
+    assert_eq!(scalar_i64(&db, "SELECT COUNT(*) FROM sensors"), 1);
+}

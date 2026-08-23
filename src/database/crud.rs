@@ -381,6 +381,8 @@ impl MoteDB {
             // store already exists (the common case after the first insert).
             let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
             store.append_row_ref(composite_key, ts, &row)?;
+            // Timestamp index maintenance (query visibility before flush).
+            self.index_row_timestamp(&row, row_id);
             // Memory-aware flush: trigger when write buffer exceeds ~8MB of heap.
             // This bounds the write_buf to ~8MB regardless of row width, while
             // keeping segment count reasonable (2M rows → ~40 segments).
@@ -1732,6 +1734,23 @@ impl MoteDB {
     /// Get or create the multi-segment ColSegmentStore for a table.
     /// This is the new append-only path; coexists with the legacy
     /// single-SSTable fields during migration (S6-S9).
+    /// Maintain the in-memory timestamp index after a row lands (runtime
+    /// insert paths). Mirrors the WAL-recovery fill: when a row's FIRST
+    /// value is a Timestamp, index ts → row_id. Without this,
+    /// `query_timestamp_range` returned nothing until the next
+    /// checkpoint/reopen — the index was only populated by recovery and
+    /// rebuild_timestamp_index. The index is a row-id filter: entries for
+    /// later-deleted rows are tolerated (liveness is checked when rows are
+    /// fetched), exactly like recovery-built entries.
+    pub(crate) fn index_row_timestamp(&self, row: &Row, row_id: RowId) {
+        if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
+            let _ = self
+                .timestamp_index
+                .write()
+                .insert(ts.as_micros_u64(), row_id);
+        }
+    }
+
     pub fn get_or_create_col_segment_store(
         &self,
         table_name: &str,
@@ -2908,7 +2927,12 @@ impl MoteDB {
             // and is updated during flush via batch building
         }
 
-        // 8. Update row count for COUNT(*) fast path
+        // 8. Timestamp index maintenance (query visibility before flush)
+        for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+            self.index_row_timestamp(row, *row_id);
+        }
+
+        // 9. Update row count for COUNT(*) fast path
         if let Some(counter) = self.table_row_count.get(table_name) {
             use std::sync::atomic::Ordering;
             counter.fetch_add(rows.len() as u64, Ordering::Relaxed);

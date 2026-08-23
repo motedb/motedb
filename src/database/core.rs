@@ -906,7 +906,6 @@ impl MoteDB {
         // 的扫描路径不读 LSM tombstone —— 重启后从 columnar_ms/ 重建时没有删除标记，
         // 导致已删除行"复活"。这里先收集，待 ColSegmentStore 创建后回放。
         // 字段：(table_name, composite_key)
-        let mut recovered_deletes: Vec<(String, u64)> = Vec::new();
 
         for records in recovered_records.values() {
             for record in records {
@@ -1031,7 +1030,6 @@ impl MoteDB {
                         let composite_key = ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF);
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         lsm_engine.delete(composite_key, ts)?;
-                        recovered_deletes.push((table_name.clone(), composite_key));
                         _recovered_count += 1;
                     }
                     WALRecord::Delete {
@@ -1048,7 +1046,6 @@ impl MoteDB {
 
                         let ts = recovery_lsn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         lsm_engine.delete(composite_key, ts)?;
-                        recovered_deletes.push((table_name.clone(), composite_key));
                         _recovered_count += 1;
                     }
                     _ => {}
@@ -1313,57 +1310,44 @@ impl MoteDB {
             }
         }
 
-        // 🔑 回放 WAL recovery 收集的 DELETE tombstone 到 ColSegmentStore。
-        // ColSegmentStore 现在已从 columnar_ms/ 恢复（上面的块），但 WAL 里的删除
-        // 记录还没反映到 columnar_ms 的 segment 中（运行时 DELETE 已改为延迟 flush，
-        // tombstone 可能还在内存 write_buf，未落盘就崩溃）。这里把已提交的删除
-        // 重放为 tombstone 并立即 flush，确保重启后已删除行不复活。
-        // 正确性：用单调递增的 write_lsn 作为 tombstone timestamp，大于所有已存在行。
-        if !recovered_deletes.is_empty() {
-            // 按表分组，减少 flush 次数。
-            let mut by_table: std::collections::HashMap<String, Vec<u64>> =
-                std::collections::HashMap::new();
-            for (tbl, key) in recovered_deletes.drain(..) {
-                by_table.entry(tbl).or_default().push(key);
-            }
-            for (tbl, keys) in by_table {
-                if let Some(store) = db.col_segment_stores.get(&tbl) {
-                    for key in keys {
-                        let ts = db
-                            .write_lsn
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _ = store.append_tombstone(key, ts);
-                    }
-                    // tombstone 进 write_buf 后立即 flush，保证落盘。
-                    let _ = store.flush_buffer();
-                }
-            }
-        }
-
-        // 🔑 Replay WAL-committed INSERT/UPDATE records for STANDARD tables
-        // into their ColSegmentStore (the store the read path actually uses).
-        // The redo phase above restores the LSM and a legacy columnar buffer,
-        // but not col_segment_stores — without this block, rows acked by
-        // execute() but not yet flushed to a columnar segment are INVISIBLE
-        // after a crash, and the first checkpoint then persists the empty
-        // view and truncates the WAL, destroying them permanently (kill -9
-        // durability hole found by tests/test_crash_injection.rs).
-        // Re-appending rows that were already flushed before the crash is
-        // safe: segment scans dedup newest-segment-wins per composite key,
-        // and UPDATEs are exactly same-key re-appends at runtime.
+        // 🔑 Replay WAL-committed records for STANDARD tables into their
+        // ColSegmentStore (the store the read path actually uses) — rows AND
+        // delete tombstones in ONE ordered pass. The redo phase restores the
+        // LSM and a legacy columnar buffer, but not col_segment_stores.
+        //
+        // Ordering: the same composite key always maps to the same WAL
+        // partition, and each partition's records are sequential, so a
+        // per-partition-ordered walk preserves per-key order — the delete of
+        // a key replays AFTER its inserts/updates, and the single
+        // flush_buffer() at the end dedups newest-wins per key. (Two separate
+        // replay passes — tombstones first, rows second — resurrected deleted
+        // rows: the row pass flushed a NEWER segment holding OLDER data;
+        // found by the kill -9 update/delete crash-injection test.)
         {
-            let mut by_table: std::collections::HashMap<String, Vec<(u64, crate::types::Row)>> =
+            enum ReplayOp {
+                Row(crate::types::Row),
+                Tombstone,
+            }
+            let mut by_table: std::collections::HashMap<String, Vec<(u64, ReplayOp)>> =
                 std::collections::HashMap::new();
             for records in recovered_records.values() {
                 for record in records {
-                    let (table_name, row_id, txn_id, row) = match record {
+                    let (table_name, key, txn_id, op) = match record {
                         WALRecord::Insert {
                             table_name,
                             row_id,
                             data,
                             txn_id,
                             ..
-                        } => (table_name.clone(), *row_id, *txn_id, data.clone()),
+                        } => {
+                            let table_id = db.table_registry.get_table_id(table_name).unwrap_or(0);
+                            (
+                                table_name.clone(),
+                                ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF),
+                                *txn_id,
+                                ReplayOp::Row(data.clone()),
+                            )
+                        }
                         WALRecord::InsertRaw {
                             table_name,
                             row_id,
@@ -1374,10 +1358,19 @@ impl MoteDB {
                             let col_types = db
                                 .table_registry
                                 .get_table(table_name)
-                                .map(|s| s.col_types().to_vec())
+                                .map(|sc| sc.col_types().to_vec())
                                 .unwrap_or_default();
                             match crate::storage::row_format::decode(raw_data, &col_types) {
-                                Ok(r) => (table_name.clone(), *row_id, *txn_id, r),
+                                Ok(r) => {
+                                    let table_id =
+                                        db.table_registry.get_table_id(table_name).unwrap_or(0);
+                                    (
+                                        table_name.clone(),
+                                        ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF),
+                                        *txn_id,
+                                        ReplayOp::Row(r),
+                                    )
+                                }
                                 Err(_) => continue,
                             }
                         }
@@ -1387,7 +1380,15 @@ impl MoteDB {
                             new_data,
                             txn_id,
                             ..
-                        } => (table_name.clone(), *row_id, *txn_id, new_data.clone()),
+                        } => {
+                            let table_id = db.table_registry.get_table_id(table_name).unwrap_or(0);
+                            (
+                                table_name.clone(),
+                                ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF),
+                                *txn_id,
+                                ReplayOp::Row(new_data.clone()),
+                            )
+                        }
                         WALRecord::UpdateRaw {
                             table_name,
                             row_id,
@@ -1398,12 +1399,41 @@ impl MoteDB {
                             let col_types = db
                                 .table_registry
                                 .get_table(table_name)
-                                .map(|s| s.col_types().to_vec())
+                                .map(|sc| sc.col_types().to_vec())
                                 .unwrap_or_default();
                             match crate::storage::row_format::decode(raw_new, &col_types) {
-                                Ok(r) => (table_name.clone(), *row_id, *txn_id, r),
+                                Ok(r) => {
+                                    let table_id =
+                                        db.table_registry.get_table_id(table_name).unwrap_or(0);
+                                    (
+                                        table_name.clone(),
+                                        ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF),
+                                        *txn_id,
+                                        ReplayOp::Row(r),
+                                    )
+                                }
                                 Err(_) => continue,
                             }
+                        }
+                        WALRecord::Delete {
+                            table_name,
+                            row_id,
+                            txn_id,
+                            ..
+                        }
+                        | WALRecord::DeleteRaw {
+                            table_name,
+                            row_id,
+                            txn_id,
+                            ..
+                        } => {
+                            let table_id = db.table_registry.get_table_id(table_name).unwrap_or(0);
+                            (
+                                table_name.clone(),
+                                ((table_id as u64) << 32) | (*row_id & 0xFFFFFFFF),
+                                *txn_id,
+                                ReplayOp::Tombstone,
+                            )
                         }
                         _ => continue,
                     };
@@ -1413,47 +1443,51 @@ impl MoteDB {
                     // TimeSeries rows were replayed into columnar_store above.
                     if let Ok(schema) = db.table_registry.get_table(&table_name) {
                         if schema.table_type != crate::types::TableType::TimeSeries {
-                            by_table.entry(table_name).or_default().push((row_id, row));
+                            by_table.entry(table_name).or_default().push((key, op));
                         }
                     }
                 }
             }
             let mut replayed = 0u64;
-            for (tbl, rows) in by_table {
+            for (tbl, ops) in by_table {
                 let Ok(schema) = db.table_registry.get_table(&tbl) else {
                     continue;
                 };
                 let Ok(store) = db.get_or_create_col_segment_store(&tbl, schema.col_types()) else {
                     warn_log!(
-                        "[Recovery] ⚠️ no ColSegmentStore for '{}': {} WAL rows stay LSM-only",
+                        "[Recovery] ⚠️ no ColSegmentStore for '{}': {} WAL ops stay LSM-only",
                         tbl,
-                        rows.len()
+                        ops.len()
                     );
                     continue;
                 };
-                for (row_id, row) in rows {
-                    let key = db.make_composite_key(&tbl, row_id);
+                for (key, op) in ops {
                     let ts = db
                         .write_lsn
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Err(e) = store.append_row_ref(key, ts, &row) {
+                    let r = match op {
+                        ReplayOp::Row(row) => store.append_row_ref(key, ts, &row),
+                        ReplayOp::Tombstone => store.append_tombstone(key, ts),
+                    };
+                    if let Err(e) = r {
                         warn_log!(
-                            "[Recovery] ⚠️ col-segment replay failed for '{}' row {}: {:?}",
+                            "[Recovery] ⚠️ col-segment replay failed for '{}' key {}: {:?}",
                             tbl,
-                            row_id,
+                            key,
                             e
                         );
                     } else {
                         replayed += 1;
                     }
                 }
-                // Replayed rows sit in the write_buf — flush so a second
-                // crash (before any later checkpoint) can't lose them again.
+                // Replayed ops sit in the write_buf — one flush per table so
+                // a second crash (before any later checkpoint) can't lose
+                // them, and newest-wins dedup applies per key.
                 let _ = store.flush_buffer();
             }
             if replayed > 0 {
                 debug_log!(
-                    "[Recovery] Replayed {} WAL rows into ColSegmentStores",
+                    "[Recovery] Replayed {} WAL ops into ColSegmentStores",
                     replayed
                 );
             }

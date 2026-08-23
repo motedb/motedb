@@ -249,6 +249,9 @@ impl MoteDB {
                 let _ = store.append_rows(&[(key, ts, row_data.clone())]);
             }
 
+            // Timestamp index maintenance (query visibility before flush).
+            self.index_row_timestamp(row_data, *row_id);
+
             let tbl_schema = self.table_registry.get_table(table_name)?;
             if let Some(pk_name) = tbl_schema.primary_key() {
                 if let Some(pk_col) = tbl_schema.get_column(pk_name) {

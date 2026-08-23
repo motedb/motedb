@@ -2,7 +2,30 @@
 
 ## [Unreleased]
 
-### 可靠性（kill -9 崩溃注入 uncovered 两个 Critical 持久化缺陷）
+### 可靠性第二轮（扩展崩溃注入负载后继续挖出 3 个缺陷）
+
+- **修复：崩溃恢复"删除复活"**。上一轮的 INSERT 重放块与既有的 DELETE
+  tombstone 重放块是两个独立 pass：tombstone 先 flush 成 segment，INSERT
+  重放随后以更新的 segment 追加同 key 的旧数据 —— newest-segment-wins 把
+  **已 ack 的删除覆盖，行复活**。重构为按 WAL 记录顺序的统一重放
+  （同 key 恒在同分区、分区内有序，行与 tombstone 交错进同一 write_buf，
+  每表一次 flush，per-key 末写胜出）。由新增的 update/delete 崩溃注入
+  模式第一轮即抓到。
+- **修复：运行时 INSERT 不维护 timestamp 索引**。索引只在崩溃恢复与
+  checkpoint 重建时填充，标准表（首列 TIMESTAMP）在两次 checkpoint 之间
+  `query_timestamp_range` 一律返回空。单行/批量/事务提交三条插入路径补上
+  `index_row_timestamp`（与恢复语义一致，容忍已删行的陈旧条目）。
+- **修复：timestamp 索引重建与 memtable 范围扫描的类型盲区**。两处用无
+  schema 的 `decode_any`：固定列一律按 Integer 解码，Timestamp 值永不匹配
+  —— 重建静默漏索引、memtable 回退路径对 raw 格式行全盲。改为按
+  table_id/schema 感知解码（重建路径 + 带 per-call 缓存的 memtable 路径）。
+- **新增：崩溃注入第二/第三模式** —— update_delete 负载（确定性 op 序列
+  模拟，恢复状态必须精确等于某个覆盖全部 ack 的前缀）与显式事务负载
+  （每事务 5 行，验证原子性 + 已提交事务连续前缀）。80×3 + 200 轮浸泡通过。
+- **新增测试**：timestamp 崩溃恢复回归（live + recovered 双路径）、
+  4 线程并发 upsert 累积（1000 次增量零丢失）。
+
+### 可靠性第一轮（kill -9 崩溃注入 uncovered 两个 Critical 持久化缺陷）
 
 - **修复：标准表 WAL 重放不进 ColSegmentStore（数据丢失级）**。写入路径每行走
   WAL + ColSegmentStore，但崩溃恢复只重放 LSM 与 legacy 列式缓冲——`execute()`

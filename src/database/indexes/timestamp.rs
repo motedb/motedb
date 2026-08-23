@@ -49,28 +49,32 @@ impl MoteDB {
         let mut entries_to_index = Vec::new();
 
         for table_name in self.table_registry.list_tables()? {
+            // Schema + first Timestamp column position, shared by both paths.
+            let schema = match self.table_registry.get_table(&table_name) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let first_ts_col = schema
+                .columns
+                .iter()
+                .position(|c| matches!(c.col_type, crate::types::ColumnType::Timestamp));
+
             // 🚀 Columnar fast path: read timestamps directly from FixedSegment
             if let Some(col_sst) = self.columnar_sstables.get(&table_name) {
-                // Find first timestamp column
-                if let Ok(schema) = self.table_registry.get_table(&table_name) {
-                    for col_def in &schema.columns {
-                        if matches!(col_def.col_type, crate::types::ColumnType::Timestamp) {
-                            if let Ok(seg) = col_sst.read_fixed_i64(col_def.position) {
-                                let _ = col_sst.load_full_keys();
-                                for i in 0..col_sst.num_rows {
-                                    if col_sst.row_map.is_deleted(i) {
-                                        continue;
-                                    }
-                                    if let Some(ts_micros) = seg.get_i64(i) {
-                                        if ts_micros as u64 > max_indexed_ts {
-                                            let row_id =
-                                                (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
-                                            entries_to_index.push((ts_micros as u64, row_id));
-                                        }
-                                    }
+                if let Some(ts_pos) = first_ts_col {
+                    let col_def = &schema.columns[ts_pos];
+                    if let Ok(seg) = col_sst.read_fixed_i64(col_def.position) {
+                        let _ = col_sst.load_full_keys();
+                        for i in 0..col_sst.num_rows {
+                            if col_sst.row_map.is_deleted(i) {
+                                continue;
+                            }
+                            if let Some(ts_micros) = seg.get_i64(i) {
+                                if ts_micros as u64 > max_indexed_ts {
+                                    let row_id = (col_sst.row_map.key(i) & 0xFFFFFFFF) as RowId;
+                                    entries_to_index.push((ts_micros as u64, row_id));
                                 }
                             }
-                            break; // only first timestamp column
                         }
                     }
                 }
@@ -87,6 +91,14 @@ impl MoteDB {
                 Err(_) => continue,
             };
 
+            // 🔑 Schema-aware decode: decode_any decodes every fixed column
+            // as Integer, so Timestamp values never matched and raw-format
+            // rows were silently skipped from the index.
+            let col_types = schema.col_types().to_vec();
+            let ts_pos = match first_ts_col {
+                Some(p) => p,
+                None => continue, // no timestamp column → nothing to index
+            };
             for result in scan_iter {
                 let (composite_key, value) = match result {
                     Ok(r) => r,
@@ -102,8 +114,8 @@ impl MoteDB {
                         }
                     }
                 };
-                if let Ok(row) = crate::storage::row_format::decode_any(&data_bytes) {
-                    if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
+                if let Ok(row) = crate::storage::row_format::decode(&data_bytes, &col_types) {
+                    if let Some(crate::types::Value::Timestamp(ts)) = row.get(ts_pos) {
                         let ts_micros = ts.as_micros_u64();
                         if ts_micros > max_indexed_ts {
                             entries_to_index.push((ts_micros, row_id));
@@ -243,13 +255,48 @@ impl MoteDB {
         let scan_start = std::time::Instant::now();
         let mut row_ids = Vec::with_capacity(memtable_entries.len() / 10);
 
+        // 🔑 Schema-aware decode with a per-call cache (keyed by table_id
+        // from the composite key). decode_any decodes fixed columns as
+        // Integer, so Timestamp values never matched — raw-format rows in
+        // the memtable were invisible to range queries.
+        let mut schema_cache: std::collections::HashMap<
+            u32,
+            (Vec<crate::types::ColumnType>, Vec<usize>),
+        > = std::collections::HashMap::new();
+
         for (composite_key, value_bytes) in memtable_entries {
             let row_id = (composite_key & 0xFFFFFFFF) as RowId;
+            let table_id = (composite_key >> 32) as u32;
 
-            // Decode row and find timestamp value by checking all columns
-            if let Ok(row) = crate::storage::row_format::decode_any(&value_bytes) {
-                for val in row.iter() {
-                    if let crate::types::Value::Timestamp(ts) = val {
+            let (col_types, ts_positions) = match schema_cache.get(&table_id) {
+                Some(e) => e,
+                None => {
+                    let entry = self
+                        .table_registry
+                        .get_table_name_by_id(table_id)
+                        .ok()
+                        .and_then(|n| self.table_registry.get_table(&n).ok())
+                        .map(|s| {
+                            let cts = s.col_types().to_vec();
+                            let pos: Vec<usize> = s
+                                .columns
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| {
+                                    matches!(c.col_type, crate::types::ColumnType::Timestamp)
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+                            (cts, pos)
+                        })
+                        .unwrap_or_default();
+                    schema_cache.entry(table_id).or_insert(entry)
+                }
+            };
+
+            if let Ok(row) = crate::storage::row_format::decode(&value_bytes, col_types) {
+                for &p in ts_positions {
+                    if let Some(crate::types::Value::Timestamp(ts)) = row.get(p) {
                         let timestamp = ts.as_micros();
                         if timestamp >= start && timestamp <= end {
                             row_ids.push(row_id);
