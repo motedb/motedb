@@ -73,6 +73,31 @@ db.execute("INSERT INTO users VALUES (1, 'Alice', 25)")?;
 db.flush()?;  // Ensure data is persisted
 ```
 
+### backup_to
+
+Online backup: copy a consistent point-in-time snapshot of the whole
+database to a new directory while the database stays open. Concurrent
+autocommit writes pause for the duration of the copy; every transaction
+committed before the call is present in the snapshot. The copy is
+fsync'd file-by-file, so it is durable the moment the call returns.
+
+```rust
+pub fn backup_to<P: AsRef<Path>>(&self, dest: P) -> Result<()>
+```
+
+**Example**:
+```rust
+// Back up a running robot's database to external storage.
+db.backup_to("/mnt/usb/robot_backup")?;
+
+// ... later, possibly on another device — restore is just open():
+let db = Database::open("/mnt/usb/robot_backup")?;
+```
+
+`dest` is normalized with the same `.mote` convention as `open()`, so the
+snapshot is opened from the exact path passed in. `dest` must not already
+exist. If a flush/checkpoint is in progress the call errors — retry.
+
 ### close
 
 Close the database (explicit call; normally handled automatically by Drop).

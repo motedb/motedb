@@ -146,6 +146,12 @@ impl Parser {
                 }
             }
             TokenType::Insert => Statement::Insert(self.parse_insert()?),
+            // EXPLAIN <statement>: recursively parse the explained statement.
+            TokenType::Explain => {
+                self.advance();
+                let inner = self.parse()?;
+                Statement::Explain(Box::new(inner))
+            }
             TokenType::Update => Statement::Update(self.parse_update()?),
             TokenType::Delete => Statement::Delete(self.parse_delete()?),
             TokenType::Create => self.parse_create()?,
@@ -684,8 +690,29 @@ impl Parser {
     /// Parse INSERT statement
     fn parse_insert(&mut self) -> Result<InsertStmt> {
         self.expect(TokenType::Insert)?;
-        self.expect(TokenType::Into)?;
 
+        // SQLite-style upsert prefix: INSERT OR IGNORE / INSERT OR REPLACE
+        // (the OR clause sits BETWEEN INSERT and INTO). `ignore`/`replace`
+        // are matched context-sensitively (as identifiers) so they stay
+        // usable as column/function names elsewhere.
+        let mut on_conflict: Option<OnConflict> = None;
+        if self.match_token(TokenType::Or) {
+            if self.match_keyword_ident("ignore") {
+                on_conflict = Some(OnConflict {
+                    target: None,
+                    action: ConflictAction::Ignore,
+                });
+            } else if self.match_keyword_ident("replace") {
+                on_conflict = Some(OnConflict {
+                    target: None,
+                    action: ConflictAction::Replace,
+                });
+            } else {
+                return Err(self.error("Expected IGNORE or REPLACE after INSERT OR"));
+            }
+        }
+
+        self.expect(TokenType::Into)?;
         let table = self.parse_identifier()?;
 
         // Optional column list
@@ -713,10 +740,47 @@ impl Parser {
             }
         }
 
+        // SQL-standard upsert suffix:
+        //   ON CONFLICT [(col, ...)] DO NOTHING
+        //   ON CONFLICT (col, ...) DO UPDATE SET col = expr [, ...]
+        // `conflict`/`do`/`nothing` are matched context-sensitively to avoid
+        // reserving them as keywords (they remain valid identifiers).
+        if self.match_token(TokenType::On) {
+            self.expect_keyword_ident("conflict")?;
+            let target = if matches!(self.current().token_type, TokenType::LParen) {
+                self.advance();
+                let cols = self.parse_identifier_list()?;
+                self.expect(TokenType::RParen)?;
+                Some(cols)
+            } else {
+                None
+            };
+            self.expect_keyword_ident("do")?;
+            let action = if self.match_keyword_ident("nothing") {
+                ConflictAction::DoNothing
+            } else {
+                self.expect(TokenType::Update)?;
+                self.expect(TokenType::Set)?;
+                let mut assignments = Vec::new();
+                loop {
+                    let column = self.parse_identifier()?;
+                    self.expect(TokenType::Eq)?;
+                    let expr = self.parse_expr(0)?;
+                    assignments.push((column, expr));
+                    if !self.match_token(TokenType::Comma) {
+                        break;
+                    }
+                }
+                ConflictAction::DoUpdate { assignments }
+            };
+            on_conflict = Some(OnConflict { target, action });
+        }
+
         Ok(InsertStmt {
             table,
             columns,
             values,
+            on_conflict,
         })
     }
 
@@ -2352,6 +2416,29 @@ impl Parser {
             Ok(name)
         } else {
             Err(self.error("Expected identifier"))
+        }
+    }
+
+    /// Context-sensitive keyword match: consumes the current token if it is an
+    /// identifier spelled `kw` (case-insensitive). Used for words like
+    /// `CONFLICT` / `REPLACE` that must NOT become reserved keywords because
+    /// they are also valid column names or function names elsewhere.
+    fn match_keyword_ident(&mut self, kw: &str) -> bool {
+        if let TokenType::Identifier(s) = &self.current().token_type {
+            if s.eq_ignore_ascii_case(kw) {
+                self.advance();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `match_keyword_ident` with a descriptive error on mismatch.
+    fn expect_keyword_ident(&mut self, kw: &str) -> Result<()> {
+        if self.match_keyword_ident(kw) {
+            Ok(())
+        } else {
+            Err(self.error(&format!("Expected {}", kw.to_uppercase())))
         }
     }
 

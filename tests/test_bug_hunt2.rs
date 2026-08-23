@@ -648,12 +648,14 @@ fn test_auto_increment_with_explicit_id() {
 
     let rows = query_rows(&db, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(rows.len(), 3);
-    // MoteDB design: AUTO_INCREMENT ignores user-provided PK values,
-    // so explicit id=100 is ignored and auto-generated ID is used instead.
-    // IDs should be sequential: 1, 2, 3
+    // Explicit PK values on AUTO_INCREMENT columns are HONORED (SQLite /
+    // MySQL semantics, and consistent with the no-column-list fast path):
+    // id=100 is stored as-is, and the counter continues past it (101).
+    // (Previously the column-list path silently dropped the explicit value —
+    // fixed together with UPSERT, which requires explicit-PK lookups.)
     assert_eq!(rows[0][0], Value::Integer(1));
-    assert_eq!(rows[1][0], Value::Integer(2));
-    assert_eq!(rows[2][0], Value::Integer(3));
+    assert_eq!(rows[1][0], Value::Integer(100));
+    assert_eq!(rows[2][0], Value::Integer(101));
 }
 
 // ============================================================

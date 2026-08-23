@@ -826,6 +826,7 @@ impl MoteDB {
                         }
                     }
                     WALRecord::InsertRaw {
+                        table_name,
                         row_id,
                         raw_data,
                         txn_id,
@@ -833,8 +834,17 @@ impl MoteDB {
                     } => {
                         max_row_id = max_row_id.max(*row_id);
                         if *txn_id == 0 || committed_txns.contains(txn_id) {
-                            // Extract timestamp from raw data for index
-                            if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
+                            // Extract timestamp from raw data for index.
+                            // 🔑 Schema-aware decode: decode_any is width-fixed
+                            // but types are guessed (Timestamp reads as
+                            // Integer), which silently skipped this index.
+                            let col_types = table_registry
+                                .get_table(table_name)
+                                .map(|s| s.col_types().to_vec())
+                                .unwrap_or_default();
+                            if let Ok(row) =
+                                crate::storage::row_format::decode(raw_data, &col_types)
+                            {
                                 if let Some(crate::types::Value::Timestamp(ts)) = row.first() {
                                     if let Err(e) =
                                         timestamp_idx.insert(ts.as_micros_u64(), *row_id)
@@ -918,7 +928,14 @@ impl MoteDB {
                         lsm_engine.put(composite_key, value)?;
                         // Also write to columnar buffer
                         if let Some(builder_arc) = col_builders.get(table_name) {
-                            if let Ok(row) = crate::storage::row_format::decode_any(raw_data) {
+                            // 🔑 Schema-aware decode (decode_any misreads types).
+                            let col_types = table_registry
+                                .get_table(table_name)
+                                .map(|s| s.col_types().to_vec())
+                                .unwrap_or_default();
+                            if let Ok(row) =
+                                crate::storage::row_format::decode(raw_data, &col_types)
+                            {
                                 let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
                                 let _ = builder_arc.value().lock().add_values(key, ts, false, &row);
                             }
@@ -963,7 +980,13 @@ impl MoteDB {
                         let value = crate::storage::lsm::Value::new(raw_new.clone(), ts);
                         lsm_engine.put(composite_key, value)?;
                         if let Some(builder_arc) = col_builders.get(table_name) {
-                            if let Ok(row) = crate::storage::row_format::decode_any(raw_new) {
+                            // 🔑 Schema-aware decode (decode_any misreads types).
+                            let col_types = table_registry
+                                .get_table(table_name)
+                                .map(|s| s.col_types().to_vec())
+                                .unwrap_or_default();
+                            if let Ok(row) = crate::storage::row_format::decode(raw_new, &col_types)
+                            {
                                 let key = (table_id as u64) << 32 | (*row_id & 0xFFFFFFFF);
                                 let _ = builder_arc.value().lock().add_values(key, ts, false, &row);
                             }
@@ -1152,7 +1175,14 @@ impl MoteDB {
                             txn_id,
                             ..
                         } => {
-                            let row = match crate::storage::row_format::decode_any(raw_data) {
+                            // 🔑 Schema-aware decode (decode_any misreads types
+                            // and broke the TimeSeries replay width assert).
+                            let col_types = table_registry
+                                .get_table(table_name)
+                                .map(|s| s.col_types().to_vec())
+                                .unwrap_or_default();
+                            let row = match crate::storage::row_format::decode(raw_data, &col_types)
+                            {
                                 Ok(r) => r,
                                 Err(_) => continue,
                             };
@@ -1307,6 +1337,125 @@ impl MoteDB {
                     // tombstone 进 write_buf 后立即 flush，保证落盘。
                     let _ = store.flush_buffer();
                 }
+            }
+        }
+
+        // 🔑 Replay WAL-committed INSERT/UPDATE records for STANDARD tables
+        // into their ColSegmentStore (the store the read path actually uses).
+        // The redo phase above restores the LSM and a legacy columnar buffer,
+        // but not col_segment_stores — without this block, rows acked by
+        // execute() but not yet flushed to a columnar segment are INVISIBLE
+        // after a crash, and the first checkpoint then persists the empty
+        // view and truncates the WAL, destroying them permanently (kill -9
+        // durability hole found by tests/test_crash_injection.rs).
+        // Re-appending rows that were already flushed before the crash is
+        // safe: segment scans dedup newest-segment-wins per composite key,
+        // and UPDATEs are exactly same-key re-appends at runtime.
+        {
+            let mut by_table: std::collections::HashMap<String, Vec<(u64, crate::types::Row)>> =
+                std::collections::HashMap::new();
+            for records in recovered_records.values() {
+                for record in records {
+                    let (table_name, row_id, txn_id, row) = match record {
+                        WALRecord::Insert {
+                            table_name,
+                            row_id,
+                            data,
+                            txn_id,
+                            ..
+                        } => (table_name.clone(), *row_id, *txn_id, data.clone()),
+                        WALRecord::InsertRaw {
+                            table_name,
+                            row_id,
+                            raw_data,
+                            txn_id,
+                            ..
+                        } => {
+                            let col_types = db
+                                .table_registry
+                                .get_table(table_name)
+                                .map(|s| s.col_types().to_vec())
+                                .unwrap_or_default();
+                            match crate::storage::row_format::decode(raw_data, &col_types) {
+                                Ok(r) => (table_name.clone(), *row_id, *txn_id, r),
+                                Err(_) => continue,
+                            }
+                        }
+                        WALRecord::Update {
+                            table_name,
+                            row_id,
+                            new_data,
+                            txn_id,
+                            ..
+                        } => (table_name.clone(), *row_id, *txn_id, new_data.clone()),
+                        WALRecord::UpdateRaw {
+                            table_name,
+                            row_id,
+                            raw_new,
+                            txn_id,
+                            ..
+                        } => {
+                            let col_types = db
+                                .table_registry
+                                .get_table(table_name)
+                                .map(|s| s.col_types().to_vec())
+                                .unwrap_or_default();
+                            match crate::storage::row_format::decode(raw_new, &col_types) {
+                                Ok(r) => (table_name.clone(), *row_id, *txn_id, r),
+                                Err(_) => continue,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if txn_id != 0 && !committed_txns.contains(&txn_id) {
+                        continue;
+                    }
+                    // TimeSeries rows were replayed into columnar_store above.
+                    if let Ok(schema) = db.table_registry.get_table(&table_name) {
+                        if schema.table_type != crate::types::TableType::TimeSeries {
+                            by_table.entry(table_name).or_default().push((row_id, row));
+                        }
+                    }
+                }
+            }
+            let mut replayed = 0u64;
+            for (tbl, rows) in by_table {
+                let Ok(schema) = db.table_registry.get_table(&tbl) else {
+                    continue;
+                };
+                let Ok(store) = db.get_or_create_col_segment_store(&tbl, schema.col_types()) else {
+                    warn_log!(
+                        "[Recovery] ⚠️ no ColSegmentStore for '{}': {} WAL rows stay LSM-only",
+                        tbl,
+                        rows.len()
+                    );
+                    continue;
+                };
+                for (row_id, row) in rows {
+                    let key = db.make_composite_key(&tbl, row_id);
+                    let ts = db
+                        .write_lsn
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = store.append_row_ref(key, ts, &row) {
+                        warn_log!(
+                            "[Recovery] ⚠️ col-segment replay failed for '{}' row {}: {:?}",
+                            tbl,
+                            row_id,
+                            e
+                        );
+                    } else {
+                        replayed += 1;
+                    }
+                }
+                // Replayed rows sit in the write_buf — flush so a second
+                // crash (before any later checkpoint) can't lose them again.
+                let _ = store.flush_buffer();
+            }
+            if replayed > 0 {
+                debug_log!(
+                    "[Recovery] Replayed {} WAL rows into ColSegmentStores",
+                    replayed
+                );
             }
         }
 

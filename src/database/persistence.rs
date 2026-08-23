@@ -62,6 +62,99 @@ impl MoteDB {
         result
     }
 
+    /// Online backup: copy a consistent point-in-time snapshot of the whole
+    /// database directory to `dest` while the database stays open.
+    ///
+    /// Durability contract: every transaction COMMITted (durable) before the
+    /// call is present in the snapshot. Concurrent autocommit writes are
+    /// blocked for the duration of the copy (they queue on the write lock);
+    /// in-flight explicit transactions are captured at their last durable
+    /// state, exactly as a crash would see them.
+    ///
+    /// The snapshot is a plain directory copy — restore is simply
+    /// `Database::open(dest)`. `dest` must not already exist.
+    pub fn backup_to(&self, dest: &std::path::Path) -> Result<()> {
+        ensure_open!(self);
+
+        // Normalize exactly like open_with_config does (with_extension
+        // "mote") so `Database::open(dest)` restores the snapshot from the
+        // same path the user passed in.
+        let dest = dest.with_extension("mote");
+
+        if dest.exists() {
+            return Err(StorageError::InvalidData(format!(
+                "backup destination already exists: {}",
+                dest.display()
+            )));
+        }
+
+        // Same discipline as flush(): CAS the reentrancy flag, then hold
+        // checkpoint_mutex so auto-checkpoint/compaction can't rewrite
+        // segment files mid-copy.
+        if self
+            .is_flushing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(StorageError::InvalidData(
+                "a flush/checkpoint is in progress — retry backup".into(),
+            ));
+        }
+        let _ckpt_guard = self
+            .checkpoint_mutex
+            .lock()
+            .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+
+        // Drain all in-memory write buffers to disk BEFORE copying.
+        let flush_result = self.flush_impl();
+
+        // Block autocommit writes (api::execute takes write_lock for
+        // INSERT/UPDATE/DELETE) so no new WAL/segment bytes appear while the
+        // directory is being copied. Lock order checkpoint_mutex → write_lock
+        // matches flush_impl's (and nothing takes them in reverse).
+        let _write_guard = self.write_lock.lock();
+
+        let result = match flush_result {
+            Ok(()) => Self::copy_dir_durable(&self.path, &dest),
+            Err(e) => Err(e),
+        };
+
+        drop(_write_guard);
+        drop(_ckpt_guard);
+        self.is_flushing.store(false, Ordering::Release);
+        result
+    }
+
+    /// Recursive directory copy with per-file fsync and a final directory
+    /// fsync, so the completed copy survives power loss immediately (no
+    /// reliance on dirty page cache). Skips the process lock file.
+    fn copy_dir_durable(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(dest).map_err(StorageError::Io)?;
+        let entries = std::fs::read_dir(src).map_err(StorageError::Io)?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            // The flock file is process-local state, not database data.
+            if name == ".lock" {
+                continue;
+            }
+            let from = entry.path();
+            let to = dest.join(&name);
+            let meta = entry.metadata().map_err(StorageError::Io)?;
+            if meta.is_dir() {
+                Self::copy_dir_durable(&from, &to)?;
+            } else {
+                let mut in_file = std::fs::File::open(&from).map_err(StorageError::Io)?;
+                let mut out_file = std::fs::File::create(&to).map_err(StorageError::Io)?;
+                std::io::copy(&mut in_file, &mut out_file).map_err(StorageError::Io)?;
+                out_file.sync_data().map_err(StorageError::Io)?;
+            }
+        }
+        // Directory fsync makes the created entries themselves durable.
+        let dir = std::fs::File::open(dest).map_err(StorageError::Io)?;
+        dir.sync_all().map_err(StorageError::Io)?;
+        Ok(())
+    }
+
     fn flush_impl(&self) -> Result<()> {
         if !self.path.exists() {
             return Ok(());

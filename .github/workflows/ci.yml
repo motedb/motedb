@@ -73,6 +73,25 @@ jobs:
           CI: "1"
         run: cargo test --lib --all-features
 
+  # ── Native ARM64: unit tests on real aarch64 hardware ────────────────────
+  # The primary deployment target for embodied-intelligence edge devices is
+  # ARM (Jetson, RPi, RK3588). The cross-compile job below catches link/compile
+  # errors only; this job executes the actual unit-test suite on GitHub's free
+  # arm64 runners so runtime/atomic/memory-model issues surface before release.
+  arm64-test:
+    name: unit (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo test --lib
+        env:
+          CI: "1"
+        run: cargo test --lib --all-features
+
   # ── Integration tests (ADVISORY): the full tests/ matrix ─────────────────
   # `cargo test --workspace` compiles 64 test binaries (~40min cold) and runs
   # them. This is too slow to be the primary gate, and some integration tests

@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### 可靠性（kill -9 崩溃注入 uncovered 两个 Critical 持久化缺陷）
+
+- **修复：标准表 WAL 重放不进 ColSegmentStore（数据丢失级）**。写入路径每行走
+  WAL + ColSegmentStore，但崩溃恢复只重放 LSM 与 legacy 列式缓冲——`execute()`
+  已确认（ack）但尚未 flush 的行在重启后**不可见**，且随后第一次 checkpoint 会
+  把空视图落盘并截断 WAL，数据被**永久抹除**。新增重放块把已提交的
+  Insert/InsertRaw/Update/UpdateRaw 回放进 ColSegmentStore（tombstone 重放此前
+  已存在，本块补齐对称的 INSERT 侧；重复回放安全：segment 扫描按 newest-wins
+  去重）。由新增的 kill -9 循环测试发现（详见下），300 轮注入验证通过。
+- **修复：`decode_raw_any` 固定返回 64 列宽**。无 schema 解码遍历 64 槽位数组
+  而非 `col_count`，所有表解出行宽恒为 64（尾部 Null），触发 TimeSeries WAL
+  重放的宽度断言崩溃；且固定列一律按 Integer 解码（Timestamp 被误读）。重放
+  路径全部改为 schema 感知 `decode(raw, col_types)`，宽度 bug 同步修复。
+- **新增：kill -9 崩溃注入循环测试**（`tests/test_crash_injection.rs`）。子进程
+  写负载中随机 SIGKILL → 重开验证两条不变量：已提交行构成连续前缀（无空洞、
+  无半行）+ journal 确认（ack）过的写入全部存活且值精确。自执行（`--exact`）
+  模式，无需额外构建目标；`MOTEDB_CRASH_ITERS` 可调浸泡轮数。
+
+### SQL / 功能
+
+- **新增 UPSERT**：`INSERT ... ON CONFLICT (pk) DO UPDATE SET ...`（支持
+  `excluded.col` 引用拟插入行）、`ON CONFLICT DO NOTHING`、`INSERT OR IGNORE`、
+  `INSERT OR REPLACE`。事务内可用（含命中同事务未提交行）；conflict/do/
+  nothing/replace 均为上下文敏感匹配，不占用保留字（`replace()` 函数与同名
+  列不受影响）。
+- **修复：AUTO_INCREMENT 表显式主键值被静默丢弃**。`values_to_row_by_columns`
+  无条件跳过自增列，`INSERT INTO t (id, v) VALUES (100, 'x')` 存入 NULL 并由
+  计数器另分配 id（与 `values_to_row_schema_order` 的既有语义相悖）。改为仅
+  在值为 NULL 时跳过，显式值透传给 explicit-PK 分支（同时抬高计数器）。
+- **新增 EXPLAIN（v1 启发式）**：`EXPLAIN <SELECT>` 不执行查询，报告执行器
+  快路径将选择的扫描策略（pk 点查 / 列索引 / top-K 有界堆 / 全表扫）与行数
+  估计、聚合/排序/LIMIT 步骤。
+
+### API / 运维
+
+- **新增 `Database::backup_to(dest)`**：打开状态下在线备份——checkpoint 互斥
+  + 写锁下 flush 后整目录拷贝（逐文件 fsync + 目录 fsync）。已提交事务全部
+  进快照；并发自增写在拷贝期间排队。恢复即 `Database::open(dest)`（同一
+  `.mote` 路径归一化）。
+
+### 平台 / CI
+
+- **CI 新增原生 arm64 测试 job**（`ubuntu-24.04-arm` 免费 runner）：具身智能
+  目标硬件（Jetson/树莓派/RK3588）此前只有交叉编译检查，现在真实 aarch64
+  Linux 上跑单元测试。
+
 ### 性能（剖析器定位的系统性优化）
 
 - **修复 compact 模式 text-eq 多段物化 O(N²)**：多段回退分支对每个匹配行 ×

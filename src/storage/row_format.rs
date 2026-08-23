@@ -2033,7 +2033,11 @@ fn decode_raw_any_with_pool(data: &[u8], mut pool: Option<&mut StringPool>) -> R
             let mut row = Vec::with_capacity(col_count);
             let mut fixed_idx = 0;
 
-            for (i, &(v_off, v_len)) in var_offsets.iter().enumerate() {
+            // 🔑 Only decode col_count values — var_offsets is a fixed
+            // 64-slot stack array; iterating all slots returned 64-wide rows
+            // (trailing Nulls) for every table, tripping width assertions in
+            // the TimeSeries WAL replay path.
+            for (i, &(v_off, v_len)) in var_offsets.iter().enumerate().take(col_count) {
                 if null_bitmap & (1u64 << i) != 0 {
                     row.push(Value::Null);
                     continue;

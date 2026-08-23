@@ -101,6 +101,52 @@ db.execute("INSERT INTO documents VALUES (
 )")?;
 ```
 
+### UPSERT (INSERT ... ON CONFLICT / OR REPLACE)
+
+Sensor-style "insert or accumulate" writes without a separate read-modify-write:
+
+```rust
+// SQL-standard form: ON CONFLICT (pk) DO UPDATE
+db.execute("INSERT INTO sensors VALUES (7, 'temp', 1.0)
+    ON CONFLICT (id) DO UPDATE SET reading = reading + excluded.reading")?;
+
+// Bare forms
+db.execute("INSERT INTO sensors VALUES (7, 'temp', 1.0) ON CONFLICT DO NOTHING")?;
+db.execute("INSERT OR IGNORE INTO sensors VALUES (7, 'temp', 1.0)")?; // skip duplicates
+db.execute("INSERT OR REPLACE INTO sensors VALUES (7, 'temp', 1.0)")?; // full-row replace
+```
+
+Semantics:
+
+- In `DO UPDATE SET` expressions, an unqualified column refers to the
+  **existing** row; `excluded.col` refers to the **proposed** (new) row —
+  same as PostgreSQL/SQLite.
+- The conflict target must be the table's primary key (`ON CONFLICT (id)`).
+  There are no secondary unique constraints to conflict on yet.
+- Works inside explicit transactions, including against rows inserted
+  earlier in the same transaction.
+- `affected_rows` counts inserted + updated rows; skipped rows count 0.
+- Not yet supported on `TIMESERIES` tables.
+
+### EXPLAIN
+
+`EXPLAIN <SELECT>` reports the plan the executor's fast paths would choose,
+without executing the query:
+
+```rust
+let plan = db.query("EXPLAIN SELECT * FROM readings WHERE id = 42")?;
+// step | operator  | detail
+//    1 | scan      | table 'readings': strategy=pk_point_lookup(id), rows=1
+//    2 | note      | heuristic plan (v1): ...
+
+let plan = db.query("EXPLAIN SELECT * FROM readings ORDER BY val LIMIT 10")?;
+//    1 | scan      | table 'readings': strategy=top_k_bounded_heap(LIMIT 10), ...
+```
+
+v1 is a heuristic report of the same signals the runtime fast paths key on
+(PK equality, column-index equality, ORDER BY + LIMIT top-K); JOIN/subquery
+plans are not yet modeled.
+
 ### UPDATE
 
 ```rust

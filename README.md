@@ -156,7 +156,7 @@ Every push runs through three CI workflows:
 
 | Workflow | What it guards |
 |----------|----------------|
-| **CI** | fmt (strict), clippy, cargo-deny supply chain, unit + integration suites on ubuntu/macos, aarch64 cross-compile |
+| **CI** | fmt (strict), clippy, cargo-deny supply chain, unit + integration suites on ubuntu/macos, **native arm64 test runner** (the edge/robotics target), aarch64 cross-compile, kill -9 crash-injection durability loop |
 | **Perf Gate** | Query-shape latency *ratios* vs a full-scan baseline — machine-independent budgets that catch complexity-class regressions (e.g. an O(N²) path that slipped through once) |
 | **Fuzz** (daily) | 5 min × 2 targets (`fuzz_sql_parser`, `fuzz_wal_recover`) under AddressSanitizer — found and fixed a parser stack-overflow on day one |
 

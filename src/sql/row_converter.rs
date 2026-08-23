@@ -115,8 +115,12 @@ pub fn values_to_row_by_columns(
         let val = values.get(i).cloned().unwrap_or(Value::Null);
         // Find the column position in schema
         if let Some(col_def) = schema.get_column(col_name) {
-            // Skip AUTO_INCREMENT columns — system fills them
-            if col_def.auto_increment {
+            // 🔑 Keep explicit AUTO_INCREMENT values (mirrors
+            // values_to_row_schema_order): `INSERT INTO t (id, v) VALUES
+            // (100, 'x')` stores id=100 — insert_row_to_table's explicit-PK
+            // branch then honors it (and bumps the counter past it). Only an
+            // omitted/NULL pk falls through for the system to allocate.
+            if col_def.auto_increment && matches!(val, Value::Null) {
                 continue;
             }
             // Enforce NOT NULL (but allow DEFAULT to satisfy it)

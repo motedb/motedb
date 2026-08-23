@@ -225,6 +225,28 @@ impl Database {
         self.inner.checkpoint()
     }
 
+    /// Online backup: copy a consistent point-in-time snapshot of the whole
+    /// database to `dest` (a new directory) while the database stays open.
+    ///
+    /// Every transaction committed before the call is present in the
+    /// snapshot. Concurrent autocommit writes pause for the duration of the
+    /// copy; in-flight explicit transactions are captured at their last
+    /// durable state. The copy is fsync'd file-by-file, so it is durable the
+    /// moment the call returns.
+    ///
+    /// Restore is simply opening the copy:
+    /// ```ignore
+    /// db.backup_to("/mnt/usb/robot_backup")?;
+    /// // ... later, possibly on another device ...
+    /// let db = Database::open("/mnt/usb/robot_backup")?;
+    /// ```
+    ///
+    /// `dest` must not already exist. Errors if a flush/checkpoint is in
+    /// progress (retry in that case).
+    pub fn backup_to<P: AsRef<std::path::Path>>(&self, dest: P) -> Result<()> {
+        self.inner.backup_to(dest.as_ref())
+    }
+
     /// Full checkpoint with index rebuild (slower but thorough).
     /// Used internally on shutdown to ensure index completeness.
     pub fn checkpoint_full(&self) -> Result<()> {

@@ -48,6 +48,7 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "array" => TokenType::Array,
     "show" => TokenType::Show,
     "describe" => TokenType::Describe,
+    "explain" => TokenType::Explain,
     "tables" => TokenType::Tables,
     "alter" => TokenType::Alter,
     "integer" => TokenType::Integer,
@@ -139,6 +140,7 @@ pub enum TokenType {
     Array,         // ARRAY (for array literals)
     Show,          // SHOW
     Describe,      // DESCRIBE or DESC
+    Explain,       // EXPLAIN
     Tables,        // TABLES
     Alter,         // ALTER
     AutoIncrement, // AUTO_INCREMENT

@@ -1861,6 +1861,7 @@ impl QueryExecutor {
                 Ok(result)
             }
             Statement::Insert(i) => self.execute_insert(i),
+            Statement::Explain(inner) => self.execute_explain(&inner),
             Statement::Update(u) => self.execute_update(u),
             Statement::Delete(d) => self.execute_delete(d),
             Statement::CreateTable(c) => self.execute_create_table(c),
@@ -2076,6 +2077,12 @@ impl QueryExecutor {
                     affected_rows: result.affected_rows(),
                 }
             }
+            Statement::Explain(inner) => match self.execute_explain(inner)? {
+                QueryResult::Select { columns, rows } => {
+                    StreamingQueryResult::SelectReady { columns, rows }
+                }
+                _ => unreachable!("execute_explain always returns Select"),
+            },
             Statement::Update(u) => {
                 let result = self.execute_update(u.clone())?;
                 StreamingQueryResult::Modification {
@@ -20011,6 +20018,12 @@ impl QueryExecutor {
             schema.columns.iter().map(|c| c.name.clone()).collect()
         };
 
+        // 🆕 Upsert (ON CONFLICT / OR IGNORE / OR REPLACE): dedicated
+        // row-at-a-time path with a per-row existence check.
+        if stmt.on_conflict.is_some() {
+            return self.execute_upsert(stmt, &schema, &columns);
+        }
+
         // Route TimeSeries INSERT to columnar store
         if schema.table_type == crate::types::TableType::TimeSeries {
             return self.execute_columnar_insert(stmt, &schema, &columns);
@@ -20135,6 +20148,404 @@ impl QueryExecutor {
         }
 
         Ok(QueryResult::Modification { affected_rows })
+    }
+
+    /// 🆕 Execute an upsert INSERT (`ON CONFLICT ...` / `INSERT OR IGNORE` /
+    /// `INSERT OR REPLACE`).
+    ///
+    /// Row-at-a-time: each proposed row's primary key is looked up against
+    /// live data, then routed to insert / update-in-place / delete+insert /
+    /// skip. `excluded.col` in DO UPDATE SET expressions refers to the
+    /// proposed row; unqualified columns refer to the existing row (standard
+    /// SQL upsert semantics).
+    ///
+    /// Existence check: outside transactions the PK index fast path
+    /// (`query_by_column`); inside a transaction the storage scan is merged
+    /// with the uncommitted write_set so upserts hit rows INSERTed earlier in
+    /// the same transaction.
+    fn execute_upsert(
+        &self,
+        stmt: &InsertStmt,
+        schema: &crate::types::TableSchema,
+        columns: &[String],
+    ) -> Result<QueryResult> {
+        use crate::sql::ast::ConflictAction;
+
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            return Err(MoteDBError::InvalidArgument(
+                "ON CONFLICT / OR REPLACE is not supported for TimeSeries tables".into(),
+            ));
+        }
+
+        let oc = stmt.on_conflict.as_ref().expect("caller checks is_some");
+        let pk_name: Option<String> = schema.primary_key().map(|s| s.to_string());
+        let pk_position = pk_name
+            .as_ref()
+            .and_then(|pk| schema.get_column(pk))
+            .map(|c| c.position);
+
+        // Explicit conflict target must be exactly the primary key — there
+        // are no secondary unique constraints to conflict on today.
+        if let Some(target) = &oc.target {
+            match &pk_name {
+                None => {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "ON CONFLICT target specified but table '{}' has no primary key",
+                        stmt.table
+                    )));
+                }
+                Some(pk) if target.len() != 1 || !target[0].eq_ignore_ascii_case(pk) => {
+                    return Err(MoteDBError::InvalidArgument(format!(
+                        "ON CONFLICT target ({}) does not match the primary key '{}' of table '{}'",
+                        target.join(", "),
+                        pk,
+                        stmt.table
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        // DO UPDATE needs a PK to locate the conflicting row. The other
+        // actions degrade to plain INSERT on PK-less tables (SQLite
+        // semantics: no constraint ⇒ conflict never fires).
+        if matches!(oc.action, ConflictAction::DoUpdate { .. }) && pk_position.is_none() {
+            return Err(MoteDBError::InvalidArgument(format!(
+                "ON CONFLICT DO UPDATE requires a primary key on table '{}'",
+                stmt.table
+            )));
+        }
+
+        let txn_id = self.current_txn_id();
+        let mut affected_rows = 0usize;
+        let mut last_row_id: Option<u64> = None;
+
+        for value_row in &stmt.values {
+            if value_row.len() != columns.len() {
+                return Err(MoteDBError::InvalidArgument(format!(
+                    "Column count mismatch: expected {}, got {}",
+                    columns.len(),
+                    value_row.len()
+                )));
+            }
+
+            let resolved: Vec<Value> = value_row
+                .iter()
+                .map(|expr| match expr {
+                    Expr::Literal(v) => Ok(v.clone()),
+                    Expr::Parameter(_) => {
+                        let empty_row = SqlRow::new();
+                        self.evaluator.eval(expr, &empty_row)
+                    }
+                    other if Self::is_constant_expr(other) => {
+                        let empty_row = SqlRow::new();
+                        self.evaluator.eval(other, &empty_row)
+                    }
+                    other => Err(MoteDBError::InvalidArgument(format!(
+                        "INSERT VALUES must be literals or parameters, got {:?}",
+                        other
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let new_row =
+                crate::sql::row_converter::values_to_row_by_columns(&resolved, columns, schema)?;
+
+            // Proposed PK value. None/Null ⇒ no conflict possible: either the
+            // table has no PK, or it's an AUTO_INCREMENT slot the insert will
+            // allocate (fresh counter value can't collide).
+            let proposed_pk = pk_position
+                .and_then(|p| new_row.get(p))
+                .cloned()
+                .filter(|v| !matches!(v, Value::Null));
+
+            let existing: Option<(RowId, Row)> = match (&proposed_pk, txn_id) {
+                (Some(pk_value), None) => {
+                    let pk_value = pk_value.clone();
+                    let mut found = None;
+                    for rid in self.resolve_pk_row_ids(&stmt.table, schema, &pk_value)? {
+                        if let Some(r) = self.db.get_table_row(&stmt.table, rid)? {
+                            found = Some((rid, r));
+                            break;
+                        }
+                    }
+                    found
+                }
+                (Some(pk_value), Some(_tid)) => {
+                    // In-transaction: merge storage scan with the write_set so
+                    // rows INSERTed earlier in this transaction are found.
+                    let pk_pos = pk_position.expect(
+                        "checked above for DoUpdate; other actions skip conflict on None pk",
+                    );
+                    let pk_value = pk_value.clone();
+                    let mut found = None;
+                    for result in self.db.scan_table_rows_streaming(&stmt.table)? {
+                        let (rid, row) = result?;
+                        if row.get(pk_pos) == Some(&pk_value) {
+                            found = Some((rid, row));
+                            break;
+                        }
+                    }
+                    if found.is_none() {
+                        for (rid, row) in self.txn_write_set_rows(&stmt.table) {
+                            if row.get(pk_pos) == Some(&pk_value) {
+                                found = Some((rid, row));
+                                break;
+                            }
+                        }
+                    }
+                    found
+                }
+                (None, _) => None,
+            };
+
+            match existing {
+                Some((rid, existing_row)) => match &oc.action {
+                    ConflictAction::Ignore | ConflictAction::DoNothing => continue,
+                    ConflictAction::Replace => {
+                        // Delete the old row first, then insert the new one
+                        // below (full-row replacement semantics). Undo delta
+                        // mirrors execute_delete_pk's transactional path.
+                        if let Some(tid) = txn_id {
+                            let _ = self.db.txn_coordinator.record_write_delta(
+                                tid,
+                                crate::txn::coordinator::DeltaOperation::Delete(
+                                    rid,
+                                    stmt.table.clone(),
+                                    std::sync::Arc::new(existing_row.clone()),
+                                ),
+                            );
+                        }
+                        self.db
+                            .delete_row_from_table(&stmt.table, rid, existing_row)?;
+                    }
+                    ConflictAction::DoUpdate { assignments } => {
+                        // Merged evaluation context: unqualified `col` → the
+                        // existing row, `excluded.col` → the proposed row.
+                        // The evaluator resolves both via direct SqlRow keys.
+                        let mut eval_row = SqlRow::new();
+                        for cd in &schema.columns {
+                            let old = existing_row
+                                .get(cd.position)
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            let new = new_row.get(cd.position).cloned().unwrap_or(Value::Null);
+                            eval_row.insert(cd.name.clone(), old.clone());
+                            eval_row.insert(format!("{}.{}", stmt.table, cd.name), old);
+                            eval_row.insert(format!("excluded.{}", cd.name), new);
+                        }
+
+                        let mut new_values: Vec<(usize, Value)> =
+                            Vec::with_capacity(assignments.len());
+                        for (col_name, expr) in assignments {
+                            let Some(cd) = schema.get_column(col_name) else {
+                                return Err(MoteDBError::InvalidArgument(format!(
+                                    "Unknown column '{}' in ON CONFLICT DO UPDATE SET for table '{}'",
+                                    col_name, stmt.table
+                                )));
+                            };
+                            let new_val = if let Expr::Literal(v) = expr {
+                                v.clone()
+                            } else if Self::expr_contains_subquery(expr) {
+                                let materialized = self.materialize_subqueries(expr)?;
+                                if let Expr::Literal(v) = materialized {
+                                    v
+                                } else {
+                                    self.evaluator.eval(&materialized, &eval_row)?
+                                }
+                            } else {
+                                self.evaluator.eval(expr, &eval_row)?
+                            };
+                            new_values.push((cd.position, new_val));
+                        }
+
+                        let mut updated_row = existing_row.clone();
+                        for (pos, val) in new_values {
+                            while updated_row.len() <= pos {
+                                updated_row.push(Value::Null);
+                            }
+                            updated_row[pos] = val;
+                        }
+
+                        // Undo/bookkeeping mirrors execute_update_pk.
+                        if let Some(tid) = txn_id {
+                            let updated = self.db.txn_coordinator.update_write_set_row(
+                                tid,
+                                &stmt.table,
+                                rid,
+                                updated_row.clone(),
+                            )?;
+                            if !updated {
+                                let _ = self.db.txn_coordinator.record_write_delta(
+                                    tid,
+                                    crate::txn::coordinator::DeltaOperation::Update(
+                                        rid,
+                                        stmt.table.clone(),
+                                        std::sync::Arc::new(existing_row.clone()),
+                                    ),
+                                );
+                            }
+                        }
+
+                        self.db.update_row_in_table_with_schema(
+                            &stmt.table,
+                            rid,
+                            existing_row,
+                            updated_row,
+                            schema,
+                        )?;
+                        affected_rows += 1;
+                        continue;
+                    }
+                },
+                None => {
+                    // No conflict (or no PK): fall through to plain insert.
+                }
+            }
+
+            let row_id = if let Some(tid) = txn_id {
+                self.db.insert_row_with_txn(&stmt.table, tid, new_row)?
+            } else {
+                self.db.insert_row_to_table(&stmt.table, new_row)?
+            };
+            last_row_id = Some(row_id);
+            affected_rows += 1;
+        }
+
+        // Same AUTO_INCREMENT bookkeeping as the plain INSERT path.
+        if schema.is_primary_key_auto_increment() {
+            if let Some(row_id) = last_row_id {
+                self.last_insert_id
+                    .store(row_id as i64, std::sync::atomic::Ordering::Relaxed);
+                self.evaluator
+                    .last_insert_id
+                    .store(row_id as i64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        Ok(QueryResult::Modification { affected_rows })
+    }
+
+    /// 🆕 EXPLAIN <SELECT>: report the plan the executor's fast paths would
+    /// choose — scan strategy (PK point lookup / column index / top-K heap /
+    /// full scan) plus a row estimate — WITHOUT executing the query.
+    ///
+    /// v1 is a heuristic report of the same signals the runtime fast paths
+    /// key on (PK equality, column-index equality, ORDER BY + LIMIT); the
+    /// aggregate step is informational.
+    fn execute_explain(&self, inner: &Statement) -> Result<QueryResult> {
+        let sel: &crate::sql::ast::SelectStmt = match inner {
+            Statement::Select { stmt: s, .. } => s,
+            _ => {
+                return Err(MoteDBError::InvalidArgument(
+                    "EXPLAIN supports SELECT statements only in this version".into(),
+                ));
+            }
+        };
+
+        let Some(crate::sql::ast::TableRef::Table { name: table, .. }) = sel.from.as_ref() else {
+            return Err(MoteDBError::InvalidArgument(
+                "EXPLAIN requires a simple FROM <table> in this version".into(),
+            ));
+        };
+        let schema = self.db.get_table_schema(table)?;
+        let total = self.db.fast_row_count(table).unwrap_or(0);
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut step = 0i64;
+        let mut push = |op: &str, detail: String, rows: &mut Vec<Vec<Value>>| {
+            step += 1;
+            rows.push(vec![
+                Value::Integer(step),
+                Value::text_from(op),
+                Value::text_from(&detail),
+            ]);
+        };
+
+        // ── Scan strategy: mirror the fast-path decision signals ──────────
+        let mut strategy = String::from("full_scan");
+        let mut cost = format!("rows≤{total}");
+        if let Some(w) = &sel.where_clause {
+            if let Some((col, _v)) = self.try_extract_point_query(w) {
+                let is_pk = schema
+                    .primary_key()
+                    .map(|pk| pk.eq_ignore_ascii_case(&col))
+                    .unwrap_or(false);
+                if is_pk {
+                    strategy = format!("pk_point_lookup({col})");
+                    cost = "rows=1".to_string();
+                } else if let Some(idx) = self.db.index_registry.find_by_column(
+                    table,
+                    &col,
+                    crate::database::index_metadata::IndexType::Column,
+                ) {
+                    strategy = format!("column_index({idx} on {col})");
+                    cost = format!("index probe + row fetch (table rows≤{total})");
+                }
+            }
+        }
+        if strategy == "full_scan"
+            && sel.where_clause.is_none()
+            && sel.order_by.is_some()
+            && sel.limit.is_some()
+        {
+            strategy = format!("top_k_bounded_heap(LIMIT {})", sel.limit.unwrap_or(0));
+            cost = format!("single pass, heap of {}", sel.limit.unwrap_or(0));
+        }
+        push(
+            "scan",
+            format!("table '{table}': strategy={strategy}, {cost}"),
+            &mut rows,
+        );
+
+        if sel.group_by.is_some() {
+            let cols = sel.group_by.clone().unwrap_or_default().join(", ");
+            push(
+                "aggregate",
+                format!("GROUP BY {cols} (hash aggregate over scan output)"),
+                &mut rows,
+            );
+        }
+        if let Some(ref ob) = sel.order_by {
+            let keys: Vec<String> = ob
+                .iter()
+                .map(|o| {
+                    let name = match &o.expr {
+                        Expr::Column(c) => c.clone(),
+                        other => format!("{:?}", other),
+                    };
+                    format!("{name} {}", if o.asc { "ASC" } else { "DESC" })
+                })
+                .collect();
+            push("sort", format!("ORDER BY {}", keys.join(", ")), &mut rows);
+        }
+        if sel.limit.is_some() {
+            push(
+                "limit",
+                format!(
+                    "LIMIT {}{}",
+                    sel.limit.map(|l| l.to_string()).unwrap_or_default(),
+                    sel.offset
+                        .map(|o| format!(" OFFSET {o}"))
+                        .unwrap_or_default()
+                ),
+                &mut rows,
+            );
+        }
+        push(
+            "note",
+            "heuristic plan (v1): reports the fast path the executor would pick; set-based paths (JOIN/subquery) are not yet modeled".to_string(),
+            &mut rows,
+        );
+
+        Ok(QueryResult::Select {
+            columns: vec![
+                "step".to_string(),
+                "operator".to_string(),
+                "detail".to_string(),
+            ],
+            rows,
+        })
     }
 
     /// Execute UPDATE statement

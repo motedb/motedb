@@ -31,6 +31,9 @@ pub enum Statement {
         offset: Option<usize>,
     },
     Insert(InsertStmt),
+    /// EXPLAIN <statement> — return the query plan instead of executing.
+    /// v1 supports SELECT; the plan reports scan strategy and row estimates.
+    Explain(Box<Statement>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
@@ -131,6 +134,33 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Option<Vec<String>>, // None means all columns
     pub values: Vec<Vec<Expr>>,       // Multiple rows
+    /// Upsert clause: `ON CONFLICT ...` / `INSERT OR IGNORE` / `INSERT OR REPLACE`
+    pub on_conflict: Option<OnConflict>,
+}
+
+/// ON CONFLICT clause for INSERT (upsert)
+#[derive(Debug, Clone)]
+pub struct OnConflict {
+    /// Explicit conflict target: `ON CONFLICT (col, ...)`. `None` for the
+    /// targetless forms (`INSERT OR ...` / bare `ON CONFLICT DO ...`).
+    /// Only the table's single primary key is a valid target today — other
+    /// columns are rejected with a clear error (no secondary unique indexes).
+    pub target: Option<Vec<String>>,
+    pub action: ConflictAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConflictAction {
+    /// `INSERT OR IGNORE` — skip rows whose primary key already exists
+    Ignore,
+    /// `INSERT OR REPLACE` — delete the existing row, then insert the new one
+    Replace,
+    /// `ON CONFLICT DO NOTHING` — same runtime behavior as Ignore
+    DoNothing,
+    /// `ON CONFLICT DO UPDATE SET col = expr, ...`
+    /// In `expr`, an unqualified column refers to the existing row and
+    /// `excluded.col` refers to the proposed (new) row.
+    DoUpdate { assignments: Vec<(String, Expr)> },
 }
 
 /// UPDATE statement
