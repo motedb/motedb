@@ -1769,6 +1769,40 @@ impl MoteDB {
     /// Get or create the multi-segment ColSegmentStore for a table.
     /// This is the new append-only path; coexists with the legacy
     /// single-SSTable fields during migration (S6-S9).
+    /// TimeSeries retention purge: delete rows with ts < cutoff from the
+    /// ColumnarStore (flush buffers first so unflushed rows are covered),
+    /// keep the COUNT(*) atomic counter in sync.
+    pub fn gc_timeseries(&self, table_name: &str, cutoff_ts: i64) -> Result<usize> {
+        ensure_open!(self);
+        let _ = self.columnar_store.flush_all();
+        let before = self
+            .columnar_store
+            .query_time_range(table_name, i64::MIN, i64::MAX, &[])
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+        let _segments_dropped = self.columnar_store.gc_expired(table_name, cutoff_ts)?;
+        let after = self
+            .columnar_store
+            .query_time_range(table_name, i64::MIN, i64::MAX, &[])
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+        // Report ROWS purged (before − after), not segments dropped — the
+        // caller's affected_rows means rows.
+        let n = before.saturating_sub(after) as usize;
+        if let Some(counter) = self.table_row_count.get(table_name) {
+            counter.store(after, std::sync::atomic::Ordering::Relaxed);
+        }
+        debug_log!(
+            "[gc_timeseries] '{}': purged {} rows (< {}), before={} after={}",
+            table_name,
+            n,
+            cutoff_ts,
+            before,
+            after
+        );
+        Ok(n)
+    }
+
     /// Maintain the in-memory timestamp index after a row lands (runtime
     /// insert paths). Mirrors the WAL-recovery fill: when a row's FIRST
     /// value is a Timestamp, index ts → row_id. Without this,

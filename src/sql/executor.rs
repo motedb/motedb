@@ -5501,6 +5501,21 @@ impl QueryExecutor {
         // Previously this was unreachable because the intercept below returned
         // before the aggregate block that calls col_segment_group_by.
         if stmt.group_by.is_some() && !Self::contains_parameter_stmt(stmt) {
+            // 🔑 TimeSeries GROUP BY: materialize (below) and the pushdown both
+            // read LSM/ColSegmentStore — no TS data. ts_simple_aggregate
+            // handles single-key GROUP BY over the ColumnarStore.
+            if let Some(TableRef::Table {
+                name: table_name, ..
+            }) = stmt.from.as_ref()
+            {
+                if let Ok(schema) = self.db.get_table_schema(table_name) {
+                    if schema.table_type == crate::types::TableType::TimeSeries {
+                        if let Some(result) = self.ts_simple_aggregate(stmt, table_name, &schema)? {
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
             // Try the columnar GROUP BY pushdown first (much faster).
             if let Some(TableRef::Table {
                 name: table_name, ..
@@ -5524,6 +5539,21 @@ impl QueryExecutor {
 
         // Aggregate queries (COUNT, SUM, etc.) — try fast paths
         if self.has_aggregates(&stmt.columns) {
+            // 🔑 TimeSeries FIRST: every fast path below (count, columnar
+            // pushdown, column index) reads LSM/ColSegmentStore, which hold
+            // no TS data — with a WHERE they returned 0. ts_simple_aggregate
+            // computes over the ColumnarStore (handles WHERE + GROUP BY).
+            {
+                if let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() {
+                    if let Ok(schema) = self.db.get_table_schema(name) {
+                        if schema.table_type == crate::types::TableType::TimeSeries {
+                            if let Some(result) = self.ts_simple_aggregate(stmt, name, &schema)? {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+            }
             // ColSegmentStore multi-segment aggregate (no compaction — avoids 70ms sync).
             if let Some(TableRef::Table {
                 name: table_name, ..
@@ -20667,6 +20697,14 @@ impl QueryExecutor {
     fn execute_update(&self, stmt: UpdateStmt) -> Result<QueryResult> {
         let schema = self.db.get_table_schema(&stmt.table)?;
 
+        // 🔑 TimeSeries rows are immutable (append-only ColumnarStore).
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            return Err(MoteDBError::InvalidArgument(format!(
+                "TimeSeries table '{}' rows are immutable; DELETE (time range) + re-INSERT instead",
+                stmt.table
+            )));
+        }
+
         // Validate all assignment columns exist before modifying any rows
         for (col_name, _) in &stmt.assignments {
             if schema.get_column(col_name).is_none() {
@@ -20880,6 +20918,17 @@ impl QueryExecutor {
 
         Ok(QueryResult::Modification { affected_rows })
     }
+    /// Literal → timestamp micros for TimeSeries DELETE ranges.
+    fn ts_value_to_micros(v: &Value) -> Result<i64> {
+        match v {
+            Value::Integer(us) => Ok(*us),
+            Value::Timestamp(ts) => Ok(ts.as_micros()),
+            _ => Err(MoteDBError::InvalidArgument(
+                "TimeSeries DELETE bound must be an INTEGER (micros) or TIMESTAMP".into(),
+            )),
+        }
+    }
+
     fn execute_delete(&self, stmt: DeleteStmt) -> Result<QueryResult> {
         // 🔑 Resolve subqueries in WHERE clause before evaluation. Without this,
         // DELETE ... WHERE id NOT IN (SELECT ...) silently matches no rows
@@ -20897,6 +20946,58 @@ impl QueryExecutor {
             stmt
         };
         let schema = self.db.get_table_schema(&stmt.table)?;
+
+        // 🔑 TimeSeries DELETE: the ColumnarStore is append-only; the general
+        // delete path wrote tombstones into a store the TS read path never
+        // consults — rows "deleted" (and counted down) stayed fully visible.
+        // Map pure time-range predicates to gc_expired; anything else is a
+        // clear error instead of a silent no-op.
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            let ts_col = schema.timeseries_column.clone().ok_or_else(|| {
+                MoteDBError::InvalidArgument(format!(
+                    "TimeSeries table '{}' has no timestamp column",
+                    stmt.table
+                ))
+            })?;
+            let cutoff = match &stmt.where_clause {
+                Some(Expr::BinaryOp {
+                    left,
+                    op: crate::sql::ast::BinaryOperator::Lt,
+                    right,
+                }) if matches!(left.as_ref(), Expr::Column(c) if *c == ts_col) => {
+                    match right.as_ref() {
+                        Expr::Literal(v) => Self::ts_value_to_micros(v)?,
+                        _ => {
+                            return Err(MoteDBError::InvalidArgument(
+                            "TimeSeries DELETE only supports a literal time range (ts < value / ts <= value)".into(),
+                        ));
+                        }
+                    }
+                }
+                Some(Expr::BinaryOp {
+                    left,
+                    op: crate::sql::ast::BinaryOperator::Le,
+                    right,
+                }) if matches!(left.as_ref(), Expr::Column(c) if *c == ts_col) => {
+                    match right.as_ref() {
+                        Expr::Literal(v) => Self::ts_value_to_micros(v)? + 1,
+                        _ => {
+                            return Err(MoteDBError::InvalidArgument(
+                                "TimeSeries DELETE only supports a literal time range (ts < value / ts <= value)".into(),
+                            ));
+                        }
+                    }
+                }
+                None => i64::MAX,
+                Some(_) => {
+                    return Err(MoteDBError::InvalidArgument(
+                        "TimeSeries DELETE only supports time-range predicates on the timestamp column (ts < value / ts <= value)".into(),
+                    ));
+                }
+            };
+            let n = self.db.gc_timeseries(&stmt.table, cutoff)?;
+            return Ok(QueryResult::Modification { affected_rows: n });
+        }
 
         // 🚀 PK fast path: skip full table scan for WHERE pk = value
         // 🔑 Skip PK fast path in transaction mode (same reason as execute_update:
@@ -24017,13 +24118,27 @@ impl QueryExecutor {
     ) -> Result<Option<StreamingQueryResult>> {
         use crate::sql::ast::SelectColumn;
 
-        // Every output column must be a plain aggregate call (or COUNT(*)).
+        // GROUP BY: single grouping column (the common TS analytics shape).
+        let group_pos: Option<usize> = match &stmt.group_by {
+            None => None,
+            Some(cols) if cols.len() == 1 => schema.get_column_position(&cols[0]),
+            Some(_) => return Ok(None), // multi-key GROUP BY: fall through
+        };
+
+        // Output columns: [group_col?] + aggregate calls.
         let mut aggs: Vec<(String, Option<usize>)> = Vec::new();
         for sc in &stmt.columns {
             match sc {
                 SelectColumn::Star => {
                     // SELECT * with aggregates shouldn't reach here; bail.
                     return Ok(None);
+                }
+                SelectColumn::Column(c) | SelectColumn::Expr(Expr::Column(c), _) => {
+                    // Plain column: only valid as the GROUP BY key.
+                    match (group_pos, schema.get_column_position(c)) {
+                        (Some(gp), Some(p)) if gp == p => continue,
+                        _ => return Ok(None),
+                    }
                 }
                 SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _) => {
                     let fname = name.to_lowercase();
@@ -24032,6 +24147,10 @@ impl QueryExecutor {
                     }
                     match args.first() {
                         None if fname == "count" => aggs.push((fname, None)), // COUNT()
+                        // COUNT(*) parses as Column("*") — count all rows.
+                        Some(Expr::Column(c)) if c == "*" && fname == "count" => {
+                            aggs.push((fname, None));
+                        }
                         Some(Expr::Column(c)) => {
                             let pos = match schema.get_column_position(c) {
                                 Some(p) => p,
@@ -24048,17 +24167,32 @@ impl QueryExecutor {
         if aggs.is_empty() {
             return Ok(None);
         }
+        // With GROUP BY there must be at least one aggregate; without GROUP BY
+        // the aggregate-only shape is handled below. (Covered by aggs check.)
 
-        // Full scan (TS → ColumnarStore) + WHERE filter.
+        // Full scan (TS → ColumnarStore) + WHERE filter, grouped when needed.
+        struct Acc {
+            count: Vec<u64>,
+            sum: Vec<f64>,
+            minv: Vec<Option<f64>>,
+            maxv: Vec<Option<f64>>,
+            anyv: Vec<bool>,
+        }
+        let new_acc = |k: usize| Acc {
+            count: vec![0; k],
+            sum: vec![0.0; k],
+            minv: vec![None; k],
+            maxv: vec![None; k],
+            anyv: vec![false; k],
+        };
+        let k = aggs.len();
+        let mut total = new_acc(k);
+        // Value is not Ord — key groups by a stable debug form, keep insertion
+        // order (GROUP BY output order is unspecified; ORDER BY applies after).
+        let mut groups: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+        let mut group_order: Vec<(String, Value)> = Vec::new();
+
         let iter = self.db.scan_table_rows_streaming(table)?;
-        let mut n: u64 = 0;
-        // Per-aggregate accumulators.
-        let mut count: Vec<u64> = vec![0; aggs.len()];
-        let mut sum: Vec<f64> = vec![0.0; aggs.len()];
-        let mut minv: Vec<Option<f64>> = vec![None; aggs.len()];
-        let mut maxv: Vec<Option<f64>> = vec![None; aggs.len()];
-        let mut anyv: Vec<bool> = vec![false; aggs.len()];
-
         for item in iter {
             let (_rid, row) = item?;
             if let Some(wc) = &stmt.where_clause {
@@ -24067,64 +24201,92 @@ impl QueryExecutor {
                     _ => continue,
                 }
             }
-            n += 1;
+            let acc = match group_pos {
+                None => &mut total,
+                Some(gp) => {
+                    let key = row.get(gp).cloned().unwrap_or(Value::Null);
+                    let kstr = format!("{:?}", key);
+                    if !groups.contains_key(&kstr) {
+                        group_order.push((kstr.clone(), key.clone()));
+                        groups.insert(kstr.clone(), new_acc(k));
+                    }
+                    groups
+                        .get_mut(&kstr)
+                        .expect("group accumulator just ensured")
+                }
+            };
             for (i, (_fname, pos)) in aggs.iter().enumerate() {
                 let p = match pos {
                     Some(p) => *p,
                     None => {
-                        count[i] += 1; // COUNT(*)
+                        acc.count[i] += 1; // COUNT(*)
                         continue;
                     }
                 };
                 match row.get(p) {
                     Some(Value::Integer(x)) => {
-                        count[i] += 1;
-                        sum[i] += *x as f64;
-                        minv[i] = Some(minv[i].map_or(*x as f64, |m: f64| m.min(*x as f64)));
-                        maxv[i] = Some(maxv[i].map_or(*x as f64, |m: f64| m.max(*x as f64)));
-                        anyv[i] = true;
+                        acc.count[i] += 1;
+                        acc.sum[i] += *x as f64;
+                        acc.minv[i] =
+                            Some(acc.minv[i].map_or(*x as f64, |m: f64| m.min(*x as f64)));
+                        acc.maxv[i] =
+                            Some(acc.maxv[i].map_or(*x as f64, |m: f64| m.max(*x as f64)));
+                        acc.anyv[i] = true;
                     }
                     Some(Value::Float(x)) => {
-                        count[i] += 1;
-                        sum[i] += *x;
-                        minv[i] = Some(minv[i].map_or(*x, |m: f64| m.min(*x)));
-                        maxv[i] = Some(maxv[i].map_or(*x, |m: f64| m.max(*x)));
-                        anyv[i] = true;
+                        acc.count[i] += 1;
+                        acc.sum[i] += *x;
+                        acc.minv[i] = Some(acc.minv[i].map_or(*x, |m: f64| m.min(*x)));
+                        acc.maxv[i] = Some(acc.maxv[i].map_or(*x, |m: f64| m.max(*x)));
+                        acc.anyv[i] = true;
                     }
                     _ => {}
                 }
             }
         }
-        let _ = n;
+
+        let finish = |acc: &Acc| -> Vec<Value> {
+            aggs.iter()
+                .enumerate()
+                .map(|(i, (fname, _pos))| {
+                    let f = fname.as_str();
+                    match f {
+                        "count" => Value::Integer(acc.count[i] as i64),
+                        "sum" => {
+                            if acc.anyv[i] {
+                                Value::Float(acc.sum[i])
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        "min" => acc.minv[i].map(Value::Float).unwrap_or(Value::Null),
+                        "max" => acc.maxv[i].map(Value::Float).unwrap_or(Value::Null),
+                        "avg" => {
+                            if acc.anyv[i] {
+                                Value::Float(acc.sum[i] / acc.count[i] as f64)
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        _ => Value::Null,
+                    }
+                })
+                .collect()
+        };
 
         let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
-        let rows: Vec<Vec<Value>> = vec![aggs
-            .iter()
-            .enumerate()
-            .map(|(i, (fname, _pos))| {
-                let f = fname.as_str();
-                match f {
-                    "count" => Value::Integer(count[i] as i64),
-                    "sum" => {
-                        if anyv[i] {
-                            Value::Float(sum[i])
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    "min" => minv[i].map(Value::Float).unwrap_or(Value::Null),
-                    "max" => maxv[i].map(Value::Float).unwrap_or(Value::Null),
-                    "avg" => {
-                        if anyv[i] {
-                            Value::Float(sum[i] / count[i] as f64)
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => Value::Null,
-                }
-            })
-            .collect()];
+        let rows: Vec<Vec<Value>> = match group_pos {
+            None => vec![finish(&total)],
+            Some(_) => group_order
+                .into_iter()
+                .map(|(kstr, key)| {
+                    let acc = groups.remove(&kstr).unwrap_or_else(|| new_acc(k));
+                    let mut row = vec![key];
+                    row.extend(finish(&acc));
+                    row
+                })
+                .collect(),
+        };
         Ok(Some(StreamingQueryResult::SelectReady { columns, rows }))
     }
 

@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### 可靠性第五轮（TimeSeries 查询语义补全）
+
+- **修复：TS 表 `COUNT(*)` 带任意 WHERE 返回 0**。计数/聚合快路径全部读
+  LSM/ColSegmentStore（TS 数据不在那里）。聚合分发最前置 TS 路由
+  （`ts_simple_aggregate`：COUNT/SUM/AVG/MIN/MAX × WHERE 全支持，
+  含 `COUNT(*)` 解析为 `Column("*")` 的匹配修复）。
+- **修复：TS 表 GROUP BY 返回 0 行**。GROUP BY 专属分发直接 materialize
+  （读 LSM）。单键 GROUP BY + 聚合 + WHERE 现走 ColumnarStore 全扫聚合
+  （分组累积器按 key 索引——初版误取最后插入的组，3 组数据算成
+  [1,1,18]，已修）。
+- **修复：TS 表 DELETE 谎报**。原通用删除路径把 tombstone 写进 TS 读路径
+  永不查询的存储——报 5 行删除、计数器扣减、行全部可见。现语义：
+  `DELETE WHERE ts < v / ts <= v`（或无 WHERE）映射到引擎保留策略
+  `gc_expired`（flush 后段级清除，affected = 实际清除行数）；非时间范围
+  谓词返回明确错误。`UPDATE` 返回明确的不可变错误（TS 引擎 append-only）。
+- **修复：列存 TEXT 65,534 字节上限写入期校验**。读路径一直有此限制，
+  超限值此前可写入但永远读不回；现 `validate_row` 写入即拒。
+- **新增 tests/test_timeseries_semantics.rs**（8 测试）：COUNT+WHERE 全
+  形态、聚合、GROUP BY（含 WHERE 过滤与 DESC 排序）、SELECT 各形状、
+  UPDATE/DELETE 错误语义、全量清除、崩溃重开后语义保持。
+
 ### 可靠性第四轮（索引维护 + TimeSeries 崩溃恢复 —— 3 个新 bug）
 
 - **修复：UPDATE 文本列后新内容对全文搜索永久隐身**。`TextFTSIndex::update`

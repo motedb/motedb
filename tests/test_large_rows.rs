@@ -96,6 +96,28 @@ fn test_large_rows_crash_reopen() {
 }
 
 #[test]
+fn test_oversized_text_rejected_at_write() {
+    // 65,534 is the columnar TEXT ceiling (0xFFFF reserved for NULL).
+    // Oversized values are rejected at INSERT time — previously they stored
+    // fine but could never be read back (read path error).
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let ok = format!("INSERT INTO t VALUES (1, '{}')", "x".repeat(65_534));
+    let too_big = format!("INSERT INTO t VALUES (2, '{}')", "x".repeat(65_535));
+    assert!(db.execute(&ok).is_ok(), "65,534 bytes must be accepted");
+    let err = match db.execute(&too_big) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("oversized TEXT must be rejected at write"),
+    };
+    assert!(
+        err.contains("65534"),
+        "oversized TEXT must be rejected at write: {err}"
+    );
+}
+
+#[test]
 fn test_large_rows_point_query() {
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
