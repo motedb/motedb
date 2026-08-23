@@ -149,6 +149,51 @@ fn crash_child_mode() {
                 journal.flush().unwrap();
             }
         }
+        // Concurrent multi-writer: 3 threads, disjoint PK ranges
+        // (t*100_000 + i). Each thread acks to its OWN journal file
+        // (acked.txt.t{t}) so appends never interleave. The parent verifies
+        // a contiguous per-thread prefix and acked durability.
+        "concurrent" => {
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS cw (id INTEGER PRIMARY KEY, w INTEGER, val INTEGER)",
+            )
+            .expect("create table");
+            let db_arc = std::sync::Arc::new(db);
+            let journal_base: std::path::PathBuf = journal_path.clone();
+            let mut handles = Vec::new();
+            for t in 0..3i64 {
+                let db = std::sync::Arc::clone(&db_arc);
+                let jp = journal_base.with_file_name(format!(
+                    "{}.t{t}",
+                    journal_base.file_name().unwrap().to_string_lossy()
+                ));
+                handles.push(std::thread::spawn(move || {
+                    let mut j = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(jp)
+                        .expect("per-thread journal");
+                    for i in 0..iterations as i64 {
+                        let id = t * 100_000 + i;
+                        db.execute(&format!(
+                            "INSERT INTO cw VALUES ({id}, {t}, {})",
+                            t * 1000 + i
+                        ))
+                        .expect("insert");
+                        writeln!(j, "{id}").unwrap();
+                        j.flush().unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("writer thread");
+            }
+            // Last Arc reference — close cleanly if we were never killed.
+            if let Some(db) = std::sync::Arc::try_unwrap(db_arc).ok() {
+                let _ = db.close();
+            }
+            std::process::exit(0);
+        }
         other => panic!("unknown crash child mode: {other}"),
     }
 
@@ -605,6 +650,100 @@ fn test_kill9_timeseries_prefix_recovery() {
         "never killed the child — test degraded to a no-op"
     );
     eprintln!("timeseries crash injection: {killed_runs} kills verified");
+}
+
+// ── Parent: concurrent multi-writer ────────────────────────────────────────
+
+#[test]
+fn test_kill9_concurrent_writers_prefix_per_thread() {
+    let iterations: usize = std::env::var("MOTEDB_CRASH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let mut rng_state: u64 = 0x0F0E_0D0C_0B0A_0908;
+    let next_delay_ms = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        ((*state % 250) + 20) as u64 // 20..270ms — let threads interleave
+    };
+
+    let mut killed_runs = 0;
+    for iter in 0..iterations {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("crash.mote");
+        let journal_path = dir.path().join("acked.txt");
+        let delay = next_delay_ms(&mut rng_state);
+        if spawn_kill_child(&db_path, &journal_path, delay, "concurrent") {
+            killed_runs += 1;
+        }
+
+        // Per-thread journals.
+        let mut thread_acked: Vec<i64> = Vec::new();
+        for t in 0..3 {
+            let jp = journal_path.with_file_name(format!("acked.txt.t{t}"));
+            thread_acked.push(read_journal(&jp).last().copied().unwrap_or(-1));
+        }
+
+        let db = match Database::open(&db_path) {
+            Ok(db) => db,
+            Err(e) => panic!("iter {}: reopen failed: {}", iter, e),
+        };
+        let rs = match db.query("SELECT id, w, val FROM cw") {
+            Ok(rs) => rs,
+            Err(e) if e.to_string().contains("not found") => {
+                drop(db);
+                continue;
+            }
+            Err(e) => panic!("iter {}: query failed: {}", iter, e),
+        };
+        drop(db);
+
+        // Group ids by writer; verify contiguous prefix + exact payload.
+        let mut by_thread: [Vec<i64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for row in &rs {
+            let (id, w, val) = match (&row[0], &row[1], &row[2]) {
+                (Value::Integer(i), Value::Integer(w), Value::Integer(v)) => (*i, *w, *v),
+                o => panic!("iter {}: bad row {o:?}", iter),
+            };
+            assert!(
+                (0..3).contains(&w),
+                "iter {}: unknown writer {w} — cross-contamination",
+                iter
+            );
+            assert!(seen_ids.insert(id), "iter {}: duplicate id {id}", iter);
+            let t = id / 100_000;
+            assert_eq!(t, w, "iter {}: id {id} under writer {w}", iter);
+            let i = id % 100_000;
+            assert_eq!(val, w * 1000 + i, "iter {}: payload corrupt for {id}", iter);
+            by_thread[w as usize].push(i);
+        }
+        for (t, idxs) in by_thread.iter().enumerate() {
+            let mut sorted = idxs.clone();
+            sorted.sort_unstable();
+            // Contiguous prefix 0..k.
+            for (k, i) in sorted.iter().enumerate() {
+                assert_eq!(*i, k as i64, "iter {}: writer {t} has a gap at {k}", iter);
+            }
+            let prefix_len = sorted.len() as i64 - 1;
+            let acked_i = if thread_acked[t] < 0 {
+                -1
+            } else {
+                thread_acked[t] % 100_000
+            };
+            assert!(
+                prefix_len >= acked_i,
+                "iter {}: writer {t} durability — acked {acked_i} but prefix is {prefix_len}",
+                iter,
+            );
+        }
+    }
+    assert!(
+        killed_runs > 0,
+        "never killed the child — test degraded to a no-op"
+    );
+    eprintln!("concurrent crash injection: {killed_runs} kills verified");
 }
 
 /// Journal lines with torn-tail filtering (raw strings, no numeric parse).

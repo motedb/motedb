@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### 可靠性第七轮（并发崩溃注入 + VACUUM 翻倍）
+
+- **新增：崩溃注入第五模式（concurrent）** —— 子进程 3 个并发写线程
+  （不相交主键区间）× 随机 SIGKILL；重开验证每线程连续前缀、acked
+  持久性、无跨线程污染、载荷精确、无重复 id（40 轮浸泡通过）。
+  并发写 + WAL group-commit + 恢复的组合自此有回归防线。
+- **修复：VACUUM 后崩溃 → TimeSeries 行翻倍（BUG #19）**。VACUUM 把
+  数据 flush 进段/列存但不截断 WAL —— 崩溃重放在已 flush 数据之上
+  再放一遍（10 行 → 20 行）。与 backup 翻倍同根因。VACUUM 新增
+  4.5 步：flush ColumnarStore + ColSegmentStore 缓冲后
+  `wal.checkpoint_all()` 截断。
+- **阴性验证（无 bug，同样有价值）**：JOIN（inner/left + WHERE 下推 +
+  聚合 + NULL 臂 + 崩溃重开）、ALTER TABLE ADD COLUMN（新旧行跨
+  重开/崩溃解码正确）、DROP TABLE（清理干净、同名重建无元数据泄漏）、
+  LATEST BY、UPSERT×索引维护。
+
 ### 可靠性第六轮（空间索引 i-Octree 全链路 —— 3 个真 bug）
 
 - **修复：`CREATE INDEX ix ON t (spatial_col)`（未标注类型）直接 panic**。

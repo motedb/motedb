@@ -191,3 +191,37 @@ fn test_ts_semantics_survive_crash_reopen() {
     let r = rows(&db, "SELECT v, COUNT(*) FROM m GROUP BY v ORDER BY v");
     assert_eq!(r.len(), 3);
 }
+
+#[test]
+fn test_ts_vacuum_then_crash_no_doubling() {
+    // Regression: VACUUM flushed data but never truncated the WAL — a crash
+    // after VACUUM replayed the WAL on top of the flushed segments and
+    // DOUBLED every TimeSeries row (10 → 20).
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("t.mote");
+    {
+        let db = Database::create(&p).unwrap();
+        db.execute("CREATE TABLE m (ts TIMESTAMP, v FLOAT) TIMESERIES(ts)")
+            .unwrap();
+        for i in 0..10i64 {
+            db.execute(&format!(
+                "INSERT INTO m VALUES ({}, {})",
+                i * 1000,
+                i as f64
+            ))
+            .unwrap();
+        }
+        assert_eq!(rows(&db, "SELECT ts FROM m").len(), 10);
+        db.execute("VACUUM").unwrap();
+        std::mem::forget(db);
+    }
+    std::fs::remove_file(p.join(".lock")).ok();
+    let db = Database::open(&p).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT ts FROM m").len(),
+        10,
+        "rows doubled after VACUUM + crash"
+    );
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM m"), Value::Integer(10));
+    assert_eq!(rows(&db, "SELECT * FROM m LATEST BY ts").len(), 10);
+}

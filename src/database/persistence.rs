@@ -331,6 +331,21 @@ impl MoteDB {
             warn_log!("[VACUUM] Index flush failed (non-fatal): {}", e);
         }
 
+        // 🔑 4.5 Flush the remaining stores and TRUNCATE the WAL. Everything
+        // the WAL still holds is now flushed into segments/columnar storage;
+        // leaving it in place means a crash-recovery reopen REPLAYS it on top
+        // of the flushed data — TimeSeries rows doubled (10 → 20) after
+        // VACUUM + crash. Same root cause as the backup-snapshot doubling.
+        {
+            let _ = self.columnar_store.flush_all();
+            for entry in self.col_segment_stores.iter() {
+                let _ = entry.flush_buffer();
+            }
+            if let Err(e) = self.wal.checkpoint_all() {
+                warn_log!("[VACUUM] WAL truncation failed (non-fatal): {}", e);
+            }
+        }
+
         // 5. Clean up version store
         let min_active_ts = self.txn_coordinator.get_min_active_timestamp();
         if let Err(e) = self.version_store.vacuum(min_active_ts) {
