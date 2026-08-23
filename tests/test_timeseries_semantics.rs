@@ -225,3 +225,36 @@ fn test_ts_vacuum_then_crash_no_doubling() {
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM m"), Value::Integer(10));
     assert_eq!(rows(&db, "SELECT * FROM m LATEST BY ts").len(), 10);
 }
+
+#[test]
+fn test_ts_ttl_enforcement() {
+    // TTL was parsed but never enforced — old rows survived forever.
+    // Enforcement runs at open and checkpoint; granularity is per SEGMENT
+    // (standard TSDB behavior): a segment is dropped when its max_timestamp
+    // falls past the cutoff, so expired data must sit in its own flush
+    // generation (time-clustered arrival makes that the common case).
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE tt (ts TIMESTAMP, v FLOAT) TIMESERIES(ts) TTL 60")
+        .unwrap();
+    for i in 0..5i64 {
+        db.execute(&format!(
+            "INSERT INTO tt VALUES ({}, 1.0)",
+            1_000_000_000 + i
+        ))
+        .unwrap();
+    }
+    let _ = db.flush();
+    for i in 0..5i64 {
+        db.execute(&format!(
+            "INSERT INTO tt VALUES ({}, 2.0)",
+            1_800_000_000_000_000 + i
+        ))
+        .unwrap();
+    }
+    let _ = db.flush();
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM tt"), Value::Integer(10));
+    db.checkpoint().unwrap();
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM tt"), Value::Integer(5));
+    assert_eq!(scalar(&db, "SELECT MIN(v) FROM tt"), Value::Float(2.0));
+}

@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 可靠性第八轮（FTS 短语方向 bug + TTL 从未执行）
+
+- **修复：短语搜索按稀有度重排后偏移跟随稀有度序而非短语序（BUG #20）**。
+  `search_phrase` 把各词 posting 按 doc_count 排序再以 index+1 当"短语
+  下一个词"——重排后 2 词短语反向匹配（搜 'alpha delta' 命中含
+  "delta alpha" 的文档）。改为：候选枚举用最稀有词（anchor），位置校验
+  按短语原序（token i 在 anchor_pos + (i − anchor_idx)）。
+- **修复：TTL 语法被解析但从未执行（BUG #21）**。`TIMESERIES(ts) TTL n`
+  只存进 schema，旧行跨 checkpoint/重开永久存活。新增
+  `enforce_ttls`：open 与 checkpoint 时按 `now − TTL` 走保留路径清除；
+  粒度为整 columnar segment（标准 TSDB 行为，已在文档注明——时序数据
+  按时间到达、flush 分代自然聚类）。
+- **新增**：`Database::text_search_phrase` API（此前只在内部实现上）；
+  短语方向回归测试 + TTL 回归测试（分代段 → 过期代整段清除）。
+- **阴性验证**：窗口函数（ROW_NUMBER/RANK 分区/LAG，含崩溃重开）、
+  多表事务崩溃（committed 存活 / 未提交整组消失）。
+
 ### 可靠性第七轮（并发崩溃注入 + VACUUM 翻倍）
 
 - **新增：崩溃注入第五模式（concurrent）** —— 子进程 3 个并发写线程

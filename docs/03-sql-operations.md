@@ -128,6 +128,22 @@ Semantics:
 - `affected_rows` counts inserted + updated rows; skipped rows count 0.
 - Not yet supported on `TIMESERIES` tables.
 
+### TimeSeries TTL
+
+`TIMESERIES(ts) TTL <seconds>` attaches a retention policy to a TimeSeries
+table. Expired data is purged at database open and at every checkpoint.
+
+```rust
+// Keep the last 24 hours of sensor readings.
+db.execute("CREATE TABLE readings (ts TIMESTAMP, v FLOAT) TIMESERIES(ts) TTL 86400")?;
+```
+
+Granularity is per columnar **segment** (standard time-series practice): a
+segment is dropped once its newest row passes the cutoff. Because time-series
+data arrives roughly in time order, flush generations cluster by time and
+expired data lands in fully-expired segments. Manual per-range purging is
+available via `DELETE FROM t WHERE ts < value` (same granularity).
+
 ### EXPLAIN
 
 `EXPLAIN <SELECT>` reports the plan the executor's fast paths would choose,

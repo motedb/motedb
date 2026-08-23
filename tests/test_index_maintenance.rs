@@ -214,3 +214,57 @@ fn test_column_index_update_delete_maintenance() {
         0
     );
 }
+
+#[test]
+fn test_fts_phrase_search_order_sensitive() {
+    // Regression: search_phrase sorted postings by doc_count and then
+    // treated index+1 as "next token in the phrase" — offsets followed
+    // RARITY order, so 2-token phrases matched in the REVERSE direction
+    // ('alpha delta' matched documents containing "delta alpha").
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    db.execute("CREATE TEXT INDEX d_body ON d (body)").unwrap();
+    db.execute("INSERT INTO d VALUES (1, 'alpha bravo charlie')")
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (2, 'bravo alpha charlie')")
+        .unwrap();
+
+    let ids = |v: Vec<u64>| {
+        let mut v = v;
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        ids(db.text_search_phrase("d_body", "alpha bravo").unwrap()),
+        vec![1]
+    );
+    assert_eq!(
+        ids(db.text_search_phrase("d_body", "bravo alpha").unwrap()),
+        vec![2]
+    );
+
+    // After UPDATE the phrase follows the NEW text, both directions.
+    db.execute("UPDATE d SET body = 'delta alpha bravo' WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        ids(db.text_search_phrase("d_body", "delta alpha").unwrap()),
+        vec![1]
+    );
+    // Reverse order must NOT match (this was the bug).
+    assert_eq!(
+        db.text_search_phrase("d_body", "alpha delta")
+            .unwrap()
+            .len(),
+        0,
+        "phrase search must be order-sensitive"
+    );
+    // 3-word phrase in order.
+    assert_eq!(
+        ids(db
+            .text_search_phrase("d_body", "delta alpha bravo")
+            .unwrap()),
+        vec![1]
+    );
+}

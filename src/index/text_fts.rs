@@ -735,12 +735,22 @@ impl TextFTSIndex {
             return Ok(doc_ids);
         }
 
-        postings.sort_by_key(|(_, p)| p.doc_count());
+        // 🔑 Enumerate candidates from the RAREST token (smallest posting)
+        // but verify positions in PHRASE ORDER. The old code sorted `postings`
+        // by doc_count and then treated index+1 as "next token in the
+        // phrase" — after the sort, offsets followed RARITY order, not phrase
+        // order, so 2-token phrases matched in the REVERSE direction
+        // ('alpha delta' matched documents containing "delta alpha").
+        let anchor_idx = postings
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, p))| p.doc_count())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
 
-        let candidates = &postings[0].1;
         let mut result = Vec::new();
 
-        'outer: for doc_id in candidates.doc_ids() {
+        'outer: for doc_id in postings[anchor_idx].1.doc_ids() {
             let doc_id = doc_id as DocId;
             if deleted.contains(&doc_id) {
                 continue;
@@ -753,16 +763,19 @@ impl TextFTSIndex {
                 continue;
             }
 
-            // Get positions of the first token in this doc
-            let first_positions = match postings[0].1.get_positions(doc_id) {
+            // Positions of the anchor (rarest) token in this doc.
+            let anchor_positions = match postings[anchor_idx].1.get_positions(doc_id) {
                 Some(positions) => positions,
                 None => continue, // No position data → cannot verify phrase
             };
 
-            'pos: for &start_pos in first_positions.iter() {
-                // Check if every subsequent token appears at start_pos + offset
-                for (offset, (_, posting)) in postings.iter().enumerate().skip(1) {
-                    let expected_pos = start_pos + offset as u32;
+            'pos: for &anchor_pos in anchor_positions.iter() {
+                // Token at phrase index i must appear at anchor_pos + (i - anchor_idx).
+                for (i, (_, posting)) in postings.iter().enumerate() {
+                    if i == anchor_idx {
+                        continue;
+                    }
+                    let expected_pos = (anchor_pos as i64 + (i as i64 - anchor_idx as i64)) as u32;
                     match posting.get_positions(doc_id) {
                         Some(positions) => {
                             if !positions.contains(&expected_pos) {
@@ -772,7 +785,7 @@ impl TextFTSIndex {
                         None => continue 'outer,
                     }
                 }
-                // All tokens matched at consecutive positions
+                // All tokens matched at consecutive positions in phrase order
                 result.push(doc_id);
                 continue 'outer;
             }

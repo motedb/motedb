@@ -1589,6 +1589,10 @@ impl MoteDB {
             }
         }
 
+        // 🔑 TTL enforcement: parsed-but-never-enforced retention — purge
+        // expired rows on open.
+        db.enforce_ttls();
+
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
         let (index_build_tx, index_builder_thread) =
             Self::start_index_builder_pipeline(db.clone_for_callback());

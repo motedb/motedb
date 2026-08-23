@@ -1769,6 +1769,38 @@ impl MoteDB {
     /// Get or create the multi-segment ColSegmentStore for a table.
     /// This is the new append-only path; coexists with the legacy
     /// single-SSTable fields during migration (S6-S9).
+    /// Enforce per-table TTLs: for every TimeSeries table with a TTL, purge
+    /// rows older than now − TTL via the retention path. Called at open and
+    /// checkpoint — the TTL syntax was parsed but never enforced (old rows
+    /// survived checkpoints and reopens forever).
+    pub fn enforce_ttls(&self) {
+        let tables = match self.table_registry.list_tables() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(i64::MAX);
+        for table in tables {
+            let Ok(schema) = self.table_registry.get_table(&table) else {
+                continue;
+            };
+            if schema.table_type != crate::types::TableType::TimeSeries {
+                continue;
+            }
+            let Some(ttl) = schema.ttl else { continue };
+            let cutoff = now_micros.saturating_sub(ttl.seconds as i64 * 1_000_000);
+            match self.gc_timeseries(&table, cutoff) {
+                Ok(n) if n > 0 => {
+                    debug_log!("[TTL] purged {n} expired rows from '{}'", table)
+                }
+                Ok(_) => {}
+                Err(e) => warn_log!("[TTL] enforcement failed for '{}': {:?}", table, e),
+            }
+        }
+    }
+
     /// TimeSeries retention purge: delete rows with ts < cutoff from the
     /// ColumnarStore (flush buffers first so unflushed rows are covered),
     /// keep the COUNT(*) atomic counter in sync.

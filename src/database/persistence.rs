@@ -209,6 +209,8 @@ impl MoteDB {
             .checkpoint_mutex
             .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
+        // 🔑 TTL retention enforcement rides along with checkpoints.
+        self.enforce_ttls();
         self.checkpoint_impl(false)
     }
 

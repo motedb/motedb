@@ -2869,6 +2869,11 @@ impl Database {
         self.inner.text_search_ranked(index_name, query, top_k)
     }
 
+    /// Phrase search: documents containing the exact word sequence.
+    pub fn text_search_phrase(&self, index_name: &str, phrase: &str) -> Result<Vec<RowId>> {
+        self.inner.text_search_phrase(index_name, phrase)
+    }
+
     /// 时间序列范围查询
     ///
     /// # Examples
