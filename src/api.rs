@@ -357,6 +357,15 @@ impl Database {
         // checkpoint_full 的 rebuild_timestamp_index + flush_all_indexes 会和
         // index-builder 竞争锁，累积效应下卡死。close 只需持久化数据（WAL/列存），
         // 索引可重建（重启时 lazy load）。
+        //
+        // 🔑 The background threads (including the index-builder) are stopped
+        // and pending batches drained above, so it is now SAFE to flush
+        // indexes. Clear the pipeline flag so flush_all_indexes inside
+        // checkpoint_impl actually runs — it early-returns while the flag is
+        // set, which silently skipped EVERY index flush at close (vector
+        // graphs, text postings and column-index buffers stayed in memory;
+        // the flag was one-shot from open() and never cleared here).
+        self.inner.mark_index_pipeline_stopped();
         let result = self.inner.checkpoint();
         self.inner
             .is_closed

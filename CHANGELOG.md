@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### 可靠性第三轮（二级索引重开全灭 —— bug 家族一次清掉）
+
+由"vector 索引重开后搜不到"顺藤摸瓜，发现 **column / text / vector 三类二级索引
+在重开后全部不可用**（干净 close 与 crash 皆然），且 3618 个存量测试无一覆盖
+"重开后用索引查询"：
+
+- **修复：close 从不 flush 索引**。`flush_all_indexes` 在 async index pipeline
+  激活时整体跳过，但 close() 明明已先停掉全部后台线程——`is_pipeline_active`
+  是 open 时一次性置位、从不清除的陈旧标志。close 在线程停止 + pending batch
+  清空后调用 `mark_index_pipeline_stopped()`，checkpoint 的索引 flush 真正生效。
+- **修复：重开时按设计重建索引（"重启从数据重建"此前从未实现）**。列索引
+  mem_buffer / FTS postings / DiskANN 增量在 async 模式下只活在内存。open 时
+  对已加载的 column（复用提取出的 `populate_column_index`）与 text
+  （`build_text_index_from_columnar`）索引从源数据重建。
+- **修复：column 索引别名丢失**。live 时执行器同时注册自定义名与
+  `{table}.{column}` 标准名（同一 Arc），loader 只恢复前者 →
+  `query_by_column` 等 API 重开后 "not found"。loader 补建别名。
+- **修复：text 索引加载路径双重错误**。传入的是 `.fts.d` 目录，内部
+  `with_extension` 再追加一次 → 实际打开 `text_x.fts.fts.d`（全新空索引、
+  错误路径、错误键名）；且 `.dict.d` 伴生目录被当成索引加载出垃圾条目。
+  loader 改用规范化 base 路径 + 剥后缀 + 跳过 `.dict.d`，并删旧重建。
+- **修复：vector SQ8 侧车陈旧（自愈）**。insert 路径追加数据文件但
+  header/侧车只在 flush 更新——async 跳过后重开读到 count=0 的空索引。
+  load 按物理文件长度恢复真实条目数、重建侧车、截断撕裂尾条目
+  （对 kill -9 同样有效）。
+- **修复：`get_table_rows_batch_range` 对列存表返回 0 行**。连续 row_id 批量
+  取行走 LSM range，但列存表运行时不写 LSM——干净关闭后（WAL 截断、LSM 空）
+  MATCH 快路径静默返回空结果（crash 场景反而靠 WAL 重放填 LSM 掩盖了此 bug）。
+  列存表改走 per-id `store.get()` 权威路径。
+- **新增 tests/test_index_reopen.rs**（6 测试）：三类索引 × 干净重开 / 崩溃
+  重开 / 重开后增量插入三个维度全部钉死。
+
 ### 可靠性第二轮（扩展崩溃注入负载后继续挖出 3 个缺陷）
 
 - **修复：崩溃恢复"删除复活"**。上一轮的 INSERT 重放块与既有的 DELETE

@@ -132,11 +132,23 @@ impl SQ8Vectors {
         }
 
         // Build sidecar index from data file (or load existing sidecar)
+        let physical_entries = file_path
+            .metadata()
+            .map(|m| m.len().saturating_sub(8) / entry_size as u64)
+            .unwrap_or(0);
         let index_count = if idx_path.exists() {
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
             let mut buf = [0u8; 8];
             idx.read_exact(&mut buf).map_err(StorageError::Io)?;
-            u64::from_le_bytes(buf)
+            let sidecar_count = u64::from_le_bytes(buf);
+            // 🔑 Self-heal: the sidecar/header go stale when the async index
+            // pipeline skips the flush at close (or the process is killed):
+            // appended entries are durable, their index is not. Rebuild.
+            if sidecar_count < physical_entries {
+                Self::build_sidecar_index(&file_path, &idx_path, entry_size)?
+            } else {
+                sidecar_count
+            }
         } else {
             // Build sidecar from scratch by scanning data file
 
@@ -183,14 +195,36 @@ impl SQ8Vectors {
     /// Returns the count of entries written.
     fn build_sidecar_index(data_path: &Path, idx_path: &Path, entry_size: usize) -> Result<u64> {
         let mut data = File::open(data_path).map_err(StorageError::Io)?;
+        let data_len = data.metadata().map_err(StorageError::Io)?.len();
+
+        // 🔑 Recovery-grade count: the header count is only updated at
+        // flush(), but the insert path APPENDS entries immediately. If the
+        // process died (or the async pipeline skipped the index flush at
+        // close), the header is stale-low while the physical entries are
+        // durable. Derive the true count from the file size, capped by the
+        // header when the file has a torn trailing entry.
+        let physical_entries = data_len.saturating_sub(8) / entry_size as u64;
         let mut count_bytes = [0u8; 8];
         data.read_exact(&mut count_bytes)
             .map_err(StorageError::Io)?;
-        let count = u64::from_le_bytes(count_bytes);
+        let header_count = u64::from_le_bytes(count_bytes);
+        let count = if header_count == 0 {
+            physical_entries
+        } else {
+            header_count.min(physical_entries)
+        };
+
+        // Drop a torn trailing entry (crash mid-append) so the file is a
+        // whole number of entries again.
+        let expected_len = 8 + count * entry_size as u64;
+        if data_len > expected_len {
+            data.set_len(expected_len).map_err(StorageError::Io)?;
+        }
 
         // Read all (row_id, offset) pairs
         let mut entries: Vec<(RowId, u64)> = Vec::with_capacity(count as usize);
         let mut offset = 8u64;
+        data.seek(SeekFrom::Start(8)).map_err(StorageError::Io)?;
         for _ in 0..count {
             let mut row_id_bytes = [0u8; 8];
             data.read_exact(&mut row_id_bytes)

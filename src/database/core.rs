@@ -559,6 +559,16 @@ impl MoteDB {
         }
     }
 
+    /// Mark the async index pipeline as inactive. Called by close() AFTER the
+    /// background threads have stopped and pending batches drained — from
+    /// that point flush_all_indexes() is safe to run (it early-returns while
+    /// the flag is set), so checkpoint persists vector/text/column indexes
+    /// instead of silently dropping them.
+    pub(crate) fn mark_index_pipeline_stopped(&self) {
+        self.is_pipeline_active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// Wait for background threads to actually finish after signaling stop.
     /// Returns true if all threads stopped within the timeout.
     pub(crate) fn wait_for_background_threads_stop(&self, timeout: std::time::Duration) -> bool {
@@ -1493,6 +1503,53 @@ impl MoteDB {
             }
         }
 
+        // 🔑 Rebuild secondary indexes from source data. The async index
+        // pipeline deliberately skips ALL index flushes at close (indexes are
+        // derived data, "rebuilt on restart") — this is that rebuild.
+        // Without it, every reopened column/text index was empty or stale:
+        // incremental updates lived only in the skipped in-memory buffers,
+        // and load-time needs_rebuild=false disabled the async safety net.
+        {
+            // Column indexes: registry-resolvable names only; the
+            // "{table}.{column}" aliases point at the same Arc and would
+            // double-populate it.
+            let col_idx: Vec<(String, Arc<crate::index::column_value::ColumnValueIndex>)> = db
+                .column_indexes
+                .iter()
+                .map(|e| (e.key().clone(), Arc::clone(e.value())))
+                .collect();
+            for (name, arc) in col_idx {
+                if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
+                    if let Err(e) = db.populate_column_index(&arc, &table, &column) {
+                        warn_log!(
+                            "[Recovery] ⚠️ column index '{}' rebuild failed: {:?}",
+                            name,
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Text indexes: backfill from the table's text column.
+            let txt_idx: Vec<String> = db.text_indexes.iter().map(|e| e.key().clone()).collect();
+            for name in txt_idx {
+                if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
+                    if let Ok(schema) = db.table_registry.get_table(&table) {
+                        if let Some(col_def) = schema.columns.iter().find(|c| c.name == column) {
+                            let pos = col_def.position;
+                            if let Err(e) = db.build_text_index_from_columnar(&name, &table, pos) {
+                                warn_log!(
+                                    "[Recovery] ⚠️ text index '{}' rebuild failed: {:?}",
+                                    name,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
         let (index_build_tx, index_builder_thread) =
             Self::start_index_builder_pipeline(db.clone_for_callback());
@@ -1781,18 +1838,54 @@ impl MoteDB {
             if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
                 for entry in entries.flatten() {
                     if let Ok(name) = entry.file_name().into_string() {
-                        if name.starts_with("text_") {
+                        if name.starts_with("text_") && !name.ends_with(".dict.d") {
+                            // (.dict.d is the companion dictionary dir, not an
+                            // index — loading it spawned a junk
+                            // "index.dict.d" entry in the map.)
                             let index_name = match name.strip_prefix("text_") {
                                 Some(n) => n,
                                 None => continue,
                             };
-                            let index_path = entry.path();
+                            // 🔑 TextFTSIndex appends ".fts.d" to its storage
+                            // path (with_extension). Two consequences:
+                            //  1. The canonical index name is the dir name
+                            //     minus "text_" AND minus ".fts.d" (else every
+                            //     lookup by the registry name fails).
+                            //  2. TextFTSIndex::new must receive the BASE
+                            //     path ("text_{name}"), not the ".fts.d" dir —
+                            //     passing the dir made with_extension produce
+                            //     "text_x.fts.fts.d", a fresh empty index at a
+                            //     wrong path (text search returned 0 after
+                            //     every reopen).
+                            let index_name =
+                                index_name.strip_suffix(".fts.d").unwrap_or(index_name);
+                            let base_path = entry.path().parent().map(|p| p.to_path_buf());
+                            let base_path = match base_path {
+                                Some(p) => p.join(format!("text_{}", index_name)),
+                                None => continue,
+                            };
 
-                            // Try to load the index
-                            if let Ok(index) = TextFTSIndex::new(index_path) {
+                            // 🔑 Reopen = rebuild from source data. Under the
+                            // async index pipeline, close() never flushes
+                            // index buffers (derived data, "rebuilt on
+                            // restart"), so the on-disk postings may be
+                            // stale. Remove the old dir and create a fresh
+                            // index; the open path backfills it from the
+                            // table data afterwards.
+                            let _ = std::fs::remove_dir_all(entry.path());
+                            let _ = std::fs::remove_dir_all(
+                                base_path
+                                    .parent()
+                                    .unwrap()
+                                    .join(format!("text_{}.dict.d", index_name)),
+                            );
+                            if let Ok(index) = TextFTSIndex::new(base_path) {
                                 indexes
                                     .insert(index_name.to_string(), Arc::new(RwLock::new(index)));
-                                debug_log!("[MoteDB] Loaded text index: {}", index_name);
+                                debug_log!(
+                                    "[MoteDB] Text index '{}' reset for rebuild",
+                                    index_name
+                                );
                             }
                         }
                     }
@@ -1884,10 +1977,25 @@ impl MoteDB {
             };
 
             let config = crate::index::column_value::ColumnValueIndexConfig::default();
-            match ColumnValueIndex::open(entry.path(), table_name, column_name, config) {
+            match ColumnValueIndex::open(
+                entry.path(),
+                table_name.clone(),
+                column_name.clone(),
+                config,
+            ) {
                 Ok(index) => {
                     debug_log!("[MoteDB] Loaded column index: {}", index_name);
-                    indexes.insert(index_name, Arc::new(index));
+                    let arc = Arc::new(index);
+                    indexes.insert(index_name, arc.clone());
+                    // 🔑 Restore the standard "{table}.{column}" alias that
+                    // execute_create_index also registers live (query_by_column
+                    // and the WHERE fast paths look indexes up by it). Without
+                    // the alias, every custom-named column index was
+                    // unreachable via the query APIs after reopen.
+                    let standard_name = format!("{}.{}", table_name, column_name);
+                    if !indexes.contains_key(&standard_name) {
+                        indexes.insert(standard_name, arc);
+                    }
                 }
                 Err(e) => {
                     debug_log!(

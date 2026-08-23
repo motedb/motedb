@@ -3120,7 +3120,13 @@ impl MoteDB {
                     Err(arc) => (*arc).clone(),
                 });
             vec![(row_id, opt)]
-        } else if is_continuous {
+        } else if is_continuous && !self.has_col_segment_store(table_name) {
+            // 🔑 The LSM-range fast path is only valid for LSM-backed rows.
+            // ColSegmentStore tables skip LSM at runtime ("columnar is the
+            // source of truth") — after a CLEAN close (WAL truncated, LSM
+            // empty) it returned 0 rows for every id (MATCH fast path
+            // silently returned empty results). Route col-segment tables to
+            // the per-id store.get() path instead.
             self.get_table_rows_batch_range(table_name, &missed_ids)?
         } else {
             let mut sorted_ids = missed_ids.clone();

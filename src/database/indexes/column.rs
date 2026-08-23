@@ -47,6 +47,25 @@ impl MoteDB {
             .insert(index_name.to_string(), index_arc.clone());
 
         // Populate from existing data
+        self.populate_column_index(&index_arc, table_name, column_name);
+
+        Ok(())
+    }
+
+    /// (Re)populate a column index from the table's current data.
+    ///
+    /// Shared by CREATE INDEX and the reopen path: under the async index
+    /// pipeline close() skips index flushes (indexes are derived data,
+    /// "rebuilt on restart"), so every open must rebuild from storage or
+    /// the index reloads stale/empty and `needs_rebuild=false` disables
+    /// the async rebuild safety net.
+    pub fn populate_column_index(
+        &self,
+        index_arc: &Arc<ColumnValueIndex>,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<()> {
+        // Populate from existing data
         if let Ok(schema) = self.table_registry.get_table(table_name) {
             if let Some(col_def) = schema.columns.iter().find(|c| c.name == column_name) {
                 let col_position = col_def.position;
