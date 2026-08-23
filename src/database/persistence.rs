@@ -105,8 +105,14 @@ impl MoteDB {
             .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
 
-        // Drain all in-memory write buffers to disk BEFORE copying.
-        let flush_result = self.flush_impl();
+        // Drain all in-memory write buffers to disk BEFORE copying, then
+        // truncate the WAL: everything it still holds is now flushed into
+        // segments and would otherwise be REPLAYED ON TOP of the flushed
+        // data when the snapshot is opened (doubled TimeSeries rows).
+        let flush_result = self.flush_impl().and_then(|()| {
+            self.wal.checkpoint_all()?;
+            Ok(())
+        });
 
         // Block autocommit writes (api::execute takes write_lock for
         // INSERT/UPDATE/DELETE) so no new WAL/segment bytes appear while the

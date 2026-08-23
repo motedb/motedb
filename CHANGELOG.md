@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### 可靠性第四轮（索引维护 + TimeSeries 崩溃恢复 —— 3 个新 bug）
+
+- **修复：UPDATE 文本列后新内容对全文搜索永久隐身**。`TextFTSIndex::update`
+  为新词条调用 `posting.add(doc, None)`（无位置），而 positions 启用时
+  `iter_doc_tf()/term_frequency()` 从 positions map 推 TF —— 无位置条目
+  TF=0，被搜索端 `if tf == 0 continue` 跳过：旧词条正确移除、新词条永远
+  搜不到（含"更新为已存在词条"场景，该行直接从结果中消失）。update 改为
+  与 insert 一致携带 token 位置；TF 推导对 positions 缺失回退 doc_freqs/1
+  （自愈历史状态）。
+- **修复：DiskGraph::remove_node 自死锁 —— 向量列的 UPDATE/DELETE 永久挂起**。
+  `*self.count.write() = self.count.read().saturating_sub(1)` 单语句内 RHS
+  读 guard 存活到语句结束，LHS 再取写锁 → 同线程读写互等。最小复现：纯
+  DiskANN 层 insert×5 + delete×1 即挂。拆成两条语句。
+- **修复：TimeSeries 表崩溃恢复后所有查询不可见（多因叠加）**。kill -9 后
+  WAL 重放正确回进 ColumnarStore（日志可证），但：① COUNT(*) 的原子计数器
+  不持久化，恢复后为 0；② 通用扫描/ORDER BY/DISTINCT 等十余个
+  `has_col_segment_store` 守卫的快路径被查询侧产物——TS 表的**空**
+  ColSegmentStore——截断，永远读不到权威数据。修复：恢复时从 ColumnarStore
+  播种行计数；`scan_table_rows_streaming` 新增 Materialized 分支按 TS 表
+  走 ColumnarStore；`get_or_create_col_segment_store` 与 open 时磁盘加载器
+  对 TimeSeries 表拒绝/跳过（空段店不再存在，所有守卫自然放行）。
+- **修复：backup 快照恢复后 TimeSeries 行翻倍**。backup 只 flush 段、不清
+  WAL —— 快照重开时 WAL 在已 flush 的段之上再重放一遍（20 行 → 40 行）。
+  backup 在 flush 后调用 `wal.checkpoint_all()` 截断 WAL（数据已入段，
+  WAL 冗余）。另外快路径 `try_fast_insert`/`try_fast_select` 对 TimeSeries
+  表放行回 AST 路径 —— 此前快路径把 TS 行写进 ColSegmentStore（空段店
+  的来源），与 ColumnarStore 权威数据彻底分裂；TS 聚合（SUM/AVG/MIN/MAX）
+  新增基于 ColumnarStore 全扫的简单聚合路径（此前返回 NULL）。
+- **新增**：崩溃注入第四模式（timeseries，单调时间戳前缀+精确值双不变量，
+  40 轮浸泡）；tests/test_index_maintenance.rs（FTS/vector/column 的
+  UPDATE/DELETE 维护 + 死锁看门狗回归）；tests/test_large_rows.rs
+  （50KB 行 × live/干净重开/崩溃重开/点查）。附带发现：列存 TEXT 上限
+  65534 字节（0xFFFF 保留），写入不拦截、读取报错 —— 已在测试中文档化，
+  待后续统一为写入期校验。
+
 ### 可靠性第三轮（二级索引重开全灭 —— bug 家族一次清掉）
 
 由"vector 索引重开后搜不到"顺藤摸瓜，发现 **column / text / vector 三类二级索引

@@ -1280,6 +1280,15 @@ impl MoteDB {
                         if meta.is_dir() {
                             let table_name = entry.file_name().to_string_lossy().to_string();
                             if let Ok(schema) = db.table_registry.get_table(&table_name) {
+                                // 🔑 TimeSeries tables are served by the
+                                // ColumnarStore — a columnar_ms/ dir for them
+                                // is a query-side artifact holding no data.
+                                // Loading it created an EMPTY ColSegmentStore
+                                // that shadowed the real data in every
+                                // has_col_segment_store-guarded fast path.
+                                if schema.table_type == crate::types::TableType::TimeSeries {
+                                    continue;
+                                }
                                 let col_types = schema.col_types().to_vec();
                                 if let Ok(store) =
                                     crate::storage::col_segment::ColSegmentStore::create(
@@ -1500,6 +1509,36 @@ impl MoteDB {
                     "[Recovery] Replayed {} WAL ops into ColSegmentStores",
                     replayed
                 );
+            }
+        }
+
+        // 🔑 TimeSeries row-count recovery: COUNT(*) answers from the atomic
+        // table_row_count counter (fast_row_count), which is NOT persisted.
+        // After crash recovery the counter was absent → SELECT COUNT(*)
+        // returned 0 even though the WAL replay had restored all rows into
+        // the ColumnarStore. Seed the counter from the recovered data.
+        {
+            let _ = db.columnar_store.flush_all();
+            for table_name in db.table_registry.list_tables()? {
+                if let Ok(schema) = db.table_registry.get_table(&table_name) {
+                    if schema.table_type == crate::types::TableType::TimeSeries {
+                        let n = db
+                            .columnar_store
+                            .query_time_range(&table_name, i64::MIN, i64::MAX, &[])
+                            .map(|v| v.len() as u64)
+                            .unwrap_or(0);
+                        if n > 0 {
+                            let counter = db
+                                .table_row_count
+                                .entry(table_name.clone())
+                                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+                            let cur = counter.load(std::sync::atomic::Ordering::Relaxed);
+                            if cur < n {
+                                counter.store(n, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
             }
         }
 

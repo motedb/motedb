@@ -5587,6 +5587,21 @@ impl QueryExecutor {
                     return Ok(result);
                 }
             }
+            // 🔑 TimeSeries tables: compute simple (non-GROUP-BY) aggregates
+            // over the ColumnarStore via the streaming scan — the fast paths
+            // above and materialize all read LSM/ColSegmentStore, which hold
+            // no TS data (returned NULL/0).
+            if stmt.group_by.is_none() {
+                if let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() {
+                    if let Ok(schema) = self.db.get_table_schema(name) {
+                        if schema.table_type == crate::types::TableType::TimeSeries {
+                            if let Some(result) = self.ts_simple_aggregate(stmt, name, &schema)? {
+                                return Ok(result);
+                            }
+                        }
+                    }
+                }
+            }
             return self.materialize_as_streaming(stmt);
         }
 
@@ -5720,7 +5735,15 @@ impl QueryExecutor {
                 }
                 // ORDER BY / DISTINCT on full scan without streaming Top-K:
                 // fall back to materialize which has the positional sort path.
+                // 🔑 EXCEPT TimeSeries tables — materialize reads the LSM /
+                // ColSegmentStore paths which hold no TS data; the full-scan
+                // Materialized TS branch handles ORDER/DISTINCT correctly.
                 if stmt.order_by.is_some() || stmt.distinct {
+                    if let Ok(schema) = self.db.get_table_schema(table) {
+                        if schema.table_type == crate::types::TableType::TimeSeries {
+                            return self.execute_full_scan_streaming(stmt, table);
+                        }
+                    }
                     return self.materialize_as_streaming(stmt);
                 }
                 self.execute_full_scan_streaming(stmt, table)
@@ -6742,6 +6765,12 @@ impl QueryExecutor {
             return Ok(None);
         }
         let schema = self.db.get_table_schema(table)?;
+        // 🔑 TimeSeries tables: the fast paths below read columnar SSTables /
+        // the LSM — neither holds TS data (ColumnarStore does). Bail so the
+        // query falls through to the full-scan Materialized TS branch.
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            return Ok(None);
+        }
         // Resolve ORDER BY column position
         let (sort_col_idx, ascending) = {
             let ob = &order_by[0];
@@ -8603,10 +8632,96 @@ impl QueryExecutor {
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
 
+        // 🔑 TimeSeries tables: authoritative data lives in the
+        // ColumnarStore. scan_table_rows_streaming routes them there
+        // (Materialized branch); the ColSegmentStore/LSM paths below hold
+        // no data for them and would return empty results.
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            let iter = self.db.scan_table_rows_streaming(table)?;
+            let schema2 = self.db.get_table_schema(table)?;
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            let col_positions = Self::resolve_select_positions(&stmt.columns, &schema2)
+                .unwrap_or_else(|| (0..schema2.columns.len()).collect());
+            for item in iter {
+                let (_rid, row) = item?;
+                let projected: Vec<Value> = col_positions
+                    .iter()
+                    .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
+                    .collect();
+                rows.push(projected);
+            }
+            // Apply WHERE / ORDER BY / LIMIT on the materialized rows.
+            // Note: rows are already PROJECTED to the SELECT positions —
+            // for WHERE/ORDER evaluation on non-selected columns we re-scan
+            // with full rows when needed. Keep it simple: evaluate against
+            // full rows, project last.
+            let mut full_rows: Vec<Vec<Value>> = Vec::new();
+            {
+                let iter2 = self.db.scan_table_rows_streaming(table)?;
+                for item in iter2 {
+                    let (_rid2, row2) = item?;
+                    full_rows.push(row2);
+                }
+            }
+            if let Some(wc) = &stmt.where_clause {
+                let mut kept = Vec::with_capacity(full_rows.len());
+                for row in full_rows.drain(..) {
+                    if let Ok(v) = Self::eval_expr_on_row(wc, &row, &schema2) {
+                        if Self::is_truthy(&v) {
+                            kept.push(row);
+                        }
+                    }
+                }
+                full_rows = kept;
+            }
+            if let Some(ob) = &stmt.order_by {
+                let mut specs: Vec<(usize, bool)> = Vec::new();
+                for o in ob {
+                    if let Expr::Column(cn) = &o.expr {
+                        if let Some(p) = schema2.get_column_position(cn) {
+                            specs.push((p, o.asc));
+                            continue;
+                        }
+                    }
+                    specs.clear();
+                    break;
+                }
+                if specs.len() == ob.len() {
+                    StreamingQueryResult::sort_rows(&mut full_rows, &specs);
+                }
+            }
+            if let Some(off) = stmt.offset {
+                let off = off.min(full_rows.len());
+                full_rows.drain(..off);
+            }
+            if let Some(lim) = stmt.limit {
+                full_rows.truncate(lim);
+            }
+            let rows: Vec<Vec<Value>> = full_rows
+                .into_iter()
+                .map(|row| {
+                    col_positions
+                        .iter()
+                        .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .collect();
+            let columns = self.build_select_columns(&stmt.columns, &schema2)?;
+            return Ok(StreamingQueryResult::SelectReady { columns, rows });
+        }
+
         // S7: when the table uses the multi-segment ColSegmentStore, data is
         // queryable via multi-way merge — no finalize/merge needed. Just flush
         // pending buffer (cheap delta). Eliminates read-triggered full-table merge.
-        if self.db.has_col_segment_store(table) {
+        // 🔑 EXCEPT TimeSeries tables: their authoritative store is the
+        // ColumnarStore (WAL recovery replays into its buffers; the
+        // ColSegmentStore view of a TS table can be empty and would shadow
+        // it — after a crash every plain SELECT / LIMIT / ORDER BY returned
+        // 0 rows). TS tables fall through to the scan_table_rows_streaming
+        // path below, which routes them to the ColumnarStore.
+        if self.db.has_col_segment_store(table)
+            && schema.table_type != crate::types::TableType::TimeSeries
+        {
             let col_types = schema.col_types().to_vec();
             if let Ok(store) = self.db.get_or_create_col_segment_store(table, &col_types) {
                 let _ = store.prepare_for_query();
@@ -23891,6 +24006,128 @@ impl QueryExecutor {
 
     /// Try to serve a SELECT from the columnar store for TimeSeries tables.
     /// Returns Ok(Some(result)) if handled, Ok(None) if it should fall through to LSM.
+    /// Simple (non-GROUP-BY) aggregates over a TimeSeries table, computed
+    /// from the ColumnarStore via the streaming scan. Handles
+    /// COUNT(*)/COUNT(col)/SUM/MIN/MAX/AVG over a full scan with WHERE.
+    fn ts_simple_aggregate(
+        &self,
+        stmt: &SelectStmt,
+        table: &str,
+        schema: &crate::types::TableSchema,
+    ) -> Result<Option<StreamingQueryResult>> {
+        use crate::sql::ast::SelectColumn;
+
+        // Every output column must be a plain aggregate call (or COUNT(*)).
+        let mut aggs: Vec<(String, Option<usize>)> = Vec::new();
+        for sc in &stmt.columns {
+            match sc {
+                SelectColumn::Star => {
+                    // SELECT * with aggregates shouldn't reach here; bail.
+                    return Ok(None);
+                }
+                SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _) => {
+                    let fname = name.to_lowercase();
+                    if !matches!(fname.as_str(), "count" | "sum" | "min" | "max" | "avg") {
+                        return Ok(None);
+                    }
+                    match args.first() {
+                        None if fname == "count" => aggs.push((fname, None)), // COUNT()
+                        Some(Expr::Column(c)) => {
+                            let pos = match schema.get_column_position(c) {
+                                Some(p) => p,
+                                None => return Ok(None),
+                            };
+                            aggs.push((fname, Some(pos)));
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        if aggs.is_empty() {
+            return Ok(None);
+        }
+
+        // Full scan (TS → ColumnarStore) + WHERE filter.
+        let iter = self.db.scan_table_rows_streaming(table)?;
+        let mut n: u64 = 0;
+        // Per-aggregate accumulators.
+        let mut count: Vec<u64> = vec![0; aggs.len()];
+        let mut sum: Vec<f64> = vec![0.0; aggs.len()];
+        let mut minv: Vec<Option<f64>> = vec![None; aggs.len()];
+        let mut maxv: Vec<Option<f64>> = vec![None; aggs.len()];
+        let mut anyv: Vec<bool> = vec![false; aggs.len()];
+
+        for item in iter {
+            let (_rid, row) = item?;
+            if let Some(wc) = &stmt.where_clause {
+                match Self::eval_expr_on_row(wc, &row, schema) {
+                    Ok(v) if Self::is_truthy(&v) => {}
+                    _ => continue,
+                }
+            }
+            n += 1;
+            for (i, (_fname, pos)) in aggs.iter().enumerate() {
+                let p = match pos {
+                    Some(p) => *p,
+                    None => {
+                        count[i] += 1; // COUNT(*)
+                        continue;
+                    }
+                };
+                match row.get(p) {
+                    Some(Value::Integer(x)) => {
+                        count[i] += 1;
+                        sum[i] += *x as f64;
+                        minv[i] = Some(minv[i].map_or(*x as f64, |m: f64| m.min(*x as f64)));
+                        maxv[i] = Some(maxv[i].map_or(*x as f64, |m: f64| m.max(*x as f64)));
+                        anyv[i] = true;
+                    }
+                    Some(Value::Float(x)) => {
+                        count[i] += 1;
+                        sum[i] += *x;
+                        minv[i] = Some(minv[i].map_or(*x, |m: f64| m.min(*x)));
+                        maxv[i] = Some(maxv[i].map_or(*x, |m: f64| m.max(*x)));
+                        anyv[i] = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let _ = n;
+
+        let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
+        let rows: Vec<Vec<Value>> = vec![aggs
+            .iter()
+            .enumerate()
+            .map(|(i, (fname, _pos))| {
+                let f = fname.as_str();
+                match f {
+                    "count" => Value::Integer(count[i] as i64),
+                    "sum" => {
+                        if anyv[i] {
+                            Value::Float(sum[i])
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    "min" => minv[i].map(Value::Float).unwrap_or(Value::Null),
+                    "max" => maxv[i].map(Value::Float).unwrap_or(Value::Null),
+                    "avg" => {
+                        if anyv[i] {
+                            Value::Float(sum[i] / count[i] as f64)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    _ => Value::Null,
+                }
+            })
+            .collect()];
+        Ok(Some(StreamingQueryResult::SelectReady { columns, rows }))
+    }
+
     fn try_columnar_select(
         &self,
         stmt: &SelectStmt,
@@ -24346,6 +24583,17 @@ impl QueryExecutor {
         }
 
         let result = self.db.columnar_store.ingest(&stmt.table, rows)?;
+        // 🔑 Keep the atomic row-count counter (COUNT(*) fast path) in sync —
+        // the ColumnarStore ingest path bypasses the crud INSERT bookkeeping.
+        self.db
+            .table_row_count
+            .entry(stmt.table.clone())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            .value()
+            .fetch_add(
+                result.row_ids.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         Ok(QueryResult::Modification {
             affected_rows: result.row_ids.len(),
         })

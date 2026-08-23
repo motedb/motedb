@@ -473,9 +473,14 @@ impl PostingList {
         if !self.doc_ids.contains(doc_id as u32) {
             return 0;
         }
-        // Fast path: lookup in positions map (O(1))
+        // Fast path: lookup in positions map (O(1)). A positions-enabled
+        // posting whose entry is missing from the map (entries added without
+        // positions) falls through to doc_freqs / 1 — the doc IS in the
+        // posting, so TF=0 would silently hide it from every search.
         if let Some(ref pos_map) = self.positions {
-            return pos_map.get(&doc_id).map(|v| v.len() as u16).unwrap_or(0);
+            if let Some(v) = pos_map.get(&doc_id) {
+                return v.len() as u16;
+            }
         }
         // Use doc_freqs parallel array via RoaringBitmap rank
         // Only if the parallel array is in sync with doc_ids
@@ -512,16 +517,18 @@ impl PostingList {
     pub fn iter_doc_tf(&self) -> Vec<(u32, u16)> {
         let doc_count = self.doc_ids.len() as usize;
         if let Some(ref pos_map) = self.positions {
+            // 🔑 Docs missing from the positions map (added without positions)
+            // fall back to doc_freqs / TF=1 — never 0, which would silently
+            // drop them from search results.
             self.doc_ids
                 .iter()
-                .map(|id| {
-                    (
-                        id,
-                        pos_map
-                            .get(&(id as u64))
-                            .map(|v| v.len() as u16)
-                            .unwrap_or(0),
-                    )
+                .enumerate()
+                .map(|(i, id)| {
+                    let tf = pos_map
+                        .get(&(id as u64))
+                        .map(|v| v.len() as u16)
+                        .unwrap_or_else(|| *self.doc_freqs.get(i).unwrap_or(&1));
+                    (id, tf)
                 })
                 .collect()
         } else if self.doc_freqs.len() == doc_count {

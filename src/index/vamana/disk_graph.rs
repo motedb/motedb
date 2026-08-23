@@ -541,7 +541,14 @@ impl DiskGraph {
         self.hot_nodes.write().remove(&node_id);
         self.hot_cache.write().pop(&node_id);
         if was_present {
-            *self.count.write() = self.count.read().saturating_sub(1);
+            // 🔑 Split read/write into two statements: in the one-liner
+            // `*self.count.write() = self.count.read().saturating_sub(1)`
+            // the RHS read guard is a temporary that lives until the END of
+            // the statement, so evaluating the LHS write blocks on a reader
+            // held by this very thread — a self-deadlock that hung every
+            // UPDATE/DELETE on a vector-indexed column.
+            let c = *self.count.read();
+            *self.count.write() = c.saturating_sub(1);
         }
         *self.dirty.write() = true;
         neighbors

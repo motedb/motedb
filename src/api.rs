@@ -1051,6 +1051,13 @@ impl Database {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
+        // 🔑 TimeSeries tables must take the AST path (execute_columnar_
+        // insert → ColumnarStore). Writing them through the standard
+        // row path here created a ColSegmentStore that shadowed the
+        // authoritative ColumnarStore data in every index fast path.
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            return Ok(None);
+        }
 
         // Parse multiple value tuples: (a,b,c),(d,e,f),...
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -1219,6 +1226,14 @@ impl Database {
         };
         if table_name.is_empty() {
             return Ok(None);
+        }
+        // 🔑 TimeSeries tables: bail to the AST path — they are served by
+        // the ColumnarStore, which this hand-rolled parser knows nothing
+        // about (its scan would return 0 rows).
+        if let Ok(schema) = self.inner.table_registry.get_table(table_name) {
+            if schema.table_type == crate::types::TableType::TimeSeries {
+                return Ok(None);
+            }
         }
 
         // 🆕 ColSegmentStore tables: we no longer bail out wholesale. The PK

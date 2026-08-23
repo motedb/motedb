@@ -134,6 +134,21 @@ fn crash_child_mode() {
                 journal.flush().unwrap();
             }
         }
+        // TimeSeries workload: monotonically increasing timestamps at a fixed
+        // step. The parent verifies a contiguous timestamp prefix with exact
+        // values (exercises the columnar_store.replay_row recovery path,
+        // which the other modes never touch).
+        "ts" => {
+            db.execute("CREATE TABLE IF NOT EXISTS m (ts TIMESTAMP, v FLOAT) TIMESERIES(ts)")
+                .expect("create table");
+            for i in 0..iterations {
+                let ts = 1_000_000i64 * (i as i64 + 1);
+                db.execute(&format!("INSERT INTO m VALUES ({ts}, {})", i as f64 / 7.0))
+                    .expect("insert");
+                writeln!(journal, "{i}").unwrap();
+                journal.flush().unwrap();
+            }
+        }
         other => panic!("unknown crash child mode: {other}"),
     }
 
@@ -505,6 +520,91 @@ fn test_kill9_txn_atomicity_and_prefix() {
         "never killed the child — test degraded to a no-op"
     );
     eprintln!("txn crash injection: {killed_runs} kills verified");
+}
+
+// ── Parent: TimeSeries workload ────────────────────────────────────────────
+
+#[test]
+fn test_kill9_timeseries_prefix_recovery() {
+    let iterations: usize = std::env::var("MOTEDB_CRASH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let mut rng_state: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+    let next_delay_ms = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        ((*state % 150) + 5) as u64
+    };
+
+    let mut killed_runs = 0;
+    for iter in 0..iterations {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("crash.mote");
+        let journal_path = dir.path().join("acked.txt");
+        let delay = next_delay_ms(&mut rng_state);
+        if spawn_kill_child(&db_path, &journal_path, delay, "ts") {
+            killed_runs += 1;
+        }
+
+        let journal = read_journal_lines(&journal_path);
+        let acked: usize = journal
+            .iter()
+            .filter(|l| l.parse::<usize>().is_ok())
+            .count();
+
+        let db = match Database::open(&db_path) {
+            Ok(db) => db,
+            Err(e) => panic!("iter {}: reopen failed: {}", iter, e),
+        };
+        let rs = match db.query("SELECT ts, v FROM m ORDER BY ts") {
+            Ok(rs) => rs,
+            Err(e) if e.to_string().contains("not found") && journal.is_empty() => {
+                drop(db);
+                continue;
+            }
+            Err(e) => panic!("iter {}: query failed: {}", iter, e),
+        };
+
+        // Prefix: rows are ts = step×(i+1) for a contiguous i-prefix, exact v.
+        for (k, row) in rs.iter().enumerate() {
+            let i = k as i64;
+            let want_ts = 1_000_000 * (i + 1);
+            let want_v = i as f64 / 7.0;
+            match (&row[0], &row[1]) {
+                (Value::Timestamp(t), Value::Float(v)) => {
+                    assert_eq!(
+                        t.as_micros(),
+                        want_ts,
+                        "iter {}: row {} ts broken (gap or corrupt)",
+                        iter,
+                        i
+                    );
+                    assert!(
+                        (v - want_v).abs() < 1e-12,
+                        "iter {}: row {} value corrupted: {v} != {want_v}",
+                        iter,
+                        i
+                    );
+                }
+                other => panic!("iter {}: row {} wrong types: {:?}", iter, i, other),
+            }
+        }
+        // Durability: acked inserts all present.
+        assert!(
+            rs.len() >= acked,
+            "iter {}: durability violation — {acked} acked but {} recovered",
+            iter,
+            rs.len()
+        );
+        drop(db);
+    }
+    assert!(
+        killed_runs > 0,
+        "never killed the child — test degraded to a no-op"
+    );
+    eprintln!("timeseries crash injection: {killed_runs} kills verified");
 }
 
 /// Journal lines with torn-tail filtering (raw strings, no numeric parse).

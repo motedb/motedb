@@ -473,14 +473,25 @@ impl TextFTSIndex {
         }
 
         // 2. Insert new terms
+        // 🔑 Carry token POSITIONS (mirrors batch_insert). The old
+        // `add(doc_id, None)` relied on doc_freqs, but with positions
+        // enabled iter_doc_tf()/term_frequency() derive TF from the
+        // positions map — a doc without positions scored TF=0 and was
+        // skipped by every search: after UPDATE, the row went permanently
+        // invisible for all its new terms.
         let new_tokens = self.tokenizer.tokenize(new_text);
         let new_token_count = new_tokens.len() as u64;
 
         // Build per-term doc lists
-        let mut term_docs: HashMap<TermId, Vec<DocId>> = HashMap::new();
+        let mut term_docs: HashMap<TermId, Vec<(DocId, Option<Position>)>> = HashMap::new();
         for token in new_tokens {
             let term_id = self.dictionary.get_or_insert(&token.text);
-            term_docs.entry(term_id).or_default().push(doc_id);
+            let pos = if self.enable_positions {
+                Some(token.position)
+            } else {
+                None
+            };
+            term_docs.entry(term_id).or_default().push((doc_id, pos));
         }
 
         // Update pending posting lists
@@ -488,15 +499,15 @@ impl TextFTSIndex {
             let mut pending = self.pending_posting_lists.write();
             let mut deleted_term_docs = self.deleted_term_docs.write();
 
-            for (term_id, doc_ids) in term_docs {
+            for (term_id, doc_entries) in term_docs {
                 // Remove from deleted set if re-adding the same term
                 deleted_term_docs.remove(&(term_id, doc_id));
 
                 let posting = pending
                     .entry(term_id)
                     .or_insert_with(|| PostingList::new_without_positions(!self.enable_positions));
-                for doc_id in doc_ids {
-                    posting.add(doc_id, None);
+                for (doc_id, pos) in doc_entries {
+                    posting.add(doc_id, pos);
                 }
             }
         }

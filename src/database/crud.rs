@@ -1526,6 +1526,41 @@ impl MoteDB {
         let schema = self.table_registry.get_table(table_name)?;
         let col_types = schema.col_types();
 
+        // 🔑 TimeSeries tables: the authoritative store is the ColumnarStore
+        // (WAL recovery replays into its buffers). The legacy col-segment /
+        // columnar_sstables path below can hold an EMPTY view of a TS table
+        // and shadow it — after a crash, every SELECT/COUNT returned 0 rows
+        // even though recovery had replayed the data. Read the full range
+        // from the ColumnarStore instead.
+        if schema.table_type == crate::types::TableType::TimeSeries {
+            // WAL-recovered rows sit in the ColumnarStore's in-memory write
+            // buffers until flushed — make them visible before querying.
+            let _ = self.columnar_store.flush_all();
+            let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let fetched =
+                self.columnar_store
+                    .query_time_range(table_name, i64::MIN, i64::MAX, &col_names)?;
+            let positions: Vec<usize> = schema.columns.iter().map(|c| c.position).collect();
+            let rows: Vec<(RowId, Row)> = fetched
+                .into_iter()
+                .map(|(rid, sql_row)| {
+                    let row: Row = positions
+                        .iter()
+                        .map(|&pos| {
+                            // SqlRow is keyed by column name; map back to
+                            // schema order positions.
+                            let name = &schema.columns[pos].name;
+                            sql_row.get(name).cloned().unwrap_or(Value::Null)
+                        })
+                        .collect();
+                    (rid, row)
+                })
+                .collect();
+            return Ok(TableRowStreamingIterator {
+                inner: TableRowStreamingInner::Materialized { rows, idx: 0 },
+            });
+        }
+
         // Columnar-backed scan: if the table's data lives in a columnar SSTable
         // (rather than the LSM), decode column arrays and synthesize rows.
         // Falling back to the LSM scan here would yield empty/stale results.
@@ -1770,6 +1805,22 @@ impl MoteDB {
         // fresh store and reuse the winner's.
         if let Some(store) = self.get_col_segment_store(table_name) {
             return Ok(store);
+        }
+        // 🔑 TimeSeries tables live in the ColumnarStore, not a
+        // ColSegmentStore. Query-side paths used to create an EMPTY
+        // ColSegmentStore for them, which then shadowed the authoritative
+        // data in every has_col_segment_store-guarded fast path (after a
+        // crash, plain SELECT / ORDER BY / DISTINCT returned 0 rows).
+        // Refuse creation; callers' `if let Ok(store)` guards fall through
+        // to the generic scan, which routes TimeSeries to the ColumnarStore.
+        if let Ok(schema) = self.table_registry.get_table(table_name) {
+            if schema.table_type == crate::types::TableType::TimeSeries {
+                return Err(StorageError::InvalidData(format!(
+                    "TimeSeries table '{}' is served by the ColumnarStore, \
+                     not a ColSegmentStore",
+                    table_name
+                )));
+            }
         }
         // Create OUTSIDE any map lock (directory + file I/O). Holding the
         // shard write lock across I/O stalled every other thread touching
@@ -3490,6 +3541,9 @@ enum TableRowStreamingInner {
         decode_ctx: Option<crate::storage::row_format::SchemaDecodeContext>,
         use_raw: bool,
     },
+    /// Pre-fetched rows (TimeSeries tables read from the authoritative
+    /// ColumnarStore, which has no streaming iterator API).
+    Materialized { rows: Vec<(RowId, Row)>, idx: usize },
     /// Columnar SSTable backed scan. For tables whose data lives in the
     /// columnar SSTable (not the LSM), we decode column arrays into rows.
     /// `col_types` drives the decode: Integer→get_i64, Float→get_f64,
@@ -3515,6 +3569,14 @@ impl Iterator for TableRowStreamingIterator {
                 decode_ctx,
                 use_raw,
             } => lsm_next(lsm_iter, decode_ctx, *use_raw),
+            TableRowStreamingInner::Materialized { rows, idx } => {
+                if *idx >= rows.len() {
+                    return None;
+                }
+                let item = Ok(rows[*idx].clone());
+                *idx += 1;
+                Some(item)
+            }
             TableRowStreamingInner::Columnar {
                 row_map,
                 segments,
