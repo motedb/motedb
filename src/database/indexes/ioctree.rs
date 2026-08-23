@@ -24,9 +24,83 @@ impl MoteDB {
         };
 
         let index = IOctreeIndex::new(config, name.to_string())?;
+        let is_new = !self.ioctree_indexes.contains_key(name);
         self.ioctree_indexes
             .insert(name.to_string(), Arc::new(RwLock::new(index)));
+
+        // 🔑 Register + backfill. Without a registry entry (table, column),
+        // the INSERT-time backfill (find_by_column … IndexType::Octree) can
+        // never resolve this index and it stays empty forever (knn always 0).
+        // The name-only API resolves via the documented "{table}_{column}"
+        // convention against Spatial columns.
+        if let Some((table, column)) = self.resolve_octree_target(name) {
+            // Tolerant registration: the SQL CREATE INDEX path also registers
+            // (its own metadata is authoritative); "already exists" is fine.
+            let metadata = crate::database::index_metadata::IndexMetadata::new(
+                name.to_string(),
+                table.clone(),
+                column.clone(),
+                crate::database::index_metadata::IndexType::Octree,
+            );
+            if let Err(e) = self.index_registry.register(metadata) {
+                debug_log!("[create_ioctree_index] registry: {:?}", e);
+            }
+            // Backfill existing rows — ONLY on a fresh index (the SQL
+            // CREATE INDEX path backfills separately; running both
+            // double-inserted every point).
+            if is_new {
+                if let Ok(schema) = self.table_registry.get_table(&table) {
+                    if let Some(col_def) = schema.columns.iter().find(|c| c.name == column) {
+                        let pos = col_def.position;
+                        let iter = self.scan_table_rows_streaming(&table)?;
+                        for result in iter {
+                            let (row_id, row) = match result {
+                                Ok(r) => r,
+                                Err(_) => continue,
+                            };
+                            if let Some(crate::types::Value::Spatial(geometry)) = row.get(pos) {
+                                if geometry.is_3d() {
+                                    let _ = self.insert_ioctree_point(row_id, name, geometry);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Resolve "{table}_{column}" against registered Spatial columns.
+    /// Longest table-name match wins (tables may contain underscores).
+    fn resolve_octree_target(&self, index_name: &str) -> Option<(String, String)> {
+        let tables = self.table_registry.list_tables().ok()?;
+        let mut best: Option<(usize, String, String)> = None;
+        for table in tables {
+            let prefix = format!("{}_", table);
+            if let Some(col) = index_name.strip_prefix(&prefix) {
+                if let Ok(schema) = self.table_registry.get_table(&table) {
+                    if schema.columns.iter().any(|c| {
+                        c.name == col && matches!(c.col_type, crate::types::ColumnType::Spatial)
+                    }) {
+                        let score = table.len();
+                        if best.as_ref().map(|(s, _, _)| score > *s).unwrap_or(true) {
+                            best = Some((score, table, col.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, t, c)| (t, c))
+    }
+
+    /// Number of indexed points (None if the index doesn't exist). Used by
+    /// the CREATE INDEX path to skip a second backfill when the index was
+    /// already populated at creation.
+    pub fn ioctree_point_count(&self, index_name: &str) -> Option<usize> {
+        self.ioctree_indexes
+            .get(index_name)
+            .map(|i| i.value().read().len())
     }
 
     /// Insert a 3D point into an i-Octree index

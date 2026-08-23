@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### 可靠性第六轮（空间索引 i-Octree 全链路 —— 3 个真 bug）
+
+- **修复：`CREATE INDEX ix ON t (spatial_col)`（未标注类型）直接 panic**。
+  解析器默认 BTree，列索引构建器用 TEXT 读取器读 SPATIAL 列的变长编码
+  ——offset 减法下溢 panic（debug）/静默垃圾（release）。执行器按列类型
+  重推断：SPATIAL → Octree。
+- **修复：Rust API `create_ioctree_index(name)` 创建的是死索引**。不注册
+  registry（无 table/column 元数据）→ INSERT 时的回填永远解析不到 →
+  knn 永远返回 0。现按 "{table}_{column}" 命名约定解析 Spatial 列、
+  容忍式注册、新索引回填存量数据。
+- **修复：回填双插**。SQL 路径与 API 路径各回填一遍 → 每个点索引两次
+  （knn(2) 返回同一行两份）。创建时回填仅在全新索引上执行，执行器回填
+  跳过已填充索引（注册幂等化）。
+- **新增 tests/test_spatial_index.rs**（4 测试）：SQL/API 双创建路径 ×
+  knn 正确性 / 增量插入 / 重开持久 / 删除维护。
+- 验证：UPSERT × column/text 索引维护语义全对（OR REPLACE 与
+  DO UPDATE 改索引列均正确更新），无回归。
+
 ### 可靠性第五轮（TimeSeries 查询语义补全）
 
 - **修复：TS 表 `COUNT(*)` 带任意 WHERE 返回 0**。计数/聚合快路径全部读

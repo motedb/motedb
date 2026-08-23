@@ -21621,9 +21621,23 @@ impl QueryExecutor {
                 IndexType::Octree
             }
             IndexType::BTree | IndexType::Column => {
-                // B-Tree/Column index can be used for any comparable type
+                // B-Tree/Column index can be used for any comparable type.
+                // (SPATIAL columns are re-inferred to Octree below — the
+                // column-index builder would read them with the TEXT reader
+                // and panic on the spatial encoding.)
                 stmt.index_type.clone()
             }
+        };
+
+        // 🔑 Untyped `CREATE INDEX ix ON t (col)` defaults to BTree in the
+        // parser (it has no schema). Re-infer from the column type here:
+        // SPATIAL → Octree (the column path above would panic otherwise).
+        let index_type = if matches!(index_type, IndexType::BTree | IndexType::Column)
+            && matches!(column.col_type, ColumnType::Spatial)
+        {
+            IndexType::Octree
+        } else {
+            index_type
         };
 
         // Create index based on type
@@ -21747,21 +21761,28 @@ impl QueryExecutor {
                 // Create i-Octree index for 3D point cloud data
                 self.db.create_ioctree_index(&index_name)?;
 
-                // 🚀 Backfill: try columnar fast path first
+                // 🚀 Backfill: try columnar fast path first.
+                // 🔑 Skip when the index is already populated —
+                // create_ioctree_index backfilled on creation (convention-
+                // named indexes); running both double-inserted every point.
                 let column_pos = schema
                     .get_column_position(&stmt.column)
                     .ok_or_else(|| MoteDBError::ColumnNotFound(stmt.column.clone()))?;
                 let mut backfill_count = 0;
+                let already_indexed = self.db.ioctree_point_count(&index_name).unwrap_or(0);
 
                 // Columnar fast path returns Ok(0) for ColSegmentStore-backed tables
                 // (not in legacy columnar_sstables); in that case fall back to row scan.
-                match self
-                    .db
-                    .build_ioctree_from_columnar(&index_name, &stmt.table, column_pos)
-                {
+                match if already_indexed > 0 {
+                    Ok(0)
+                } else {
+                    self.db
+                        .build_ioctree_from_columnar(&index_name, &stmt.table, column_pos)
+                } {
                     Ok(count) if count > 0 => {
                         backfill_count = count;
                     }
+                    _ if already_indexed > 0 => {}
                     _ => {
                         let iter = self.db.scan_table_rows_streaming(&stmt.table)?;
                         for result in iter {
@@ -21793,14 +21814,22 @@ impl QueryExecutor {
                     );
                 }
 
-                // Register metadata
-                let metadata = crate::database::index_metadata::IndexMetadata::new(
-                    index_name.clone(),
-                    stmt.table.clone(),
-                    stmt.column.clone(),
-                    crate::database::index_metadata::IndexType::Octree,
-                );
-                self.db.index_registry.register(metadata)?;
+                // Register metadata (idempotent — create_ioctree_index may
+                // already have registered via the "{table}_{column}" resolve).
+                if self
+                    .db
+                    .index_registry
+                    .resolve_index_name(&index_name)
+                    .is_none()
+                {
+                    let metadata = crate::database::index_metadata::IndexMetadata::new(
+                        index_name.clone(),
+                        stmt.table.clone(),
+                        stmt.column.clone(),
+                        crate::database::index_metadata::IndexType::Octree,
+                    );
+                    self.db.index_registry.register(metadata)?;
+                }
             }
             IndexType::BTree | IndexType::Column => {
                 // 🚀 Column/BTree index creation
