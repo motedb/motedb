@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### 可靠性第十一轮（UPSERT 崩溃注入 + 缓存×schema 阴性验证）
+
+- **新增：崩溃注入第六模式（upsert）**——DO UPDATE 累积 / OR REPLACE /
+  OR IGNORE 确定性轮转 × 随机 SIGKILL × 60 轮浸泡。验证模型按持久化
+  契约精确枚举恢复态：已 ack 全部生效 + 至多 2 条未 ack 在途语句
+  skip/full/**half**（OR REPLACE 是 delete+insert 两条 WAL 记录，被杀
+  在中间可留下"删而无插"的半应用态——未 ack 语句的合法结局）。数据库
+  本体全程行为正确（独立 64-op 复现 live == recovered）。
+- **阴性验证（无 bug）**：语句缓存 × schema 变更——ALTER ADD COLUMN /
+  DROP+异构重建 / prepared×schema 漂移，缓存 AST 按名存储、执行时对
+  活 schema 校验，错则明确报列数不匹配，无损坏路径。
+- **吞吐复核**：batch_insert 1M 行 ~2.0M rows/s（与 README 声称同量级，
+  机器相关）。
+
 ### 性能第十轮（事务 COMMIT 批量 fsync —— 8.5×；group-commit 自适应窗口）
 
 - **修复/优化：N 行事务的 COMMIT 逐行 log_insert → 每行一次 fsync

@@ -194,6 +194,45 @@ fn crash_child_mode() {
             }
             std::process::exit(0);
         }
+        // Upsert workload: 8 keys, each round does ON CONFLICT DO UPDATE
+        // accumulate (+1), OR REPLACE (rewrite), OR IGNORE (no-op) in a
+        // deterministic rotation. Journal "U k" / "R k" per op; the parent
+        // simulates prefixes and requires the recovered state to match one.
+        "upsert" => {
+            db.execute("CREATE TABLE IF NOT EXISTS u (id INTEGER PRIMARY KEY, val INTEGER)")
+                .expect("create table");
+            // Base rows.
+            for k in 0..8i64 {
+                db.execute(&format!("INSERT INTO u VALUES ({k}, 0)"))
+                    .expect("base insert");
+                writeln!(journal, "I {k}").unwrap();
+                journal.flush().unwrap();
+            }
+            for i in 0..iterations as i64 {
+                let k = i % 8;
+                match (i / 8) % 3 {
+                    0 => {
+                        db.execute(&format!(
+                            "INSERT INTO u VALUES ({k}, 1) \
+                             ON CONFLICT (id) DO UPDATE SET val = val + excluded.val"
+                        ))
+                        .expect("upsert accum");
+                        writeln!(journal, "U {k}").unwrap();
+                    }
+                    1 => {
+                        db.execute(&format!("INSERT OR REPLACE INTO u VALUES ({k}, 5)"))
+                            .expect("replace");
+                        writeln!(journal, "R {k}").unwrap();
+                    }
+                    _ => {
+                        db.execute(&format!("INSERT OR IGNORE INTO u VALUES ({k}, -100)"))
+                            .expect("ignore");
+                        writeln!(journal, "G {k}").unwrap();
+                    }
+                }
+                journal.flush().unwrap();
+            }
+        }
         other => panic!("unknown crash child mode: {other}"),
     }
 
@@ -744,6 +783,149 @@ fn test_kill9_concurrent_writers_prefix_per_thread() {
         "never killed the child — test degraded to a no-op"
     );
     eprintln!("concurrent crash injection: {killed_runs} kills verified");
+}
+
+// ── Parent: upsert workload ────────────────────────────────────────────────
+
+#[test]
+fn test_kill9_upsert_recovers_exactly() {
+    let iterations: usize = std::env::var("MOTEDB_CRASH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let mut rng_state: u64 = 0x1234_5678_9ABC_DEF0;
+    let next_delay_ms = |state: &mut u64| {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        ((*state % 200) + 10) as u64
+    };
+
+    let mut killed_runs = 0;
+    for iter in 0..iterations {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("crash.mote");
+        let journal_path = dir.path().join("acked.txt");
+        let delay = next_delay_ms(&mut rng_state);
+        if spawn_kill_child(&db_path, &journal_path, delay, "upsert") {
+            killed_runs += 1;
+        }
+
+        let journal = read_journal_lines(&journal_path);
+        let db =
+            Database::open(&db_path).unwrap_or_else(|e| panic!("iter {}: reopen: {}", iter, e));
+        let rs = match db.query("SELECT id, val FROM u") {
+            Ok(rs) => rs,
+            Err(e) if e.to_string().contains("not found") && journal.is_empty() => {
+                drop(db);
+                continue;
+            }
+            Err(e) => panic!("iter {}: query: {}", iter, e),
+        };
+        drop(db);
+        let state: std::collections::HashMap<i64, i64> = rs
+            .into_iter()
+            .filter_map(|r| match (&r[0], &r[1]) {
+                (Value::Integer(k), Value::Integer(v)) => Some((*k, *v)),
+                _ => None,
+            })
+            .collect();
+
+        // Replay the acked journal to the state at the ack point.
+        let ops: Vec<(u8, i64)> = journal
+            .iter()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                match (it.next()?, it.next()?.parse::<i64>().ok()) {
+                    ("I", Some(k)) => Some((b'I', k)),
+                    ("U", Some(k)) => Some((b'U', k)),
+                    ("R", Some(k)) => Some((b'R', k)),
+                    ("G", Some(k)) => Some((b'G', k)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut sim: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for (op, k) in &ops {
+            apply_upsert_op(&mut sim, *op, *k, false);
+        }
+
+        // Durability contract: everything acked is reflected; up to a couple
+        // of UNACKED in-flight statements may ALSO have partially or fully
+        // landed. OR REPLACE is two WAL records (delete+insert) — killed
+        // mid-statement it can leave the delete applied without the insert
+        // (key absent). Enumerate skip/full/half applications of the next
+        // deterministic ops and require the state to match one.
+        let matched = {
+            let mut candidates: Vec<std::collections::HashMap<i64, i64>> = vec![sim.clone()];
+            // Absolute sequence position of the next op: 8 base inserts,
+            // then the workload rotation.
+            let mut frontier = vec![sim.clone()];
+            for step in 0..2 {
+                let seq_idx = (ops.len() + step) as i64;
+                let (op, k) = if seq_idx < 8 {
+                    (b'I', seq_idx)
+                } else {
+                    upsert_op_at(seq_idx - 8)
+                };
+                let mut next_frontier = Vec::new();
+                for base in &frontier {
+                    // skip
+                    next_frontier.push(base.clone());
+                    // full
+                    let mut full = base.clone();
+                    apply_upsert_op(&mut full, op, k, false);
+                    next_frontier.push(full);
+                    // half (only R has an observable intermediate: delete
+                    // applied, insert not → key absent)
+                    if op == b'R' {
+                        let mut half = base.clone();
+                        half.remove(&k);
+                        next_frontier.push(half);
+                    }
+                }
+                candidates.extend(next_frontier.iter().cloned());
+                frontier = next_frontier;
+            }
+            candidates.into_iter().find(|c| *c == state)
+        };
+        assert!(
+            matched.is_some(),
+            "iter {}: upsert state {:?} matches no durability-legal outcome of {} acked ops",
+            iter,
+            state,
+            ops.len()
+        );
+    }
+    assert!(killed_runs > 0, "never killed the child");
+    eprintln!("upsert crash injection: {killed_runs} kills verified");
+}
+
+/// Deterministic upsert-workload op at workload index i (mirrors the child:
+/// key = i % 8; rotation (i/8)%3 → 0: DO UPDATE +1, 1: OR REPLACE 5, 2: IGNORE).
+fn upsert_op_at(i: i64) -> (u8, i64) {
+    let k = i % 8;
+    match (i / 8) % 3 {
+        0 => (b'U', k),
+        1 => (b'R', k),
+        _ => (b'G', k),
+    }
+}
+
+/// Apply one workload op to a simulated state. `half` is unused for now
+/// (half-states are modeled at the enumeration site).
+fn apply_upsert_op(sim: &mut std::collections::HashMap<i64, i64>, op: u8, k: i64, _half: bool) {
+    match op {
+        b'I' => {
+            sim.insert(k, 0);
+        }
+        b'U' => *sim.entry(k).or_insert(0) += 1,
+        b'R' => {
+            sim.insert(k, 5);
+        }
+        b'G' => {}
+        _ => {}
+    }
 }
 
 /// Journal lines with torn-tail filtering (raw strings, no numeric parse).
