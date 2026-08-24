@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### 可靠性第十二轮（磁盘损坏自愈 —— 2 个真 bug）
+
+- **修复：索引文件损坏 → 静默缺失/空结果（BUG #23）**。损坏的 column
+  index 文件让 loader 跳过该索引（查询永远 "not found"）；损坏/截断的
+  FTS postings 更阴险——btree 把小于 superblock 帧的文件当**空文件无错
+  加载**，词典完好、倒排为空，所有搜索静默返回 0。现两者都降级为
+  **自动重建**：registry 中有而加载失败的 column 索引先删损坏文件再
+  重建回填；FTS 按 postings 文件大小做合理性预检，可疑即硬重置重建。
+- **修复：纯查询 open 的 close 丢弃重建状态（BUG #24）**。`checkpoint_
+  impl` 在"零 pending 且 WAL 空"时提前返回、跳过 `flush_all_indexes`——
+  崩溃恢复/自愈重建产生的待刷索引数据被静默丢弃（重建结果活不过
+  第二次重开）。索引 flush 提前到早退判定之前。
+- **阴性验证**：catalog.bin 损坏 → 清晰的序列化错误（不 panic）；
+  双开互斥正确、句柄释放后可重开。
+- **新增 tests/test_corruption_recovery.rs**（4 测试）。
+
 ### 可靠性第十一轮（UPSERT 崩溃注入 + 缓存×schema 阴性验证）
 
 - **新增：崩溃注入第六模式（upsert）**——DO UPDATE 累积 / OR REPLACE /

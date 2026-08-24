@@ -380,6 +380,12 @@ impl MoteDB {
             self.finalize_columnar_buffer(&table_name);
         }
 
+        // 🔑 Flush indexes BEFORE the no-op early return below: an open that
+        // only REBUILT indexes (crash recovery / corruption self-heal) has
+        // pending posting lists but zero pending_updates and an empty WAL —
+        // the early return would silently discard the rebuilt state.
+        self.flush_all_indexes()?;
+
         let pending_before = self.pending_updates.load(Ordering::Acquire);
         if pending_before == 0 {
             let wal_dir = self.path.join("wal");
@@ -412,7 +418,7 @@ impl MoteDB {
             self.rebuild_timestamp_index()?;
         }
 
-        self.flush_all_indexes()?;
+        // (indexes were flushed at the top of checkpoint_impl)
 
         // Re-check: if the LSM has pending immutable memtables, skip WAL
         // truncation (that data is only in the active memtable, not yet in an

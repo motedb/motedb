@@ -210,6 +210,16 @@ impl IndexRegistry {
     }
 
     /// List all indexes for a table
+    /// All registered indexes of a given type (used by recovery to re-create
+    /// ones whose on-disk file failed to load).
+    pub fn list_by_type(&self, t: IndexType) -> Vec<String> {
+        self.indexes
+            .iter()
+            .filter(|e| e.value().index_type == t)
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     pub fn list_table_indexes(&self, table_name: &str) -> Vec<IndexMetadata> {
         self.indexes
             .iter()

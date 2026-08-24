@@ -236,6 +236,11 @@ struct AutoFlushThread {
     should_stop: Arc<AtomicBool>,
 }
 
+/// Corrupt-loaded text indexes from the last load_text_indexes call
+/// (name, table) — the open path backfills them from source data.
+static REBUILD_TEXT_EXTRA: std::sync::Mutex<Vec<(String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
 impl MoteDB {
     /// Create a new database
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -1597,6 +1602,58 @@ impl MoteDB {
                 .iter()
                 .map(|e| (e.key().clone(), Arc::clone(e.value())))
                 .collect();
+            // Registry column indexes that FAILED to load (corrupt/missing
+            // on-disk file → loader skipped them) are re-created empty and
+            // repopulated — corruption degrades to a rebuild, not a
+            // permanently missing index.
+            let registry_cols: Vec<String> = db
+                .index_registry
+                .list_by_type(crate::database::index_metadata::IndexType::Column)
+                .into_iter()
+                .filter(|n| !db.column_indexes.contains_key(n))
+                .collect();
+            for name in registry_cols {
+                if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
+                    let col_types = db
+                        .table_registry
+                        .get_table(&table)
+                        .map(|sc| sc.col_types().to_vec())
+                        .unwrap_or_default();
+                    // Remove the corrupt file first — create() would open
+                    // the same garbage superblock and fail identically.
+                    let _ = std::fs::remove_file(
+                        db.path.join("indexes").join(format!("column_{}.idx", name)),
+                    );
+                    match crate::index::column_value::ColumnValueIndex::create(
+                        db.path.join("indexes").join(format!("column_{}.idx", name)),
+                        table.clone(),
+                        column.clone(),
+                        crate::index::column_value::ColumnValueIndexConfig::default(),
+                    ) {
+                        Ok(idx) => {
+                            let arc = Arc::new(idx);
+                            if let Err(e) = db.populate_column_index(&arc, &table, &column) {
+                                warn_log!(
+                                    "[Recovery] ⚠️ column index '{}' rebuild failed: {:?}",
+                                    name,
+                                    e
+                                );
+                            }
+                            let standard = format!("{}.{}", table, column);
+                            if !db.column_indexes.contains_key(&standard) {
+                                db.column_indexes.insert(standard, arc.clone());
+                            }
+                            db.column_indexes.insert(name, arc);
+                        }
+                        Err(e) => warn_log!(
+                            "[Recovery] ⚠️ column index '{}' recreate failed: {:?}",
+                            name,
+                            e
+                        ),
+                    }
+                }
+            }
+
             for (name, arc) in col_idx {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
                     // Clean close flushed the index and the loader opened it
@@ -1617,20 +1674,32 @@ impl MoteDB {
             // Text indexes: backfill from the table's text column — ONLY
             // for tables with replayed rows (others were loaded current).
             let txt_idx: Vec<String> = db.text_indexes.iter().map(|e| e.key().clone()).collect();
+            let corrupt_loaded: Vec<String> = REBUILD_TEXT_EXTRA
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
             for name in txt_idx {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
-                    if !replayed_tables.contains(&table) {
+                    let corrupt = corrupt_loaded.iter().any(|n| n == &name);
+                    if !replayed_tables.contains(&table) && !corrupt {
                         continue;
                     }
                     if let Ok(schema) = db.table_registry.get_table(&table) {
                         if let Some(col_def) = schema.columns.iter().find(|c| c.name == column) {
                             let pos = col_def.position;
-                            if let Err(e) = db.build_text_index_from_columnar(&name, &table, pos) {
-                                warn_log!(
+                            match db.build_text_index_from_columnar(&name, &table, pos) {
+                                Ok(n) => {
+                                    if std::env::var_os("MOTEDB_CZDBG").is_some() {
+                                        eprintln!("[czdbg] rebuild {name} → {n} docs");
+                                    }
+                                }
+                                Err(e) => warn_log!(
                                     "[Recovery] ⚠️ text index '{}' rebuild failed: {:?}",
                                     name,
                                     e
-                                );
+                                ),
                             }
                         }
                     }
@@ -1929,6 +1998,9 @@ impl MoteDB {
         }
 
         // 🎯 从统一目录加载：{db}.mote/indexes/text_*/
+        // Corrupt-load victims collected here for rebuild-after-load.
+        let rebuild_text_extra: std::cell::RefCell<Vec<(String, String)>> =
+            std::cell::RefCell::new(Vec::new());
         let indexes_dir = db_path.join("indexes");
         if indexes_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&indexes_dir) {
@@ -1990,10 +2062,52 @@ impl MoteDB {
                                         index_name
                                     );
                                 }
-                            } else if let Ok(index) = TextFTSIndex::new(base_path) {
-                                indexes
-                                    .insert(index_name.to_string(), Arc::new(RwLock::new(index)));
-                                debug_log!("[MoteDB] Loaded text index: {}", index_name);
+                            } else {
+                                // 🔑 Both a hard load FAILURE and an
+                                // implausible postings file (smaller than a
+                                // superblock frame — the btree then loads as
+                                // EMPTY with no error and silently swallows
+                                // inserts into a garbage handle) take the same
+                                // path: hard reset + rebuild from source data.
+                                let postings = entry.path().join("postings.gbtree");
+                                let plausible = postings
+                                    .metadata()
+                                    .map(|m| m.len() >= 16) // [len:u32][bincode superblock…]
+                                    .unwrap_or(false);
+                                if plausible {
+                                    if let Ok(index) = TextFTSIndex::new(base_path.clone()) {
+                                        indexes.insert(
+                                            index_name.to_string(),
+                                            Arc::new(RwLock::new(index)),
+                                        );
+                                        debug_log!("[MoteDB] Loaded text index: {}", index_name);
+                                    }
+                                    continue;
+                                }
+                                // 🔑 Persisted postings failed to LOAD (corrupt
+                                // / missing file). Reset + rebuild from data —
+                                // corruption degrades to a rebuild, not a
+                                // silently missing index.
+                                let _ = std::fs::remove_dir_all(entry.path());
+                                let _ = std::fs::remove_dir_all(
+                                    base_path
+                                        .parent()
+                                        .unwrap()
+                                        .join(format!("text_{}.dict.d", index_name)),
+                                );
+                                if let Ok(index) = TextFTSIndex::new(base_path) {
+                                    indexes.insert(
+                                        index_name.to_string(),
+                                        Arc::new(RwLock::new(index)),
+                                    );
+                                    if let Some((t, _)) =
+                                        index_registry.resolve_index_name(index_name)
+                                    {
+                                        rebuild_text_extra
+                                            .borrow_mut()
+                                            .push((index_name.to_string(), t));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2001,6 +2115,7 @@ impl MoteDB {
             }
         }
 
+        *REBUILD_TEXT_EXTRA.lock().unwrap() = rebuild_text_extra.into_inner();
         Ok(indexes)
     }
 
