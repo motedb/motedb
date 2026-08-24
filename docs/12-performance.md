@@ -81,3 +81,27 @@ Key metrics:
 ---
 
 - Related docs: [05 Transaction Management](./05-transactions.md), [07~11 Index Topics](./07-column-index.md)
+
+
+## Durability vs. write throughput
+
+Write latency is dominated by fsync (measured 3.3ms on the reference SSD).
+Pick the shape that matches your durability needs:
+
+| Pattern | Measured | Durability |
+|---|---|---|
+| Single-row `INSERT` (default GroupCommit) | ~fsync latency/row (~3.3ms) | Durable on ack |
+| Multi-row `VALUES` (100 rows/stmt) | 45.9µs/row | Durable on ack |
+| Explicit transaction, N-row COMMIT | 309µs/row (50-row txns) | Durable on COMMIT |
+| `Periodic` durability | 1.1µs/row | Up to interval loss |
+| `NoSync` | fastest | No guarantee until flush |
+
+Notes:
+- Multi-row `VALUES` and transaction `COMMIT` batch all WAL records into a
+  single fsync — prefer them for bulk loads.
+- Autocommit writes are serialized by a database-level write lock (lost-update
+  protection); WAL group-commit batching engages for explicit transactions and
+  batch APIs.
+- `DurabilityLevel::periodic(ms)` trades bounded loss windows for ~3500×
+  single-row throughput — suitable for sensor telemetry where the source can
+  re-send.

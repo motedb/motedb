@@ -1282,6 +1282,9 @@ struct GroupCommitState {
     wakeup: PlCondvar,
     /// Maximum records per batch
     max_batch_size: usize,
+    /// Whether the last completed batch had multiple writers (adaptive
+    /// accrue). Lone-writer batches skip the accrue window entirely.
+    last_batch_concurrent: Arc<std::sync::atomic::AtomicBool>,
     /// Maximum wait time in microseconds before flushing
     max_wait_us: u64,
     /// Last flush error (set by flush thread, checked by callers)
@@ -1453,6 +1456,11 @@ impl WALManager {
                 max_batch_size,
                 max_wait_us,
                 last_error: parking_lot::Mutex::new(None),
+                // 🔑 Adaptive accrue: only wait the batching window when the
+                // previous batch actually had multiple writers. A lone writer
+                // blocks until its own insert completes — the accrue window
+                // can never batch anything and is pure latency.
+                last_batch_concurrent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
 
             let should_stop_clone = should_stop.clone();
@@ -1471,18 +1479,25 @@ impl WALManager {
                             }
                         }
 
-                        // Batch accumulation: wait briefly for more entries to grow
-                        // the batch. 🔑 PERF: cap this at a small fraction of
-                        // max_wait_us — the original code waited the FULL
-                        // max_wait_us (1ms) even when only one writer was active,
-                        // making every single-thread INSERT take ≥1ms (193 TPS).
-                        // A short spin-wait (max_wait_us / 10, min 50µs) catches
-                        // concurrent bursts without penalizing the lone-writer case.
+                        // Batch accumulation: wait a brief window for more
+                        // entries to join the batch. 🔑 ADAPTIVE WINDOW: after
+                        // a batch that had ≥2 writers the window is the full
+                        // accrue (max_wait_us/10, min 50µs) to keep batching
+                        // them; after lone-writer batches it shrinks to 25µs —
+                        // enough for a concurrent push (µs-scale) to join if
+                        // one exists, near-zero latency cost when alone.
+                        // (Skipping the window entirely starved batching:
+                        // batch-of-1 → flag false → skip → batch-of-1 forever.)
                         {
+                            let was_concurrent =
+                                state_clone.last_batch_concurrent.load(Ordering::Relaxed);
+                            let accrue = if was_concurrent {
+                                Duration::from_micros((state_clone.max_wait_us / 10).max(50))
+                            } else {
+                                Duration::from_micros(25)
+                            };
                             let mut queue = state_clone.queue.lock();
                             if !queue.is_empty() && queue.len() < state_clone.max_batch_size {
-                                let accrue =
-                                    Duration::from_micros((state_clone.max_wait_us / 10).max(50));
                                 let _ = state_clone.wakeup.wait_for(&mut queue, accrue);
                             }
                         }
@@ -1497,6 +1512,11 @@ impl WALManager {
                         if entries.is_empty() {
                             continue;
                         }
+
+                        // Track concurrency for the adaptive accrue window.
+                        state_clone
+                            .last_batch_concurrent
+                            .store(entries.len() > 1, Ordering::Relaxed);
 
                         // Group by partition
                         let mut groups: HashMap<PartitionId, Vec<WALRecord>> = HashMap::new();
