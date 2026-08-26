@@ -59,6 +59,14 @@ pub struct MoteDB {
     /// are not affected (still concurrent).
     pub(crate) write_lock: Arc<parking_lot::Mutex<()>>,
 
+    /// 🚀 Per-table-striped autocommit write locks. Same-table autocommit
+    /// writes still serialize (RMW/PK-uniqueness semantics unchanged);
+    /// writes to DIFFERENT tables proceed in parallel so WAL group-commit
+    /// can actually batch concurrent writers. `backup_to` takes all stripes
+    /// + write_lock (big-lock equivalence); statements whose table can't be
+    /// extracted cheaply fall back to the global write_lock.
+    pub(crate) autocommit_locks: Arc<Vec<Arc<parking_lot::Mutex<()>>>>,
+
     /// 🚀 Phase 4: Per-table AUTO_INCREMENT counters
     /// Format: table_name → next_id
     /// 🚀 Optimized: DashMap for lock-free reads after first insert per table.
@@ -241,7 +249,101 @@ struct AutoFlushThread {
 static REBUILD_TEXT_EXTRA: std::sync::Mutex<Vec<(String, String)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Guard held while an autocommit write executes.
+pub(crate) enum AutocommitWriteGuard<'a> {
+    Stripe(parking_lot::MutexGuard<'a, ()>),
+    Global(parking_lot::MutexGuard<'a, ()>),
+}
+
+/// FNV-1a over a plain identifier — stripe index for autocommit writes.
+fn table_stripe(table: &str, stripes: usize) -> usize {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in table.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % stripes as u64) as usize
+}
+
+/// Extract the target table of an autocommit INSERT/UPDATE/DELETE for stripe
+/// locking. Deliberately conservative: plain ASCII identifiers only, no
+/// comments/parens/quirks — anything unusual returns None and the caller
+/// falls back to the global write_lock (same serialization as before, never
+/// less). The table names produced here only pick a LOCK; a mismatch can
+/// cost concurrency but never correctness.
+pub(crate) fn autocommit_write_stripe(sql: &str, stripes: usize) -> Option<usize> {
+    let b = sql.as_bytes();
+    if b.len() < 7 {
+        return None;
+    }
+    let kw_ins = b[..6].eq_ignore_ascii_case(b"INSERT");
+    let kw_upd = !kw_ins && b[..6].eq_ignore_ascii_case(b"UPDATE");
+    let kw_del = !kw_ins && !kw_upd && b[..6].eq_ignore_ascii_case(b"DELETE");
+    if !kw_ins && !kw_upd && !kw_del {
+        return None;
+    }
+
+    let mut rest = &sql[6..];
+
+    // INSERT [OR REPLACE | OR IGNORE] INTO <table>
+    if kw_ins {
+        rest = rest.trim_start();
+        for or_kw in ["OR REPLACE", "OR IGNORE"] {
+            let k = or_kw.len();
+            let rb = rest.as_bytes();
+            if rb.len() > k && rb[..k].eq_ignore_ascii_case(or_kw.as_bytes()) {
+                rest = &rest[k..];
+                rest = rest.trim_start();
+                break;
+            }
+        }
+        let rb = rest.as_bytes();
+        if rb.len() <= 4 || !rb[..4].eq_ignore_ascii_case(b"INTO") {
+            return None;
+        }
+        rest = &rest[4..].trim_start();
+    } else {
+        // UPDATE <table> | DELETE FROM <table>
+        rest = rest.trim_start();
+        if kw_del {
+            let rb = rest.as_bytes();
+            if rb.len() <= 4 || !rb[..4].eq_ignore_ascii_case(b"FROM") {
+                return None;
+            }
+            rest = &rest[4..].trim_start();
+        }
+    }
+
+    // Plain identifier: [A-Za-z_][A-Za-z0-9_]*
+    let rb = rest.as_bytes();
+    if rb.is_empty() || !(rb[0].is_ascii_alphabetic() || rb[0] == b'_') {
+        return None;
+    }
+    let mut end = 1;
+    while end < rb.len() && (rb[end].is_ascii_alphanumeric() || rb[end] == b'_') {
+        end += 1;
+    }
+    let table = &rest[..end];
+    if table.len() == rest.len() {
+        // No terminator — malformed tail; be conservative
+        return None;
+    }
+    Some(table_stripe(table, stripes))
+}
+
 impl MoteDB {
+    /// Acquire the autocommit write lock for a statement: striped by table
+    /// when the table is extractable, global otherwise.
+    pub(crate) fn lock_autocommit_write<'a>(
+        &'a self,
+        sql_trimmed: &str,
+    ) -> AutocommitWriteGuard<'a> {
+        match autocommit_write_stripe(sql_trimmed, self.autocommit_locks.len()) {
+            Some(idx) => AutocommitWriteGuard::Stripe(self.autocommit_locks[idx].lock()),
+            None => AutocommitWriteGuard::Global(self.write_lock.lock()),
+        }
+    }
+
     /// Create a new database
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         Self::create_with_config(path, DBConfig::default())
@@ -396,6 +498,11 @@ impl MoteDB {
             next_row_id: next_row_id.clone(),
             write_lsn: write_lsn.clone(),
             write_lock: Arc::new(parking_lot::Mutex::new(())),
+            autocommit_locks: Arc::new(
+                (0..32)
+                    .map(|_| Arc::new(parking_lot::Mutex::new(())))
+                    .collect(),
+            ),
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,
@@ -667,6 +774,7 @@ impl MoteDB {
             next_row_id: self.next_row_id.clone(),
             write_lsn: self.write_lsn.clone(),
             write_lock: self.write_lock.clone(),
+            autocommit_locks: self.autocommit_locks.clone(),
             table_auto_increment: self.table_auto_increment.clone(), // 🚀 Phase 4
             num_partitions: self.num_partitions,
             txn_coordinator: self.txn_coordinator.clone(),
@@ -1276,6 +1384,11 @@ impl MoteDB {
             next_row_id,
             write_lsn,
             write_lock: Arc::new(parking_lot::Mutex::new(())),
+            autocommit_locks: Arc::new(
+                (0..32)
+                    .map(|_| Arc::new(parking_lot::Mutex::new(())))
+                    .collect(),
+            ),
             table_auto_increment: Arc::new(DashMap::new()),
             num_partitions,
             txn_coordinator,

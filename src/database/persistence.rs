@@ -105,6 +105,22 @@ impl MoteDB {
             .lock()
             .map_err(|_| StorageError::Lock("Checkpoint mutex poisoned".into()))?;
 
+        // 🔑 Block autocommit writes FIRST (all stripes + global): records
+        // acked in the window between flush_impl and checkpoint_all's
+        // per-partition truncation lived only in volatile ColSegmentStore
+        // write buffers (flush_impl had already passed them by) — their WAL
+        // bytes got truncated with nothing durable left, and the snapshot
+        // silently dropped them (BUG #35). With the barrier up front no
+        // autocommit write can race the flush/truncate sequence. Writers
+        // hold ONE stripe (per table) or the global write_lock (unparsed
+        // fallback), so take ALL stripes in ascending order plus the global
+        // lock — big-lock equivalence. Lock order checkpoint_mutex →
+        // stripes → write_lock; writers take a single stripe and nothing
+        // else, so no cycle.
+        let mut _stripe_guards: Vec<parking_lot::MutexGuard<'_, ()>> =
+            self.autocommit_locks.iter().map(|s| s.lock()).collect();
+        let _write_guard = self.write_lock.lock();
+
         // Drain all in-memory write buffers to disk BEFORE copying, then
         // truncate the WAL: everything it still holds is now flushed into
         // segments and would otherwise be REPLAYED ON TOP of the flushed
@@ -113,12 +129,6 @@ impl MoteDB {
             self.wal.checkpoint_all()?;
             Ok(())
         });
-
-        // Block autocommit writes (api::execute takes write_lock for
-        // INSERT/UPDATE/DELETE) so no new WAL/segment bytes appear while the
-        // directory is being copied. Lock order checkpoint_mutex → write_lock
-        // matches flush_impl's (and nothing takes them in reverse).
-        let _write_guard = self.write_lock.lock();
 
         let result = match flush_result {
             Ok(()) => Self::copy_dir_durable(&self.path, &dest),

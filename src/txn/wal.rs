@@ -1275,6 +1275,45 @@ struct GroupCommitEntry {
     done: Arc<(PlMutex<Option<std::result::Result<(), String>>>, PlCondvar)>,
 }
 
+/// Flush a batch's partition groups — in PARALLEL when it spans multiple
+/// partitions (each partition has its own file and mutex). Single-group
+/// batches avoid the thread spawn entirely.
+fn flush_partition_groups(
+    groups: HashMap<PartitionId, Vec<WALRecord>>,
+    partitions: &Arc<DashMap<PartitionId, parking_lot::Mutex<PartitionWAL>>>,
+) -> std::result::Result<(), String> {
+    if groups.len() <= 1 {
+        for (partition, records) in groups {
+            if let Some(entry) = partitions.get(&partition) {
+                let mut wal = entry.value().lock();
+                wal.batch_append(records).map_err(|e| e.to_string())?;
+            }
+        }
+        return Ok(());
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = groups
+            .into_iter()
+            .map(|(partition, records)| {
+                scope.spawn(move || match partitions.get(&partition) {
+                    Some(entry) => entry
+                        .value()
+                        .lock()
+                        .batch_append(records)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    None => Ok(()),
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .unwrap_or_else(|_| Err("group-commit flush thread panicked".to_string()))?;
+        }
+        Ok(())
+    })
+}
+
 struct GroupCommitState {
     /// Queue of pending records
     queue: PlMutex<Vec<GroupCommitEntry>>,
@@ -1532,16 +1571,12 @@ impl WALManager {
                             done_signals.push(entry.done);
                         }
 
-                        // Flush each partition group
-                        let flush_ok = (|| -> std::result::Result<(), String> {
-                            for (partition, records) in groups {
-                                if let Some(entry) = partitions.get(&partition) {
-                                    let mut wal = entry.value().lock();
-                                    wal.batch_append(records).map_err(|e| e.to_string())?;
-                                }
-                            }
-                            Ok(())
-                        })();
+                        // Flush each partition group. 🔑 多分区并行 fsync：
+                        // 单 flusher 串行 fsync 是吞吐天花板（4 写者落 4 分区
+                        // = 每批 4 次串行 fsync ≈ 无批量化收益）；不同分区是
+                        // 不同文件+不同锁，天然可并行。单分区走原路径（免线程
+                        // 开销）。
+                        let flush_ok = flush_partition_groups(groups, &partitions);
 
                         // Signal all callers with the result
                         for done in done_signals {
@@ -1579,15 +1614,7 @@ impl WALManager {
                             done_signals.push(entry.done);
                         }
 
-                        let drain_ok = (|| -> std::result::Result<(), String> {
-                            for (partition, records) in groups {
-                                if let Some(entry) = partitions.get(&partition) {
-                                    let mut wal = entry.value().lock();
-                                    wal.batch_append(records).map_err(|e| e.to_string())?;
-                                }
-                            }
-                            Ok(())
-                        })();
+                        let drain_ok = flush_partition_groups(groups, &partitions);
 
                         for done in done_signals {
                             {

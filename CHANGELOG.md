@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### 性能/可靠性第十六轮（并发写吞吐 1.9× + 备份快照丢行）
+
+- **优化：autocommit 写锁按表条带化 + WAL 批内分区并行 fsync —— 4 线程
+  并发写 284→547 ops/s（1.9×），单线程延迟不变。** api 层原来对每条
+  autocommit INSERT/UPDATE/DELETE 持**全局**写锁：所有并发 autocommit 写
+  完全串行化（实测 4 线程并发写入零收益），WAL group-commit 的攒批永远
+  无法形成。现在：写者按表名哈希持单条带锁（同表仍串行，v=v+1 丢失更新
+  防护与主键查重语义不变；表名提取只认简单 ASCII 标识符，非常规语句退
+  回全局锁——锁选错只影响并发度，绝不影响正确性）；group-commit flusher
+  对批内多分区改为**并行 fsync**（各分区独立文件+锁；单分区免线程开销）。
+  backup_to 取全部条带+全局锁保持大锁语义（锁序 checkpoint_mutex →
+  stripes → global，无环）。
+- **修复：backup 快照丢失窗口期内 ack 的写入（BUG #35，预存在，被本轮
+  新增的并发备份测试逼出）。** 原顺序 flush_impl → checkpoint_all →
+  拿写锁：在 flush 之后、WAL 截断之前 ack 的记录只存在于易失的
+  ColSegmentStore 写缓冲（flush 已跑过），其 WAL 字节被按分区截断后
+  无任何持久副本——快照静默缺行（实测 live=300 而快照缺 0,1 却有
+  2,3）。写屏障提前到 flush 之前，杜绝该窗口。
+- **新增 tests/test_write_concurrency.rs**（3 测试）：并发 v=v+1 精确
+  无丢失更新、同表并发主键冲突压力（接受数 == 存储数且无重复主键）、
+  并发写期间备份快照一致性（前缀完整性逐行校验）。
+- 新增 examples/bench_autocommit_lock.rs（串行化度量基准）。
+
 ### 可靠性第十五轮（主键改值全链路 —— 2 个真 bug）
 
 - **修复：UPDATE 改主键后 row_cache 留下"幽灵"条目（BUG #33）**。PK 改值

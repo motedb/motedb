@@ -518,7 +518,10 @@ impl Database {
                     | Some(b"delete")
             );
         let _write_guard = if is_autocommit_write {
-            Some(self.inner.write_lock.lock())
+            // 🚀 条带化：同表串行（RMW/PK 语义不变），跨表并行 —— 全局锁
+            // 曾把所有并发 autocommit 写完全串行化，GroupCommit 的攒批
+            // 永远无法形成（实测 4 线程并发写入零收益）。
+            Some(self.inner.lock_autocommit_write(trimmed))
         } else {
             None
         };
