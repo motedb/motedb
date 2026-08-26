@@ -589,7 +589,11 @@ fn test_kill9_txn_atomicity_and_prefix() {
         // Durability: every acked COMMIT is fully present.
         for line in &journal {
             if let Some(j) = line.strip_prefix("T ") {
-                let j: i64 = j.parse().unwrap();
+                // Torn marker (kill mid-write) = the ack never completed →
+                // the txn is in-flight, both 0 and 5 rows are legal. Skip.
+                let Ok(j) = j.trim().parse::<i64>() else {
+                    continue;
+                };
                 assert_eq!(
                     counts.get(&j).copied().unwrap_or(0),
                     5,
