@@ -207,6 +207,11 @@ pub struct DiskANNIndex {
     /// SSD optimization state
     last_reorder_size: Arc<RwLock<usize>>,
     total_inserts_since_reorder: Arc<RwLock<usize>>,
+
+    /// Vector UPDATEs since the last graph rebuild. Incremental re-linking
+    /// preserves consistency but the topology decays as vectors move — past
+    /// ~25% churn the recall loss dominates and a rebuild pays for itself.
+    updates_since_rebuild: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DiskANNIndex {
@@ -257,6 +262,7 @@ impl DiskANNIndex {
             cached_stats: Arc::new(RwLock::new(None)),
             last_reorder_size: Arc::new(RwLock::new(0)),
             total_inserts_since_reorder: Arc::new(RwLock::new(0)),
+            updates_since_rebuild: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -322,6 +328,7 @@ impl DiskANNIndex {
             cached_stats: Arc::new(RwLock::new(None)),
             last_reorder_size: Arc::new(RwLock::new(initial_size)),
             total_inserts_since_reorder: Arc::new(RwLock::new(0)),
+            updates_since_rebuild: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -539,10 +546,7 @@ impl DiskANNIndex {
         }
 
         // 🚀 分批渐进式构建
-        use dashmap::DashMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let ef_construction = 400;
 
         // 预排序：按距离medoid排序（保证核心区域高质量）
         let medoid_vec = match self.vectors.get(medoid_id) {
@@ -583,38 +587,16 @@ impl DiskANNIndex {
             }
 
             let progress = AtomicUsize::new(0);
-            let temp_graph: DashMap<RowId, Vec<RowId>> = DashMap::new();
 
-            // 添加本批节点
-            for &id in batch {
-                self.graph.add_node(id);
-            }
-
-            // Sequential graph construction (avoids Rayon/parking_lot deadlock)
-            // Parallelism is counterproductive here due to DiskGraph lock contention.
-            if show_progress {
-                debug_log!("[DiskANN] Phase 1: Building batch nodes (sequential)...");
-            }
-
+            // 🔑 逐节点双向连边（经典增量图构建语义）：
+            // greedy_search 全部从 medoid 出发 —— 若前向边延迟落图、或反向边
+            // 延迟到块/批末（旧实现两者都做），搜索期间 medoid 没有任何出边，
+            // 每个节点只会连向 medoid：图退化为星形，通用数据上召回率坍缩
+            // 到接近随机（实测 avg_degree=1.0、recall≈7%，聚簇数据掩盖了它）。
+            // incremental_insert_into_graph 在每个节点落前向边后立即维护其
+            // 邻居的反向边，保证后续搜索能经由 medoid 的入边抵达已建节点。
             for &id in batch.iter() {
-                let query_vec = match self.vectors.get(id) {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let candidates = self.greedy_search(&query_vec, medoid_id, ef_construction)?;
-
-                let neighbors = robust_prune(
-                    candidates,
-                    self.config.max_degree,
-                    self.config.alpha,
-                    |a, b| match (self.vectors.get(a), self.vectors.get(b)) {
-                        (Some(vec_a), Some(vec_b)) => self.metric.distance(&vec_a, &vec_b),
-                        _ => f32::MAX,
-                    },
-                );
-
-                temp_graph.insert(id, neighbors);
+                self.incremental_insert_into_graph(id, medoid_id)?;
 
                 if show_progress {
                     let p = progress.fetch_add(1, Ordering::Relaxed);
@@ -622,81 +604,6 @@ impl DiskANNIndex {
                         debug_log!("  Progress: {}/{}", p, batch.len());
                     }
                 }
-            }
-
-            // Phase 2: 写入前向边
-            if show_progress {
-                debug_log!("[DiskANN] Phase 2: Writing forward edges...");
-            }
-
-            for entry in temp_graph.iter() {
-                self.graph
-                    .set_neighbors(*entry.key(), entry.value().clone())?;
-            }
-
-            // Phase 3: 收集并更新反向边
-            if show_progress {
-                debug_log!("[DiskANN] Phase 3: Updating reverse edges...");
-            }
-
-            let reverse_edges: DashMap<RowId, Vec<RowId>> = DashMap::new();
-
-            for entry in temp_graph.iter() {
-                let id = *entry.key();
-                let neighbors = entry.value();
-
-                for &neighbor_id in neighbors {
-                    reverse_edges.entry(neighbor_id).or_default().push(id);
-                }
-            }
-
-            let slack_factor = 1.3;
-            let soft_limit = (self.config.max_degree as f32 * slack_factor) as usize;
-
-            for entry in reverse_edges.iter() {
-                let node_id = *entry.key();
-                let incoming = entry.value();
-                let neighbors_arc = self.graph.neighbors(node_id);
-                let mut neighbors = (*neighbors_arc).clone();
-
-                for &incoming_id in incoming {
-                    if neighbors.contains(&incoming_id) {
-                        continue;
-                    }
-
-                    neighbors.push(incoming_id);
-
-                    if neighbors.len() > soft_limit {
-                        let node_vec = match self.vectors.get(node_id) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-
-                        let candidates: Vec<Candidate> = neighbors
-                            .iter()
-                            .filter_map(|&nid| {
-                                let vec = self.vectors.get(nid)?;
-                                let dist = self.metric.distance(&node_vec, &vec);
-                                Some(Candidate {
-                                    id: nid,
-                                    distance: dist,
-                                })
-                            })
-                            .collect();
-
-                        neighbors = robust_prune(
-                            candidates,
-                            self.config.max_degree,
-                            self.config.alpha,
-                            |a, b| match (self.vectors.get(a), self.vectors.get(b)) {
-                                (Some(vec_a), Some(vec_b)) => self.metric.distance(&vec_a, &vec_b),
-                                _ => f32::MAX,
-                            },
-                        );
-                    }
-                }
-
-                self.graph.set_neighbors(node_id, neighbors)?;
             }
         } // End of batch loop
 
@@ -712,9 +619,39 @@ impl DiskANNIndex {
             if let Some(medoid_id) = *self.medoid.read() {
                 self.incremental_update_node(row_id, medoid_id)?;
             }
+
+            // 🔧 更新流失衡 → 召回率衰减：增量重连只保证一致性，向量大
+            // 规模迁移后图拓扑与新位置失配（实测 50% 数据重写后 recall
+            // 掉到 ~0）。超过 ~12.5% 节点被更新后自动重建图（重建 10K 节点 ≈1s，摊销可控）。
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let churn = self
+                .updates_since_rebuild
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1;
+            let len = self.len();
+            if len >= 100 && churn > len / 8 {
+                self.rebuild_graph()?;
+                self.updates_since_rebuild.store(0, AtomicOrdering::Relaxed);
+            }
         }
 
         Ok(existed)
+    }
+
+    /// 全量重建图（向量数据不动，仅图结构）—— 大规模向量更新后的召回率恢复
+    fn rebuild_graph(&self) -> Result<()> {
+        let ids = self.vectors.ids();
+        if ids.is_empty() {
+            self.graph.clear();
+            *self.medoid.write() = None;
+            return Ok(());
+        }
+
+        let medoid_id = self.select_medoid(&ids);
+        *self.medoid.write() = Some(medoid_id);
+        self.graph.clear();
+        self.batch_build_graph(&ids)?;
+        Ok(())
     }
 
     /// Delete vector
@@ -730,8 +667,14 @@ impl DiskANNIndex {
                 // ✅ P1: Arc auto-derefs
                 let neighbor_edges_arc = self.graph.neighbors(*neighbor);
                 let mut neighbor_edges = (*neighbor_edges_arc).clone(); // ✅ P1: Clone for modification
+                let before = neighbor_edges.len();
                 neighbor_edges.retain(|&id| id != row_id);
-                self.graph.set_neighbors(*neighbor, neighbor_edges)?;
+                // 🔑 keepAtLeastOneLink：被删节点是某邻居的最后一条边时保留
+                // 它（悬挂引用，search 以 f32::MAX 距离跳过），避免邻居变成
+                // 0 度孤点。
+                if !(neighbor_edges.is_empty() && before > 0) {
+                    self.graph.set_neighbors(*neighbor, neighbor_edges)?;
+                }
             }
 
             // If deleted node was the medoid, pick a new one
@@ -781,6 +724,10 @@ impl DiskANNIndex {
         let is_l2 = self.metric == DistanceKind::Euclidean;
         let mut results: Vec<(RowId, f32)> = candidates
             .into_iter()
+            // Dangling references to deleted vectors resolve to f32::MAX in
+            // greedy_search — with k larger than the reachable live set they
+            // used to leak into the result list as ghost rows.
+            .filter(|c| c.distance < f32::MAX)
             .take(k)
             .map(|c| {
                 let dist = if is_l2 { c.distance.sqrt() } else { c.distance };
@@ -1129,8 +1076,13 @@ impl DiskANNIndex {
             },
         );
 
-        // 3. 设置前向边
-        self.graph.set_neighbors(new_id, neighbors.clone())?;
+        // 3. 设置前向边（自环-only 列表会被剥成空，连回 medoid 兜底）
+        let forward: Vec<RowId> = if neighbors.iter().all(|&n| n == new_id) {
+            vec![medoid_id]
+        } else {
+            neighbors.clone()
+        };
+        self.graph.set_neighbors(new_id, forward)?;
 
         // 4. 🚀 局部更新反向边（只更新邻居节点）
         let slack_factor = 1.3;
@@ -1145,7 +1097,12 @@ impl DiskANNIndex {
                 continue;
             }
 
-            neighbor_edges.push(new_id);
+            // 🔑 空/自环-only 列表：push 后会被自环过滤剥掉，直接给出边
+            if neighbor_edges.is_empty() {
+                neighbor_edges = vec![new_id];
+            } else {
+                neighbor_edges.push(new_id);
+            }
 
             // 🚀 Slack-based pruning：只在必要时剪枝
             if neighbor_edges.len() > soft_limit {
@@ -1217,8 +1174,14 @@ impl DiskANNIndex {
 
         let new_neighbors_set: HashSet<RowId> = new_neighbors.iter().copied().collect();
 
-        // 4. 更新前向边
-        self.graph.set_neighbors(node_id, new_neighbors.clone())?;
+        // 4. 更新前向边。搜索只找到自己（图已失配/被抽真空）时连回
+        // medoid 作为生命线，set_neighbors 会剥掉自环导致 0 度孤点。
+        let forward: Vec<RowId> = if new_neighbors.iter().all(|&n| n == node_id) {
+            vec![medoid_id]
+        } else {
+            new_neighbors.clone()
+        };
+        self.graph.set_neighbors(node_id, forward)?;
 
         // 5. 🚀 增量更新反向边（只更新diff部分）
         // 5a. 移除不再需要的反向边
@@ -1226,8 +1189,14 @@ impl DiskANNIndex {
             if !new_neighbors_set.contains(&old_neighbor) {
                 let edges_arc = self.graph.neighbors(old_neighbor);
                 let mut edges = (*edges_arc).clone(); // ✅ P1: Clone for modification
+                let before = edges.len();
                 edges.retain(|&id| id != node_id);
-                self.graph.set_neighbors(old_neighbor, edges)?;
+                // 🔑 不允许把邻居抽成 0 度孤点：0 出边节点无法再被贪心搜索
+                // 遍历到（实测更新风暴后 1/3 节点被搁浅，recall 掉到 ~0）。
+                // 宁可保留一条指向旧位置的边（keepAtLeastOneLink）。
+                if !(edges.is_empty() && before > 0) {
+                    self.graph.set_neighbors(old_neighbor, edges)?;
+                }
             }
         }
 
@@ -1278,6 +1247,11 @@ impl DiskANNIndex {
                 );
             }
 
+            // 🔑 邻居已被抽成 0 度：push 出的 [node_id] 会被 set_neighbors
+            // 的自环过滤剥掉，永远空转。直接以 node_id 作为其唯一出边复活。
+            if neighbor_edges.is_empty() {
+                neighbor_edges = vec![node_id];
+            }
             self.graph.set_neighbors(new_neighbor, neighbor_edges)?;
         }
 

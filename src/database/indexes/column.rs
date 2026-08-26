@@ -47,7 +47,7 @@ impl MoteDB {
             .insert(index_name.to_string(), index_arc.clone());
 
         // Populate from existing data
-        self.populate_column_index(&index_arc, table_name, column_name);
+        let _ = self.populate_column_index(&index_arc, table_name, column_name);
 
         Ok(())
     }

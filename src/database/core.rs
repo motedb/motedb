@@ -1614,11 +1614,6 @@ impl MoteDB {
                 .collect();
             for name in registry_cols {
                 if let Some((table, column)) = db.index_registry.resolve_index_name(&name) {
-                    let col_types = db
-                        .table_registry
-                        .get_table(&table)
-                        .map(|sc| sc.col_types().to_vec())
-                        .unwrap_or_default();
                     // Remove the corrupt file first — create() would open
                     // the same garbage superblock and fail identically.
                     let _ = std::fs::remove_file(

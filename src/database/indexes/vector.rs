@@ -172,7 +172,16 @@ impl MoteDB {
             StorageError::Index(format!("Vector index '{}' not found", index_name))
         })?;
 
-        index_ref.value().write().insert(row_id, vector.to_vec())?;
+        // update() rewrites the fixed-size entry (and incrementally repairs
+        // the node's graph edges); insert() only covers ids the index has
+        // never seen. Calling insert() alone made updates of existing rows
+        // fail with "already exists".
+        {
+            let guard = index_ref.value().write();
+            if !guard.update(row_id, vector.to_vec())? {
+                guard.insert(row_id, vector.to_vec())?;
+            }
+        }
         Ok(())
     }
 

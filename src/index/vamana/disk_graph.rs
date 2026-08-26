@@ -20,6 +20,12 @@ const MAGIC: u32 = 0x4752_5048; // "GRPH"
 const VERSION: u32 = 1;
 const HEADER_SIZE: u64 = 16;
 
+/// Sidecar header: [count: u64][flushed_upto: u64][entries...]
+/// `flushed_upto` = graph.bin length at the last flush; the loader trusts the
+/// sidecar only while the file hasn't grown past it. Old-format sidecars
+/// (8-byte header) are detected by size and force a one-time rebuild.
+const SIDECAR_HEADER_SIZE: u64 = 16;
+
 /// Disk-based graph with bounded memory
 pub struct DiskGraph {
     max_degree: usize,
@@ -56,6 +62,11 @@ pub struct DiskGraph {
     /// Serializes flush with set_neighbors to prevent stale node_count
     /// in sidecar index (flush acquires exclusively, set_neighbors shared)
     flush_lock: Arc<Mutex<()>>,
+
+    /// Nodes deleted since the last flush. graph.bin is append-only, so the
+    /// deleted node's record (and its sidecar entry) physically remain until
+    /// the next flush filters them out.
+    tombstones: Arc<Mutex<HashSet<RowId>>>,
 
     file_path: PathBuf,
 }
@@ -122,6 +133,7 @@ impl DiskGraph {
             next_offset: Arc::new(Mutex::new(HEADER_SIZE)),
             dirty: Arc::new(RwLock::new(false)),
             flush_lock: Arc::new(Mutex::new(())),
+            tombstones: Arc::new(Mutex::new(HashSet::new())),
             file_path,
         })
     }
@@ -147,37 +159,50 @@ impl DiskGraph {
             .open(&file_path)
             .map_err(StorageError::Io)?;
 
-        let (max_degree, node_count) = Self::read_header(&mut file)?;
+        let (max_degree, _node_count) = Self::read_header(&mut file)?;
+        let graph_len = file.metadata().map_err(StorageError::Io)?.len();
 
-        // Build sidecar index if needed
+        // Full scan of every record in the file: the file is an append-only
+        // log (updates append a newer record for the same node), so the true
+        // append point is EOF, not "after the first `count` records" — that
+        // stale assumption made post-reload set_neighbors overwrite live
+        // records mid-file.
+        let (scan_eof, truncated) = Self::scan_eof(&mut file)?;
+        let next_off = if truncated {
+            // Torn trailing record (crash mid-append): drop it so later
+            // appends and future scans stay well-formed.
+            file.set_len(scan_eof).map_err(StorageError::Io)?;
+            scan_eof
+        } else {
+            graph_len.min(scan_eof)
+        };
+        let effective_len = next_off;
+
+        // Sidecar: trust it only in the new format AND only while graph.bin
+        // hasn't grown past the flush marker. Otherwise rebuild with
+        // last-wins semantics (tombstones are unknown on this path — this is
+        // the crash-recovery path; the DB layer rebuilds the whole index for
+        // tables with replayed WAL records).
         let index_count = if idx_path.exists() {
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
             let mut buf = [0u8; 8];
             idx.read_exact(&mut buf).map_err(StorageError::Io)?;
-            u64::from_le_bytes(buf)
+            let sidecar_count = u64::from_le_bytes(buf);
+            let idx_len = idx.metadata().map(|m| m.len()).unwrap_or(0);
+            let new_format = idx_len == SIDECAR_HEADER_SIZE + sidecar_count * 16;
+            let trusted = if new_format {
+                let mut marker = [0u8; 8];
+                idx.read_exact(&mut marker).is_ok() && u64::from_le_bytes(marker) == effective_len
+            } else {
+                false
+            };
+            if trusted {
+                sidecar_count
+            } else {
+                Self::build_sidecar_index(&file_path, &idx_path, None)?
+            }
         } else {
-            Self::build_sidecar_index(&file_path, &idx_path, node_count)?;
-            // Reopen file after building
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&file_path)
-                .map_err(StorageError::Io)?;
-            // Recalculate next_offset by scanning
-            let (_, _next_off) = Self::scan_for_next_offset(&mut file, node_count)?;
-            // We return count, next_offset is derived later
-            node_count as u64
-        };
-
-        // Derive next_offset
-        let next_off = {
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&file_path)
-                .map_err(StorageError::Io)?;
-            let (_, off) = Self::scan_for_next_offset(&mut file, node_count)?;
-            off
+            Self::build_sidecar_index(&file_path, &idx_path, None)?
         };
 
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
@@ -214,19 +239,24 @@ impl DiskGraph {
             next_offset: Arc::new(Mutex::new(next_off)),
             dirty: Arc::new(RwLock::new(false)),
             flush_lock: Arc::new(Mutex::new(())),
+            tombstones: Arc::new(Mutex::new(HashSet::new())),
             file_path,
         })
     }
 
-    fn scan_for_next_offset(file: &mut File, node_count: usize) -> Result<(usize, u64)> {
+    /// Walk every record in graph.bin from the header to the first parse
+    /// failure. Returns (offset after the last well-formed record, torn?).
+    /// `torn == true` means the file contains bytes past `eof` (a partially
+    /// written record).
+    fn scan_eof(file: &mut File) -> Result<(u64, bool)> {
+        let file_len = file.metadata().map_err(StorageError::Io)?.len();
         file.seek(SeekFrom::Start(HEADER_SIZE))
             .map_err(StorageError::Io)?;
         let mut offset = HEADER_SIZE;
-        let mut actual_count = 0usize;
         let mut buf8 = [0u8; 8];
         let mut buf4 = [0u8; 4];
 
-        for _ in 0..node_count {
+        loop {
             if file.read_exact(&mut buf8).is_err() {
                 break;
             }
@@ -235,54 +265,91 @@ impl DiskGraph {
             }
             let ncount = u32::from_le_bytes(buf4) as usize;
             let record_size = 8 + 4 + (ncount * 8);
-            offset += record_size as u64;
-            actual_count += 1;
+            if offset + record_size as u64 > file_len {
+                // Neighbor bytes run past EOF: torn record
+                return Ok((offset, true));
+            }
             if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() {
                 break;
             }
+            offset += record_size as u64;
         }
-        Ok((actual_count, offset))
+
+        let torn = offset != file_len;
+        Ok((offset, torn))
     }
 
-    fn build_sidecar_index(data_path: &Path, idx_path: &Path, node_count: usize) -> Result<u64> {
+    /// Rebuild the sidecar index by scanning graph.bin.
+    ///
+    /// graph.bin is an append-only log: `set_neighbors` on an existing node
+    /// APPENDS a newer record, and deletes leave the old record behind. The
+    /// scan therefore covers every record with LAST-WINS semantics per
+    /// node_id (minus tombstones when known). The previous implementation
+    /// scanned only the first `node_count` records, which reverted every
+    /// post-build edge update, resurrected deleted nodes, and dropped the
+    /// newest nodes from the sidecar after any delete.
+    fn build_sidecar_index(
+        data_path: &Path,
+        idx_path: &Path,
+        tombstones: Option<&HashSet<RowId>>,
+    ) -> Result<u64> {
         let mut file = OpenOptions::new()
             .read(true)
+            .write(true)
             .open(data_path)
             .map_err(StorageError::Io)?;
+        let file_len = file.metadata().map_err(StorageError::Io)?.len();
         file.seek(SeekFrom::Start(HEADER_SIZE))
             .map_err(StorageError::Io)?;
 
-        let mut entries: Vec<(RowId, u64)> = Vec::with_capacity(node_count);
-        let mut offset = HEADER_SIZE;
+        let mut entries: std::collections::HashMap<RowId, u64> = std::collections::HashMap::new();
         let mut buf8 = [0u8; 8];
         let mut buf4 = [0u8; 4];
+        let mut offset = HEADER_SIZE;
+        let mut well_formed_len = HEADER_SIZE;
 
-        for _ in 0..node_count {
+        loop {
             if file.read_exact(&mut buf8).is_err() {
+                break;
+            }
+            if file.read_exact(&mut buf4).is_err() {
                 break;
             }
             let node_id = u64::from_le_bytes(buf8);
-            if file.read_exact(&mut buf4).is_err() {
-                break;
-            }
             let ncount = u32::from_le_bytes(buf4) as usize;
-
-            entries.push((node_id, offset));
             let record_size = 8 + 4 + (ncount * 8);
-            offset += record_size as u64;
+            if offset + record_size as u64 > file_len {
+                break; // torn trailing record
+            }
             if file.seek(SeekFrom::Current((ncount * 8) as i64)).is_err() {
                 break;
             }
+
+            if tombstones.is_none_or(|t| !t.contains(&node_id)) {
+                // later record wins for duplicate node ids
+                entries.insert(node_id, offset);
+            }
+            offset += record_size as u64;
+            well_formed_len = offset;
         }
 
-        entries.sort_by_key(|(id, _)| *id);
+        // Drop a torn tail so the file stays a whole number of records
+        if well_formed_len < file_len {
+            file.set_len(well_formed_len).map_err(StorageError::Io)?;
+        }
+
+        let mut sorted: Vec<(RowId, u64)> = entries.into_iter().collect();
+        sorted.sort_by_key(|(id, _)| *id);
+        let count = sorted.len() as u64;
 
         let mut idx_file = File::create(idx_path).map_err(StorageError::Io)?;
-        let count = entries.len() as u64;
         idx_file
             .write_all(&count.to_le_bytes())
             .map_err(StorageError::Io)?;
-        for (row_id, off) in &entries {
+        idx_file
+            .write_all(&well_formed_len.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        for (row_id, off) in &sorted {
             idx_file
                 .write_all(&row_id.to_le_bytes())
                 .map_err(StorageError::Io)?;
@@ -295,8 +362,12 @@ impl DiskGraph {
         Ok(count)
     }
 
-    /// Look up file offset: LRU → mmap binary search → sidecar file fallback
+    /// Look up file offset: tombstone check → LRU → mmap binary search →
+    /// sidecar file fallback
     fn lookup_offset(&self, node_id: RowId) -> Option<u64> {
+        if self.tombstones.lock().contains(&node_id) {
+            return None;
+        }
         {
             let mut index = self.index.write();
             if let Some(&offset) = index.get(&node_id) {
@@ -319,7 +390,7 @@ impl DiskGraph {
 
                 while lo <= hi {
                     let mid = lo + (hi - lo) / 2;
-                    let off = 8 + mid as usize * entry_size;
+                    let off = SIDECAR_HEADER_SIZE as usize + mid as usize * entry_size;
                     if off + 16 > mmap.len() {
                         break;
                     }
@@ -348,7 +419,7 @@ impl DiskGraph {
 
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
-            let file_offset = 8 + mid as u64 * entry_size;
+            let file_offset = SIDECAR_HEADER_SIZE + mid as u64 * entry_size;
             file.seek(SeekFrom::Start(file_offset)).ok()?;
             let mut buf = [0u8; 16];
             file.read_exact(&mut buf).ok()?;
@@ -429,7 +500,7 @@ impl DiskGraph {
         if count > 0 {
             let mut file = self.index_file.write();
             let mut ids = Vec::with_capacity(count as usize);
-            let _ = file.seek(SeekFrom::Start(8));
+            let _ = file.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE));
             for _ in 0..count {
                 let mut buf = [0u8; 16];
                 if file.read_exact(&mut buf).is_ok() {
@@ -513,6 +584,8 @@ impl DiskGraph {
             idx.put(node_id, offset);
             !was_present
         };
+        // A re-inserted node comes back to life
+        self.tombstones.lock().remove(&node_id);
         if is_new {
             *self.count.write() += 1;
         }
@@ -535,21 +608,28 @@ impl DiskGraph {
 
     /// Remove node
     pub fn remove_node(&self, node_id: RowId) -> Arc<Vec<RowId>> {
+        // Presence via the same tombstone-aware lookup readers use: after a
+        // fresh load the LRU is empty and the sidecar is the only source of
+        // truth, so an LRU-only check made delete-then-delete over-decrement
+        // the count and made delete-after-load a silent no-op.
+        let was_present = self.lookup_offset(node_id).is_some();
+        if !was_present {
+            return Arc::new(Vec::new());
+        }
         let neighbors = self.neighbors(node_id);
-        let was_present = self.index.write().pop(&node_id).is_some();
+        self.index.write().pop(&node_id);
         self.cache.lock().pop(&node_id);
         self.hot_nodes.write().remove(&node_id);
         self.hot_cache.write().pop(&node_id);
-        if was_present {
-            // 🔑 Split read/write into two statements: in the one-liner
-            // `*self.count.write() = self.count.read().saturating_sub(1)`
-            // the RHS read guard is a temporary that lives until the END of
-            // the statement, so evaluating the LHS write blocks on a reader
-            // held by this very thread — a self-deadlock that hung every
-            // UPDATE/DELETE on a vector-indexed column.
-            let c = *self.count.read();
-            *self.count.write() = c.saturating_sub(1);
-        }
+        self.tombstones.lock().insert(node_id);
+        // 🔑 Split read/write into two statements: in the one-liner
+        // `*self.count.write() = self.count.read().saturating_sub(1)`
+        // the RHS read guard is a temporary that lives until the END of
+        // the statement, so evaluating the LHS write blocks on a reader
+        // held by this very thread — a self-deadlock that hung every
+        // UPDATE/DELETE on a vector-indexed column.
+        let c = *self.count.read();
+        *self.count.write() = c.saturating_sub(1);
         *self.dirty.write() = true;
         neighbors
     }
@@ -571,20 +651,23 @@ impl DiskGraph {
             return Ok(());
         }
 
-        let node_count = self.node_count();
+        // Rebuild sidecar with last-wins semantics minus tombstones. This
+        // runs even when the graph is empty: delete-all previously skipped
+        // the rebuild, leaving the old sidecar in place and resurrecting
+        // every node on the next load.
+        let idx_path = self.file_path.with_extension("idx");
+        let live =
+            Self::build_sidecar_index(&self.file_path, &idx_path, Some(&self.tombstones.lock()))?;
+        *self.index_count.write() = live;
+        *self.count.write() = live;
+        self.tombstones.lock().clear();
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+        *self.index_file.write() = idx_read;
+
         {
             let mut file = self.file.write();
-            Self::write_header(&mut file, self.max_degree, node_count)?;
+            Self::write_header(&mut file, self.max_degree, live as usize)?;
             file.sync_all().map_err(StorageError::Io)?;
-        }
-
-        // Rebuild sidecar index
-        if node_count > 0 {
-            let idx_path = self.file_path.with_extension("idx");
-            let count = Self::build_sidecar_index(&self.file_path, &idx_path, node_count)?;
-            *self.index_count.write() = count;
-            let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-            *self.index_file.write() = idx_read;
         }
 
         // Remap after flush
@@ -600,6 +683,9 @@ impl DiskGraph {
         let temp_path = self.file_path.with_extension("tmp");
         let idx_path = self.file_path.with_extension("idx");
 
+        // Get all node IDs from sidecar (the live set)
+        let ids = self.node_ids();
+        let final_offset;
         {
             let mut temp_file = OpenOptions::new()
                 .create(true)
@@ -608,8 +694,6 @@ impl DiskGraph {
                 .open(&temp_path)
                 .map_err(StorageError::Io)?;
 
-            // Get all node IDs from sidecar
-            let ids = self.node_ids();
             Self::write_header(&mut temp_file, self.max_degree, ids.len())?;
 
             let mut new_entries: Vec<(RowId, u64)> = Vec::with_capacity(ids.len());
@@ -635,12 +719,15 @@ impl DiskGraph {
 
             temp_file.sync_all().map_err(StorageError::Io)?;
 
-            // Write new sidecar
+            // Write new sidecar (with the flushed_upto marker)
             new_entries.sort_by_key(|(id, _)| *id);
             let mut idx_file = File::create(&idx_path).map_err(StorageError::Io)?;
             let count = new_entries.len() as u64;
             idx_file
                 .write_all(&count.to_le_bytes())
+                .map_err(StorageError::Io)?;
+            idx_file
+                .write_all(&offset.to_le_bytes())
                 .map_err(StorageError::Io)?;
             for (row_id, off) in &new_entries {
                 idx_file
@@ -652,7 +739,7 @@ impl DiskGraph {
             }
             idx_file.sync_all().map_err(StorageError::Io)?;
 
-            *self.next_offset.lock() = offset;
+            final_offset = offset;
         }
 
         std::fs::rename(&temp_path, &self.file_path).map_err(StorageError::Io)?;
@@ -670,6 +757,12 @@ impl DiskGraph {
         self.index.write().clear();
         self.cache.lock().clear();
         self.hot_cache.write().clear();
+        // The rewrite covers exactly the live set from the old sidecar —
+        // any pending tombstones are now physically gone
+        self.tombstones.lock().clear();
+        *self.index_count.write() = ids.len() as u64;
+        *self.count.write() = ids.len() as u64;
+        *self.next_offset.lock() = final_offset;
 
         // Remap after compact
         self.remap();
@@ -683,6 +776,21 @@ impl DiskGraph {
         self.cache.lock().clear();
         self.hot_nodes.write().clear();
         self.hot_cache.write().clear();
+        self.tombstones.lock().clear();
+        // Reset the on-disk state too: flush() rebuilds the sidecar from
+        // graph.bin, so leaving the records in place resurrected everything.
+        {
+            let mut file = self.file.write();
+            let _ = Self::write_header(&mut file, self.max_degree, 0);
+            let _ = file.set_len(HEADER_SIZE);
+        }
+        let idx_path = self.file_path.with_extension("idx");
+        if let Ok(mut idx_file) = File::create(&idx_path) {
+            let _ = idx_file.write_all(&0u64.to_le_bytes());
+            let _ = idx_file.write_all(&HEADER_SIZE.to_le_bytes());
+        }
+        *self.index_count.write() = 0;
+        *self.count.write() = 0;
         *self.next_offset.lock() = HEADER_SIZE;
         *self.dirty.write() = true;
     }

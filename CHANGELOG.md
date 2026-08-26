@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### 可靠性/召回第十三轮（向量索引 —— 4 个真 bug + 召回率 0.07→0.97）
+
+- **修复：向量 UPDATE 后 flush+reopen 静默回退旧值、DELETE 复活、
+  delete-all 全体复活（BUG #25）**。SQ8Vectors/DiskGraph 把数据文件当
+  append-only 日志，但 sidecar 重建只扫**前 count 条**记录且不按 row_id
+  去重：update 追加的新条目落在扫描窗口外（重开后读回旧向量）；
+  remove_node 残留记录使已删节点复活、最新节点被挤出 sidecar；count=0
+  时 sidecar 干脆不重建（delete-all 后全体复活）。现改为**全量扫描 +
+  last-wins 去重 + 内存墓碑集合**，sidecar 新增 `flushed_upto` 标记区分
+  "干净 flush（可信）"与"崩溃后有追加（重建）"，旧格式 sidecar 自动
+  一次性迁移。SQ8 条目定长，update 顺势改为**原地覆写**（不再追加）。
+- **修复：load 自愈截断用只读句柄调 set_len → EINVAL（BUG #26）**。
+  任何向量更新都会让 sidecar_count < 物理条目数，触发自愈路径在 macOS
+  上 EINVAL，**整个向量索引加载失败**（DB 层静默跳过 → 查询无索引）。
+  改为 read+write 打开。
+- **修复：batch_build_graph 在无边图上建图 —— 星形图、通用数据召回
+  ~7%（BUG #27）**。前向边延迟到 Phase 2 才落图、反向边延迟到批末，
+  而所有 greedy_search 都从 medoid 出发且 medoid 无出边 → 每个节点只
+  连向 medoid（实测 avg_degree=1.0，recall@10≈7%；聚簇测试数据掩盖了
+  它）。改为**逐节点双向连边**（经典增量图构建语义）：每节点落前向边
+  后立即维护邻居反向边。通用随机数据召回 **0.07 → 0.97**；10K 构建
+  1.0s、查询 126µs，性能无损。
+- **修复：边被"抽真空"成 0 度孤点 + 更新流失衡无重建（BUG #28）**。
+  `incremental_update_node` 5a 移除反向边可把邻居清成 0 度（更新风暴后
+  1/3 节点搁浅，recall 塌到 ~0）；5b 在空列表上 push 出 `[node]` 又被
+  自环过滤剥掉，空列表永远救不回。现：**keepAtLeastOneLink**（移除后
+  为空则保留最后一条边）+ 空/自环-only 列表直接以对方作为唯一出边复活
+  + 更新流失衡 >12.5% 自动**全量重建图**（向量数据不动）。300 节点
+  50% 重写后 recall@10 = 0.86+，重载后不衰减。
+- 附带：`update_vector` API 对已存在行先 update 再 insert（原来直接
+  insert 报 "already exists"，update_row 的 delete+insert 流程必撞）；
+  `search` 过滤 f32::MAX 死边（k 大于可达集时幽灵行不再泄漏进结果）；
+  `DiskGraph::clear()` 真正重置磁盘状态；`remove_node`/`delete` 的
+  存在性判断改用 sidecar 感知的 lookup（加载后首次删除不再静默 no-op）。
+- **新增 tests/test_vector_durability.rs**（12 测试）：DiskGraph/SQ8/
+  DiskANN/DB 四层的更新-删除-重开往返 + 召回率量化（round-12 遗留
+  todo 闭环）。
+
 ### 可靠性第十二轮（磁盘损坏自愈 —— 2 个真 bug）
 
 - **修复：索引文件损坏 → 静默缺失/空结果（BUG #23）**。损坏的 column

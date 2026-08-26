@@ -12,12 +12,20 @@ use crate::types::RowId;
 use crate::{Result, StorageError};
 use lru::LruCache;
 use memmap2::Mmap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Sidecar header: [count: u64][flushed_upto: u64][entries...]
+/// `flushed_upto` = data file length at the last flush. The loader trusts the
+/// sidecar only when the data file hasn't grown since (no crash-appended
+/// entries); otherwise it rebuilds. Old-format sidecars (8-byte header, no
+/// marker) are detected by size and force a one-time rebuild.
+const SIDECAR_HEADER_SIZE: u64 = 16;
 
 /// SQ8 compressed vector storage with bounded memory
 pub struct SQ8Vectors {
@@ -53,6 +61,11 @@ pub struct SQ8Vectors {
     read_file: Arc<RwLock<File>>,
     write_file: Arc<RwLock<File>>,
     file_path: PathBuf,
+
+    /// Row ids deleted since the last flush. The sidecar/file keep the old
+    /// entries (append-only layout), so liveness between flushes rides on
+    /// this overlay; flush() filters them out of the rebuilt sidecar.
+    tombstones: Arc<Mutex<HashSet<RowId>>>,
 }
 
 impl SQ8Vectors {
@@ -83,7 +96,8 @@ impl SQ8Vectors {
 
         let read_file = File::open(&file_path).map_err(StorageError::Io)?;
         let write_file = OpenOptions::new()
-            .append(true)
+            .read(true)
+            .write(true)
             .open(&file_path)
             .map_err(StorageError::Io)?;
         let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
@@ -110,6 +124,7 @@ impl SQ8Vectors {
             read_file: Arc::new(RwLock::new(read_file)),
             write_file: Arc::new(RwLock::new(write_file)),
             file_path,
+            tombstones: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -131,36 +146,41 @@ impl SQ8Vectors {
             ));
         }
 
-        // Build sidecar index from data file (or load existing sidecar)
-        let physical_entries = file_path
-            .metadata()
-            .map(|m| m.len().saturating_sub(8) / entry_size as u64)
-            .unwrap_or(0);
+        let read_file = File::open(&file_path).map_err(StorageError::Io)?;
+        let write_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .map_err(StorageError::Io)?;
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+
+        let data_len = read_file.metadata().map(|m| m.len()).unwrap_or(0);
         let index_count = if idx_path.exists() {
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
             let mut buf = [0u8; 8];
             idx.read_exact(&mut buf).map_err(StorageError::Io)?;
             let sidecar_count = u64::from_le_bytes(buf);
-            // 🔑 Self-heal: the sidecar/header go stale when the async index
-            // pipeline skips the flush at close (or the process is killed):
-            // appended entries are durable, their index is not. Rebuild.
-            if sidecar_count < physical_entries {
-                Self::build_sidecar_index(&file_path, &idx_path, entry_size)?
+            let idx_len = idx.metadata().map(|m| m.len()).unwrap_or(0);
+            let new_format = idx_len == SIDECAR_HEADER_SIZE + sidecar_count * 16;
+            let trusted = if new_format {
+                let mut marker = [0u8; 8];
+                idx.read_exact(&mut marker).is_ok() && u64::from_le_bytes(marker) == data_len
             } else {
+                // Old format (no flushed_upto marker) or torn sidecar
+                false
+            };
+            if trusted {
                 sidecar_count
+            } else {
+                // Sidecar predates unflushed appends (crash / old format):
+                // rebuild with last-wins semantics. Tombstones are lost on
+                // crash — the DB layer rebuilds the whole index for tables
+                // with replayed WAL records, so this stays recovery-grade.
+                Self::build_sidecar_index(&file_path, &idx_path, entry_size, None)?
             }
         } else {
-            // Build sidecar from scratch by scanning data file
-
-            Self::build_sidecar_index(&file_path, &idx_path, entry_size)?
+            Self::build_sidecar_index(&file_path, &idx_path, entry_size, None)?
         };
-
-        let read_file = File::open(&file_path).map_err(StorageError::Io)?;
-        let write_file = OpenOptions::new()
-            .append(true)
-            .open(&file_path)
-            .map_err(StorageError::Io)?;
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
 
         // mmap data and sidecar for zero-syscall reads
         let data_mmap = unsafe { Mmap::map(&read_file).ok() };
@@ -188,63 +208,73 @@ impl SQ8Vectors {
             read_file: Arc::new(RwLock::new(read_file)),
             write_file: Arc::new(RwLock::new(write_file)),
             file_path,
+            tombstones: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     /// Build sidecar index file by scanning the data file.
-    /// Returns the count of entries written.
-    fn build_sidecar_index(data_path: &Path, idx_path: &Path, entry_size: usize) -> Result<u64> {
-        let mut data = File::open(data_path).map_err(StorageError::Io)?;
-        let data_len = data.metadata().map_err(StorageError::Io)?.len();
-
-        // 🔑 Recovery-grade count: the header count is only updated at
-        // flush(), but the insert path APPENDS entries immediately. If the
-        // process died (or the async pipeline skipped the index flush at
-        // close), the header is stale-low while the physical entries are
-        // durable. Derive the true count from the file size, capped by the
-        // header when the file has a torn trailing entry.
-        let physical_entries = data_len.saturating_sub(8) / entry_size as u64;
-        let mut count_bytes = [0u8; 8];
-        data.read_exact(&mut count_bytes)
+    ///
+    /// The data file is an append-only log: `update()` may leave superseded
+    /// entries and `delete()` leaves the old entry behind (removed via the
+    /// tombstone set at flush time). The scan therefore covers ALL physical
+    /// entries with LAST-WINS semantics per row_id — scanning only the first
+    /// `count` records silently reverted updates and resurrected deletes.
+    ///
+    /// Returns the live entry count written to the sidecar.
+    fn build_sidecar_index(
+        data_path: &Path,
+        idx_path: &Path,
+        entry_size: usize,
+        tombstones: Option<&HashSet<RowId>>,
+    ) -> Result<u64> {
+        // 🔑 read+write: the torn-tail repair below truncates via set_len,
+        // which fails with EINVAL on a read-only handle.
+        let mut data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(data_path)
             .map_err(StorageError::Io)?;
-        let header_count = u64::from_le_bytes(count_bytes);
-        let count = if header_count == 0 {
-            physical_entries
-        } else {
-            header_count.min(physical_entries)
-        };
+        let data_len = data.metadata().map_err(StorageError::Io)?.len();
 
         // Drop a torn trailing entry (crash mid-append) so the file is a
         // whole number of entries again.
-        let expected_len = 8 + count * entry_size as u64;
+        let physical_entries = data_len.saturating_sub(8) / entry_size as u64;
+        let expected_len = 8 + physical_entries * entry_size as u64;
         if data_len > expected_len {
             data.set_len(expected_len).map_err(StorageError::Io)?;
         }
 
-        // Read all (row_id, offset) pairs
-        let mut entries: Vec<(RowId, u64)> = Vec::with_capacity(count as usize);
+        // Read all (row_id, offset) pairs — full scan, last-wins per row_id
+        let mut entries: std::collections::HashMap<RowId, u64> =
+            std::collections::HashMap::with_capacity(physical_entries as usize);
         let mut offset = 8u64;
         data.seek(SeekFrom::Start(8)).map_err(StorageError::Io)?;
-        for _ in 0..count {
+        for _ in 0..physical_entries {
             let mut row_id_bytes = [0u8; 8];
             data.read_exact(&mut row_id_bytes)
                 .map_err(StorageError::Io)?;
             let row_id = u64::from_le_bytes(row_id_bytes);
-            entries.push((row_id, offset));
+            if tombstones.is_none_or(|t| !t.contains(&row_id)) {
+                entries.insert(row_id, offset);
+            }
             offset += entry_size as u64;
             data.seek(SeekFrom::Current((entry_size - 8) as i64))
                 .map_err(StorageError::Io)?;
         }
 
-        // Sort by row_id for binary search
-        entries.sort_by_key(|(id, _)| *id);
+        let mut sorted: Vec<(RowId, u64)> = entries.into_iter().collect();
+        sorted.sort_by_key(|(id, _)| *id);
+        let count = sorted.len() as u64;
 
-        // Write sidecar index
+        // Write sidecar index with the flushed_upto marker
         let mut idx_file = File::create(idx_path).map_err(StorageError::Io)?;
         idx_file
             .write_all(&count.to_le_bytes())
             .map_err(StorageError::Io)?;
-        for (row_id, off) in &entries {
+        idx_file
+            .write_all(&expected_len.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        for (row_id, off) in &sorted {
             idx_file
                 .write_all(&row_id.to_le_bytes())
                 .map_err(StorageError::Io)?;
@@ -260,6 +290,13 @@ impl SQ8Vectors {
     /// Look up file offset for a row_id.
     /// Checks LRU first, then mmap binary search, then sidecar file fallback.
     fn lookup_offset(&self, row_id: RowId) -> Option<u64> {
+        // Tombstone overlay: deleted ids stay physically present (and in the
+        // sidecar) until the next flush — without this check, re-inserting a
+        // deleted id hit "already exists".
+        if self.tombstones.lock().contains(&row_id) {
+            return None;
+        }
+
         // 1. Check LRU cache
         {
             let mut index = self.index.write();
@@ -283,7 +320,7 @@ impl SQ8Vectors {
 
                 while lo <= hi {
                     let mid = lo + (hi - lo) / 2;
-                    let off = 8 + mid as usize * entry_size;
+                    let off = SIDECAR_HEADER_SIZE as usize + mid as usize * entry_size;
                     if off + 16 > mmap.len() {
                         break;
                     }
@@ -312,7 +349,7 @@ impl SQ8Vectors {
 
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
-            let file_offset = 8 + mid as u64 * entry_size;
+            let file_offset = SIDECAR_HEADER_SIZE + mid as u64 * entry_size;
             file.seek(SeekFrom::Start(file_offset)).ok()?;
             let mut buf = [0u8; 16];
             file.read_exact(&mut buf).ok()?;
@@ -400,8 +437,10 @@ impl SQ8Vectors {
         let qvec = self.quantizer.quantize(&vector)?;
         let offset = self.append_quantized(row_id, &qvec)?;
 
-        // Update in-memory LRU index
+        // Update in-memory LRU index; a re-inserted (previously deleted) id
+        // comes back to life
         self.index.write().put(row_id, offset);
+        self.tombstones.lock().remove(&row_id);
         *self.count.write() += 1;
 
         // Cache decompressed vector
@@ -452,32 +491,33 @@ impl SQ8Vectors {
     }
 
     /// Update vector (quantize, persist to disk, update caches)
+    ///
+    /// Entries are fixed-size, so the new quantized vector OVERWRITES the old
+    /// entry in place. The previous append-based implementation broke the
+    /// flush path: the sidecar rebuild only covered the first `count` records,
+    /// so every updated vector silently reverted to its old value after
+    /// flush + reload.
     pub fn update(&self, row_id: RowId, vector: Vec<f32>) -> Result<bool> {
-        if self.lookup_offset(row_id).is_none() {
-            return Ok(false);
-        }
+        let offset = match self.lookup_offset(row_id) {
+            Some(off) => off,
+            None => return Ok(false),
+        };
 
-        // Quantize the new vector
         let qvec = self.quantizer.quantize(&vector)?;
-        // Append the new quantized vector to disk (the old entry remains but
-        // the index will be updated to point to the new offset)
-        let new_offset = self.append_quantized(row_id, &qvec)?;
-
-        // Update in-memory index to point to the new disk offset
-        self.index.write().put(row_id, new_offset);
+        self.write_quantized_at(offset, row_id, &qvec)?;
 
         // Update raw vector cache
         {
             let mut cache = self.cache.write();
             cache.put(row_id, Arc::new(vector));
         }
-        // Invalidate stale quantized cache entry (next read will use new offset)
+        // Invalidate stale quantized cache entry (next read re-reads disk)
         {
             let mut qcache = self.quantized_cache.write();
             qcache.pop(&row_id);
         }
 
-        // Invalidate mmap — file has grown, stale mmap will cause out-of-bounds
+        // Invalidate mmap — bytes changed under it
         *self.data_mmap.write() = None;
 
         Ok(true)
@@ -485,22 +525,20 @@ impl SQ8Vectors {
 
     /// Delete vector
     pub fn delete(&self, row_id: RowId) -> Result<bool> {
-        let removed = {
-            let mut index = self.index.write();
-            index.pop(&row_id).is_some()
-        };
-
-        if removed {
-            *self.count.write() -= 1;
-            self.invalidate_single(row_id);
+        // Liveness = LRU/sidecar says present AND not tombstoned. Checking
+        // only the LRU made delete a silent no-op after a fresh load (LRU
+        // empty, entry only in the sidecar).
+        if self.lookup_offset(row_id).is_none() {
+            return Ok(false);
         }
 
-        Ok(removed)
-    }
-
-    fn invalidate_single(&self, row_id: RowId) {
+        self.index.write().pop(&row_id);
+        self.tombstones.lock().insert(row_id);
+        *self.count.write() -= 1;
         self.cache.write().pop(&row_id);
         self.quantized_cache.write().pop(&row_id);
+
+        Ok(true)
     }
 
     /// Flush: update data file header and rebuild sidecar index
@@ -519,14 +557,20 @@ impl SQ8Vectors {
             file.sync_all().map_err(StorageError::Io)?;
         }
 
-        // Rebuild sidecar index from data file
-        if count > 0 {
-            let idx_path = self.file_path.with_extension("idx");
-            let _ = Self::build_sidecar_index(&self.file_path, &idx_path, self._entry_size);
-            *self.index_count.write() = count;
-            let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-            *self.index_file.write() = idx_read;
-        }
+        // Always rebuild the sidecar — including when count == 0 (delete-all
+        // previously left the old sidecar in place and resurrected every
+        // vector on the next load). The rebuild drops tombstoned ids.
+        let idx_path = self.file_path.with_extension("idx");
+        let live = Self::build_sidecar_index(
+            &self.file_path,
+            &idx_path,
+            self._entry_size,
+            Some(&self.tombstones.lock()),
+        )?;
+        *self.index_count.write() = live;
+        self.tombstones.lock().clear();
+        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
+        *self.index_file.write() = idx_read;
 
         // Remap after flush
         self.remap();
@@ -544,7 +588,7 @@ impl SQ8Vectors {
 
         let mut file = self.index_file.write();
         let mut ids = Vec::with_capacity(count as usize);
-        let _ = file.seek(SeekFrom::Start(8));
+        let _ = file.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE));
         for _ in 0..count {
             let mut buf = [0u8; 16];
             if file.read_exact(&mut buf).is_ok() {
@@ -619,7 +663,7 @@ impl SQ8Vectors {
 
     fn append_quantized(&self, row_id: RowId, qvec: &QuantizedVector) -> Result<u64> {
         let mut file = self.write_file.write();
-        let offset = file.metadata().map_err(StorageError::Io)?.len();
+        let offset = file.seek(SeekFrom::End(0)).map_err(StorageError::Io)?;
 
         file.write_all(&row_id.to_le_bytes())
             .map_err(StorageError::Io)?;
@@ -630,6 +674,21 @@ impl SQ8Vectors {
         file.write_all(&qvec.codes).map_err(StorageError::Io)?;
 
         Ok(offset)
+    }
+
+    /// Overwrite a fixed-size entry in place (used by update)
+    fn write_quantized_at(&self, offset: u64, row_id: RowId, qvec: &QuantizedVector) -> Result<()> {
+        let mut file = self.write_file.write();
+        file.seek(SeekFrom::Start(offset))
+            .map_err(StorageError::Io)?;
+        file.write_all(&row_id.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&qvec.min.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&qvec.max.to_le_bytes())
+            .map_err(StorageError::Io)?;
+        file.write_all(&qvec.codes).map_err(StorageError::Io)?;
+        Ok(())
     }
 
     /// Remap data and sidecar files after flush
