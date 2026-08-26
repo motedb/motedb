@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 可靠性第十五轮（主键改值全链路 —— 2 个真 bug）
+
+- **修复：UPDATE 改主键后 row_cache 留下"幽灵"条目（BUG #33）**。PK 改值
+  时行物理搬移到新复合键（tombstone 旧 + append 新），但缓存把**新行写进
+  旧 row_id 槽位**——get_row/get_table_row 按旧 id 仍能读到该行，一行在
+  两个 id 上同时可见（还会让点查式主键查重误报）。现在缓存跟随搬移：
+  旧槽失效 + 新行入新槽。
+- **修复：次级索引不跟随主键改值（BUG #34）**。列索引/FTS/向量/八叉树
+  的条目全部挂在旧 row_id 上，pk_cache 也把新主键映射到旧 row_id——修好
+  #33 的幽灵缓存后，行反而从所有索引驱动查询中静默消失（FTS 命中旧 id →
+  行取不到；向量 top-k 返回旧 id；列索引同病）。现在引入 eff_rid（搬移
+  后的最终 row_id）：列索引无条件按"旧 id 摘除 + 新 id 插入"重键（值
+  未变也要重键）、FTS delete_text(旧)+insert_text(新)、向量插入侧挂新
+  id、八叉树插入侧挂新 id、pk_cache 新映射指向新 id。
+- **新增 tests/test_pk_change_semantics.rs**（4 测试）：缓存幽灵、
+  FTS/列索引/向量跟随、checkpoint+重开往返。
+
 ### 可靠性第十四轮（事务语义 —— 4 个真 bug）
 
 - **修复：同一事务内重复 INSERT 相同主键被静默放行（BUG #29）**。缓冲

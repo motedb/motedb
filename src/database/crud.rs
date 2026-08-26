@@ -898,8 +898,43 @@ impl MoteDB {
         let timestamp = self
             .write_lsn
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.row_cache
-            .put(table_name.to_string(), row_id, new_row.clone());
+        // 🔑 PK changed: the row physically moves to the NEW pk-derived
+        // composite key (the store block below tombstones the old key and
+        // appends at the new one). The cache must follow — putting the new
+        // row under the OLD row_id leaves a ghost entry that get_table_row
+        // (old) keeps returning even though the row is gone there, making
+        // one row visible under two ids (and point-read dup checks misfire).
+        let cache_relocate_rid = if !schema.is_primary_key_auto_increment() {
+            schema
+                .primary_key()
+                .and_then(|n| schema.get_column(n))
+                .and_then(|c| {
+                    let pos = c.position;
+                    match (old_row.get(pos), new_row.get(pos)) {
+                        (Some(Value::Integer(o)), Some(Value::Integer(n))) if o != n => {
+                            Some(if *n >= 0 {
+                                *n as u64
+                            } else {
+                                0x8000_0000u64 | (*n as u64 & 0x7FFF_FFFF)
+                            })
+                        }
+                        _ => None,
+                    }
+                })
+        } else {
+            None
+        };
+        match cache_relocate_rid {
+            Some(new_rid) => {
+                self.row_cache.invalidate(table_name, row_id);
+                self.row_cache
+                    .put(table_name.to_string(), new_rid, new_row.clone());
+            }
+            None => {
+                self.row_cache
+                    .put(table_name.to_string(), row_id, new_row.clone());
+            }
+        }
 
         // Add new row to columnar buffer (create if first write to this table)
         {
@@ -986,6 +1021,11 @@ impl MoteDB {
         }
 
         // 6. Update indexes. Collect failures, then mark ALL stale consistently.
+        // 🔑 PK 改值时行物理搬到了新 row_id（上面的 tombstone+append）——
+        // 所有次级索引的新条目必须挂到 eff_rid，旧条目按 row_id 摘除；
+        // pk_cache 的新映射也指向 eff_rid。否则行从这些索引里"消失"。
+        let eff_rid: RowId = cache_relocate_rid.unwrap_or(row_id);
+        let rid_changed = cache_relocate_rid.is_some();
         let mut index_errors = Vec::new();
 
         // Reusable index key buffer
@@ -996,8 +1036,9 @@ impl MoteDB {
             let old_value = old_row.get(col_def.position);
             let new_value = new_row.get(col_def.position);
 
-            // Skip unchanged columns
-            if old_value == new_value {
+            // Skip unchanged columns (unless the row moved — index entries
+            // must be re-keyed to the new row_id)
+            if old_value == new_value && !rid_changed {
                 continue;
             }
 
@@ -1013,7 +1054,33 @@ impl MoteDB {
                 let old_is_null = old_value.is_none() || matches!(old_value, Some(Value::Null));
                 let new_is_null = new_value.is_none() || matches!(new_value, Some(Value::Null));
 
-                if !old_is_null && !new_is_null {
+                if rid_changed {
+                    // Row moved: unconditionally re-key (value may be identical)
+                    if !old_is_null {
+                        if let Some(old_val) = old_value {
+                            if let Err(_e) = index.delete(old_val, row_id) {
+                                debug_log!(
+                                    "[update_row] Failed to delete column index '{}': {}",
+                                    col_name,
+                                    _e
+                                );
+                                index_errors.push(index_key_buf.clone());
+                            }
+                        }
+                    }
+                    if !new_is_null {
+                        if let Some(new_val) = new_value {
+                            if let Err(_e) = index.insert(new_val, eff_rid) {
+                                debug_log!(
+                                    "[update_row] Failed to insert column index '{}': {}",
+                                    col_name,
+                                    _e
+                                );
+                                index_errors.push(index_key_buf.clone());
+                            }
+                        }
+                    }
+                } else if !old_is_null && !new_is_null {
                     if let (Some(old_val), Some(new_val)) = (old_value, new_value) {
                         if let Err(_e) = index.update(old_val, new_val, row_id) {
                             debug_log!(
@@ -1037,7 +1104,7 @@ impl MoteDB {
                     }
                 } else if old_is_null && !new_is_null {
                     if let Some(new_val) = new_value {
-                        if let Err(_e) = index.insert(new_val, row_id) {
+                        if let Err(_e) = index.insert(new_val, eff_rid) {
                             debug_log!(
                                 "[update_row] Failed to insert column index '{}': {}",
                                 col_name,
@@ -1072,7 +1139,7 @@ impl MoteDB {
                         crate::types::Value::Tensor(tensor) => Some(tensor.to_f32()),
                         _ => None,
                     }) {
-                        if let Err(_e) = self.update_vector(row_id, &index_name, &new_vec) {
+                        if let Err(_e) = self.update_vector(eff_rid, &index_name, &new_vec) {
                             debug_log!(
                                 "[update_row] Failed to update vector index '{}': {}",
                                 index_name,
@@ -1099,7 +1166,27 @@ impl MoteDB {
                         Some(crate::types::Value::Text(new_text)),
                     ) = (old_value, new_value)
                     {
-                        if let Err(_e) = self.update_text(row_id, &index_name, old_text, new_text) {
+                        if rid_changed {
+                            // 行搬移：旧文档按 row_id 摘除，新文档挂 eff_rid
+                            if let Err(_e) = self.delete_text(row_id, &index_name, old_text) {
+                                debug_log!(
+                                    "[update_row] Failed to delete text index '{}': {}",
+                                    index_name,
+                                    _e
+                                );
+                                index_errors.push(index_name.clone());
+                            }
+                            if let Err(_e) = self.insert_text(eff_rid, &index_name, new_text) {
+                                debug_log!(
+                                    "[update_row] Failed to insert text index '{}': {}",
+                                    index_name,
+                                    _e
+                                );
+                                index_errors.push(index_name.clone());
+                            }
+                        } else if let Err(_e) =
+                            self.update_text(row_id, &index_name, old_text, new_text)
+                        {
                             debug_log!(
                                 "[update_row] Failed to update text index '{}': {}",
                                 index_name,
@@ -1128,7 +1215,8 @@ impl MoteDB {
                         failed = true;
                     }
                     if let Some(crate::types::Value::Spatial(new_geom)) = new_value {
-                        if let Err(_e) = self.insert_ioctree_point(row_id, &octree_name, new_geom) {
+                        if let Err(_e) = self.insert_ioctree_point(eff_rid, &octree_name, new_geom)
+                        {
                             debug_log!(
                                 "[update_row] Failed to update ioctree index '{}': {}",
                                 octree_name,
@@ -1158,7 +1246,7 @@ impl MoteDB {
                             }
                             if let Some(new_val) = new_pk {
                                 let new_key = crate::database::pk_cache::PkKey::from_value(new_val);
-                                pk_lookup.insert(new_key, row_id);
+                                pk_lookup.insert(new_key, eff_rid);
                             }
                         }
                     }
