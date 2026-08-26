@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### 可靠性第十四轮（事务语义 —— 4 个真 bug）
+
+- **修复：同一事务内重复 INSERT 相同主键被静默放行（BUG #29）**。缓冲
+  INSERT 对存储层查重不可见，write_set 又按 (table, row_id) 键存储 ——
+  第二次同主键 INSERT 直接覆盖第一次的缓冲行：无报错、COMMIT 后只剩
+  一行。现在 insert 前检查本事务 write_set（Integer 主键 O(1) 键查、
+  其他类型值扫描），SQL INSERT 与行 API 两条路径同修。
+- **修复：事务内修改缓冲行主键后行"消失"（BUG #30）**。UPDATE 改掉
+  未提交 INSERT 的主键时，行仍存在旧 row_id 下而内容已是新主键 ——
+  `WHERE pk = <新>` 永远找不到它、`WHERE pk = <旧>` 反而返回内容为新
+  主键的行（PK 点查依赖 row_id == Integer 主键不变量）。现在检测到
+  Integer 主键变化即把 write_set 条目**搬移**到新 row_id（新主键先做
+  存储点查 + write_set 查重），并记一对可逆 savepoint delta。
+- **修复：savepoint 回滚对 write_set 行的更新视而不见（BUG #31）**。
+  缓冲行的 UPDATE 完全不记 delta —— ROLLBACK TO SAVEPOINT 后新值
+  原样存活；配合搬移修复后回滚更会让整行凭空消失。现在缓冲行更新/
+  搬移都记 savepoint-only delta（新增 record_savepoint_delta：绝不进
+  undo_log —— 后者在整事务 ROLLBACK 时对存储做写回重放，缓冲行 delta
+  进去会实体化从未提交过的幽灵行）。
+- **修复：冷缓存下事务 INSERT 已存在主键被放行（BUG #32）**。存储层
+  查重走 query_by_column，而 ColSegmentStore 表默认没有列索引 → 返回
+  Err 被 `if let Ok` 吞掉，检查形同虚设；重开后 pk_cache 冷 → 事务
+  INSERT 已提交主键成功，COMMIT 静默顶掉原行。Integer 主键改用
+  row_id == pk 不变量做精确点查（O(log N)，不依赖任何索引）。
+- **新增 tests/test_transaction_semantics.rs**（13 测试）：同事务/并发/
+  冷缓存查重、缓冲行主键改值与可见性（含重开）、savepoint 回滚三种
+  形态、整事务 ROLLBACK 无幽灵行。
+
 ### 可靠性/召回第十三轮（向量索引 —— 4 个真 bug + 召回率 0.07→0.97）
 
 - **修复：向量 UPDATE 后 flush+reopen 静默回退旧值、DELETE 复活、

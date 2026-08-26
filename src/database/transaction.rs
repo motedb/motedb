@@ -75,6 +75,24 @@ impl MoteDB {
                                 pk_value, table_name
                             )));
                         }
+                        // 🔑 Integer PK 的 row_id 恒等于 PK 值 —— 直接点查比
+                        // query_by_column 更准：后者在无列索引时直接报错，
+                        // 而 ColSegmentStore 表默认不建列索引，`if let Ok`
+                        // 把错误吞掉后这条检查从未生效（冷缓存重开 + 事务
+                        // INSERT 已存在主键被放行，COMMIT 后静默顶掉原行）。
+                        if let crate::types::Value::Integer(pk_int) = pk_value {
+                            let rid = if *pk_int >= 0 {
+                                *pk_int as RowId
+                            } else {
+                                0x8000_0000u64 | (*pk_int as u64 & 0x7FFF_FFFF)
+                            };
+                            if self.get_table_row(table_name, rid)?.is_some() {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Duplicate primary key {:?} for table '{}'",
+                                    pk_value, table_name
+                                )));
+                            }
+                        }
                         if let Ok(found) = self.query_by_column(table_name, pk_name, pk_value) {
                             if !found.is_empty() {
                                 let mut has_live = false;
@@ -91,6 +109,41 @@ impl MoteDB {
                                     )));
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 🔑 同事务 write_set 查重：缓冲 INSERT 对上面的存储层检查不可见，
+        // 第二次插入同一主键若不在此拦截，会按 (table, row_id) 键静默覆盖
+        // write_set 里的前一行 —— COMMIT 后只剩一行且无任何报错（BUG #29）。
+        if !schema.is_primary_key_auto_increment() {
+            if let Some(pk_name) = schema.primary_key() {
+                if let Some(pk_col) = schema.get_column(pk_name) {
+                    if let Some(pk_value) = row.get(pk_col.position) {
+                        let ctx = self.txn_coordinator.get_context(txn_id)?;
+                        let ws = ctx.write_set.read();
+                        let dup = match pk_value {
+                            // Integer PK: row_id 由 PK 值决定 —— O(1) 键查
+                            Value::Integer(i) => {
+                                let rid = if *i >= 0 {
+                                    *i as RowId
+                                } else {
+                                    0x8000_0000u64 | (*i as u64 & 0x7FFF_FFFF)
+                                };
+                                ws.contains_key(&(table_name.to_string(), rid))
+                            }
+                            // 其他类型 PK 的 row_id 来自 next_row_id —— 值扫描
+                            _ => ws.iter().any(|((t, _), buffered)| {
+                                t == table_name && buffered.get(pk_col.position) == Some(pk_value)
+                            }),
+                        };
+                        if dup {
+                            return Err(StorageError::InvalidData(format!(
+                                "Duplicate primary key {:?} for table '{}'",
+                                pk_value, table_name
+                            )));
                         }
                     }
                 }

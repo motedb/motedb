@@ -266,6 +266,24 @@ impl TransactionCoordinator {
 
     /// Record a write delta to the most recent savepoint (if any exist).
     /// This enables rollback_to_savepoint to undo operations.
+    /// Record a delta for SAVEPOINT rollback only — NOT in the undo_log.
+    /// The undo_log is replayed against STORAGE on full ROLLBACK
+    /// (replay_undo_log writes Update/Delete back to the store); deltas for
+    /// write_set-buffered rows must never reach it or a full ROLLBACK would
+    /// materialize phantom rows that were never committed to storage.
+    pub fn record_savepoint_delta(
+        &self,
+        txn_id: TransactionId,
+        delta: DeltaOperation,
+    ) -> Result<()> {
+        let ctx = self.get_context(txn_id)?;
+        let mut savepoints = ctx.savepoints.write();
+        if let Some(last) = savepoints.last_mut() {
+            last.write_deltas.push(delta);
+        }
+        Ok(())
+    }
+
     pub fn record_write_delta(&self, txn_id: TransactionId, delta: DeltaOperation) -> Result<()> {
         let ctx = self.get_context(txn_id)?;
         // Record in undo_log for full-transaction rollback.
@@ -299,6 +317,47 @@ impl TransactionCoordinator {
             Ok(false)
         }
     }
+    /// Relocate a buffered write_set row to a new row_id — the PK of an
+    /// uncommitted INSERT changed. Keeps the row_id == Integer-PK invariant
+    /// that PK point queries (fast_col_segment_pk_select / RowMap binary
+    /// search) rely on: without relocation the committed row lives under the
+    /// OLD row_id while its content claims the NEW pk, making it invisible to
+    /// `WHERE pk = <new>` forever. Records an Insert delta for the new key so
+    /// savepoint rollback removes the relocated entry (the original Insert
+    /// delta for the old key becomes a harmless no-op).
+    pub fn relocate_write_set_row(
+        &self,
+        txn_id: TransactionId,
+        table_name: &str,
+        old_row_id: RowId,
+        new_row_id: RowId,
+        new_row: Row,
+    ) -> Result<bool> {
+        let ctx = self.get_context(txn_id)?;
+        let mut write_set = ctx.write_set.write();
+        let old_key = (table_name.to_string(), old_row_id);
+        let old_row = match write_set.remove(&old_key) {
+            Some(row) => row,
+            None => return Ok(false),
+        };
+        write_set.insert((table_name.to_string(), new_row_id), new_row.clone());
+        drop(write_set);
+        // Reversible via reverse-order savepoint replay:
+        //   undo Insert(new) → remove the relocated key,
+        //   undo Update(old) → restore the pre-relocation row under the old key.
+        // Savepoint-only: the undo_log replays against storage and must not
+        // see write_set-row deltas.
+        let _ = self.record_savepoint_delta(
+            txn_id,
+            DeltaOperation::Update(old_row_id, table_name.to_string(), Arc::new(old_row)),
+        );
+        let _ = self.record_savepoint_delta(
+            txn_id,
+            DeltaOperation::Insert(new_row_id, table_name.to_string(), Arc::new(new_row)),
+        );
+        Ok(true)
+    }
+
     /// Rollback to a savepoint (Delta Snapshot optimized)
     ///
     /// 🚀 Memory Optimization: Instead of restoring full snapshot,

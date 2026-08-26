@@ -20906,12 +20906,96 @@ impl QueryExecutor {
             }
             // 🔑 Update the write_set entry (not storage — the row isn't committed yet).
             if let Some(tid) = self.current_txn_id() {
-                let _ = self.db.txn_coordinator.update_write_set_row(
-                    tid,
-                    &stmt.table,
-                    *ws_row_id,
-                    new_row,
-                );
+                // 🔑 Integer PK changed on a buffered row: relocate the
+                // write_set entry to the new PK-derived row_id. PK point
+                // queries assume row_id == Integer PK — a content-only update
+                // left the row under the OLD row_id, making `WHERE pk = <new>`
+                // permanently miss it (and `WHERE pk = <old>` return a row
+                // whose content claims otherwise).
+                let mut relocated = false;
+                let pk_pos = schema
+                    .primary_key()
+                    .and_then(|n| schema.get_column(n))
+                    .map(|c| c.position);
+                if let Some(pos) = pk_pos {
+                    if let (Some(Value::Integer(old_pk)), Some(Value::Integer(new_pk))) =
+                        (row.get(pos), new_row.get(pos))
+                    {
+                        if old_pk != new_pk {
+                            // New PK must be free. Integer PK 的 row_id 恒等于
+                            // PK 值 —— 直接点查（query_by_column 在无列索引时
+                            // 报错，错误被吞后检查形同虚设）。
+                            let target_rid = if *new_pk >= 0 {
+                                *new_pk as RowId
+                            } else {
+                                0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
+                            };
+                            if target_rid != *ws_row_id
+                                && self
+                                    .db
+                                    .get_table_row(&stmt.table, target_rid)
+                                    .ok()
+                                    .flatten()
+                                    .is_some()
+                            {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Duplicate primary key {:?} for table '{}'",
+                                    Value::Integer(*new_pk),
+                                    stmt.table
+                                )));
+                            }
+                            // ... and other buffered rows in this txn.
+                            let ws_now = self.txn_write_set_rows(&stmt.table);
+                            for (other_rid, other_row) in &ws_now {
+                                if other_rid != ws_row_id
+                                    && other_row.get(pos) == Some(&Value::Integer(*new_pk))
+                                {
+                                    return Err(StorageError::InvalidData(format!(
+                                        "Duplicate primary key {:?} for table '{}'",
+                                        Value::Integer(*new_pk),
+                                        stmt.table
+                                    )));
+                                }
+                            }
+                            let new_rid = if *new_pk >= 0 {
+                                *new_pk as RowId
+                            } else {
+                                0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
+                            };
+                            relocated = self
+                                .db
+                                .txn_coordinator
+                                .relocate_write_set_row(
+                                    tid,
+                                    &stmt.table,
+                                    *ws_row_id,
+                                    new_rid,
+                                    new_row.clone(),
+                                )
+                                .unwrap_or(false);
+                        }
+                    }
+                }
+                if !relocated {
+                    // 🔑 Savepoint rollback must restore the pre-update value:
+                    // buffer updates previously recorded no delta at all, so
+                    // ROLLBACK TO SAVEPOINT silently kept the new value.
+                    // Savepoint-only (never the storage-replayed undo_log).
+                    let _ = self.db.txn_coordinator.record_savepoint_delta(
+                        tid,
+                        crate::txn::coordinator::DeltaOperation::Update(
+                            *ws_row_id,
+                            stmt.table.clone(),
+                            std::sync::Arc::new(row.clone()),
+                        ),
+                    );
+                    let _ = self.db.txn_coordinator.update_write_set_row(
+                        tid,
+                        &stmt.table,
+                        *ws_row_id,
+                        new_row,
+                    );
+                }
             }
             affected_rows += 1;
         }
