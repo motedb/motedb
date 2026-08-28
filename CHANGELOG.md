@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### 性能/可靠性第十七轮（WHERE 编译提升 —— 过滤扫描 2×、GROUP BY 1.7× + 2 个真 bug）
+
+- **优化：扫描热路径的 WHERE 编译一次（列位置预解析）。** profile 显示
+  eval_expr_on_row 每行每个列引用都做 `get_column_position` 字符串线性
+  查找（约占扫描 CPU 9%）。CompiledWhere（预编译谓词）早已存在但近乎
+  dead-code——本轮接入四条热路径：col_segment_general_scan、聚合预过滤、
+  投影扫描、UPDATE 全表扫描（含事务 write_set 循环）。实测：过滤扫描
+  72ms→36ms（**2×**）、GROUP BY 50.8ms→29.9ms（**1.7×**，同时去掉每行
+  的全宽 NULL 缓冲分配与克隆，改为复用缓冲）；编译失败或单行不可判定
+  时逐行回退原求值，语义零变化。
+- **修复：LIKE 匹配回溯死循环（BUG #36，预存在于 dead-code 的
+  CompiledWhere，接线后暴露）。** `like_match` 的 `%` 回溯没有耗尽检查：
+  模式 `%x%` 对不含 x 的文本，star_ti 无限增长、pi 原地弹跳 =
+  死循环（test_where_like_patterns 100% CPU 挂死 94 分钟才发现）。
+  加上 `star_ti >= text.len() → false` 终止条件。
+- **修复：NOT IN 被静默编译成 IN（BUG #37，同上暴露）。** compile_where
+  编译 `Expr::In`/`InHashset` 时丢弃 `negated` 标志——`NOT IN (0,1,2)`
+  恰好返回被排除的 3 行。InHash 增加 negated + has_null 字段并实现
+  SQL 三值逻辑（NULL NOT IN → false；x NOT IN (…,NULL) 对非成员 →
+  UNKNOWN → false）。
+- **修复：与 NULL 字面量比较被任意排序（BUG #43，同上暴露）。** 编译版
+  比较不检查字面量侧 NULL —— Value 的 Ord 把 Null 排最前，10 > NULL
+  算成 true；物化标量子查询 v > (SELECT MAX(x) FROM empty) 即 NULL，
+  行被错误保留。字面量含 NULL 一律不编译，回退三值逻辑。
+- **修复：NOT 翻转把 UNKNOWN 变 true（BUG #42，同上暴露）。** 编译表示
+  Some<bool> 无法区分 false 与 UNKNOWN（Gt 对 NULL 返回 Some(false)），
+  Not 翻转后 WHERE NOT v > 20 错误命中 NULL 行。NOT 不再编译，回退
+  原生三值逻辑求值（NOT IS NULL 由 IsNull(negated) 覆盖）。
+- **修复：编译版 LIKE 大小写不敏感（BUG #41，同上暴露）。** like_match
+  用了 eq_ignore_ascii_case —— SQL LIKE 应大小写敏感（'apple' 曾同时
+  命中 Apple/APPLE）。移除忽略大小写分支。
+- **修复：NULL = NULL 在编译版 Eq 下错误为 true（BUG #40，同上暴露）。**
+  Rust 的 Value::Null == Value::Null 是 true，SQL 语义应为 UNKNOWN →
+  false —— prepared  传 NULL 曾错误命中 NULL 行。Eq 分支显式判
+  NULL 参数直接 false（eval 与 eval_at 两处）。
+- **修复：后缀锚定 LIKE '%x' 永不匹配（BUG #39，同上暴露）。** like_
+  match 主循环结束后直接判 `ti>=len`，剩余文本无法被 % 吞掉——'%a'
+  对 "banana" 返回空。循环改为支持模式耗尽后的回溯（star 后模式重新
+  锚到更靠后位置）。
+- **修复：NULL NOT LIKE 返回 true（BUG #38，同上暴露）。** 编译版 Like
+  把"值不是文本"统一当 false 再被 negated 翻转 —— NULL NOT LIKE '%'
+  错误命中 NULL 行。三值逻辑修正：NULL LIKE/NOT LIKE 均 UNKNOWN →
+  false（negated 不翻转 NULL），非文本类型回退原生求值。
+- **新增 tests/test_compiled_where_semantics.rs**（9 测试）：NULL=NULL、NOT IN 补集、
+  NOT IN 含 NULL 全空、IN 含 NULL 仍匹配成员、非匹配通配符终止、
+  LIKE/NOT LIKE 边界、AND 组合、全集排除、NULL LIKE/NOT LIKE 双 false。
+
 ### 性能/可靠性第十六轮（并发写吞吐 1.9× + 备份快照丢行）
 
 - **优化：autocommit 写锁按表条带化 + WAL 批内分区并行 fsync —— 4 线程

@@ -1248,19 +1248,21 @@ struct AggregateInfo {
 /// + direct Value comparison — no recursion, no string ops, no HashMap.
 #[allow(dead_code)]
 enum CompiledWhere {
-    Eq(usize, Value),                                // col[pos] == value
-    Ne(usize, Value),                                // col[pos] != value
-    Lt(usize, Value),                                // col[pos] < value
-    Le(usize, Value),                                // col[pos] <= value
-    Gt(usize, Value),                                // col[pos] > value
-    Ge(usize, Value),                                // col[pos] >= value
-    InHash(usize, std::collections::HashSet<Value>), // col[pos] IN set (O(1))
-    Like(usize, String, bool),                       // col[pos] LIKE pattern (negated bool)
-    IsNull(usize, bool),                             // col[pos] IS NULL / IS NOT NULL
-    Between(usize, Value, Value),                    // col[pos] BETWEEN low AND high
-    And(Vec<CompiledWhere>),                         // all must match (short-circuit)
-    Or(Vec<CompiledWhere>),                          // any must match (short-circuit)
-    Not(Box<CompiledWhere>),                         // negation
+    Eq(usize, Value), // col[pos] == value
+    Ne(usize, Value), // col[pos] != value
+    Lt(usize, Value), // col[pos] < value
+    Le(usize, Value), // col[pos] <= value
+    Gt(usize, Value), // col[pos] > value
+    Ge(usize, Value), // col[pos] >= value
+    /// col[pos] IN set (O(1)). `negated` = NOT IN; `has_null` = the list/set
+    /// contains NULL (SQL 三值逻辑: x NOT IN (…, NULL) → UNKNOWN → false).
+    InHash(usize, std::collections::HashSet<Value>, bool, bool),
+    Like(usize, String, bool),    // col[pos] LIKE pattern (negated bool)
+    IsNull(usize, bool),          // col[pos] IS NULL / IS NOT NULL
+    Between(usize, Value, Value), // col[pos] BETWEEN low AND high
+    And(Vec<CompiledWhere>),      // all must match (short-circuit)
+    Or(Vec<CompiledWhere>),       // any must match (short-circuit)
+    Not(Box<CompiledWhere>),      // negation
 }
 
 impl CompiledWhere {
@@ -1270,7 +1272,12 @@ impl CompiledWhere {
     fn eval(&self, row: &[Value]) -> Option<bool> {
         match self {
             CompiledWhere::Eq(pos, val) => {
-                // SQL: NULL = val → NULL (false). Value PartialEq already returns false for Null==NonNull.
+                // SQL: NULL = val → NULL (false). Value PartialEq already returns false for Null==NonNull,
+                // 🔑 但 Null == Null 在 Rust 里是 true —— NULL = NULL 必须显式
+                // 判 false（BUG #40，prepared `v = ?` 传 NULL 曾错误命中 NULL 行）。
+                if matches!(val, Value::Null) {
+                    return Some(false);
+                }
                 // 🔑 Bool/Int coercion: `flag = 1` should match a BOOLEAN TRUE.
                 // 🚀 快速路径：绝大多数列非 Bool，直接比较（零 clone）。
                 //    仅当任一方是 Bool 时才 coerce（flag=1 ↔ TRUE 场景）。
@@ -1317,8 +1324,8 @@ impl CompiledWhere {
                     .filter(|v| !matches!(v, Value::Null))
                     .is_some_and(|v| v >= val),
             ),
-            CompiledWhere::InHash(pos, set) => {
-                // SQL: NULL IN (...) → NULL (false)
+            CompiledWhere::InHash(pos, set, negated, has_null) => {
+                // SQL: NULL IN (...) → NULL (false); NULL NOT IN (...) → false
                 Some(row.get(*pos).is_some_and(|v| {
                     if matches!(v, Value::Null) {
                         return false;
@@ -1326,20 +1333,25 @@ impl CompiledWhere {
                     // 🔑 Bool↔Int coercion: normalize the column value the same
                     // way the set was normalized at compile time so a BOOLEAN
                     // column matches an integer IN list (TRUE IN (1)).
-                    set.contains(&normalize_for_in(v))
+                    let contains = set.contains(&normalize_for_in(v));
+                    if *negated {
+                        // x NOT IN (..., NULL): x 在集合中 → false；
+                        // x 不在 → UNKNOWN（因 NULL 可能等值）→ false
+                        !contains && !*has_null
+                    } else {
+                        contains
+                    }
                 }))
             }
             CompiledWhere::Like(pos, pattern, negated) => {
-                let matches = row
-                    .get(*pos)
-                    .and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(Self::like_match(s, pattern))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(false);
+                // 🔑 SQL 三值逻辑：NULL LIKE / NULL NOT LIKE → UNKNOWN → false
+                // （negated 不能翻转 NULL 的结果）。非文本类型交给原生求值。
+                let v = row.get(*pos)?;
+                let matches = match v {
+                    Value::Text(s) => Self::like_match(s, pattern),
+                    Value::Null => return Some(false),
+                    _ => return None,
+                };
                 Some(if *negated { !matches } else { matches })
             }
             CompiledWhere::IsNull(pos, negated) => {
@@ -1379,36 +1391,54 @@ impl CompiledWhere {
         let mut star_ti = None;
         let pbytes = pattern.as_bytes();
         let tbytes = text.as_bytes();
-        while pi < pbytes.len() {
-            if pbytes[pi] == b'%' {
-                pi += 1;
-                if pi >= pbytes.len() {
-                    return true;
-                } // trailing %
-                star_pi = Some(pi);
-                star_ti = Some(ti);
-            } else if ti < tbytes.len()
-                && (pbytes[pi] == b'_'
-                    || pbytes[pi] == tbytes[ti]
-                    || pbytes[pi].eq_ignore_ascii_case(&tbytes[ti]))
-            {
-                pi += 1;
-                ti += 1;
-            } else if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
-                // backtrack: consume one more char for the %
-                let new_ti = sti + 1;
-                ti = new_ti;
-                star_ti = Some(new_ti);
-                pi = spi;
+        loop {
+            if pi < pbytes.len() {
+                if pbytes[pi] == b'%' {
+                    pi += 1;
+                    if pi >= pbytes.len() {
+                        return true;
+                    } // trailing %
+                    star_pi = Some(pi);
+                    star_ti = Some(ti);
+                } else if ti < tbytes.len() && (pbytes[pi] == b'_' || pbytes[pi] == tbytes[ti]) {
+                    pi += 1;
+                    ti += 1;
+                } else if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
+                    // 🔑 回溯耗尽检查：star_ti 已到文本末尾意味着 % 已吞尽全部
+                    // 文本仍无法让后续模式字符匹配 —— 再回溯只会 ti 无限增长，
+                    // pi 原地弹跳 = 死循环（BUG #36，like("abc", "%x%") 即触发）。
+                    if sti >= tbytes.len() {
+                        return false;
+                    }
+                    // backtrack: consume one more char for the %
+                    let new_ti = sti + 1;
+                    ti = new_ti;
+                    star_ti = Some(new_ti);
+                    pi = spi;
+                } else {
+                    return false;
+                }
             } else {
-                return false;
+                // 模式耗尽：文本也必须耗尽，否则唯一机会是让上一个 % 吞掉
+                // 剩余文本前缀、把 star 之后的模式重新锚到更靠后的位置
+                //（后缀锚定模式如 '%a'：必须回溯到最后的 'a' 才能命中，
+                //  BUG #39 —— 旧代码在循环外直接判 ti>=len，'%a' 永不匹配）。
+                if ti >= tbytes.len() {
+                    return true;
+                }
+                if let (Some(spi), Some(sti)) = (star_pi, star_ti) {
+                    if sti >= tbytes.len() {
+                        return false;
+                    }
+                    let new_ti = sti + 1;
+                    ti = new_ti;
+                    star_ti = Some(new_ti);
+                    pi = spi;
+                } else {
+                    return false;
+                }
             }
         }
-        // skip trailing %s
-        while pi < pbytes.len() && pbytes[pi] == b'%' {
-            pi += 1;
-        }
-        ti >= tbytes.len()
     }
 
     /// Collect all column positions referenced by this compiled WHERE.
@@ -1421,7 +1451,7 @@ impl CompiledWhere {
             | CompiledWhere::Le(pos, _)
             | CompiledWhere::Gt(pos, _)
             | CompiledWhere::Ge(pos, _)
-            | CompiledWhere::InHash(pos, _)
+            | CompiledWhere::InHash(pos, ..)
             | CompiledWhere::Like(pos, _, _)
             | CompiledWhere::IsNull(pos, _)
             | CompiledWhere::Between(pos, _, _) => {
@@ -1445,6 +1475,10 @@ impl CompiledWhere {
         match self {
             CompiledWhere::Eq(pos, val) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
+                // 🔑 NULL = 任何值（含 NULL）→ UNKNOWN → false（BUG #40）
+                if matches!(val, Value::Null) {
+                    return Some(false);
+                }
                 Some(row.get(*idx).is_some_and(|v| {
                     let (a, b) = coerce_bool_int(v.clone(), val.clone());
                     a == b
@@ -1492,28 +1526,30 @@ impl CompiledWhere {
                         .is_some_and(|v| v >= val),
                 )
             }
-            CompiledWhere::InHash(pos, set) => {
+            CompiledWhere::InHash(pos, set, negated, has_null) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 Some(row.get(*idx).is_some_and(|v| {
                     if matches!(v, Value::Null) {
                         return false;
                     }
                     // 🔑 Bool↔Int coercion (see CompiledWhere::InHash above).
-                    set.contains(&normalize_for_in(v))
+                    let contains = set.contains(&normalize_for_in(v));
+                    if *negated {
+                        !contains && !*has_null
+                    } else {
+                        contains
+                    }
                 }))
             }
             CompiledWhere::Like(pos, pattern, negated) => {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
-                let matches = row
-                    .get(*idx)
-                    .and_then(|v| {
-                        if let Value::Text(s) = v {
-                            Some(Self::like_match(s, pattern))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(false);
+                // 🔑 同上：NULL LIKE/NOT LIKE → false，非文本回退原生求值
+                let v = row.get(*idx)?;
+                let matches = match v {
+                    Value::Text(s) => Self::like_match(s, pattern),
+                    Value::Null => return Some(false),
+                    _ => return None,
+                };
                 Some(if *negated { !matches } else { matches })
             }
             CompiledWhere::IsNull(pos, negated) => {
@@ -11278,6 +11314,15 @@ impl QueryExecutor {
         // reads persisted segments, so unflushed inserts would be invisible.
         let _ = store.flush_buffer();
         let has_subquery = Self::expr_contains_subquery(wc);
+        // 🔥 WHERE 编译一次（列位置预解析）：eval_expr_on_row 每行每个列引用
+        // 都做 get_column_position 字符串线性查找 —— profile 显示占扫描 CPU
+        // 的 ~9%（还有随行的 Value::clone）。简单谓词全部走 CompiledWhere
+        // 的纯位置比较；编译不了（复杂表达式）或单行 eval 返回 None 时回退。
+        let compiled: Option<CompiledWhere> = if has_subquery {
+            None
+        } else {
+            Self::compile_where(wc, schema)
+        };
         let mut rows = Vec::new();
         let mut skipped = 0usize;
         for (_key, _ts, row) in store.scan() {
@@ -11290,6 +11335,16 @@ impl QueryExecutor {
                     Ok(Value::Integer(i)) => i != 0,
                     Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
                     _ => false,
+                }
+            } else if let Some(cw) = compiled.as_ref() {
+                match cw.eval(&row) {
+                    Some(b) => b,
+                    None => match Self::eval_expr_on_row(wc, &row, schema) {
+                        Ok(Value::Bool(b)) => b,
+                        Ok(Value::Integer(i)) => i != 0,
+                        Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+                        _ => false,
+                    },
                 }
             } else {
                 match Self::eval_expr_on_row(wc, &row, schema) {
@@ -12261,7 +12316,7 @@ impl QueryExecutor {
     ) -> Option<Result<StreamingQueryResult>> {
         // Only handle a top-level non-negated InHash (no AND/OR/NOT wrapping)
         let (col_pos, values) = match compiled_where {
-            CompiledWhere::InHash(pos, set) => (*pos, set.clone()),
+            CompiledWhere::InHash(pos, set, negated, _) if !*negated => (*pos, set.clone()),
             _ => return None,
         };
 
@@ -12427,6 +12482,26 @@ impl QueryExecutor {
         true
     }
 
+    /// Per-row WHERE truthiness: prefer the pre-compiled predicate (pure
+    /// positional compare), fall back to positional eval when the compiled
+    /// form can't decide (eval → None) or was never compiled.
+    fn compiled_or_eval_row(
+        compiled: Option<&CompiledWhere>,
+        fallback_expr: &Expr,
+        row: &[Value],
+        schema: &TableSchema,
+    ) -> bool {
+        if let Some(cw) = compiled {
+            match cw.eval(row) {
+                Some(b) => return b,
+                None => {}
+            }
+        }
+        Self::eval_expr_on_row(fallback_expr, row, schema)
+            .map(|v| Self::is_truthy(&v))
+            .unwrap_or(false)
+    }
+
     /// Compile a WHERE expression into a `CompiledWhere` with pre-resolved column positions.
     /// Returns `None` if the expression is too complex for the compiled path.
     fn compile_where(expr: &Expr, schema: &TableSchema) -> Option<CompiledWhere> {
@@ -12448,6 +12523,14 @@ impl QueryExecutor {
                         // Simple comparison: left must be a column, right a literal (or vice versa)
                         let (col_pos, op_val, cmp_val) =
                             Self::extract_col_literal_cmp(left, right, op, schema)?;
+                        // 🔑 字面量侧为 NULL 时不编译：Value 的 Ord 对 Null 有
+                        // 任意全序（Null 最小），10 > NULL 会算成 true —— 而 SQL
+                        // 语义是与 NULL 比较恒 UNKNOWN → false（物化后的标量子
+                        // 查询如 v > (SELECT MAX(x) FROM empty) 即 NULL，BUG #43）。
+                        // 回退 eval_expr_on_row 的正确三值逻辑。
+                        if matches!(cmp_val, Value::Null) {
+                            return None;
+                        }
                         Some(match op_val {
                             BinaryOperator::Eq => CompiledWhere::Eq(col_pos, cmp_val),
                             BinaryOperator::Ne => CompiledWhere::Ne(col_pos, cmp_val),
@@ -12463,7 +12546,7 @@ impl QueryExecutor {
             Expr::In {
                 expr,
                 list,
-                negated: _,
+                negated,
             } => {
                 if let Expr::Column(col_name) = expr.as_ref() {
                     let pos = schema.get_column_position(if col_name.contains('.') {
@@ -12472,6 +12555,10 @@ impl QueryExecutor {
                         col_name
                     })?;
                     if list.iter().all(|e| matches!(e, Expr::Literal(_))) {
+                        // 🔑 NOT IN 的 negated 必须传下去 —— 旧代码丢弃它，
+                        // 把 NOT IN 静默编译成 IN（BUG #37）。has_null 驱动
+                        // 三值逻辑：x NOT IN (…, NULL) → UNKNOWN → false。
+                        let has_null = list.iter().any(|e| matches!(e, Expr::Literal(Value::Null)));
                         let set: std::collections::HashSet<Value> = list
                             .iter()
                             .filter_map(|e| {
@@ -12482,7 +12569,7 @@ impl QueryExecutor {
                                 }
                             })
                             .collect();
-                        Some(CompiledWhere::InHash(pos, set))
+                        Some(CompiledWhere::InHash(pos, set, *negated, has_null))
                     } else {
                         None
                     }
@@ -12495,8 +12582,8 @@ impl QueryExecutor {
             Expr::InHashset {
                 expr,
                 set,
-                negated: _,
-                has_null: _,
+                negated,
+                has_null,
             } => {
                 if let Expr::Column(col_name) = expr.as_ref() {
                     let pos = schema.get_column_position(if col_name.contains('.') {
@@ -12508,7 +12595,7 @@ impl QueryExecutor {
                     // integer-valued subquery set (and vice versa).
                     let set: std::collections::HashSet<Value> =
                         set.iter().map(normalize_for_in).collect();
-                    Some(CompiledWhere::InHash(pos, set))
+                    Some(CompiledWhere::InHash(pos, set, *negated, *has_null))
                 } else {
                     None
                 }
@@ -12547,10 +12634,14 @@ impl QueryExecutor {
             }
             Expr::UnaryOp {
                 op: UnaryOperator::Not,
-                expr: inner,
+                expr: _inner,
             } => {
-                let compiled = Self::compile_where(inner, schema)?;
-                Some(CompiledWhere::Not(Box::new(compiled)))
+                // 🔑 NOT 不编译：Some<bool> 表示法无法区分 false 与 UNKNOWN
+                //（Gt 对 NULL 返回 Some(false)），Not 翻转会把 UNKNOWN 变
+                // true —— `WHERE NOT v > 20` 曾错误命中 NULL 行（BUG #42）。
+                // 回退 eval_expr_on_row（正确的三值逻辑）。NOT IS NULL 语义
+                // 已由 IsNull(negated) 覆盖。
+                None
             }
             _ => None,
         }
@@ -18813,13 +18904,30 @@ impl QueryExecutor {
                 .materialize_subqueries_checked(where_clause, Some(schema))
                 .unwrap_or_else(|_| where_clause.clone());
             let where_clause = &resolved_where;
+            // 🔥 编译一次（列位置预解析）—— 每行做 get_column_position 字符串
+            // 查找的旧路径是扫描 CPU 的显著份额
+            let compiled = Self::compile_where(where_clause, schema);
             let mut matching = Vec::new();
             for result in row_iter {
                 let (_row_id, row) = result?;
-                match Self::eval_expr_on_row(where_clause, &row, schema) {
-                    Ok(Value::Bool(true)) => matching.push(row),
-                    Ok(_) => {}                // false or null -> skip
-                    Err(_) => return Ok(None), // can't evaluate positionally
+                let hit = if let Some(cw) = compiled.as_ref() {
+                    match cw.eval(&row) {
+                        Some(b) => b,
+                        None => match Self::eval_expr_on_row(where_clause, &row, schema) {
+                            Ok(Value::Bool(b)) => b,
+                            Ok(_) => false,
+                            Err(_) => return Ok(None),
+                        },
+                    }
+                } else {
+                    match Self::eval_expr_on_row(where_clause, &row, schema) {
+                        Ok(Value::Bool(b)) => b,
+                        Ok(_) => false,
+                        Err(_) => return Ok(None),
+                    }
+                };
+                if hit {
+                    matching.push(row);
                 }
             }
             matching
@@ -19241,21 +19349,41 @@ impl QueryExecutor {
                 let mut scanned = store.scan_projected_filtered(None, &needed_cols, &|_| true);
                 if has_where {
                     let clause = where_clause.as_ref().unwrap();
+                    // 🔥 WHERE 编译一次 + 全宽评估缓冲复用：旧路径每行分配
+                    // vec![Null; ncol]、克隆全部 needed 值，再用字符串解析列名
+                    // 的 eval_expr_on_row 评估 —— GROUP BY 比普通过滤慢 40%
+                    // 的主因。每个 needed 槽位每行都会被覆写（缺失即写
+                    // Null），非 needed 槽恒为 Null，复用安全。
+                    let compiled = Self::compile_where(clause, schema);
                     let ncol = schema.columns.len();
-                    scanned.retain(|(_, prow)| {
-                        let mut full = vec![Value::Null; ncol];
+                    let mut full = vec![Value::Null; ncol];
+                    let mut keep: Vec<_> = Vec::with_capacity(scanned.len());
+                    for entry in scanned.drain(..) {
+                        let prow = &entry.1;
                         for (i, &sp) in needed_cols.iter().enumerate() {
                             if sp < ncol {
-                                if let Some(v) = prow.get(i) {
-                                    full[sp] = v.clone();
-                                }
+                                full[sp] = prow.get(i).cloned().unwrap_or(Value::Null);
                             }
                         }
-                        matches!(
-                            Self::eval_expr_on_row(clause, &full, schema),
-                            Ok(Value::Bool(true))
-                        )
-                    });
+                        let hit = if let Some(cw) = compiled.as_ref() {
+                            match cw.eval(&full) {
+                                Some(b) => b,
+                                None => matches!(
+                                    Self::eval_expr_on_row(clause, &full, schema),
+                                    Ok(Value::Bool(true))
+                                ),
+                            }
+                        } else {
+                            matches!(
+                                Self::eval_expr_on_row(clause, &full, schema),
+                                Ok(Value::Bool(true))
+                            )
+                        };
+                        if hit {
+                            keep.push(entry);
+                        }
+                    }
+                    scanned = keep;
                 }
                 Some(scanned.into_iter().map(|(_, r)| r).collect())
             } else {
@@ -20046,19 +20174,33 @@ impl QueryExecutor {
         let mut projected_rows: Vec<Vec<Value>> = if stmt.where_clause.is_some() {
             let row_iter = self.db.scan_table_rows_streaming(table_name)?;
             let where_clause = stmt.where_clause.as_ref().unwrap();
+            // 🔥 编译一次：避免每行的列名字符串解析
+            let compiled = Self::compile_where(where_clause, schema);
             let mut matching = Vec::new();
             for result in row_iter {
                 let (_, row) = result?;
-                match Self::eval_expr_on_row(where_clause, &row, schema) {
-                    Ok(Value::Bool(true)) => {
-                        let projected: Vec<Value> = col_positions
-                            .iter()
-                            .map(|pos| pos.and_then(|p| row.get(p)).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        matching.push(projected);
+                let hit = if let Some(cw) = compiled.as_ref() {
+                    match cw.eval(&row) {
+                        Some(b) => b,
+                        None => match Self::eval_expr_on_row(where_clause, &row, schema) {
+                            Ok(Value::Bool(b)) => b,
+                            Ok(_) => false,
+                            Err(_) => return Ok(None),
+                        },
                     }
-                    Ok(_) => {}
-                    Err(_) => return Ok(None),
+                } else {
+                    match Self::eval_expr_on_row(where_clause, &row, schema) {
+                        Ok(Value::Bool(b)) => b,
+                        Ok(_) => false,
+                        Err(_) => return Ok(None),
+                    }
+                };
+                if hit {
+                    let projected: Vec<Value> = col_positions
+                        .iter()
+                        .map(|pos| pos.and_then(|p| row.get(p)).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    matching.push(projected);
                 }
             }
             matching
@@ -20778,6 +20920,12 @@ impl QueryExecutor {
 
         let mut affected_rows = 0;
 
+        // 🔥 WHERE 编译一次（列位置预解析）：旧路径每行每个列引用都做
+        // get_column_position 字符串线性查找
+        let compiled_where: Option<CompiledWhere> = resolved_where
+            .as_ref()
+            .and_then(|wc| Self::compile_where(wc, &schema));
+
         // 🔑 In transaction mode, also process rows from the write_set
         // (uncommitted INSERTs). These rows are NOT in storage yet, so the
         // scan above doesn't see them. Without this, `UPDATE t SET v=99
@@ -20794,9 +20942,7 @@ impl QueryExecutor {
 
             // WHERE filter using positional evaluation (no HashMap)
             let should_update = if let Some(ref where_clause) = resolved_where {
-                Self::eval_expr_on_row(where_clause, &row, &schema)
-                    .map(|v| Self::is_truthy(&v))
-                    .unwrap_or(false)
+                Self::compiled_or_eval_row(compiled_where.as_ref(), where_clause, &row, &schema)
             } else {
                 true
             };
@@ -20873,9 +21019,7 @@ impl QueryExecutor {
         for (ws_row_id, ws_row) in &txn_rows {
             let row = ws_row.clone();
             let should_update = if let Some(ref where_clause) = resolved_where {
-                Self::eval_expr_on_row(where_clause, &row, &schema)
-                    .map(|v| Self::is_truthy(&v))
-                    .unwrap_or(false)
+                Self::compiled_or_eval_row(compiled_where.as_ref(), where_clause, &row, &schema)
             } else {
                 true
             };
