@@ -1307,22 +1307,62 @@ impl CompiledWhere {
             CompiledWhere::Lt(pos, val) => Some(
                 row.get(*pos)
                     .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| v < val),
+                    .is_some_and(|v| {
+                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
+                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
+                        //（BUG #44，差分对拍捕获）。
+                        if needs_bool_coerce(v, val) {
+                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                            a < b
+                        } else {
+                            v < val
+                        }
+                    }),
             ),
             CompiledWhere::Le(pos, val) => Some(
                 row.get(*pos)
                     .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| v <= val),
+                    .is_some_and(|v| {
+                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
+                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
+                        //（BUG #44，差分对拍捕获）。
+                        if needs_bool_coerce(v, val) {
+                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                            a <= b
+                        } else {
+                            v <= val
+                        }
+                    }),
             ),
             CompiledWhere::Gt(pos, val) => Some(
                 row.get(*pos)
                     .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| v > val),
+                    .is_some_and(|v| {
+                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
+                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
+                        //（BUG #44，差分对拍捕获）。
+                        if needs_bool_coerce(v, val) {
+                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                            a > b
+                        } else {
+                            v > val
+                        }
+                    }),
             ),
             CompiledWhere::Ge(pos, val) => Some(
                 row.get(*pos)
                     .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| v >= val),
+                    .is_some_and(|v| {
+                        // 🔑 Bool↔Int 强制转换（与 Eq 一致）：-3 < TRUE 应按
+                        // -3 < 1 判 —— Value 的 Ord 对跨类型是任意全序
+                        //（BUG #44，差分对拍捕获）。
+                        if needs_bool_coerce(v, val) {
+                            let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                            a >= b
+                        } else {
+                            v >= val
+                        }
+                    }),
             ),
             CompiledWhere::InHash(pos, set, negated, has_null) => {
                 // SQL: NULL IN (...) → NULL (false); NULL NOT IN (...) → false
@@ -1499,7 +1539,14 @@ impl CompiledWhere {
                 Some(
                     row.get(*idx)
                         .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| v < val),
+                        .is_some_and(|v| {
+                            if needs_bool_coerce(v, val) {
+                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                                a < b
+                            } else {
+                                v < val
+                            }
+                        }),
                 )
             }
             CompiledWhere::Le(pos, val) => {
@@ -1507,7 +1554,14 @@ impl CompiledWhere {
                 Some(
                     row.get(*idx)
                         .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| v <= val),
+                        .is_some_and(|v| {
+                            if needs_bool_coerce(v, val) {
+                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                                a <= b
+                            } else {
+                                v <= val
+                            }
+                        }),
                 )
             }
             CompiledWhere::Gt(pos, val) => {
@@ -1515,7 +1569,14 @@ impl CompiledWhere {
                 Some(
                     row.get(*idx)
                         .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| v > val),
+                        .is_some_and(|v| {
+                            if needs_bool_coerce(v, val) {
+                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                                a > b
+                            } else {
+                                v > val
+                            }
+                        }),
                 )
             }
             CompiledWhere::Ge(pos, val) => {
@@ -1523,7 +1584,14 @@ impl CompiledWhere {
                 Some(
                     row.get(*idx)
                         .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| v >= val),
+                        .is_some_and(|v| {
+                            if needs_bool_coerce(v, val) {
+                                let (a, b) = coerce_bool_int(v.clone(), val.clone());
+                                a >= b
+                            } else {
+                                v >= val
+                            }
+                        }),
                 )
             }
             CompiledWhere::InHash(pos, set, negated, has_null) => {
@@ -25403,5 +25471,251 @@ mod tests {
             QueryExecutor::eval_expr_on_row(&sub, &r, &schema).is_err(),
             "Unsupported expression should return Err for fallback path"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 差分对拍：CompiledWhere（编译谓词）vs eval_expr_on_row（原生求值）
+    //
+    // 第 17 轮把 CompiledWhere 接入热路径后暴露了 8 个潜伏语义 bug
+    // （#36-#43）。本测试把"接线暴露"变成"系统穷举"：对编译器声称
+    // 支持的每个谓词形态 × 每行（NULL/类型混用/大小写），两个求值器
+    // 的"行是否保留"必须一致。
+    // ════════════════════════════════════════════════════════════════════
+
+    fn diff_schema() -> TableSchema {
+        use crate::types::ColumnType as CT;
+        let cols: Vec<(&str, CT)> = vec![
+            ("i", CT::Integer),
+            ("t", CT::Text),
+            ("f", CT::Float),
+            ("b", CT::Boolean),
+        ];
+        TableSchema::new(
+            "diff".into(),
+            cols.iter()
+                .enumerate()
+                .map(|(pos, (name, ct))| ColumnDef {
+                    name: (*name).into(),
+                    col_type: ct.clone(),
+                    position: pos,
+                    nullable: true,
+                    auto_increment: false,
+                    auto_increment_start: None,
+                    default_value: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn diff_rows() -> Vec<Row> {
+        vec![
+            vec![
+                Value::Integer(5),
+                Value::Text("Apple".into()),
+                Value::Float(2.5),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::Integer(-3),
+                Value::Text("apple".into()),
+                Value::Float(-0.5),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::Integer(0),
+                Value::Text("APPLE".into()),
+                Value::Float(0.0),
+                Value::Null,
+            ],
+            vec![Value::Null, Value::Null, Value::Null, Value::Bool(true)],
+            // 类型混用：整数列放 Float、文本列放 Integer（宽容转换场景）
+            vec![
+                Value::Integer(5),
+                Value::Integer(65),
+                Value::Integer(3),
+                Value::Integer(1),
+            ],
+        ]
+    }
+
+    fn native_keep(expr: &Expr, row: &Row, schema: &TableSchema) -> bool {
+        match QueryExecutor::eval_expr_on_row(expr, row, schema) {
+            Ok(Value::Bool(b)) => b,
+            Ok(Value::Integer(i)) => i != 0,
+            Ok(Value::Float(f)) => f != 0.0 && !f.is_nan(),
+            _ => false,
+        }
+    }
+
+    fn diff_predicates() -> Vec<Expr> {
+        use crate::sql::ast::BinaryOperator as B;
+        let cols = ["i", "t", "f", "b"];
+        let lits = vec![
+            Value::Integer(5),
+            Value::Integer(-3),
+            Value::Integer(0),
+            Value::Float(2.5),
+            Value::Text("Apple".into()),
+            Value::Text("apple".into()),
+            Value::Bool(true),
+            Value::Null,
+        ];
+        let mut out: Vec<Expr> = Vec::new();
+        for c in cols {
+            for l in &lits {
+                for op in [B::Eq, B::Ne, B::Lt, B::Le, B::Gt, B::Ge] {
+                    out.push(Expr::BinaryOp {
+                        left: Box::new(Expr::Column(c.into())),
+                        op,
+                        right: Box::new(Expr::Literal(l.clone())),
+                    });
+                }
+            }
+            // IN / NOT IN（含 NULL 成员）
+            for (list, neg) in [
+                (vec![Value::Integer(5), Value::Integer(-3)], false),
+                (vec![Value::Integer(5), Value::Integer(-3)], true),
+                (vec![Value::Integer(5), Value::Null], true),
+                (vec![Value::Text("apple".into())], true),
+                (vec![], false),
+            ] {
+                out.push(Expr::In {
+                    expr: Box::new(Expr::Column(c.into())),
+                    list: list.into_iter().map(Expr::Literal).collect(),
+                    negated: neg,
+                });
+            }
+            // LIKE / NOT LIKE（各锚定形态 + 大小写）
+            for (p, neg) in [
+                ("app%", false),
+                ("%ple", false),
+                ("%p%", false),
+                ("a__le", false),
+                ("%", false),
+                ("_", false),
+                ("Apple", false),
+                ("%X%", false),
+                ("%", true),
+                ("app%", true),
+            ] {
+                out.push(Expr::Like {
+                    expr: Box::new(Expr::Column(c.into())),
+                    pattern: Box::new(Expr::Literal(Value::Text(p.into()))),
+                    negated: neg,
+                });
+            }
+            // IS NULL / IS NOT NULL
+            out.push(Expr::IsNull {
+                expr: Box::new(Expr::Column(c.into())),
+                negated: false,
+            });
+            out.push(Expr::IsNull {
+                expr: Box::new(Expr::Column(c.into())),
+                negated: true,
+            });
+        }
+        // InHashset（子查询物化形态）× has_null × negated —— 原生路径的
+        // NOT IN + NULL 三值逻辑从未与编译版对拍过
+        for (set_vals, has_null, neg) in [
+            (vec![Value::Integer(5), Value::Integer(-3)], false, false),
+            (vec![Value::Integer(5), Value::Integer(-3)], false, true),
+            (vec![Value::Integer(5)], true, true),
+            (vec![Value::Text("apple".into())], false, true),
+        ] {
+            out.push(Expr::InHashset {
+                expr: Box::new(Expr::Column("i".into())),
+                set: set_vals.into_iter().collect(),
+                negated: neg,
+                has_null,
+            });
+        }
+        // AND / OR 组合（比较 ∧/∨ IN、比较 ∧ LIKE、嵌套 OR）
+        out.push(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("i".into())),
+                op: B::Gt,
+                right: Box::new(Expr::Literal(Value::Integer(0))),
+            }),
+            op: B::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("f".into())),
+                op: B::Lt,
+                right: Box::new(Expr::Literal(Value::Float(3.0))),
+            }),
+        });
+        out.push(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("i".into())),
+                op: B::Eq,
+                right: Box::new(Expr::Literal(Value::Integer(5))),
+            }),
+            op: B::Or,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("b".into())),
+                op: B::Eq,
+                right: Box::new(Expr::Literal(Value::Bool(true))),
+            }),
+        });
+        out.push(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("i".into())),
+                    op: B::Ge,
+                    right: Box::new(Expr::Literal(Value::Integer(-3))),
+                }),
+                op: B::Or,
+                right: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column("f".into())),
+                    op: B::Ne,
+                    right: Box::new(Expr::Literal(Value::Float(0.0))),
+                }),
+            }),
+            op: B::And,
+            right: Box::new(Expr::Like {
+                expr: Box::new(Expr::Column("t".into())),
+                pattern: Box::new(Expr::Literal(Value::Text("%p%".into()))),
+                negated: false,
+            }),
+        });
+        out
+    }
+
+    #[test]
+    fn test_compiled_vs_native_equivalence() {
+        let schema = diff_schema();
+        let rows = diff_rows();
+        let mut checked = 0usize;
+        let mut compiled_forms = 0usize;
+        for expr in diff_predicates() {
+            let Some(cw) = QueryExecutor::compile_where(&expr, &schema) else {
+                continue;
+            };
+            compiled_forms += 1;
+            for row in &rows {
+                let Some(compiled) = cw.eval(row) else {
+                    continue; // 编译器自身要求回退（如非文本 LIKE）
+                };
+                let native = native_keep(&expr, row, &schema);
+                assert_eq!(compiled, native, "divergence: expr={expr:?}\nrow={row:?}");
+                checked += 1;
+            }
+            // eval_at（部分解码路径）在完整映射下必须与 eval 一致
+            let pos_to_idx: Vec<Option<usize>> = (0..schema.columns.len()).map(Some).collect();
+            for row in &rows {
+                let a = cw.eval(row);
+                let b = cw.eval_at(row, &pos_to_idx);
+                if let (Some(x), Some(y)) = (a, b) {
+                    assert_eq!(
+                        x, y,
+                        "eval vs eval_at divergence: expr={expr:?} row={row:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            compiled_forms >= 200,
+            "predicate coverage too small: {compiled_forms}"
+        );
+        assert!(checked >= 1000, "row-level checks too small: {checked}");
     }
 }

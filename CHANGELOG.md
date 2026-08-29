@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### 可靠性第十八轮（谓词差分对拍 —— 1 个真 bug + 两个新测试战线）
+
+- **修复：编译版比较操作符缺 Bool↔Int 强制转换（BUG #44，差分对拍
+  捕获）。** Lt/Le/Gt/Ge 直接用 Value 的 Ord —— 跨类型是任意全序
+  （Bool 排前），`-3 < TRUE` 算成 false；原生路径经 coerce_bool_int 按
+  `-3 < 1` = true。Eq 早有 needs_bool_coerce，四个不等号比较（eval 与
+  eval_at 共 8 处）补齐同样的转换。
+- **新增战线一：编译谓词 vs 原生求值器的系统差分对拍（executor 单元
+  测试）。** 穷举 ~215 个谓词形态（6 操作符 × 4 类型列 × 8 字面量含
+  NULL/Bool/大小写文本、IN/NOT IN 含 NULL 成员、InHashset×has_null×
+  negated、LIKE 10 种锚定、IS NULL、AND/OR/NOT 嵌套）× 5 行类型混用
+  数据，断言两个求值器"行是否保留"一致 + eval 与 eval_at 一致。
+  下限断言保证覆盖不退化（≥200 形态、≥1000 行级断言）。
+- **新增战线二：引擎级等价查询对拍（tests/test_query_equivalence.rs，
+  13 测试）。** 同一谓词的两种 SQL 写法结果集必须一致：IN vs OR 链、
+  NOT IN vs AND 链（含 NULL 语义）、BETWEEN vs 区间、NOT 分配律、
+  IN(x,NULL) vs OR(x,NULL)、Bool 字面量三态（TRUE/1/裸列）、LIKE∪NOT
+  LIKE=非 NULL 全集、GROUP BY 聚合 vs 手工求值、COUNT(*) vs COUNT(col)、
+  UPDATE WHERE 触达集 = SELECT WHERE 结果集。
+
 ### 性能/可靠性第十七轮（WHERE 编译提升 —— 过滤扫描 2×、GROUP BY 1.7× + 2 个真 bug）
 
 - **优化：扫描热路径的 WHERE 编译一次（列位置预解析）。** profile 显示
