@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### 可靠性第十九轮（prepared DML 静默无效 —— 1 个 Critical + 参数替换贯通）
+
+- **修复：`execute_prepared` 对 UPDATE/DELETE 静默无效（BUG #45，
+  Critical）。** `UPDATE t SET v = 0 WHERE id = ?` 报 affected=1 但**行
+  原样不动**、`DELETE ... WHERE v = ? AND id > ?` 报成功但行不消失。
+  三层根因叠加：
+  1. **fast-PK 路径丢 SET 字面量**（主因）：`WHERE <pk> = ?` 命中
+     `execute_fast_pk_with_meta`，其 update 分支只应用 SET 里的
+     **Parameter** 赋值（set_param_positions），字面量赋值被静默丢弃 ——
+     克隆旧行原样写回还报 affected=1。FastPkMeta 增加
+     `set_literal_positions`（含负号折叠 UnaryOp(Minus, Literal)），
+     update 先应用字面量再应用参数。
+  2. **WHERE 参数不进执行器**：execute_streaming_ref 的 UPDATE/DELETE
+     分支现做参数替换（substitute_params_mutation，复用 SELECT 的
+     substitute_expr）—— 旧路径逐行求值遇 Expr::Parameter 返回 Err 被
+     `.unwrap_or(false)` 吞成"不匹配"，affected=0 但 Ok。
+  3. api 层 try_fast_update 等 literal 路径一直正常（对照实验锁定）。
+- **已知限制记录**：`LIMIT ?`/`OFFSET ?` 参数化不支持（解析器要求
+  字面量数字）—— 方言缺口非正确性问题，参数化分页暂用拼接 SQL。
+- **新增 tests/test_prepared_dml.rs**（8 测试）：字面量/参数/混合/
+  负数字面量 SET、双参数 DELETE、非 PK WHERE 形状、SELECT-DML 交错
+  （同语句缓存）、checkpoint 持久化往返；三路读回（row API/PK 点查/
+  全扫）一致性断言。
+
 ### 可靠性第十八轮（谓词差分对拍 —— 1 个真 bug + 两个新测试战线）
 
 - **修复：编译版比较操作符缺 Bool↔Int 强制转换（BUG #44，差分对拍

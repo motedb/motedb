@@ -2188,13 +2188,25 @@ impl QueryExecutor {
                 _ => unreachable!("execute_explain always returns Select"),
             },
             Statement::Update(u) => {
-                let result = self.execute_update(u.clone())?;
+                // 🔑 参数替换（BUG #45）：prepared UPDATE/DELETE 的 WHERE/SET
+                // 曾不被解析 —— 逐行求值遇 Parameter 返回 Err 被
+                // unwrap_or(false) 吞掉，静默 0 行受影响但返回 Ok。
+                let mut owned = u.clone();
+                let mut assignments = std::mem::take(&mut owned.assignments);
+                self.do_substitute_params_mutation(
+                    &mut owned.where_clause,
+                    Some(&mut assignments),
+                )?;
+                owned.assignments = assignments;
+                let result = self.execute_update(owned)?;
                 StreamingQueryResult::Modification {
                     affected_rows: result.affected_rows(),
                 }
             }
             Statement::Delete(d) => {
-                let result = self.execute_delete(d.clone())?;
+                let mut owned = d.clone();
+                self.do_substitute_params_mutation(&mut owned.where_clause, None)?;
+                let result = self.execute_delete(owned)?;
                 StreamingQueryResult::Modification {
                     affected_rows: result.affected_rows(),
                 }
@@ -12996,6 +13008,33 @@ impl QueryExecutor {
             having: stmt.having.clone(),
             latest_by: stmt.latest_by.clone(),
         })
+    }
+
+    /// 🔑 UPDATE/DELETE 入口的参数替换：eval_expr_on_row 遇到 Parameter
+    /// 返回 Err，而 UPDATE 的 WHERE 求值用 `.unwrap_or(false)` 吞掉 Err ——
+    /// prepared UPDATE/DELETE 曾全部静默无效（affected 0 行但 Ok）。
+    /// SELECT 有 substitute_params_stmt；UPDATE/DELETE 在此对 WHERE 与
+    /// SET 表达式做同样的 Literal 替换。
+    fn do_substitute_params_mutation(
+        self: &Self,
+        expr: &mut Option<Expr>,
+        assignments: Option<&mut Vec<(String, Expr)>>,
+    ) -> Result<()> {
+        let params = self.evaluator.get_params();
+        if params.is_empty() {
+            return Ok(());
+        }
+        let sub = |e: &Expr| -> Result<Expr> { Self::substitute_expr(e, &params) };
+        if let Some(w) = expr {
+            let replaced = sub(w)?;
+            *w = replaced;
+        }
+        if let Some(assigns) = assignments {
+            for (_, e) in assigns.iter_mut() {
+                *e = sub(e)?;
+            }
+        }
+        Ok(())
     }
 
     /// Recursively substitute Parameter nodes in an expression tree.

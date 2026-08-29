@@ -33,6 +33,11 @@ struct FastPkMeta {
     select_col_positions: Vec<usize>,
     /// Only for UPDATE: (col_position, param_idx) for SET col = ?
     set_param_positions: Vec<(usize, usize)>,
+    /// Only for UPDATE: (col_position, literal) for SET col = <literal>.
+    /// 🔑 字面量赋值必须单独保存 —— fast 路径曾只应用 Parameter 赋值，
+    /// `UPDATE t SET v = 0 WHERE id = ?` 的 SET 被静默丢弃，克隆旧行
+    /// 原样写回还报 affected=1（BUG #45）。
+    set_literal_positions: Vec<(usize, crate::types::Value)>,
     is_auto_increment: bool,
     column_names: Arc<Vec<String>>,
     schema: Arc<crate::types::TableSchema>,
@@ -799,24 +804,50 @@ impl Database {
             vec![]
         };
 
-        // For UPDATE: detect SET col = ? patterns
-        let set_param_positions: Vec<(usize, usize)> = if stmt_type == "update" {
+        // For UPDATE: detect SET col = ? patterns AND SET col = <literal>
+        let (set_param_positions, set_literal_positions) = if stmt_type == "update" {
             if let S::Update(s) = statement {
-                s.assignments
-                    .iter()
-                    .filter_map(|(col_name, expr)| {
-                        if let Expr::Parameter(idx) = expr {
-                            schema.get_column_position(col_name).map(|pos| (pos, *idx))
-                        } else {
-                            None
+                let mut params_out: Vec<(usize, usize)> = Vec::new();
+                let mut literals_out: Vec<(usize, crate::types::Value)> = Vec::new();
+                for (col_name, expr) in &s.assignments {
+                    match expr {
+                        Expr::Parameter(idx) => {
+                            if let Some(pos) = schema.get_column_position(col_name) {
+                                params_out.push((pos, *idx));
+                            }
                         }
-                    })
-                    .collect()
+                        // 🔑 字面量（含负号折叠 UnaryOp(Minus, Literal)）也要
+                        // 应用 —— 否则 fast 路径丢 SET（BUG #45）
+                        Expr::Literal(v) => {
+                            if let Some(pos) = schema.get_column_position(col_name) {
+                                literals_out.push((pos, v.clone()));
+                            }
+                        }
+                        Expr::UnaryOp {
+                            op: crate::sql::ast::UnaryOperator::Minus,
+                            expr: inner,
+                        } => {
+                            if let (Some(pos), Expr::Literal(crate::types::Value::Integer(i))) =
+                                (schema.get_column_position(col_name), inner.as_ref())
+                            {
+                                literals_out.push((pos, crate::types::Value::Integer(-*i)));
+                            } else if let (
+                                Some(pos),
+                                Expr::Literal(crate::types::Value::Float(f)),
+                            ) = (schema.get_column_position(col_name), inner.as_ref())
+                            {
+                                literals_out.push((pos, crate::types::Value::Float(-*f)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (params_out, literals_out)
             } else {
-                vec![]
+                (vec![], vec![])
             }
         } else {
-            vec![]
+            (vec![], vec![])
         };
 
         Ok(Some(FastPkMeta {
@@ -826,6 +857,7 @@ impl Database {
             is_star,
             select_col_positions,
             set_param_positions,
+            set_literal_positions,
             is_auto_increment: schema.is_primary_key_auto_increment(),
             column_names: schema.column_names_arc(),
             schema,
@@ -928,6 +960,13 @@ impl Database {
                         }
                     };
                 let mut new_row = (*old_row_arc).clone();
+                // 🔑 SET col = <literal> 必须应用 —— 见 FastPkMeta 注释
+                for &(col_pos, ref literal) in &meta.set_literal_positions {
+                    while new_row.len() <= col_pos {
+                        new_row.push(Value::Null);
+                    }
+                    new_row[col_pos] = literal.clone();
+                }
                 for &(col_pos, param_idx) in &meta.set_param_positions {
                     if let Some(new_val) = params.get(param_idx - 1) {
                         while new_row.len() <= col_pos {
