@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### 可靠性第二十轮（死锁专项 —— 双压力测试零死锁 + 锁序审计）
+
+- **死锁专项验证（无新 bug，两项资产转正）**：
+  1. **混合负载压力**（15s，7 类并发：checkpoint 循环、backup 循环、
+     双写者 INSERT+UPDATE、UPDATE/DELETE churn、SELECT 点查+扫描、
+     CREATE/DROP TABLE churn）—— 全程心跳推进无停滞。
+  2. **硬核混合压力**（20s，6 类并发：VACUUM 循环、checkpoint 循环、
+     显式事务+savepoint 回滚 churn、prepared DML、FTS 索引 CREATE/DROP
+     +搜索、双表并发写删）—— 同样零死锁。
+  两者都用**心跳看门狗**（5 秒窗口无任何线程进展即判死锁）。
+- **锁序静态审计**：确认 `checkpoint_mutex → autocommit stripes →
+  write_lock` 单向获取无环（backup_to 大锁=全条带+全局；写者单条带或
+  全局二选一；checkpoint/flush 持 checkpoint_mutex 不反向取条带）。
+  本会话早前已修复的死锁类 bug（DiskGraph 自死锁、commit ctx 自死锁、
+  backup 屏障重排）在压力下均未复发。
+- **新增 tests/test_deadlock_stress.rs**（2 测试，CI 时长 15s+20s）。
+
 ### 可靠性第十九轮（prepared DML 静默无效 —— 1 个 Critical + 参数替换贯通）
 
 - **修复：`execute_prepared` 对 UPDATE/DELETE 静默无效（BUG #45，
