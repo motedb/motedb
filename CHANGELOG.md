@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### 性能第二十一轮（回归审计 —— 全维度无退化）
+
+对照本会话历史基准逐项复测：perf_smoke 六项全部持平或更好（full_scan
+11.57ms、text_eq 2.55ms、group_by 1.57ms、count_sum 3.50ms、order_topk
+5.50ms、in_subquery 13.31ms）；并发写 single 283 ops/s / 4 线程 540
+ops/s（R16 优化后水平）；PK 点查单线程 1.75M ops/s、4 线程 1.72M（+12%）；
+批量插入 500K 4.63s、2.97M rows/s（vs SQLite 2.70M）；过滤扫描 36ms、
+GROUP BY 同口径 29.6ms（R17 优化后水平）；小表干净重开 7.8ms（R8 时的
+19ms 更快）；内存 221B/行（vs SQLite 335B）。点更新 3.79ms vs 3.5ms
+（+8%，fsync 类基准的噪声区间内）。SQLite 对照格局不变（赢 5 输 6，
+全部行数一致）。**结论：19 轮修复/优化无性能回退。**
+新增 examples/bench_profile_hot.rs（含参考数字的防退化工作负载基准）。
+
 ### 可靠性第二十轮（死锁专项 —— 双压力测试零死锁 + 锁序审计）
 
 - **死锁专项验证（无新 bug，两项资产转正）**：
