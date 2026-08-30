@@ -1316,7 +1316,13 @@ impl MoteDB {
 
         // 🚀 Columnar tombstone is the source of truth. LSM delete removed.
         // Columnar tombstone below marks the row deleted in all reads.
-        {
+        // 🔑 与 INSERT/UPDATE 相同的守卫（此前 DELETE 漏掉，BUG #46）：对
+        // ColSegmentStore 表，legacy 墓碑通道是多余的 —— add_values 携带
+        // 完整旧行数据在内存累积，VACUUM 3a finish() 落盘成 indexes/
+        // {table}_col.sst = 被删行的完整尸体文件（磁盘 = 活数据 + 尸体，
+        // 实测删一半后 VACUUM 磁盘反涨 85%）。S9 路径已把墓碑写进
+        // ColSegmentStore write_buf（见下），可见性由它保证。
+        if !self.col_segment_stores.contains_key(table_name) {
             use dashmap::mapref::entry::Entry;
             let builder_arc = match self.columnar_write_bufs.entry(table_name.to_string()) {
                 Entry::Occupied(o) => o.get().clone(),

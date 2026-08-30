@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### 可靠性/存储第二十二轮（资源审计 —— 修复删除尸体文件 BUG #46）
+
+- **资源画像（磁盘）**：500K 行×4 列 checkpoint 后 48.6 B/行（columnar_ms
+  占绝对主体）；VACUUM 紧凑产物 48.7 B/行（与原始二进制载荷 32 B/行
+  比 1.5×，含时间戳/墓碑空间/段元数据）；对照 SQLite（无索引 rowid 表+
+  VACUUM 后）18.7 B/行——口径偏 SQLite 最优。UPDATE 膨胀正常（200K
+  更新后 1.67×），DELETE 触发段合并可自愈。
+- **资源画像（内存）**：空库 4.3MB；500K 行稳态 71 B/行（纯插入后）；
+  全扫峰值 +28MB 后回落；10 轮重复扫描 RSS 有涨有落（jemalloc 归还
+  行为），末轮 Δ=48KB 趋稳——无单调泄漏。vs SQLite 221 B/行 vs 335。
+- **修复：DELETE 落盘被删行完整尸体（BUG #46，审计中发现）**。DELETE
+  往 legacy columnar_write_bufs 写墓碑时**携带完整旧行数据**，且缺少
+  INSERT/UPDATE 都有的 ColSegmentStore 守卫 —— VACUUM 3a 把缓冲
+  finish() 成 indexes/{table}_col.sst = 每一条被删行的完整尸体文件。
+  后果：磁盘 = 活数据 + 删者尸体（实测删一半后 VACUUM 磁盘反涨 85%，
+  500K 表删 250K 后留 12MB 尸体）；且每行 DELETE 多一次全行 clone+锁。
+  补守卫后：60K 场景 VACUUM 产物 2.92→1.46MB（正好单份活数据），
+  尸体文件不再产生。正确性全程无恙（无复活、幸存行完好、崩溃注入
+  7/7）。
+- **新增 tests/test_disk_bloat.rs**（2 测试）：删半后 VACUUM 不得增长
+  磁盘 + 尸体文件不得物化；UPDATE churn 后 VACUUM 必须回收。
+- 新增 examples/bench_disk.rs（磁盘审计基准）。
+
 ### 性能第二十一轮（回归审计 —— 全维度无退化）
 
 对照本会话历史基准逐项复测：perf_smoke 六项全部持平或更好（full_scan
