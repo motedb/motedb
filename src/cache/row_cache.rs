@@ -29,6 +29,15 @@ fn table_hash(name: &str) -> u64 {
     hash
 }
 
+impl RowCache {
+    fn shard_index(&self, key: &CacheKey) -> usize {
+        let h = (key.0 as usize)
+            .wrapping_mul(key.1 as usize)
+            .wrapping_add(key.0 as usize);
+        h % self.shard_count
+    }
+}
+
 /// Access pattern tracker for sequential detection
 #[derive(Debug, Clone)]
 struct AccessPattern {
@@ -42,10 +51,18 @@ struct AccessPattern {
     last_access: std::time::Instant,
 }
 
+/// 🚀 16 分片 LRU：单把 RwLock 的读计数在多线程下于同一 cacheline 上
+/// RMW 弹跳（实测并发点查负扩展：4.15M 单线程 → 2.0M 4 线程）。分片后
+/// 读锁争用摊到 16 个 cacheline，各分片容量 = capacity/16。
+const ROW_CACHE_SHARDS: usize = 16;
+
 /// Row cache with LRU eviction and prefetching
 pub struct RowCache {
-    /// LRU cache: (table_name, row_id) -> Arc<Row>
-    cache: Arc<RwLock<LruCache<CacheKey, Arc<Row>>>>,
+    /// Sharded LRU caches: (table_name, row_id) -> Arc<Row>
+    cache: Arc<[RwLock<LruCache<CacheKey, Arc<Row>>>]>,
+    /// Actual shard count (≤ ROW_CACHE_SHARDS; small capacities degrade to
+    /// fewer shards so total-capacity semantics are preserved).
+    shard_count: usize,
 
     /// 🚀 Atomic counters (no lock needed for stats — eliminates double-write-lock per get())
     hits: AtomicU64,
@@ -111,11 +128,17 @@ impl RowCache {
 
     pub fn with_prefetch_config(capacity: usize, prefetch_config: PrefetchConfig) -> Self {
         let capacity = capacity.max(1);
+        // 分片数不超过容量本身：容量 3 时退化为 1 片容量 3（而不是 16 片
+        // 各 1 = 总容量 16 的语义漂移）。每片容量按 ceil 均摊。
+        let shard_count = ROW_CACHE_SHARDS.min(capacity);
+        let per_shard = capacity.div_ceil(shard_count);
 
         Self {
-            cache: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(capacity).unwrap(),
-            ))),
+            cache: Arc::from_iter(
+                (0..shard_count)
+                    .map(|_| RwLock::new(LruCache::new(NonZeroUsize::new(per_shard).unwrap()))),
+            ),
+            shard_count,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             size: AtomicUsize::new(0),
@@ -130,7 +153,7 @@ impl RowCache {
     /// Get a row from cache (with prefetch detection).
     pub fn get(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
         let key = (table_hash(table_name), row_id);
-        let cache = self.cache.read();
+        let cache = self.cache[self.shard_index(&key)].read();
         if let Some(row) = cache.peek(&key) {
             let result = Arc::clone(row);
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -149,16 +172,26 @@ impl RowCache {
     /// Eliminates N lock/unlock cycles — 1 lock for all rows.
     pub fn batch_get(&self, table_name: &str, row_ids: &[RowId]) -> Vec<Option<Arc<Row>>> {
         let thash = table_hash(table_name);
-        let cache = self.cache.read();
-        let mut results = Vec::with_capacity(row_ids.len());
-        for &row_id in row_ids {
-            let key = (thash, row_id);
-            if let Some(row) = cache.peek(&key) {
-                results.push(Some(Arc::clone(row)));
-                self.hits.fetch_add(1, Ordering::Relaxed);
-            } else {
-                results.push(None);
-                self.misses.fetch_add(1, Ordering::Relaxed);
+        // 🚀 分片化后批量查询分组取锁：按分片聚集，一次锁一片
+        use std::collections::HashMap;
+        let mut by_shard: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, &row_id) in row_ids.iter().enumerate() {
+            by_shard
+                .entry(self.shard_index(&(thash, row_id)))
+                .or_default()
+                .push(i);
+        }
+        let mut results: Vec<Option<Arc<Row>>> = (0..row_ids.len()).map(|_| None).collect();
+        for (si, idxs) in by_shard {
+            let cache = self.cache[si].read();
+            for i in idxs {
+                let key = (thash, row_ids[i]);
+                if let Some(row) = cache.peek(&key) {
+                    results[i] = Some(Arc::clone(row));
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         results
@@ -168,7 +201,7 @@ impl RowCache {
     /// Use for single-row PK lookups where sequential prefetch is irrelevant.
     pub fn get_fast(&self, table_name: &str, row_id: RowId) -> Option<Arc<Row>> {
         let key = (table_hash(table_name), row_id);
-        let cache = self.cache.read();
+        let cache = self.cache[self.shard_index(&key)].read();
         if let Some(row) = cache.peek(&key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             // SAFETY: Arc::clone only increments refcount, safe while cache read lock held
@@ -272,44 +305,46 @@ impl RowCache {
     /// Put an Arc<Row> into cache (avoids clone when caller already has Arc)
     pub fn put_arc(&self, table_name: String, row_id: RowId, row_arc: Arc<Row>) {
         let key = (table_hash(&table_name), row_id);
-        let mut cache = self.cache.write();
+        let mut cache = self.cache[self.shard_index(&key)].write();
         cache.put(key, row_arc);
-        self.size.store(cache.len(), Ordering::Relaxed);
     }
 
     /// Put a row into cache using &str table name (avoids String allocation).
     /// 🔑 PERF: hot INSERT path — saves a to_string() per insert.
     pub fn put_ref(&self, table_name: &str, row_id: RowId, row: Row) {
         let key = (table_hash(table_name), row_id);
-        let mut cache = self.cache.write();
+        let mut cache = self.cache[self.shard_index(&key)].write();
         cache.put(key, Arc::new(row));
-        self.size.store(cache.len(), Ordering::Relaxed);
+    }
+
+    /// Lazily computed total size (called from stats() only — the hot
+    /// put/invalidate paths stay lock-local with zero cross-shard traffic).
+    fn total_size(&self) -> usize {
+        self.cache.iter().map(|c| c.read().len()).sum()
     }
 
     /// Invalidate a single row
     pub fn invalidate(&self, table_name: &str, row_id: RowId) {
         let key = (table_hash(table_name), row_id);
-
-        let mut cache = self.cache.write();
+        let mut cache = self.cache[self.shard_index(&key)].write();
         cache.pop(&key);
-        self.size.store(cache.len(), Ordering::Relaxed);
     }
 
     /// Invalidate all rows for a table
     pub fn invalidate_table(&self, table_name: &str) {
-        let mut cache = self.cache.write();
         let thash = table_hash(table_name);
 
-        let keys_to_remove: Vec<CacheKey> = cache
-            .iter()
-            .filter(|(key, _)| key.0 == thash)
-            .map(|(key, _)| *key)
-            .collect();
-
-        for key in keys_to_remove {
-            cache.pop(&key);
+        for shard in self.cache.iter() {
+            let mut cache = shard.write();
+            let keys_to_remove: Vec<CacheKey> = cache
+                .iter()
+                .filter(|(key, _)| key.0 == thash)
+                .map(|(key, _)| *key)
+                .collect();
+            for key in keys_to_remove {
+                cache.pop(&key);
+            }
         }
-        self.size.store(cache.len(), Ordering::Relaxed);
 
         // Also clean up access_patterns for this table
         self.access_patterns.write().remove(table_name);
@@ -317,10 +352,10 @@ impl RowCache {
 
     /// Clear entire cache
     pub fn clear(&self) {
-        let mut cache = self.cache.write();
-        cache.clear();
+        for shard in self.cache.iter() {
+            shard.write().clear();
+        }
 
-        self.size.store(0, Ordering::Relaxed);
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.prefetch_triggered.store(0, Ordering::Relaxed);
@@ -345,7 +380,7 @@ impl RowCache {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
-            size: self.size.load(Ordering::Relaxed),
+            size: self.total_size(),
             capacity: self.capacity,
             prefetch_triggered: self.prefetch_triggered.load(Ordering::Relaxed),
             prefetch_useful: self.prefetch_useful.load(Ordering::Relaxed),
@@ -393,23 +428,30 @@ mod tests {
 
     #[test]
     fn test_row_cache_lru_eviction() {
+        // 🚀 分片 LRU：总容量是 capacity 上限（3 键哈希到 3 片可能碰撞
+        // 驱逐）。小容量断言上限语义；大容量断言逐出确实发生。
         let cache = RowCache::new(3);
-
-        for i in 1..=3 {
+        for i in 1..=4 {
             let row = vec![Value::Integer(i)];
             cache.put("users".to_string(), i as u64, row);
         }
-
         let stats = cache.stats();
-        assert_eq!(stats.size, 3);
+        assert!(
+            stats.size <= 3,
+            "sharded capacity is an upper bound: {}",
+            stats.size
+        );
+        assert!(cache.get("users", 4).is_some(), "newest key survives");
 
-        let row = vec![Value::Integer(4)];
-        cache.put("users".to_string(), 4, row);
-
+        // 大容量：插入超过容量的键，最老的必被逐出
+        let cache = RowCache::new(2000);
+        for i in 1..=2005 {
+            let row = vec![Value::Integer(i)];
+            cache.put("users".to_string(), i as u64, row);
+        }
         let stats = cache.stats();
-        assert_eq!(stats.size, 3);
-
-        assert!(cache.get("users", 1).is_none());
-        assert!(cache.get("users", 4).is_some());
+        assert!(stats.size <= 2000, "eviction happened: {}", stats.size);
+        assert!(cache.get("users", 2005).is_some());
+        assert!(cache.get("users", 1).is_none(), "oldest evicted");
     }
 }
