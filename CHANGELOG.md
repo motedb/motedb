@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### 性能第二十四轮（SQL execute 四重去串行化 —— 消灭共享锁 cacheline 弹跳）
+
+上轮把 get_row 修成正扩展后，execute 仍 0.66× 负扩展。逐个排查该路径
+上"每次调用拿一把共享锁"的点并全部消灭：
+
+- **stmt_cache → DashMap + 解析移出锁外**：单 RwLock<LruCache> 每次
+  execute 读写；miss 时 **Lexer+Parser 在写锁内跑**，全部线程串行排队。
+  现为分片读（DashMap）+ 各线程并行解析、仅插入瞬间占用各自分片；
+  越界（2×cap）整体收缩。
+- **ColSegmentStore.segments → ArcSwap**：每次点查拿 VecDeque 读锁。
+  段列表读多写极少（仅 flush/merge 变更），ArcSwap 读侧完全无锁
+  （load Arc 即返回），写侧 rcu/快照重建（25 个使用点全转换，合并/重开
+  路径逐一验证）。
+- **TableRegistry.schema_cache → ArcSwap**：get_table 每次 execute 拿
+  读锁。同病同治，读侧零锁。
+- **contains_aggregate_function 零分配化**：旧实现每次 execute
+  to_uppercase() 分配整段 String。残余瓶颈实测为 jemalloc arena 互斥
+  （每 execute ~7 次小分配 × 4 线程 × 百万级/秒）—— 本项消其一。
+
+实测：execute 4 线程 1.28M → **~1.95M ops/s（+48%）**；get_row 4t
+维持 3.4-4.0M 正扩展。残余为分配受限（jemalloc），已记后续项。
+
 ### 性能第二十三轮（RowCache 分片 —— 并发点查负扩展修正）
 
 - **优化：RowCache 16 分片化 —— 并发点查从负扩展修正为正扩展。** 分层

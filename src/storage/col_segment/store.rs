@@ -175,7 +175,12 @@ pub struct ColSegmentStore {
     table_name: String,
     dir: PathBuf,
     /// Active segments in ascending creation order (oldest first, newest at back).
-    segments: RwLock<VecDeque<Arc<Segment>>>,
+    /// 🚀 ArcSwap 段列表：点查热路径每次 store.get 都要拿读锁 —— 单把
+    /// RwLock 的读计数在多核下同一 cacheline 弹跳（并发负扩展的第二个
+    /// 来源，与 row_cache 同病）。段列表读多写极少（仅 flush/merge 变更），
+    /// ArcSwap 读侧完全无锁（load Arc 即返回）。Vec 语义：index 0 最旧、
+    /// 末尾最新（与旧 VecDeque front/back 一致，iter/iter().rev() 等价）。
+    segments: arc_swap::ArcSwap<Vec<Arc<Segment>>>,
     /// In-memory write buffer. Flushed as a delta segment (does not read old data).
     write_buf: Mutex<ColumnarSSTableBuilder>,
     /// Write lock serializing flush_buffer + merge_segments. Without this, a
@@ -241,7 +246,7 @@ impl ColSegmentStore {
         let store = Arc::new(Self {
             table_name: table_name.to_string(),
             dir,
-            segments: RwLock::new(VecDeque::new()),
+            segments: arc_swap::ArcSwap::from_pointee(Vec::new()),
             write_buf: Mutex::new(write_buf),
             flush_merge_lock: parking_lot::Mutex::new(()),
             next_segment_id: AtomicU64::new(1),
@@ -260,6 +265,11 @@ impl ColSegmentStore {
             store.recover_from_disk();
         }
         Ok(store)
+    }
+
+    /// Lock-free segment snapshot (Arc clone) for read paths.
+    fn segs(&self) -> Arc<Vec<Arc<Segment>>> {
+        self.segments.load_full()
     }
 
     /// 🚀 设置 compact_storage 模式（zstd 压缩 Fixed/Text 列）。
@@ -382,7 +392,7 @@ impl ColSegmentStore {
         //    and writes a fresh N-column segment. We unconditionally compact
         //    even a single segment (force_compact_all skips single-segment
         //    tables, which would leave the layout mismatch in place).
-        let old_segs: Vec<Arc<Segment>> = self.segments.read().iter().cloned().collect();
+        let old_segs: Vec<Arc<Segment>> = self.segs().iter().cloned().collect();
         if !old_segs.is_empty() {
             // merge_segments_locked — we already hold flush_merge_lock above
             // (calling merge_segments would deadlock: parking_lot::Mutex is
@@ -436,7 +446,11 @@ impl ColSegmentStore {
         let seg = Arc::new(Segment::open(&path, id)?);
         // Record in manifest (fsync'd) BEFORE exposing in memory.
         self.manifest.lock().add_segment(id)?;
-        self.segments.write().push_back(seg);
+        {
+            let mut list = self.segs().as_ref().clone();
+            list.push(seg);
+            self.segments.store(Arc::new(list));
+        }
         // Invalidate all query caches (data changed).
         self.groupby_cache.write().clear();
         self.in_hash_cache.write().clear();
@@ -459,7 +473,7 @@ impl ColSegmentStore {
         // Snapshot segment ids (for file deletion), then clear in-memory state.
         let segs = self.segments_snapshot();
         let seg_ids: Vec<u64> = segs.iter().map(|s| s.id).collect();
-        self.segments.write().clear();
+        self.segments.store(Arc::new(Vec::new()));
         // Clear the write buffer by finishing (no-op if empty) then draining.
         // The builder has no public clear(); we just leave it — the store is
         // being removed from the registry anyway, so a new store is created on
@@ -491,7 +505,7 @@ impl ColSegmentStore {
         if self.buffered_count.load(Ordering::Relaxed) > 0 {
             self.flush_buffer()?;
         }
-        let segs = self.segments.read();
+        let segs = self.segs();
         if segs.len() >= COMPACTION_SEGMENT_THRESHOLD {
             drop(segs);
             let _ = self.force_compact_all();
@@ -546,7 +560,7 @@ impl ColSegmentStore {
                 return Some(row);
             }
         }
-        let segs = self.segments.read();
+        let segs = self.segs();
         for seg in segs.iter().rev() {
             // Check if this segment contains the key using the sparse fence
             // index (O(1) memory, ~16KB disk read for the key block).
@@ -579,7 +593,7 @@ impl ColSegmentStore {
     /// Full-table ordered scan via multi-way merge. Newest version wins.
     pub fn scan(&self) -> MergeCursor {
         let col_types = self.col_types.load();
-        let segs: Vec<Arc<Segment>> = self.segments.read().iter().cloned().collect();
+        let segs: Vec<Arc<Segment>> = self.segs().iter().cloned().collect();
         MergeCursor::new(&segs, &col_types)
     }
 
@@ -624,7 +638,7 @@ impl ColSegmentStore {
         // Snapshot col_types once for the whole scan — guards against a
         // concurrent ALTER swapping in a new layout mid-scan.
         let col_types = self.col_types.load();
-        let total_rows: usize = self.segments.read().iter().map(|s| s.sst.num_rows).sum();
+        let total_rows: usize = self.segs().iter().map(|s| s.sst.num_rows).sum();
         let mut result: Vec<(u64, Vec<Value>)> =
             Vec::with_capacity(total_rows.min(max_results).min(65536));
         if max_results == 0 {
@@ -1660,7 +1674,7 @@ impl ColSegmentStore {
     }
 
     pub fn segment_count(&self) -> usize {
-        self.segments.read().len()
+        self.segs().len()
     }
 
     /// 🚀 Combined scan + row build for text-equality WHERE queries.
@@ -1907,7 +1921,7 @@ impl ColSegmentStore {
     /// Snapshot of active segments (oldest→newest). Callers iterate directly
     /// for single-column reads (e.g. CREATE INDEX) without full-row decode.
     pub fn segments_snapshot(&self) -> Vec<Arc<Segment>> {
-        self.segments.read().iter().cloned().collect()
+        self.segs().iter().cloned().collect()
     }
 
     /// Release mmap pages + clear col caches to reduce RSS after queries.
@@ -1917,7 +1931,7 @@ impl ColSegmentStore {
     /// fast (no re-faulting). mmap pages count against OS page cache, not heap.
     /// Call after batch queries to release decode-cache heap allocations.
     pub fn release_query_memory(&self) {
-        let segs = self.segments.read();
+        let segs = self.segs();
         for seg in segs.iter() {
             seg.clear_all_caches();
             seg.release_pages();
@@ -1928,7 +1942,7 @@ impl ColSegmentStore {
     /// Release mmap pages WITHOUT clearing col_cache. Keeps decoded column
     /// data in heap for fast repeated aggregate queries.
     pub fn release_pages_only(&self) {
-        let segs = self.segments.read();
+        let segs = self.segs();
         for seg in segs.iter() {
             seg.release_pages();
             seg.sst.advise_dontneed();
@@ -1944,7 +1958,7 @@ impl ColSegmentStore {
     /// queries to prevent decoded column data from accumulating, while keeping
     /// mmap pages resident for fast point queries.
     pub fn clear_cache(&self) {
-        let segs = self.segments.read();
+        let segs = self.segs();
         for seg in segs.iter() {
             seg.clear_all_caches();
         }
@@ -1958,7 +1972,7 @@ impl ColSegmentStore {
     pub fn latest_segment_sst(
         &self,
     ) -> Option<Arc<crate::storage::lsm::columnar::ColumnarSSTable>> {
-        self.segments.read().back().map(|seg| Arc::clone(&seg.sst))
+        self.segs().last().map(|seg| Arc::clone(&seg.sst))
     }
 
     /// Number of rows currently buffered in memory (not yet flushed to a segment).
@@ -1979,7 +1993,7 @@ impl ColSegmentStore {
         // segments. A single compacted segment with empty buffer is the only
         // safe no-dedup case.
         let buf_n = self.write_buf.lock().num_rows;
-        let seg_count = self.segments.read().len();
+        let seg_count = self.segs().len();
         buf_n > 0 && seg_count >= 1 || seg_count >= 2
     }
 
@@ -2006,7 +2020,7 @@ impl ColSegmentStore {
         // also locks write_buf — parking_lot Mutex is not reentrant → deadlock).
         let need_dedup = self.may_have_duplicate_keys();
         let buf = self.write_buf.lock();
-        let segs = self.segments.read();
+        let segs = self.segs();
         let mut seen: std::collections::HashSet<u64> = if need_dedup {
             std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
         } else {
@@ -2467,7 +2481,7 @@ impl ColSegmentStore {
         // This covers the common case (fresh insert, no UPDATE/DELETE history).
         let buf = self.write_buf.lock();
         let buf_count = buf.num_rows;
-        let segs = self.segments.read();
+        let segs = self.segs();
         if segs.len() == 1 && buf_count == 0 {
             let seg = &segs[0];
             if !seg.sst.row_map.has_any_deleted() {
@@ -3411,25 +3425,24 @@ impl ColSegmentStore {
         self.next_segment_id.store(max_id + 1, Ordering::Relaxed);
 
         // Load each active segment.
-        let mut segs = self.segments.write();
+        let mut loaded: Vec<Arc<Segment>> = Vec::new();
         let mut loaded_ids: Vec<u64> = Vec::new();
         for &id in &state.active_segments {
             let path = self.dir.join(format!("{:010}.sst", id));
             if path.exists() {
                 if let Ok(seg) = Segment::open(&path, id) {
-                    segs.push_back(Arc::new(seg));
+                    loaded.push(Arc::new(seg));
                     loaded_ids.push(id);
                 }
             }
         }
+        self.segments.store(Arc::new(loaded));
         // Clean up obsolete files (superseded by compaction but not yet GC'd).
         for &id in &state.obsolete_files {
             let path = self.dir.join(format!("{:010}.sst", id));
             let _ = std::fs::remove_file(&path);
         }
 
-        // Sort segments by id (creation order).
-        segs.make_contiguous();
         // Already in push order (ascending id) — correct.
     }
 
@@ -3441,7 +3454,7 @@ impl ColSegmentStore {
     }
 
     pub fn needs_compaction(&self) -> bool {
-        self.segments.read().len() >= COMPACTION_SEGMENT_THRESHOLD
+        self.segs().len() >= COMPACTION_SEGMENT_THRESHOLD
     }
 
     /// Run one compaction pass (synchronous; called by bg thread or test).
@@ -3449,7 +3462,7 @@ impl ColSegmentStore {
     /// tombstoned/superseded versions.
     pub fn compact_once(&self) -> Result<()> {
         let old_segs: Vec<Arc<Segment>> = {
-            let segs = self.segments.read();
+            let segs = self.segs();
             if segs.len() < COMPACTION_SEGMENT_THRESHOLD {
                 return Ok(());
             }
@@ -3463,7 +3476,7 @@ impl ColSegmentStore {
     /// the complete dataset in a single SSTable. No-op if < 2 segments.
     pub fn force_compact_all(&self) -> Result<()> {
         let old_segs: Vec<Arc<Segment>> = {
-            let segs = self.segments.read();
+            let segs = self.segs();
             if segs.len() < 2 {
                 return Ok(());
             }
@@ -3480,7 +3493,7 @@ impl ColSegmentStore {
         for (key, _) in self.write_buf.lock().latest_entries() {
             max = max.max(key & 0xFFFFFFFF);
         }
-        for seg in self.segments.read().iter() {
+        for seg in self.segs().iter() {
             let _ = seg.sst.load_full_keys();
             for i in 0..seg.sst.num_rows {
                 let key = seg.sst.row_map.key(i);
@@ -3900,20 +3913,20 @@ impl ColSegmentStore {
         // Record compaction in manifest FIRST (crash safety), then swap memory.
         self.manifest.lock().record_compaction(id, &old_ids)?;
         {
-            let mut segs = self.segments.write();
             let old_set: std::collections::HashSet<u64> = old_ids.iter().copied().collect();
-            let new_list: VecDeque<Arc<Segment>> = segs
+            let mut new_list: Vec<Arc<Segment>> = self
+                .segs()
                 .iter()
                 .filter(|s| !old_set.contains(&s.id))
                 .cloned()
                 .collect();
-            *segs = new_list;
-            segs.push_back(new_seg);
+            new_list.push(new_seg);
+            self.segments.store(Arc::new(new_list));
         }
 
         // Clear column caches + release mmap pages to keep peak RSS low.
         {
-            let segs = self.segments.read();
+            let segs = self.segs();
             for seg in segs.iter() {
                 seg.clear_all_caches();
                 seg.release_pages();

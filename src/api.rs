@@ -16,8 +16,6 @@ use crate::sql::StreamingQueryResult;
 use crate::types::{Row, RowId, SqlRow, Value};
 use crate::StorageError;
 use crate::{DBConfig, Result};
-use lru::LruCache;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -109,7 +107,11 @@ pub struct Database {
     inner: Arc<MoteDB>,
     /// 🚀 Prepared statement cache: SQL string → CachedStmt
     /// Uses RwLock for concurrent reads + Arc<Statement> for O(1) clone on cache hit
-    stmt_cache: Arc<parking_lot::RwLock<LruCache<String, CachedStmt>>>,
+    /// 🚀 DashMap（分片锁）语句缓存：单把 RwLock 曾把并发 execute 的
+    /// 读取/写入全部串行化（miss 时 Lexer+Parser 还在写锁内）。分片锁
+    /// + 解析移出锁外后并发解析近线性。越界（2×cap）整体收缩。
+    stmt_cache: Arc<dashmap::DashMap<String, CachedStmt>>,
+    stmt_cache_cap: usize,
     /// Reused QueryExecutor — avoids per-call allocation of pattern_cache, optimizer state
     query_executor: crate::sql::QueryExecutor,
 }
@@ -130,9 +132,8 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
-                NonZeroUsize::new(256).unwrap(),
-            ))),
+            stmt_cache: Arc::new(dashmap::DashMap::new()),
+            stmt_cache_cap: 256,
             query_executor,
         })
     }
@@ -154,9 +155,8 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
-                NonZeroUsize::new(256).unwrap(),
-            ))),
+            stmt_cache: Arc::new(dashmap::DashMap::new()),
+            stmt_cache_cap: 256,
             query_executor,
         })
     }
@@ -172,9 +172,8 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
-                NonZeroUsize::new(256).unwrap(),
-            ))),
+            stmt_cache: Arc::new(dashmap::DashMap::new()),
+            stmt_cache_cap: 256,
             query_executor,
         })
     }
@@ -191,9 +190,8 @@ impl Database {
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
-            stmt_cache: Arc::new(parking_lot::RwLock::new(LruCache::new(
-                NonZeroUsize::new(256).unwrap(),
-            ))),
+            stmt_cache: Arc::new(dashmap::DashMap::new()),
+            stmt_cache_cap: 256,
             query_executor,
         })
     }
@@ -557,31 +555,21 @@ impl Database {
             }
         }
 
-        // 🚀 Prepared statement cache: skip re-parsing on repeated queries
+        // 🚀 Prepared statement cache: skip re-parsing on repeated queries.
+        // 🔑 分片读（DashMap）+ 解析在锁外：旧路径 miss 时在写锁内跑
+        // Lexer+Parser，全部线程串行排队；现在各线程并行解析，仅在
+        // 插入瞬间占用各自分片。
         let statement: Arc<Statement> = {
-            let read_cache = self.stmt_cache.read();
-            if let Some(cached) = read_cache.peek(sql) {
+            if let Some(cached) = self.stmt_cache.get(sql) {
                 Arc::clone(&cached.stmt)
             } else {
-                drop(read_cache);
-                let mut cache = self.stmt_cache.write();
-                if let Some(cached) = cache.get(sql) {
-                    Arc::clone(&cached.stmt)
-                } else {
-                    let mut lexer = Lexer::new(sql);
-                    let tokens = lexer.tokenize()?;
-                    let mut parser = Parser::new(tokens);
-                    let stmt = parser.parse()?;
-                    let stmt_arc = Arc::new(stmt);
-                    cache.put(
-                        sql.to_string(),
-                        CachedStmt {
-                            stmt: Arc::clone(&stmt_arc),
-                            fast_pk: None,
-                        },
-                    );
-                    stmt_arc
-                }
+                let mut lexer = Lexer::new(sql);
+                let tokens = lexer.tokenize()?;
+                let mut parser = Parser::new(tokens);
+                let stmt = parser.parse()?;
+                let stmt_arc = Arc::new(stmt);
+                self.insert_stmt_cached(sql.to_string(), &stmt_arc);
+                stmt_arc
             }
         };
 
@@ -620,10 +608,10 @@ impl Database {
             ));
         }
 
-        // Get or parse the statement — check for cached fast PK metadata
+        // Get or parse the statement — check for cached fast PK metadata.
+        // 🔑 同 execute()：分片读 + 解析在锁外。
         let (statement, cached_fast_pk): (Arc<Statement>, bool) = {
-            let read_cache = self.stmt_cache.read();
-            if let Some(cached) = read_cache.peek(sql) {
+            if let Some(cached) = self.stmt_cache.get(sql) {
                 // 🚀 Fast path: use pre-computed PK metadata
                 if let Some(ref meta) = cached.fast_pk {
                     if let Some(result) = self.execute_fast_pk_with_meta(meta, &params)? {
@@ -635,33 +623,13 @@ impl Database {
                     (Arc::clone(&cached.stmt), false)
                 }
             } else {
-                drop(read_cache);
-                let mut cache = self.stmt_cache.write();
-                if let Some(cached) = cache.get(sql) {
-                    if let Some(ref meta) = cached.fast_pk {
-                        if let Some(result) = self.execute_fast_pk_with_meta(meta, &params)? {
-                            return Ok(result);
-                        }
-                        // PK cache miss — fall through to full path.
-                        (Arc::clone(&cached.stmt), false)
-                    } else {
-                        (Arc::clone(&cached.stmt), false)
-                    }
-                } else {
-                    let mut lexer = Lexer::new(sql);
-                    let tokens = lexer.tokenize()?;
-                    let mut parser = Parser::new(tokens);
-                    let stmt = parser.parse()?;
-                    let stmt_arc = Arc::new(stmt);
-                    cache.put(
-                        sql.to_string(),
-                        CachedStmt {
-                            stmt: Arc::clone(&stmt_arc),
-                            fast_pk: None,
-                        },
-                    );
-                    (stmt_arc, true)
-                }
+                let mut lexer = Lexer::new(sql);
+                let tokens = lexer.tokenize()?;
+                let mut parser = Parser::new(tokens);
+                let stmt = parser.parse()?;
+                let stmt_arc = Arc::new(stmt);
+                self.insert_stmt_cached(sql.to_string(), &stmt_arc);
+                (stmt_arc, true)
             }
         };
 
@@ -671,11 +639,8 @@ impl Database {
                 // Execute using the metadata we just computed (no extra lock)
                 if let Some(result) = self.execute_fast_pk_with_meta(&meta, &params)? {
                     // Cache for future calls (write lock only, no read-back)
-                    {
-                        let mut cache = self.stmt_cache.write();
-                        if let Some(cached) = cache.get_mut(sql) {
-                            cached.fast_pk = Some(meta);
-                        }
+                    if let Some(mut cached) = self.stmt_cache.get_mut(sql) {
+                        cached.fast_pk = Some(meta);
                     }
                     return Ok(result);
                 }
@@ -707,6 +672,22 @@ impl Database {
         let result = self.query_executor.execute_streaming_ref(&statement);
         self.query_executor.clear_params();
         result
+    }
+
+    /// Insert into the statement cache with a coarse bound: beyond 2×cap
+    /// the map is cleared wholesale (statement working sets are small; a
+    /// clear triggers a bounded re-parse burst, sub-ms for ≤512 entries).
+    fn insert_stmt_cached(&self, sql: String, stmt: &Arc<Statement>) {
+        self.stmt_cache.insert(
+            sql,
+            CachedStmt {
+                stmt: Arc::clone(stmt),
+                fast_pk: None,
+            },
+        );
+        if self.stmt_cache.len() >= self.stmt_cache_cap * 2 {
+            self.stmt_cache.clear();
+        }
     }
 
     /// Detect if a statement is a simple PK SELECT pattern.
@@ -1870,24 +1851,32 @@ impl Database {
     /// Check if a SELECT column expression contains aggregate functions.
     /// Returns true if any of COUNT, SUM, AVG, MIN, MAX are found (case-insensitive).
     fn contains_aggregate_function(select_part: &str) -> bool {
-        let upper = select_part.to_uppercase();
-        for keyword in &["COUNT", "SUM", "AVG", "MIN", "MAX"] {
-            if upper.contains(keyword) {
-                // Verify it's a word, not part of a column name like "max_value"
-                // Simple check: preceded by non-alphanumeric or start-of-string
-                if let Some(pos) = upper.find(keyword) {
-                    let before_ok = pos == 0 || {
-                        let b = upper.as_bytes()[pos - 1];
-                        !b.is_ascii_alphanumeric() && b != b'_'
-                    };
-                    let after_pos = pos + keyword.len();
-                    let after_ok = after_pos >= upper.len() || {
-                        let b = upper.as_bytes()[after_pos];
-                        !b.is_ascii_alphanumeric() && b != b'_'
-                    };
-                    if before_ok && after_ok {
-                        return true;
-                    }
+        // 🔑 零分配：旧实现每次 execute 都 to_uppercase() 分配整段 String，
+        // 在并发下挤爆 jemalloc arena 互斥（点查路径 ~7 次小分配之一）。
+        // 直接在原字节上做 ASCII 大小写不敏感的窗口扫描。
+        const KEYWORDS: [&str; 5] = ["COUNT", "SUM", "AVG", "MIN", "MAX"];
+        let hay = select_part.as_bytes();
+        for keyword in KEYWORDS {
+            let kb = keyword.as_bytes();
+            let klen = kb.len();
+            if hay.len() < klen {
+                continue;
+            }
+            for i in 0..=hay.len() - klen {
+                if !hay[i].eq_ignore_ascii_case(&kb[0]) {
+                    continue;
+                }
+                if !hay[i..i + klen].eq_ignore_ascii_case(kb) {
+                    continue;
+                }
+                // 词边界：前后不能是字母数字/下划线（max_value 不算 MAX）
+                let before_ok =
+                    i == 0 || (!hay[i - 1].is_ascii_alphanumeric() && hay[i - 1] != b'_');
+                let after = i + klen;
+                let after_ok = after >= hay.len()
+                    || (!hay[after].is_ascii_alphanumeric() && hay[after] != b'_');
+                if before_ok && after_ok {
+                    return true;
                 }
             }
         }

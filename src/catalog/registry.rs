@@ -33,7 +33,10 @@ pub struct TableRegistry {
     metadata: Arc<RwLock<RegistryMetadata>>,
     /// Schema cache: avoids cloning entire TableSchema on every query.
     /// Invalidated on any DDL change. Uses parking_lot for concurrent reads.
-    schema_cache: parking_lot::RwLock<HashMap<String, Arc<TableSchema>>>,
+    /// 🚀 ArcSwap schema 缓存：每次 execute 的 get_table 都拿读锁 ——
+    /// 单 RwLock 读计数多核弹跳（并发 execute 负扩展的第三个来源）。
+    /// 读多写极少（首次访问填充、DDL 失效），ArcSwap 读侧完全无锁。
+    schema_cache: arc_swap::ArcSwap<HashMap<String, Arc<TableSchema>>>,
     /// Table ID cache: avoids acquiring metadata lock for every composite key construction.
     /// Invalidated on CREATE TABLE / DROP TABLE. Uses parking_lot for lock-free reads.
     table_id_cache: parking_lot::RwLock<HashMap<String, u32>>,
@@ -83,7 +86,7 @@ impl TableRegistry {
 
         Ok(Self {
             metadata: Arc::new(RwLock::new(metadata)),
-            schema_cache: parking_lot::RwLock::new(HashMap::new()),
+            schema_cache: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             table_id_cache: parking_lot::RwLock::new(HashMap::new()),
             persist_path,
         })
@@ -138,7 +141,7 @@ impl TableRegistry {
         drop(meta);
 
         // Invalidate schema cache (new table may affect lookups)
-        self.schema_cache.write().clear();
+        self.schema_cache.rcu(|_| Arc::new(HashMap::new()));
         self.table_id_cache.write().clear();
 
         self.persist()?;
@@ -172,7 +175,15 @@ impl TableRegistry {
         drop(meta);
 
         // Invalidate schema cache (dropped table)
-        self.schema_cache.write().remove(table_name);
+        self.schema_cache.rcu(|cur| {
+            let mut next: HashMap<String, Arc<TableSchema>> = HashMap::new();
+            for (k, v) in cur.iter() {
+                if k != table_name {
+                    next.insert(k.clone(), Arc::clone(v));
+                }
+            }
+            Arc::new(next)
+        });
         self.table_id_cache.write().remove(table_name);
 
         self.persist()?;
@@ -222,7 +233,15 @@ impl TableRegistry {
         drop(meta);
 
         // Invalidate schema cache so the new column is visible.
-        self.schema_cache.write().remove(table_name);
+        self.schema_cache.rcu(|cur| {
+            let mut next: HashMap<String, Arc<TableSchema>> = HashMap::new();
+            for (k, v) in cur.iter() {
+                if k != table_name {
+                    next.insert(k.clone(), Arc::clone(v));
+                }
+            }
+            Arc::new(next)
+        });
 
         self.persist()?;
 
@@ -237,7 +256,7 @@ impl TableRegistry {
     pub fn get_table(&self, table_name: &str) -> Result<Arc<TableSchema>> {
         // Fast path: check schema cache (cheap read lock, no struct cloning)
         {
-            let cache = self.schema_cache.read();
+            let cache = self.schema_cache.load();
             if let Some(cached) = cache.get(table_name) {
                 return Ok(Arc::clone(cached));
             }
@@ -255,13 +274,18 @@ impl TableRegistry {
 
         let arc_schema = Arc::new(schema.clone());
 
-        // Populate cache (write lock only for insertion)
-        {
-            let mut cache = self.schema_cache.write();
-            cache
-                .entry(table_name.to_string())
-                .or_insert(Arc::clone(&arc_schema));
-        }
+        // Populate cache（rcu：读侧无锁，插入仅在慢路径发生）
+        self.schema_cache.rcu(|cur| {
+            if cur.contains_key(table_name) {
+                return Arc::clone(cur);
+            }
+            let mut next: HashMap<String, Arc<TableSchema>> = HashMap::with_capacity(cur.len() + 1);
+            for (k, v) in cur.iter() {
+                next.insert(k.clone(), Arc::clone(v));
+            }
+            next.insert(table_name.to_string(), Arc::clone(&arc_schema));
+            Arc::new(next)
+        });
 
         Ok(arc_schema)
     }
@@ -332,7 +356,15 @@ impl TableRegistry {
         drop(meta);
 
         // Invalidate schema cache (index added — schema changed)
-        self.schema_cache.write().remove(&table_name);
+        self.schema_cache.rcu(|cur| {
+            let mut next: HashMap<String, Arc<TableSchema>> = HashMap::new();
+            for (k, v) in cur.iter() {
+                if k != &table_name {
+                    next.insert(k.clone(), Arc::clone(v));
+                }
+            }
+            Arc::new(next)
+        });
 
         self.persist()?;
 
