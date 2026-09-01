@@ -6,7 +6,6 @@ use crate::types::{ArcString, ColumnType, Value};
 use crate::Result;
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -3063,75 +3062,6 @@ impl ColSegmentStore {
         let mut out: Vec<(u64, usize, usize)> = heap.into_vec();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out.into_iter().map(|(_, s, r)| (s, r)).collect()
-    }
-
-    /// (group_value, count) pairs. Zero Vec<Value> allocation — uses &str from
-    /// the text segment directly. Optimized for GROUP BY col, COUNT(*).
-    #[allow(dead_code)]
-    pub fn group_by_count(&self, group_col: usize) -> std::collections::HashMap<String, i64> {
-        // 🔑 PERF: avoid per-row String allocation. Use an interned index:
-        // collect unique group values into a Vec<String> once, then count
-        // via index (usize key into the Vec, hashed via the &str). This avoids
-        // 20K to_string() + String hash allocations for a 4-group column.
-        let segs = self.segments_snapshot();
-        let single_seg = segs.len() <= 1;
-        let need_dedup = !single_seg || self.may_have_duplicate_keys();
-        let mut seen: std::collections::HashSet<u64> = if need_dedup {
-            std::collections::HashSet::with_capacity(segs.iter().map(|s| s.sst.num_rows).sum())
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        // 🔑 PERF: avoid per-row String allocation. Use get_mut() first (no
-        // alloc for existing keys); only allocate String for genuinely new
-        // group values. For a 4-group column over 20K rows, this does 4
-        // to_string() calls instead of 20K.
-        let mut groups: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-
-        for seg in segs.iter().rev() {
-            let n = seg.sst.num_rows;
-            let _ = seg.sst.load_full_keys();
-            if group_col >= seg.sst.column_tags.len() {
-                continue;
-            }
-            if let Ok(tseg) = seg.sst.read_text(group_col) {
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    if need_dedup && !seen.insert(key) {
-                        continue;
-                    }
-                    if seg.sst.row_map.is_deleted(i) {
-                        continue;
-                    }
-                    let s = tseg.get_str(i).unwrap_or("");
-                    // Fast path: key exists → increment without allocation.
-                    if let Some(c) = groups.get_mut(s) {
-                        *c += 1;
-                    } else {
-                        groups.insert(s.to_string(), 1);
-                    }
-                }
-            } else if let Ok(fseg) = seg.sst.read_fixed_i64(group_col) {
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    if need_dedup && !seen.insert(key) {
-                        continue;
-                    }
-                    if seg.sst.row_map.is_deleted(i) {
-                        continue;
-                    }
-                    let v = fseg.get_i64(i).unwrap_or(0);
-                    let buf = v.to_string();
-                    if let Some(c) = groups.get_mut(buf.as_str()) {
-                        *c += 1;
-                    } else {
-                        groups.insert(buf, 1);
-                    }
-                }
-            }
-        }
-
-        groups
     }
 
     /// Distinct values from a text column with early exit. Returns unique

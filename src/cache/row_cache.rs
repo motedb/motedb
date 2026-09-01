@@ -13,7 +13,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Row cache key: (table_hash, row_id) — avoids String allocation per lookup
@@ -67,7 +67,6 @@ pub struct RowCache {
     /// 🚀 Atomic counters (no lock needed for stats — eliminates double-write-lock per get())
     hits: AtomicU64,
     misses: AtomicU64,
-    size: AtomicUsize,
     capacity: usize,
     prefetch_triggered: AtomicU64,
     prefetch_useful: AtomicU64,
@@ -141,7 +140,6 @@ impl RowCache {
             shard_count,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
-            size: AtomicUsize::new(0),
             capacity,
             prefetch_triggered: AtomicU64::new(0),
             prefetch_useful: AtomicU64::new(0),

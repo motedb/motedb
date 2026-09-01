@@ -9,7 +9,7 @@
 //! - Memory: heap size = S (bounded by MAX_SEGMENTS), independent of table size.
 
 use super::segment::Segment;
-use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTable, FixedSegment, TextSegment};
+use crate::storage::lsm::columnar::{ColumnTypeTag, FixedSegment, TextSegment};
 use crate::types::{ColumnType, Value};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -272,5 +272,3 @@ impl Iterator for MergeCursor {
 }
 
 // Reference ColumnarSSTable to ensure we only build when it's in scope.
-#[allow(dead_code)]
-fn _type_anchor(_s: &ColumnarSSTable) {}

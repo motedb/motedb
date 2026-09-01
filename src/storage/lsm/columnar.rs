@@ -391,32 +391,6 @@ impl RowMap {
         Some(slice.to_vec().into_boxed_slice())
     }
 
-    /// Zero-copy view into mmap data.
-    #[allow(dead_code)]
-    pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize) -> Result<Self> {
-        let (_total, keys_size, timestamps_size, deleted_len) = Self::compute_sizes(num_rows);
-        let deleted_offset = offset + keys_size + timestamps_size;
-        let deleted_bitmap = {
-            let mmap_ref = &mmap;
-            Self::extract_deleted_bitmap(mmap_ref, deleted_offset, deleted_len)
-        };
-        let interval = Self::compute_fence_interval(num_rows);
-        let mmap_slice: &[u8] = &mmap[offset..];
-        let fence_keys = Self::build_fence_keys(mmap_slice, num_rows, interval);
-        Ok(Self {
-            num_rows,
-            fence_keys,
-            fence_interval: interval,
-            keys_file_offset: offset as u64,
-            keys_data: Some(SegData::Mmap { mmap, offset }),
-            timestamps_file_offset: (offset + keys_size) as u64,
-            timestamps_data: None,
-            deleted_offset,
-            deleted_len,
-            deleted_bitmap,
-        })
-    }
-
     /// Get a key at the given row index. Requires keys_data to be loaded
     /// (via load_full_keys). For point queries, use ColumnarSSTable::find_row_by_key
     /// which uses the sparse fence index instead.
@@ -680,29 +654,6 @@ impl FixedSegment {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn from_mmap(
-        mmap: Arc<Mmap>,
-        offset: usize,
-        num_rows: usize,
-        tag: ColumnTypeTag,
-    ) -> Self {
-        let null_bytes = num_rows.div_ceil(8);
-        Self {
-            num_rows,
-            null_bitmap: SegData::Mmap {
-                mmap: mmap.clone(),
-                offset,
-            },
-            data: SegData::Mmap {
-                mmap,
-                offset: offset + null_bytes,
-            },
-            elem_size: tag.fixed_size(),
-            tag,
-        }
-    }
-
     #[inline]
     pub fn is_null(&self, row_idx: usize) -> bool {
         (self.null_bitmap.get(row_idx / 8) >> (row_idx % 8)) & 1 != 0
@@ -861,29 +812,6 @@ impl TextSegment {
             trust_utf8: true,
             offsets_start: 0,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn from_mmap(mmap: Arc<Mmap>, offset: usize, num_rows: usize) -> Self {
-        let null_bytes = num_rows.div_ceil(8);
-        let offsets_size = (num_rows + 1) * 4;
-        Self {
-            num_rows,
-            null_bitmap: SegData::Mmap {
-                mmap: mmap.clone(),
-                offset,
-            },
-            offsets_data: SegData::Mmap {
-                mmap: mmap.clone(),
-                offset: offset + null_bytes,
-            },
-            string_data: SegData::Mmap {
-                mmap,
-                offset: offset + null_bytes + offsets_size,
-            },
-            trust_utf8: true, // Our builder only writes valid UTF-8
-            offsets_start: 0,
-        }
     }
 
     #[inline]
@@ -2037,50 +1965,6 @@ impl ColumnarSSTable {
         std::borrow::Cow::Owned(result)
     }
 
-    /// 🚀 Read a single page from page-level zstd segment data.
-    /// Returns the decompressed bytes of the page containing `byte_offset`.
-    /// Format: [flag=3][page_count:u32][page_sizes:u32×N][pages...]
-    /// page boundaries are in the DECOMPRESSED domain (byte offsets into the
-    /// original uncompressed segment data).
-    #[allow(dead_code)]
-    fn decompress_single_page(
-        data: &[u8],
-        page_target: usize,
-        byte_offset_in_col: usize,
-    ) -> Option<Vec<u8>> {
-        if data.len() < 5 || data[0] != 3 {
-            return None;
-        }
-        let page_count = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-        if page_count == 0 {
-            return None;
-        }
-        // Calculate which page the byte_offset falls in
-        let page_idx = byte_offset_in_col / page_target;
-        if page_idx >= page_count {
-            return None;
-        }
-        // Read page_sizes to find the compressed page data
-        let mut compressed_offset = 1 + 4 + page_count * 4;
-        for i in 0..=page_idx {
-            if 5 + i * 4 + 4 > data.len() {
-                return None;
-            }
-            let off = 5 + i * 4;
-            let psize = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-                as usize;
-            if i == page_idx {
-                // Found the target page — decompress it
-                if compressed_offset + psize > data.len() {
-                    return None;
-                }
-                return zstd::decode_all(&data[compressed_offset..compressed_offset + psize]).ok();
-            }
-            compressed_offset += psize;
-        }
-        None
-    }
-
     /// Read a single fixed-width column value at a specific row index WITHOUT
     /// decoding the entire column segment. This is the O(1) point-read path —
     /// it seeks directly to the row's byte offset and reads 8 bytes. Avoids the
@@ -2606,56 +2490,6 @@ impl ColumnarSSTable {
 }
 
 // ── Columnar SSTable Builder ───────────────────────────────────────
-
-/// Builds a columnar SSTable from rows.
-///
-/// Usage:
-/// 🚀 P1: 辅助函数——从 raw 字节解出 i64/f64 slice。
-#[allow(dead_code)]
-fn bytes_to_i64_slice(raw: &[u8], num_rows: usize) -> Vec<i64> {
-    (0..num_rows)
-        .filter_map(|i| {
-            let off = i * 8;
-            if off + 8 <= raw.len() {
-                Some(i64::from_le_bytes([
-                    raw[off],
-                    raw[off + 1],
-                    raw[off + 2],
-                    raw[off + 3],
-                    raw[off + 4],
-                    raw[off + 5],
-                    raw[off + 6],
-                    raw[off + 7],
-                ]))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-#[allow(dead_code)]
-fn bytes_to_f64_slice(raw: &[u8], num_rows: usize) -> Vec<f64> {
-    (0..num_rows)
-        .filter_map(|i| {
-            let off = i * 8;
-            if off + 8 <= raw.len() {
-                Some(f64::from_le_bytes([
-                    raw[off],
-                    raw[off + 1],
-                    raw[off + 2],
-                    raw[off + 3],
-                    raw[off + 4],
-                    raw[off + 5],
-                    raw[off + 6],
-                    raw[off + 7],
-                ]))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
 
 /// 🚀 P1: 从 gorilla 解码后的值重建 raw 字节（null_bitmap 后的数据部分）。
 fn i64_slice_to_bytes(vals: &[i64]) -> Vec<u8> {

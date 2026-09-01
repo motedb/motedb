@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### 清理第二十五轮（废弃代码清理 —— 13 项死代码删除）
+
+- 系统性审计 34 个 `#[allow(dead_code)]` 标记 + 编译器死代码警告：
+  用**全库词边界调用点扫描**逐个验证，区分三类 —— 真死代码 / 磁盘布局
+  字段（写入文件格式用，运行时不读，必须保留）/ 警告误报（守卫枚举
+  字段持有活锁守卫，drop 即释放）。
+- **删除（全部零调用点）**：sstable `next_entry_raw`；columnar
+  `RowMap/FixedSegment/TextSegment::from_mmap` ×3、
+  `decompress_single_page`、`bytes_to_i64_slice`、`bytes_to_f64_slice`；
+  executor `parse_select_aggregates`、`project_text_search_columns`；
+  merge `_type_anchor`；store `group_by_count`；**`CompiledWhere::Between`
+  死变体**（无构造点，连同 eval/eval_at/collect_positions 三个匹配臂）；
+  row_cache `size` 死字段（R23 分片化后 stats() 已改惰性求和）；
+  5 个失效 import。
+- **保留并注释**：WAL 头 `num_partitions/config`、row_format
+  `fixed_count`、columnar 12 个布局字段（磁盘格式组成部分）；
+  `AutocommitWriteGuard` 字段"never read"误报加说明性 allow。
+- 净 -470 行死代码；构建零死代码警告（仅剩 2 个预存在 check-cfg 提示）。
+
 ### 性能第二十四轮（SQL execute 四重去串行化 —— 消灭共享锁 cacheline 弹跳）
 
 上轮把 get_row 修成正扩展后，execute 仍 0.66× 负扩展。逐个排查该路径

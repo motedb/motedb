@@ -1257,12 +1257,11 @@ enum CompiledWhere {
     /// col[pos] IN set (O(1)). `negated` = NOT IN; `has_null` = the list/set
     /// contains NULL (SQL 三值逻辑: x NOT IN (…, NULL) → UNKNOWN → false).
     InHash(usize, std::collections::HashSet<Value>, bool, bool),
-    Like(usize, String, bool),    // col[pos] LIKE pattern (negated bool)
-    IsNull(usize, bool),          // col[pos] IS NULL / IS NOT NULL
-    Between(usize, Value, Value), // col[pos] BETWEEN low AND high
-    And(Vec<CompiledWhere>),      // all must match (short-circuit)
-    Or(Vec<CompiledWhere>),       // any must match (short-circuit)
-    Not(Box<CompiledWhere>),      // negation
+    Like(usize, String, bool), // col[pos] LIKE pattern (negated bool)
+    IsNull(usize, bool),       // col[pos] IS NULL / IS NOT NULL
+    And(Vec<CompiledWhere>),   // all must match (short-circuit)
+    Or(Vec<CompiledWhere>),    // any must match (short-circuit)
+    Not(Box<CompiledWhere>),   // negation
 }
 
 impl CompiledWhere {
@@ -1398,11 +1397,6 @@ impl CompiledWhere {
                 let is_null = row.get(*pos).is_none_or(|v| matches!(v, Value::Null));
                 Some(if *negated { !is_null } else { is_null })
             }
-            CompiledWhere::Between(pos, low, high) => Some(
-                row.get(*pos)
-                    .filter(|v| !matches!(v, Value::Null))
-                    .is_some_and(|v| v >= low && v <= high),
-            ),
             CompiledWhere::And(conds) => {
                 for c in conds {
                     if !c.eval(row)? {
@@ -1493,8 +1487,7 @@ impl CompiledWhere {
             | CompiledWhere::Ge(pos, _)
             | CompiledWhere::InHash(pos, ..)
             | CompiledWhere::Like(pos, _, _)
-            | CompiledWhere::IsNull(pos, _)
-            | CompiledWhere::Between(pos, _, _) => {
+            | CompiledWhere::IsNull(pos, _) => {
                 positions.push(*pos);
             }
             CompiledWhere::And(conds) | CompiledWhere::Or(conds) => {
@@ -1624,14 +1617,6 @@ impl CompiledWhere {
                 let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
                 let is_null = row.get(*idx).is_none_or(|v| matches!(v, Value::Null));
                 Some(if *negated { !is_null } else { is_null })
-            }
-            CompiledWhere::Between(pos, low, high) => {
-                let idx = (*pos_to_idx).get(*pos)?.as_ref()?;
-                Some(
-                    row.get(*idx)
-                        .filter(|v| !matches!(v, Value::Null))
-                        .is_some_and(|v| v >= low && v <= high),
-                )
             }
             CompiledWhere::And(conds) => {
                 for c in conds {
@@ -4126,30 +4111,6 @@ impl QueryExecutor {
             columns,
             rows: vec![result_row],
         }))
-    }
-
-    /// GROUP BY via multi-segment scan + in-memory HashMap aggregation.
-    /// Avoids sync compaction entirely.
-    /// Parse each select column into its aggregate spec (None = plain column,
-    /// Some = aggregate like COUNT/SUM/MIN/MAX/AVG). Used by col_segment_group_by
-    /// to decide whether the COUNT-only fast path is safe.
-    #[allow(dead_code)]
-    fn parse_select_aggregates(
-        &self,
-        columns: &[crate::sql::ast::SelectColumn],
-        schema: &TableSchema,
-    ) -> Vec<Option<AggregateInfo>> {
-        columns
-            .iter()
-            .map(|sc| {
-                match sc {
-                    crate::sql::ast::SelectColumn::Expr(expr, _) => {
-                        self.try_parse_aggregate(expr, schema)
-                    }
-                    _ => None, // Star / Column / ColumnWithAlias — not an aggregate
-                }
-            })
-            .collect()
     }
 
     fn col_segment_group_by(
@@ -23022,96 +22983,6 @@ impl QueryExecutor {
             columns,
             rows: result_rows,
         }))
-    }
-
-    /// Project columns for text search fast path, handling MATCH score columns
-    #[allow(dead_code)]
-    fn project_text_search_columns(
-        &self,
-        stmt: &SelectStmt,
-        rows: &[(u64, SqlRow)],
-        schema: &TableSchema,
-        match_column: &str,
-        scores: &[(RowId, f32)],
-    ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-        // Build score lookup
-        let score_map: std::collections::HashMap<u64, f64> =
-            scores.iter().map(|(id, s)| (*id, *s as f64)).collect();
-
-        let (column_names, result_rows) = if stmt.columns.len() == 1
-            && matches!(stmt.columns[0], SelectColumn::Star)
-        {
-            // SELECT *
-            let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            let projected: Vec<Vec<Value>> = rows
-                .iter()
-                .map(|(_, row)| {
-                    schema
-                        .columns
-                        .iter()
-                        .map(|col| row.get(&col.name).cloned().unwrap_or(Value::Null))
-                        .collect()
-                })
-                .collect();
-            (col_names, projected)
-        } else {
-            // Specific columns — handle MATCH expressions
-            let col_names: Vec<String> = stmt
-                .columns
-                .iter()
-                .map(|col| match col {
-                    SelectColumn::Star => "*".to_string(),
-                    SelectColumn::Column(name) => name.clone(),
-                    SelectColumn::ColumnWithAlias(_, alias) => alias.clone(),
-                    SelectColumn::Expr(_, Some(alias)) => alias.clone(),
-                    SelectColumn::Expr(expr, None) => format!("{:?}", expr),
-                })
-                .collect();
-
-            let projected: Vec<Vec<Value>> = rows
-                .iter()
-                .map(|(row_id, row)| {
-                    stmt.columns
-                        .iter()
-                        .map(|col| {
-                            match col {
-                                SelectColumn::Column(name)
-                                | SelectColumn::ColumnWithAlias(name, _) => row
-                                    .get(name)
-                                    .cloned()
-                                    .or_else(|| {
-                                        if !name.contains('.') {
-                                            row.iter()
-                                                .find(|(k, _)| k.ends_with(&format!(".{}", name)))
-                                                .map(|(_, v)| v.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(Value::Null),
-                                SelectColumn::Expr(expr, _) => {
-                                    // Check if this is a MATCH expression for our column
-                                    if let Expr::Match { column, .. } = expr {
-                                        if column == match_column {
-                                            return score_map
-                                                .get(row_id)
-                                                .map(|s| Value::Float(*s))
-                                                .unwrap_or(Value::Float(0.0));
-                                        }
-                                    }
-                                    self.eval_with_materialized(expr, row)
-                                        .unwrap_or(Value::Null)
-                                }
-                                SelectColumn::Star => Value::Null,
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            (col_names, projected)
-        };
-
-        Ok((column_names, result_rows))
     }
 
     /// 🚀 FAST PATH 0b: Spatial (ST_WITHIN / ST_KNN) — single index lookup

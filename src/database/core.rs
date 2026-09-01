@@ -250,6 +250,8 @@ static REBUILD_TEXT_EXTRA: std::sync::Mutex<Vec<(String, String)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Guard held while an autocommit write executes.
+#[allow(dead_code)] // 字段持有活 guard（drop 即释放锁）——"never read" 是
+                    // 警告误报：守卫的全部意义在于存活期间持有锁。
 pub(crate) enum AutocommitWriteGuard<'a> {
     Stripe(parking_lot::MutexGuard<'a, ()>),
     Global(parking_lot::MutexGuard<'a, ()>),
