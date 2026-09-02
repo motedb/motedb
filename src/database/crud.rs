@@ -3254,6 +3254,63 @@ impl MoteDB {
             store.flush_buffer()?;
         }
 
+        // 🚨 Column index maintenance (BUG: bulk batches never reached the index).
+        // fast_batch_insert used to skip this entirely — rows inserted in
+        // batches (≥100 rows, AUTO_INCREMENT tables) were permanently absent
+        // from every secondary column index. Index-trusting query paths then
+        // returned wrong results (COUNT(*) = 0 for values with thousands of
+        // matches) and CHECKPOINT did not rebuild the index. Mirror the full
+        // batch path's column_tasks → batch_insert logic here.
+        let mut column_tasks: Vec<(
+            std::sync::Arc<crate::index::column_value::ColumnValueIndex>,
+            Vec<(Value, RowId)>,
+            String,
+        )> = Vec::new();
+        let prefix_len = table_name.len() + 1;
+        for col_def in &schema.columns {
+            let mut col_index_key = String::with_capacity(prefix_len + col_def.name.len());
+            col_index_key.push_str(table_name);
+            col_index_key.push('.');
+            col_index_key.push_str(&col_def.name);
+            if let Some(index_ref) = self.column_indexes.get(&col_index_key) {
+                let mut column_data: Vec<(Value, RowId)> = Vec::with_capacity(n);
+                for (row_id, (_key, _ts, row)) in row_ids.iter().zip(store_rows.iter()) {
+                    if let Some(col_value) = row.get(col_def.position) {
+                        column_data.push((col_value.clone(), *row_id));
+                    }
+                }
+                if !column_data.is_empty() {
+                    column_tasks.push((index_ref.value().clone(), column_data, col_index_key));
+                }
+            }
+        }
+        if column_tasks.len() > 1 {
+            std::thread::scope(|s| {
+                for (index, data, key) in column_tasks {
+                    s.spawn(move || {
+                        if let Err(_e) = index.batch_insert(data) {
+                            debug_log!(
+                                "[fast_batch_insert] Failed to batch update column index '{}': {}",
+                                key,
+                                _e
+                            );
+                        }
+                    });
+                }
+            });
+        } else {
+            for (index, data, key) in column_tasks {
+                if let Err(_e) = index.batch_insert(data) {
+                    debug_log!(
+                        "[fast_batch_insert] Failed to batch update column index '{}': {}",
+                        key,
+                        _e
+                    );
+                    self.index_registry.mark_stale(&key);
+                }
+            }
+        }
+
         // Update row count for COUNT(*) fast path.
         if let Some(counter) = self.table_row_count.get(table_name) {
             counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);

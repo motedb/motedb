@@ -2862,11 +2862,25 @@ impl QueryExecutor {
                     // Check if an index exists on this column.
                     let col_name = &schema.columns[pos].name;
                     let index_key = format!("{}.{}", table_name, col_name);
-                    let indexed_count = if matches!(op, crate::sql::ast::BinaryOperator::Eq) {
+                    let indexed_count = if matches!(op, crate::sql::ast::BinaryOperator::Eq)
+                        // 🚨 Long Text values are truncated to a 64-byte
+                        // prefix in index keys — the index cannot answer
+                        // exact counts for them (prefix-sharing values
+                        // cross-count). Fall back to count_filtered.
+                        && Self::index_key_exact_for(&target)
+                    {
                         // Equality lookup: index.get(value) → row_ids → count.
+                        // 🚨 An EMPTY result is NOT authoritative: the index can
+                        // be stale (async rebuild window, or a crash between
+                        // data and index writes). Only trust a non-empty hit;
+                        // fall back to count_filtered otherwise — it returns
+                        // the same 0 for genuinely-missing values.
                         self.db.column_indexes.get(&index_key).and_then(|index| {
                             let idx = index.value();
-                            idx.get(&target).ok().map(|ids| ids.len() as i64)
+                            idx.get(&target)
+                                .ok()
+                                .filter(|ids| !ids.is_empty())
+                                .map(|ids| ids.len() as i64)
                         })
                     } else {
                         None
@@ -3139,6 +3153,20 @@ impl QueryExecutor {
     /// matched `=` (or worse, matched every BinaryOp but discarded the operator
     /// and always compared with equality — silently turning `id > 49000` into
     /// `id == 49000` and returning 0 rows).
+    /// Column index keys truncate Text values to a 64-byte prefix (zero
+    /// padded), so two distinct texts sharing that prefix are
+    /// indistinguishable IN THE INDEX. A search value shorter than 64 bytes
+    /// has an exact key (collisions would need an embedded NUL at a precise
+    /// position in another value); longer texts MUST NOT be answered from the
+    /// index alone — callers either verify the actual row value (row-fetch
+    /// paths) or fall back to a scan (count/aggregate paths).
+    fn index_key_exact_for(value: &Value) -> bool {
+        match value {
+            Value::Text(s) => s.as_str().len() < 64,
+            _ => true,
+        }
+    }
+
     fn parse_simple_comparison_where(
         wc: &crate::sql::ast::Expr,
         schema: &TableSchema,
@@ -5784,6 +5812,7 @@ impl QueryExecutor {
         // This replaces the old behavior of falling back to full table scan when
         // post_filters were present.
         let post_filters = &plan.post_filters;
+        if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] scan_method={:?}", plan.scan_method); }
         match plan.scan_method {
             super::optimizer::ScanMethod::PointQuery {
                 ref table,
@@ -6070,18 +6099,92 @@ impl QueryExecutor {
             // PK-column scan if index isn't built yet (async pipeline).
             let index_name = format!("{}.{}", table, column);
             if let Some(index) = self.db.column_indexes.get(&index_name) {
+                let __t0 = std::time::Instant::now();
                 let row_ids = index
                     .value()
                     .get_arc(value)
                     .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+                let __t1 = std::time::Instant::now();
                 if !row_ids.is_empty() {
-                    let batch = self.db.get_table_rows_batch(table, &row_ids)?;
+                    // 🔑 The optimizer attaches the full WHERE clause as
+                    // post_filter to EVERY index plan ("redundant but
+                    // harmless"). For a simple `col = literal` that is exactly
+                    // the predicate this index probe resolved, re-applying it
+                    // forces a second full row fetch and disables LIMIT
+                    // pushdown. Detect that redundancy and treat the plan as
+                    // filter-free.
+                    let eq_covers_filters = post_filters.iter().all(|f| {
+                        matches!(
+                            f,
+                            Expr::BinaryOp {
+                                left,
+                                op: crate::sql::ast::BinaryOperator::Eq,
+                                right,
+                            } if matches!(&**left, Expr::Column(c)
+                                    if c.rsplit('.').next() == Some(column))
+                                && matches!(&**right, Expr::Literal(v) if v == value)
+                        )
+                    });
+                    let filters_redundant = post_filters.is_empty() || eq_covers_filters;
+                    if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] branch1: post_filters={} eq_covers={} row_ids={} limit={:?} get_arc={:?}", post_filters.len(), eq_covers_filters, row_ids.len(), stmt.limit, __t1.duration_since(__t0)); }
+
+                    // Exact-value verification: index keys truncate long Text
+                    // values to a 64-byte prefix, so a row whose value merely
+                    // shares that prefix must not be returned as a match.
+                    let filter_pos = schema.get_column_position(column);
+                    let verified_push = |result_rows: &mut Vec<Vec<Value>>, row: &Vec<Value>| {
+                        if let Some(pos) = filter_pos {
+                            if row.get(pos) != Some(value) {
+                                return;
+                            }
+                        }
+                        result_rows.push(Self::project_row_direct(
+                            row,
+                            &stmt.columns,
+                            &columns,
+                            &schema,
+                        ));
+                    };
+
+                    // 🔑 LIMIT pushdown: when the index probe covers the whole
+                    // predicate, fetch only the offset+limit window of matches
+                    // instead of all of them. `WHERE indexed = ? LIMIT k`
+                    // previously fetched and projected EVERY match — cost grew
+                    // linearly with table size for a fixed-size result. Row
+                    // output order follows row_ids order, so the trailing
+                    // OFFSET/LIMIT below keeps exactly the first offset+limit
+                    // verified rows. Fetching proceeds in windows of
+                    // offset+limit so the (rare) prefix false positives dropped
+                    // by verification can be backfilled from later ids — never
+                    // under-returning.
                     let mut result_rows: Vec<Vec<Value>> = Vec::new();
-                    for (_, row_opt) in batch {
-                        if let Some(row) = row_opt {
-                            let projected =
-                                Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
-                            result_rows.push(projected);
+                    if filters_redundant && stmt.limit.is_some() {
+                        let need = stmt
+                            .offset
+                            .unwrap_or(0)
+                            .saturating_add(stmt.limit.unwrap_or(0))
+                            .max(1);
+                        'window: for chunk in row_ids.chunks(need) {
+                            let __f0 = std::time::Instant::now();
+                            let batch = self.db.get_table_rows_batch(table, chunk)?;
+                            if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] window fetch: {} ids in {:?}", chunk.len(), __f0.elapsed()); }
+                            for (_, row_opt) in batch {
+                                if let Some(row) = row_opt {
+                                    verified_push(&mut result_rows, &row);
+                                    if result_rows.len() >= need {
+                                        break 'window;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let __f0 = std::time::Instant::now();
+                        let batch = self.db.get_table_rows_batch(table, &row_ids)?;
+                        if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] full fetch: {} ids in {:?}", row_ids.len(), __f0.elapsed()); }
+                        for (_, row_opt) in batch {
+                            if let Some(row) = row_opt {
+                                verified_push(&mut result_rows, &row);
+                            }
                         }
                     }
                     if !result_rows.is_empty() {
@@ -6095,7 +6198,7 @@ impl QueryExecutor {
                         // but post_filters reference schema columns — so we
                         // keep the full decoded rows for filtering.
                         // (Re-fetch full rows for filtering since we projected.)
-                        let filtered: Vec<Vec<Value>> = if post_filters.is_empty() {
+                        let filtered: Vec<Vec<Value>> = if filters_redundant {
                             result_rows
                         } else {
                             let mut kept = Vec::with_capacity(result_rows.len());
@@ -6209,9 +6312,30 @@ impl QueryExecutor {
                     // ~1667 matches — and the full-scan WHERE path on INT-PK
                     // ColSegmentStore tables returned 0 rows (the v0.5.0 index bug).
                     if !row_ids.is_empty() && row_ids.len() <= 10000 {
-                        let mut result_rows = Vec::with_capacity(row_ids.len());
-                        for &rid in row_ids.iter() {
+                        // Exact-value verification: index keys truncate long
+                        // Text values to a 64-byte prefix — drop prefix
+                        // false positives instead of returning them.
+                        let filter_pos = schema.get_column_position(column);
+                        // 🔑 LIMIT pushdown: fetch only the offset+limit
+                        // window of matches (output order follows row_ids
+                        // order, so the trailing OFFSET/LIMIT applied below
+                        // keeps exactly this prefix).
+                        let fetch_end = match stmt.limit {
+                            Some(lim) => stmt
+                                .offset
+                                .unwrap_or(0)
+                                .saturating_add(lim)
+                                .min(row_ids.len()),
+                            None => row_ids.len(),
+                        };
+                        let mut result_rows = Vec::with_capacity(fetch_end);
+                        for &rid in row_ids.iter().take(fetch_end) {
                             if let Some(row) = self.db.get_table_row(table, rid)? {
+                                if let Some(pos) = filter_pos {
+                                    if row.get(pos) != Some(value) {
+                                        continue;
+                                    }
+                                }
                                 let mut sql_row = SqlRow::new();
                                 sql_row
                                     .insert("__row_id__".to_string(), Value::Integer(rid as i64));
@@ -6226,8 +6350,20 @@ impl QueryExecutor {
                                 result_rows.push((rid, sql_row));
                             }
                         }
-                        let (_, projected) =
+                        let (_, mut projected) =
                             self.project_columns(&stmt.columns, &result_rows, &schema)?;
+                        // 🚨 Apply OFFSET/LIMIT — this branch previously
+                        // returned ALL matches, so `WHERE x = ? LIMIT k`
+                        // returned more than k rows.
+                        let offset = stmt.offset.unwrap_or(0);
+                        if offset >= projected.len() {
+                            projected.clear();
+                        } else if offset > 0 {
+                            projected.drain(..offset);
+                        }
+                        if let Some(lim) = stmt.limit {
+                            projected.truncate(lim);
+                        }
                         return Ok(StreamingQueryResult::SelectReady {
                             columns,
                             rows: projected,
@@ -7994,6 +8130,12 @@ impl QueryExecutor {
             Some(idx) => idx,
             None => return Ok(None),
         };
+        // 🚨 Long Text values share truncated 64-byte prefix keys — aggregate
+        // results over the raw index row set would cross-count distinct
+        // values. Fall back to scan-based aggregate paths.
+        if !Self::index_key_exact_for(&filter_value) {
+            return Ok(None);
+        }
         let row_ids_arc = index_ref.value().get_arc(&filter_value)?;
         if row_ids_arc.is_empty() {
             return Ok(None);
@@ -8737,6 +8879,7 @@ impl QueryExecutor {
         stmt: &SelectStmt,
         table: &str,
     ) -> Result<StreamingQueryResult> {
+        if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] full_scan_streaming limit={:?}", stmt.limit); }
         let schema = self.db.get_table_schema(table)?;
 
         // 🔑 TimeSeries tables: authoritative data lives in the
@@ -12377,6 +12520,12 @@ impl QueryExecutor {
         //   2) Batch row fetching via individual point lookups is expensive
         //   3) Large IN lists often mean low selectivity (many matching rows)
         // The sweet spot is 3-50 values where index lookups + targeted row fetch wins.
+        // 🚨 Any long Text value (≥64 bytes) has a prefix-truncated index key;
+        // the fetched row set could include prefix-sharing false positives.
+        // Fall back to scan paths (they compare actual values).
+        if values.iter().any(|v| !Self::index_key_exact_for(v)) {
+            return None;
+        }
         if values.len() < 3 || values.len() > 50 {
             return None;
         }
@@ -12401,10 +12550,11 @@ impl QueryExecutor {
         drop(index_ref);
 
         if row_id_set.is_empty() {
-            return Some(Ok(StreamingQueryResult::SelectReady {
-                columns: columns.to_vec(),
-                rows: vec![],
-            }));
+            // 🚨 Empty is NOT authoritative — the index may be stale (async
+            // rebuild window / crash between data and index writes). Fall
+            // through to the full-scan path; a genuinely-matching-free IN
+            // list still returns empty there. (index_ref already dropped.)
+            return None;
         }
 
         // Sort row IDs for sequential LSM access (better cache locality)
