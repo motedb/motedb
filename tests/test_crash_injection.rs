@@ -644,6 +644,11 @@ fn test_kill9_timeseries_prefix_recovery() {
 
         let db = match Database::open(&db_path) {
             Ok(db) => db,
+            // Killed before the child created the database directory: with
+            // nothing acked there is nothing to recover — legal empty state.
+            Err(e) if journal.is_empty() && e.to_string().contains("No such file") => {
+                continue;
+            }
             Err(e) => panic!("iter {}: reopen failed: {}", iter, e),
         };
         let rs = match db.query("SELECT ts, v FROM m ORDER BY ts") {

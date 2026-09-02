@@ -1997,15 +1997,28 @@ impl MoteDB {
         )?;
         // 🚀 compact_storage: 从 DBConfig 继承到 store
         store.set_compact_storage(self.compact_storage);
+        // col_cache 字节预算同样从 DBConfig 继承（None = 存储层默认 64MB）。
+        store.set_col_cache_budget(
+            self.col_cache_budget_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or(crate::storage::col_segment::DEFAULT_COL_CACHE_BUDGET_BYTES),
+        );
         // Race-safe publish: winner inserts, loser reuses the winner's store.
         use dashmap::mapref::entry::Entry;
-        match self.col_segment_stores.entry(table_name.to_string()) {
+        let store = match self.col_segment_stores.entry(table_name.to_string()) {
             Entry::Vacant(v) => {
                 v.insert(store.clone());
-                Ok(store)
+                store
             }
-            Entry::Occupied(o) => Ok(o.get().clone()),
-        }
+            Entry::Occupied(o) => o.get().clone(),
+        };
+        // Budget choke point: every statement that touches a col-segment table
+        // funnels through here, so trim here covers query paths that never call
+        // release_pages_only (aggregates, GROUP BY early returns, api redirect).
+        // Caches filled by the PREVIOUS query are dropped once over budget, so
+        // sustained RSS stays flat as data grows. Cost: N atomic loads.
+        store.trim_col_cache_to_budget();
+        Ok(store)
     }
 
     /// Read-only accessor for ColSegmentStore — no String allocation, no entry

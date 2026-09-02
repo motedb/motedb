@@ -131,6 +131,16 @@ impl CachedIndex {
     }
 
     /// Get cache hit rate
+    /// Number of cached value→row_ids entries (diagnostic).
+    pub fn len(&self) -> usize {
+        self.cache.read().len()
+    }
+
+    /// Whether no entries are cached.
+    pub fn is_empty(&self) -> bool {
+        self.cache.read().is_empty()
+    }
+
     pub fn hit_rate(&self) -> f64 {
         let hits = self.hit_count.load(Ordering::Relaxed) as f64;
         let misses = self.miss_count.load(Ordering::Relaxed) as f64;

@@ -213,7 +213,21 @@ pub struct ColSegmentStore {
     buffered_count: AtomicU64,
     /// 🚀 compact_storage: segment 写入时 zstd 压缩 Fixed/Text 列。
     compact_storage: std::sync::atomic::AtomicBool,
+    /// Total decoded-bytes budget for col_cache across this table's segments.
+    /// The per-entry bound (COL_CACHE_CAP) limits cache WIDTH (columns), not
+    /// total bytes — without this budget, a scan-heavy workload on a large
+    /// table caches a decoded copy of ~the entire dataset (RSS grows linearly
+    /// with data). When the total exceeds the budget we clear all segment
+    /// col_caches; the next scan re-decodes. Atomic so set_() can be called
+    /// after construction (same pattern as compact_storage).
+    col_cache_budget_bytes: std::sync::atomic::AtomicUsize,
 }
+
+/// Default col_cache budget: 256MB per table. Also caps the eager
+/// single-segment file_data preload (pointer-read fast path) — segments
+/// larger than the budget stay on the lazy seek+read path, trading point-read
+/// speed (3-5x slower once the OS page cache misses) for flat RSS.
+pub const DEFAULT_COL_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
 /// one col_cache fill is ~88MB (5 columns). Clearing every 4096 queries keeps
@@ -256,6 +270,9 @@ impl ColSegmentStore {
             point_query_count: AtomicU64::new(0),
             buffered_count: AtomicU64::new(0),
             compact_storage: std::sync::atomic::AtomicBool::new(false),
+            col_cache_budget_bytes: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_COL_CACHE_BUDGET_BYTES,
+            ),
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -512,9 +529,14 @@ impl ColSegmentStore {
         } else if segs.len() == 1 {
             // 🚀 Single segment (post-compaction): eagerly load file_data
             // so point queries use pure pointer reads instead of seek+read.
-            // Memory cost: one segment's file (~18MB for 300K rows), bounded.
+            // Memory cost: the WHOLE segment file after full compaction
+            // (97MB at 1.6M rows — the old "~18MB, bounded" assumption broke
+            // at scale). Cap the eager load by the col-cache budget; oversized
+            // segments stay lazy so RSS does not track data size.
             let seg = &segs[0];
-            let _ = seg.sst.ensure_file_data_loaded();
+            let _ = seg
+                .sst
+                .ensure_file_data_loaded_within(self.col_cache_budget());
         }
         Ok(())
     }
@@ -1939,7 +1961,9 @@ impl ColSegmentStore {
     }
 
     /// Release mmap pages WITHOUT clearing col_cache. Keeps decoded column
-    /// data in heap for fast repeated aggregate queries.
+    /// data in heap for fast repeated aggregate queries — up to the configured
+    /// col_cache byte budget (see `set_col_cache_budget`); beyond it the
+    /// decoded caches are dropped so sustained RSS stays flat as data grows.
     pub fn release_pages_only(&self) {
         let segs = self.segs();
         for seg in segs.iter() {
@@ -1951,6 +1975,84 @@ impl ColSegmentStore {
         // SELECT * queries even though the data is freed — jemalloc retains
         // arena pages for reuse. Purging bounds RSS after query bursts.
         crate::purge_memory_to_os();
+        self.trim_col_cache_to_budget();
+    }
+
+    /// Set the total decoded-bytes budget for this table's col_caches.
+    /// Values below 1MB are clamped up (a 0 budget would clear caches on
+    /// every query, thrashing decodes).
+    pub fn set_col_cache_budget(&self, bytes: usize) {
+        self.col_cache_budget_bytes
+            .store(bytes.max(1024 * 1024), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current col_cache budget in bytes.
+    pub fn col_cache_budget(&self) -> usize {
+        self.col_cache_budget_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Diagnostic: one line per segment with resident heap bytes.
+    #[doc(hidden)]
+    pub fn debug_memory_stats(&self) -> String {
+        let segs = self.segs();
+        let mut out = String::new();
+        let mut tot_cache = 0usize;
+        let mut tot_fd = 0usize;
+        let mut tot_keys = 0usize;
+        let mut tot_fence = 0usize;
+        let mut tot_rows = 0usize;
+        for seg in segs.iter() {
+            let (cache, fd, keys, fence) = seg.debug_resident_bytes();
+            tot_cache += cache;
+            tot_fd += fd;
+            tot_keys += keys;
+            tot_fence += fence;
+            tot_rows += seg.row_count;
+            if std::env::var_os("MOTE_TRACE").is_some() {
+                out.push_str(&format!(
+                    "\n    seg {}: rows={} colcache={:.1}MB file_data={:.1}MB keys={:.1}MB fence={:.1}KB",
+                    seg.id,
+                    seg.row_count,
+                    cache as f64 / 1048576.0,
+                    fd as f64 / 1048576.0,
+                    keys as f64 / 1048576.0,
+                    fence as f64 / 1024.0
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "\n  store: segs={} rows={} colcache={:.1}MB file_data={:.1}MB keys={:.1}MB fence={:.1}KB writebuf=({} rows, {:.1}MB) budget={:.1}MB",
+            segs.len(),
+            tot_rows,
+            tot_cache as f64 / 1048576.0,
+            tot_fd as f64 / 1048576.0,
+            tot_keys as f64 / 1048576.0,
+            tot_fence as f64 / 1024.0,
+            self.buffered_count.load(std::sync::atomic::Ordering::Relaxed),
+            self.buffered_bytes() as f64 / 1048576.0,
+            self.col_cache_budget() as f64 / 1048576.0
+        ));
+        out
+    }
+
+    /// Clear all segment col_caches if their combined decoded bytes exceed
+    /// the budget. Returns true when a trim happened. Cost: one atomic load
+    /// + N short Mutex locks (N = segment count), ~ns per segment.
+    pub fn trim_col_cache_to_budget(&self) -> bool {
+        let budget = self.col_cache_budget();
+        let segs = self.segs();
+        let mut total = 0usize;
+        for seg in segs.iter() {
+            total += seg.cached_col_bytes();
+        }
+        if total <= budget {
+            return false;
+        }
+        for seg in segs.iter() {
+            seg.clear_cache();
+        }
+        true
     }
 
     /// Clear segment col_cache WITHOUT releasing mmap pages. Use this between
@@ -3869,5 +3971,73 @@ impl ColSegmentStore {
         }
         self.manifest.lock().record_gc(&old_ids)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// col_cache byte budget: decoded columns accumulate up to the budget,
+    /// then trim_col_cache_to_budget clears them (RSS no longer tracks data
+    /// size on scan-heavy workloads).
+    #[test]
+    fn col_cache_budget_trims_decoded_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Timestamp,
+        ];
+        let store = ColSegmentStore::create(dir.path(), "t", col_types).unwrap();
+        // Tiny budget so the test triggers without MBs of data (bypasses the
+        // 1MB floor in set_col_cache_budget, which only guards config misuse).
+        store
+            .col_cache_budget_bytes
+            .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+
+        // 30K rows × 8-byte BIGINT ≈ 240KB decoded — well over the 64KB budget.
+        let rows: Vec<(u64, u64, Vec<crate::types::Value>)> = (0..30_000u64)
+            .map(|i| {
+                (
+                    i,
+                    i,
+                    vec![
+                        crate::types::Value::Integer(i as i64),
+                        crate::types::Value::Timestamp(crate::types::Timestamp::from_micros(
+                            i as i64 * 7,
+                        )),
+                    ],
+                )
+            })
+            .collect();
+        store.append_rows(&rows).unwrap();
+        store.flush_buffer().unwrap();
+
+        // Populate col_cache the way a scan-shaped query does.
+        let segs = store.segments_snapshot();
+        assert!(!segs.is_empty(), "flush must materialize a segment");
+        for seg in &segs {
+            let _ = seg.read_fixed_cached(1);
+        }
+        let total: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
+        assert!(
+            total > 64 * 1024,
+            "decoded cache should exceed the 64KB budget, got {total}B"
+        );
+
+        // Under a higher budget no trim happens.
+        store
+            .col_cache_budget_bytes
+            .store(usize::MAX / 2, std::sync::atomic::Ordering::Relaxed);
+        assert!(!store.trim_col_cache_to_budget());
+
+        // Over the budget: trim clears every segment's cache.
+        store
+            .col_cache_budget_bytes
+            .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
+        assert!(store.trim_col_cache_to_budget());
+        let after: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
+        assert_eq!(after, 0, "trim must clear all decoded col caches");
+        assert!(!store.trim_col_cache_to_budget(), "second trim is a no-op");
     }
 }

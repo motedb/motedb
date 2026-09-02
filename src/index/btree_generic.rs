@@ -1852,6 +1852,11 @@ impl<K: BTreeKey> GenericBTree<K> {
     /// 🚀 Bulk-load sorted entries into a fresh B+Tree. O(N/B) sequential writes.
     /// Uses Page::serialize (same format as write_page) + sync_superblock
     /// (same format as normal path) — fully compatible with read_page.
+    /// Diagnostic: number of pages currently held in the LRU page cache.
+    pub fn cached_pages(&self) -> usize {
+        self.page_cache.read().len()
+    }
+
     pub fn bulk_load(&mut self, mut entries: Vec<K>) -> Result<()> {
         if entries.is_empty() {
             return Ok(());

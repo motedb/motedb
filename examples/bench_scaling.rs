@@ -36,7 +36,7 @@ impl Lcg {
 }
 
 fn main() {
-    println!("\n  MoteDB Query Scaling Benchmark (100K -> 1.6M rows)");
+    println!("\n  MoteDB Query Scaling Benchmark (100K -> 3.2M rows)");
     println!("  config: for_general (desktop defaults)\n");
 
     let dir = TempDir::new().unwrap();
@@ -47,6 +47,15 @@ fn main() {
                                    // single-shot outliers (COUNT 910ms vs 27µs). Production still benefits
                                    // from it; benchmarks of query scaling should not sample that contention.
     config.auto_checkpoint = None;
+    // Budget override for A/B runs: BENCH_BUDGET_MB=512 restores the uncapped
+    // eager-load behavior of pre-0.9.2 builds.
+    if let Some(mb) = std::env::var("BENCH_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        config.col_cache_budget_mb = Some(mb);
+        println!("  budget override: {}MB", mb);
+    }
     let db = Database::create_with_config(dir.path(), config).unwrap();
 
     db.execute(
@@ -62,7 +71,14 @@ fn main() {
     db.execute("CREATE INDEX idx_code ON t (code) USING COLUMN")
         .unwrap();
 
-    let milestones = [100_000usize, 200_000, 400_000, 800_000, 1_600_000];
+    let milestones = [
+        100_000usize,
+        200_000,
+        400_000,
+        800_000,
+        1_600_000,
+        3_200_000,
+    ];
     let mut total = 0usize;
     let batch_size = 5000;
 
@@ -161,6 +177,7 @@ fn main() {
 
         let rss = get_rss_kb();
         let b_per_row = rss * 1024 / total.max(1) as u64;
+        println!("{}", db.debug_memory_report());
         println!(
             "  {:>9} | {:>8.1} | {:>7} | {:>9.1} | {:>10.2} | {:>11.1} | {:>10.1} | {:>10.1} | {:>10.1}",
             total,

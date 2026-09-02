@@ -78,12 +78,17 @@ impl TextPageCache {
 /// under adversarial access patterns.
 struct BoundedColCache {
     entries: std::collections::VecDeque<(usize, CachedCol)>,
+    /// Running total of decoded bytes held in `entries` (guarded by the same
+    /// Mutex as `entries`). The per-entry count bound (COL_CACHE_CAP) limits
+    /// width, not total bytes — this tracks bytes for the store-level budget.
+    bytes: usize,
 }
 
 impl BoundedColCache {
     fn new() -> Self {
         Self {
             entries: std::collections::VecDeque::with_capacity(COL_CACHE_CAP),
+            bytes: 0,
         }
     }
 
@@ -104,15 +109,39 @@ impl BoundedColCache {
     fn insert(&mut self, col_idx: usize, val: CachedCol) {
         // Evict oldest if at capacity.
         while self.entries.len() >= COL_CACHE_CAP {
-            self.entries.pop_back();
+            if let Some((_, v)) = self.entries.pop_back() {
+                self.bytes = self.bytes.saturating_sub(cached_col_bytes(&v));
+            }
         }
         // Remove existing entry for this key (if any).
-        self.entries.retain(|(k, _)| *k != col_idx);
+        self.entries.retain(|(k, v)| {
+            if *k == col_idx {
+                self.bytes = self.bytes.saturating_sub(cached_col_bytes(v));
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes += cached_col_bytes(&val);
         self.entries.push_front((col_idx, val));
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.bytes = 0;
+    }
+
+    /// Total decoded bytes currently cached (for budget accounting).
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Decoded heap bytes of a cached column chunk.
+fn cached_col_bytes(c: &CachedCol) -> usize {
+    match c {
+        CachedCol::Fixed(f) => f.heap_bytes(),
+        CachedCol::Text(t) => t.heap_bytes(),
     }
 }
 
@@ -149,6 +178,18 @@ impl Segment {
     pub fn clear_all_caches(&self) {
         self.col_cache.lock().clear();
         self.text_page_cache.lock().clear();
+    }
+
+    /// Decoded bytes currently held in this segment's col_cache (excluding the
+    /// tiny text_page_cache). Used by the store to enforce a total budget.
+    pub fn cached_col_bytes(&self) -> usize {
+        self.col_cache.lock().bytes()
+    }
+
+    /// Diagnostic: (col_cache, file_data, keys_data, fence) heap bytes.
+    pub fn debug_resident_bytes(&self) -> (usize, usize, usize, usize) {
+        let (fd, keys, fence) = self.sst.debug_resident_bytes();
+        (self.cached_col_bytes(), fd, keys, fence)
     }
 
     /// Read a fixed-width column, using the cross-query col_cache.

@@ -213,6 +213,21 @@ impl MoteDB {
     }
 
     /// Checkpoint (flush WAL and indexes)
+    /// Diagnostic: resident heap bytes of the major internal structures
+    /// (col-segment stores, column indexes). #[doc(hidden)] — for memory
+    /// benchmarks and debugging only.
+    pub fn debug_memory_report(&self) -> String {
+        let mut out = String::from("[memory]");
+        for e in self.col_segment_stores.iter() {
+            out.push_str(&format!("\n table {}", e.key()));
+            out.push_str(&e.value().debug_memory_stats());
+        }
+        for e in self.column_indexes.iter() {
+            out.push_str(&format!("\n {}", e.value().debug_memory_stats()));
+        }
+        out
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         ensure_open!(self);
         let _guard = self

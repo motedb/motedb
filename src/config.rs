@@ -438,6 +438,20 @@ pub struct DBConfig {
 
     /// Columnar store configuration (for TimeSeries tables)
     pub columnar_config: crate::storage::columnar::config::ColumnarConfig,
+
+    /// Per-table in-memory budget (MB) for columnar cache residency. Bounds
+    /// two structures that otherwise grow linearly with data size:
+    /// 1. decoded col_caches (scan reuse) — cleared when over budget;
+    /// 2. the eager single-segment file_data preload (pointer-read point
+    ///    queries) — skipped when the segment file exceeds the budget.
+    /// Larger = faster point/indexed reads on big tables, more RSS; smaller =
+    /// hard memory ceiling, oversized tables fall back to seek+read (3-5x
+    /// slower point reads depending on OS page cache). None = 256MB.
+    ///
+    /// - for_general: 256MB (default)
+    /// - for_edge: 16MB
+    /// - for_robotics: 8MB
+    pub col_cache_budget_mb: Option<usize>,
 }
 
 /// Auto-checkpoint trigger configuration
@@ -492,6 +506,7 @@ impl Default for DBConfig {
             query_timeout_secs: Some(30), // 30-second timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
+            col_cache_budget_mb: None, // 256MB default (store: DEFAULT_COL_CACHE_BUDGET_BYTES)
         }
     }
 }
@@ -546,7 +561,8 @@ impl DBConfig {
                 enable_compression: Some(true), // was false — enable zstd for disk savings
                 ..Default::default()
             },
-            row_cache_size: Some(200), // was 500 — cut cache memory
+            row_cache_size: Some(200),     // was 500 — cut cache memory
+            col_cache_budget_mb: Some(16), // 16MB decoded-column budget per table
             max_result_rows: Some(50_000),
             compact_storage: true, // 紧凑模式：zstd 压缩 segment（省 ~40% 磁盘）
             pk_lookup_capacity: 5_000, // was 10_000 — halve PK cache
@@ -598,8 +614,9 @@ impl DBConfig {
             },
             row_cache_size: Some(500),
             max_result_rows: Some(100_000),
-            compact_storage: true,      // 紧凑模式：zstd 压缩
-            pk_lookup_capacity: 10_000, // ~0.8MB per table for robotics
+            compact_storage: true,        // 紧凑模式：zstd 压缩
+            col_cache_budget_mb: Some(8), // 8MB decoded-column budget per table
+            pk_lookup_capacity: 10_000,   // ~0.8MB per table for robotics
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
                 min_interval_secs: 60,
@@ -642,7 +659,8 @@ impl DBConfig {
             },
             row_cache_size: Some(200),
             max_result_rows: Some(10_000),
-            compact_storage: true, // 紧凑模式：zstd 压缩
+            compact_storage: true,         // 紧凑模式：zstd 压缩
+            col_cache_budget_mb: Some(16), // 16MB decoded-column budget per table
             pk_lookup_capacity: 5_000,
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 4 * 1024 * 1024, // 4MB

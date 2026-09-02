@@ -577,6 +577,13 @@ impl SegData {
             SegData::Mmap { mmap, offset } => &mmap[*offset..],
         }
     }
+    /// Heap bytes held by this buffer (mmap-backed views hold none).
+    fn heap_bytes(&self) -> usize {
+        match self {
+            SegData::Owned(v) => v.len(),
+            SegData::Mmap { .. } => 0,
+        }
+    }
 }
 
 /// Typed view into a fixed-width column segment. Zero-copy from mmap when available.
@@ -592,6 +599,11 @@ pub struct FixedSegment {
 }
 
 impl FixedSegment {
+    /// Heap bytes held by the decoded buffers (for cache budget accounting).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.null_bitmap.heap_bytes() + self.data.heap_bytes() + std::mem::size_of::<Self>()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn from_bytes(data: &[u8], num_rows: usize, tag: ColumnTypeTag) -> Result<Self> {
         let null_bytes = num_rows.div_ceil(8);
@@ -754,6 +766,14 @@ pub struct TextSegment {
 }
 
 impl TextSegment {
+    /// Heap bytes held by the decoded buffers (for cache budget accounting).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.null_bitmap.heap_bytes()
+            + self.offsets_data.heap_bytes()
+            + self.string_data.heap_bytes()
+            + std::mem::size_of::<Self>()
+    }
+
     /// Returns raw offset bytes for fast batch iteration (bypasses per-row slice()).
     pub fn offsets_bytes(&self) -> &[u8] {
         self.offsets_data.as_bytes()
@@ -1739,6 +1759,39 @@ impl ColumnarSSTable {
     /// Called when a segment is the only one (post-compaction) so that point
     /// queries and indexed lookups get pure pointer reads instead of seek+read.
     /// Uses unsafe interior mutability (same pattern as load_full_keys).
+    /// Diagnostic: heap bytes resident in this SSTable's caches.
+    /// Returns (file_data, keys_data, fence_keys). #[doc(hidden)]-level helper
+    /// for memory-budget benchmarks; not part of the stable API.
+    pub fn debug_resident_bytes(&self) -> (usize, usize, usize) {
+        let keys = self
+            .row_map
+            .keys_data
+            .as_ref()
+            .map(|d| d.len())
+            .unwrap_or(0);
+        let fence = self.row_map.fence_keys.len() * 8;
+        (self.file_data.len(), keys, fence)
+    }
+
+    /// Like [`Self::ensure_file_data_loaded`], but skips loading when the
+    /// file exceeds `max_bytes`. The caller's memory budget decides whether
+    /// the single-segment pointer-read fast path is affordable; oversized
+    /// segments stay on the lazy seek+read path (bounded RSS, slightly
+    /// slower scans). Returns true when file_data is resident after the call.
+    pub fn ensure_file_data_loaded_within(&self, max_bytes: usize) -> bool {
+        if !self.file_data.is_empty() {
+            return true;
+        }
+        let file_len = match &self.file {
+            Some(f) => f.lock().metadata().map(|m| m.len()).unwrap_or(0),
+            None => 0,
+        };
+        if file_len == 0 || file_len > max_bytes as u64 {
+            return false;
+        }
+        self.ensure_file_data_loaded().is_ok() && !self.file_data.is_empty()
+    }
+
     pub fn ensure_file_data_loaded(&self) -> Result<()> {
         if !self.file_data.is_empty() {
             return Ok(()); // Already loaded (small file or previously called).

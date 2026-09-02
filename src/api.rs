@@ -224,6 +224,12 @@ impl Database {
     ///
     /// Stronger durability guarantee than flush() alone.
     /// Use before closing to ensure full recoverability.
+    /// Diagnostic passthrough: resident heap bytes of internal structures.
+    #[doc(hidden)]
+    pub fn debug_memory_report(&self) -> String {
+        self.inner.debug_memory_report()
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.checkpoint()
     }

@@ -1025,6 +1025,23 @@ impl ColumnValueIndex {
     /// incremental inserts accumulate ~500K entries before a single giant
     /// drain — a multi-second stall on one INSERT batch. Call this after the
     /// initial populate completes.
+    /// Diagnostic: resident bytes of the in-memory index structures.
+    #[doc(hidden)]
+    pub fn debug_memory_stats(&self) -> String {
+        let st = self.mem_buffer.stats();
+        let pages = self.btree.read().cached_pages();
+        format!(
+            "index {}: buffer(active {} entries {:.1}MB, immutable {} bufs {:.1}MB) btree_cached_pages={} tombstones={}",
+            self.column_name,
+            st.active_entry_count,
+            st.active_size_bytes as f64 / 1048576.0,
+            st.immutable_buffer_count,
+            st.immutable_size_bytes as f64 / 1048576.0,
+            pages,
+            self.tombstones.lock().len()
+        )
+    }
+
     pub fn set_mem_buffer_size(&self, bytes: usize) {
         self.mem_buffer.set_size_limit(bytes);
     }
