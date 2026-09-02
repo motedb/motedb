@@ -27,7 +27,10 @@ fn get_rss_kb() -> u64 {
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 16
     }
 }
@@ -48,10 +51,10 @@ fn main() {
     let dir = TempDir::new().unwrap();
     let mut config = DBConfig::for_general();
     config.max_result_rows = None; // allow full materialization measurements
-    // Measure query paths cleanly: the background auto-checkpoint thread
-    // occasionally fires mid-query and its lock hold time shows up as huge
-    // single-shot outliers (COUNT 910ms vs 27µs). Production still benefits
-    // from it; benchmarks of query scaling should not sample that contention.
+                                   // Measure query paths cleanly: the background auto-checkpoint thread
+                                   // occasionally fires mid-query and its lock hold time shows up as huge
+                                   // single-shot outliers (COUNT 910ms vs 27µs). Production still benefits
+                                   // from it; benchmarks of query scaling should not sample that contention.
     config.auto_checkpoint = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
 
@@ -68,19 +71,21 @@ fn main() {
     db.execute("CREATE INDEX idx_code ON t (code) USING COLUMN")
         .unwrap();
 
-    let milestones = [
-        100_000usize,
-        200_000,
-        400_000,
-        800_000,
-        1_600_000,
-    ];
+    let milestones = [100_000usize, 200_000, 400_000, 800_000, 1_600_000];
     let mut total = 0usize;
     let batch_size = 5000;
 
     println!(
         "  {:>9} | {:>8} | {:>7} | {:>9} | {:>10} | {:>11} | {:>10} | {:>10} | {:>10}",
-        "rows", "RSS_MB", "B/row", "point_us", "idx_eq_ms", "idx_lim_us", "count_ms", "filter_ms", "group_ms"
+        "rows",
+        "RSS_MB",
+        "B/row",
+        "point_us",
+        "idx_eq_ms",
+        "idx_lim_us",
+        "count_ms",
+        "filter_ms",
+        "group_ms"
     );
     println!("  {}", "-".repeat(115));
 
@@ -110,7 +115,9 @@ fn main() {
             total = milestone;
             println!(
                 "  [inserted to {} in {}ms — {} rows/s]",
-                total, ins_ms, (to_insert as u64 * 1000) / ins_ms.max(1) as u64
+                total,
+                ins_ms,
+                (to_insert as u64 * 1000) / ins_ms.max(1) as u64
             );
         }
 

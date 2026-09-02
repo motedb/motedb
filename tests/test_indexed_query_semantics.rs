@@ -18,10 +18,8 @@ fn db() -> (Database, TempDir) {
     let mut config = DBConfig::for_testing();
     config.auto_checkpoint = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();
-    db.execute(
-        "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT, val INT)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT, val INT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN")
         .unwrap();
     (db, dir)
@@ -77,10 +75,7 @@ fn test_indexed_equality_limit_returns_exactly_k() {
 
     for k in [1usize, 5, 29, 30, 31, 300] {
         let r = db
-            .execute(&format!(
-                "SELECT id FROM t WHERE cat = 'cat_1' LIMIT {}",
-                k
-            ))
+            .execute(&format!("SELECT id FROM t WHERE cat = 'cat_1' LIMIT {}", k))
             .unwrap()
             .materialize()
             .unwrap();
@@ -106,7 +101,10 @@ fn test_indexed_equality_limit_prefix_matches_no_limit() {
         .unwrap()
         .materialize()
         .unwrap();
-    let full_rows = full.select_rows().map(|(_, r)| r.to_vec()).unwrap_or_default();
+    let full_rows = full
+        .select_rows()
+        .map(|(_, r)| r.to_vec())
+        .unwrap_or_default();
     let lim_rows = limited
         .select_rows()
         .map(|(_, r)| r.to_vec())
@@ -133,7 +131,10 @@ fn test_indexed_equality_offset_limit() {
         .unwrap()
         .materialize()
         .unwrap();
-    let full_rows = full.select_rows().map(|(_, r)| r.to_vec()).unwrap_or_default();
+    let full_rows = full
+        .select_rows()
+        .map(|(_, r)| r.to_vec())
+        .unwrap_or_default();
     let paged_rows = paged
         .select_rows()
         .map(|(_, r)| r.to_vec())
@@ -149,10 +150,7 @@ fn test_indexed_equality_offset_limit() {
         .unwrap()
         .materialize()
         .unwrap();
-    assert_eq!(
-        empty.select_rows().map(|(_, r)| r.len()).unwrap_or(0),
-        0
-    );
+    assert_eq!(empty.select_rows().map(|(_, r)| r.len()).unwrap_or(0), 0);
 }
 
 #[test]
@@ -209,16 +207,10 @@ fn test_text_prefix_no_false_positive() {
     let b = format!("{}-beta", prefix);
 
     // Insert via single rows (per-row path) so both land in the index.
-    db.execute(&format!(
-        "INSERT INTO t (cat, val) VALUES ('{}', 1)",
-        a
-    ))
-    .unwrap();
-    db.execute(&format!(
-        "INSERT INTO t (cat, val) VALUES ('{}', 2)",
-        b
-    ))
-    .unwrap();
+    db.execute(&format!("INSERT INTO t (cat, val) VALUES ('{}', 1)", a))
+        .unwrap();
+    db.execute(&format!("INSERT INTO t (cat, val) VALUES ('{}', 2)", b))
+        .unwrap();
     // And via a bulk batch of the same long values.
     let mut batch = String::new();
     for i in 0..120 {

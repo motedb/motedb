@@ -154,10 +154,8 @@ fn test_vector_update_delete_no_deadlock() {
         .into_iter()
         .map(|(i, _)| i)
         .collect();
-    assert!(
-        !ids.contains(&1) || true,
-        "old vector position irrelevant once updated"
-    );
+    // Old vector position is irrelevant once updated (id 1 may or may not
+    // appear near the new location; only ids 0 and 4 must be intact below).
     assert!(
         ids.contains(&0) && ids.contains(&4),
         "unrelated rows intact: {ids:?}"

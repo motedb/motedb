@@ -5812,7 +5812,9 @@ impl QueryExecutor {
         // This replaces the old behavior of falling back to full table scan when
         // post_filters were present.
         let post_filters = &plan.post_filters;
-        if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] scan_method={:?}", plan.scan_method); }
+        if std::env::var_os("MOTE_TRACE").is_some() {
+            eprintln!("[trace] scan_method={:?}", plan.scan_method);
+        }
         match plan.scan_method {
             super::optimizer::ScanMethod::PointQuery {
                 ref table,
@@ -6126,7 +6128,9 @@ impl QueryExecutor {
                         )
                     });
                     let filters_redundant = post_filters.is_empty() || eq_covers_filters;
-                    if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] branch1: post_filters={} eq_covers={} row_ids={} limit={:?} get_arc={:?}", post_filters.len(), eq_covers_filters, row_ids.len(), stmt.limit, __t1.duration_since(__t0)); }
+                    if std::env::var_os("MOTE_TRACE").is_some() {
+                        eprintln!("[trace] branch1: post_filters={} eq_covers={} row_ids={} limit={:?} get_arc={:?}", post_filters.len(), eq_covers_filters, row_ids.len(), stmt.limit, __t1.duration_since(__t0));
+                    }
 
                     // Exact-value verification: index keys truncate long Text
                     // values to a 64-byte prefix, so a row whose value merely
@@ -6167,7 +6171,13 @@ impl QueryExecutor {
                         'window: for chunk in row_ids.chunks(need) {
                             let __f0 = std::time::Instant::now();
                             let batch = self.db.get_table_rows_batch(table, chunk)?;
-                            if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] window fetch: {} ids in {:?}", chunk.len(), __f0.elapsed()); }
+                            if std::env::var_os("MOTE_TRACE").is_some() {
+                                eprintln!(
+                                    "[trace] window fetch: {} ids in {:?}",
+                                    chunk.len(),
+                                    __f0.elapsed()
+                                );
+                            }
                             for (_, row_opt) in batch {
                                 if let Some(row) = row_opt {
                                     verified_push(&mut result_rows, &row);
@@ -6180,7 +6190,13 @@ impl QueryExecutor {
                     } else {
                         let __f0 = std::time::Instant::now();
                         let batch = self.db.get_table_rows_batch(table, &row_ids)?;
-                        if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] full fetch: {} ids in {:?}", row_ids.len(), __f0.elapsed()); }
+                        if std::env::var_os("MOTE_TRACE").is_some() {
+                            eprintln!(
+                                "[trace] full fetch: {} ids in {:?}",
+                                row_ids.len(),
+                                __f0.elapsed()
+                            );
+                        }
                         for (_, row_opt) in batch {
                             if let Some(row) = row_opt {
                                 verified_push(&mut result_rows, &row);
@@ -8879,7 +8895,9 @@ impl QueryExecutor {
         stmt: &SelectStmt,
         table: &str,
     ) -> Result<StreamingQueryResult> {
-        if std::env::var_os("MOTE_TRACE").is_some() { eprintln!("[trace] full_scan_streaming limit={:?}", stmt.limit); }
+        if std::env::var_os("MOTE_TRACE").is_some() {
+            eprintln!("[trace] full_scan_streaming limit={:?}", stmt.limit);
+        }
         let schema = self.db.get_table_schema(table)?;
 
         // 🔑 TimeSeries tables: authoritative data lives in the
