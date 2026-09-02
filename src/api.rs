@@ -1466,10 +1466,14 @@ impl Database {
                 let row_ids_arc = index_ref.value().get_arc(&value)?;
 
                 // 🚀 High-cardinality redirect: for ColSegmentStore tables, when
-                // the index matches many rows (>1000), per-row get() is O(K)
-                // lock+scan+decode — extremely slow for K=100K. Redirect to a
-                // single-pass columnar scan which is dramatically faster.
-                if has_col_seg && row_ids_arc.len() > 1000 {
+                // the index matches a very large row set, the batch row fetch
+                // (K sorted point reads) eventually loses to a single-pass
+                // columnar scan. Threshold aligned with the executor's index
+                // fast path (10000) so mid-selectivity filters (1K-10K
+                // matches) keep using the index: O(log N + K) targeted reads
+                // beat scanning the whole table (e.g. 1600 matches in a 1.6M
+                // row table: ~15ms index fetch vs ~180ms full scan).
+                if has_col_seg && row_ids_arc.len() > 10000 {
                     if let Some(store) = self.inner.get_col_segment_store(table_name) {
                         let col_types = schema.col_types();
                         let filter_pos = schema.get_column_position(col_name);

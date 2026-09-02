@@ -987,11 +987,16 @@ impl ColumnValueIndex {
                 if !entries.is_empty() {
                     let tombstones = self.tombstones.lock();
                     let mut btree = self.btree.write();
-                    for (key, _) in entries {
-                        if !tombstones.contains(&tombstone_key(&key)) {
-                            btree.insert(key, vec![])?;
-                        }
-                    }
+                    // 🚀 Sorted batch insert: entries arrive in BTreeMap order,
+                    // so each leaf is loaded and persisted once per run instead
+                    // of once per key (per-key insert = full-page serialize +
+                    // pwrite syscall per entry — multi-second drains at 1M+).
+                    let batch: Vec<(IndexKey, Vec<u8>)> = entries
+                        .into_iter()
+                        .filter(|(key, _)| !tombstones.contains(&tombstone_key(key)))
+                        .map(|(key, _)| (key, vec![]))
+                        .collect();
+                    btree.insert_batch_sorted(batch)?;
                 }
             } else {
                 break;
@@ -1011,6 +1016,17 @@ impl ColumnValueIndex {
         }
 
         Ok(())
+    }
+
+    /// Shrink the in-memory write buffer to its steady-state size.
+    ///
+    /// CREATE INDEX uses a large buffer (≥32MB) so the initial bulk populate
+    /// drains once; leaving that buffer in place afterwards makes RUNTIME
+    /// incremental inserts accumulate ~500K entries before a single giant
+    /// drain — a multi-second stall on one INSERT batch. Call this after the
+    /// initial populate completes.
+    pub fn set_mem_buffer_size(&self, bytes: usize) {
+        self.mem_buffer.set_size_limit(bytes);
     }
 
     /// Flush all buffered entries (active + immutable) to persistent btree.
@@ -1033,15 +1049,23 @@ impl ColumnValueIndex {
                 let tombstones = self.tombstones.lock();
                 let mut btree = self.btree.write();
                 let mut keys_to_clear = Vec::new();
-                // Insert buffered entries (skip tombstoned)
-                for (key, _) in &entries {
-                    let tk = tombstone_key(key);
-                    if tombstones.contains(&tk) {
-                        keys_to_clear.push(tk);
-                    } else {
-                        btree.insert(key.clone(), vec![])?;
-                    }
-                }
+                // Insert buffered entries (skip tombstoned).
+                // 🚀 Sorted batch insert (mem_buffer.drain() returns globally
+                // sorted entries): one leaf load + one page write per run
+                // instead of per key.
+                let batch: Vec<(IndexKey, Vec<u8>)> = entries
+                    .iter()
+                    .filter_map(|(key, _)| {
+                        let tk = tombstone_key(key);
+                        if tombstones.contains(&tk) {
+                            keys_to_clear.push(tk);
+                            None
+                        } else {
+                            Some((key.clone(), vec![]))
+                        }
+                    })
+                    .collect();
+                btree.insert_batch_sorted(batch)?;
                 // Process deferred deletes from update path
                 for key in &deletes {
                     let _ = btree.delete(key);

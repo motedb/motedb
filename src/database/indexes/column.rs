@@ -49,6 +49,13 @@ impl MoteDB {
         // Populate from existing data
         let _ = self.populate_column_index(&index_arc, table_name, column_name);
 
+        // 🔑 Shrink the build buffer back to steady state. The ≥32MB buffer
+        // above is only for the one-shot populate; kept at runtime it lets
+        // incremental inserts pile up ~500K entries before a single giant
+        // drain (multi-second stall inside one INSERT batch).
+        let _ = index_arc.flush_buffer();
+        index_arc.set_mem_buffer_size(self.column_index_buffer_size);
+
         Ok(())
     }
 

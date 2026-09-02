@@ -950,6 +950,158 @@ impl<K: BTreeKey> GenericBTree<K> {
     }
 
     /// Split a leaf page
+    /// Descend to the leaf that owns `key`.
+    /// Returns (leaf_page_id, path of (parent_id, child_index) from root down,
+    /// is_rightmost_leaf).
+    fn find_leaf_path(&self, key: &K) -> Result<(u64, Vec<(u64, usize)>, Option<K>)> {
+        let mut page_id = *self.root_page_id.read();
+        let mut path: Vec<(u64, usize)> = Vec::new();
+        let mut bound: Option<K> = None;
+        loop {
+            let page = self.read_page(page_id)?;
+            if page.is_leaf {
+                return Ok((page_id, path, bound));
+            }
+            let child_idx = match page.keys.binary_search(key) {
+                Ok(idx) => idx + 1, // Key equals separator, go to right child
+                Err(idx) => idx,    // Insert position
+            };
+            // A separator to the right of the chosen child bounds this
+            // subtree. The deepest level's separator is the tightest;
+            // descending into a last child inherits the ancestor bound.
+            if child_idx < page.keys.len() {
+                bound = Some(page.keys[child_idx].clone());
+            }
+            path.push((page_id, child_idx));
+            page_id = page.children[child_idx];
+        }
+    }
+
+    /// Bulk-insert a SORTED batch of keys in ascending order.
+    ///
+    /// 🚀 Optimization for index drains (mem_buffer → B+Tree): the per-key
+    /// `insert()` path serializes and pwrite()s the whole leaf page on EVERY
+    /// key (~5µs/entry at 1.6M entries ≈ multi-second stalls). Sorted input
+    /// visits leaves left→right, so this path loads each leaf once, inserts
+    /// the whole run in memory, and writes the final page once — amortizing
+    /// serialization + syscalls over ~max_keys entries.
+    ///
+    /// Duplicate keys within the batch (or already in the tree): last value
+    /// wins (same semantics as `insert()`). Requires `entries` sorted
+    /// ascending by key.
+    pub fn insert_batch_sorted(&mut self, entries: Vec<(K, Vec<u8>)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        #[cfg(debug_assertions)]
+        for w in entries.windows(2) {
+            debug_assert!(
+                w[0].0 <= w[1].0,
+                "insert_batch_sorted requires sorted input"
+            );
+        }
+
+        let n = entries.len();
+        let mut i = 0;
+        while i < n {
+            let (leaf_id, mut path, upper) = self.find_leaf_path(&entries[i].0)?;
+            let mut page = self.read_page(leaf_id)?;
+            let mut split: Option<(K, u64)> = None;
+
+            // This leaf owns all keys strictly below `upper` (the parent's
+            // separator to its right; None = rightmost leaf, unbounded). A
+            // key equal to the separator belongs to the right sibling.
+            // Appending past the leaf's current last key is legal while the
+            // separator invariant holds — bounding by keys.last() instead
+            // starves interleaved runs (the entry belongs nowhere → the
+            // outer loop re-descends to the same leaf forever).
+            while i < n {
+                let (key, value) = &entries[i];
+                if let Some(bound) = &upper {
+                    if key >= bound {
+                        break;
+                    }
+                }
+                match page.keys.binary_search(key) {
+                    Ok(idx) => {
+                        page.values[idx] = value.clone();
+                        page.dirty = true;
+                    }
+                    Err(idx) => {
+                        page.keys.insert(idx, key.clone());
+                        page.values.insert(idx, value.clone());
+                        page.num_keys += 1;
+                        page.dirty = true;
+                    }
+                }
+                i += 1;
+
+                if page.num_keys >= self.max_keys
+                    || page.calculate_serialized_size(K::key_size()) > PAGE_SIZE
+                {
+                    // split_leaf persists both halves; re-descend for the next
+                    // entry (boundaries changed).
+                    split = Some(self.split_leaf(&mut page)?);
+                    break;
+                }
+            }
+
+            if split.is_none() {
+                // split_leaf already wrote both halves; otherwise persist the
+                // in-memory run exactly once.
+                self.write_page(&page)?;
+            }
+
+            // Propagate the split upward (mirrors insert()'s phase 3).
+            let mut last_split_page = leaf_id;
+            while let Some((split_key, new_page_id)) = split {
+                if path.is_empty() {
+                    let new_root_id = {
+                        let mut next = self.next_page_id.write();
+                        let id = *next;
+                        *next += 1;
+                        id
+                    };
+                    let mut new_root = Page::new_internal(new_root_id, self.max_keys);
+                    new_root.keys.push(split_key);
+                    new_root.children.push(last_split_page);
+                    new_root.children.push(new_page_id);
+                    new_root.num_keys = 1;
+                    new_root.dirty = true;
+                    self.write_page(&new_root)?;
+                    *self.root_page_id.write() = new_root_id;
+                    split = None;
+                } else {
+                    let (parent_id, _child_idx) = path.pop().unwrap();
+                    let mut parent = self.read_page(parent_id)?;
+                    let idx = match parent.keys.binary_search(&split_key) {
+                        Ok(existing_idx) => existing_idx,
+                        Err(insert_idx) => insert_idx,
+                    };
+                    if idx < parent.keys.len() && parent.keys[idx] == split_key {
+                        parent.children[idx + 1] = new_page_id;
+                    } else {
+                        parent.keys.insert(idx, split_key.clone());
+                        parent.children.insert(idx + 1, new_page_id);
+                        parent.num_keys += 1;
+                    }
+                    parent.dirty = true;
+
+                    let needs_split = parent.num_keys >= self.max_keys
+                        || parent.calculate_serialized_size(K::key_size()) > PAGE_SIZE;
+                    last_split_page = parent_id;
+                    if needs_split {
+                        split = Some(self.split_internal(&mut parent)?);
+                    } else {
+                        self.write_page(&parent)?;
+                        split = None;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn split_leaf(&mut self, page: &mut Page<K>) -> Result<(K, u64)> {
         // NOTE: Do NOT convert values here - write_page will handle it
         // This prevents double conversion bugs
@@ -2180,6 +2332,99 @@ mod tests {
 
         let decoded = u32::deserialize(&bytes).unwrap();
         assert_eq!(key, decoded);
+    }
+
+    /// Deterministic xorshift PRNG — no rand crate dependency.
+    fn xorshift64(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn test_insert_batch_sorted_matches_per_key_insert() {
+        // Random key sets (spanning many leaves, deep trees, and splits):
+        // batch-sorted insert must produce the identical tree contents as
+        // per-key insert.
+        for &(n, seed) in &[(1usize, 1u64), (10, 2), (100, 3), (5_000, 4), (50_000, 5)] {
+            let mut state = seed;
+            let keys: Vec<u32> = (0..n as u32)
+                .map(|_i| (xorshift64(&mut state) as u32) % (n as u32 * 7 + 1))
+                .collect();
+
+            let d1 = TempDir::new().unwrap();
+            let d2 = TempDir::new().unwrap();
+            let mut batch_tree = GenericBTree::<u32>::new(d1.path().join("b.gbtree")).unwrap();
+            let mut ref_tree = GenericBTree::<u32>::new(d2.path().join("r.gbtree")).unwrap();
+
+            let mut sorted = keys.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let batch_entries: Vec<(u32, Vec<u8>)> = sorted.iter().map(|&k| (k, vec![])).collect();
+            batch_tree.insert_batch_sorted(batch_entries).unwrap();
+
+            for k in &sorted {
+                ref_tree.insert(*k, vec![]).unwrap();
+            }
+
+            let got = batch_tree.range_keys(&0, &u32::MAX).unwrap();
+            let want = ref_tree.range_keys(&0, &u32::MAX).unwrap();
+            assert_eq!(got, want, "n={} batch tree must match per-key tree", n);
+        }
+    }
+
+    #[test]
+    fn test_insert_batch_sorted_increments_and_merges() {
+        // Batch inserts interleaved with earlier tree contents: new sorted
+        // batches must merge into an already-populated tree.
+        let d = TempDir::new().unwrap();
+        let mut tree = GenericBTree::<u32>::new(d.path().join("m.gbtree")).unwrap();
+
+        let first: Vec<(u32, Vec<u8>)> = (0..1000).step_by(2).map(|k| (k, vec![])).collect();
+        tree.insert_batch_sorted(first).unwrap();
+
+        let second: Vec<(u32, Vec<u8>)> = (1..1000).step_by(2).map(|k| (k, vec![])).collect();
+        tree.insert_batch_sorted(second).unwrap();
+
+        let all = tree.range_keys(&0, &u32::MAX).unwrap();
+        assert_eq!(all.len(), 1000);
+        for (i, k) in all.iter().enumerate() {
+            assert_eq!(*k, i as u32, "tree must be fully ordered");
+        }
+    }
+
+    #[test]
+    fn test_insert_batch_sorted_duplicate_last_wins() {
+        let d = TempDir::new().unwrap();
+        let mut tree = GenericBTree::<u32>::new(d.path().join("d.gbtree")).unwrap();
+
+        let batch: Vec<(u32, Vec<u8>)> = vec![(5, vec![]), (5, b"final".to_vec()), (9, vec![])];
+        tree.insert_batch_sorted(batch).unwrap();
+
+        let got = tree.range(&0, &u32::MAX).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (5u32, b"final".to_vec()));
+        assert_eq!(got[1].0, 9);
+    }
+
+    #[test]
+    fn test_insert_batch_sorted_reopen_persisted() {
+        // Pages written by the batch path must be readable after reopening
+        // (validates the write_page/offset bookkeeping of the fast path).
+        let d = TempDir::new().unwrap();
+        let path = d.path().join("p.gbtree");
+        {
+            let mut tree = GenericBTree::<u32>::new(path.clone()).unwrap();
+            let batch: Vec<(u32, Vec<u8>)> = (0..20_000u32).map(|k| (k, vec![])).collect();
+            tree.insert_batch_sorted(batch).unwrap();
+            tree.flush().unwrap();
+        }
+        let tree = GenericBTree::<u32>::new(path).unwrap();
+        let all = tree.range_keys(&0, &u32::MAX).unwrap();
+        assert_eq!(all.len(), 20_000);
+        assert_eq!(all[0], 0);
+        assert_eq!(all[19_999], 19_999);
     }
 
     #[test]

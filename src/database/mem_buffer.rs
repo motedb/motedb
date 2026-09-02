@@ -61,7 +61,10 @@ where
     immutable: ImmutableBufferList<K, V>,
 
     /// Size limit in bytes (e.g., 1MB)
-    size_limit: usize,
+    /// Size limit in bytes (atomic: adjustable at runtime — e.g. shrink
+    /// the 32MB CREATE INDEX buffer back to the steady-state size after the
+    /// initial bulk populate, so later incremental drains stay small).
+    size_limit: std::sync::atomic::AtomicUsize,
 
     /// Flush lock (prevents concurrent flush operations)
     flush_lock: Arc<Mutex<()>>,
@@ -102,7 +105,7 @@ where
                 size: 0,
             })),
             immutable: Arc::new(RwLock::new(Vec::new())),
-            size_limit,
+            size_limit: std::sync::atomic::AtomicUsize::new(size_limit),
             flush_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -131,7 +134,7 @@ where
         active.size += entry_size;
 
         // Check if buffer is full
-        if active.size >= self.size_limit {
+        if active.size >= self.size_limit.load(std::sync::atomic::Ordering::Relaxed) {
             // 🔄 Switch: make current active → immutable
             let old_active = BufferState {
                 data: std::mem::take(&mut active.data),
@@ -170,7 +173,8 @@ where
         }
 
         // Check once after all inserts
-        if active.size >= self.size_limit {
+        let limit = self.size_limit.load(std::sync::atomic::Ordering::Relaxed);
+        if active.size >= limit {
             let old_active = BufferState {
                 data: std::mem::take(&mut active.data),
                 size: active.size,
@@ -394,9 +398,10 @@ where
             immutable_buffer_count: immutable_count,
             immutable_size_bytes: immutable_size,
             total_size_bytes: active_size + immutable_size,
-            size_limit: self.size_limit,
-            fullness: ((active_size + immutable_size) as f64 / self.size_limit as f64 * 100.0)
-                as u8,
+            size_limit: self.size_limit.load(std::sync::atomic::Ordering::Relaxed),
+            fullness: ((active_size + immutable_size) as f64
+                / self.size_limit.load(std::sync::atomic::Ordering::Relaxed) as f64
+                * 100.0) as u8,
         }
     }
 
@@ -422,6 +427,16 @@ where
     /// Get number of immutable buffers waiting to flush
     pub fn immutable_count(&self) -> usize {
         self.immutable.read().len()
+    }
+
+    /// Adjust the size limit at runtime (bytes).
+    ///
+    /// Used after a bulk populate (CREATE INDEX): the large build buffer is
+    /// shrunk back to the steady-state size so subsequent incremental
+    /// drains fire small and often instead of accumulating one giant buffer.
+    pub fn set_size_limit(&self, limit: usize) {
+        self.size_limit
+            .store(limit.max(1024), std::sync::atomic::Ordering::Relaxed);
     }
 }
 

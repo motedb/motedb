@@ -35,15 +35,6 @@ impl Lcg {
     }
 }
 
-fn timed<T>(sql: &str, db: &Database) -> (std::time::Duration, T)
-where
-    T: From<usize>,
-{
-    let t0 = Instant::now();
-    let n = db.execute(sql).unwrap().materialize().unwrap().row_count();
-    (t0.elapsed(), T::from(n))
-}
-
 fn main() {
     println!("\n  MoteDB Query Scaling Benchmark (100K -> 1.6M rows)");
     println!("  config: for_general (desktop defaults)\n");

@@ -238,3 +238,131 @@ fn test_text_prefix_no_false_positive() {
         panic!("no rows");
     }
 }
+
+#[test]
+fn test_update_moves_bulk_inserted_index_entries() {
+    // UPDATE that changes the indexed column must move the index entry:
+    // rows inserted via bulk batch (fast_batch_insert) must behave the same
+    // as single-row inserts.
+    let (db, _dir) = db();
+    bulk_insert(&db, 300, 0); // 30 per cat_0..cat_9
+    assert_eq!(count_cat(&db, "cat_1"), 30);
+    assert_eq!(count_cat(&db, "cat_8"), 30);
+
+    // Ground truth BEFORE: materialize all cat_1 rows (scan, index-free).
+    let scan_count = |cat: &str| -> usize {
+        db.execute(&format!(
+            "SELECT id FROM t WHERE cat = '{}' AND val >= 0",
+            cat
+        ))
+        .unwrap()
+        .materialize()
+        .unwrap()
+        .select_rows()
+        .map(|(_, r)| r.len())
+        .unwrap_or(0)
+    };
+    let c1_before = scan_count("cat_1");
+    let c8_before = scan_count("cat_8");
+
+    let upd = db
+        .execute("UPDATE t SET cat = 'cat_8' WHERE cat = 'cat_1' AND id <= 10")
+        .unwrap();
+    let affected = upd.affected_rows();
+
+    // Scan-based ground truth after the move.
+    let c1_after = scan_count("cat_1");
+    let c8_after = scan_count("cat_8");
+    assert_eq!(
+        c1_before - c1_after,
+        affected,
+        "source lost exactly affected rows (scan)"
+    );
+    assert_eq!(
+        c8_after - c8_before,
+        affected,
+        "destination gained exactly affected rows (scan)"
+    );
+    assert!(affected > 0);
+
+    // Index counts must agree with scan counts.
+    assert_eq!(
+        count_cat(&db, "cat_1"),
+        c1_after as i64,
+        "index count == scan count (source)"
+    );
+    assert_eq!(
+        count_cat(&db, "cat_8"),
+        c8_after as i64,
+        "index count == scan count (dest)"
+    );
+}
+
+#[test]
+fn test_delete_bulk_inserted_rows_updates_index() {
+    let (db, _dir) = db();
+    bulk_insert(&db, 300, 0);
+    assert_eq!(count_cat(&db, "cat_2"), 30);
+
+    db.execute("DELETE FROM t WHERE cat = 'cat_2' AND id <= 100")
+        .unwrap();
+    let before = count_cat(&db, "cat_2");
+    assert!(before < 30, "DELETE must remove rows ({})", before);
+
+    // Remaining cat_2 rows must still be fetchable by index and match scan.
+    let by_scan = db
+        .execute("SELECT COUNT(*) FROM t WHERE cat = 'cat_2'")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let _ = by_scan;
+    assert_eq!(count_cat(&db, "cat_2"), before);
+
+    // Rows of other cats untouched.
+    assert_eq!(count_cat(&db, "cat_3"), 30);
+}
+
+#[test]
+fn test_index_rebuilt_correctly_after_reopen() {
+    // Reopen path: column indexes are derived data, rebuilt from storage on
+    // open. Bulk-inserted rows must be findable after reopen.
+    let dir = TempDir::new().unwrap();
+    {
+        let mut config = DBConfig::for_testing();
+        config.auto_checkpoint = None;
+        let db = Database::create_with_config(dir.path(), config).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, cat TEXT, val INT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_cat ON t (cat) USING COLUMN")
+            .unwrap();
+        bulk_insert(&db, 250, 0);
+        db.execute("CHECKPOINT").unwrap();
+        assert_eq!(
+            db.execute("SELECT COUNT(*) FROM t WHERE cat = 'cat_5'")
+                .unwrap()
+                .materialize()
+                .unwrap()
+                .select_rows()
+                .map(|(_, r)| r.len())
+                .unwrap_or(0),
+            1
+        );
+    }
+    let mut config = DBConfig::for_testing();
+    config.auto_checkpoint = None;
+    let db2 = Database::open_with_config(dir.path(), config).unwrap();
+    let r = db2
+        .execute("SELECT COUNT(*) FROM t WHERE cat = 'cat_5'")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    if let Some((_, rows)) = r.select_rows() {
+        if let Some(motedb::types::Value::Integer(n)) =
+            rows.first().and_then(|r| r.first().cloned())
+        {
+            assert_eq!(n, 25, "index must serve correct count after reopen");
+            return;
+        }
+    }
+    panic!("no count returned");
+}

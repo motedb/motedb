@@ -3247,12 +3247,14 @@ impl MoteDB {
                 (key, base_ts + i as u64, row)
             })
             .collect();
+        let __ta = std::time::Instant::now();
         store.append_rows(&store_rows)?;
 
         // Flush periodically to bound memory (same threshold as full path).
         if store.buffered_bytes() >= 4 * 1024 * 1024 {
             store.flush_buffer()?;
         }
+        let __tb = std::time::Instant::now();
 
         // 🚨 Column index maintenance (BUG: bulk batches never reached the index).
         // fast_batch_insert used to skip this entirely — rows inserted in
@@ -3309,6 +3311,16 @@ impl MoteDB {
                     self.index_registry.mark_stale(&key);
                 }
             }
+        }
+
+        let __tc = std::time::Instant::now();
+        if std::env::var_os("MOTE_TRACE").is_some() && __tc.duration_since(__ta).as_millis() > 200 {
+            eprintln!(
+                "[trace] fast_batch_insert slow: n={} append+flush={:?} index={:?}",
+                n,
+                __tb.duration_since(__ta),
+                __tc.duration_since(__tb)
+            );
         }
 
         // Update row count for COUNT(*) fast path.
