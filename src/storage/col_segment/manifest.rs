@@ -18,6 +18,11 @@ pub struct ManifestState {
     pub active_segments: Vec<u64>,
     /// Segment files safe to delete (superseded + manifest-recorded).
     pub obsolete_files: Vec<u64>,
+    /// Every segment id mentioned by any record (active, superseded or GC'd).
+    /// Recovery uses this to distinguish orphan files (id never recorded —
+    /// written after the last durable manifest byte → adopt) from retired
+    /// files (id recorded then superseded/GC'd → delete).
+    pub ever_seen: Vec<u64>,
 }
 
 enum Record {
@@ -96,10 +101,23 @@ impl Manifest {
     }
 
     fn append(&mut self, rec: Record) -> Result<()> {
+        // write+flush only (page cache) — NO fsync. Per-record fsync cost
+        // ~3.8ms and the query-path flush/compaction appends 2-4 records per
+        // statement under sustained writes (filter 4ms → 25ms). Durability is
+        // provided at sync points: segment FILES are fsync'd before their
+        // manifest record is appended, so a lost manifest tail leaves complete
+        // orphan files that recovery adopts (see recover_from_disk). Kill -9
+        // always sees page-cache data; only power loss relies on adoption.
         let bytes = rec.encode();
         self.writer.write_all(&bytes)?;
         self.writer.flush()?;
-        // fsync for crash safety — manifest is the only fsync'd file.
+        Ok(())
+    }
+
+    /// fsync the manifest (durability point). Callers then may physically
+    /// delete retired segment files.
+    pub fn sync(&mut self) -> Result<()> {
+        self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
     }
@@ -131,6 +149,7 @@ impl Manifest {
         let mut pos = 10; // skip magic(4) + version(2) + count(4)
         let mut active: Vec<u64> = Vec::new();
         let mut obsolete: Vec<u64> = Vec::new();
+        let mut ever_seen: Vec<u64> = Vec::new();
         while pos < data.len() {
             let t = data[pos];
             pos += 1;
@@ -143,6 +162,7 @@ impl Manifest {
                     let id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                     pos += 8;
                     active.push(id);
+                    ever_seen.push(id);
                 }
                 2 => {
                     // Compaction
@@ -163,7 +183,9 @@ impl Manifest {
                     }
                     active.retain(|x| !olds.contains(x));
                     active.push(new_id);
-                    obsolete.extend(olds);
+                    obsolete.extend(olds.iter().copied());
+                    ever_seen.push(new_id);
+                    ever_seen.extend(olds.iter().copied());
                 }
                 3 => {
                     // GcCompleted
@@ -188,6 +210,7 @@ impl Manifest {
         ManifestState {
             active_segments: active,
             obsolete_files: obsolete,
+            ever_seen,
         }
     }
 }

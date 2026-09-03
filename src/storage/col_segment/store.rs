@@ -213,6 +213,12 @@ pub struct ColSegmentStore {
     buffered_count: AtomicU64,
     /// 🚀 compact_storage: segment 写入时 zstd 压缩 Fixed/Text 列。
     compact_storage: std::sync::atomic::AtomicBool,
+    /// Retired segment ids whose files are not yet physically deleted.
+    /// With deferred manifest fsync, files must outlive the manifest record
+    /// that retires them (a power loss between "record durable" and "file
+    /// deleted" must never leave the manifest referencing a deleted file).
+    /// Deleted at sync points (`sync_manifest`), bounded by inline sync.
+    pending_gc: Mutex<Vec<u64>>,
     /// Whether cross-segment duplicate keys are possible (UPDATE/DELETE of an
     /// already-segmented key). Precise replacement for the old conservative
     /// `seg_count >= 2` heuristic — under tiered compaction the steady state
@@ -281,6 +287,7 @@ impl ColSegmentStore {
                 DEFAULT_COL_CACHE_BUDGET_BYTES,
             ),
             overlap_possible: std::sync::atomic::AtomicBool::new(false),
+            pending_gc: Mutex::new(Vec::new()),
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -3468,28 +3475,45 @@ impl ColSegmentStore {
         for &id in &state.active_segments {
             max_id = max_id.max(id);
         }
-        // Also check files on disk (in case MANIFEST lags).
+        // Scan files on disk: adopt orphans, clean retired leftovers.
+        // With deferred manifest fsync a crash can leave complete segment
+        // files whose manifest record was never durable. Segment files are
+        // fsync'd BEFORE their manifest record is appended, so an orphan
+        // (id never mentioned by any record) is a complete, durable segment —
+        // adopt it. A file whose id WAS mentioned but is no longer active was
+        // superseded/GC'd — delete it.
+        let mut orphans: Vec<u64> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.ends_with(".sst") {
                         if let Ok(id) = name.trim_end_matches(".sst").parse::<u64>() {
                             max_id = max_id.max(id);
-                            if !state.active_segments.contains(&id) {
-                                // File on disk but not in MANIFEST — orphan, skip.
+                            if state.active_segments.contains(&id) || state.ever_seen.contains(&id)
+                            {
                                 continue;
                             }
+                            orphans.push(id);
                         }
                     }
                 }
             }
         }
+        orphans.sort_unstable();
         self.next_segment_id.store(max_id + 1, Ordering::Relaxed);
 
         // Load each active segment.
         let mut loaded: Vec<Arc<Segment>> = Vec::new();
         let mut loaded_ids: Vec<u64> = Vec::new();
-        for &id in &state.active_segments {
+        let mut loadable: Vec<u64> = state
+            .active_segments
+            .iter()
+            .copied()
+            .chain(orphans.iter().copied())
+            .collect();
+        loadable.sort_unstable();
+        loadable.dedup();
+        for id in loadable {
             let path = self.dir.join(format!("{:010}.sst", id));
             if path.exists() {
                 if let Ok(seg) = Segment::open(&path, id) {
@@ -3499,10 +3523,14 @@ impl ColSegmentStore {
             }
         }
         self.segments.store(Arc::new(loaded));
-        // Clean up obsolete files (superseded by compaction but not yet GC'd).
-        for &id in &state.obsolete_files {
-            let path = self.dir.join(format!("{:010}.sst", id));
-            let _ = std::fs::remove_file(&path);
+        let _ = loaded_ids; // (kept for crash-recovery debugging)
+                            // Clean up files for ids the manifest retired (superseded by
+                            // compaction or already GC'd — their records were durable).
+        for &id in &state.ever_seen {
+            if !state.active_segments.contains(&id) {
+                let path = self.dir.join(format!("{:010}.sst", id));
+                let _ = std::fs::remove_file(&path);
+            }
         }
 
         // Already in push order (ascending id) — correct.
@@ -4075,20 +4103,42 @@ impl ColSegmentStore {
             self.segments.store(Arc::new(new_list));
         }
 
-        // Clear column caches + release mmap pages to keep peak RSS low.
+        // NOTE: do NOT clear col_caches of segments here. This merge replaced
+        // only old_segs (already swapped out of the list); untouched segments
+        // (e.g. the tiered base) hold immutable data whose decoded caches stay
+        // valid. Clearing them forced a full re-decode of the base on every
+        // scan under sustained writes (filter 5ms → 50ms). Memory hygiene is
+        // handled by trim_col_cache_to_budget at the statement boundary.
+        // GC: retire old ids in the manifest now, defer the physical file
+        // deletion to the next sync point (sync_manifest). Deleting before the
+        // manifest record is durable could leave a power-loss recovery with
+        // active ids whose files are gone. Inline sync bounds disk usage when
+        // checkpoints are far apart.
+        self.manifest.lock().record_gc(&old_ids)?;
         {
-            let segs = self.segs();
-            for seg in segs.iter() {
-                seg.clear_all_caches();
-                seg.release_pages();
+            let mut gc = self.pending_gc.lock();
+            gc.extend(old_ids.iter().copied());
+            if gc.len() >= 32 {
+                drop(gc);
+                let _ = self.sync_manifest();
             }
         }
-        // GC: delete old files, record in manifest.
-        for oid in &old_ids {
+        Ok(())
+    }
+
+    /// Durability point: fsync the manifest, then physically delete retired
+    /// segment files. Called from CHECKPOINT/flush/close and inline when
+    /// pending file deletions pile up.
+    pub fn sync_manifest(&self) -> Result<()> {
+        {
+            let mut m = self.manifest.lock();
+            m.sync()?;
+        }
+        let to_delete: Vec<u64> = std::mem::take(&mut *self.pending_gc.lock());
+        for oid in &to_delete {
             let p = self.dir.join(format!("{:010}.sst", oid));
             let _ = std::fs::remove_file(p);
         }
-        self.manifest.lock().record_gc(&old_ids)?;
         Ok(())
     }
 }
@@ -4304,5 +4354,117 @@ mod tiered_tests {
         }
         assert_eq!(st.count_live_rows(), 10_000 + 20 * 100);
         assert!(st.get(1).is_some() && st.get(12_000).is_some());
+    }
+}
+
+#[cfg(test)]
+mod manifest_durability_tests {
+    use super::*;
+
+    fn fresh(dir: &tempfile::TempDir) -> Arc<ColSegmentStore> {
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Text,
+        ];
+        ColSegmentStore::create(dir.path(), "t", col_types).unwrap()
+    }
+
+    fn rows(start: u64, n: u64, ts: u64) -> Vec<(u64, u64, Vec<crate::types::Value>)> {
+        (start..start + n)
+            .map(|i| {
+                (
+                    i,
+                    ts,
+                    vec![
+                        crate::types::Value::Integer(i as i64 * 10),
+                        crate::types::Value::Text(format!("v{}", i).into()),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    fn sst_ids(dir: &std::path::Path) -> Vec<u64> {
+        let mut v = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".sst") {
+                if let Ok(id) = name.trim_end_matches(".sst").parse::<u64>() {
+                    v.push(id);
+                }
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    /// Manifest records are deferred-fsync: a crash after flush_buffer (file
+    /// fsync'd, manifest record only in page cache) must recover the segment
+    /// via orphan adoption.
+    #[test]
+    fn reopen_adopts_orphan_segment_after_unsynced_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let st = fresh(&dir);
+            st.append_rows(&rows(1, 100, 1)).unwrap();
+            st.flush_buffer().unwrap();
+            st.append_rows(&rows(101, 50, 2)).unwrap();
+            st.flush_buffer().unwrap();
+            // NO sync_manifest — simulates crash before the durability point.
+        } // drop without close
+
+        let st2 = fresh(&dir);
+        st2.recover_from_disk();
+        assert_eq!(
+            st2.count_live_rows(),
+            150,
+            "orphan segments must be adopted"
+        );
+        assert!(st2.get(1).is_some() && st2.get(150).is_some());
+    }
+
+    /// Tail merge retires old ids but defers file deletion to sync_manifest.
+    /// Before sync: files linger (recovery must ignore them via ever_seen).
+    /// After sync: files physically deleted. Either way data is correct.
+    #[test]
+    fn retired_files_survive_until_sync_then_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = fresh(&dir);
+        st.append_rows(&rows(1, 1000, 1)).unwrap();
+        st.flush_buffer().unwrap();
+        st.append_rows(&rows(1001, 100, 2)).unwrap();
+        st.flush_buffer().unwrap();
+        st.append_rows(&rows(1101, 100, 3)).unwrap();
+        st.flush_buffer().unwrap();
+        let before = sst_ids(&store_dir(&st));
+
+        st.prepare_for_query().unwrap(); // tiered merge retires the two tails
+        let after_merge = sst_ids(&store_dir(&st));
+        assert!(
+            after_merge.len() > 1 || before.len() > 2,
+            "retired files must still exist before sync (got {:?} → {:?})",
+            before,
+            after_merge
+        );
+        assert_eq!(st.count_live_rows(), 1200);
+
+        st.sync_manifest().unwrap();
+        let after_sync = sst_ids(&store_dir(&st));
+        assert_eq!(
+            after_sync.len(),
+            2,
+            "sync must delete retired files: {after_sync:?}"
+        );
+        assert_eq!(st.count_live_rows(), 1200);
+
+        // Reopen: everything consistent.
+        let st2 = fresh(&dir);
+        st2.recover_from_disk();
+        assert_eq!(st2.count_live_rows(), 1200);
+        assert_eq!(sst_ids(&store_dir(&st2)).len(), 2);
+    }
+
+    fn store_dir(st: &ColSegmentStore) -> std::path::PathBuf {
+        st.dir.clone()
     }
 }

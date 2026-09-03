@@ -200,6 +200,10 @@ impl MoteDB {
                     e
                 );
             }
+            // fsync manifest + physically delete retired segment files.
+            // (manifest appends are deferred-fsync for query latency; this is
+            // the durability point.)
+            let _ = entry.sync_manifest();
             // Release mmap pages from flushed segments so RSS stays bounded.
             // Without this, each open segment's row_map + column data pages
             // remain resident, causing RSS to grow with segment count.
@@ -329,6 +333,12 @@ impl MoteDB {
         for table_name in self.table_registry.list_tables()? {
             if self.col_segment_stores.contains_key(&table_name) {
                 self.sync_col_segment_to_sstables(&table_name);
+                // VACUUM is an explicit reclamation point: fsync the manifest
+                // and physically delete retired segment files (deferred since
+                // the last checkpoint — see store.pending_gc).
+                if let Some(store) = self.col_segment_stores.get(&table_name) {
+                    store.sync_manifest()?;
+                }
                 continue;
             }
             if let Ok(schema) = self.table_registry.get_table(&table_name) {
@@ -392,6 +402,7 @@ impl MoteDB {
         // buffers avoids replaying the entire WAL on next open.
         for entry in self.col_segment_stores.iter() {
             let _ = entry.flush_buffer();
+            let _ = entry.sync_manifest();
         }
         Ok(())
     }
