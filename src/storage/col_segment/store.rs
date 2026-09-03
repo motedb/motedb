@@ -213,6 +213,13 @@ pub struct ColSegmentStore {
     buffered_count: AtomicU64,
     /// 🚀 compact_storage: segment 写入时 zstd 压缩 Fixed/Text 列。
     compact_storage: std::sync::atomic::AtomicBool,
+    /// Whether cross-segment duplicate keys are possible (UPDATE/DELETE of an
+    /// already-segmented key). Precise replacement for the old conservative
+    /// `seg_count >= 2` heuristic — under tiered compaction the steady state
+    /// is always [base, tail] (2 segments), and paying dedup on every scan
+    /// for that cost 1.5-2.5x scan latency. Cleared by a FULL merge (single
+    /// deduped segment); tail merges keep it (base∩tail overlap persists).
+    overlap_possible: std::sync::atomic::AtomicBool,
     /// Total decoded-bytes budget for col_cache across this table's segments.
     /// The per-entry bound (COL_CACHE_CAP) limits cache WIDTH (columns), not
     /// total bytes — without this budget, a scan-heavy workload on a large
@@ -273,6 +280,7 @@ impl ColSegmentStore {
             col_cache_budget_bytes: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_COL_CACHE_BUDGET_BYTES,
             ),
+            overlap_possible: std::sync::atomic::AtomicBool::new(false),
         });
         // 🔥 Auto-recover segments from disk if the MANIFEST has active entries.
         // This handles the restart case: get_or_create_col_segment_store is called
@@ -332,10 +340,21 @@ impl ColSegmentStore {
         Ok(())
     }
 
+    /// Mark that a write may target a key already present in an older
+    /// segment (UPDATE new-version, DELETE tombstone, PK re-insert). Called
+    /// by the crud layer's UPDATE/DELETE paths; makes cross-segment dedup
+    /// precise instead of paying it on every multi-segment scan.
+    pub fn note_overlapping_write(&self) {
+        self.overlap_possible
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Append a tombstone (deletion marker) for a key. The tombstone suppresses
     /// the row in multi-segment scans (newest-version-wins with deleted=true).
     /// 🔥 Stability: auto-compacts when segments exceed threshold.
     pub fn append_tombstone(&self, key: u64, ts: u64) -> Result<()> {
+        // A tombstone always targets an existing (possibly segmented) key.
+        self.note_overlapping_write();
         let col_types = self.col_types.load();
         let mut buf = self.write_buf.lock();
         // Write placeholder values for each column (keeps column_buffers in sync
@@ -414,7 +433,7 @@ impl ColSegmentStore {
             // (calling merge_segments would deadlock: parking_lot::Mutex is
             // not reentrant). Pass the new column's default_value so the merge
             // backfills pre-existing rows with it instead of NULL.
-            self.merge_segments_locked_with_default(old_segs, default_value)?;
+            self.merge_segments_locked_with_default(old_segs, default_value, false)?;
         }
         // 5. Invalidate schema-dependent caches.
         self.groupby_cache.write().clear();
@@ -524,7 +543,14 @@ impl ColSegmentStore {
         let segs = self.segs();
         if segs.len() >= COMPACTION_SEGMENT_THRESHOLD {
             drop(segs);
-            let _ = self.force_compact_all();
+            // Tiered: merge just the small newest deltas when a large base
+            // exists (bounds the per-query stall); the full merge only runs
+            // once the tail itself has grown to a significant fraction of
+            // the base — then its cost is amortized over that growth.
+            let tiered = self.compact_small_tail()?;
+            if !tiered {
+                let _ = self.force_compact_all();
+            }
             crate::purge_memory_to_os();
         } else if segs.len() == 1 {
             // 🚀 Single segment (post-compaction): eagerly load file_data
@@ -2087,16 +2113,19 @@ impl ColSegmentStore {
     /// Returns false for the common case (no pending UPDATEs), letting the scan
     /// path skip dedup entirely (the v0.5.0 performance fix).
     pub fn may_have_duplicate_keys(&self) -> bool {
-        // The write buffer can hold a newer version of an already-segmented key.
-        // Multiple segments can also hold overlapping keys (e.g. an INSERT
-        // segment flushed by auto-checkpoint, then an UPDATE segment from a
-        // later flush — both contain the same composite key with different
-        // values). Conservative: dedup whenever there's buffered data OR 2+
-        // segments. A single compacted segment with empty buffer is the only
-        // safe no-dedup case.
+        // The write buffer can hold a newer version of an already-segmented key
+        // (covered by the buf_n check). On-disk cross-segment overlap happens
+        // only after an UPDATE/DELETE of a segmented key (overlap_possible),
+        // and is cleared by a full merge. A tiered-compaction steady state of
+        // [base, tail] with fresh inserts only needs no dedup.
         let buf_n = self.write_buf.lock().num_rows;
-        let seg_count = self.segs().len();
-        buf_n > 0 && seg_count >= 1 || seg_count >= 2
+        if buf_n > 0 {
+            return true;
+        }
+        self.segs().len() >= 2
+            && self
+                .overlap_possible
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Count rows matching a filter WITHOUT materializing Value objects.
@@ -3477,6 +3506,13 @@ impl ColSegmentStore {
         }
 
         // Already in push order (ascending id) — correct.
+
+        // Conservative on reopen: if 2+ segments were persisted, an
+        // un-compacted UPDATE/DELETE overlap may exist on disk. A full merge
+        // will clear it.
+        if self.segs().len() >= 2 {
+            self.note_overlapping_write();
+        }
     }
 
     /// Returns a cheap `Arc<Vec<ColumnType>>` snapshot of the current column
@@ -3553,7 +3589,42 @@ impl ColSegmentStore {
     /// `add_column_type` (which already holds the lock — calling `merge_segments`
     /// from there would deadlock since parking_lot::Mutex is NOT reentrant).
     fn merge_segments_locked(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
-        self.merge_segments_locked_with_default(old_segs, None)
+        self.merge_segments_locked_with_default(old_segs, None, false)
+    }
+
+    /// Merge a SUBSET of segments (the newest tail) preserving tombstones.
+    /// A tombstone's older live version may live in a base segment outside
+    /// the merge set — dropping it (the full-merge behavior) would resurrect
+    /// that row. Used by tiered compaction (`compact_small_tail`).
+    fn merge_tail_segments(&self, old_segs: Vec<Arc<Segment>>) -> Result<()> {
+        if old_segs.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.flush_merge_lock.lock();
+        self.merge_segments_locked_with_default(old_segs, None, true)
+    }
+
+    /// Tiered compaction: when a much larger base segment exists and the
+    /// newer delta segments are small relative to it (< 50% of the base's
+    /// rows), merge ONLY the deltas. O(delta) work inside the triggering
+    /// query instead of an O(total data) rewrite — bounds the per-query
+    /// compaction stall under sustained small-batch insert streams.
+    /// Returns true when a tail merge ran; false = caller should fall back
+    /// to a full merge (the tail is then large, so a full merge is amortized).
+    fn compact_small_tail(&self) -> Result<bool> {
+        let segs = self.segs();
+        if segs.len() < COMPACTION_SEGMENT_THRESHOLD {
+            return Ok(false);
+        }
+        let base_rows = segs[0].row_count as u64;
+        let tail_rows: u64 = segs[1..].iter().map(|s| s.row_count as u64).sum();
+        if tail_rows * 2 >= base_rows {
+            return Ok(false);
+        }
+        let old_segs: Vec<Arc<Segment>> = segs[1..].iter().cloned().collect();
+        drop(segs);
+        self.merge_tail_segments(old_segs)?;
+        Ok(true)
     }
 
     /// Merge segments, backfilling the new (last) column with `new_col_default`
@@ -3563,6 +3634,7 @@ impl ColSegmentStore {
         &self,
         old_segs: Vec<Arc<Segment>>,
         new_col_default: Option<&crate::types::Value>,
+        keep_tombstones: bool,
     ) -> Result<()> {
         if old_segs.is_empty() {
             return Ok(());
@@ -3605,7 +3677,7 @@ impl ColSegmentStore {
             // row_map, breaking point lookups (get/where id=...) after compaction.
             let single_seg = old_segs.len() <= 1;
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut collected: Vec<(u64, u64, Vec<[u8; 8]>, Vec<bool>)> = Vec::new();
+            let mut collected: Vec<(u64, u64, Vec<[u8; 8]>, Vec<bool>, bool)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
                 // Load timestamps from disk (lazy — only needed during merge).
@@ -3627,6 +3699,18 @@ impl ColSegmentStore {
                         continue;
                     }
                     if seg.sst.row_map.is_deleted(i) {
+                        if keep_tombstones {
+                            // Tiered (subset) merge: the older live version may
+                            // live in a base segment outside this merge set —
+                            // the tombstone must survive to keep shadowing it.
+                            collected.push((
+                                key,
+                                seg.sst.row_map.timestamp_loaded(i),
+                                vec![[0u8; 8]; ncols],
+                                vec![true; ncols],
+                                true,
+                            ));
+                        }
                         continue;
                     }
                     let ts = seg.sst.row_map.timestamp_loaded(i);
@@ -3676,17 +3760,17 @@ impl ColSegmentStore {
                             }
                         }
                     }
-                    collected.push((key, ts, col_vals, col_nulls));
+                    collected.push((key, ts, col_vals, col_nulls, false));
                 }
             }
             // Single-segment data is already sorted (sequential insert); skip the
             // sort for that case to avoid the O(N log N) overhead.
             if !single_seg {
-                collected.sort_unstable_by_key(|(k, _, _, _)| *k);
+                collected.sort_unstable_by_key(|(k, _, _, _, _)| *k);
             }
-            for (key, ts, col_vals, col_nulls) in collected {
+            for (key, ts, col_vals, col_nulls, deleted) in collected {
                 let col_bytes: Vec<&[u8]> = col_vals.iter().map(|b| b.as_slice()).collect();
-                builder.add_values_raw_with_nulls(key, ts, false, &col_bytes, &col_nulls)?;
+                builder.add_values_raw_with_nulls(key, ts, deleted, &col_bytes, &col_nulls)?;
             }
         } else {
             // Mixed columns (has Text and/or Vector/Spatial): direct copy with
@@ -3699,7 +3783,7 @@ impl ColSegmentStore {
             use crate::storage::lsm::columnar::ColumnTypeTag;
             let single_seg = old_segs.len() <= 1;
             let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            let mut collected: Vec<(u64, u64, Vec<Vec<u8>>, Vec<bool>)> = Vec::new();
+            let mut collected: Vec<(u64, u64, Vec<Vec<u8>>, Vec<bool>, bool)> = Vec::new();
             for seg in old_segs.iter().rev() {
                 let n = seg.sst.num_rows;
                 // Load timestamps from disk (lazy — only needed during merge).
@@ -3791,6 +3875,32 @@ impl ColSegmentStore {
                         continue;
                     }
                     if seg.sst.row_map.is_deleted(i) {
+                        if keep_tombstones {
+                            // Tiered (subset) merge: keep the tombstone — the
+                            // older live version may live in a base segment
+                            // outside this merge set (see all_fixed path).
+                            let ts = seg.sst.row_map.timestamp_loaded(i);
+                            let mut ph: Vec<Vec<u8>> = Vec::with_capacity(ncols);
+                            let mut pn: Vec<bool> = Vec::with_capacity(ncols);
+                            for ci in 0..ncols {
+                                // Width-correct NULL placeholders (values of
+                                // deleted rows are never read, but column
+                                // buffers must stay in sync with num_rows).
+                                match col_types.get(ci) {
+                                    Some(ColumnType::Integer)
+                                    | Some(ColumnType::Float)
+                                    | Some(ColumnType::Timestamp) => {
+                                        ph.push(vec![0u8; 8]);
+                                    }
+                                    Some(ColumnType::Boolean) => {
+                                        ph.push(vec![0u8]);
+                                    }
+                                    _ => ph.push(0xFFFFu16.to_le_bytes().to_vec()),
+                                }
+                                pn.push(true);
+                            }
+                            collected.push((key, ts, ph, pn, true));
+                        }
                         continue;
                     }
                     let ts = seg.sst.row_map.timestamp_loaded(i);
@@ -3928,21 +4038,29 @@ impl ColSegmentStore {
                         }
                         row_bytes.push(buf);
                     }
-                    collected.push((key, ts, row_bytes, row_nulls));
+                    collected.push((key, ts, row_bytes, row_nulls, false));
                 }
             }
             if !single_seg {
-                collected.sort_unstable_by_key(|(k, _, _, _)| *k);
+                collected.sort_unstable_by_key(|(k, _, _, _, _)| *k);
             }
-            for (key, ts, row_bytes, row_nulls) in collected {
+            for (key, ts, row_bytes, row_nulls, deleted) in collected {
                 let col_slices: Vec<&[u8]> = row_bytes.iter().map(|b| b.as_slice()).collect();
-                builder.add_values_raw_with_nulls(key, ts, false, &col_slices, &row_nulls)?;
+                builder.add_values_raw_with_nulls(key, ts, deleted, &col_slices, &row_nulls)?;
             }
         }
         builder.finish()?;
 
         let new_seg = Arc::new(Segment::open(&path, id)?);
 
+        // A full merge produces one deduped segment — cross-segment overlap
+        // is gone. Tail merges (keep_tombstones) keep the flag: base∩tail
+        // overlap may persist. Only clear while the buffer is empty (a
+        // buffered UPDATE would re-introduce overlap after its flush).
+        if !keep_tombstones && self.write_buf.lock().num_rows == 0 {
+            self.overlap_possible
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         // Record compaction in manifest FIRST (crash safety), then swap memory.
         self.manifest.lock().record_compaction(id, &old_ids)?;
         {
@@ -4045,5 +4163,146 @@ mod budget_tests {
             0,
             "second trim is a no-op"
         );
+    }
+}
+
+#[cfg(test)]
+mod tiered_tests {
+    use super::*;
+
+    fn store(dir: &tempfile::TempDir) -> Arc<ColSegmentStore> {
+        let col_types = vec![
+            crate::types::ColumnType::Integer,
+            crate::types::ColumnType::Text,
+        ];
+        ColSegmentStore::create(dir.path(), "t", col_types).unwrap()
+    }
+
+    fn rows(start: u64, n: u64, ts: u64) -> Vec<(u64, u64, Vec<crate::types::Value>)> {
+        (start..start + n)
+            .map(|i| {
+                (
+                    i,
+                    ts,
+                    vec![
+                        crate::types::Value::Integer(i as i64 * 10),
+                        crate::types::Value::Text(format!("v{}", i).into()),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    /// The resurrection hazard: a tombstone in a delta segment whose live row
+    /// lives in the BASE must survive a tiered tail merge.
+    #[test]
+    fn tail_merge_preserves_delete_of_base_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = store(&dir);
+        // base: 1000 rows, then two small deltas → 3 segments.
+        st.append_rows(&rows(1, 1000, 1)).unwrap();
+        st.flush_buffer().unwrap();
+        st.append_rows(&rows(1001, 100, 2)).unwrap();
+        st.flush_buffer().unwrap();
+        // Delete a BASE row (id 5) with a newer timestamp.
+        st.append_tombstone(5, 9).unwrap();
+        st.append_rows(&rows(1101, 50, 3)).unwrap();
+        st.flush_buffer().unwrap(); // 4th segment: [base1000, d100, d50+tomb]
+        assert!(st.segs().len() >= 3);
+
+        st.prepare_for_query().unwrap();
+
+        // Tail (150+1 rows) < 50% of base (1000) → tiered path taken.
+        assert!(
+            st.segs().len() >= 2,
+            "tiered merge must keep the base segment"
+        );
+        assert!(
+            st.get(5).is_none(),
+            "deleted base row must stay deleted after tail merge"
+        );
+        assert_eq!(st.count_live_rows(), 1000 + 100 + 50 - 1);
+        // Rows from every segment still readable.
+        assert!(st.get(1).is_some() && st.get(1001).is_some() && st.get(1150).is_some());
+    }
+
+    /// An UPDATE (newer version of a base key) in a delta keeps shadowing the
+    /// base after a tiered merge.
+    #[test]
+    fn tail_merge_keeps_newest_version_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = store(&dir);
+        st.append_rows(&rows(1, 1000, 1)).unwrap();
+        st.flush_buffer().unwrap();
+        st.append_rows(&rows(1001, 100, 2)).unwrap();
+        st.flush_buffer().unwrap();
+        // Overwrite base key 7 with a newer version (ts=8).
+        st.append_rows(&[(
+            7,
+            8,
+            vec![
+                crate::types::Value::Integer(77777),
+                crate::types::Value::Text("updated".into()),
+            ],
+        )])
+        .unwrap();
+        st.append_rows(&rows(1101, 50, 3)).unwrap();
+        st.flush_buffer().unwrap();
+
+        st.prepare_for_query().unwrap();
+
+        let row = st.get(7).expect("row must exist");
+        assert_eq!(row[0], crate::types::Value::Integer(77777));
+        assert_eq!(row[1], crate::types::Value::Text("updated".into()));
+        assert_eq!(st.count_live_rows(), 1000 + 100 + 50); // no duplicate key 7
+    }
+
+    /// A large tail (≥ 50% of base) falls back to the full merge: one segment,
+    /// tombstones physically dropped.
+    #[test]
+    fn large_tail_falls_back_to_full_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = store(&dir);
+        st.append_rows(&rows(1, 100, 1)).unwrap();
+        st.flush_buffer().unwrap();
+        st.append_rows(&rows(101, 150, 2)).unwrap();
+        st.flush_buffer().unwrap();
+        st.append_rows(&rows(251, 150, 3)).unwrap();
+        st.flush_buffer().unwrap();
+        assert_eq!(st.segs().len(), 3);
+
+        st.prepare_for_query().unwrap();
+
+        assert_eq!(st.segs().len(), 1, "tail ≥ 50% of base → full compaction");
+        assert_eq!(st.count_live_rows(), 400);
+    }
+
+    /// Sustained small batches: segment count stays bounded by tail merges
+    /// without any full rewrite (base row count unchanged ⇒ base untouched).
+    #[test]
+    fn sustained_small_batches_never_rewrite_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = store(&dir);
+        st.append_rows(&rows(1, 10_000, 1)).unwrap();
+        st.flush_buffer().unwrap();
+        let base_id = st.segs()[0].id;
+
+        for b in 0..20 {
+            st.append_rows(&rows(10_001 + b * 100, 100, 2 + b)).unwrap();
+            st.flush_buffer().unwrap();
+            st.prepare_for_query().unwrap(); // tiered compaction kicks in at ≥3
+            assert!(
+                st.segs().len() < COMPACTION_SEGMENT_THRESHOLD + 2,
+                "segment count must stay bounded (got {})",
+                st.segs().len()
+            );
+            assert_eq!(
+                st.segs()[0].id,
+                base_id,
+                "base segment must never be rewritten"
+            );
+        }
+        assert_eq!(st.count_live_rows(), 10_000 + 20 * 100);
+        assert!(st.get(1).is_some() && st.get(12_000).is_some());
     }
 }

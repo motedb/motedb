@@ -944,6 +944,9 @@ impl MoteDB {
             // 🔑 PERF: use append_row_ref (by reference) to avoid Vec<Value> clone.
             let store = self.get_or_create_col_segment_store(table_name, schema.col_types())?;
             let table_id = self.table_registry.get_table_id(table_name).unwrap_or(0) as u64;
+            // UPDATE writes a new version of an already-segmented key →
+            // cross-segment overlap becomes possible (scan dedup flag).
+            store.note_overlapping_write();
 
             // 🔑 If the PK value changed, we need to:
             // 1. Tombstone the OLD composite_key (so WHERE old_pk finds nothing)
