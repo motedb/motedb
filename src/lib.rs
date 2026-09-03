@@ -116,6 +116,38 @@ pub fn purge_memory_to_os() {
     }
 }
 
+/// Configure jemalloc page-decay so freed memory returns to the OS promptly.
+///
+/// macOS rejects jemalloc's `background_thread` option (pthread-only), and the
+/// default dirty-page decay is 10 seconds — large transient allocations
+/// (compaction rewrites, CREATE INDEX, bulk SELECT materialization) linger in
+/// RSS long after being freed, making the effective memory ceiling look far
+/// higher than the live set. A short decay (100ms) bounds that lag; purge
+/// still happens on allocation activity, so idle processes pay nothing.
+/// Idempotent (once per process); no-op without the jemalloc feature.
+pub fn configure_allocator_decay() {
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            const DECAY_MS: i64 = 100;
+            // New arenas inherit the global default.
+            let _ = unsafe { tikv_jemalloc_ctl::raw::write(b"dirty_decay_ms\0", DECAY_MS) };
+            let _ = unsafe { tikv_jemalloc_ctl::raw::write(b"muzzy_decay_ms\0", DECAY_MS) };
+            // Arenas created before this call need per-arena writes.
+            if let Ok(n) = tikv_jemalloc_ctl::arenas::narenas::read() {
+                for i in 0..n {
+                    let d = format!("arena.{}.dirty_decay_ms\0", i);
+                    let _ = unsafe { tikv_jemalloc_ctl::raw::write(d.as_bytes(), DECAY_MS) };
+                    let m = format!("arena.{}.muzzy_decay_ms\0", i);
+                    let _ = unsafe { tikv_jemalloc_ctl::raw::write(m.as_bytes(), DECAY_MS) };
+                }
+            }
+        });
+    }
+}
+
 // ── Logging ─────────────────────────────────────────────────────────────
 // The crate emits log records via the `log` crate facade (our
 // `debug_log!`/`info_log!`/`warn_log!`/`error_log!` macros delegate to

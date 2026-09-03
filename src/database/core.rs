@@ -356,6 +356,7 @@ impl MoteDB {
 
     /// Create a new database with custom configuration
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        crate::configure_allocator_decay();
         config.validate()?;
         let path = path.as_ref();
         let db_path = path.with_extension("mote");
@@ -836,6 +837,7 @@ impl MoteDB {
     /// let db = MoteDB::open_with_config("data.mote", config)?;
     /// ```
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
+        crate::configure_allocator_decay();
         config.validate()?;
         let path = path.as_ref();
         let db_path = path.with_extension("mote");

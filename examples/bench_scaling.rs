@@ -175,6 +175,10 @@ fn main() {
         let filter_ms = best_of_3("SELECT COUNT(*) FROM t WHERE val > 500");
         let group_ms = best_of_3("SELECT code, COUNT(*), AVG(val) FROM t GROUP BY code");
 
+        // Steady-state RSS: wait out the allocator's 100ms dirty-page decay so
+        // the reading reflects live memory, not the just-finished query mix's
+        // transient working set.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let rss = get_rss_kb();
         let b_per_row = rss * 1024 / total.max(1) as u64;
         println!("{}", db.debug_memory_report());

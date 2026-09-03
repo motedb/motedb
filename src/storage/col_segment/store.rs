@@ -2037,9 +2037,10 @@ impl ColSegmentStore {
     }
 
     /// Clear all segment col_caches if their combined decoded bytes exceed
-    /// the budget. Returns true when a trim happened. Cost: one atomic load
-    /// + N short Mutex locks (N = segment count), ~ns per segment.
-    pub fn trim_col_cache_to_budget(&self) -> bool {
+    /// the budget. Returns the number of decoded bytes freed (0 = under
+    /// budget, nothing cleared). Cost: one atomic load + N short Mutex locks
+    /// (N = segment count), ~ns per segment.
+    pub fn trim_col_cache_to_budget(&self) -> usize {
         let budget = self.col_cache_budget();
         let segs = self.segs();
         let mut total = 0usize;
@@ -2047,12 +2048,12 @@ impl ColSegmentStore {
             total += seg.cached_col_bytes();
         }
         if total <= budget {
-            return false;
+            return 0;
         }
         for seg in segs.iter() {
             seg.clear_cache();
         }
-        true
+        total
     }
 
     /// Clear segment col_cache WITHOUT releasing mmap pages. Use this between
@@ -4029,15 +4030,20 @@ mod budget_tests {
         store
             .col_cache_budget_bytes
             .store(usize::MAX / 2, std::sync::atomic::Ordering::Relaxed);
-        assert!(!store.trim_col_cache_to_budget());
+        assert_eq!(store.trim_col_cache_to_budget(), 0);
 
         // Over the budget: trim clears every segment's cache.
         store
             .col_cache_budget_bytes
             .store(64 * 1024, std::sync::atomic::Ordering::Relaxed);
-        assert!(store.trim_col_cache_to_budget());
+        let freed = store.trim_col_cache_to_budget();
+        assert_eq!(freed, total, "trim must report the bytes it cleared");
         let after: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
         assert_eq!(after, 0, "trim must clear all decoded col caches");
-        assert!(!store.trim_col_cache_to_budget(), "second trim is a no-op");
+        assert_eq!(
+            store.trim_col_cache_to_budget(),
+            0,
+            "second trim is a no-op"
+        );
     }
 }

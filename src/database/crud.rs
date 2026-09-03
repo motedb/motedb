@@ -2017,7 +2017,16 @@ impl MoteDB {
         // release_pages_only (aggregates, GROUP BY early returns, api redirect).
         // Caches filled by the PREVIOUS query are dropped once over budget, so
         // sustained RSS stays flat as data grows. Cost: N atomic loads.
-        store.trim_col_cache_to_budget();
+        let cleared = store.trim_col_cache_to_budget();
+        // A large trim means we are in the over-budget regime where every scan
+        // re-decodes whole columns: the freed dirty pages would otherwise sit
+        // in allocator arenas (macOS has no jemalloc background thread, and
+        // decay only fires on allocation activity in the SAME arena). Purging
+        // here converges RSS to the live set. Gated at 4MB so small tables
+        // and steady-state workloads pay nothing.
+        if cleared >= 4 * 1024 * 1024 {
+            crate::purge_memory_to_os();
+        }
         Ok(store)
     }
 
