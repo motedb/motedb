@@ -218,6 +218,8 @@ pub enum QueryResult {
     Definition { message: String },
 }
 
+use crate::types::CompSum;
+
 impl QueryResult {
     pub fn affected_rows(&self) -> usize {
         match self {
@@ -3457,7 +3459,7 @@ impl QueryExecutor {
                                             } else if is_int {
                                                 row.push(Value::Integer(stats.sum_i));
                                             } else {
-                                                row.push(Value::Float(stats.sum_f));
+                                                row.push(Value::Float(stats.sum_f.total()));
                                             }
                                         }
                                         "MIN" => {
@@ -3487,7 +3489,7 @@ impl QueryExecutor {
                                                 ));
                                             } else {
                                                 row.push(Value::Float(
-                                                    stats.sum_f / stats.count as f64,
+                                                    stats.sum_f.total() / stats.count as f64,
                                                 ));
                                             }
                                         }
@@ -3583,7 +3585,9 @@ impl QueryExecutor {
                                 if agg.count == 0 {
                                     row.push(Value::Null);
                                 } else if agg.has_float {
-                                    row.push(Value::Float(agg.float_sum + agg.int_sum as f64));
+                                    row.push(Value::Float(
+                                        agg.float_sum.total() + agg.int_sum as f64,
+                                    ));
                                 } else {
                                     row.push(Value::Integer(agg.int_sum));
                                 }
@@ -3593,7 +3597,7 @@ impl QueryExecutor {
                                     row.push(Value::Null);
                                 } else {
                                     let s = if agg.has_float {
-                                        agg.float_sum + agg.int_sum as f64
+                                        agg.float_sum.total() + agg.int_sum as f64
                                     } else {
                                         agg.int_sum as f64
                                     };
@@ -7447,7 +7451,7 @@ impl QueryExecutor {
         struct GroupAcc {
             count: i64,
             int_sum: i64,
-            float_sum: f64,
+            float_sum: CompSum,
             has_float: bool,
         }
         impl GroupAcc {
@@ -7455,7 +7459,7 @@ impl QueryExecutor {
                 Self {
                     count: 0,
                     int_sum: 0,
-                    float_sum: 0.0,
+                    float_sum: CompSum::default(),
                     has_float: false,
                 }
             }
@@ -7465,14 +7469,14 @@ impl QueryExecutor {
                 } else {
                     if !self.has_float {
                         self.has_float = true;
-                        self.float_sum = self.int_sum as f64;
+                        self.float_sum.add(self.int_sum as f64);
                     }
-                    self.float_sum += val;
+                    self.float_sum.add(val);
                 }
             }
             fn sum(&self) -> Value {
                 if self.has_float {
-                    Value::Float(self.float_sum)
+                    Value::Float(self.float_sum.total())
                 } else {
                     Value::Integer(self.int_sum)
                 }
@@ -7482,7 +7486,7 @@ impl QueryExecutor {
                     return Value::Null;
                 }
                 let s = if self.has_float {
-                    self.float_sum
+                    self.float_sum.total()
                 } else {
                     self.int_sum as f64
                 };
@@ -7638,7 +7642,7 @@ impl QueryExecutor {
                     // Re-add the accumulated sums so partial sums from lin_groups
                     // merge into the hashmap entry. add() handles int/float flagging.
                     if a.has_float {
-                        entry.add(a.float_sum, true);
+                        entry.add(a.float_sum.total(), true);
                     }
                     entry.add(a.int_sum as f64, false);
                 }
@@ -8485,7 +8489,7 @@ impl QueryExecutor {
             .scan_range_streaming(tp << 32, (tp + 1) << 32)?;
         let raw = it.has_raw_sst();
         let mut count: i64 = 0;
-        let mut sum: f64 = 0.0;
+        let mut sum = CompSum::default();
         let mut min: Option<f64> = None;
         let mut max: Option<f64> = None;
 
@@ -8512,7 +8516,7 @@ impl QueryExecutor {
                                     Value::Float(f) => f,
                                     _ => continue,
                                 };
-                                sum += fv;
+                                sum.add(fv);
                                 min = Some(min.map_or(fv, |m| m.min(fv)));
                                 max = Some(max.map_or(fv, |m| m.max(fv)));
                             }
@@ -8548,7 +8552,7 @@ impl QueryExecutor {
                                     Value::Float(f) => f,
                                     _ => continue,
                                 };
-                                sum += fv;
+                                sum.add(fv);
                                 min = Some(min.map_or(fv, |m| m.min(fv)));
                                 max = Some(max.map_or(fv, |m| m.max(fv)));
                             }
@@ -8566,7 +8570,7 @@ impl QueryExecutor {
         }
         for (f, _) in &agg_cols {
             match f.as_str() {
-                "SUM" => r.push(Value::Float(sum)),
+                "SUM" => r.push(Value::Float(sum.total())),
                 "MIN" => r.push(min.map(Value::Float).unwrap_or(Value::Null)),
                 "MAX" => r.push(max.map(Value::Float).unwrap_or(Value::Null)),
                 "COUNT" => r.push(Value::Integer(count)),
@@ -17772,7 +17776,7 @@ impl QueryExecutor {
                             all_vals
                         };
                         let mut int_sum: i64 = 0;
-                        let mut float_sum: f64 = 0.0;
+                        let mut float_sum = CompSum::default();
                         let mut has_float = false;
                         let mut has_value = false;
                         for val in &vals {
@@ -17780,21 +17784,22 @@ impl QueryExecutor {
                                 Value::Integer(i) => {
                                     has_value = true;
                                     if has_float {
-                                        float_sum += *i as f64;
+                                        float_sum.add(*i as f64);
                                     } else if let Some(s) = int_sum.checked_add(*i) {
                                         int_sum = s;
                                     } else {
                                         has_float = true;
-                                        float_sum = int_sum as f64 + *i as f64;
+                                        float_sum.add(int_sum as f64);
+                                        float_sum.add(*i as f64);
                                     }
                                 }
                                 Value::Float(f) => {
                                     has_value = true;
                                     if !has_float {
                                         has_float = true;
-                                        float_sum = int_sum as f64;
+                                        float_sum.add(int_sum as f64);
                                     }
-                                    float_sum += *f;
+                                    float_sum.add(*f);
                                 }
                                 Value::Null => {}
                                 _ => {
@@ -17807,7 +17812,7 @@ impl QueryExecutor {
                         if !has_value {
                             Ok(Value::Null)
                         } else if has_float {
-                            Ok(Value::Float(float_sum))
+                            Ok(Value::Float(float_sum.total()))
                         } else {
                             Ok(Value::Integer(int_sum))
                         }
@@ -17832,16 +17837,16 @@ impl QueryExecutor {
                         } else {
                             all_vals
                         };
-                        let mut sum = 0.0;
+                        let mut sum = CompSum::default();
                         let mut count = 0;
                         for val in &vals {
                             match val {
                                 Value::Integer(i) => {
-                                    sum += *i as f64;
+                                    sum.add(*i as f64);
                                     count += 1;
                                 }
                                 Value::Float(f) => {
-                                    sum += *f;
+                                    sum.add(*f);
                                     count += 1;
                                 }
                                 Value::Null => {}
@@ -17855,7 +17860,7 @@ impl QueryExecutor {
                         if count == 0 {
                             Ok(Value::Null)
                         } else {
-                            Ok(Value::Float(sum / count as f64))
+                            Ok(Value::Float(sum.total() / count as f64))
                         }
                     }
                     "MIN" => {
@@ -18744,7 +18749,7 @@ impl QueryExecutor {
         struct Acc {
             count: u64,
             int_sum: i64,
-            float_sum: f64,
+            float_sum: CompSum,
             has_float: bool,
             has_value: bool,
             min_val: Option<Value>,
@@ -18755,7 +18760,7 @@ impl QueryExecutor {
                 Self {
                     count: 0,
                     int_sum: 0,
-                    float_sum: 0.0,
+                    float_sum: CompSum::default(),
                     has_float: false,
                     has_value: false,
                     min_val: None,
@@ -18776,20 +18781,21 @@ impl QueryExecutor {
                         match val {
                             Value::Integer(i) => {
                                 if self.has_float {
-                                    self.float_sum += *i as f64;
+                                    self.float_sum.add(*i as f64);
                                 } else if let Some(s) = self.int_sum.checked_add(*i) {
                                     self.int_sum = s;
                                 } else {
                                     self.has_float = true;
-                                    self.float_sum = self.int_sum as f64 + *i as f64;
+                                    self.float_sum.add(self.int_sum as f64);
+                                    self.float_sum.add(*i as f64);
                                 }
                             }
                             Value::Float(f) => {
                                 if !self.has_float {
                                     self.has_float = true;
-                                    self.float_sum = self.int_sum as f64;
+                                    self.float_sum.add(self.int_sum as f64);
                                 }
-                                self.float_sum += *f;
+                                self.float_sum.add(*f);
                             }
                             _ => {}
                         }
@@ -18817,7 +18823,7 @@ impl QueryExecutor {
                             return Value::Null;
                         }
                         if self.has_float {
-                            Value::Float(self.float_sum)
+                            Value::Float(self.float_sum.total())
                         } else {
                             Value::Integer(self.int_sum)
                         }
@@ -18827,7 +18833,7 @@ impl QueryExecutor {
                             return Value::Null;
                         }
                         let sum = if self.has_float {
-                            self.float_sum
+                            self.float_sum.total()
                         } else {
                             self.int_sum as f64
                         };
@@ -19423,7 +19429,7 @@ impl QueryExecutor {
         struct AggAccumulator {
             count: u64,
             int_sum: i64,
-            float_sum: f64,
+            float_sum: CompSum,
             has_float: bool,
             has_value: bool,
             min_val: Option<Value>,
@@ -19434,7 +19440,7 @@ impl QueryExecutor {
                 Self {
                     count: 0,
                     int_sum: 0,
-                    float_sum: 0.0,
+                    float_sum: CompSum::default(),
                     has_float: false,
                     has_value: false,
                     min_val: None,
@@ -19455,20 +19461,21 @@ impl QueryExecutor {
                         match val {
                             Value::Integer(i) => {
                                 if self.has_float {
-                                    self.float_sum += *i as f64;
+                                    self.float_sum.add(*i as f64);
                                 } else if let Some(s) = self.int_sum.checked_add(*i) {
                                     self.int_sum = s;
                                 } else {
                                     self.has_float = true;
-                                    self.float_sum = self.int_sum as f64 + *i as f64;
+                                    self.float_sum.add(self.int_sum as f64);
+                                    self.float_sum.add(*i as f64);
                                 }
                             }
                             Value::Float(f) => {
                                 if !self.has_float {
                                     self.has_float = true;
-                                    self.float_sum = self.int_sum as f64;
+                                    self.float_sum.add(self.int_sum as f64);
                                 }
-                                self.float_sum += *f;
+                                self.float_sum.add(*f);
                             }
                             _ => {}
                         }
@@ -19496,7 +19503,7 @@ impl QueryExecutor {
                             return Value::Null;
                         }
                         if self.has_float {
-                            Value::Float(self.float_sum)
+                            Value::Float(self.float_sum.total())
                         } else {
                             Value::Integer(self.int_sum)
                         }
@@ -19506,7 +19513,7 @@ impl QueryExecutor {
                             return Value::Null;
                         }
                         let sum = if self.has_float {
-                            self.float_sum
+                            self.float_sum.total()
                         } else {
                             self.int_sum as f64
                         };
@@ -19835,7 +19842,7 @@ impl QueryExecutor {
             }
             "SUM" => {
                 let mut int_sum: i64 = 0;
-                let mut float_sum: f64 = 0.0;
+                let mut float_sum = CompSum::default();
                 let mut has_float = false;
                 let mut has_value = false;
                 // DISTINCT: dedup non-NULL values first.
@@ -19858,21 +19865,22 @@ impl QueryExecutor {
                         Value::Integer(i) => {
                             has_value = true;
                             if has_float {
-                                float_sum += i as f64;
+                                float_sum.add(i as f64);
                             } else if let Some(s) = int_sum.checked_add(i) {
                                 int_sum = s;
                             } else {
                                 has_float = true;
-                                float_sum = int_sum as f64 + i as f64;
+                                float_sum.add(int_sum as f64);
+                                float_sum.add(i as f64);
                             }
                         }
                         Value::Float(f) => {
                             has_value = true;
                             if !has_float {
                                 has_float = true;
-                                float_sum = int_sum as f64;
+                                float_sum.add(int_sum as f64);
                             }
-                            float_sum += f;
+                            float_sum.add(f);
                         }
                         Value::Null => {}
                         _ => {
@@ -19885,13 +19893,13 @@ impl QueryExecutor {
                 if !has_value {
                     Ok(Value::Null)
                 } else if has_float {
-                    Ok(Value::Float(float_sum))
+                    Ok(Value::Float(float_sum.total()))
                 } else {
                     Ok(Value::Integer(int_sum))
                 }
             }
             "AVG" => {
-                let mut sum = 0.0;
+                let mut sum = CompSum::default();
                 let mut count = 0;
                 let distinct_vals: Vec<Value> = if agg.distinct {
                     collect_distinct_positional(agg.col_pos, rows)
@@ -19909,11 +19917,11 @@ impl QueryExecutor {
                 for val in iter {
                     match val {
                         Value::Integer(i) => {
-                            sum += i as f64;
+                            sum.add(i as f64);
                             count += 1;
                         }
                         Value::Float(f) => {
-                            sum += f;
+                            sum.add(f);
                             count += 1;
                         }
                         Value::Null => {}
@@ -19925,7 +19933,7 @@ impl QueryExecutor {
                     }
                 }
                 if count > 0 {
-                    Ok(Value::Float(sum / count as f64))
+                    Ok(Value::Float(sum.total() / count as f64))
                 } else {
                     Ok(Value::Null)
                 }
@@ -19999,18 +20007,18 @@ impl QueryExecutor {
                 Ok(max_val.unwrap_or(Value::Null))
             }
             "STDDEV" | "VARIANCE" => {
-                let mut sum = 0.0;
+                let mut sum = CompSum::default();
                 let mut count = 0u64;
                 for row in rows {
                     if let Some(pos) = agg.col_pos {
                         if let Some(val) = row.get(pos) {
                             match val {
                                 Value::Integer(i) => {
-                                    sum += *i as f64;
+                                    sum.add(*i as f64);
                                     count += 1;
                                 }
                                 Value::Float(f) => {
-                                    sum += *f;
+                                    sum.add(*f);
                                     count += 1;
                                 }
                                 _ => {}
@@ -20021,7 +20029,7 @@ impl QueryExecutor {
                 if count < 2 {
                     return Ok(Value::Null);
                 }
-                let mean = sum / count as f64;
+                let mean = sum.total() / count as f64;
                 let mut var_sum = 0.0;
                 for row in rows {
                     if let Some(pos) = agg.col_pos {

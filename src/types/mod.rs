@@ -7,6 +7,8 @@ mod text;
 mod timestamp;
 
 pub use spatial::{BoundingBox, BoundingBox3D, Geometry, Point, Point3D};
+mod comp_sum;
+pub use comp_sum::CompSum;
 pub use table::{ColumnDef, ColumnType, IndexDef, IndexType, TTLDuration, TableSchema, TableType};
 pub use tensor::Tensor;
 pub use text::{Text, TextDoc};

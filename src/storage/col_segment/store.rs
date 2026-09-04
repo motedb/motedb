@@ -17,7 +17,7 @@ pub struct AggregateResult {
     pub count: i64,      // non-NULL values (for COUNT(col))
     pub null_count: i64, // NULL values (for COUNT(*) = count + null_count)
     pub int_sum: i64,
-    pub float_sum: f64,
+    pub float_sum: crate::types::CompSum,
     pub has_float: bool,
     pub min_int: i64,
     pub max_int: i64,
@@ -36,7 +36,7 @@ pub struct AggStats {
     pub sum_i: i64,
     pub min_i: i64,
     pub max_i: i64,
-    pub sum_f: f64,
+    pub sum_f: crate::types::CompSum,
     pub min_f: f64,
     pub max_f: f64,
 }
@@ -2450,7 +2450,7 @@ impl ColSegmentStore {
                         match af.get_f64(i) {
                             Some(v) => {
                                 result.count += 1;
-                                result.float_sum += v;
+                                result.float_sum.add(v);
                                 result.has_float = true;
                                 if result.count == 1 {
                                     result.min_float = v;
@@ -2473,12 +2473,14 @@ impl ColSegmentStore {
                                 // (negative) totals for large i64 columns.
                                 // On overflow, promote to float accumulator.
                                 if result.has_float {
-                                    result.float_sum += v as f64;
+                                    result.float_sum.add(v as f64);
                                 } else if let Some(s) = result.int_sum.checked_add(v) {
                                     result.int_sum = s;
                                 } else {
                                     result.has_float = true;
-                                    result.float_sum = result.int_sum as f64 + v as f64;
+                                    result.float_sum =
+                                        crate::types::CompSum::from_value(result.int_sum as f64);
+                                    result.float_sum.add(v as f64);
                                 }
                                 if result.count == 1 {
                                     result.min_int = v;
@@ -2537,7 +2539,7 @@ impl ColSegmentStore {
                                 continue;
                             }
                             result.count += 1;
-                            result.float_sum += v;
+                            result.float_sum.add(v);
                             result.has_float = true;
                             if result.count == 1 {
                                 result.min_float = v;
@@ -2554,8 +2556,10 @@ impl ColSegmentStore {
                         // checked_add 的溢出分支 + min/max 依赖链阻止自动向量化。
                         // i128 永不溢出（i64 绝对值之和 < 2^127），wrapping_add 可向量化。
                         // 循环后一次性提升到 i64/f64。
+                        // has_float + i128 mixing: exact only when the float
+                        // came from integer overflow promotion; use total().
                         let mut sum128: i128 = if result.has_float {
-                            result.float_sum as i128
+                            result.float_sum.total() as i128
                         } else {
                             result.int_sum as i128
                         };
@@ -2595,10 +2599,10 @@ impl ColSegmentStore {
                                 result.int_sum = s;
                             } else {
                                 result.has_float = true;
-                                result.float_sum = sum128 as f64;
+                                result.float_sum = crate::types::CompSum::from_value(sum128 as f64);
                             }
                         } else {
-                            result.float_sum += sum128 as f64;
+                            result.float_sum.add(sum128 as f64);
                         }
                     }
                 } else {
@@ -2788,7 +2792,7 @@ impl ColSegmentStore {
         let mut sum_i = 0i64;
         let mut min_i = i64::MAX;
         let mut max_i = i64::MIN;
-        let mut sum_f = 0.0f64;
+        let mut sum_f = crate::types::CompSum::default();
         let mut min_f = f64::INFINITY;
         let mut max_f = f64::NEG_INFINITY;
         for seg in segs.iter().rev() {
@@ -2824,7 +2828,7 @@ impl ColSegmentStore {
                                     }
                                 }
                             } else if let Some(v) = f.get_f64(i) {
-                                sum_f += v;
+                                sum_f.add(v);
                                 if v < min_f {
                                     min_f = v;
                                 }
