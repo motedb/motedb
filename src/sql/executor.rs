@@ -3670,6 +3670,16 @@ impl QueryExecutor {
                 ),
             });
             if all_fixed {
+                // 🚨 Cross-segment duplicate versions (UPDATE/DELETE of an
+                // already-segmented key leaves old + new versions in different
+                // segments until compaction) must dedup newest-wins — this
+                // raw per-segment loop only skips tombstones. SQLite
+                // differential testing caught it as COUNT(a), COUNT(b)
+                // overcounting (61 vs 40). Fall back to the materialized path
+                // whenever overlap is possible.
+                if store.may_have_duplicate_keys() {
+                    return Ok(None);
+                }
                 let _ = store.flush_buffer();
                 let segs = store.segments_snapshot();
                 // Per-column accumulators.
