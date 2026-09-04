@@ -540,6 +540,15 @@ impl RowMap {
 
 // ── Column Segment Views ───────────────────────────────────────────
 
+/// Bounds-checked u32 read for corrupt-offset tolerance: returns 0 when
+/// the 4 bytes fall outside the buffer (disk corruption), never panics.
+fn read_u32_safe(buf: &[u8], at: usize) -> u32 {
+    match buf.get(at..at + 4) {
+        Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        None => 0,
+    }
+}
+
 /// Data source for a column segment: owned bytes (legacy) or mmap reference (zero-copy).
 #[derive(Clone, Debug)]
 enum SegData {
@@ -550,17 +559,22 @@ enum SegData {
 }
 
 impl SegData {
+    /// 🚨 Corruption-safe element access (disk-corruption fuzzing): offsets
+    /// come off disk; a flipped bit used to panic here (index 2^30 into a
+    /// 1.9KB buffer). Out-of-range reads degrade to 0 / empty — never panic.
     #[inline]
     fn get(&self, idx: usize) -> u8 {
         match self {
-            SegData::Owned(v) => v[idx],
-            SegData::Mmap { mmap, offset } => mmap[offset + idx],
+            SegData::Owned(v) => v.get(idx).copied().unwrap_or(0),
+            SegData::Mmap { mmap, offset } => mmap.get(*offset + idx).copied().unwrap_or(0),
         }
     }
     fn slice(&self, start: usize, len: usize) -> &[u8] {
         match self {
-            SegData::Owned(v) => &v[start..start + len],
-            SegData::Mmap { mmap, offset } => &mmap[*offset + start..*offset + start + len],
+            SegData::Owned(v) => v.get(start..start + len).unwrap_or(&[]),
+            SegData::Mmap { mmap, offset } => mmap
+                .get(*offset + start..*offset + start + len)
+                .unwrap_or(&[]),
         }
     }
     fn len(&self) -> usize {
@@ -1297,25 +1311,21 @@ impl TextSegment {
         let string_bytes: &[u8] = self.string_data.slice(0, total_str_len);
 
         // Parallel extraction: each row independently extracts its bytes.
+        // 🚨 Corruption guard (disk fuzzing): offsets are off-disk data —
+        // clamp/validate instead of panicking on flipped bits.
         (0..n)
             .into_par_iter()
             .map(|i| {
                 let off_base = i * 4;
-                let start = u32::from_le_bytes([
-                    offsets_bytes[off_base],
-                    offsets_bytes[off_base + 1],
-                    offsets_bytes[off_base + 2],
-                    offsets_bytes[off_base + 3],
-                ]) as usize;
-                let end = u32::from_le_bytes([
-                    offsets_bytes[off_base + 4],
-                    offsets_bytes[off_base + 5],
-                    offsets_bytes[off_base + 6],
-                    offsets_bytes[off_base + 7],
-                ]) as usize;
-                let len = (end - start).min(64);
+                let start = read_u32_safe(offsets_bytes, off_base) as usize;
+                let end = read_u32_safe(offsets_bytes, off_base + 4) as usize;
+                let len = end.saturating_sub(start).min(64);
                 let mut buf = [0u8; 64];
-                buf[..len].copy_from_slice(&string_bytes[start..start + len]);
+                if len > 0 {
+                    if let Some(src) = string_bytes.get(start..start + len) {
+                        buf[..len].copy_from_slice(src);
+                    }
+                }
                 (buf, i)
             })
             .collect()
@@ -1342,21 +1352,16 @@ impl TextSegment {
 
         for i in 0..n {
             let off_base = i * 4;
-            let start = u32::from_le_bytes([
-                offsets_bytes[off_base],
-                offsets_bytes[off_base + 1],
-                offsets_bytes[off_base + 2],
-                offsets_bytes[off_base + 3],
-            ]) as usize;
-            let end = u32::from_le_bytes([
-                offsets_bytes[off_base + 4],
-                offsets_bytes[off_base + 5],
-                offsets_bytes[off_base + 6],
-                offsets_bytes[off_base + 7],
-            ]) as usize;
-            let len = (end - start).min(64);
+            // 🚨 Corruption guard: same clamp/validate as the parallel path.
+            let start = read_u32_safe(offsets_bytes, off_base) as usize;
+            let end = read_u32_safe(offsets_bytes, off_base + 4) as usize;
+            let len = end.saturating_sub(start).min(64);
             let mut buf = [0u8; 64];
-            buf[..len].copy_from_slice(&string_bytes[start..start + len]);
+            if len > 0 {
+                if let Some(src) = string_bytes.get(start..start + len) {
+                    buf[..len].copy_from_slice(src);
+                }
+            }
             result.push((buf, i));
         }
         result
@@ -1742,11 +1747,16 @@ impl ColumnarSSTable {
         let ts_size = self.num_rows * 8;
         let mut buf = vec![0u8; ts_size];
         self.read_raw(self.row_map.timestamps_file_offset as usize, &mut buf)?;
-        // Store via unsafe ptr write — merge cursor is single-threaded and
-        // holds exclusive access to this segment during compaction.
+        // Store via unsafe ptr write. The merge cursor is the documented
+        // single-threaded caller, but apply the same publish-once guard as
+        // load_full_keys: overwriting could drop a buffer a concurrent reader
+        // already holds. The loser drops its unpublished buffer (safe).
         unsafe {
             let rm: *const RowMap = &self.row_map;
             let rm_mut: *mut RowMap = rm as *mut RowMap;
+            if (*rm_mut).timestamps_data.is_some() {
+                return Ok(());
+            }
             (*rm_mut).timestamps_data = Some(buf.into_boxed_slice());
         }
         Ok(())
@@ -1815,9 +1825,17 @@ impl ColumnarSSTable {
             return Ok(());
         }
         // Swap into file_data via unsafe interior mutability.
+        // 🔒 Race guard: another thread may have published between our
+        // is_empty() check and here. Overwriting would drop a Vec that
+        // concurrent readers may hold slices into (use-after-free). Only
+        // publish if still empty; the loser drops its own unpublished buffer,
+        // which no reader has ever seen (safe).
         unsafe {
             let sst: *const Self = self;
             let sst_mut: *mut Self = sst as *mut Self;
+            if !(*sst_mut).file_data.is_empty() {
+                return Ok(()); // lost the race — our buf is dropped unpublished
+            }
             (*sst_mut).file_data = buf;
         }
         Ok(())
@@ -1833,6 +1851,9 @@ impl ColumnarSSTable {
         unsafe {
             let rm: *const RowMap = &self.row_map;
             let rm_mut: *mut RowMap = rm as *mut RowMap;
+            if (*rm_mut).keys_data.is_some() {
+                return Ok(()); // lost the race — drop our unpublished buf
+            }
             (*rm_mut).keys_data = Some(SegData::Owned(buf));
         }
         Ok(())

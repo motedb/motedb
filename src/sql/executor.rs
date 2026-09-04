@@ -4373,7 +4373,11 @@ impl QueryExecutor {
                             off_bytes[ob + 6],
                             off_bytes[ob + 7],
                         ]) as usize;
-                        let key_bytes = &str_bytes[start..end];
+                        // 🚨 Corruption guard (disk-corruption fuzzing): offsets
+                        // come straight off disk — a flipped bit can produce
+                        // start > end or end > len. Degrade to an empty key
+                        // instead of panicking.
+                        let key_bytes = str_bytes.get(start..end).unwrap_or(&[]);
 
                         let idx = if use_hash {
                             if let Some(&idx) =

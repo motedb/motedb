@@ -467,11 +467,35 @@ impl<K: BTreeKey> Page<K> {
         offset += 8;
 
         // Read content_len (v3 header)
-        let _content_len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
+        let content_len = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
         offset += 2;
 
         // Skip reserved (1 byte)
         offset += 1;
+
+        // 🚨 Corruption guard (found by disk-corruption fuzzing): num_keys,
+        // value offsets and overflow markers come straight off disk. A single
+        // bit flip used to reach Vec::with_capacity(huge) (OOM abort) or
+        // slice indexing 2^30 bytes out of bounds (panic). A corrupt page
+        // must deserialize to Err, never panic.
+        let body_end = content_len.min(buf.len());
+        if num_keys > buf.len() / key_size.max(1) {
+            return Err(StorageError::InvalidData(format!(
+                "page {page_id}: corrupt num_keys {num_keys} (buf {}B, key_size {key_size})",
+                buf.len()
+            )));
+        }
+        let keys_end = HEADER_SIZE + num_keys * key_size;
+        if keys_end > body_end {
+            return Err(StorageError::InvalidData(format!(
+                "page {page_id}: keys section ({keys_end}B) exceeds content ({body_end}B)"
+            )));
+        }
+        if is_leaf && keys_end + num_keys * 4 > body_end {
+            return Err(StorageError::InvalidData(format!(
+                "page {page_id}: value-offset section exceeds content ({body_end}B)"
+            )));
+        }
 
         // Read keys
         let mut keys = Vec::with_capacity(num_keys);
@@ -502,6 +526,25 @@ impl<K: BTreeKey> Page<K> {
 
             for &val_offset in &value_offsets {
                 let abs_offset = value_data_start + val_offset as usize;
+                // 🚨 Corruption guard: val_offset is off-disk data. Bound the
+                // read against the content region before touching buf.
+                let entry_len = if abs_offset + 4 <= body_end
+                    && u32::from_le_bytes([
+                        buf[abs_offset],
+                        buf[abs_offset + 1],
+                        buf[abs_offset + 2],
+                        buf[abs_offset + 3],
+                    ]) == OVERFLOW_MARKER
+                {
+                    20
+                } else {
+                    4
+                };
+                if abs_offset + entry_len > body_end {
+                    return Err(StorageError::InvalidData(format!(
+                        "page {page_id}: value at {abs_offset} (+{entry_len}) exceeds content ({body_end}B)"
+                    )));
+                }
 
                 let len_or_marker = u32::from_le_bytes([
                     buf[abs_offset],
@@ -543,8 +586,13 @@ impl<K: BTreeKey> Page<K> {
                     overflow_marker.extend_from_slice(&total_size.to_le_bytes());
                     values.push(overflow_marker);
                 } else {
-                    // Normal inline value
+                    // Normal inline value — 🚨 bound the off-disk length.
                     let len = len_or_marker as usize;
+                    if abs_offset + 4 + len > body_end {
+                        return Err(StorageError::InvalidData(format!(
+                            "page {page_id}: inline value at {abs_offset} (len {len}) exceeds content ({body_end}B)"
+                        )));
+                    }
                     let data = buf[abs_offset + 4..abs_offset + 4 + len].to_vec();
                     values.push(data);
                 }
@@ -2328,6 +2376,48 @@ struct SuperBlock {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Corruption robustness (found by disk-corruption fuzzing): a page with
+    /// bit-flipped header fields must deserialize to Err — never panic via
+    /// huge with_capacity or out-of-bounds slices.
+    #[test]
+    fn test_deserialize_corrupt_page_returns_err_not_panic() {
+        // Build a valid two-page tree to get a real serialized page.
+        let dir = TempDir::new().unwrap();
+        let mut btree: GenericBTree<u64> = GenericBTree::new(dir.path().join("t.idx")).unwrap();
+        for i in 0..200u64 {
+            btree.insert(i, vec![1, 2, 3]).unwrap();
+        }
+        let key_size = u64::key_size();
+        let (page_id, raw) = {
+            let cache = btree.page_cache.read();
+            let (&pid, page) = cache.iter().next().unwrap();
+            let bytes = page.read().serialize(key_size).unwrap();
+            (pid, bytes)
+        };
+
+        // Corrupt each single byte of the header region: must Err or succeed,
+        // never panic.
+        for byte in 0..HEADER_SIZE {
+            for bit in [1u8, 0x80u8] {
+                let mut buf = raw.clone();
+                buf[byte] ^= bit;
+                // Any outcome is acceptable EXCEPT a panic.
+                let _ = Page::<u64>::deserialize(page_id, &buf, key_size);
+            }
+        }
+
+        // Corrupt value-offset region on a leaf page.
+        let mut buf = raw.clone();
+        let mid = HEADER_SIZE + buf.len() / 3;
+        buf[mid] ^= 0xFF;
+        let _ = Page::<u64>::deserialize(page_id, &buf, key_size);
+
+        // Truncations at every 8-byte boundary.
+        for cut in (0..raw.len()).step_by(8) {
+            let _ = Page::<u64>::deserialize(page_id, &raw[..cut], key_size);
+        }
+    }
 
     #[test]
     fn test_u32_key_trait() {

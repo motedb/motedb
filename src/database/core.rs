@@ -554,7 +554,7 @@ impl MoteDB {
         // A dedicated index builder thread receives and builds indexes asynchronously.
         // This eliminates deadlock: the flush thread never blocks on index locks.
         let (index_build_tx, index_builder_thread) =
-            Self::start_index_builder_pipeline(db.clone_for_callback());
+            Self::start_index_builder_pipeline(db.clone_for_callback())?;
         db.index_build_tx = Some(index_build_tx);
         db.index_builder_thread = Some(index_builder_thread);
         db.is_pipeline_active
@@ -587,7 +587,7 @@ impl MoteDB {
         db.auto_checkpoint_thread = auto_checkpoint_thread;
 
         // Start auto-flush background thread (single thread for all auto-flush requests)
-        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback());
+        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback())?;
         db.auto_flush_thread = Some(auto_flush);
 
         Ok(db)
@@ -1838,7 +1838,7 @@ impl MoteDB {
 
         // 🚀 P1: Async Index Build Pipeline (same as create_with_config)
         let (index_build_tx, index_builder_thread) =
-            Self::start_index_builder_pipeline(db.clone_for_callback());
+            Self::start_index_builder_pipeline(db.clone_for_callback())?;
         db.index_build_tx = Some(index_build_tx);
         db.index_builder_thread = Some(index_builder_thread);
         db.is_pipeline_active
@@ -1866,7 +1866,7 @@ impl MoteDB {
         db.auto_checkpoint_thread = auto_checkpoint_thread;
 
         // Start auto-flush background thread
-        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback());
+        let auto_flush = Self::start_auto_flush_thread(db.clone_for_callback())?;
         db.auto_flush_thread = Some(auto_flush);
 
         // 🚀 Phase 5: Recover AUTO_INCREMENT counters (B3: Crash Recovery)
@@ -2365,7 +2365,7 @@ impl MoteDB {
     /// The builder thread receives batches and builds indexes in the background.
     fn start_index_builder_pipeline(
         db: Self,
-    ) -> (std::sync::mpsc::Sender<IndexBuildBatch>, IndexBuilderThread) {
+    ) -> crate::Result<(std::sync::mpsc::Sender<IndexBuildBatch>, IndexBuilderThread)> {
         let (tx, rx) = std::sync::mpsc::channel::<IndexBuildBatch>();
         let should_stop = Arc::new(AtomicBool::new(false));
         let should_stop_clone = should_stop.clone();
@@ -2448,15 +2448,19 @@ impl MoteDB {
                 }
                 debug_log!("[IndexBuilder] Background thread stopped");
             })
-            .expect("Failed to spawn index-builder thread");
+            .map_err(|e| {
+                StorageError::InvalidData(format!(
+                    "failed to spawn index-builder thread (resource exhaustion?): {e}"
+                ))
+            })?;
 
-        (
+        Ok((
             tx,
             IndexBuilderThread {
                 handle: Some(handle),
                 should_stop,
             },
-        )
+        ))
     }
 
     /// Extract rows from a flushed memtable and send through the channel.
@@ -2536,7 +2540,7 @@ impl MoteDB {
     /// 1. Lazy-checking: Only checks WAL size when interval reached (no unnecessary fs calls)
     /// 2. Start a single background thread for auto-flush requests.
     ///    Replaces the old pattern of spawning a new thread per 2000 writes.
-    fn start_auto_flush_thread(db: Self) -> AutoFlushThread {
+    fn start_auto_flush_thread(db: Self) -> crate::Result<AutoFlushThread> {
         let (flush_tx, flush_rx) = std::sync::mpsc::channel::<()>();
         let should_stop = Arc::new(AtomicBool::new(false));
         let should_stop_clone = should_stop.clone();
@@ -2576,13 +2580,17 @@ impl MoteDB {
                 }
                 debug_log!("[AutoFlush] Background thread stopped");
             })
-            .expect("Failed to spawn auto-flush thread");
+            .map_err(|e| {
+                StorageError::InvalidData(format!(
+                    "failed to spawn auto-flush thread (resource exhaustion?): {e}"
+                ))
+            })?;
 
-        AutoFlushThread {
+        Ok(AutoFlushThread {
             flush_tx,
             handle: Some(handle),
             should_stop,
-        }
+        })
     }
 
     /// Request an auto-flush via the background thread (non-blocking).
@@ -2607,82 +2615,99 @@ impl MoteDB {
         let should_stop = Arc::new(AtomicBool::new(false));
         let should_stop_clone = should_stop.clone();
 
-        let handle = std::thread::spawn(move || {
-            let mut last_checkpoint = Instant::now();
+        // 🚨 Graceful degradation (disk-corruption fuzzing found thread
+        // exhaustion panicking the process here): if the OS refuses another
+        // thread, run WITHOUT background checkpointing — inline flush paths
+        // (8MB write-buffer threshold, query-time visibility) still bound
+        // memory; durability points are flush()/checkpoint()/close().
+        let handle = std::thread::Builder::new()
+            .name("motedb-auto-checkpoint".into())
+            .spawn(move || {
+                let mut last_checkpoint = Instant::now();
 
-            // 🚀 Adaptive check interval:
-            // - Start with min_interval (avoid too-frequent checks)
-            // - Only check WAL size when interval reached
-            let check_interval = Duration::from_secs(config.min_interval_secs.max(10));
+                // 🚀 Adaptive check interval:
+                // - Start with min_interval (avoid too-frequent checks)
+                // - Only check WAL size when interval reached
+                let check_interval = Duration::from_secs(config.min_interval_secs.max(10));
 
-            debug_log!("[AutoCheckpoint] 🚀 Background thread started (embedded-optimized)");
-            debug_log!(
-                "[AutoCheckpoint] Config: max_wal={}MB, interval={}s, check_every={}s",
-                config.max_wal_size_bytes / 1024 / 1024,
-                config.min_interval_secs,
-                check_interval.as_secs()
-            );
+                debug_log!("[AutoCheckpoint] 🚀 Background thread started (embedded-optimized)");
+                debug_log!(
+                    "[AutoCheckpoint] Config: max_wal={}MB, interval={}s, check_every={}s",
+                    config.max_wal_size_bytes / 1024 / 1024,
+                    config.min_interval_secs,
+                    check_interval.as_secs()
+                );
 
-            while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
-                // 🚀 **CRITICAL FIX**: Use interruptible sleep (check every 1s)
-                // This allows fast shutdown when Drop is called
-                let mut remaining = check_interval;
-                while remaining > Duration::ZERO {
+                while !should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
+                    // 🚀 **CRITICAL FIX**: Use interruptible sleep (check every 1s)
+                    // This allows fast shutdown when Drop is called
+                    let mut remaining = check_interval;
+                    while remaining > Duration::ZERO {
+                        if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
+                            debug_log!("[AutoCheckpoint] 🛑 Shutdown signal received during sleep");
+                            break;
+                        }
+
+                        // Use 100ms chunks so shutdown is responsive (was 1s)
+                        let sleep_chunk = Duration::from_millis(100).min(remaining);
+                        std::thread::sleep(sleep_chunk);
+                        remaining = remaining.saturating_sub(sleep_chunk);
+                    }
+
+                    // Check if stop signal was set during sleep
                     if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
-                        debug_log!("[AutoCheckpoint] 🛑 Shutdown signal received during sleep");
                         break;
                     }
 
-                    // Use 100ms chunks so shutdown is responsive (was 1s)
-                    let sleep_chunk = Duration::from_millis(100).min(remaining);
-                    std::thread::sleep(sleep_chunk);
-                    remaining = remaining.saturating_sub(sleep_chunk);
-                }
+                    // 🚀 Only check WAL size when enough time has passed
+                    // (avoids unnecessary filesystem calls)
+                    let elapsed = last_checkpoint.elapsed();
+                    if elapsed.as_secs() < config.min_interval_secs {
+                        continue;
+                    }
 
-                // Check if stop signal was set during sleep
-                if should_stop_clone.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
+                    // 🚀 Lazy WAL size check - only when needed
+                    let wal_dir = db.path.join("wal");
+                    match super::helpers::dir_size(&wal_dir) {
+                        Ok(wal_size) if wal_size >= config.max_wal_size_bytes => {
+                            debug_log!(
+                                "[AutoCheckpoint] 🔔 Trigger: WAL {}MB >= {}MB",
+                                wal_size / 1024 / 1024,
+                                config.max_wal_size_bytes / 1024 / 1024
+                            );
 
-                // 🚀 Only check WAL size when enough time has passed
-                // (avoids unnecessary filesystem calls)
-                let elapsed = last_checkpoint.elapsed();
-                if elapsed.as_secs() < config.min_interval_secs {
-                    continue;
-                }
-
-                // 🚀 Lazy WAL size check - only when needed
-                let wal_dir = db.path.join("wal");
-                match super::helpers::dir_size(&wal_dir) {
-                    Ok(wal_size) if wal_size >= config.max_wal_size_bytes => {
-                        debug_log!(
-                            "[AutoCheckpoint] 🔔 Trigger: WAL {}MB >= {}MB",
-                            wal_size / 1024 / 1024,
-                            config.max_wal_size_bytes / 1024 / 1024
-                        );
-
-                        // Trigger checkpoint
-                        if let Err(e) = db.checkpoint() {
-                            debug_log!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
-                        } else {
-                            debug_log!("[AutoCheckpoint] ✅ Checkpoint complete");
-                            last_checkpoint = Instant::now();
+                            // Trigger checkpoint
+                            if let Err(e) = db.checkpoint() {
+                                debug_log!("[AutoCheckpoint] ⚠️  Checkpoint failed: {:?}", e);
+                            } else {
+                                debug_log!("[AutoCheckpoint] ✅ Checkpoint complete");
+                                last_checkpoint = Instant::now();
+                            }
+                        }
+                        Ok(_) => {
+                            // WAL size below threshold, skip checkpoint
+                        }
+                        Err(_e) => {
+                            debug_log!("[AutoCheckpoint] ⚠️  Failed to check WAL size: {:?}", _e);
                         }
                     }
-                    Ok(_) => {
-                        // WAL size below threshold, skip checkpoint
-                    }
-                    Err(_e) => {
-                        debug_log!("[AutoCheckpoint] ⚠️  Failed to check WAL size: {:?}", _e);
-                    }
                 }
-            }
 
-            debug_log!("[AutoCheckpoint] 👋 Background thread stopped");
-        });
+                debug_log!("[AutoCheckpoint] 👋 Background thread stopped");
+            });
+
+        let handle = match handle {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn_log!(
+                    "[AutoCheckpoint] Cannot spawn background thread ({e});                      running without periodic checkpointing"
+                );
+                None
+            }
+        };
 
         AutoCheckpointThread {
-            handle: Some(handle),
+            handle,
             should_stop,
         }
     }
@@ -2888,6 +2913,11 @@ impl Drop for MoteDB {
         if self._is_clone {
             return;
         }
+
+        // 🔒 Break the engine self-reference cycle FIRST (engine → flush
+        // callback → Arc<engine>). Otherwise LSMEngine::Drop never runs and
+        // its `lsm-flush` thread leaks on every open/close cycle.
+        self.lsm_engine.clear_flush_callback();
 
         // 🛑 Step 1: Stop index builder thread (drop sender to signal end, then join)
         if let Some(mut thread) = self.index_builder_thread.take() {

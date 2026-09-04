@@ -1612,6 +1612,17 @@ impl LSMEngine {
         Ok(())
     }
 
+    /// Drop the flush callback. The callback captures a strong `Arc<LSMEngine>`
+    /// (for index-batch extraction), creating a self-reference cycle:
+    /// engine → callback → engine. With the cycle intact, the engine's Arc
+    /// count never reaches zero, `Drop` never runs, and the `lsm-flush`
+    /// background thread is never signaled — one leaked thread per open/close
+    /// cycle (found by 5000-iteration open/close fuzzing: threads grew to
+    /// exhaustion). `MoteDB::drop` calls this to break the cycle.
+    pub fn clear_flush_callback(&self) {
+        *self.flush_callback.write() = None;
+    }
+
     /// Check if the background flush thread is currently writing a memtable to disk.
     pub fn is_flush_in_progress(&self) -> bool {
         self.flush_in_progress.load(Ordering::Acquire)
