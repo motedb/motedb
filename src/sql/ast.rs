@@ -46,6 +46,12 @@ pub enum Statement {
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
+    /// SAVEPOINT name
+    Savepoint(String),
+    /// ROLLBACK TO [SAVEPOINT] name
+    RollbackToSavepoint(String),
+    /// RELEASE [SAVEPOINT] name
+    ReleaseSavepoint(String),
 }
 
 /// Common Table Expression definition (`WITH name [(cols)] AS ( SELECT ... )`).

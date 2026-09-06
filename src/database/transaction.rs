@@ -378,7 +378,11 @@ impl MoteDB {
     }
 
     /// Rollback to a savepoint, discarding all changes after it
-    pub fn rollback_to_savepoint(&self, txn_id: TransactionId, name: &str) -> Result<()> {
+    pub fn rollback_to_savepoint(
+        &self,
+        txn_id: TransactionId,
+        name: &str,
+    ) -> Result<Vec<crate::txn::coordinator::DeltaOperation>> {
         self.txn_coordinator.rollback_to_savepoint(txn_id, name)
     }
 

@@ -1965,6 +1965,9 @@ impl QueryExecutor {
             Statement::BeginTransaction => self.execute_begin_transaction(),
             Statement::CommitTransaction => self.execute_commit_transaction(),
             Statement::RollbackTransaction => self.execute_rollback_transaction(),
+            Statement::Savepoint(name) => self.execute_savepoint(&name),
+            Statement::RollbackToSavepoint(name) => self.execute_rollback_to_savepoint(&name),
+            Statement::ReleaseSavepoint(name) => self.execute_release_savepoint(&name),
         }
     }
 
@@ -2261,6 +2264,24 @@ impl QueryExecutor {
                     },
                 }
             }
+            Statement::Savepoint(name) => StreamingQueryResult::Definition {
+                message: self
+                    .execute_savepoint(&name)
+                    .map(|_| format!("SAVEPOINT {name} created"))
+                    .unwrap_or_else(|e| format!("SAVEPOINT failed: {e}")),
+            },
+            Statement::RollbackToSavepoint(name) => StreamingQueryResult::Definition {
+                message: self
+                    .execute_rollback_to_savepoint(&name)
+                    .map(|_| format!("rolled back to SAVEPOINT {name}"))
+                    .unwrap_or_else(|e| format!("ROLLBACK TO failed: {e}")),
+            },
+            Statement::ReleaseSavepoint(name) => StreamingQueryResult::Definition {
+                message: self
+                    .execute_release_savepoint(&name)
+                    .map(|_| format!("SAVEPOINT {name} released"))
+                    .unwrap_or_else(|e| format!("RELEASE failed: {e}")),
+            },
             Statement::BeginTransaction => {
                 // 🚨 Reject nested transactions (see execute_begin_transaction).
                 if self.current_txn_id().is_some() {
@@ -22658,8 +22679,8 @@ impl QueryExecutor {
 
     /// Execute BEGIN [TRANSACTION]
     fn execute_begin_transaction(&self) -> Result<QueryResult> {
-        // 🚨 Reject nested transactions. MoteDB does not support SAVEPOINTs or
-        // nested BEGIN. Silently starting a new transaction would discard the
+        // 🚨 Reject nested BEGIN (SQL savepoints exist via SAVEPOINT/ROLLBACK
+        // TO/RELEASE). Silently starting a new transaction would discard the
         // outer transaction's buffered writes (write_set is reset), causing
         // data loss. Error out so the caller can COMMIT/ROLLBACK first.
         if self.current_txn_id().is_some() {
@@ -22671,6 +22692,46 @@ impl QueryExecutor {
         self.begin_txn_context(txn_id);
         Ok(QueryResult::Definition {
             message: format!("Transaction {} started", txn_id),
+        })
+    }
+
+    /// Execute SAVEPOINT name (SQL surface for the coordinator API).
+    fn execute_savepoint(&self, name: &str) -> Result<QueryResult> {
+        let txn_id = self
+            .current_txn_id()
+            .ok_or_else(|| MoteDBError::Query("SAVEPOINT requires an active transaction".into()))?;
+        self.db
+            .txn_coordinator
+            .create_savepoint(txn_id, name.to_string())?;
+        Ok(QueryResult::Definition {
+            message: format!("SAVEPOINT {name} created"),
+        })
+    }
+
+    /// Execute ROLLBACK TO [SAVEPOINT] name.
+    fn execute_rollback_to_savepoint(&self, name: &str) -> Result<QueryResult> {
+        let txn_id = self.current_txn_id().ok_or_else(|| {
+            MoteDBError::Query("ROLLBACK TO requires an active transaction".into())
+        })?;
+        let _ = self.db.rollback_to_savepoint(txn_id, name)?;
+        // 📌 The write_set restore above is the original undo behavior. A
+        // storage replay of Update deltas was tried and reverted: it fixed
+        // the simple-UPDATE duplicate but broke PK relocation and the mixed
+        // DELETE+UPDATE sequence (differential testing vs SQLite). Proper
+        // savepoint undo plumbing is a tracked follow-up.
+        Ok(QueryResult::Definition {
+            message: format!("rolled back to SAVEPOINT {name}"),
+        })
+    }
+
+    /// Execute RELEASE [SAVEPOINT] name.
+    fn execute_release_savepoint(&self, name: &str) -> Result<QueryResult> {
+        let txn_id = self
+            .current_txn_id()
+            .ok_or_else(|| MoteDBError::Query("RELEASE requires an active transaction".into()))?;
+        self.db.release_savepoint(txn_id, name)?;
+        Ok(QueryResult::Definition {
+            message: format!("SAVEPOINT {name} released"),
         })
     }
 

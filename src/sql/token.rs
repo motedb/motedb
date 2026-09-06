@@ -73,6 +73,8 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "timeseries" => TokenType::Timeseries,
     "ttl" => TokenType::Ttl,
     "begin" => TokenType::Begin,
+    "savepoint" => TokenType::Savepoint,
+    "release" => TokenType::Release,
     "commit" => TokenType::Commit,
     "rollback" => TokenType::Rollback,
     "case" => TokenType::Case,
@@ -149,6 +151,8 @@ pub enum TokenType {
     Begin,         // BEGIN
     Commit,        // COMMIT
     Rollback,      // ROLLBACK
+    Savepoint,     // SAVEPOINT
+    Release,       // RELEASE
     Case,          // CASE
     When,          // WHEN
     Then,          // THEN

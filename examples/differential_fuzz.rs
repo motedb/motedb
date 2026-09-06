@@ -356,4 +356,187 @@ fn main() {
         total_checks += checks;
     }
     println!("\nTOTAL checks={total_checks} divergences={total_div}");
+
+    // ── Phase 2: transaction visibility + subquery shapes ──
+    let dir = TempDir::new().unwrap();
+    let mut config = DBConfig::for_testing();
+    config.auto_checkpoint = None;
+    let db = Database::create_with_config(dir.path(), config).unwrap();
+    let con = Connection::open_in_memory().unwrap();
+    for stmt in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, t_id INTEGER, score REAL)",
+    ] {
+        db.execute(stmt).unwrap();
+        con.execute_batch(stmt).unwrap();
+    }
+    let mut rng = Lcg(0xABCD1234);
+    let mut seed = |i: i64| {
+        let sql = format!(
+            "INSERT INTO t (id, a, b, c) VALUES ({i}, {}, {:.2}, 't{}')",
+            rng.below(21),
+            rng.below(1000) as f64 / 7.0,
+            rng.below(6)
+        );
+        let _ = con.execute(&sql, ());
+        let _ = db.execute(&sql);
+        let usql = format!(
+            "INSERT INTO u (id, t_id, score) VALUES ({i}, {}, {:.2})",
+            rng.below(40),
+            rng.below(300) as f64 / 3.0
+        );
+        let _ = con.execute(&usql, ());
+        let _ = db.execute(&usql);
+    };
+    for i in 1..=30 {
+        seed(i);
+    }
+
+    let mut divs: Vec<String> = Vec::new();
+    let mut checks2 = 0u64;
+    let mut cmp =
+        |sql: &str, o: bool, d: &mut Vec<String>, c: &mut u64| compare(&db, &con, sql, o, d, c);
+
+    // Txn 1: INSERT inside txn visible after COMMIT.
+    for stmt in [
+        "BEGIN",
+        "INSERT INTO t (id, a, b, c) VALUES (91, 5, 1.5, 'tx')",
+    ] {
+        let _ = con.execute(stmt, ());
+        let _ = db.execute(stmt);
+    }
+    cmp(
+        "SELECT COUNT(*) FROM t WHERE id = 91",
+        false,
+        &mut divs,
+        &mut checks2,
+    ); // read-your-writes
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+    for stmt in ["COMMIT", "SELECT COUNT(*) FROM t WHERE id = 91"] {
+        let _ = con.execute(stmt, ());
+        let _ = db.execute(stmt);
+    }
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+
+    // Txn 2: ROLLBACK discards.
+    for stmt in [
+        "BEGIN",
+        "INSERT INTO t (id, a, b, c) VALUES (92, 6, 2.5, 'ty')",
+        "UPDATE t SET a = 99 WHERE id <= 3",
+        "DELETE FROM t WHERE id > 28",
+    ] {
+        let _ = con.execute(stmt, ());
+        let _ = db.execute(stmt);
+    }
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+    cmp(
+        "SELECT a FROM t WHERE id = 1",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    let _ = con.execute("ROLLBACK", ());
+    let _ = db.execute("ROLLBACK");
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+    cmp(
+        "SELECT a FROM t WHERE id = 1",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT COUNT(*) FROM t WHERE id > 28",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+
+    // Txn 3: SAVEPOINT / ROLLBACK TO.
+    for stmt in [
+        "BEGIN",
+        "INSERT INTO t (id, a, b, c) VALUES (93, 7, 3.5, 'tz')",
+        "SAVEPOINT sp1",
+        "DELETE FROM t WHERE id BETWEEN 10 AND 15",
+        "UPDATE t SET a = 55 WHERE id = 1",
+    ] {
+        let _ = con.execute(stmt, ());
+        let _ = db.execute(stmt);
+    }
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+    let _ = con.execute("ROLLBACK TO sp1", ());
+    let _ = db.execute("ROLLBACK TO sp1");
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+    cmp(
+        "SELECT a FROM t WHERE id = 1",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT COUNT(*) FROM t WHERE id = 93",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    let _ = con.execute("COMMIT", ());
+    let _ = db.execute("COMMIT");
+    cmp("SELECT COUNT(*) FROM t", false, &mut divs, &mut checks2);
+
+    // Subquery shapes.
+    cmp(
+        "SELECT COUNT(*) FROM t WHERE a IN (SELECT t_id FROM u WHERE score > 50.0)",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT COUNT(*) FROM t WHERE a NOT IN (SELECT t_id FROM u)",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT id FROM t WHERE a = (SELECT MAX(a) FROM t)",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT id FROM t WHERE a = (SELECT MIN(a) FROM t WHERE c = 't1')",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.a)",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT a, (SELECT COUNT(*) FROM u WHERE u.t_id = t.a) FROM t WHERE id < 5",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT COUNT(*) FROM (SELECT a FROM t WHERE a > 5) sub",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+    cmp(
+        "SELECT AVG(a) FROM t WHERE a IN (SELECT a FROM t WHERE a < 10)",
+        false,
+        &mut divs,
+        &mut checks2,
+    );
+
+    println!(
+        "phase2 (txn+subquery): checks={checks2} divergences={}",
+        divs.len()
+    );
+    for d in divs.iter().take(10) {
+        println!("  ── {d}");
+    }
 }

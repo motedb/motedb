@@ -2597,7 +2597,7 @@ impl Database {
 
     /// 回滚到保存点
     pub fn rollback_to_savepoint(&self, tx_id: u64, name: &str) -> Result<()> {
-        self.inner.rollback_to_savepoint(tx_id, name)
+        self.inner.rollback_to_savepoint(tx_id, name).map(|_| ())
     }
 
     /// 释放保存点

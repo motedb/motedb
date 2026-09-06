@@ -370,7 +370,11 @@ impl TransactionCoordinator {
     ///    - Update → Restore old value
     ///    - Delete → Restore old value
     /// 3. Remove savepoint[position..end] from stack
-    pub fn rollback_to_savepoint(&self, txn_id: TransactionId, name: &str) -> Result<()> {
+    pub fn rollback_to_savepoint(
+        &self,
+        txn_id: TransactionId,
+        name: &str,
+    ) -> Result<Vec<DeltaOperation>> {
         let ctx = self.get_context(txn_id)?;
 
         // Check if transaction is active
@@ -423,7 +427,11 @@ impl TransactionCoordinator {
             (position, all_deltas, read_deltas)
         }; // savepoints lock dropped here — safe to acquire write_set/write
 
-        // Phase 2: Apply undo operations (P3.3 COW: Arc clone is cheap)
+        // Phase 2: Apply undo operations (P3.3 COW: Arc clone is cheap).
+        // `applied` is returned so the SQL layer can replay Update/Delete
+        // restores against storage (the write_set alone isn't the source of
+        // truth for rows the DML path already persisted).
+        let applied = all_deltas.clone();
         let mut write_set = ctx.write_set.write();
         let mut read_set = ctx.read_set.write();
 
@@ -436,7 +444,15 @@ impl TransactionCoordinator {
                     undo_count += 1;
                 }
                 DeltaOperation::Update(row_id, table_name, old_value) => {
-                    // Undo update: restore old value (Arc clone is O(1))
+                    // Undo update: restore the old value (Arc clone is O(1)).
+                    // 📌 Known issue (differential testing): a simple UPDATE
+                    // of a storage-resident row leaves both the write_set
+                    // restore and the storage version visible after commit
+                    // (count +1); a PK-relocated row REQUIRES the insert-
+                    // if-absent here (test savepoint_rollback_after_pk_
+                    // relocation). The two cases need different undo
+                    // plumbing — deferred to a focused round; behavior
+                    // unchanged from the pre-SQL-surface state.
                     write_set.insert(
                         (table_name, row_id),
                         Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
@@ -475,7 +491,7 @@ impl TransactionCoordinator {
             undo_count
         );
 
-        Ok(())
+        Ok(applied)
     }
 
     /// Release a savepoint

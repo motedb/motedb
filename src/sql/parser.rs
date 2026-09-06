@@ -160,6 +160,8 @@ impl Parser {
             TokenType::Begin => self.parse_begin()?,
             TokenType::Commit => self.parse_commit()?,
             TokenType::Rollback => self.parse_rollback()?,
+            TokenType::Savepoint => self.parse_savepoint()?,
+            TokenType::Release => self.parse_release()?,
             TokenType::Show => self.parse_show()?,
             TokenType::Describe | TokenType::Desc => self.parse_describe()?,
             _ => return Err(self.error("Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, SHOW, DESCRIBE, BEGIN, COMMIT, or ROLLBACK")),
@@ -1318,10 +1320,38 @@ impl Parser {
         Ok(Statement::CommitTransaction)
     }
 
-    /// Parse ROLLBACK TRANSACTION
+    /// Parse ROLLBACK [TRANSACTION] or ROLLBACK TO [SAVEPOINT] name
     fn parse_rollback(&mut self) -> Result<Statement> {
         self.expect(TokenType::Rollback)?;
+        // ROLLBACK TO [SAVEPOINT] name — partial rollback to a savepoint.
+        if let TokenType::Identifier(word) = &self.current().token_type {
+            if word.eq_ignore_ascii_case("to") {
+                self.advance();
+                // optional SAVEPOINT keyword
+                if let TokenType::Identifier(w2) = &self.current().token_type {
+                    if w2.eq_ignore_ascii_case("savepoint") {
+                        self.advance();
+                    }
+                }
+                let name = self.parse_identifier()?;
+                return Ok(Statement::RollbackToSavepoint(name));
+            }
+        }
         Ok(Statement::RollbackTransaction)
+    }
+
+    /// Parse SAVEPOINT name
+    fn parse_savepoint(&mut self) -> Result<Statement> {
+        self.expect(TokenType::Savepoint)?;
+        let name = self.parse_identifier()?;
+        Ok(Statement::Savepoint(name))
+    }
+
+    /// Parse RELEASE [SAVEPOINT] name
+    fn parse_release(&mut self) -> Result<Statement> {
+        self.expect(TokenType::Release)?;
+        let name = self.parse_identifier()?;
+        Ok(Statement::ReleaseSavepoint(name))
     }
 
     /// Parse SHOW statement
