@@ -2049,6 +2049,10 @@ impl QueryExecutor {
                 crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
                     // INSERT undo: write_set INSERT was never committed to store.
                 }
+                crate::txn::coordinator::DeltaOperation::UpdateBuffered(_, _, _) => {
+                    // write_set-level undo (handled by the coordinator) —
+                    // never replay against storage (uncommitted row).
+                }
             }
         }
     }
@@ -2348,6 +2352,13 @@ impl QueryExecutor {
                                 }
                                 crate::txn::coordinator::DeltaOperation::Insert(_, _, _) => {
                                     // INSERT undo: write_set INSERT was never committed to store.
+                                }
+                                crate::txn::coordinator::DeltaOperation::UpdateBuffered(
+                                    _,
+                                    _,
+                                    _,
+                                ) => {
+                                    // write_set-level undo — no storage action.
                                 }
                             }
                         }
@@ -2903,7 +2914,30 @@ impl QueryExecutor {
                             idx.get(&target)
                                 .ok()
                                 .filter(|ids| !ids.is_empty())
-                                .map(|ids| ids.len() as i64)
+                                .map(|ids| {
+                                    // 🔑 Verify: index entries can be stale
+                                    // inside a transaction (undo replays keep
+                                    // old value→row_id entries until commit;
+                                    // differential testing: COUNT WHERE id=X
+                                    // counted 7/8 phantoms in the ROLLBACK-TO
+                                    // window while row LIST was correct).
+                                    let verified = self
+                                        .db
+                                        .get_table_rows_batch(table_name, &ids)
+                                        .map(|batch| {
+                                            batch
+                                                .iter()
+                                                .filter(|(_, opt)| {
+                                                    opt.as_ref()
+                                                        .and_then(|row| row.get(pos))
+                                                        .map(|v| v == &target)
+                                                        .unwrap_or(false)
+                                                })
+                                                .count()
+                                        })
+                                        .unwrap_or(ids.len());
+                                    verified as i64
+                                })
                         })
                     } else {
                         None
@@ -3056,9 +3090,41 @@ impl QueryExecutor {
             // atomic counter / count_live_rows doesn't include them — add them.
             // (DELETEs already wrote a tombstone to storage during the txn, so
             // count_live_rows already excludes them — no adjustment needed.)
+            // 🚨 WITH a WHERE clause the adjustment must FILTER the write_set
+            // rows by the same predicate — adding ws.len() unconditionally
+            // counted every uncommitted row regardless of the filter
+            // (differential testing: COUNT WHERE id=X in a ROLLBACK-TO window
+            // returned storage_match + ws.len()).
             if self.is_in_transaction() {
                 let ws = self.txn_write_set_rows(table_name);
-                count += ws.len() as i64;
+                if stmt.where_clause.is_none() {
+                    count += ws.len() as i64;
+                } else if let Some(comparisons) =
+                    Self::parse_where_comparisons(stmt.where_clause.as_ref().unwrap(), &schema)
+                {
+                    if let Some(&(pos, ref op, ref target)) = comparisons.first() {
+                        let matches: Vec<bool> = ws
+                            .iter()
+                            .map(|(_, row)| match row.get(pos) {
+                                Some(v) => self
+                                    .evaluator
+                                    .eval_binary_op(op, v.clone(), target.clone())
+                                    .map(|r| matches!(r, Value::Bool(true)))
+                                    .unwrap_or(false),
+                                None => false,
+                            })
+                            .collect();
+                        // Single comparison: count matches. Multi-AND: only
+                        // count rows matching the FIRST comparison when it is
+                        // the only one; otherwise skip (conservative).
+                        if comparisons.len() == 1 {
+                            count += matches.iter().filter(|m| **m).count() as i64;
+                        }
+                    }
+                }
+                // Other predicate shapes: fall through WITHOUT the write_set
+                // adjustment (undercount is safer than phantom overcount;
+                // committed rows are always correct).
             }
             let columns: Vec<String> = self
                 .build_select_columns(&stmt.columns, &schema)
@@ -5851,9 +5917,6 @@ impl QueryExecutor {
         // This replaces the old behavior of falling back to full table scan when
         // post_filters were present.
         let post_filters = &plan.post_filters;
-        if std::env::var_os("MOTE_TRACE").is_some() {
-            eprintln!("[trace] scan_method={:?}", plan.scan_method);
-        }
         match plan.scan_method {
             super::optimizer::ScanMethod::PointQuery {
                 ref table,
@@ -6167,9 +6230,6 @@ impl QueryExecutor {
                         )
                     });
                     let filters_redundant = post_filters.is_empty() || eq_covers_filters;
-                    if std::env::var_os("MOTE_TRACE").is_some() {
-                        eprintln!("[trace] branch1: post_filters={} eq_covers={} row_ids={} limit={:?} get_arc={:?}", post_filters.len(), eq_covers_filters, row_ids.len(), stmt.limit, __t1.duration_since(__t0));
-                    }
 
                     // Exact-value verification: index keys truncate long Text
                     // values to a 64-byte prefix, so a row whose value merely
@@ -6210,13 +6270,6 @@ impl QueryExecutor {
                         'window: for chunk in row_ids.chunks(need) {
                             let __f0 = std::time::Instant::now();
                             let batch = self.db.get_table_rows_batch(table, chunk)?;
-                            if std::env::var_os("MOTE_TRACE").is_some() {
-                                eprintln!(
-                                    "[trace] window fetch: {} ids in {:?}",
-                                    chunk.len(),
-                                    __f0.elapsed()
-                                );
-                            }
                             for (_, row_opt) in batch {
                                 if let Some(row) = row_opt {
                                     verified_push(&mut result_rows, &row);
@@ -6229,13 +6282,6 @@ impl QueryExecutor {
                     } else {
                         let __f0 = std::time::Instant::now();
                         let batch = self.db.get_table_rows_batch(table, &row_ids)?;
-                        if std::env::var_os("MOTE_TRACE").is_some() {
-                            eprintln!(
-                                "[trace] full fetch: {} ids in {:?}",
-                                row_ids.len(),
-                                __f0.elapsed()
-                            );
-                        }
                         for (_, row_opt) in batch {
                             if let Some(row) = row_opt {
                                 verified_push(&mut result_rows, &row);
@@ -8207,6 +8253,21 @@ impl QueryExecutor {
 
         // Batch fetch matching rows
         let batch = self.db.get_table_rows_batch_arc(table, &row_ids_arc)?;
+        // 🔑 Verify the filter value on fetched rows: index entries can be
+        // stale inside a transaction (undo replays of DELETE/UPDATE keep
+        // accumulating value→row_id entries until commit — differential
+        // testing: COUNT(*) WHERE id=X returned 7/8 phantom rows in the
+        // ROLLBACK-TO window while row LIST queries verified correctly).
+        let filter_pos = schema.get_column_position(&filter_col);
+        let batch: Vec<_> = batch
+            .into_iter()
+            .filter(|(_, opt)| {
+                opt.as_ref()
+                    .and_then(|row| filter_pos.and_then(|p| row.get(p)))
+                    .map(|v| v == &filter_value)
+                    .unwrap_or(false)
+            })
+            .collect();
         let rows: Vec<&Row> = batch
             .iter()
             .filter_map(|(_, opt)| opt.as_ref().map(|a| a.as_ref()))
@@ -8934,9 +8995,6 @@ impl QueryExecutor {
         stmt: &SelectStmt,
         table: &str,
     ) -> Result<StreamingQueryResult> {
-        if std::env::var_os("MOTE_TRACE").is_some() {
-            eprintln!("[trace] full_scan_streaming limit={:?}", stmt.limit);
-        }
         let schema = self.db.get_table_schema(table)?;
 
         // 🔑 TimeSeries tables: authoritative data lives in the
@@ -14204,7 +14262,38 @@ impl QueryExecutor {
                                     if !row_ids.is_empty()
                                         || !self.db.is_async_index_pipeline_active() =>
                                 {
-                                    let count = row_ids.len() as i64;
+                                    // 🔑 Verify before counting: index entries
+                                    // can be stale inside a transaction (undo
+                                    // replays of DELETE/UPDATE keep old
+                                    // value→row_id entries until commit —
+                                    // differential testing: COUNT WHERE id=X
+                                    // returned 7/8 phantom rows while the row
+                                    // LIST path verified correctly).
+                                    let count = if let Ok(schema) =
+                                        self.db.get_table_schema(&table_name)
+                                    {
+                                        let pos = schema.get_column_position(&col_name);
+                                        match self.db.get_table_rows_batch(&table_name, &row_ids) {
+                                            Ok(batch) => {
+                                                let c = batch
+                                                    .iter()
+                                                    .filter(|(_, opt)| {
+                                                        opt.as_ref()
+                                                            .and_then(|row| {
+                                                                pos.and_then(|p| row.get(p))
+                                                            })
+                                                            .map(|v| v == &target_value)
+                                                            .unwrap_or(false)
+                                                    })
+                                                    .count()
+                                                    as i64;
+                                                c
+                                            }
+                                            Err(_) => row_ids.len() as i64,
+                                        }
+                                    } else {
+                                        row_ids.len() as i64
+                                    };
                                     // 🔑 Use the user-provided alias if present (e.g.
                                     // `SELECT COUNT(*) as c FROM t`), so derived
                                     // tables / CTEs can reference it by name.
@@ -22713,12 +22802,30 @@ impl QueryExecutor {
         let txn_id = self.current_txn_id().ok_or_else(|| {
             MoteDBError::Query("ROLLBACK TO requires an active transaction".into())
         })?;
-        let _ = self.db.rollback_to_savepoint(txn_id, name)?;
-        // 📌 The write_set restore above is the original undo behavior. A
-        // storage replay of Update deltas was tried and reverted: it fixed
-        // the simple-UPDATE duplicate but broke PK relocation and the mixed
-        // DELETE+UPDATE sequence (differential testing vs SQLite). Proper
-        // savepoint undo plumbing is a tracked follow-up.
+        let replay = self.db.rollback_to_savepoint(txn_id, name)?;
+        // Replay ONLY the deltas the coordinator returned: Update undos of
+        // storage-resident rows (key absent from the write_set). Buffered /
+        // PK-relocated rows were already restored in place in the write_set —
+        // replaying those against storage would create phantom rows (the
+        // earlier failed attempt).
+        for delta in replay {
+            match delta {
+                crate::txn::coordinator::DeltaOperation::Update(row_id, table_name, old_value) => {
+                    let old_row =
+                        std::sync::Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
+                    if let Ok(schema) = self.db.get_table_schema(&table_name) {
+                        let _ = self.db.update_row_in_table_with_schema(
+                            &table_name,
+                            row_id,
+                            old_row.clone(),
+                            old_row,
+                            &schema,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(QueryResult::Definition {
             message: format!("rolled back to SAVEPOINT {name}"),
         })

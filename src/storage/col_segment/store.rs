@@ -2042,17 +2042,6 @@ impl ColSegmentStore {
             tot_keys += keys;
             tot_fence += fence;
             tot_rows += seg.row_count;
-            if std::env::var_os("MOTE_TRACE").is_some() {
-                out.push_str(&format!(
-                    "\n    seg {}: rows={} colcache={:.1}MB file_data={:.1}MB keys={:.1}MB fence={:.1}KB",
-                    seg.id,
-                    seg.row_count,
-                    cache as f64 / 1048576.0,
-                    fd as f64 / 1048576.0,
-                    keys as f64 / 1048576.0,
-                    fence as f64 / 1024.0
-                ));
-            }
         }
         out.push_str(&format!(
             "\n  store: segs={} rows={} colcache={:.1}MB file_data={:.1}MB keys={:.1}MB fence={:.1}KB writebuf=({} rows, {:.1}MB) budget={:.1}MB",

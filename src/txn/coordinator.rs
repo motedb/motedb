@@ -23,6 +23,12 @@ pub enum DeltaOperation {
     Update(RowId, String, Arc<Row>), // old_value
     /// Delete a row (store old value for rollback)
     Delete(RowId, String, Arc<Row>), // old_value
+    /// Update of a row that was WRITE_SET-BUFFERED when updated (e.g. a
+    /// buffered INSERT whose PK then changed — relocate_write_set_row).
+    /// Undo must restore it INTO the write_set (insert-if-absent), never
+    /// replay against storage: an uncommitted row has no storage version,
+    /// and a storage write would materialize a phantom.
+    UpdateBuffered(RowId, String, Arc<Row>), // old_value
 }
 
 /// Savepoint representation (Delta Snapshot optimized)
@@ -349,7 +355,7 @@ impl TransactionCoordinator {
         // see write_set-row deltas.
         let _ = self.record_savepoint_delta(
             txn_id,
-            DeltaOperation::Update(old_row_id, table_name.to_string(), Arc::new(old_row)),
+            DeltaOperation::UpdateBuffered(old_row_id, table_name.to_string(), Arc::new(old_row)),
         );
         let _ = self.record_savepoint_delta(
             txn_id,
@@ -431,7 +437,11 @@ impl TransactionCoordinator {
         // `applied` is returned so the SQL layer can replay Update/Delete
         // restores against storage (the write_set alone isn't the source of
         // truth for rows the DML path already persisted).
-        let applied = all_deltas.clone();
+        // `applied` carries ONLY the deltas the caller must replay against
+        // storage: Update undos of STORAGE-RESIDENT rows (key absent from the
+        // write_set — restoring into the write_set would overlay-duplicate
+        // the storage row: reads counted both, differential testing 21 vs 20).
+        let mut applied: Vec<DeltaOperation> = Vec::new();
         let mut write_set = ctx.write_set.write();
         let mut read_set = ctx.read_set.write();
 
@@ -444,23 +454,42 @@ impl TransactionCoordinator {
                     undo_count += 1;
                 }
                 DeltaOperation::Update(row_id, table_name, old_value) => {
-                    // Undo update: restore the old value (Arc clone is O(1)).
-                    // 📌 Known issue (differential testing): a simple UPDATE
-                    // of a storage-resident row leaves both the write_set
-                    // restore and the storage version visible after commit
-                    // (count +1); a PK-relocated row REQUIRES the insert-
-                    // if-absent here (test savepoint_rollback_after_pk_
-                    // relocation). The two cases need different undo
-                    // plumbing — deferred to a focused round; behavior
-                    // unchanged from the pre-SQL-surface state.
+                    // Undo update, split by where the row lives:
+                    // - write_set (buffered / PK-relocated buffered row):
+                    //   restore IN PLACE — never add a key (adding one for a
+                    //   storage-resident row duplicated it at read time).
+                    // - storage-resident (key absent): leave the write_set
+                    //   alone; the caller replays the old value against
+                    //   storage (same row_id, newest version wins).
+                    let key = (table_name.clone(), row_id);
+                    let old_row = Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone());
+                    match write_set.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            e.insert(old_row);
+                        }
+                        std::collections::hash_map::Entry::Vacant(_) => {
+                            applied.push(DeltaOperation::Update(
+                                row_id,
+                                table_name,
+                                Arc::new(old_row),
+                            ));
+                        }
+                    }
+                    undo_count += 1;
+                }
+                DeltaOperation::Delete(row_id, table_name, old_value) => {
+                    // Undo delete: restore old value (Arc clone is O(1))
                     write_set.insert(
                         (table_name, row_id),
                         Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
                     );
                     undo_count += 1;
                 }
-                DeltaOperation::Delete(row_id, table_name, old_value) => {
-                    // Undo delete: restore old value (Arc clone is O(1))
+                DeltaOperation::UpdateBuffered(row_id, table_name, old_value) => {
+                    // Undo of a write_set-buffered update (relocation):
+                    // restore into the write_set. Reverse-order replay has
+                    // already removed the relocated (new) key, so this key is
+                    // vacant — insert restores the pre-relocation row.
                     write_set.insert(
                         (table_name, row_id),
                         Arc::try_unwrap(old_value).unwrap_or_else(|arc| (*arc).clone()),
