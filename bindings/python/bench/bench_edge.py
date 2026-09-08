@@ -42,7 +42,11 @@ def rows():
 
 
 def rss_mb():
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    # ru_maxrss is KB on Linux but BYTES on macOS.
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return rss / (1024 * 1024)
+    return rss / 1024
 
 
 def bench_motedb():
@@ -57,18 +61,16 @@ def bench_motedb():
     batch = []
     BATCH = 500
     for row in rows():
-        batch.append(row)
+        batch.append(list(row))
         if len(batch) >= BATCH:
-            vals = ",".join(["(?,?,?,?,?)"] * len(batch))
-            flat = [x for r in batch for x in (list(r[:3]) + [r[3], r[4]])]
-            db.execute(
-                f"INSERT INTO t (id, c, v, emb, ts) VALUES {vals}", params=flat
+            db.executemany(
+                "INSERT INTO t (id, c, v, emb, ts) VALUES (?, ?, ?, ?, ?)", batch
             )
             batch = []
     if batch:
-        vals = ",".join(["(?,?,?,?,?)"] * len(batch))
-        flat = [x for r in batch for x in (list(r[:3]) + [r[3], r[4]])]
-        db.execute(f"INSERT INTO t (id, c, v, emb, ts) VALUES {vals}", params=flat)
+        db.executemany(
+            "INSERT INTO t (id, c, v, emb, ts) VALUES (?, ?, ?, ?, ?)", batch
+        )
     ins = time.perf_counter() - t0
 
     # Warmup: first query after bulk insert pays flush + query-time

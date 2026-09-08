@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn db_dir(root: &Path) -> PathBuf {
-    root.with_extension("mote")
+    root.to_path_buf() // db lives inside the given dir
 }
 
 fn build_seed(root: &Path) {

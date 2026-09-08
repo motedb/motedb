@@ -59,7 +59,7 @@ fn main() {
     println!("\n  Memory-source probe (insert-only, no scans)");
     let dir = TempDir::new().unwrap();
     // Database lives in the SIBLING directory {stem}.mote (core.rs with_extension).
-    let db_dir = dir.path().with_extension("mote");
+    let db_dir = dir.path().to_path_buf(); // db lives inside the tempdir
     let mut config = DBConfig::for_general();
     config.auto_checkpoint = None;
     let db = Database::create_with_config(dir.path(), config).unwrap();

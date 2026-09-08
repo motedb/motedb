@@ -193,6 +193,33 @@ impl PyDatabase {
         self.db.begin_transaction().map_err(py_err)
     }
 
+    /// Execute one INSERT once per parameter set (executemany).
+    /// All rows go through a single multi-row INSERT — one WAL fsync for the
+    /// whole batch. `params` is a list of per-row parameter lists.
+    /// Returns the affected-row count.
+    #[pyo3(signature = (sql, params))]
+    fn executemany(&self, sql: &str, params: Bound<'_, PyAny>) -> PyResult<usize> {
+        use pyo3::types::PyAnyMethods as _;
+        let list = params
+            .extract::<Vec<Bound<'_, PyAny>>>()
+            .map_err(|_| PyValueError::new_err("params must be a list of parameter lists"))?;
+        let mut batch: Vec<Vec<MValue>> = Vec::with_capacity(list.len());
+        for row in &list {
+            let vals = row
+                .extract::<Vec<Bound<'_, PyAny>>>()
+                .map_err(|_| PyValueError::new_err("each params item must be a list"))?;
+            let mut converted = Vec::with_capacity(vals.len());
+            for v in &vals {
+                converted.push(py_to_mote(v)?);
+            }
+            batch.push(converted);
+        }
+        self.db
+            .execute_prepared_many(sql, batch)
+            .map(|n| n as usize)
+            .map_err(py_err)
+    }
+
     /// Commit a transaction begun with begin().
     fn commit(&self, tx: u64) -> PyResult<()> {
         self.db.commit_transaction(tx).map_err(py_err)

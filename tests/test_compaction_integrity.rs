@@ -70,7 +70,7 @@ fn create_table(db: &Database) {
 /// truth since v0.3.0). Data lives in `<db>.mote/columnar_ms/<table>/*.sst`,
 /// NOT in the legacy `lsm/` dir.
 fn count_sst_files(dir: &TempDir) -> usize {
-    let ms = dir.path().with_extension("mote").join("columnar_ms");
+    let ms = dir.path().join("columnar_ms"); // db lives inside the tempdir
     let mut count = 0;
     if let Ok(rd) = std::fs::read_dir(&ms) {
         for entry in rd.flatten() {
@@ -736,7 +736,7 @@ fn test_orphan_cleanup_on_open() {
     }
 
     // Create an orphan .sst file
-    let lsm = path.with_extension("mote").join("lsm");
+    let lsm = path.join("lsm"); // db lives inside this dir
     let orphan = lsm.join("l0_orphan_999999.sst");
     std::fs::write(&orphan, b"garbage data not a real sstable").unwrap();
     assert!(orphan.exists(), "Orphan file should exist before open");

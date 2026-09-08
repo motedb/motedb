@@ -76,10 +76,10 @@ impl MoteDB {
     pub fn backup_to(&self, dest: &std::path::Path) -> Result<()> {
         ensure_open!(self);
 
-        // Normalize exactly like open_with_config does (with_extension
-        // "mote") so `Database::open(dest)` restores the snapshot from the
-        // same path the user passed in.
-        let dest = dest.with_extension("mote");
+        // Normalize exactly like open_with_config does so
+        // `Database::open(dest)` restores the snapshot from the same path
+        // the user passed in.
+        let dest = Self::resolve_open_path(dest);
 
         if dest.exists() {
             return Err(StorageError::InvalidData(format!(

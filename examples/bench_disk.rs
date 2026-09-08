@@ -45,7 +45,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&root);
     let db = Database::create(&root).unwrap();
     // Database::create appends .mote — measure the real directory
-    let root = root.with_extension("mote");
+    let root = root.to_path_buf(); // db lives inside the given dir
     println!("db dir: {}", root.display());
     db.execute("CREATE TABLE events (id INT PRIMARY KEY, user_id INT, kind INT, val REAL)")
         .unwrap();

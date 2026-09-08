@@ -1038,6 +1038,8 @@ impl StreamingQueryResult {
     }
 
     /// 🔧 应用 ORDER BY（静态方法，在 materialize() 中调用）
+    /// A resolved ORDER BY key: either a projected column index or a
+    /// per-row precomputed expression value.
     fn apply_order_by(
         rows: &mut [Vec<Value>],
         columns: &[String],
@@ -1045,70 +1047,61 @@ impl StreamingQueryResult {
     ) -> Result<()> {
         use std::cmp::Ordering;
 
-        // Pre-compute column indices and ascending flags to avoid O(columns) per comparison
-        let sort_specs: Vec<(usize, bool)> = order_clauses
-            .iter()
-            .filter_map(|clause| {
-                let col_idx = match &clause.expr {
-                    Expr::Column(name) => {
-                        // Try direct column name match
-                        match columns.iter().position(|c| c == name) {
-                            Some(idx) => idx,
-                            None => {
-                                // Try stripping table prefix from the ORDER BY
-                                // name itself (e.g., "t.id" → "id").
-                                if let Some(dot_pos) = name.rfind('.') {
-                                    let base = &name[dot_pos + 1..];
-                                    if let Some(idx) = columns.iter().position(|c| c == base) {
-                                        return Some((idx, clause.asc));
-                                    }
-                                }
-                                // 🆕 Derived-table case: ORDER BY references a
-                                // bare column name ("cat") but the output
-                                // columns are table-qualified ("x.cat"). Match
-                                // against the base name of each output column.
-                                // This makes `WITH x AS (...) SELECT ... FROM x
-                                // ORDER BY col` sort correctly.
-                                if !name.contains('.') {
-                                    if let Some(idx) = columns
-                                        .iter()
-                                        .position(|c| c.rsplit('.').next().unwrap_or(c) == name)
-                                    {
-                                        return Some((idx, clause.asc));
-                                    }
-                                }
-                                return None;
+        // Resolve each clause: projected column index when possible, else
+        // precompute per-row key values by evaluating the expression against
+        // the projected columns (e.g. `ORDER BY emb <-> ?` when emb is
+        // projected, `ORDER BY v * 2`, `ORDER BY LENGTH(name)`). Previously
+        // expression keys were dropped → arbitrary order (or a NotImplemented
+        // error when every key was an expression).
+        let evaluator = ExprEvaluator::new();
+        let mut specs: Vec<(OrderByKey, bool)> = Vec::with_capacity(order_clauses.len());
+        for clause in order_clauses {
+            let key = match order_by_projected_index(&clause.expr, columns) {
+                Some(idx) => OrderByKey::Col(idx),
+                None => {
+                    // Build a SqlRow per row (columns → values) and evaluate.
+                    // Evaluation failure on a row (e.g. the expression
+                    // references a non-projected column) yields Null — the
+                    // caller's routing is responsible for routing
+                    // non-projected-key queries to the materialized path.
+                    let keys: Vec<Value> = rows
+                        .iter()
+                        .map(|row| {
+                            let mut sql_row: crate::types::SqlRow =
+                                std::collections::HashMap::with_capacity(columns.len());
+                            for (c, v) in columns.iter().zip(row.iter()) {
+                                sql_row.insert(c.clone(), v.clone());
                             }
-                        }
-                    }
-                    Expr::Literal(Value::Integer(n)) => {
-                        // ORDER BY column position (1-based)
-                        let idx = (*n as usize).wrapping_sub(1);
-                        if idx >= columns.len() {
-                            return None; // Out of range — ignore
-                        }
-                        idx
-                    }
-                    _ => return None, // Expression ORDER BY not supported in streaming path
-                };
-                Some((col_idx, clause.asc))
-            })
-            .collect();
-
-        if sort_specs.is_empty() && !order_clauses.is_empty() {
-            return Err(MoteDBError::NotImplemented(
-                "ORDER BY with expressions not supported in streaming queries; use materialize()."
-                    .into(),
-            ));
+                            evaluator
+                                .eval(&clause.expr, &sql_row)
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect();
+                    OrderByKey::Keys(keys)
+                }
+            };
+            specs.push((key, clause.asc));
         }
 
-        rows.sort_by(|a, b| {
-            for &(col_idx, asc) in &sort_specs {
-                if col_idx >= a.len() || col_idx >= b.len() {
-                    continue;
-                }
+        // Sort via index permutation: expression keys read from precomputed
+        // vectors, column keys from the rows themselves.
+        let mut perm: Vec<usize> = (0..rows.len()).collect();
+        perm.sort_by(|&a, &b| {
+            for (key, asc) in &specs {
+                let (va, vb) = match key {
+                    OrderByKey::Col(idx) => {
+                        let va = rows.get(a).and_then(|r| r.get(*idx));
+                        let vb = rows.get(b).and_then(|r| r.get(*idx));
+                        (va, vb)
+                    }
+                    OrderByKey::Keys(keys) => (keys.get(a), keys.get(b)),
+                };
+                let (va, vb) = match (va, vb) {
+                    (Some(va), Some(vb)) => (va, vb),
+                    _ => continue,
+                };
 
-                let cmp = match (&a[col_idx], &b[col_idx]) {
+                let cmp = match (va, vb) {
                     (Value::Float(a), Value::Float(b)) => {
                         if a.is_nan() && b.is_nan() {
                             Ordering::Equal
@@ -1128,7 +1121,7 @@ impl StreamingQueryResult {
                     (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                 };
 
-                let final_cmp = if asc { cmp } else { cmp.reverse() };
+                let final_cmp = if *asc { cmp } else { cmp.reverse() };
 
                 if final_cmp != Ordering::Equal {
                     return final_cmp;
@@ -1136,6 +1129,14 @@ impl StreamingQueryResult {
             }
             Ordering::Equal
         });
+        // Apply the permutation in place (rows is &mut [Vec<Value>] — no Copy).
+        let mut sorted: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for &i in &perm {
+            sorted.push(std::mem::take(&mut rows[i]));
+        }
+        for (i, r) in sorted.into_iter().enumerate() {
+            rows[i] = r;
+        }
 
         Ok(())
     }
@@ -1229,6 +1230,37 @@ impl StreamingQueryResult {
         }
 
         result
+    }
+}
+
+/// A resolved ORDER BY key for `apply_order_by`: either a projected column
+/// index or per-row precomputed expression values.
+enum OrderByKey {
+    Col(usize),
+    /// One evaluated key value per row (aligned with the row slice).
+    Keys(Vec<Value>),
+}
+
+/// Resolve an ORDER BY key expression against projected output columns,
+/// mirroring `try_sort_projected`'s matching (name, bare-name, ordinal).
+/// Returns None when the key must be evaluated as an expression.
+fn order_by_projected_index(expr: &Expr, columns: &[String]) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            columns
+                .iter()
+                .position(|c| c == name || c.rsplit('.').next().unwrap_or(c) == bare)
+        }
+        Expr::Literal(Value::Integer(n)) => {
+            let idx = (*n as usize).wrapping_sub(1);
+            if idx < columns.len() {
+                Some(idx)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -5681,6 +5713,25 @@ impl QueryExecutor {
                             && stmt.having.is_none()
                         {
                             let schema = self.db.get_table_schema(table_name)?;
+                            // 🔑 Only take the scan+projected-sort fast path when
+                            // EVERY ORDER BY key resolves to a projected output
+                            // column (name/alias/ordinal). Expression keys
+                            // (`emb <-> ?`, `v*2`) and non-projected columns
+                            // (`SELECT id ... ORDER BY val`) can't be sorted from
+                            // the projected rows — route to the materialized path,
+                            // which evaluates keys against full source rows.
+                            // Previously try_sort_projected silently skipped
+                            // unresolvable keys → arbitrary row order.
+                            let output_cols = self.build_select_columns(&stmt.columns, &schema)?;
+                            let all_projected = stmt.order_by.as_ref().is_some_and(|ob| {
+                                ob.iter().all(|o| {
+                                    order_by_projected_index(&o.expr, &output_cols).is_some()
+                                })
+                            });
+                            if !all_projected {
+                                store.release_pages_only();
+                                return self.materialize_as_streaming(stmt);
+                            }
                             let mut result = self.execute_full_scan_via_col_segment(
                                 stmt, table_name, &schema, &store,
                             )?;
@@ -10752,6 +10803,24 @@ impl QueryExecutor {
                         _ => None,
                     })
                     .collect();
+                // 🔑 SELECT-alias → aliased EXPRESSION for computed select
+                // columns (`SELECT emb <-> [...] AS d ... ORDER BY d`).
+                // alias_to_col only maps plain-column aliases; a computed
+                // alias must be evaluated per row as the sort key. Without
+                // this, ORDER BY d produced all-Null keys → arbitrary order
+                // (an all-Equal comparator also made select_nth_unstable
+                // return a scrambled permutation of the scan head).
+                let alias_to_expr: std::collections::HashMap<&str, Expr> = stmt
+                    .columns
+                    .iter()
+                    .filter_map(|c| match c {
+                        SelectColumn::Expr(e, Some(alias)) => Some((alias.as_str(), e.clone())),
+                        SelectColumn::ColumnWithAlias(name, alias) => {
+                            Some((alias.as_str(), crate::sql::ast::Expr::Column(name.clone())))
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 enum SortKey {
                     Col(usize),
                     Expr(Expr),
@@ -10759,14 +10828,23 @@ impl QueryExecutor {
                 let sort_plan: Vec<(SortKey, bool)> = ob
                     .iter()
                     .map(|oe| {
-                        let bare_col = match &oe.expr {
+                        match &oe.expr {
                             crate::sql::ast::Expr::Column(cn) => {
                                 let b = cn.rsplit('.').next().unwrap_or(cn);
-                                // Try direct schema lookup first.
-                                schema
-                                    .get_column_position(b)
-                                    // Then try SELECT alias resolution.
-                                    .or_else(|| alias_to_col.get(b).copied())
+                                // 1. Direct schema column.
+                                if let Some(p) = schema.get_column_position(b) {
+                                    return (SortKey::Col(p), oe.asc);
+                                }
+                                // 2. SELECT alias of a plain column.
+                                if let Some(&p) = alias_to_col.get(b) {
+                                    return (SortKey::Col(p), oe.asc);
+                                }
+                                // 3. SELECT alias of a computed expression —
+                                //    evaluate that expression as the sort key.
+                                match alias_to_expr.get(b) {
+                                    Some(e) => (SortKey::Expr(e.clone()), oe.asc),
+                                    None => (SortKey::Expr(oe.expr.clone()), oe.asc),
+                                }
                             }
                             // ORDER BY column position (1-based, references
                             // SELECT output columns). Resolve to schema position
@@ -10774,16 +10852,12 @@ impl QueryExecutor {
                             crate::sql::ast::Expr::Literal(Value::Integer(n)) => {
                                 let pos_1based = *n as usize;
                                 if pos_1based == 0 || pos_1based > out_positions.len() {
-                                    None
+                                    (SortKey::Expr(oe.expr.clone()), oe.asc)
                                 } else {
-                                    Some(out_positions[pos_1based - 1])
+                                    (SortKey::Col(out_positions[pos_1based - 1]), oe.asc)
                                 }
                             }
-                            _ => None,
-                        };
-                        match bare_col {
-                            Some(p) => (SortKey::Col(p), oe.asc),
-                            None => (SortKey::Expr(oe.expr.clone()), oe.asc),
+                            _ => (SortKey::Expr(oe.expr.clone()), oe.asc),
                         }
                     })
                     .collect();
@@ -24599,6 +24673,7 @@ impl QueryExecutor {
         col: &str,
         query: &[f32],
         k: usize,
+        cosine: bool,
     ) -> Result<Vec<(RowId, f32)>> {
         let schema = self.db.get_table_schema(table)?;
         let col_pos = schema.get_column_position(col).unwrap_or(0);
@@ -24616,8 +24691,13 @@ impl QueryExecutor {
                     let _ = seg.sst.load_full_keys();
                 }
             }
-            // Top-K heap (max-heap by distance → pop largest to keep smallest k).
-            let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(OrderedF32, u64)>> =
+            // 🔑 Top-K MAX-heap by (distance, key): peek() is the WORST kept
+            // candidate; a new candidate replaces it only when strictly
+            // nearer. The old version wrapped entries in Reverse, making
+            // peek() the BEST candidate — it evicted the nearest rows and
+            // kept the farthest ones (`ORDER BY emb <-> ?` on an index-less
+            // table returned [5,3,2,1] instead of [5,6,4,7]).
+            let mut heap: std::collections::BinaryHeap<(OrderedF32, u64)> =
                 std::collections::BinaryHeap::with_capacity(k + 1);
             for seg in &segs {
                 if col_pos >= seg.sst.column_tags.len() {
@@ -24660,21 +24740,21 @@ impl QueryExecutor {
                             dim,
                         )
                     };
-                    let dist =
-                        crate::distance::euclidean::euclidean_distance_squared(query, row_vec);
-                    // Maintain top-K max-heap.
+                    // L2 ranks by squared distance (monotone — cheaper, no
+                    // sqrt); cosine needs the actual distance value.
+                    let dist = if cosine {
+                        crate::distance::cosine::cosine_distance(query, row_vec)
+                    } else {
+                        crate::distance::euclidean::euclidean_distance_squared(query, row_vec)
+                    };
+                    // Maintain top-K max-heap (peek = worst kept candidate).
+                    let cand = (OrderedF32(dist), seg.sst.row_map.key(i));
                     if heap.len() < k {
-                        heap.push(std::cmp::Reverse((
-                            OrderedF32(dist),
-                            seg.sst.row_map.key(i),
-                        )));
-                    } else if let Some(&std::cmp::Reverse((worst, _))) = heap.peek() {
-                        if OrderedF32(dist) < worst {
+                        heap.push(cand);
+                    } else if let Some(&(worst, _)) = heap.peek() {
+                        if cand.0 < worst {
                             heap.pop();
-                            heap.push(std::cmp::Reverse((
-                                OrderedF32(dist),
-                                seg.sst.row_map.key(i),
-                            )));
+                            heap.push(cand);
                         }
                     }
                 }
@@ -24690,24 +24770,32 @@ impl QueryExecutor {
             for (key, v) in store.buffered_column_values(col_pos) {
                 if let crate::types::Value::Vector(rv) = v {
                     if rv.len() == qdim {
-                        let dist =
-                            crate::distance::euclidean::euclidean_distance_squared(query, &rv.0);
+                        let dist = if cosine {
+                            crate::distance::cosine::cosine_distance(query, &rv.0)
+                        } else {
+                            crate::distance::euclidean::euclidean_distance_squared(query, &rv.0)
+                        };
+                        let cand = (OrderedF32(dist), key);
                         if heap.len() < k {
-                            heap.push(std::cmp::Reverse((OrderedF32(dist), key)));
-                        } else if let Some(&std::cmp::Reverse((worst, _))) = heap.peek() {
-                            if OrderedF32(dist) < worst {
+                            heap.push(cand);
+                        } else if let Some(&(worst, _)) = heap.peek() {
+                            if cand.0 < worst {
                                 heap.pop();
-                                heap.push(std::cmp::Reverse((OrderedF32(dist), key)));
+                                heap.push(cand);
                             }
                         }
                     }
                 }
             }
-            let mut results: Vec<(RowId, f32)> = heap
-                .into_iter()
-                .map(|std::cmp::Reverse((d, id))| (id, d.0))
-                .collect();
-            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut results: Vec<(RowId, f32)> =
+                heap.into_iter().map(|(d, id)| (id, d.0)).collect();
+            // Ascending distance; ties broken by key for deterministic output
+            // (BinaryHeap's into_iter order is unspecified).
+            results.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
             return Ok(results);
         }
         Ok(Vec::new())
@@ -24727,23 +24815,27 @@ impl QueryExecutor {
         };
 
         // 解析 ORDER BY 表达式
-        let (column, query_vector, asc) = match &order_by.expr {
-            // 匹配: column <-> [vector] (L2Distance)
-            Expr::BinaryOp {
-                op: BinaryOperator::L2Distance | BinaryOperator::CosineDistance,
-                left,
-                right,
-            } => match (&**left, &**right) {
-                (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
-                    (col.clone(), vec.clone(), order_by.asc)
+        let (column, query_vector, asc, cosine) = match &order_by.expr {
+            // 匹配: column <-> [vector] (L2Distance / CosineDistance)
+            Expr::BinaryOp { op, left, right }
+                if matches!(
+                    *op,
+                    BinaryOperator::L2Distance | BinaryOperator::CosineDistance
+                ) =>
+            {
+                match (&**left, &**right) {
+                    (Expr::Column(col), Expr::Literal(Value::Vector(vec))) => {
+                        let cosine = matches!(*op, BinaryOperator::CosineDistance);
+                        (col.clone(), vec.clone(), order_by.asc, cosine)
+                    }
+                    (Expr::Column(_col), _other) => {
+                        return Ok(None);
+                    }
+                    _ => {
+                        return Ok(None);
+                    }
                 }
-                (Expr::Column(_col), _other) => {
-                    return Ok(None);
-                }
-                _ => {
-                    return Ok(None);
-                }
-            },
+            }
             _other_expr => {
                 return Ok(None);
             }
@@ -24754,32 +24846,33 @@ impl QueryExecutor {
             return Ok(None);
         }
 
+        // 🔑 No WHERE: the plan fetches the global top-k candidates first and
+        // applies WHERE afterwards — with a filter that can drop candidates,
+        // `WHERE cat='a' ORDER BY emb <-> q LIMIT 5` would return fewer than
+        // 5 rows even when ≥5 matching rows exist. Filtered ANN must go
+        // through the materialized path (filter → sort → limit).
+        if stmt.where_clause.is_some() {
+            return Ok(None);
+        }
+
         // 获取表名
         let table_name = match stmt.from.as_ref() {
             Some(TableRef::Table { name, .. }) => name.clone(),
             _ => return Ok(None),
         };
 
-        // 检查索引: 先通过 registry 查实际索引名（支持自定义名如 idx_emb），
-        // 再 fallback 到默认名 table_col。
-        let index_name = self
-            .db
-            .index_registry
-            .find_by_column(
-                &table_name,
-                &column,
-                crate::database::index_metadata::IndexType::Vector,
-            )
-            .unwrap_or_else(|| format!("{}_{}", table_name, column));
-        if !self.db.has_vector_index(&index_name) {
-            return Ok(None);
-        }
-
+        // 🔑 No vector-index requirement here: execute_vector_order_by_plan
+        // falls back to brute_force_vector_knn (correct L2/cosine top-k over
+        // segments + write buffer) when no index exists. Previously the gate
+        // made index-less tables fall through to the col-segment scan, whose
+        // try_sort_projected silently skips expression keys → arbitrary
+        // order for `ORDER BY emb <-> ? LIMIT k` (found via Python bindings).
         Ok(Some(VectorOrderByPlan {
             table: table_name,
             column,
             query_vector: query_vector.to_vec(),
             k: limit,
+            cosine,
         }))
     }
 
@@ -24818,7 +24911,13 @@ impl QueryExecutor {
                 .vector_search(&index_name, &plan.query_vector, plan.k)?
         } else {
             // No index built (e.g. data not yet flushed) — brute-force scan.
-            self.brute_force_vector_knn(&plan.table, &plan.column, &plan.query_vector, plan.k)?
+            self.brute_force_vector_knn(
+                &plan.table,
+                &plan.column,
+                &plan.query_vector,
+                plan.k,
+                plan.cosine,
+            )?
         };
         debug_log!(
             "[Executor] 🔍 vector_search返回了{}个候选",
@@ -25613,6 +25712,10 @@ struct VectorOrderByPlan {
     column: String,
     query_vector: Vec<f32>,
     k: usize,
+    /// true = cosine distance (<=>), false = L2 (<->).
+    /// Only used by the brute-force fallback (no index); indexed search
+    /// takes the metric from the index definition.
+    cosine: bool,
 }
 
 #[cfg(test)]

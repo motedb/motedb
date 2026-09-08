@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 fn db_dir(root: &Path) -> PathBuf {
-    root.with_extension("mote")
+    // create() on an existing directory puts the database inside it.
+    root.to_path_buf()
 }
 
 fn build_seed(root: &Path) {

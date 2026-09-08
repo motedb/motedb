@@ -216,7 +216,8 @@ fn test_memory_linear_growth() {
 
     // File size check
     db.checkpoint().expect("checkpoint");
-    let mote_dir = dir.path().with_extension("mote");
+    // The database lives inside the (existing) tempdir directory.
+    let mote_dir = dir.path().to_path_buf();
     let dir_size = get_directory_size_mb(&mote_dir);
     let disk_bpr = if dir_size > 0.01 && final_rows > 0 {
         dir_size * 1024.0 * 1024.0 / final_rows as f64

@@ -1545,6 +1545,43 @@ impl ColSegmentStore {
                 })
                 .collect();
 
+            // 🔑 Pre-read VECTOR (Tensor) columns so projected vector values
+            // decode as Value::Vector instead of Null. Needed by ORDER BY
+            // emb <-> ? on a text-filtered table (`WHERE cat='even' ORDER BY
+            // emb <-> [...]`) — the sort key is computed from the projected
+            // row. Same key-alignment walk as scan_projected_filtered_limit.
+            let pvector: Vec<Vec<Option<Vec<f32>>>> = project_cols
+                .iter()
+                .map(|&pc| {
+                    if pc < seg.sst.column_tags.len()
+                        && matches!(
+                            seg.sst.column_tags[pc],
+                            crate::storage::lsm::columnar::ColumnTypeTag::Vector
+                        )
+                    {
+                        let decoded = seg.sst.read_vectors(pc).unwrap_or_default();
+                        let mut per = vec![None; n];
+                        let mut di = 0usize;
+                        for i in 0..n {
+                            if seg.sst.row_map.is_deleted(i) {
+                                continue;
+                            }
+                            let ek = seg.sst.row_map.key(i) & 0xFFFFFFFF;
+                            while di < decoded.len() && decoded[di].0 != ek {
+                                di += 1;
+                            }
+                            if di < decoded.len() {
+                                per[i] = Some(decoded[di].1.clone());
+                                di += 1;
+                            }
+                        }
+                        per
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+
             // Inner row-processing macro — shared between natural & sorted order.
             macro_rules! process_row {
                 ($i:expr) => {{
@@ -1574,9 +1611,19 @@ impl ColSegmentStore {
                     let mut row = Vec::with_capacity(project_cols.len());
                     for (pi, &pc) in project_cols.iter().enumerate() {
                         let v = if pc < col_types.len() {
-                            if matches!(col_types[pc], ColumnType::Spatial | ColumnType::Tensor(_))
-                            {
+                            if matches!(col_types[pc], ColumnType::Spatial) {
                                 Some(Value::Null)
+                            } else if matches!(col_types[pc], ColumnType::Tensor(_)) {
+                                // Pre-decoded vector column (pvector above);
+                                // Vec::new() for non-vector positions → Null.
+                                pvector
+                                    .get(pi)
+                                    .and_then(|p| p.get(i))
+                                    .cloned()
+                                    .flatten()
+                                    .map(|v| {
+                                        Value::Vector(crate::types::ArcVec(std::sync::Arc::from(v)))
+                                    })
                             } else if let Some(Some(ref f)) = pfixed.get(pi) {
                                 match col_types[pc] {
                                     ColumnType::Integer => f.get_i64(i).map(Value::Integer),

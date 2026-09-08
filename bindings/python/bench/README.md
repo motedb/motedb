@@ -4,7 +4,7 @@
 MoteDB via the Python bindings. Runs anywhere Python ≥3.9 runs.
 
 Methodology:
-- batched inserts (500-row multi-VALUES / executemany) — the realistic
+- batched inserts (500-row executemany batches both sides) — the realistic
   embedded write pattern, not per-row FFI calls;
 - one warmup pass first (bulk-insert → first-query flush/compaction is a
   documented one-time cost; steady state is what applications live in);
@@ -16,9 +16,9 @@ Reference (Apple silicon, N=50K, dim=8):
 
 | shape | MoteDB | SQLite | note |
 |---|---|---|---|
-| batch insert | 0.54s | 0.28s | SQLite's executemany C loop wins — honest loss |
-| PK point | 2.8µs | 8.2µs | 2.9× |
-| filter count | 0.84ms | 3.14ms | 3.7× |
-| GROUP BY | 1.81ms | 17.8ms | 9.8× |
-| ANN top-5 | 41ms | 135ms | 3.2× (SQLite is brute-force) |
-| peak RSS | 56MB | 64MB | -12% |
+| batch insert | 0.29s | 0.16s | SQLite's C executemany loop still wins (1.8×) |
+| PK point | 1.4µs | 3.2µs | 2.3× |
+| filter count | 0.33ms | 1.34ms | 4.1× |
+| GROUP BY | 0.77ms | 7.41ms | 9.6× |
+| ANN top-5 | 1.20ms | 56.45ms | 47× (SQLite is brute-force) |
+| peak RSS | 45MB | 46MB | parity |

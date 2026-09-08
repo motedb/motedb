@@ -25,9 +25,8 @@ db.execute("INSERT INTO docs (text, emb) VALUES (?, ?)", params=["hello world", 
 rows = db.execute("SELECT id, text FROM docs WHERE text MATCH AGAINST('hello')")   # list[dict]
 cols, tuples = db.query("SELECT id, text FROM docs")                               # (columns, list[tuple])
 
-# Vector ANN — use the literal form for ORDER BY (known gap: a `?` vector
-# parameter in ORDER BY misorders until streaming expression keys land):
-near = db.execute("SELECT id FROM docs ORDER BY emb <-> [0.1, 0.1, ...] LIMIT 5")
+# Vector ANN — literal or parameter vectors both order correctly:
+near = db.execute("SELECT id FROM docs ORDER BY emb <-> ? LIMIT 5", params=[[0.1] * 384])
 
 tx = db.begin()
 db.execute("UPDATE docs SET text = ? WHERE id = 1", params=["hi"])
@@ -44,6 +43,7 @@ db.close()
 | `Database(path, preset=None, create=True)` | create-or-open |
 | `execute(sql, params=None)` | SELECT → `list[dict]`; DML → affected count; DDL → None |
 | `query(sql, params=None)` | SELECT → `(columns, list[tuple])` |
+| `executemany(sql, params)` | one INSERT per parameter set — single WAL fsync per batch |
 | `begin()/commit(tx)/rollback(tx)` | transactions |
 | `checkpoint()/vacuum()/close()` | lifecycle |
 
@@ -66,7 +66,4 @@ pypi.org → no token secret needed).
 
 ## Known gaps (pre-1.0)
 
-- `ORDER BY emb <-> ?` with a vector **parameter** misorders — use the
-  literal `[...]` form (tracked for the streaming ORDER-BY expression-key
-  work).
 - Tensor/Spatial/TextDoc values pass through as tags, not Python objects.

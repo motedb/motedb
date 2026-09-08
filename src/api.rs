@@ -123,6 +123,10 @@ impl Database {
 
     /// 创建新数据库
     ///
+    /// Path resolution: `foo.mote` is used verbatim; an existing directory
+    /// (e.g. a TempDir) holds the database INSIDE itself; anything else
+    /// creates the legacy sibling `{stem}.mote` directory.
+    ///
     /// # Examples
     /// ```ignore
     /// let db = Database::create("data.mote")?;
@@ -582,6 +586,107 @@ impl Database {
         // Reuse shared QueryExecutor (preserves pattern_cache + optimizer state)
         self.query_executor.reset_last_insert_id();
         self.query_executor.execute_streaming_ref(&statement)
+    }
+
+    /// Execute one INSERT statement once per parameter set (executemany).
+    ///
+    /// The SQL must be a single `INSERT ... VALUES (?, ...)` whose VALUES
+    /// holds exactly one row template of literals/parameters. Every set in
+    /// `batch` is substituted into that template, and all N rows are executed
+    /// as ONE multi-row INSERT — the engine's batch path takes a single WAL
+    /// fsync and batched index updates for the whole batch, which is an order
+    /// of magnitude faster than N separate `execute_prepared` calls.
+    ///
+    /// Returns the total number of affected rows.
+    pub fn execute_prepared_many(&self, sql: &str, batch: Vec<Vec<Value>>) -> Result<u64> {
+        if self
+            .inner
+            .is_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::StorageError::InvalidData(
+                "Database is closed".into(),
+            ));
+        }
+        if batch.is_empty() {
+            return Ok(0);
+        }
+
+        // Parse once through the shared statement cache (same as execute()).
+        let statement: Arc<Statement> = {
+            if let Some(cached) = self.stmt_cache.get(sql) {
+                Arc::clone(&cached.stmt)
+            } else {
+                use crate::sql::{Lexer, Parser};
+                let mut lexer = Lexer::new(sql);
+                let tokens = lexer.tokenize()?;
+                let mut parser = Parser::new(tokens);
+                let stmt_arc = Arc::new(parser.parse()?);
+                self.insert_stmt_cached(sql.to_string(), &stmt_arc);
+                stmt_arc
+            }
+        };
+
+        let insert = match statement.as_ref() {
+            Statement::Insert(stmt) => stmt,
+            _ => {
+                return Err(crate::error::MoteDBError::InvalidArgument(
+                    "execute_prepared_many only supports INSERT statements".to_string(),
+                ))
+            }
+        };
+
+        // The template must be exactly one VALUES row of Parameter/Literal.
+        if insert.values.len() != 1 {
+            return Err(crate::error::MoteDBError::InvalidArgument(
+                "execute_prepared_many requires a single-row VALUES template".to_string(),
+            ));
+        }
+        let template = &insert.values[0];
+
+        let mut rows: Vec<Vec<crate::sql::ast::Expr>> = Vec::with_capacity(batch.len());
+        for params in &batch {
+            let row: Result<Vec<crate::sql::ast::Expr>> = template
+                .iter()
+                .map(|e| match e {
+                    crate::sql::ast::Expr::Parameter(idx) => {
+                        let i = *idx;
+                        if i == 0 || i > params.len() {
+                            Err(crate::error::MoteDBError::InvalidArgument(format!(
+                                "Parameter ?{} out of range ({} provided)",
+                                i,
+                                params.len()
+                            )))
+                        } else {
+                            Ok(crate::sql::ast::Expr::Literal(params[i - 1].clone()))
+                        }
+                    }
+                    crate::sql::ast::Expr::Literal(v) => {
+                        Ok(crate::sql::ast::Expr::Literal(v.clone()))
+                    }
+                    other => Err(crate::error::MoteDBError::InvalidArgument(format!(
+                        "execute_prepared_many VALUES must be literals or parameters, got {:?}",
+                        other
+                    ))),
+                })
+                .collect();
+            rows.push(row?);
+        }
+
+        let batched = crate::sql::ast::InsertStmt {
+            table: insert.table.clone(),
+            columns: insert.columns.clone(),
+            values: rows,
+            on_conflict: insert.on_conflict.clone(),
+        };
+        self.query_executor.reset_last_insert_id();
+        let result = self
+            .query_executor
+            .execute_streaming_ref(&Statement::Insert(batched));
+        match result? {
+            StreamingQueryResult::Modification { affected_rows } => Ok(affected_rows as u64),
+            _ => Ok(0),
+        }
     }
 
     /// Execute a parameterized query.

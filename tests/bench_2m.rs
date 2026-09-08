@@ -103,19 +103,8 @@ fn bench_2m_memory_and_perf() {
     db.checkpoint().ok();
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // MoteDB stores files under {path}.mote/ (sibling of the path passed to
-    // create_with_config). The temp dir path has no extension, so .mote is
-    // appended: /tmp/xxx → /tmp/xxx.mote
-    let ds_mote = {
-        let p = dir.path();
-        // path.with_extension("mote") for a path without extension
-        let parent = p.parent().unwrap_or(std::path::Path::new("/tmp"));
-        let name = p
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        parent.join(format!("{}.mote", name))
-    };
+    // The database lives inside the (existing) tempdir directory.
+    let ds_mote = dir.path().to_path_buf();
 
     // Detailed disk breakdown
     fn print_dir_breakdown(path: &std::path::Path, _label: &str) -> u64 {

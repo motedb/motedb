@@ -354,12 +354,43 @@ impl MoteDB {
         Self::create_with_config(path, DBConfig::default())
     }
 
+    /// Resolve the on-disk database directory for `create()`.
+    ///
+    /// 1. Path already ends with `.mote` → used verbatim.
+    /// 2. Path is an existing directory (a TempDir, or a user-made data dir)
+    ///    → the database lives INSIDE it (`{dir}/lsm`, `{dir}/wal`). This
+    ///    fixes the orphan-dir hygiene bug: `create(tempdir.path())` used to
+    ///    create a sibling `{tempdir}.mote` that TempDir never cleaned up.
+    /// 3. Otherwise → legacy sibling `{stem}.mote`.
+    fn resolve_create_path(path: &Path) -> PathBuf {
+        if path.extension().and_then(|e| e.to_str()) == Some("mote") || path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.with_extension("mote")
+        }
+    }
+
+    /// Resolve the on-disk database directory for `open()`.
+    ///
+    /// Like [`Self::resolve_create_path`], but an existing directory is only
+    /// accepted when it actually holds a database (`lsm/` or `wal/` inside) —
+    /// `open()` must not silently adopt an unrelated empty directory.
+    pub(crate) fn resolve_open_path(path: &Path) -> PathBuf {
+        if path.extension().and_then(|e| e.to_str()) == Some("mote") {
+            return path.to_path_buf();
+        }
+        if path.is_dir() && (path.join("lsm").is_dir() || path.join("wal").is_dir()) {
+            return path.to_path_buf();
+        }
+        path.with_extension("mote")
+    }
+
     /// Create a new database with custom configuration
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
         crate::configure_allocator_decay();
         config.validate()?;
         let path = path.as_ref();
-        let db_path = path.with_extension("mote");
+        let db_path = Self::resolve_create_path(path);
 
         // 🎯 统一目录结构：所有文件放在 {name}.mote/ 目录下
         if db_path.exists() && db_path.join("lsm").exists() {
@@ -840,7 +871,7 @@ impl MoteDB {
         crate::configure_allocator_decay();
         config.validate()?;
         let path = path.as_ref();
-        let db_path = path.with_extension("mote");
+        let db_path = Self::resolve_open_path(path);
 
         // 🔒 Acquire exclusive file lock to prevent concurrent opens
         let lock_file = Self::acquire_lock(&db_path)?;

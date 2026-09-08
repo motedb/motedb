@@ -43,7 +43,10 @@ fn dir_size(p: &Path) -> u64 {
 }
 
 fn db_dir(p: &Path) -> std::path::PathBuf {
-    p.with_extension("mote")
+    // create() on an existing directory puts the database INSIDE it (the
+    // legacy {stem}.mote sibling is only for non-directory paths) — measure
+    // that directory directly.
+    p.to_path_buf()
 }
 
 fn insert_rows(db: &Database, n: i64) {
