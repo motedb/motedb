@@ -1,0 +1,57 @@
+name: Python wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing (no static token needed)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI (trusted publisher)
+        # Requires the repo to be registered as a Trusted Publisher at
+        # https://pypi.org/manage/account/publishing/ — no API token secret.
+        uses: pypa/gh-action-pypi-publish@release/v1
