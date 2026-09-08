@@ -5397,6 +5397,23 @@ impl QueryExecutor {
     /// Takes &SelectStmt — no cloning of the AST at all.
     /// This is the primary entry point from the statement cache.
     fn execute_select_streaming_ref(&self, stmt: &SelectStmt) -> Result<StreamingQueryResult> {
+        // 🔑 Substitute bind parameters FIRST: every downstream dispatch
+        // (point query, col-segment scan, ORDER BY keys carried to
+        // materialize) must see literal-only expressions — Parameter nodes
+        // evaluate to NULL at materialize() time and sorted arbitrarily
+        // (`ORDER BY emb <-> ?` returned the FARTHER row; found via the
+        // Python bindings).
+        let stmt_substituted_storage;
+        let stmt = if Self::contains_parameter_stmt(stmt) {
+            let params = self.evaluator.get_params();
+            if let Some(err) = Self::validate_params_bound(stmt, &params) {
+                return Err(err);
+            }
+            stmt_substituted_storage = self.substitute_params_stmt(stmt)?;
+            &stmt_substituted_storage
+        } else {
+            stmt
+        };
         // 🔑 Read-your-writes: when inside a transaction with buffered writes for
         // this table, ensure the ColSegmentStore exists so downstream paths
         // (full scan, aggregate) take the txn-merge route. Without this, a table
@@ -5946,16 +5963,8 @@ impl QueryExecutor {
         }
 
         // Pass bind parameters to optimizer (resolves ? inline, no AST clone needed).
-        let has_params = Self::contains_parameter_stmt(stmt);
-        let plan = if has_params {
-            let params = self.evaluator.get_params();
-            if let Some(err) = Self::validate_params_bound(stmt, &params) {
-                return Err(err);
-            }
-            self.optimizer.optimize_select(stmt, &params)?
-        } else {
-            self.optimizer.optimize_select(stmt, &[])?
-        };
+        // (The stmt was already fully substituted at function entry.)
+        let plan = self.optimizer.optimize_select(stmt, &[])?;
 
         // For PointQuery/RangeQuery, the plan already has resolved values — use original stmt.
         // For FullScan, WHERE still contains Parameter nodes — substitute needed.
@@ -5988,11 +5997,6 @@ impl QueryExecutor {
                 end_inclusive,
                 post_filters,
             ),
-            super::optimizer::ScanMethod::FullScan { .. } if has_params => {
-                // FullScan with params: need to substitute WHERE for correct evaluation
-                let resolved = self.substitute_params_stmt(stmt)?;
-                self.execute_full_scan_streaming(&resolved, plan.scan_method.table_name())
-            }
             super::optimizer::ScanMethod::FullScan { ref table } => {
                 // 🚀 DISTINCT via column value index: SELECT DISTINCT col FROM table
                 // without WHERE — iterate index keys directly (O(unique) vs O(N) scan).
@@ -13270,6 +13274,18 @@ impl QueryExecutor {
                 SelectColumn::Expr(e, _) => Self::contains_parameter(e),
                 _ => false,
             })
+            // ORDER BY keys can carry parameters too (`ORDER BY emb <-> ?`);
+            // missing here, the stmt skipped substitution and Parameter nodes
+            // evaluated to NULL at materialize() (param-vector ANN returned
+            // the FARTHER row — found via the Python bindings).
+            || stmt
+                .order_by
+                .as_ref()
+                .is_some_and(|obs| obs.iter().any(|ob| Self::contains_parameter(&ob.expr)))
+            || stmt
+                .having
+                .as_ref()
+                .is_some_and(Self::contains_parameter)
     }
 
     /// Validate that all Parameter nodes in stmt are bound to a value in params.
@@ -13325,11 +13341,25 @@ impl QueryExecutor {
             })
             .collect();
 
+        // 🔑 ORDER BY keys must be substituted too: `ORDER BY emb <-> ?` left
+        // a Parameter node that evaluated to NULL per row → arbitrary order
+        // (found via the Python bindings: param-vector ANN returned the
+        // FARTHER row). Errors fall back to the original (unsupported shapes
+        // keep their old behavior).
+        let order_by = stmt.order_by.as_ref().map(|obs| {
+            obs.iter()
+                .map(|ob| crate::sql::ast::OrderByExpr {
+                    expr: sub(&ob.expr).unwrap_or_else(|_| ob.expr.clone()),
+                    asc: ob.asc,
+                })
+                .collect::<Vec<_>>()
+        });
+
         Ok(SelectStmt {
             columns,
             from: stmt.from.clone(),
             where_clause,
-            order_by: stmt.order_by.clone(),
+            order_by,
             limit: stmt.limit,
             offset: stmt.offset,
             distinct: stmt.distinct,
@@ -24651,9 +24681,28 @@ impl QueryExecutor {
             }
             // Also scan the write buffer for unflushed vectors (correctness —
             // brute force is used when no index exists, so buffered rows must
-            // be visible).
-            // (Buffer scan omitted for brevity; index build flushes first, and
-            // the brute-force path is only a fallback before first flush.)
+            // be visible). The original implementation omitted this "for
+            // brevity", making rows inserted after the last flush invisible
+            // to vector ORDER BY (found via the Python bindings' smoke test:
+            // a nearer flushed row lost to a farther buffered one because the
+            // buffered row wasn't even a candidate — and vice versa when the
+            // buffer held the nearer row).
+            for (key, v) in store.buffered_column_values(col_pos) {
+                if let crate::types::Value::Vector(rv) = v {
+                    if rv.len() == qdim {
+                        let dist =
+                            crate::distance::euclidean::euclidean_distance_squared(query, &rv.0);
+                        if heap.len() < k {
+                            heap.push(std::cmp::Reverse((OrderedF32(dist), key)));
+                        } else if let Some(&std::cmp::Reverse((worst, _))) = heap.peek() {
+                            if OrderedF32(dist) < worst {
+                                heap.pop();
+                                heap.push(std::cmp::Reverse((OrderedF32(dist), key)));
+                            }
+                        }
+                    }
+                }
+            }
             let mut results: Vec<(RowId, f32)> = heap
                 .into_iter()
                 .map(|std::cmp::Reverse((d, id))| (id, d.0))

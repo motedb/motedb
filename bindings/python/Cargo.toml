@@ -1,0 +1,16 @@
+[package]
+name = "motedb-python"
+version = "0.9.1"
+edition = "2021"
+description = "Python bindings for MoteDB — AI-native embedded multimodal database."
+license = "MIT"
+repository = "https://github.com/motedb/motedb"
+publish = false
+
+[lib]
+name = "motedb"
+crate-type = ["cdylib"]
+
+[dependencies]
+motedb-core = { path = "../..", package = "motedb" }
+pyo3 = { version = "0.22", features = ["extension-module"] }

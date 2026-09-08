@@ -22,3 +22,6 @@ fuzz/corpus/
 fuzz/target/
 fuzz/coverage/
 
+
+# Python bindings build artifacts
+bindings/python/target/

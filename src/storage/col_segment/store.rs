@@ -161,6 +161,30 @@ fn decode_buffered_value(
             }
             Value::Null
         }
+        Some(ColumnTypeTag::Vector) => {
+            // Vector rows are variable-length: [u16 dim][f32 × dim], concatenated.
+            let mut pos = 0usize;
+            let mut r = 0usize;
+            while pos + 2 <= raw.len() {
+                let dim = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
+                pos += 2;
+                if r == row_idx {
+                    if dim == 0 || pos + dim * 4 > raw.len() {
+                        return Value::Null;
+                    }
+                    let mut out = Vec::with_capacity(dim);
+                    for b in (0..dim * 4).step_by(4) {
+                        out.push(f32::from_le_bytes(
+                            raw[pos + b..pos + b + 4].try_into().unwrap(),
+                        ));
+                    }
+                    return Value::Vector(crate::types::ArcVec::new(out));
+                }
+                pos += dim * 4;
+                r += 1;
+            }
+            Value::Null
+        }
         _ => Value::Null,
     }
 }
@@ -572,6 +596,29 @@ impl ColSegmentStore {
                 .ensure_file_data_loaded_within(self.col_cache_budget());
         }
         Ok(())
+    }
+
+    /// Buffered (unflushed) rows of one column for brute-force paths:
+    /// returns (composite_key, value) for every live buffered row. Used by
+    /// brute_force_vector_knn so write_buf rows are visible to KNN before
+    /// the first flush (the scan was "omitted for brevity" and unflushed
+    /// rows were silently missing from vector ORDER BY results).
+    pub fn buffered_column_values(&self, col_idx: usize) -> Vec<(u64, Value)> {
+        let buf = self.write_buf.lock();
+        let col_types = self.col_types.load();
+        let ct = match col_types.get(col_idx) {
+            Some(ct) => ct,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(buf.num_rows);
+        for i in 0..buf.num_rows {
+            if buf.deleted.get(i) == Some(&true) {
+                continue;
+            }
+            let key = buf.keys.get(i).copied().unwrap_or(0);
+            out.push((key, decode_buffered_value(&buf, col_idx, i, ct)));
+        }
+        out
     }
 
     /// Point lookup: newest segment first, return first hit.
