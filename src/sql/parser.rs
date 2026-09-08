@@ -877,8 +877,11 @@ impl Parser {
                 if !self.match_token(TokenType::Not) {
                     return Err(self.error("Expected NOT after IF"));
                 }
-                // Expect EXISTS (identifier)
-                if let TokenType::Identifier(id3) = &self.current().token_type {
+                // Expect EXISTS (keyword since the EXISTS-subquery grammar
+                // landed; keep the identifier form for backwards compat).
+                if self.match_token(TokenType::Exists) {
+                    if_not_exists = true;
+                } else if let TokenType::Identifier(id3) = &self.current().token_type {
                     if id3.eq_ignore_ascii_case("EXISTS") {
                         self.advance();
                         if_not_exists = true;
@@ -1282,6 +1285,10 @@ impl Parser {
                             self.advance();
                             true
                         }
+                        TokenType::Exists => {
+                            self.advance();
+                            true
+                        }
                         _ => return Err(self.error("Expected EXISTS after IF")),
                     }
                 } else {
@@ -1423,6 +1430,22 @@ impl Parser {
 
     fn parse_prefix_expr(&mut self) -> Result<Expr> {
         match &self.current().token_type {
+            // EXISTS (SELECT ...) — boolean subquery test. Also covers the
+            // prefix position of NOT EXISTS's inner expression (the parser's
+            // NOT handling wraps whatever parse_expr returns in UnaryOp::Not).
+            TokenType::Exists => {
+                self.advance();
+                self.expect(TokenType::LParen)?;
+                if !matches!(self.current().token_type, TokenType::Select) {
+                    return Err(self.error("Expected SELECT after EXISTS("));
+                }
+                let sub = self.parse_select()?;
+                self.expect(TokenType::RParen)?;
+                Ok(Expr::Exists(Box::new(crate::sql::ast::Statement::Select {
+                    stmt: sub,
+                    ctes: Vec::new(),
+                })))
+            }
             // CASE WHEN ... THEN ... [WHEN ... THEN ...] [ELSE ...] END
             //   (searched form)
             // CASE expr WHEN val THEN ... [WHEN val THEN ...] [ELSE ...] END

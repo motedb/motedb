@@ -74,6 +74,7 @@ static KEYWORDS: phf::Map<&'static str, TokenType> = phf_map! {
     "ttl" => TokenType::Ttl,
     "begin" => TokenType::Begin,
     "savepoint" => TokenType::Savepoint,
+    "exists" => TokenType::Exists,
     "release" => TokenType::Release,
     "commit" => TokenType::Commit,
     "rollback" => TokenType::Rollback,
@@ -153,6 +154,7 @@ pub enum TokenType {
     Rollback,      // ROLLBACK
     Savepoint,     // SAVEPOINT
     Release,       // RELEASE
+    Exists,        // EXISTS
     Case,          // CASE
     When,          // WHEN
     Then,          // THEN

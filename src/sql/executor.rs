@@ -2869,6 +2869,17 @@ impl QueryExecutor {
         if stmt.having.is_some() {
             return Ok(None);
         }
+        // 🚨 Subqueries in WHERE (scalar, IN, EXISTS — possibly correlated)
+        // need per-row execution by the general scan path; this pushdown
+        // cannot evaluate them (differential testing: COUNT(*) WHERE EXISTS
+        // silently returned 0).
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
         let schema = self.db.get_table_schema(table_name).ok();
         let schema = match schema {
             Some(s) => s,
@@ -3099,28 +3110,56 @@ impl QueryExecutor {
                 let ws = self.txn_write_set_rows(table_name);
                 if stmt.where_clause.is_none() {
                     count += ws.len() as i64;
+                } else if let crate::sql::ast::Expr::Between {
+                    expr,
+                    low,
+                    high,
+                    negated,
+                } = stmt.where_clause.as_ref().unwrap()
+                {
+                    // BETWEEN: filter write_set rows by [low, high] (or the
+                    // negation). Mirrors the comparison branch below.
+                    let col = match expr.as_ref() {
+                        crate::sql::ast::Expr::Column(cn) => {
+                            let bare = cn.rsplit('.').next().unwrap_or(cn);
+                            schema.get_column_position(bare)
+                        }
+                        _ => None,
+                    };
+                    let empty = std::collections::HashMap::new();
+                    let lo = self.evaluator.eval(low, &empty).ok();
+                    let hi = self.evaluator.eval(high, &empty).ok();
+                    if let (Some(pos), Some(lo), Some(hi)) = (col, lo, hi) {
+                        let in_range = |row: &Vec<Value>| -> bool {
+                            let inside =
+                                row.get(pos).map(|v| v >= &lo && v <= &hi).unwrap_or(false);
+                            if *negated {
+                                !inside
+                            } else {
+                                inside
+                            }
+                        };
+                        count += ws.iter().filter(|(_, row)| in_range(row)).count() as i64;
+                    }
                 } else if let Some(comparisons) =
                     Self::parse_where_comparisons(stmt.where_clause.as_ref().unwrap(), &schema)
                 {
-                    if let Some(&(pos, ref op, ref target)) = comparisons.first() {
-                        let matches: Vec<bool> = ws
-                            .iter()
-                            .map(|(_, row)| match row.get(pos) {
-                                Some(v) => self
-                                    .evaluator
-                                    .eval_binary_op(op, v.clone(), target.clone())
-                                    .map(|r| matches!(r, Value::Bool(true)))
-                                    .unwrap_or(false),
-                                None => false,
-                            })
-                            .collect();
-                        // Single comparison: count matches. Multi-AND: only
-                        // count rows matching the FIRST comparison when it is
-                        // the only one; otherwise skip (conservative).
-                        if comparisons.len() == 1 {
-                            count += matches.iter().filter(|m| **m).count() as i64;
-                        }
-                    }
+                    // AND semantics: count write_set rows matching EVERY
+                    // comparison (BETWEEN arrives here rewritten as
+                    // col >= low AND col <= high).
+                    let row_matches = |row: &Vec<Value>| -> bool {
+                        comparisons.iter().all(|&(pos, ref op, ref target)| {
+                            row.get(pos)
+                                .map(|v| {
+                                    self.evaluator
+                                        .eval_binary_op(op, v.clone(), target.clone())
+                                        .map(|r| matches!(r, Value::Bool(true)))
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                    };
+                    count += ws.iter().filter(|(_, row)| row_matches(row)).count() as i64;
                 }
                 // Other predicate shapes: fall through WITHOUT the write_set
                 // adjustment (undercount is safer than phantom overcount;
@@ -3413,6 +3452,15 @@ impl QueryExecutor {
         // 🆕 HAVING requires post-aggregation filtering that this pushdown path
         // doesn't apply — fall back to the materialized path.
         if stmt.having.is_some() {
+            return Ok(None);
+        }
+        // 🚨 Subqueries in WHERE need per-row execution (see
+        // col_segment_aggregate) — fall back.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
             return Ok(None);
         }
         // COUNT(DISTINCT col) and other DISTINCT aggregates are not supported
@@ -6014,6 +6062,7 @@ impl QueryExecutor {
     fn expr_contains_subquery(expr: &Expr) -> bool {
         match expr {
             Expr::Subquery(_) => true,
+            Expr::Exists(_) => true,
             Expr::BinaryOp { left, right, .. } => {
                 Self::expr_contains_subquery(left) || Self::expr_contains_subquery(right)
             }
@@ -7439,6 +7488,16 @@ impl QueryExecutor {
     /// Only reads the group-by column and aggregate columns — no per-row decode.
     /// For GROUP BY customer: read TextSegment → HashMap<String, (count, sum)> → compute AVG.
     fn try_group_by_columnar(&self, stmt: &SelectStmt) -> Result<Option<StreamingQueryResult>> {
+        // 🚨 Subqueries in WHERE (incl. correlated EXISTS) need per-row
+        // execution by the general path — this fast path cannot evaluate
+        // them and would silently return wrong counts.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
         let table = match &stmt.from {
             Some(TableRef::Table { name, .. }) => name.as_str(),
             _ => return Ok(None),
@@ -7946,6 +8005,16 @@ impl QueryExecutor {
         &self,
         stmt: &SelectStmt,
     ) -> Result<Option<StreamingQueryResult>> {
+        // 🚨 Subqueries in WHERE (incl. correlated EXISTS) need per-row
+        // execution by the general path — this fast path cannot evaluate
+        // them and would silently return wrong counts.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
         if stmt.group_by.is_some() {
             return Ok(None);
         }
@@ -8177,6 +8246,16 @@ impl QueryExecutor {
         &self,
         stmt: &SelectStmt,
     ) -> Result<Option<StreamingQueryResult>> {
+        // 🚨 Subqueries in WHERE (incl. correlated EXISTS) need per-row
+        // execution by the general path — this fast path cannot evaluate
+        // them and would silently return wrong counts.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
         // Must have WHERE clause with simple col = value
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
@@ -8383,6 +8462,16 @@ impl QueryExecutor {
         &self,
         stmt: &SelectStmt,
     ) -> Result<Option<StreamingQueryResult>> {
+        // 🚨 Subqueries in WHERE (incl. correlated EXISTS) need per-row
+        // execution by the general path — this fast path cannot evaluate
+        // them and would silently return wrong counts.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
         // 🆕 HAVING not supported by this pushdown path — fall back.
         if stmt.having.is_some() {
             return Ok(None);
@@ -10984,14 +11073,28 @@ impl QueryExecutor {
         all_rows.sort_by_key(|(rid, _)| *rid);
 
         // Apply WHERE filter + projection.
+        // 🚨 Subqueries in WHERE (incl. correlated EXISTS) need binding +
+        // per-row execution — the static evaluator cannot run them (errors
+        // were silently skipped, yielding 0 rows).
+        let where_has_subquery = where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery);
         let mut result_rows: Vec<Vec<Value>> = Vec::new();
         let mut skipped = 0usize;
         for (_, row) in all_rows {
             // WHERE filter.
             if let Some(ref wc) = where_clause {
-                let v = match Self::eval_expr_on_row(wc, &row, schema) {
-                    Ok(v) => v,
-                    Err(_) => continue,
+                let v = if where_has_subquery {
+                    let bound = Self::bind_outer_columns(wc, &row, schema);
+                    match self.eval_correlated_expr(&bound, &row, schema) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    }
+                } else {
+                    match Self::eval_expr_on_row(wc, &row, schema) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    }
                 };
                 if !Self::is_truthy(&v) {
                     continue;
@@ -13913,6 +14016,27 @@ impl QueryExecutor {
                 if let Some(h) = cloned.having.take() {
                     cloned.having =
                         Some(self.materialize_subqueries_checked(&h, outer_schema.as_deref())?);
+                }
+                // 🚨 Honesty guard: an aggregate-only query whose WHERE still
+                // holds a subquery node (correlated EXISTS / scalar that
+                // couldn't be proven uncorrelated) has no evaluator on the
+                // aggregate fast paths — they silently returned 0. Fail
+                // loudly instead; row-level (non-aggregate) queries DO
+                // support correlated subqueries per-row.
+                let still_subq = cloned
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(Self::expr_contains_subquery);
+                let aggregate_only = cloned.group_by.is_none()
+                    && !cloned.columns.is_empty()
+                    && cloned
+                        .columns
+                        .iter()
+                        .all(|c| matches!(c, SelectColumn::Expr(Expr::FunctionCall { .. }, _)));
+                if still_subq && aggregate_only {
+                    return Err(MoteDBError::Query(
+                        "aggregate queries with a correlated-subquery WHERE are not yet supported; rewrite as a join or use a non-aggregate SELECT".into(),
+                    ));
                 }
                 resolved_subq_stmt = cloned;
                 &resolved_subq_stmt as &SelectStmt
@@ -16934,6 +17058,24 @@ impl QueryExecutor {
                 // subqueries ("use IN instead of =").
                 self.materialize_subqueries(expr)
             }
+            Expr::Exists(stmt) => {
+                // Correlated EXISTS must stay a node for per-row evaluation.
+                // Only fold when non-correlation is PROVABLE (outer schema
+                // present + no outer refs): with outer_schema=None, eagerly
+                // materializing a correlated subquery evaluated its unbound
+                // outer columns as NULL → empty result → EXISTS silently
+                // folded to false (differential testing: COUNT ... WHERE
+                // EXISTS returned 0).
+                if let crate::sql::ast::Statement::Select { stmt: sub, .. } = stmt.as_ref() {
+                    match outer_schema {
+                        Some(os) if !Self::is_correlated_subquery(sub, os) => {
+                            return self.materialize_subqueries(expr);
+                        }
+                        _ => return Ok(expr.clone()),
+                    }
+                }
+                self.materialize_subqueries(expr)
+            }
             // All other expr types: delegate to standard materialization (which
             // handles their recursion correctly without touching Subquery nodes).
             _ => self.materialize_subqueries(expr),
@@ -16942,6 +17084,17 @@ impl QueryExecutor {
 
     fn materialize_subqueries(&self, expr: &Expr) -> Result<Expr> {
         match expr {
+            Expr::Exists(_) => {
+                // NEVER fold here: this fn has no schema context and cannot
+                // prove non-correlation. Eager materialization of a
+                // correlated EXISTS evaluated its unbound outer columns as
+                // NULL → empty subquery → silent false (differential testing:
+                // COUNT ... WHERE EXISTS returned 0). Keep the node; the
+                // schema-aware pass (materialize_subqueries_checked) folds
+                // PROVABLY uncorrelated cases, everything else evaluates
+                // per-row via eval_correlated_expr.
+                Ok(expr.clone())
+            }
             Expr::Subquery(subquery) => {
                 // Execute subquery
                 let result = self.execute_select_internal(subquery)?;
@@ -18346,6 +18499,28 @@ impl QueryExecutor {
                 }
                 Expr::Subquery(bound)
             }
+            Expr::Exists(stmt) => {
+                // Same outer-ref binding for EXISTS subqueries.
+                let mut bound = stmt.as_ref().clone();
+                if let crate::sql::ast::Statement::Select {
+                    stmt: ref mut s, ..
+                } = bound
+                {
+                    if let Some(wc) = &s.where_clause {
+                        let w = wc.clone();
+                        s.where_clause =
+                            Some(Self::bind_outer_columns(&w, outer_row, outer_schema));
+                    }
+                }
+                Expr::Exists(Box::new(bound))
+            }
+            // NOT EXISTS (and any unary wrapper) must bind its inner
+            // subquery too — without this the unbound correlated EXISTS
+            // errored per row and NOT EXISTS silently matched nothing.
+            Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(Self::bind_outer_columns(expr, outer_row, outer_schema)),
+            },
             Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
                 left: Box::new(Self::bind_outer_columns(left, outer_row, outer_schema)),
                 op: op.clone(),
@@ -18376,6 +18551,34 @@ impl QueryExecutor {
         schema: &TableSchema,
     ) -> Result<Value> {
         match expr {
+            Expr::UnaryOp {
+                op: crate::sql::ast::UnaryOperator::Not,
+                expr,
+            } => {
+                // NOT EXISTS / NOT (correlated predicate): evaluate the inner
+                // expression recursively, then negate.
+                let v = self.eval_correlated_expr(expr, row, schema)?;
+                Ok(match v {
+                    Value::Bool(b) => Value::Bool(!b),
+                    Value::Null => Value::Null,
+                    Value::Integer(i) => Value::Bool(i == 0),
+                    other => Value::Bool(!Self::is_truthy(&other)),
+                })
+            }
+            Expr::Exists(stmt) => {
+                // Correlated EXISTS: outer refs were bound to literals by
+                // bind_outer_columns; execute and test non-emptiness.
+                // (EXISTS permits multi-row results — no scalar limit.)
+                let sub = match stmt.as_ref() {
+                    crate::sql::ast::Statement::Select { stmt, .. } => stmt,
+                    _ => return Ok(Value::Bool(false)),
+                };
+                let result = self.execute_select_internal(sub)?;
+                match result {
+                    QueryResult::Select { rows, .. } => Ok(Value::Bool(!rows.is_empty())),
+                    _ => Ok(Value::Bool(false)),
+                }
+            }
             Expr::Subquery(sub) => {
                 let result = self.execute_select_internal(sub)?;
                 match result {

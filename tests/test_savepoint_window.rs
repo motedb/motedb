@@ -78,6 +78,10 @@ fn no_phantom_counts_in_rollback_to_window() {
         "in-window point count must not include write_set phantoms"
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE id = 1"), 1);
+    // 📌 Known limitation: range predicates (BETWEEN) are served by the
+    // RangeQuery streaming path which has no write_set adjustment — restored
+    // rows are invisible in the pre-COMMIT window (undercount; self-heals at
+    // COMMIT, unlike the phantom overcounts fixed above).
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t WHERE id = 92"), 0);
     assert_eq!(
         count(&db, "SELECT a FROM t WHERE id = 1"),

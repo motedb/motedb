@@ -532,6 +532,17 @@ impl ExprEvaluator {
                 }
             }
 
+            Expr::Exists(_) => {
+                // Correlated/EXISTS execution is done by the executor
+                // (eval_correlated_expr); the bare evaluator has no subquery
+                // engine. Reaching here means an unsupported context.
+                if std::env::var_os("MOTE_TRACE").is_some() {
+                    eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                }
+                return Err(MoteDBError::Query(
+                    "EXISTS evaluation must be done by executor".into(),
+                ));
+            }
             Expr::Subquery(_) => {
                 // Subqueries are handled at executor level, not here
                 Err(MoteDBError::Query(

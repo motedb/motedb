@@ -362,6 +362,10 @@ pub enum Expr {
         negated: bool,
     },
 
+    /// EXISTS (subquery) — true iff the subquery yields ≥1 row.
+    /// NOT EXISTS is represented as UnaryOp::Not around this.
+    Exists(Box<Statement>),
+
     /// LIKE expression: column LIKE pattern
     Like {
         expr: Box<Expr>,
