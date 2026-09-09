@@ -27,6 +27,7 @@ macro_rules! ensure_open {
 
 pub mod core;
 pub mod crud;
+pub mod doctor;
 pub mod helpers;
 pub mod index_metadata;
 pub mod indexes;

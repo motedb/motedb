@@ -45,6 +45,7 @@ db.close()
 | `query(sql, params=None)` | SELECT → `(columns, list[tuple])` |
 | `executemany(sql, params)` | one INSERT per parameter set — single WAL fsync per batch |
 | `begin()/commit(tx)/rollback(tx)` | transactions |
+| `doctor()` | self-check → `{"verdict", "checks": [{name,status,detail}]}` |
 | `checkpoint()/vacuum()/close()` | lifecycle |
 
 Parameter types: `None/bool/int/float/str/list[float]` (→ embedding vector).

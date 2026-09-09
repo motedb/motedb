@@ -235,6 +235,27 @@ impl PyDatabase {
         self.db.checkpoint().map_err(py_err)
     }
 
+    /// Operational self-check: list of {"name", "status", "detail"} dicts
+    /// plus a "verdict" ("PASS" | "WARN" | "FAIL").
+    fn doctor(&self) -> PyResult<PyObject> {
+        let report = self.db.doctor();
+        Python::with_gil(|py| -> PyResult<PyObject> {
+            use pyo3::types::PyAnyMethods as _;
+            let list = pyo3::types::PyList::empty_bound(py);
+            for c in &report.checks {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("name", &c.name)?;
+                dict.set_item("status", c.status.label())?;
+                dict.set_item("detail", &c.detail)?;
+                list.append(dict)?;
+            }
+            let out = pyo3::types::PyDict::new_bound(py);
+            out.set_item("verdict", report.worst().label())?;
+            out.set_item("checks", list)?;
+            Ok(out.into_any().unbind().into())
+        })
+    }
+
     /// Reclaim disk space (full compaction).
     fn vacuum(&self) -> PyResult<()> {
         self.db.vacuum().map_err(py_err)

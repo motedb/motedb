@@ -126,6 +126,8 @@ See [`examples/logging.rs`](examples/logging.rs) for a runnable demo.
 
 ## Features
 
+- 🔍 **运维自检** — `db.doctor()` / `motedb-cli doctor <path>`：表布局、内存预算、索引覆盖率、磁盘占用逐项 PASS/WARN 报告。
+
 ### Multimodal
 
 | Modality | Index | Query |

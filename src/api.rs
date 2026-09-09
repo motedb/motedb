@@ -234,6 +234,13 @@ impl Database {
         self.inner.debug_memory_report()
     }
 
+    /// Operational self-check: table layout, memory budgets, index coverage,
+    /// build errors and disk breakdown as a structured PASS/WARN report.
+    /// Read-only; safe on a live database. See `motedb-cli doctor <path>`.
+    pub fn doctor(&self) -> crate::database::doctor::DoctorReport {
+        self.inner.doctor()
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         self.inner.checkpoint()
     }

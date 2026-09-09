@@ -56,6 +56,12 @@ assert n == 100
 mx = db.execute("SELECT MAX(temp) AS m FROM sensors")[0]["m"]
 assert mx == 70.0, mx
 
+# Operational self-check
+report = db.doctor()
+print("doctor verdict:", report["verdict"])
+assert report["verdict"] in ("PASS", "WARN")
+assert any(c["name"].startswith("table.robots.layout") for c in report["checks"])
+
 db.checkpoint()
 db.close()
 print("SMOKE OK")

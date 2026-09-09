@@ -42,6 +42,9 @@ fn run() -> Result<()> {
                 }
             }
         }
+        3 if args[1] == "doctor" => {
+            doctor_command(&args[2])?;
+        }
         _ => {
             print_help();
             return Err(StorageError::InvalidData("Invalid arguments".to_string()));
@@ -49,6 +52,19 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn doctor_command(path: &str) -> Result<()> {
+    use motedb::database::doctor::DoctorStatus;
+    let db = MoteDB::open(path)?;
+    let report = db.doctor();
+    print!("{}", report.format_text());
+    drop(db);
+    match report.worst() {
+        DoctorStatus::Fail => std::process::exit(2),
+        DoctorStatus::Warn => std::process::exit(1),
+        DoctorStatus::Pass => Ok(()),
+    }
 }
 
 fn print_help() {
@@ -59,6 +75,7 @@ MoteDB v{} - 高性能嵌入式数据库引擎
 用法:
   motedb                启动交互式 SQL shell (默认数据库: ./motedb_data)
   motedb <db_path>      打开指定数据库
+  motedb doctor <path>  运维自检（表布局/内存/索引覆盖/磁盘），退出码 0/1/2
   motedb --version      显示版本信息
   motedb --help         显示此帮助信息
 
@@ -140,6 +157,9 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
                 }
                 ".tables" => {
                     list_tables(&db)?;
+                }
+                ".doctor" => {
+                    print!("{}", db.doctor().format_text());
                 }
                 ".schema" => {
                     show_all_schemas(&db)?;
