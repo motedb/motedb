@@ -13,7 +13,7 @@ use crate::{Result, StorageError};
 use lru::LruCache;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
@@ -38,16 +38,15 @@ pub struct SQ8Vectors {
 
     /// mmap of vectors_sq8.bin — zero-syscall quantized vector reads
     data_mmap: Arc<RwLock<Option<Mmap>>>,
-    /// mmap of vectors_sq8.idx sidecar — zero-syscall offset lookups
-    idx_mmap: Arc<RwLock<Option<Mmap>>>,
 
-    /// Bounded offset index: row_id -> file offset (LRU-capped)
-    index: Arc<RwLock<LruCache<RowId, u64>>>,
+    /// 🔑 Authoritative COMPLETE offset map: row_id -> file offset.
+    /// The old bounded LRU lost ids beyond cache capacity between flushes —
+    /// lookups failed, ids() returned a subset, and rebuilds stranded every
+    /// non-resident vector (measured recall@10 3% after incremental
+    /// inserts). The sidecar file remains the durable form (rebuilt at
+    /// flush, loaded at open); this map is the in-memory truth.
+    offsets: Arc<RwLock<HashMap<RowId, u64>>>,
 
-    /// Sidecar index file handle for binary search on LRU miss
-    index_file: Arc<RwLock<File>>,
-    /// Total entries in the sidecar index (for binary search bounds)
-    index_count: Arc<RwLock<u64>>,
     /// Total entries (tracked incrementally on insert/delete)
     count: Arc<RwLock<u64>>,
 
@@ -100,20 +99,13 @@ impl SQ8Vectors {
             .write(true)
             .open(&file_path)
             .map_err(StorageError::Io)?;
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-
         Ok(Self {
             _data_dir: data_dir,
             dimension,
             quantizer,
             _entry_size: entry_size,
             data_mmap: Arc::new(RwLock::new(None)),
-            idx_mmap: Arc::new(RwLock::new(None)),
-            index: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_size.max(1)).unwrap(),
-            ))),
-            index_file: Arc::new(RwLock::new(idx_read)),
-            index_count: Arc::new(RwLock::new(0)),
+            offsets: Arc::new(RwLock::new(HashMap::new())),
             count: Arc::new(RwLock::new(0)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
@@ -152,8 +144,6 @@ impl SQ8Vectors {
             .write(true)
             .open(&file_path)
             .map_err(StorageError::Io)?;
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-
         let data_len = read_file.metadata().map(|m| m.len()).unwrap_or(0);
         let index_count = if idx_path.exists() {
             let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
@@ -182,9 +172,28 @@ impl SQ8Vectors {
             Self::build_sidecar_index(&file_path, &idx_path, entry_size, None)?
         };
 
-        // mmap data and sidecar for zero-syscall reads
+        // mmap data for zero-syscall reads
         let data_mmap = unsafe { Mmap::map(&read_file).ok() };
-        let sidecar_mmap = unsafe { Mmap::map(&idx_read).ok() };
+
+        // 🔑 Load the COMPLETE row_id → offset map from the sidecar (the
+        // sidecar covers every physical entry: trusted-marker form is
+        // post-flush complete; the untrusted form was just rebuilt).
+        let offsets = {
+            let mut map: HashMap<RowId, u64> = HashMap::new();
+            let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
+            idx.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE))
+                .map_err(StorageError::Io)?;
+            for _ in 0..index_count {
+                let mut buf = [0u8; 16];
+                if idx.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let id = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let off = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                map.insert(id, off);
+            }
+            map
+        };
 
         Ok(Self {
             _data_dir: data_dir,
@@ -192,13 +201,8 @@ impl SQ8Vectors {
             quantizer,
             _entry_size: entry_size,
             data_mmap: Arc::new(RwLock::new(data_mmap)),
-            idx_mmap: Arc::new(RwLock::new(sidecar_mmap)),
-            index: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_size.max(1)).unwrap(),
-            ))),
-            index_file: Arc::new(RwLock::new(idx_read)),
-            index_count: Arc::new(RwLock::new(index_count)),
-            count: Arc::new(RwLock::new(index_count)),
+            offsets: Arc::new(RwLock::new(offsets)),
+            count: Arc::new(RwLock::new(index_count as u64)),
             cache: Arc::new(RwLock::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
             ))),
@@ -287,89 +291,19 @@ impl SQ8Vectors {
         Ok(count)
     }
 
-    /// Look up file offset for a row_id.
-    /// Checks LRU first, then mmap binary search, then sidecar file fallback.
+    /// Look up file offset for a row_id — O(1) from the complete
+    /// authoritative map (complete by construction: inserts add, deletes
+    /// remove, load() populates from the sidecar).
     fn lookup_offset(&self, row_id: RowId) -> Option<u64> {
-        // Tombstone overlay: deleted ids stay physically present (and in the
-        // sidecar) until the next flush — without this check, re-inserting a
-        // deleted id hit "already exists".
+        // Tombstone overlay: deleted ids stay physically present in the
+        // append-only data file until the next flush — without this check,
+        // re-inserting a deleted id hit "already exists".
         if self.tombstones.lock().contains(&row_id) {
             return None;
         }
-
-        // 1. Check LRU cache
-        {
-            let mut index = self.index.write();
-            if let Some(&offset) = index.get(&row_id) {
-                return Some(offset);
-            }
-        }
-
-        let count = *self.index_count.read();
-        if count == 0 {
-            return None;
-        }
-
-        // 2. mmap binary search (zero syscall)
-        {
-            let guard = self.idx_mmap.read();
-            if let Some(ref mmap) = *guard {
-                let entry_size = 16usize;
-                let mut lo = 0i64;
-                let mut hi = count as i64 - 1;
-
-                while lo <= hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let off = SIDECAR_HEADER_SIZE as usize + mid as usize * entry_size;
-                    if off + 16 > mmap.len() {
-                        break;
-                    }
-                    let mid_id = u64::from_le_bytes(mmap[off..off + 8].try_into().ok()?);
-                    let mid_offset = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().ok()?);
-
-                    match mid_id.cmp(&row_id) {
-                        std::cmp::Ordering::Equal => {
-                            drop(guard);
-                            self.index.write().put(row_id, mid_offset);
-                            return Some(mid_offset);
-                        }
-                        std::cmp::Ordering::Less => lo = mid + 1,
-                        std::cmp::Ordering::Greater => hi = mid - 1,
-                    }
-                }
-                return None;
-            }
-        }
-
-        // 3. Fallback: binary search on sidecar index file
-        let mut file = self.index_file.write();
-        let entry_size = 16u64; // row_id (8) + offset (8)
-        let mut lo = 0i64;
-        let mut hi = count as i64 - 1;
-
-        while lo <= hi {
-            let mid = lo + (hi - lo) / 2;
-            let file_offset = SIDECAR_HEADER_SIZE + mid as u64 * entry_size;
-            file.seek(SeekFrom::Start(file_offset)).ok()?;
-            let mut buf = [0u8; 16];
-            file.read_exact(&mut buf).ok()?;
-            let mid_id = u64::from_le_bytes(buf[..8].try_into().ok()?);
-            let mid_offset = u64::from_le_bytes(buf[8..].try_into().ok()?);
-
-            match mid_id.cmp(&row_id) {
-                std::cmp::Ordering::Equal => {
-                    drop(file);
-                    self.index.write().put(row_id, mid_offset);
-                    return Some(mid_offset);
-                }
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid - 1,
-            }
-        }
-        None
+        self.offsets.read().get(&row_id).copied()
     }
 
-    /// Get decompressed vector
     pub fn get(&self, row_id: RowId) -> Option<Arc<Vec<f32>>> {
         // 🔑 PERF: read-lock fast path (peek, no LRU touch).
         {
@@ -437,9 +371,9 @@ impl SQ8Vectors {
         let qvec = self.quantizer.quantize(&vector)?;
         let offset = self.append_quantized(row_id, &qvec)?;
 
-        // Update in-memory LRU index; a re-inserted (previously deleted) id
-        // comes back to life
-        self.index.write().put(row_id, offset);
+        // Update the authoritative offset map; a re-inserted (previously
+        // deleted) id comes back to life
+        self.offsets.write().insert(row_id, offset);
         self.tombstones.lock().remove(&row_id);
         *self.count.write() += 1;
 
@@ -532,7 +466,7 @@ impl SQ8Vectors {
             return Ok(false);
         }
 
-        self.index.write().pop(&row_id);
+        self.offsets.write().remove(&row_id);
         self.tombstones.lock().insert(row_id);
         *self.count.write() -= 1;
         self.cache.write().pop(&row_id);
@@ -561,16 +495,13 @@ impl SQ8Vectors {
         // previously left the old sidecar in place and resurrected every
         // vector on the next load). The rebuild drops tombstoned ids.
         let idx_path = self.file_path.with_extension("idx");
-        let live = Self::build_sidecar_index(
+        let _live = Self::build_sidecar_index(
             &self.file_path,
             &idx_path,
             self._entry_size,
             Some(&self.tombstones.lock()),
         )?;
-        *self.index_count.write() = live;
         self.tombstones.lock().clear();
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-        *self.index_file.write() = idx_read;
 
         // Remap after flush
         self.remap();
@@ -578,23 +509,10 @@ impl SQ8Vectors {
         Ok(())
     }
 
-    /// Get all vector IDs (reads from sidecar index)
+    /// Get all live vector IDs — complete and deterministic (sorted).
     pub fn ids(&self) -> Vec<RowId> {
-        let count = *self.index_count.read();
-        if count == 0 {
-            // Fall back to LRU entries if sidecar is empty (during initial inserts)
-            return self.index.read().iter().map(|(&id, _)| id).collect();
-        }
-
-        let mut file = self.index_file.write();
-        let mut ids = Vec::with_capacity(count as usize);
-        let _ = file.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE));
-        for _ in 0..count {
-            let mut buf = [0u8; 16];
-            if file.read_exact(&mut buf).is_ok() {
-                ids.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
-            }
-        }
+        let mut ids: Vec<RowId> = self.offsets.read().keys().copied().collect();
+        ids.sort_unstable();
         ids
     }
 
@@ -611,7 +529,7 @@ impl SQ8Vectors {
     }
 
     pub fn memory_usage(&self) -> usize {
-        let index_size = self.index.read().len() * 16;
+        let index_size = self.offsets.read().len() * 24;
         let cache_size = self.cache.read().len() * (8 + self.dimension * 4);
         index_size + cache_size
     }
@@ -693,14 +611,8 @@ impl SQ8Vectors {
 
     /// Remap data and sidecar files after flush
     fn remap(&self) {
-        {
-            let file = self.read_file.read();
-            *self.data_mmap.write() = unsafe { Mmap::map(&*file).ok() };
-        }
-        {
-            let idx = self.index_file.read();
-            *self.idx_mmap.write() = unsafe { Mmap::map(&*idx).ok() };
-        }
+        let file = self.read_file.read();
+        *self.data_mmap.write() = unsafe { Mmap::map(&*file).ok() };
     }
 }
 

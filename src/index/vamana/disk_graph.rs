@@ -9,7 +9,7 @@ use crate::{Result, StorageError};
 use lru::LruCache;
 use memmap2::Mmap;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
@@ -33,15 +33,21 @@ pub struct DiskGraph {
 
     /// mmap of graph.bin — zero-syscall neighbor reads
     mmap: Arc<RwLock<Option<Mmap>>>,
-    /// mmap of graph.idx sidecar — zero-syscall offset lookups
-    idx_mmap: Arc<RwLock<Option<Mmap>>>,
 
-    /// Bounded offset index: row_id → file offset (LRU-capped)
-    index: Arc<RwLock<LruCache<RowId, u64>>>,
+    /// 🔑 Inbound edge counts: node_id → number of edges pointing at it
+    /// across all edge lists. Evictions may only drop a node whose inbound
+    /// count stays ≥1 — otherwise the node becomes unreachable from the
+    /// medoid (the graph has no other reachability oracle).
+    inbound: Arc<RwLock<HashMap<RowId, u32>>>,
 
-    /// Sidecar index file handle (fallback when mmap unavailable)
-    index_file: Arc<RwLock<File>>,
-    index_count: Arc<RwLock<u64>>,
+    /// 🔑 Authoritative COMPLETE offset map: node_id → file offset.
+    /// The old bounded LRU lost nodes beyond cache capacity between
+    /// flushes — lookups failed and builds/rebuilds stranded every
+    /// non-resident node (measured: 1020/2100 reachable after a 1999-node
+    /// rebuild). The sidecar file stays the durable form; this map is the
+    /// in-memory truth.
+    index: Arc<RwLock<HashMap<RowId, u64>>>,
+
     /// Tracked count of nodes (incremental on set/remove)
     count: Arc<RwLock<u64>>,
 
@@ -113,14 +119,8 @@ impl DiskGraph {
             max_degree,
             file: Arc::new(RwLock::new(file)),
             mmap: Arc::new(RwLock::new(None)),
-            idx_mmap: Arc::new(RwLock::new(None)),
-            index: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
-            ))),
-            index_file: Arc::new(RwLock::new(
-                File::open(&idx_path).map_err(StorageError::Io)?,
-            )),
-            index_count: Arc::new(RwLock::new(0)),
+            inbound: Arc::new(RwLock::new(HashMap::new())),
+            index: Arc::new(RwLock::new(HashMap::new())),
             count: Arc::new(RwLock::new(0)),
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
@@ -205,29 +205,57 @@ impl DiskGraph {
             Self::build_sidecar_index(&file_path, &idx_path, None)?
         };
 
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-
         let rw_file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&file_path)
             .map_err(StorageError::Io)?;
 
-        // mmap data file and sidecar for zero-syscall reads
+        // mmap data file for zero-syscall reads
         let data_mmap = unsafe { Mmap::map(&rw_file).ok() };
-        let idx_mmap = unsafe { Mmap::map(&idx_read).ok() };
+
+        // 🔑 Load the COMPLETE node_id → offset map from the sidecar (the
+        // sidecar covers every physical record with last-wins semantics:
+        // trusted-marker form is post-flush complete; the untrusted form was
+        // just rebuilt by build_sidecar_index above).
+        let index_map = {
+            let mut map: HashMap<RowId, u64> = HashMap::new();
+            let mut idx = File::open(&idx_path).map_err(StorageError::Io)?;
+            idx.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE))
+                .map_err(StorageError::Io)?;
+            for _ in 0..index_count {
+                let mut buf = [0u8; 16];
+                if idx.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let id = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let off = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                map.insert(id, off);
+            }
+            map
+        };
+
+        // 🔑 Rebuild inbound counts by reading every edge list once.
+        let inbound = {
+            let mut map: HashMap<RowId, u32> = HashMap::new();
+            let mut rf = rw_file.try_clone().map_err(StorageError::Io)?;
+            for &off in index_map.values() {
+                if let Ok(ns) = read_neighbors_from(&mut rf, off) {
+                    for n in ns {
+                        *map.entry(n).or_insert(0) += 1;
+                    }
+                }
+            }
+            map
+        };
 
         Ok(Self {
             max_degree,
             file: Arc::new(RwLock::new(rw_file)),
             mmap: Arc::new(RwLock::new(data_mmap)),
-            idx_mmap: Arc::new(RwLock::new(idx_mmap)),
-            index: Arc::new(RwLock::new(LruCache::new(
-                NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
-            ))),
-            index_file: Arc::new(RwLock::new(idx_read)),
-            index_count: Arc::new(RwLock::new(index_count)),
-            count: Arc::new(RwLock::new(index_count)),
+            inbound: Arc::new(RwLock::new(inbound)),
+            index: Arc::new(RwLock::new(index_map)),
+            count: Arc::new(RwLock::new(index_count as u64)),
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(cache_capacity.max(1)).unwrap(),
             ))),
@@ -364,83 +392,25 @@ impl DiskGraph {
 
     /// Look up file offset: tombstone check → LRU → mmap binary search →
     /// sidecar file fallback
+    /// Look up a node's file offset — O(1) from the complete authoritative
+    /// map (inserts add, removes delete, load() populates from sidecar).
     fn lookup_offset(&self, node_id: RowId) -> Option<u64> {
         if self.tombstones.lock().contains(&node_id) {
             return None;
         }
-        {
-            let mut index = self.index.write();
-            if let Some(&offset) = index.get(&node_id) {
-                return Some(offset);
-            }
-        }
-
-        let count = *self.index_count.read();
-        if count == 0 {
-            return None;
-        }
-
-        // Try mmap path first (zero syscall)
-        {
-            let guard = self.idx_mmap.read();
-            if let Some(ref mmap) = *guard {
-                let entry_size = 16usize;
-                let mut lo = 0i64;
-                let mut hi = count as i64 - 1;
-
-                while lo <= hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let off = SIDECAR_HEADER_SIZE as usize + mid as usize * entry_size;
-                    if off + 16 > mmap.len() {
-                        break;
-                    }
-                    let mid_id = u64::from_le_bytes(mmap[off..off + 8].try_into().ok()?);
-                    let mid_offset = u64::from_le_bytes(mmap[off + 8..off + 16].try_into().ok()?);
-
-                    match mid_id.cmp(&node_id) {
-                        std::cmp::Ordering::Equal => {
-                            drop(guard);
-                            self.index.write().put(node_id, mid_offset);
-                            return Some(mid_offset);
-                        }
-                        std::cmp::Ordering::Less => lo = mid + 1,
-                        std::cmp::Ordering::Greater => hi = mid - 1,
-                    }
-                }
-                return None;
-            }
-        }
-
-        // Fallback: seek+read on sidecar file
-        let mut file = self.index_file.write();
-        let entry_size = 16u64;
-        let mut lo = 0i64;
-        let mut hi = count as i64 - 1;
-
-        while lo <= hi {
-            let mid = lo + (hi - lo) / 2;
-            let file_offset = SIDECAR_HEADER_SIZE + mid as u64 * entry_size;
-            file.seek(SeekFrom::Start(file_offset)).ok()?;
-            let mut buf = [0u8; 16];
-            file.read_exact(&mut buf).ok()?;
-            let mid_id = u64::from_le_bytes(buf[..8].try_into().ok()?);
-            let mid_offset = u64::from_le_bytes(buf[8..].try_into().ok()?);
-
-            match mid_id.cmp(&node_id) {
-                std::cmp::Ordering::Equal => {
-                    drop(file);
-                    self.index.write().put(node_id, mid_offset);
-                    return Some(mid_offset);
-                }
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid - 1,
-            }
-        }
-        None
+        self.index.read().get(&node_id).copied()
     }
 
     pub fn max_degree(&self) -> usize {
         self.max_degree
+    }
+
+    /// 🔑 Eviction guard: true when `id` has more than one inbound edge, so
+    /// removing ONE edge (e.g. from the caller's list) cannot strand it.
+    /// Counting is conservative: `false` means "unknown or ≤1" — callers
+    /// must treat it as NOT evictable.
+    pub fn evictable(&self, id: RowId) -> bool {
+        self.inbound.read().get(&id).is_some_and(|c| *c > 1)
     }
 
     pub fn node_count(&self) -> usize {
@@ -481,7 +451,9 @@ impl DiskGraph {
         // Sample a subset of IDs to avoid loading all
         let ids: Vec<RowId> = {
             let index = self.index.read();
-            index.iter().map(|(&id, _)| id).take(top_k * 10).collect()
+            let mut v: Vec<RowId> = index.keys().copied().collect();
+            v.sort_unstable();
+            v.into_iter().take(top_k * 10).collect()
         };
 
         let mut degrees: Vec<(RowId, usize)> = ids
@@ -496,21 +468,9 @@ impl DiskGraph {
     }
 
     pub fn node_ids(&self) -> Vec<RowId> {
-        let count = *self.index_count.read();
-        if count > 0 {
-            let mut file = self.index_file.write();
-            let mut ids = Vec::with_capacity(count as usize);
-            let _ = file.seek(SeekFrom::Start(SIDECAR_HEADER_SIZE));
-            for _ in 0..count {
-                let mut buf = [0u8; 16];
-                if file.read_exact(&mut buf).is_ok() {
-                    ids.push(u64::from_le_bytes(buf[..8].try_into().unwrap()));
-                }
-            }
-            ids
-        } else {
-            self.index.read().iter().map(|(&id, _)| id).collect()
-        }
+        let mut ids: Vec<RowId> = self.index.read().keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Add node (without neighbors)
@@ -562,11 +522,29 @@ impl DiskGraph {
     pub fn set_neighbors(&self, node_id: RowId, mut neighbors: Vec<RowId>) -> Result<()> {
         // Block during flush to prevent sidecar from being built with stale node_count
         let _flush_guard = self.flush_lock.lock();
+        // 🔑 Inbound delta bookkeeping: a node's edge list swap changes the
+        // inbound counts of every id added/removed. Eviction sites rely on
+        // these counts to never strand a node (drop its last inbound edge).
+        let old_list: Vec<RowId> = self
+            .lookup_offset(node_id)
+            .and_then(|off| self.read_neighbors_at(off).ok())
+            .unwrap_or_default();
         neighbors.retain(|&id| id != node_id);
         neighbors.sort_unstable();
         neighbors.dedup();
         if neighbors.len() > self.max_degree {
             neighbors.truncate(self.max_degree);
+        }
+        {
+            let mut inbound = self.inbound.write();
+            for id in old_list.iter().filter(|id| !neighbors.contains(id)) {
+                if let Some(c) = inbound.get_mut(id) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            for id in neighbors.iter().filter(|id| !old_list.contains(id)) {
+                *inbound.entry(*id).or_insert(0) += 1;
+            }
         }
 
         let offset = {
@@ -580,8 +558,7 @@ impl DiskGraph {
 
         let is_new = {
             let mut idx = self.index.write();
-            let was_present = idx.get(&node_id).is_some();
-            idx.put(node_id, offset);
+            let was_present = idx.insert(node_id, offset).is_none();
             !was_present
         };
         // A re-inserted node comes back to life
@@ -617,7 +594,16 @@ impl DiskGraph {
             return Arc::new(Vec::new());
         }
         let neighbors = self.neighbors(node_id);
-        self.index.write().pop(&node_id);
+        {
+            let mut inbound = self.inbound.write();
+            for n in neighbors.iter() {
+                if let Some(c) = inbound.get_mut(n) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            inbound.remove(&node_id);
+        }
+        self.index.write().remove(&node_id);
         self.cache.lock().pop(&node_id);
         self.hot_nodes.write().remove(&node_id);
         self.hot_cache.write().pop(&node_id);
@@ -658,11 +644,8 @@ impl DiskGraph {
         let idx_path = self.file_path.with_extension("idx");
         let live =
             Self::build_sidecar_index(&self.file_path, &idx_path, Some(&self.tombstones.lock()))?;
-        *self.index_count.write() = live;
         *self.count.write() = live;
         self.tombstones.lock().clear();
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-        *self.index_file.write() = idx_read;
 
         {
             let mut file = self.file.write();
@@ -686,6 +669,8 @@ impl DiskGraph {
         // Get all node IDs from sidecar (the live set)
         let ids = self.node_ids();
         let final_offset;
+        let mut new_entries: Vec<(RowId, u64)> = Vec::with_capacity(ids.len());
+        let mut compact_edges: Vec<(RowId, Vec<RowId>)> = Vec::with_capacity(ids.len());
         {
             let mut temp_file = OpenOptions::new()
                 .create(true)
@@ -695,12 +680,11 @@ impl DiskGraph {
                 .map_err(StorageError::Io)?;
 
             Self::write_header(&mut temp_file, self.max_degree, ids.len())?;
-
-            let mut new_entries: Vec<(RowId, u64)> = Vec::with_capacity(ids.len());
             let mut offset = HEADER_SIZE;
 
             for &node_id in &ids {
                 let neighbors = self.neighbors(node_id);
+                compact_edges.push((node_id, neighbors.to_vec()));
                 temp_file
                     .write_all(&node_id.to_le_bytes())
                     .map_err(StorageError::Io)?;
@@ -751,16 +735,28 @@ impl DiskGraph {
             .map_err(StorageError::Io)?;
         *self.file.write() = file;
 
-        let idx_read = File::open(&idx_path).map_err(StorageError::Io)?;
-        *self.index_file.write() = idx_read;
-        // Clear LRU index (offsets changed) and neighbor caches (stale data)
-        self.index.write().clear();
+        // 🔑 Rebuild the authoritative offset map AND inbound counts from
+        // the rewrite's (id, offset) pairs — offsets changed, so the old
+        // maps are stale.
+        {
+            let mut idx = self.index.write();
+            idx.clear();
+            idx.extend(new_entries.iter().copied());
+        }
+        {
+            let mut inbound = self.inbound.write();
+            inbound.clear();
+            for (_, neighbors) in compact_edges.iter() {
+                for n in neighbors {
+                    *inbound.entry(*n).or_insert(0) += 1;
+                }
+            }
+        }
         self.cache.lock().clear();
         self.hot_cache.write().clear();
         // The rewrite covers exactly the live set from the old sidecar —
         // any pending tombstones are now physically gone
         self.tombstones.lock().clear();
-        *self.index_count.write() = ids.len() as u64;
         *self.count.write() = ids.len() as u64;
         *self.next_offset.lock() = final_offset;
 
@@ -773,6 +769,7 @@ impl DiskGraph {
 
     pub fn clear(&self) {
         self.index.write().clear();
+        self.inbound.write().clear();
         self.cache.lock().clear();
         self.hot_nodes.write().clear();
         self.hot_cache.write().clear();
@@ -789,7 +786,6 @@ impl DiskGraph {
             let _ = idx_file.write_all(&0u64.to_le_bytes());
             let _ = idx_file.write_all(&HEADER_SIZE.to_le_bytes());
         }
-        *self.index_count.write() = 0;
         *self.count.write() = 0;
         *self.next_offset.lock() = HEADER_SIZE;
         *self.dirty.write() = true;
@@ -798,7 +794,8 @@ impl DiskGraph {
     pub fn memory_usage(&self) -> usize {
         let cache_size = self.cache.lock().len() * (8 + 4 + 32 * 8);
         let hot_size = self.hot_cache.read().len() * (8 + 4 + 32 * 8);
-        cache_size + hot_size
+        let map_size = self.index.read().len() * 24;
+        cache_size + hot_size + map_size
     }
 
     pub fn disk_usage(&self) -> usize {
@@ -808,16 +805,10 @@ impl DiskGraph {
 
     // --- Private helpers ---
 
-    /// Remap data and sidecar files after flush/compact
+    /// Remap the data file after flush/compact
     fn remap(&self) {
-        {
-            let file = self.file.read();
-            *self.mmap.write() = unsafe { Mmap::map(&*file).ok() };
-        }
-        {
-            let idx = self.index_file.read();
-            *self.idx_mmap.write() = unsafe { Mmap::map(&*idx).ok() };
-        }
+        let file = self.file.read();
+        *self.mmap.write() = unsafe { Mmap::map(&*file).ok() };
     }
 
     fn write_header(file: &mut File, max_degree: usize, node_count: usize) -> Result<()> {
@@ -973,4 +964,29 @@ mod tests {
             assert_eq!(n.len(), 1, "node {} should have 1 neighbor", i);
         }
     }
+}
+
+/// Read one neighbor record at `offset` from an open graph file (used by the
+/// load-time inbound-count rebuild before Self exists).
+fn read_neighbors_from(file: &mut File, offset: u64) -> Result<Vec<RowId>> {
+    use std::io::{Read as _, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))
+        .map_err(StorageError::Io)?;
+    let mut buf8 = [0u8; 8];
+    let mut buf4 = [0u8; 4];
+    if file.read_exact(&mut buf8).is_err() {
+        return Ok(Vec::new());
+    }
+    if file.read_exact(&mut buf4).is_err() {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_le_bytes(buf4) as usize;
+    let mut neighbors = Vec::with_capacity(count);
+    for _ in 0..count {
+        if file.read_exact(&mut buf8).is_err() {
+            break;
+        }
+        neighbors.push(u64::from_le_bytes(buf8));
+    }
+    Ok(neighbors)
 }

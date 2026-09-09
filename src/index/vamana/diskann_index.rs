@@ -656,11 +656,6 @@ impl DiskANNIndex {
 
     /// 全量重建图（向量数据不动，仅图结构）—— 大规模向量更新后的召回率恢复
     fn rebuild_graph(&self) -> Result<()> {
-        // 🔑 Flush first: ids() falls back to the LRU-resident subset while
-        // the sidecar is stale (before the first flush), and the offset LRU
-        // is cache_size-capped — a partial id set here meant graph.clear()
-        // wiped every non-resident node (recall@10 0.84 → stranded half).
-        self.vectors.flush()?;
         let ids = self.vectors.ids();
         if ids.is_empty() {
             self.graph.clear();
@@ -672,14 +667,102 @@ impl DiskANNIndex {
         *self.medoid.write() = Some(medoid_id);
         self.graph.clear();
         self.batch_build_graph(&ids)?;
-        // 🔑 Rebuild the graph sidecar: batch_build_graph writes nodes via
-        // set_neighbors (append + offset LRU, cache-capped). Without a flush
-        // the first ~cache_size nodes of the rebuild are evicted from the
-        // offset LRU with no sidecar entry to fall back to — findable
-        // neither by search nor by lookup (measured: 1021/2100 reachable
-        // after a 1999-node rebuild). batch_insert() already flushes here.
+
+        // 🔑 Orphan adoption: incremental linking trims can evict a node's
+        // only inbound edge, leaving it unreachable from the medoid (1848/
+        // 2100 reachable after a full rebuild before this pass). Flood-fill
+        // once, then re-link every unreachable node to its nearest REACHABLE
+        // neighbor — one inbound edge restores it (its forward edges are
+        // already set). Repeat until the reachable set stops growing.
+        {
+            let mut reachable = self.flood_fill_from(medoid_id);
+            loop {
+                let stranded: Vec<RowId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !reachable.contains(id))
+                    .collect();
+                if stranded.is_empty() {
+                    break;
+                }
+                for node in stranded {
+                    // Nearest reachable node via the vector store (exact
+                    // scan — strandees are few, this is not the hot path).
+                    let nv = match self.vectors.get(node) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let mut best: Option<(RowId, f32)> = None;
+                    for &cand in reachable.iter() {
+                        if cand == node {
+                            continue;
+                        }
+                        if let Some(cv) = self.vectors.get(cand) {
+                            let d = self.metric.distance(&nv, &cv);
+                            if best.is_none_or(|(_, bd)| d < bd) {
+                                best = Some((cand, d));
+                            }
+                        }
+                    }
+                    if let Some((anchor, _)) = best {
+                        let edges_arc = self.graph.neighbors(anchor);
+                        let mut edges = (*edges_arc).clone();
+                        if !edges.contains(&node) {
+                            if edges.len() >= self.config.max_degree {
+                                // Evict an entry that has inbound edges
+                                // elsewhere — a blind pop could re-strand
+                                // its target (the adoption loop would then
+                                // never converge).
+                                if let Some(pos) =
+                                    edges.iter().rposition(|&id| self.graph.evictable(id))
+                                {
+                                    edges.remove(pos);
+                                } else {
+                                    // No safe victim: exceed the cap; the
+                                    // stranded node matters more than one
+                                    // oversized list (set_neighbors still
+                                    // truncates — accept and re-adopt next
+                                    // loop pass).
+                                    edges.pop();
+                                }
+                            }
+                            edges.push(node);
+                            edges.sort_unstable();
+                            edges.dedup();
+                            self.graph.set_neighbors(anchor, edges)?;
+                        }
+                        reachable.insert(node);
+                    } else {
+                        break; // no reachable anchor (shouldn't happen)
+                    }
+                }
+                let again = self.flood_fill_from(medoid_id);
+                if again.len() <= reachable.len() {
+                    break;
+                }
+                reachable = again;
+            }
+        }
+
+        // 🔑 Flush the graph sidecar so every rebuilt node stays findable
+        // across the offset-map boundary (batch_insert() also flushes).
         self.graph.flush()?;
         Ok(())
+    }
+
+    /// Flood fill the edge graph from `start`, returning all reachable ids.
+    fn flood_fill_from(&self, start: RowId) -> std::collections::HashSet<RowId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start];
+        seen.insert(start);
+        while let Some(node) = stack.pop() {
+            for nb in self.graph.neighbors(node).iter() {
+                if seen.insert(*nb) {
+                    stack.push(*nb);
+                }
+            }
+        }
+        seen
     }
 
     /// Delete vector
@@ -1176,11 +1259,12 @@ impl DiskANNIndex {
             } else if neighbor_edges.len() > self.config.max_degree {
                 // 🚨 set_neighbors sorts + truncates to max_degree, and the
                 // newcomer (highest id so far) would ALWAYS be the dropped
-                // one — the silent connectivity break. Trim the same count
-                // of largest OTHER ids instead: O(sort), no distance calls,
-                // and evicting the newest edges approximates LRU. (Random
-                // eviction was tried and is far worse — it destroys the
-                // diversity-pruned edges: recall@10 0.07 vs 0.84.)
+                // one — the silent connectivity break. Evict the same count
+                // of largest OTHER ids, but ONLY ones with inbound edges
+                // elsewhere (graph.evictable) — evicting a node's last
+                // inbound edge strands it. If too few safe victims exist,
+                // drop new_id itself instead: the force-backlink tail below
+                // still guarantees this insert's connectivity.
                 neighbor_edges.sort_unstable();
                 neighbor_edges.dedup();
                 let overflow = neighbor_edges.len() - self.config.max_degree;
@@ -1188,9 +1272,17 @@ impl DiskANNIndex {
                 let mut i = neighbor_edges.len();
                 while removed < overflow && i > 0 {
                     i -= 1;
-                    if neighbor_edges[i] != new_id {
+                    let cand = neighbor_edges[i];
+                    if cand != new_id && self.graph.evictable(cand) {
                         neighbor_edges.remove(i);
                         removed += 1;
+                    }
+                }
+                if removed < overflow {
+                    // Not enough safe victims — sacrifice the newcomer's
+                    // edge here (it links back elsewhere via force-backlink).
+                    if let Some(pos) = neighbor_edges.iter().position(|&id| id == new_id) {
+                        neighbor_edges.remove(pos);
                     }
                 }
             }
@@ -1213,9 +1305,13 @@ impl DiskANNIndex {
                 edges = vec![new_id];
             } else if !edges.contains(&new_id) {
                 if let Some(target_vec) = self.vectors.get(target) {
-                    // Evict the entry farthest from `target`.
-                    let mut far_idx = 0usize;
+                    // Evict the entry farthest from `target` among EVICTABLE
+                    // candidates (inbound elsewhere); fall back to the
+                    // plain farthest if none qualify (rare, bounded).
+                    let mut far_idx = usize::MAX;
                     let mut far_dist = -1.0f32;
+                    let mut safe_idx = usize::MAX;
+                    let mut safe_dist = -1.0f32;
                     for (i, &eid) in edges.iter().enumerate() {
                         if let Some(ev) = self.vectors.get(eid) {
                             let d = self.metric.distance(&target_vec, &ev);
@@ -1223,11 +1319,22 @@ impl DiskANNIndex {
                                 far_dist = d;
                                 far_idx = i;
                             }
+                            if d > safe_dist && self.graph.evictable(eid) {
+                                safe_dist = d;
+                                safe_idx = i;
+                            }
                         }
                     }
-                    edges[far_idx] = new_id;
-                    edges.sort_unstable();
-                    edges.dedup();
+                    let victim = if safe_idx != usize::MAX {
+                        safe_idx
+                    } else {
+                        far_idx
+                    };
+                    if victim != usize::MAX {
+                        edges[victim] = new_id;
+                        edges.sort_unstable();
+                        edges.dedup();
+                    }
                 } else {
                     edges.pop();
                     edges.push(new_id);
@@ -1700,15 +1807,11 @@ mod tests {
             assert!(results[0].1 < 1.0); // Should be close to query
         }
     }
-    /// Churn-rebuild must cover ALL nodes. KNOWN ISSUE (tracked): beyond the
-    /// graph offset-LRU capacity (~cache_size nodes) rebuilds/builds strand
-    /// nodes — flood-fill reaches ~1020/2100. SQL-level ANN is unaffected:
-    /// execute_vector_order_by_plan routes ≤200K-row tables to the EXACT
-    /// SIMD brute force; the graph index only serves larger tables. Fixing
-    /// the DiskANN build machinery (unbounded id set, sidecar freshness,
-    /// mmap refresh) is a separate overhaul.
+    /// Churn-rebuild must cover ALL nodes. Before the authoritative-map
+    /// refactor, lookups depended on a cache-capped offset LRU: builds and
+    /// rebuilds stranded every non-resident node (flood-fill reached
+    /// ~1020/2100).
     #[test]
-    #[ignore = "known issue: DiskANN build strands nodes beyond offset-LRU capacity"]
     fn churn_rebuild_covers_all_nodes() {
         let temp_dir = TempDir::new().unwrap();
         let dim = 8usize;
@@ -1733,11 +1836,10 @@ mod tests {
                 }
             }
         }
-        assert!(
-            seen.len() * 100 >= n as usize * 99,
-            "{}/{} nodes reachable after churn rebuilds",
+        assert_eq!(
             seen.len(),
-            n
+            n as usize,
+            "every node must be reachable after churn rebuilds"
         );
     }
 }
