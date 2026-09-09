@@ -263,13 +263,9 @@ impl PyDatabase {
                 let list = p
                     .extract::<Vec<Bound<'_, PyAny>>>()
                     .map_err(|_| PyValueError::new_err("params must be a list"))?;
-                let vals: Vec<MValue> = list
-                    .iter()
-                    .map(py_to_mote)
-                    .collect::<PyResult<Vec<_>>>()?;
-                self.db
-                    .execute_prepared(sql, vals)
-                    .map_err(py_err)?
+                let vals: Vec<MValue> =
+                    list.iter().map(py_to_mote).collect::<PyResult<Vec<_>>>()?;
+                self.db.execute_prepared(sql, vals).map_err(py_err)?
             }
         };
         streaming.materialize().map_err(py_err)

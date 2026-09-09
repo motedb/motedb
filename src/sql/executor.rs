@@ -24899,18 +24899,39 @@ impl QueryExecutor {
             )
             .unwrap_or_else(|| format!("{}_{}", plan.table, plan.column));
 
-        // 🚀 Always use the DiskANN graph index when it exists. The old
-        // BRUTE_FORCE_THRESHOLD (50_000) heuristic forced small tables into a
-        // brute-force scan that was 14x slower than the graph search (no SIMD,
-        // per-call flush_buffer + load_full_keys). Empirically the graph path
-        // wins even at 2K rows (75µs vs 1048µs). Brute-force is now only a
-        // fallback for tables that have no vector index built yet.
-        let has_index = self.db.has_vector_index(&index_name);
-        let candidates = if has_index {
+        // 🔑 Correctness-first routing: the SIMD columnar brute force is
+        // EXACT (scans every live row, segments + write buffer) and fast in
+        // the embedded envelope (~1.2ms @ 50K rows), while the DiskANN graph
+        // index's incremental/rebuild machinery has multiple LRU-capacity
+        // hazards that strand nodes and silently drop rows from top-k
+        // (measured recall@10 as low as 0.03-0.09). Below the threshold the
+        // brute force is used unconditionally — index or not; the graph
+        // index only serves tables large enough that an exact scan would
+        // dominate query latency.
+        const EXACT_SCAN_MAX_ROWS: usize = 200_000;
+        let use_index = {
+            let has_index = self.db.has_vector_index(&index_name);
+            has_index
+                && self
+                    .db
+                    .get_or_create_col_segment_store(&plan.table, &[])
+                    .ok()
+                    .map(|store| {
+                        let rows: usize = store
+                            .segments_snapshot()
+                            .iter()
+                            .map(|s| s.sst.num_rows)
+                            .sum::<usize>()
+                            + store.buffered_row_count();
+                        rows > EXACT_SCAN_MAX_ROWS
+                    })
+                    .unwrap_or(false)
+        };
+        let candidates = if use_index {
             self.db
                 .vector_search(&index_name, &plan.query_vector, plan.k)?
         } else {
-            // No index built (e.g. data not yet flushed) — brute-force scan.
+            // Embedded envelope (or no index) — exact brute-force scan.
             self.brute_force_vector_knn(
                 &plan.table,
                 &plan.column,
