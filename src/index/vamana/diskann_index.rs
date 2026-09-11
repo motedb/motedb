@@ -91,45 +91,53 @@ impl VectorStorage {
     /// 用于 greedy_search 两阶段访存优化：先批量预加载，再串行算距离，
     /// 让 distance 第二次调 get_quantized 时 cache 命中（无 page fault stall）。
     fn prefetch(&self, row_id: RowId) {
-        let _ = self.vectors.get_quantized(row_id);
+        // Touch the entry (page fault) without copying it into the LRU.
+        let _ = self
+            .vectors
+            .with_quantized(row_id, |_, _, codes| std::hint::black_box(codes.len()));
     }
 
-    /// 🚀 Compute distance using optimized SQ8 asymmetric distance
+    /// 🚀 Compute distance using optimized SQ8 asymmetric distance, run
+    /// directly on the mmap'd entry (no copy, no LRU churn).
     fn distance(&self, query: &[f32], row_id: RowId, metric: DistanceKind) -> f32 {
-        if let Some(qvec) = self.vectors.get_quantized(row_id) {
-            match metric {
+        self.vectors
+            .with_quantized(row_id, |min, max, codes| match metric {
                 DistanceKind::Euclidean => {
                     #[cfg(target_arch = "aarch64")]
                     {
-                        self.quantizer.asymmetric_distance_l2_neon(query, &qvec)
+                        self.quantizer
+                            .asymmetric_distance_l2_neon_raw(query, codes, min, max)
                     }
                     #[cfg(target_arch = "x86_64")]
                     {
-                        self.quantizer.asymmetric_distance_l2_avx2(query, &qvec)
+                        self.quantizer
+                            .asymmetric_distance_l2_avx2_raw(query, codes, min, max)
                     }
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     {
-                        self.quantizer.asymmetric_distance_l2(query, &qvec)
+                        self.quantizer
+                            .asymmetric_distance_l2_raw(query, codes, min, max)
                     }
                 }
                 DistanceKind::Cosine => {
                     #[cfg(target_arch = "aarch64")]
                     {
-                        self.quantizer.asymmetric_distance_cosine_neon(query, &qvec)
+                        self.quantizer
+                            .asymmetric_distance_cosine_neon_raw(query, codes, min, max)
                     }
                     #[cfg(target_arch = "x86_64")]
                     {
-                        self.quantizer.asymmetric_distance_cosine_avx2(query, &qvec)
+                        self.quantizer
+                            .asymmetric_distance_cosine_avx2_raw(query, codes, min, max)
                     }
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     {
-                        self.quantizer.asymmetric_distance_cosine(query, &qvec)
+                        self.quantizer
+                            .asymmetric_distance_cosine_raw(query, codes, min, max)
                     }
                 }
-            }
-        } else {
-            f32::MAX
-        }
+            })
+            .unwrap_or(f32::MAX)
     }
 
     fn insert(&self, row_id: RowId, vector: Vec<f32>) -> Result<()> {

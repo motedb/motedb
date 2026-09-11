@@ -28,6 +28,9 @@ use std::sync::Arc;
 const SIDECAR_HEADER_SIZE: u64 = 16;
 
 /// SQ8 compressed vector storage with bounded memory
+/// Remap vectors_sq8.bin once this many appended bytes lie past the mmap.
+const REMAP_TAIL_BYTES: u64 = 4 << 20;
+
 pub struct SQ8Vectors {
     _data_dir: PathBuf,
     dimension: usize,
@@ -326,6 +329,34 @@ impl SQ8Vectors {
         Some(arc_vec)
     }
 
+    /// Run `f` on an entry's `(min, max, codes)` without copying it out:
+    /// straight from the mmap when the entry is mapped, otherwise through
+    /// `get_quantized`. This is the distance hot path — a graph build calls
+    /// it thousands of times per inserted node, and the copy + Arc + LRU
+    /// churn of `get_quantized` used to dominate the CPU profile.
+    pub fn with_quantized<R>(
+        &self,
+        row_id: RowId,
+        f: impl FnOnce(f32, f32, &[u8]) -> R,
+    ) -> Option<R> {
+        let offset = self.lookup_offset(row_id)?;
+        {
+            let guard = self.data_mmap.read();
+            if let Some(ref mmap) = *guard {
+                // Entry layout: [row_id: 8] [min: 4] [max: 4] [codes: dimension]
+                let off = offset as usize + 8;
+                let end = off + 8 + self.dimension;
+                if end <= mmap.len() {
+                    let min = f32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
+                    let max = f32::from_le_bytes(mmap[off + 4..off + 8].try_into().unwrap());
+                    return Some(f(min, max, &mmap[off + 8..end]));
+                }
+            }
+        }
+        let q = self.get_quantized(row_id)?;
+        Some(f(q.min, q.max, &q.codes))
+    }
+
     /// Get quantized vector (no decompression)
     pub fn get_quantized(&self, row_id: RowId) -> Option<Arc<QuantizedVector>> {
         // 🔑 PERF: read-lock fast path (peek, no LRU touch). The greedy_search
@@ -451,8 +482,10 @@ impl SQ8Vectors {
             qcache.pop(&row_id);
         }
 
-        // Invalidate mmap — bytes changed under it
-        *self.data_mmap.write() = None;
+        // Bytes changed under the map: take a fresh mapping rather than
+        // dropping it (which sent every read through seek+read until the next
+        // flush). One mmap call per UPDATE is far cheaper than that.
+        self.remap();
 
         Ok(true)
     }
@@ -560,37 +593,48 @@ impl SQ8Vectors {
             }
         }
 
-        // Fallback: seek+read
+        // Fallback (unmapped tail): one read for [min][max][codes].
         let mut file = self.read_file.write();
         file.seek(SeekFrom::Start(offset + 8))
             .map_err(StorageError::Io)?;
+        let mut buf = vec![0u8; 8 + self.dimension];
+        file.read_exact(&mut buf).map_err(StorageError::Io)?;
+        let min = f32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let max = f32::from_le_bytes(buf[4..8].try_into().unwrap());
+        buf.drain(..8);
 
-        let mut min_bytes = [0u8; 4];
-        let mut max_bytes = [0u8; 4];
-        file.read_exact(&mut min_bytes).map_err(StorageError::Io)?;
-        file.read_exact(&mut max_bytes).map_err(StorageError::Io)?;
-
-        let min = f32::from_le_bytes(min_bytes);
-        let max = f32::from_le_bytes(max_bytes);
-
-        let mut codes = vec![0u8; self.dimension];
-        file.read_exact(&mut codes).map_err(StorageError::Io)?;
-
-        Ok(QuantizedVector { codes, min, max })
+        Ok(QuantizedVector {
+            codes: buf,
+            min,
+            max,
+        })
     }
 
     fn append_quantized(&self, row_id: RowId, qvec: &QuantizedVector) -> Result<u64> {
-        let mut file = self.write_file.write();
-        let offset = file.seek(SeekFrom::End(0)).map_err(StorageError::Io)?;
-
-        file.write_all(&row_id.to_le_bytes())
-            .map_err(StorageError::Io)?;
-        file.write_all(&qvec.min.to_le_bytes())
-            .map_err(StorageError::Io)?;
-        file.write_all(&qvec.max.to_le_bytes())
-            .map_err(StorageError::Io)?;
-        file.write_all(&qvec.codes).map_err(StorageError::Io)?;
-
+        // One write per entry (was four).
+        let mut buf = Vec::with_capacity(16 + qvec.codes.len());
+        buf.extend_from_slice(&row_id.to_le_bytes());
+        buf.extend_from_slice(&qvec.min.to_le_bytes());
+        buf.extend_from_slice(&qvec.max.to_le_bytes());
+        buf.extend_from_slice(&qvec.codes);
+        let offset = {
+            let mut file = self.write_file.write();
+            let offset = file.seek(SeekFrom::End(0)).map_err(StorageError::Io)?;
+            file.write_all(&buf).map_err(StorageError::Io)?;
+            offset
+        };
+        // The data file is append-only: the existing mmap stays valid for the
+        // range it covers, reads past it fall back to seek+read. Remap once
+        // the unmapped tail is large enough to matter.
+        let mapped = self
+            .data_mmap
+            .read()
+            .as_ref()
+            .map(|m| m.len() as u64)
+            .unwrap_or(0);
+        if (offset + buf.len() as u64).saturating_sub(mapped) >= REMAP_TAIL_BYTES {
+            self.remap();
+        }
         Ok(offset)
     }
 

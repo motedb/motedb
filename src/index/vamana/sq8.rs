@@ -172,15 +172,27 @@ impl SQ8Quantizer {
     /// - Partial dequantization: only scale/offset, no full f32 conversion
     /// ```ignore
     pub fn asymmetric_distance_cosine(&self, query: &[f32], data: &QuantizedVector) -> f32 {
-        if query.len() != self.dimension || data.codes.len() != self.dimension {
+        self.asymmetric_distance_cosine_raw(query, &data.codes, data.min, data.max)
+    }
+
+    /// Borrowed-slice form of `asymmetric_distance_cosine` — lets callers run the kernel
+    /// straight on an mmap'd entry without copying the codes out.
+    pub fn asymmetric_distance_cosine_raw(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if query.len() != self.dimension || codes.len() != self.dimension {
             return f32::MAX; // Invalid dimension
         }
 
         // Handle constant vector (zero range)
-        let range = data.max - data.min;
+        let range = max - min;
         if range < 1e-8 {
             // Constant vector: distance is 1 - dot(query_norm, constant)
-            let constant_val = data.min;
+            let constant_val = min;
             let query_norm = Self::fast_norm(query);
             if query_norm < 1e-8 {
                 return 0.0; // Both zero vectors
@@ -205,8 +217,8 @@ impl SQ8Quantizer {
         let mut data_norm_sq = 0.0f32;
 
         // SIMD-friendly loop (all operations fused)
-        for (&q, &code) in query.iter().zip(data.codes.iter()) {
-            let d = code as f32 * scale + data.min;
+        for (&q, &code) in query.iter().zip(codes.iter()) {
+            let d = code as f32 * scale + min;
 
             dot_product += q * d;
             query_norm_sq += q * q;
@@ -232,15 +244,27 @@ impl SQ8Quantizer {
     /// Computes squared L2 distance between f32 query and SQ8 data vector.
     /// Returns squared distance (no sqrt) for faster comparison/sorting.
     pub fn asymmetric_distance_l2(&self, query: &[f32], data: &QuantizedVector) -> f32 {
-        if query.len() != self.dimension || data.codes.len() != self.dimension {
+        self.asymmetric_distance_l2_raw(query, &data.codes, data.min, data.max)
+    }
+
+    /// Borrowed-slice form of `asymmetric_distance_l2` — lets callers run the kernel
+    /// straight on an mmap'd entry without copying the codes out.
+    pub fn asymmetric_distance_l2_raw(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if query.len() != self.dimension || codes.len() != self.dimension {
             return f32::MAX;
         }
 
         // Handle constant vector (zero range)
-        let range = data.max - data.min;
+        let range = max - min;
         if range < 1e-8 {
             // Constant vector: L2² = dim * (query_i - constant)²
-            let c = data.min;
+            let c = min;
             let mut sum_sq = 0.0f32;
             for &q in query.iter() {
                 let diff = q - c;
@@ -252,8 +276,8 @@ impl SQ8Quantizer {
         let scale = range / 255.0;
         let mut sum_sq = 0.0f32;
 
-        for (&q, &code) in query.iter().zip(data.codes.iter()) {
-            let d = code as f32 * scale + data.min;
+        for (&q, &code) in query.iter().zip(codes.iter()) {
+            let d = code as f32 * scale + min;
             let diff = q - d;
             sum_sq += diff * diff;
         }
@@ -270,14 +294,27 @@ impl SQ8Quantizer {
     /// - vfmaq_f32: fused multiply-add
     #[cfg(target_arch = "aarch64")]
     pub fn asymmetric_distance_cosine_neon(&self, query: &[f32], data: &QuantizedVector) -> f32 {
-        if query.len() != self.dimension || data.codes.len() != self.dimension {
+        self.asymmetric_distance_cosine_neon_raw(query, &data.codes, data.min, data.max)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    /// Borrowed-slice form of `asymmetric_distance_cosine_neon` — lets callers run the kernel
+    /// straight on an mmap'd entry without copying the codes out.
+    pub fn asymmetric_distance_cosine_neon_raw(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if query.len() != self.dimension || codes.len() != self.dimension {
             return f32::MAX;
         }
 
-        let range = data.max - data.min;
+        let range = max - min;
         if range < 1e-8 {
             // Fallback to scalar for constant vectors
-            return self.asymmetric_distance_cosine(query, data);
+            return self.asymmetric_distance_cosine_raw(query, codes, min, max);
         }
 
         let scale = range / 255.0;
@@ -293,14 +330,14 @@ impl SQ8Quantizer {
         let mut dnorm_sum2 = unsafe { vdupq_n_f32(0.0) };
 
         let scale_vec = unsafe { vdupq_n_f32(scale) };
-        let min_vec = unsafe { vdupq_n_f32(data.min) };
+        let min_vec = unsafe { vdupq_n_f32(min) };
 
         unsafe {
             for i in 0..chunks {
                 let offset = i * 16;
 
                 // Load 16 u8 codes and process in two groups of 8
-                let codes = vld1q_u8(data.codes.as_ptr().add(offset));
+                let codes = vld1q_u8(codes.as_ptr().add(offset));
 
                 // Widen u8→u16 (low 8 and high 8)
                 let codes_u16_low = vmovl_u8(vget_low_u8(codes));
@@ -348,8 +385,8 @@ impl SQ8Quantizer {
             let mut data_norm_sq = vaddvq_f32(dnorm_sum);
 
             // Scalar remainder
-            for (&q, &code) in query[chunks * 16..].iter().zip(&data.codes[chunks * 16..]) {
-                let d = code as f32 * scale + data.min;
+            for (&q, &code) in query[chunks * 16..].iter().zip(&codes[chunks * 16..]) {
+                let d = code as f32 * scale + min;
                 dot_product += q * d;
                 query_norm_sq += q * q;
                 data_norm_sq += d * d;
@@ -374,12 +411,25 @@ impl SQ8Quantizer {
     /// not(aarch64) 分支），给 x86 部署的 DiskANN 查询 SIMD 加速。
     #[cfg(target_arch = "x86_64")]
     pub fn asymmetric_distance_l2_avx2(&self, query: &[f32], data: &QuantizedVector) -> f32 {
-        if query.len() != self.dimension || data.codes.len() != self.dimension {
+        self.asymmetric_distance_l2_avx2_raw(query, &data.codes, data.min, data.max)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Borrowed-slice form of `asymmetric_distance_l2_avx2` — lets callers run the kernel
+    /// straight on an mmap'd entry without copying the codes out.
+    pub fn asymmetric_distance_l2_avx2_raw(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if query.len() != self.dimension || codes.len() != self.dimension {
             return f32::MAX;
         }
-        let range = data.max - data.min;
+        let range = max - min;
         if range < 1e-8 {
-            return self.asymmetric_distance_l2(query, data);
+            return self.asymmetric_distance_l2_raw(query, codes, min, max);
         }
 
         let scale = range / 255.0;
@@ -387,7 +437,7 @@ impl SQ8Quantizer {
         let chunks = n / 8;
 
         let scale_vec = unsafe { _mm256_set1_ps(scale) };
-        let min_vec = unsafe { _mm256_set1_ps(data.min) };
+        let min_vec = unsafe { _mm256_set1_ps(min) };
         let mut sum = unsafe { _mm256_setzero_ps() };
 
         unsafe {
@@ -395,7 +445,7 @@ impl SQ8Quantizer {
                 let offset = i * 8;
                 // 8 u8 → 8 i32 → 8 f32。读 8 字节为 u64 再 _mm_set_epi64x（避免
                 // *const u8 as *const __m128i 的指针转换问题）。
-                let bits = std::ptr::read_unaligned(data.codes.as_ptr().add(offset) as *const u64);
+                let bits = std::ptr::read_unaligned(codes.as_ptr().add(offset) as *const u64);
                 let codes_u8 = _mm_set_epi64x(0, bits as i64);
                 let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
                 let d_f32 = _mm256_cvtepi32_ps(codes_i32);
@@ -414,8 +464,8 @@ impl SQ8Quantizer {
             let mut result = _mm256_cvtss_f32(tmp);
 
             // 标量尾部 (< 8)
-            for (&q, &code) in query[chunks * 8..].iter().zip(&data.codes[chunks * 8..]) {
-                let d = code as f32 * scale + data.min;
+            for (&q, &code) in query[chunks * 8..].iter().zip(&codes[chunks * 8..]) {
+                let d = code as f32 * scale + min;
                 let diff = q - d;
                 result += diff * diff;
             }
@@ -426,12 +476,25 @@ impl SQ8Quantizer {
     /// 🚀 x86 AVX2 optimized asymmetric SQ8 cosine distance.
     #[cfg(target_arch = "x86_64")]
     pub fn asymmetric_distance_cosine_avx2(&self, query: &[f32], data: &QuantizedVector) -> f32 {
-        if query.len() != self.dimension || data.codes.len() != self.dimension {
+        self.asymmetric_distance_cosine_avx2_raw(query, &data.codes, data.min, data.max)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Borrowed-slice form of `asymmetric_distance_cosine_avx2` — lets callers run the kernel
+    /// straight on an mmap'd entry without copying the codes out.
+    pub fn asymmetric_distance_cosine_avx2_raw(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if query.len() != self.dimension || codes.len() != self.dimension {
             return f32::MAX;
         }
-        let range = data.max - data.min;
+        let range = max - min;
         if range < 1e-8 {
-            return self.asymmetric_distance_cosine(query, data);
+            return self.asymmetric_distance_cosine_raw(query, codes, min, max);
         }
 
         let scale = range / 255.0;
@@ -439,7 +502,7 @@ impl SQ8Quantizer {
         let chunks = n / 8;
 
         let scale_vec = unsafe { _mm256_set1_ps(scale) };
-        let min_vec = unsafe { _mm256_set1_ps(data.min) };
+        let min_vec = unsafe { _mm256_set1_ps(min) };
         let mut dot = unsafe { _mm256_setzero_ps() };
         let mut norm_q = unsafe { _mm256_setzero_ps() };
         let mut norm_d = unsafe { _mm256_setzero_ps() };
@@ -447,7 +510,7 @@ impl SQ8Quantizer {
         unsafe {
             for i in 0..chunks {
                 let offset = i * 8;
-                let bits = std::ptr::read_unaligned(data.codes.as_ptr().add(offset) as *const u64);
+                let bits = std::ptr::read_unaligned(codes.as_ptr().add(offset) as *const u64);
                 let codes_u8 = _mm_set_epi64x(0, bits as i64);
                 let codes_i32 = _mm256_cvtepu8_epi32(codes_u8);
                 let d_f32 = _mm256_cvtepi32_ps(codes_i32);
@@ -468,8 +531,8 @@ impl SQ8Quantizer {
             let mut nq = hsum(norm_q);
             let mut nd = hsum(norm_d);
 
-            for (&q, &code) in query[chunks * 8..].iter().zip(&data.codes[chunks * 8..]) {
-                let d = code as f32 * scale + data.min;
+            for (&q, &code) in query[chunks * 8..].iter().zip(&codes[chunks * 8..]) {
+                let d = code as f32 * scale + min;
                 dp += q * d;
                 nq += q * q;
                 nd += d * d;
@@ -486,13 +549,26 @@ impl SQ8Quantizer {
     /// 🚀 ARM NEON optimized asymmetric SQ8 L2 (squared Euclidean) distance
     #[cfg(target_arch = "aarch64")]
     pub fn asymmetric_distance_l2_neon(&self, query: &[f32], data: &QuantizedVector) -> f32 {
-        if query.len() != self.dimension || data.codes.len() != self.dimension {
+        self.asymmetric_distance_l2_neon_raw(query, &data.codes, data.min, data.max)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    /// Borrowed-slice form of `asymmetric_distance_l2_neon` — lets callers run the kernel
+    /// straight on an mmap'd entry without copying the codes out.
+    pub fn asymmetric_distance_l2_neon_raw(
+        &self,
+        query: &[f32],
+        codes: &[u8],
+        min: f32,
+        max: f32,
+    ) -> f32 {
+        if query.len() != self.dimension || codes.len() != self.dimension {
             return f32::MAX;
         }
 
-        let range = data.max - data.min;
+        let range = max - min;
         if range < 1e-8 {
-            return self.asymmetric_distance_l2(query, data);
+            return self.asymmetric_distance_l2_raw(query, codes, min, max);
         }
 
         let scale = range / 255.0;
@@ -503,13 +579,13 @@ impl SQ8Quantizer {
         let mut sum2 = unsafe { vdupq_n_f32(0.0) };
 
         let scale_vec = unsafe { vdupq_n_f32(scale) };
-        let min_vec = unsafe { vdupq_n_f32(data.min) };
+        let min_vec = unsafe { vdupq_n_f32(min) };
 
         unsafe {
             for i in 0..chunks {
                 let offset = i * 16;
 
-                let codes = vld1q_u8(data.codes.as_ptr().add(offset));
+                let codes = vld1q_u8(codes.as_ptr().add(offset));
 
                 let codes_u16_low = vmovl_u8(vget_low_u8(codes));
                 let codes_u16_high = vmovl_u8(vget_high_u8(codes));
@@ -549,8 +625,8 @@ impl SQ8Quantizer {
             let mut result = vaddvq_f32(total);
 
             // Scalar remainder
-            for (&q, &code) in query[chunks * 16..].iter().zip(&data.codes[chunks * 16..]) {
-                let d = code as f32 * scale + data.min;
+            for (&q, &code) in query[chunks * 16..].iter().zip(&codes[chunks * 16..]) {
+                let d = code as f32 * scale + min;
                 let diff = q - d;
                 result += diff * diff;
             }

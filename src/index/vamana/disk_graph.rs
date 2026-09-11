@@ -25,6 +25,18 @@ const HEADER_SIZE: u64 = 16;
 /// sidecar only while the file hasn't grown past it. Old-format sidecars
 /// (8-byte header) are detected by size and force a one-time rebuild.
 const SIDECAR_HEADER_SIZE: u64 = 16;
+/// Appended records are mirrored in memory (`Tail`) and written out in one
+/// go once this many bytes have accumulated; the mmap is refreshed at the
+/// same time, so neighbor reads never need a syscall.
+const TAIL_FLUSH_BYTES: usize = 256 << 10;
+
+/// Records appended since the last tail flush. graph.bin `[0, start)` is on
+/// disk (and mmap'd); `[start, start + buf.len())` lives only here until
+/// `flush_tail` writes it. Bounded by TAIL_FLUSH_BYTES.
+struct Tail {
+    start: u64,
+    buf: Vec<u8>,
+}
 
 /// Disk-based graph with bounded memory
 pub struct DiskGraph {
@@ -59,8 +71,11 @@ pub struct DiskGraph {
     hot_cache: Arc<RwLock<LruCache<RowId, Arc<Vec<RowId>>>>>,
     max_hot_nodes: usize,
 
-    /// Next write offset
+    /// Next write offset (== tail.start + tail.buf.len())
     next_offset: Arc<Mutex<u64>>,
+
+    /// In-memory mirror of the not-yet-written file tail (see `Tail`).
+    tail: Arc<Mutex<Tail>>,
 
     /// Dirty flag
     dirty: Arc<RwLock<bool>>,
@@ -131,6 +146,10 @@ impl DiskGraph {
             ))),
             max_hot_nodes,
             next_offset: Arc::new(Mutex::new(HEADER_SIZE)),
+            tail: Arc::new(Mutex::new(Tail {
+                start: HEADER_SIZE,
+                buf: Vec::new(),
+            })),
             dirty: Arc::new(RwLock::new(false)),
             flush_lock: Arc::new(Mutex::new(())),
             tombstones: Arc::new(Mutex::new(HashSet::new())),
@@ -265,6 +284,10 @@ impl DiskGraph {
             ))),
             max_hot_nodes,
             next_offset: Arc::new(Mutex::new(next_off)),
+            tail: Arc::new(Mutex::new(Tail {
+                start: next_off,
+                buf: Vec::new(),
+            })),
             dirty: Arc::new(RwLock::new(false)),
             flush_lock: Arc::new(Mutex::new(())),
             tombstones: Arc::new(Mutex::new(HashSet::new())),
@@ -525,10 +548,8 @@ impl DiskGraph {
         // 🔑 Inbound delta bookkeeping: a node's edge list swap changes the
         // inbound counts of every id added/removed. Eviction sites rely on
         // these counts to never strand a node (drop its last inbound edge).
-        let old_list: Vec<RowId> = self
-            .lookup_offset(node_id)
-            .and_then(|off| self.read_neighbors_at(off).ok())
-            .unwrap_or_default();
+        // Hot/LRU cache first; only an uncached node costs a disk read.
+        let old_list: Arc<Vec<RowId>> = self.neighbors(node_id);
         neighbors.retain(|&id| id != node_id);
         neighbors.sort_unstable();
         neighbors.dedup();
@@ -575,10 +596,6 @@ impl DiskGraph {
         }
 
         *self.dirty.write() = true;
-
-        // Invalidate mmap — file has grown but mmap still maps the old range.
-        // Subsequent reads will use seek+read fallback until next flush() remaps.
-        *self.mmap.write() = None;
 
         Ok(())
     }
@@ -636,6 +653,9 @@ impl DiskGraph {
         if !*self.dirty.read() {
             return Ok(());
         }
+
+        // The sidecar is built from the file, so the tail must be on disk.
+        self.flush_tail()?;
 
         // Rebuild sidecar with last-wins semantics minus tombstones. This
         // runs even when the graph is empty: delete-all previously skipped
@@ -759,6 +779,11 @@ impl DiskGraph {
         self.tombstones.lock().clear();
         *self.count.write() = ids.len() as u64;
         *self.next_offset.lock() = final_offset;
+        {
+            let mut tail = self.tail.lock();
+            tail.start = final_offset;
+            tail.buf.clear();
+        }
 
         // Remap after compact
         self.remap();
@@ -788,6 +813,14 @@ impl DiskGraph {
         }
         *self.count.write() = 0;
         *self.next_offset.lock() = HEADER_SIZE;
+        {
+            let mut tail = self.tail.lock();
+            tail.start = HEADER_SIZE;
+            tail.buf.clear();
+        }
+        // The file was truncated under the map; a stale map past the new EOF
+        // would SIGBUS on access.
+        self.remap();
         *self.dirty.write() = true;
     }
 
@@ -844,22 +877,77 @@ impl DiskGraph {
         Ok((max_degree, node_count))
     }
 
+    /// Append a record at `offset` (always the current end of file). The
+    /// bytes go to the in-memory tail; `flush_tail` writes them out in bulk.
+    /// The old per-record path did 2 + degree write syscalls, then dropped
+    /// the mmap so every uncached read for the rest of a build went through
+    /// seek + one read per neighbor.
     fn write_neighbors_at(&self, node_id: RowId, neighbors: &[RowId], offset: u64) -> Result<()> {
-        let mut file = self.file.write();
-        file.seek(SeekFrom::Start(offset))
-            .map_err(StorageError::Io)?;
-        file.write_all(&node_id.to_le_bytes())
-            .map_err(StorageError::Io)?;
-        file.write_all(&(neighbors.len() as u32).to_le_bytes())
-            .map_err(StorageError::Io)?;
+        let mut tail = self.tail.lock();
+        debug_assert_eq!(offset, tail.start + tail.buf.len() as u64);
+        let _ = offset;
+        tail.buf.reserve(12 + neighbors.len() * 8);
+        tail.buf.extend_from_slice(&node_id.to_le_bytes());
+        tail.buf
+            .extend_from_slice(&(neighbors.len() as u32).to_le_bytes());
         for &neighbor in neighbors {
-            file.write_all(&neighbor.to_le_bytes())
-                .map_err(StorageError::Io)?;
+            tail.buf.extend_from_slice(&neighbor.to_le_bytes());
+        }
+        if tail.buf.len() >= TAIL_FLUSH_BYTES {
+            self.flush_tail_locked(&mut tail)?;
         }
         Ok(())
     }
 
+    /// Write the in-memory tail to graph.bin and refresh the mmap so those
+    /// records are served from the map from now on.
+    fn flush_tail(&self) -> Result<()> {
+        let mut tail = self.tail.lock();
+        self.flush_tail_locked(&mut tail)
+    }
+
+    fn flush_tail_locked(&self, tail: &mut Tail) -> Result<()> {
+        if tail.buf.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut file = self.file.write();
+            file.seek(SeekFrom::Start(tail.start))
+                .map_err(StorageError::Io)?;
+            file.write_all(&tail.buf).map_err(StorageError::Io)?;
+        }
+        tail.start += tail.buf.len() as u64;
+        tail.buf.clear();
+        self.remap();
+        Ok(())
+    }
+
     fn read_neighbors_at(&self, offset: u64) -> Result<Vec<RowId>> {
+        // Not yet written: serve from the in-memory tail.
+        {
+            let tail = self.tail.lock();
+            if offset >= tail.start {
+                let rel = (offset - tail.start) as usize;
+                let buf = &tail.buf;
+                if rel + 12 > buf.len() {
+                    return Err(StorageError::InvalidData(format!(
+                        "graph record at {offset} beyond tail"
+                    )));
+                }
+                let count = u32::from_le_bytes(buf[rel + 8..rel + 12].try_into().unwrap()) as usize;
+                let start = rel + 12;
+                let end = start + count * 8;
+                if end > buf.len() {
+                    return Err(StorageError::InvalidData(format!(
+                        "graph record at {offset} truncated in tail"
+                    )));
+                }
+                return Ok(buf[start..end]
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                    .collect());
+            }
+        }
         // Try mmap path (zero syscall)
         {
             let guard = self.mmap.read();
@@ -886,22 +974,33 @@ impl DiskGraph {
             }
         }
 
-        // Fallback: seek+read
+        // Fallback (unmapped tail): header, then the whole edge list in one
+        // read — was one read per neighbor.
         let mut file = self.file.write();
         file.seek(SeekFrom::Start(offset))
             .map_err(StorageError::Io)?;
-        let mut buf8 = [0u8; 8];
-        file.read_exact(&mut buf8).map_err(StorageError::Io)?;
-        let mut buf4 = [0u8; 4];
-        file.read_exact(&mut buf4).map_err(StorageError::Io)?;
-        let count = u32::from_le_bytes(buf4) as usize;
-
-        let mut neighbors = Vec::with_capacity(count);
-        for _ in 0..count {
-            file.read_exact(&mut buf8).map_err(StorageError::Io)?;
-            neighbors.push(u64::from_le_bytes(buf8));
+        let mut head = [0u8; 12];
+        file.read_exact(&mut head).map_err(StorageError::Io)?;
+        let count = u32::from_le_bytes(head[8..12].try_into().unwrap()) as usize;
+        if count > self.max_degree * 4 + 16 {
+            return Err(StorageError::InvalidData(format!(
+                "graph record at {offset} claims {count} neighbors"
+            )));
         }
-        Ok(neighbors)
+        let mut body = vec![0u8; count * 8];
+        file.read_exact(&mut body).map_err(StorageError::Io)?;
+        Ok(body
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+}
+
+impl Drop for DiskGraph {
+    fn drop(&mut self) {
+        // Best effort: a shutdown that skipped flush() must not lose the
+        // buffered tail (bounded by TAIL_FLUSH_BYTES).
+        let _ = self.flush_tail();
     }
 }
 
