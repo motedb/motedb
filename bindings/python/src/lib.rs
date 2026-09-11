@@ -28,10 +28,48 @@ fn mote_to_py(v: &MValue) -> PyObject {
                 list.into_py(py)
             }
             MValue::Timestamp(ts) => ts.as_micros().into_py(py),
-            // Tensor / Spatial / TextDoc: not first-class in Python yet —
-            // render as a tag so users see WHAT it is instead of garbage.
+            // Spatial: {"type": "Point3D", "x": .., "y": .., "z": ..} /
+            // {"type": "Point", "x": .., "y": ..} / {"type": "LineString",
+            // "points": [[x, y], ...]} / {"type": "Polygon", ...} — round
+            // trippable by py_to_mote below (used to be a "<geometry>" tag,
+            // so Python could read back neither coordinates nor equality).
+            MValue::Spatial(g) => {
+                use motedb_core::types::Geometry;
+                match &**g {
+                    Geometry::Point(p) => {
+                        let dict = pyo3::types::PyDict::new_bound(py);
+                        dict.set_item("type", "Point").ok();
+                        dict.set_item("x", p.x).ok();
+                        dict.set_item("y", p.y).ok();
+                        dict.into_any().unbind()
+                    }
+                    Geometry::Point3D(p) => {
+                        let dict = pyo3::types::PyDict::new_bound(py);
+                        dict.set_item("type", "Point3D").ok();
+                        dict.set_item("x", p.x).ok();
+                        dict.set_item("y", p.y).ok();
+                        dict.set_item("z", p.z).ok();
+                        dict.into_any().unbind()
+                    }
+                    Geometry::LineString(pts) => {
+                        let dict = pyo3::types::PyDict::new_bound(py);
+                        dict.set_item("type", "LineString").ok();
+                        let list: Vec<(f64, f64)> = pts.iter().map(|p| (p.x, p.y)).collect();
+                        dict.set_item("points", list).ok();
+                        dict.into_any().unbind()
+                    }
+                    Geometry::Polygon(pts) => {
+                        let dict = pyo3::types::PyDict::new_bound(py);
+                        dict.set_item("type", "Polygon").ok();
+                        let list: Vec<(f64, f64)> = pts.iter().map(|p| (p.x, p.y)).collect();
+                        dict.set_item("points", list).ok();
+                        dict.into_any().unbind()
+                    }
+                }
+            }
+            // Tensor / TextDoc: not first-class in Python yet — render as a
+            // tag so users see WHAT it is instead of garbage.
             MValue::Tensor(_) => "<tensor>".into_py(py),
-            MValue::Spatial(_) => "<geometry>".into_py(py),
             MValue::TextDoc(_) => "<textdoc>".into_py(py),
         }
     })
@@ -53,6 +91,66 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
     }
     if let Ok(s) = v.extract::<String>() {
         return Ok(MValue::Text(s.into()));
+    }
+    // dict with "type" Point/Point3D/LineString/Polygon → geometry
+    if let Ok(dict) =
+        v.extract::<std::collections::HashMap<String, pyo3::Bound<pyo3::types::PyAny>>>()
+    {
+        if let Some(t) = dict.get("type").and_then(|t| t.extract::<String>().ok()) {
+            use motedb_core::types::{Geometry, Point, Point3D};
+            let geom = match t.as_str() {
+                "Point" => {
+                    let x = dict.get("x").and_then(|v| v.extract::<f64>().ok());
+                    let y = dict.get("y").and_then(|v| v.extract::<f64>().ok());
+                    match (x, y) {
+                        (Some(x), Some(y)) => Geometry::Point(Point::new(x, y)),
+                        _ => {
+                            return Err(PyValueError::new_err(
+                                "Point geometry requires numeric 'x' and 'y'",
+                            ))
+                        }
+                    }
+                }
+                "Point3D" => {
+                    let x = dict.get("x").and_then(|v| v.extract::<f64>().ok());
+                    let y = dict.get("y").and_then(|v| v.extract::<f64>().ok());
+                    let z = dict.get("z").and_then(|v| v.extract::<f64>().ok());
+                    match (x, y, z) {
+                        (Some(x), Some(y), Some(z)) => Geometry::Point3D(Point3D::new(x, y, z)),
+                        _ => {
+                            return Err(PyValueError::new_err(
+                                "Point3D geometry requires numeric 'x', 'y' and 'z'",
+                            ))
+                        }
+                    }
+                }
+                "LineString" | "Polygon" => {
+                    let pts = dict
+                        .get("points")
+                        .and_then(|v| v.extract::<Vec<(f64, f64)>>().ok());
+                    let pts = match pts {
+                        Some(p) if !p.is_empty() => p,
+                        _ => {
+                            return Err(PyValueError::new_err(format!(
+                                "{t} geometry requires a non-empty 'points' list of [x, y] pairs"
+                            )))
+                        }
+                    };
+                    let pts: Vec<Point> = pts.into_iter().map(|(x, y)| Point::new(x, y)).collect();
+                    if t == "LineString" {
+                        Geometry::LineString(pts)
+                    } else {
+                        Geometry::Polygon(pts)
+                    }
+                }
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown geometry type {other:?} (Point|Point3D|LineString|Polygon)"
+                    )))
+                }
+            };
+            return Ok(MValue::Spatial(Box::new(geom)));
+        }
     }
     // list/tuple of numbers → embedding vector (f32 storage)
     if let Ok(seq) = v.extract::<Vec<f64>>() {
@@ -149,7 +247,7 @@ impl PyDatabase {
                         }
                         list.append(dict)?;
                     }
-                    Ok(list.into_any().unbind().into())
+                    Ok(list.into_any().unbind())
                 }
                 motedb_core::QueryResult::Modification { affected_rows } => {
                     Ok(affected_rows.into_py(py).into())
@@ -179,9 +277,9 @@ impl PyDatabase {
                     }
                     let t = pyo3::types::PyTuple::new_bound(
                         py,
-                        vec![cols.into_py(py), list.into_any().unbind().into()],
+                        vec![cols.into_py(py), list.into_any().unbind()],
                     );
-                    Ok(t.into_any().unbind().into())
+                    Ok(t.into_any().unbind())
                 }
                 _ => Err(PyValueError::new_err("query() expects a SELECT statement")),
             }
@@ -252,7 +350,7 @@ impl PyDatabase {
             let out = pyo3::types::PyDict::new_bound(py);
             out.set_item("verdict", report.worst().label())?;
             out.set_item("checks", list)?;
-            Ok(out.into_any().unbind().into())
+            Ok(out.into_any().unbind())
         })
     }
 

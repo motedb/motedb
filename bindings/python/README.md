@@ -48,9 +48,14 @@ db.close()
 | `doctor()` | self-check → `{"verdict", "checks": [{name,status,detail}]}` |
 | `checkpoint()/vacuum()/close()` | lifecycle |
 
-Parameter types: `None/bool/int/float/str/list[float]` (→ embedding vector).
+Parameter types: `None/bool/int/float/str/list[float]` (→ embedding vector),
+and geometry dicts for GEOMETRY columns:
+`{"type": "Point3D", "x": 1.0, "y": -2.0, "z": 0.5}`,
+`{"type": "Point", "x": 1.0, "y": -2.0}`,
+`{"type": "LineString"|"Polygon", "points": [[x, y], ...]}`.
 Result types: `None/bool/int/float/str/list[float]` (vector), timestamp as
-int microseconds, tensor/geometry render as tags.
+int microseconds, geometry as the same dict shapes (tensor still renders as
+a `<tensor>` tag).
 
 ## Benchmark
 
