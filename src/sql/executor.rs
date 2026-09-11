@@ -22161,7 +22161,32 @@ impl QueryExecutor {
             }
         }
 
-        // Cache miss — fall back to column index, or full scan if index missing
+        // Cache miss on an integer-PK ColSegmentStore table: the composite
+        // key encodes the PK value, so the row is an O(log N) binary search
+        // away. The old fallback was a full table scan — which ALSO
+        // force-compacted every segment, turning each single-row UPDATE into
+        // an O(table) rewrite (~95ms at 200K rows).
+        if let Value::Integer(pk) = pk_value {
+            if let Some(store) = self.db.get_col_segment_store(table) {
+                let rid = if *pk >= 0 {
+                    *pk as u64
+                } else {
+                    0x8000_0000u64 | (*pk as u64 & 0x7FFF_FFFF)
+                };
+                let key = self.db.make_composite_key(table, rid);
+                if let Some(row) = store.get(key) {
+                    let schema = self.db.get_table_schema(table)?;
+                    let pk_pos = schema.get_column_position(pk_col_name).unwrap_or(0);
+                    if row.get(pk_pos) == Some(pk_value) {
+                        if let Some(lookup) = self.db.pk_lookup.get(table) {
+                            lookup.insert(pk_key.clone(), rid);
+                        }
+                        return Ok(Some(rid));
+                    }
+                }
+            }
+        }
+        // Column index, or full scan if index missing
         let row_ids = match self.db.query_by_column(table, pk_col_name, pk_value) {
             Ok(ids) => ids,
             Err(_) => {
