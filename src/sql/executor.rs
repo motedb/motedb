@@ -24649,6 +24649,53 @@ impl QueryExecutor {
     /// Brute-force vector KNN: scan all vectors in the columnar store,
     /// compute L2 distance inline, keep top-K. Used for small tables (<50K)
     /// where DiskANN graph traversal overhead exceeds brute-force O(N).
+    /// Re-order ANN candidates by exact distance against the stored vectors
+    /// and keep the best `k`. Rows the table no longer has are dropped; rows
+    /// whose vector is NULL or of another dimension keep their approximate
+    /// distance (they sort after every exact one).
+    fn rerank_exact(
+        &self,
+        table: &str,
+        col: &str,
+        query: &[f32],
+        cosine: bool,
+        approx: Vec<(RowId, f32)>,
+        k: usize,
+    ) -> Result<Vec<(RowId, f32)>> {
+        if approx.is_empty() {
+            return Ok(approx);
+        }
+        let schema = self.db.get_table_schema(table)?;
+        let col_pos = schema.get_column_position(col).unwrap_or(0);
+        let ids: Vec<RowId> = approx.iter().map(|(id, _)| *id).collect();
+        let approx_dist: std::collections::HashMap<RowId, f32> = approx.into_iter().collect();
+        let rows = self.db.get_table_rows_batch(table, &ids)?;
+        let mut exact: Vec<(RowId, f32)> = Vec::with_capacity(rows.len());
+        for (rid, row) in rows {
+            let Some(row) = row else {
+                continue;
+            };
+            let d = match row.get(col_pos) {
+                Some(Value::Vector(v)) if v.len() == query.len() => {
+                    if cosine {
+                        crate::distance::cosine::cosine_distance(query, &v.0)
+                    } else {
+                        crate::distance::euclidean::euclidean_distance_squared(query, &v.0)
+                    }
+                }
+                _ => approx_dist.get(&rid).copied().unwrap_or(f32::MAX),
+            };
+            exact.push((rid, d));
+        }
+        exact.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        exact.truncate(k);
+        Ok(exact)
+    }
+
     fn brute_force_vector_knn(
         &self,
         table: &str,
@@ -24681,11 +24728,78 @@ impl QueryExecutor {
             // table returned [5,3,2,1] instead of [5,6,4,7]).
             let mut heap: std::collections::BinaryHeap<(OrderedF32, u64)> =
                 std::collections::BinaryHeap::with_capacity(k + 1);
+            // L2 ranks by squared distance (monotone — cheaper, no sqrt);
+            // cosine needs the actual distance value. Top-K max-heap: peek()
+            // is the worst kept candidate.
+            let offer = |heap: &mut std::collections::BinaryHeap<(OrderedF32, u64)>,
+                         key: u64,
+                         row_vec: &[f32]| {
+                let dist = if cosine {
+                    crate::distance::cosine::cosine_distance(query, row_vec)
+                } else {
+                    crate::distance::euclidean::euclidean_distance_squared(query, row_vec)
+                };
+                let cand = (OrderedF32(dist), key);
+                if heap.len() < k {
+                    heap.push(cand);
+                } else if let Some(&(worst, _)) = heap.peek() {
+                    if cand.0 < worst {
+                        heap.pop();
+                        heap.push(cand);
+                    }
+                }
+            };
+            // Rows must be handed to the SIMD kernels as `&[f32]`. In the
+            // segment the floats follow a null bitmap and a u16 dim header, so
+            // the raw bytes are never 4-byte aligned — the old in-place
+            // reinterpret was UB (and aborts under debug assertions). Two
+            // alignment-safe paths, chosen per segment by the col_cache byte
+            // budget:
+            //   * fits → decoded VectorSegment kept in the cache, so repeated
+            //     scans cost no I/O or decode (0.13ms for 5K×384 rows);
+            //   * doesn't fit → stream the raw payload and copy each row into
+            //     one reusable aligned scratch buffer: no large allocation,
+            //     nothing left in the cache (a >8MB segment is read lazily,
+            //     338MB per query for 220K×384 rows, exactly as before).
+            let budget = store.col_cache_budget();
+            // Bytes already held by this table's col_caches (all columns); new
+            // vector columns are cached only while the cumulative total stays
+            // within budget, so a table of many small segments doesn't decode
+            // + cache + trim everything on every query.
+            let mut cached_total: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
+            let mut scratch: Vec<f32> = vec![0.0; qdim];
             for seg in &segs {
                 if col_pos >= seg.sst.column_tags.len() {
                     continue;
                 }
-                // Read raw vector column bytes (zero Vec<f32> allocation).
+                let n = seg.sst.num_rows;
+                let seg_bytes = n * qdim * 4;
+                let cached = match seg.cached_vectors(col_pos) {
+                    Some(vs) => Some(vs),
+                    None if cached_total + seg_bytes <= budget => {
+                        let vs = seg.read_vectors_cached(col_pos);
+                        if vs.is_some() {
+                            cached_total += seg_bytes;
+                        }
+                        vs
+                    }
+                    None => None,
+                };
+                if let Some(vs) = cached {
+                    if vs.dim != qdim {
+                        continue;
+                    }
+                    for i in 0..n {
+                        let Some(row_vec) = vs.row(i) else {
+                            continue;
+                        };
+                        if seg.sst.row_map.is_deleted(i) {
+                            continue;
+                        }
+                        offer(&mut heap, seg.sst.row_map.key(i), row_vec);
+                    }
+                    continue;
+                }
                 let entry = &seg.sst.column_index[col_pos];
                 let seg_bytes = seg.sst.read_segment_bytes(
                     entry.offset as usize,
@@ -24693,7 +24807,7 @@ impl QueryExecutor {
                     col_pos,
                 );
                 let data = seg_bytes.as_ref();
-                let null_bytes = seg.sst.num_rows.div_ceil(8);
+                let null_bytes = n.div_ceil(8);
                 if null_bytes + 2 > data.len() {
                     continue;
                 }
@@ -24703,44 +24817,23 @@ impl QueryExecutor {
                 }
                 let stride = dim * 4;
                 let data_start = null_bytes + 2;
-                let n = seg.sst.num_rows;
                 for i in 0..n {
-                    // Skip nulls and deleted rows.
-                    if (data[i / 8] >> (i % 8)) & 1 != 0 {
-                        continue;
-                    }
-                    if seg.sst.row_map.is_deleted(i) {
+                    if (data[i / 8] >> (i % 8)) & 1 != 0 || seg.sst.row_map.is_deleted(i) {
                         continue;
                     }
                     let base = data_start + i * stride;
-                    // 🚀 SIMD distance: reinterpret the row's f32 bytes as a
-                    // &[f32] slice and call the NEON/AVX2 euclidean_distance_squared.
-                    // This is 4-8x faster than the scalar per-element loop.
-                    let row_vec: &[f32] = unsafe {
-                        std::slice::from_raw_parts(
-                            data[base..base + stride].as_ptr() as *const f32,
-                            dim,
-                        )
+                    let Some(bytes) = data.get(base..base + stride) else {
+                        break;
                     };
-                    // L2 ranks by squared distance (monotone — cheaper, no
-                    // sqrt); cosine needs the actual distance value.
-                    let dist = if cosine {
-                        crate::distance::cosine::cosine_distance(query, row_vec)
-                    } else {
-                        crate::distance::euclidean::euclidean_distance_squared(query, row_vec)
-                    };
-                    // Maintain top-K max-heap (peek = worst kept candidate).
-                    let cand = (OrderedF32(dist), seg.sst.row_map.key(i));
-                    if heap.len() < k {
-                        heap.push(cand);
-                    } else if let Some(&(worst, _)) = heap.peek() {
-                        if cand.0 < worst {
-                            heap.pop();
-                            heap.push(cand);
-                        }
-                    }
+                    crate::storage::lsm::columnar::copy_le_f32(&mut scratch, bytes);
+                    offer(&mut heap, seg.sst.row_map.key(i), &scratch);
                 }
             }
+            // Safety net for the budget (other columns' caches may have grown
+            // since the estimate above); `get_or_create_col_segment_store`
+            // only trims when it creates the store, so this path had no budget
+            // choke point before.
+            store.trim_col_cache_to_budget();
             // Also scan the write buffer for unflushed vectors (correctness —
             // brute force is used when no index exists, so buffered rows must
             // be visible). The original implementation omitted this "for
@@ -24910,8 +25003,25 @@ impl QueryExecutor {
                     .unwrap_or(false)
         };
         let candidates = if use_index {
-            self.db
-                .vector_search(&index_name, &plan.query_vector, plan.k)?
+            // Over-fetch from the graph, then re-rank with the table's
+            // full-precision vectors. The index ranks by SQ8-dequantized
+            // distance, which reshuffles near-equal neighbours (measured
+            // recall@10 0.985 on real 384-d embeddings); the exact re-rank of
+            // a slightly larger candidate set recovers most of that. For
+            // small k the extra candidates come from the search list the
+            // graph walk already visited, so it costs no extra traversal.
+            let k_over = (plan.k * 2).max(plan.k + 16).min(1024);
+            let approx = self
+                .db
+                .vector_search(&index_name, &plan.query_vector, k_over)?;
+            self.rerank_exact(
+                &plan.table,
+                &plan.column,
+                &plan.query_vector,
+                plan.cosine,
+                approx,
+                plan.k,
+            )?
         } else {
             // Embedded envelope (or no index) — exact brute-force scan.
             self.brute_force_vector_knn(
