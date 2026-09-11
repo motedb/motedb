@@ -1872,6 +1872,11 @@ pub struct QueryExecutor {
 // so each thread independently tracks its own active transaction.
 thread_local! {
     static CURRENT_TXN_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Per-statement memo of ST_KNN_3D result sets, keyed by
+    /// "index|x|y|z|k" (see the StKnn3D arm of the row evaluator).
+    static SPATIAL_KNN_MEMO: std::cell::RefCell<
+        std::collections::HashMap<String, Arc<std::collections::HashSet<u64>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Determine if a CASE WHEN condition value is "true".
@@ -2168,6 +2173,7 @@ impl QueryExecutor {
 
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
+        SPATIAL_KNN_MEMO.with(|m| m.borrow_mut().clear());
 
         // NOTE: We intentionally do NOT clear segment col_cache here. The cache
         // is bounded to 16 entries per segment (BoundedColCache), so it can't
@@ -6209,6 +6215,11 @@ impl QueryExecutor {
     /// must run through the materialized execution path.
     fn expr_needs_materialized_path(expr: &Expr) -> bool {
         match expr {
+            // NOTE: ST_WITHIN_3D / ST_RADIUS_3D are per-row evaluable now
+            // (SqlRow + positional evaluators), but they must still take the
+            // materialized route: the columnar scan path runs BEFORE the
+            // i-Octree fast paths, so un-gating them makes indexed radius /
+            // within queries full-scan (0.02ms → 22ms at 200K rows).
             Expr::Match { .. }
             | Expr::StWithin3D { .. }
             | Expr::StKnn3D { .. }
@@ -6247,6 +6258,30 @@ impl QueryExecutor {
             Expr::Like { expr, pattern, .. } => {
                 Self::expr_needs_materialized_path(expr)
                     || Self::expr_needs_materialized_path(pattern)
+            }
+            _ => false,
+        }
+    }
+
+    /// Does `expr` contain an ST_KNN_3D predicate? Unlike the other spatial
+    /// functions it is a *set* predicate that needs the octree index and the
+    /// row id, so the positional (schema-indexed row) evaluators cannot
+    /// answer it; paths built on them must yield to the materialized path,
+    /// whose evaluator resolves it through the index (memoized per statement).
+    fn expr_contains_st_knn(expr: &Expr) -> bool {
+        match expr {
+            Expr::StKnn3D { .. } => true,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_contains_st_knn(left) || Self::expr_contains_st_knn(right)
+            }
+            Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } => {
+                Self::expr_contains_st_knn(expr)
+            }
+            Expr::Case { whens, else_expr } => {
+                whens
+                    .iter()
+                    .any(|(c, v)| Self::expr_contains_st_knn(c) || Self::expr_contains_st_knn(v))
+                    || else_expr.as_deref().is_some_and(Self::expr_contains_st_knn)
             }
             _ => false,
         }
@@ -13856,6 +13891,58 @@ impl QueryExecutor {
                     Ok(Value::Null)
                 }
             }
+            // 3D spatial functions on a positional row (columnar projection
+            // paths). Same semantics as the SqlRow evaluator.
+            Expr::StDistance3D { column, x, y, z } => {
+                let v = schema
+                    .get_column_position(column)
+                    .and_then(|pos| row.get(pos))
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
+                Ok(match crate::sql::evaluator::point3d_of(v) {
+                    Some(p) => Value::Float(crate::sql::evaluator::euclid3(&p, *x, *y, *z)),
+                    None => Value::Null,
+                })
+            }
+            Expr::StWithin3D {
+                column,
+                min_x,
+                min_y,
+                min_z,
+                max_x,
+                max_y,
+                max_z,
+            } => {
+                let v = schema
+                    .get_column_position(column)
+                    .and_then(|pos| row.get(pos))
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
+                Ok(Value::Bool(
+                    crate::sql::evaluator::point3d_of(v).is_some_and(|p| {
+                        p.x >= *min_x
+                            && p.x <= *max_x
+                            && p.y >= *min_y
+                            && p.y <= *max_y
+                            && p.z >= *min_z
+                            && p.z <= *max_z
+                    }),
+                ))
+            }
+            Expr::StRadius3D {
+                column,
+                x,
+                y,
+                z,
+                radius,
+            } => {
+                let v = schema
+                    .get_column_position(column)
+                    .and_then(|pos| row.get(pos))
+                    .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
+                Ok(Value::Bool(
+                    crate::sql::evaluator::point3d_of(v)
+                        .is_some_and(|p| crate::sql::evaluator::euclid3(&p, *x, *y, *z) <= *radius),
+                ))
+            }
             _ => Err(MoteDBError::Query(format!(
                 "eval_expr_on_row: unsupported expression: {:?}",
                 expr
@@ -17660,10 +17747,9 @@ impl QueryExecutor {
 
             // ==================== 3D Spatial Expressions (i-Octree) ====================
             Expr::StDistance3D { column, x, y, z } => {
-                // Fast path: use pre-computed distance if available
-                if let Some(Value::Float(dist)) = row.get("__spatial_distance__") {
-                    return Ok(Value::Float(*dist));
-                }
+                // Always computed from the row's geometry: the pre-computed
+                // `__spatial_distance__` belongs to the ORDER BY / KNN query
+                // point, which need not be this expression's point.
                 let point_value = self
                     .get_column_value(row, column)
                     .ok_or_else(|| MoteDBError::ColumnNotFound(column.clone()))?;
@@ -17757,24 +17843,45 @@ impl QueryExecutor {
                         MoteDBError::Query("ST_KNN_3D requires __table__ in row".into())
                     })?;
 
-                let index_name = self
-                    .db
-                    .index_registry
-                    .find_by_column(
-                        table_name,
-                        column,
-                        crate::database::index_metadata::IndexType::Octree,
-                    )
-                    .ok_or_else(|| {
-                        MoteDBError::Query(format!(
-                            "No ioctree index for '{}.{}'",
-                            table_name, column
-                        ))
-                    })?;
+                // No index → exact kNN over the table's geometry column
+                // (computed once, memoized). Without this the arm errored
+                // ("No ioctree index for …") and index-less tables silently
+                // returned 0 rows for ST_KNN_3D.
+                let index_name = self.db.index_registry.find_by_column(
+                    table_name,
+                    column,
+                    crate::database::index_metadata::IndexType::Octree,
+                );
 
-                let query_point = crate::types::Point3D::new(*x, *y, *z);
-                let results = self.db.ioctree_knn_query(&index_name, &query_point, *k)?;
-                Ok(Value::Bool(results.iter().any(|(id, _)| *id == row_id)))
+                // One lookup per statement, not per row: this arm runs for
+                // every scanned row when the predicate sits under an
+                // aggregate / ORDER BY / AND, and a fresh KNN walk per row is
+                // O(N × log N) — 200K rows took seconds. The memo is thread
+                // local and cleared at statement start (execute_streaming_ref).
+                let memo_key = format!("{table_name}|{column}|{x}|{y}|{z}|{k}");
+                let hit = SPATIAL_KNN_MEMO.with(|m| m.borrow().get(&memo_key).cloned());
+                let set = match hit {
+                    Some(set) => set,
+                    None => {
+                        let set: Arc<std::collections::HashSet<u64>> = Arc::new(
+                            self.spatial_knn_row_ids(
+                                table_name,
+                                column,
+                                *x,
+                                *y,
+                                *z,
+                                *k,
+                                index_name.as_deref(),
+                            )?
+                            .into_iter()
+                            .collect(),
+                        );
+                        SPATIAL_KNN_MEMO
+                            .with(|m| m.borrow_mut().insert(memo_key, Arc::clone(&set)));
+                        set
+                    }
+                };
+                Ok(Value::Bool(set.contains(&row_id)))
             }
 
             Expr::StRadius3D {
@@ -18852,6 +18959,15 @@ impl QueryExecutor {
                     }
                 }
             }
+            // Spatial / vector-distance expressions name their column directly.
+            // They fell through to `_ => {}` like CASE used to, so an
+            // un-indexed `ORDER BY ST_DISTANCE_3D(pt, …)` never scanned `pt`,
+            // computed NULL keys and returned rows in insertion order.
+            Expr::StDistance3D { column, .. }
+            | Expr::StWithin3D { column, .. }
+            | Expr::StRadius3D { column, .. }
+            | Expr::StKnn3D { column, .. }
+            | Expr::KnnDistance { column, .. } => add(column, &mut out),
             _ => {}
         }
         out
@@ -19101,6 +19217,16 @@ impl QueryExecutor {
         schema: &TableSchema,
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
+        // ST_KNN_3D cannot be evaluated positionally (needs the index and the
+        // row id); single_pass_group_by treated the evaluation error as "no
+        // match", so `COUNT(*) WHERE ST_KNN_3D(…)` returned 0.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_st_knn)
+        {
+            return Ok(None);
+        }
         // 🆕 HAVING requires post-aggregation filtering that this streaming
         // path doesn't apply — fall back to the materialized path.
         if stmt.having.is_some() {
@@ -19437,6 +19563,16 @@ impl QueryExecutor {
         schema: &TableSchema,
         table_name: &str,
     ) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+        // ST_KNN_3D cannot be evaluated positionally (needs the index and the
+        // row id); single_pass_group_by treated the evaluation error as "no
+        // match", so `COUNT(*) WHERE ST_KNN_3D(…)` returned 0.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_st_knn)
+        {
+            return Ok(None);
+        }
         use std::collections::HashMap;
 
         let group_by_cols = match &stmt.group_by {
@@ -23642,6 +23778,19 @@ impl QueryExecutor {
         where_clause: &Expr,
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
+        // The index lookup yields candidate rows in distance order and
+        // nothing else: aggregates, GROUP BY, DISTINCT and ORDER BY need the
+        // general pipeline (which evaluates the predicate per row — see the
+        // ST_KNN_3D memo there). Taking the fast path for `COUNT(*) WHERE
+        // ST_KNN_3D(…)` used to return k rows of (NULL, distance).
+        if self.has_aggregates(&stmt.columns)
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.order_by.is_some()
+        {
+            return Ok(None);
+        }
         match where_clause {
             // 3D spatial fast paths (i-Octree)
             Expr::StWithin3D {
@@ -23787,49 +23936,50 @@ impl QueryExecutor {
     }
 
     /// Load rows by row_ids and project columns for spatial fast path
+    /// Load the index's candidate rows (already in distance order) and
+    /// project exactly the SELECT list. `ST_DISTANCE_3D(col, …)` in the list
+    /// is computed from the row's geometry like any other expression; the
+    /// old version appended an extra `distance` column (the *squared*
+    /// distance) to whatever the user selected, so `SELECT id` came back
+    /// with two columns.
     fn load_and_project_spatial_rows(
         &self,
         stmt: &SelectStmt,
         table_name: &str,
         row_ids: &[RowId],
-        dist_map: Option<&std::collections::HashMap<u64, f64>>,
-        _is_within: bool,
     ) -> Result<Option<QueryResult>> {
+        let schema = self.db.get_table_schema(table_name)?;
+        let columns = self.build_select_columns(&stmt.columns, &schema)?;
         if row_ids.is_empty() {
             return Ok(Some(QueryResult::Select {
-                columns: vec![],
+                columns,
                 rows: vec![],
             }));
         }
-
-        let schema = self.db.get_table_schema(table_name)?;
         let limit = stmt.limit.unwrap_or(row_ids.len());
         let row_ids_to_load = &row_ids[..row_ids.len().min(limit)];
-        let columns = self.build_select_columns(&stmt.columns, &schema)?;
 
         let batch_rows = self.db.get_table_rows_batch(table_name, row_ids_to_load)?;
-
-        let mut result_rows = Vec::with_capacity(batch_rows.len());
-        for (row_id, row_opt) in batch_rows {
-            if let Some(row) = row_opt {
-                let mut projected =
-                    Self::project_row_direct(&row, &stmt.columns, &columns, &schema);
-                if let Some(dm) = dist_map {
-                    if let Some(d) = dm.get(&row_id) {
-                        projected.push(Value::Float(*d));
-                    }
-                }
-                result_rows.push(projected);
+        // get_table_rows_batch may reorder (continuous-id fast path); keep the
+        // index's nearest-first order.
+        let mut by_id: std::collections::HashMap<RowId, Row> = batch_rows
+            .into_iter()
+            .filter_map(|(id, r)| r.map(|r| (id, r)))
+            .collect();
+        let mut result_rows = Vec::with_capacity(row_ids_to_load.len());
+        for id in row_ids_to_load {
+            if let Some(row) = by_id.remove(id) {
+                result_rows.push(Self::project_row_direct_checked(
+                    &row,
+                    &stmt.columns,
+                    &columns,
+                    &schema,
+                )?);
             }
         }
 
-        let mut column_names = columns.clone();
-        if dist_map.is_some() {
-            column_names.push("distance".to_string());
-        }
-
         Ok(Some(QueryResult::Select {
-            columns: column_names,
+            columns,
             rows: result_rows,
         }))
     }
@@ -23923,7 +24073,7 @@ impl QueryExecutor {
 
         let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
         // load_and_project_spatial_rows takes care of batch fetching + projection.
-        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, None, false)
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids)
     }
 
     // ==================== 3D Spatial Fast Paths (i-Octree) ====================
@@ -23961,7 +24111,7 @@ impl QueryExecutor {
             Err(_) => return Ok(None),
         };
 
-        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, None, true)
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids)
     }
 
     /// Execute ST_KNN_3D using i-Octree index directly
@@ -23996,9 +24146,7 @@ impl QueryExecutor {
         };
 
         let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
-        let dist_map: std::collections::HashMap<u64, f64> = results.into_iter().collect();
-
-        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, Some(&dist_map), false)
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids)
     }
 
     /// Execute ST_RADIUS_3D using i-Octree index directly
@@ -24033,9 +24181,7 @@ impl QueryExecutor {
         };
 
         let row_ids: Vec<RowId> = results.iter().map(|(id, _)| *id).collect();
-        let dist_map: std::collections::HashMap<u64, f64> = results.into_iter().collect();
-
-        self.load_and_project_spatial_rows(stmt, table_name, &row_ids, Some(&dist_map), false)
+        self.load_and_project_spatial_rows(stmt, table_name, &row_ids)
     }
 
     fn to_bool(&self, val: &Value) -> Result<bool> {
@@ -24646,9 +24792,6 @@ impl QueryExecutor {
 
     // 🚀 P0 FIX: Vector ORDER BY optimization helpers
 
-    /// Brute-force vector KNN: scan all vectors in the columnar store,
-    /// compute L2 distance inline, keep top-K. Used for small tables (<50K)
-    /// where DiskANN graph traversal overhead exceeds brute-force O(N).
     /// Re-order ANN candidates by exact distance against the stored vectors
     /// and keep the best `k`. Rows the table no longer has are dropped; rows
     /// whose vector is NULL or of another dimension keep their approximate
@@ -24696,6 +24839,69 @@ impl QueryExecutor {
         Ok(exact)
     }
 
+    /// The k nearest row ids to (x, y, z): via the i-Octree index when
+    /// present, otherwise an exact scan of the geometry column (segments +
+    /// write buffer).
+    fn spatial_knn_row_ids(
+        &self,
+        table: &str,
+        column: &str,
+        x: f64,
+        y: f64,
+        z: f64,
+        k: usize,
+        index_name: Option<&str>,
+    ) -> Result<Vec<u64>> {
+        if let Some(index_name) = index_name {
+            if self.db.ioctree_indexes.contains_key(index_name) {
+                let point = crate::types::Point3D::new(x, y, z);
+                return Ok(self
+                    .db
+                    .ioctree_knn_query(index_name, &point, k)?
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect());
+            }
+        }
+        let schema = self.db.get_table_schema(table)?;
+        let col_pos = schema.get_column_position(column).unwrap_or(0);
+        let q = [x, y, z];
+        let mut dists: Vec<(f64, u64)> = Vec::new();
+        let offer = |dists: &mut Vec<(f64, u64)>, row_id: u64, g: &crate::types::Geometry| {
+            if let crate::types::Geometry::Point3D(p) = g {
+                let d = (p.x - q[0]).powi(2) + (p.y - q[1]).powi(2) + (p.z - q[2]).powi(2);
+                dists.push((d, row_id));
+            }
+        };
+        if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
+            for seg in store.segments_snapshot() {
+                if col_pos >= seg.sst.column_tags.len() {
+                    continue;
+                }
+                for (row_id, g) in seg.sst.read_spatial(col_pos).unwrap_or_default() {
+                    offer(&mut dists, row_id, &g);
+                }
+            }
+            for (row_id, v) in store.buffered_column_values(col_pos) {
+                if let crate::types::Value::Spatial(g) = v {
+                    offer(&mut dists, row_id, &g);
+                }
+            }
+        } else {
+            for item in self.db.scan_table_rows_streaming(table)? {
+                let (row_id, row) = item?;
+                if let Some(crate::types::Value::Spatial(g)) = row.get(col_pos) {
+                    offer(&mut dists, row_id, g);
+                }
+            }
+        }
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(dists.into_iter().take(k).map(|(_, id)| id).collect())
+    }
+
+    /// Brute-force vector KNN: scan all vectors in the columnar store,
+    /// compute L2 distance inline, keep top-K. Used for small tables (<50K)
+    /// where DiskANN graph traversal overhead exceeds brute-force O(N).
     fn brute_force_vector_knn(
         &self,
         table: &str,

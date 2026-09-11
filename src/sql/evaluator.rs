@@ -571,18 +571,60 @@ impl ExprEvaluator {
                 ))
             }
 
-            Expr::StWithin3D { .. } => Err(MoteDBError::Query(
-                "ST_WITHIN_3D must be evaluated by executor".into(),
-            )),
-            Expr::StDistance3D { .. } => Err(MoteDBError::Query(
-                "ST_DISTANCE_3D must be evaluated by executor".into(),
-            )),
+            // 3D spatial expressions are computed from the row's geometry so
+            // every path — SELECT-list projection, ORDER BY keys, WHERE — gets a
+            // value. They used to error here ("must be evaluated by executor")
+            // and the projection paths swallowed that as NULL: `SELECT id,
+            // ST_DISTANCE_3D(pt, …) FROM t` returned NULL distances, and an
+            // un-indexed `ORDER BY ST_DISTANCE_3D(…) LIMIT k` sorted on NULL —
+            // i.e. returned arbitrary rows.
+            Expr::StWithin3D {
+                column,
+                min_x,
+                min_y,
+                min_z,
+                max_x,
+                max_y,
+                max_z,
+            } => {
+                if row.get("__spatial_within__").is_some() {
+                    return Ok(Value::Bool(true));
+                }
+                let v = self.eval(&Expr::Column(column.clone()), row)?;
+                Ok(Value::Bool(point3d_of(&v).is_some_and(|p| {
+                    p.x >= *min_x
+                        && p.x <= *max_x
+                        && p.y >= *min_y
+                        && p.y <= *max_y
+                        && p.z >= *min_z
+                        && p.z <= *max_z
+                })))
+            }
+            Expr::StDistance3D { column, x, y, z } => {
+                let v = self.eval(&Expr::Column(column.clone()), row)?;
+                Ok(match point3d_of(&v) {
+                    Some(p) => Value::Float(euclid3(&p, *x, *y, *z)),
+                    None => Value::Null,
+                })
+            }
             Expr::StKnn3D { .. } => Err(MoteDBError::Query(
                 "ST_KNN_3D must be evaluated by executor".into(),
             )),
-            Expr::StRadius3D { .. } => Err(MoteDBError::Query(
-                "ST_RADIUS_3D must be evaluated by executor".into(),
-            )),
+            Expr::StRadius3D {
+                column,
+                x,
+                y,
+                z,
+                radius,
+            } => {
+                if row.get("__spatial_knn__").is_some() {
+                    return Ok(Value::Bool(true));
+                }
+                let v = self.eval(&Expr::Column(column.clone()), row)?;
+                Ok(Value::Bool(
+                    point3d_of(&v).is_some_and(|p| euclid3(&p, *x, *y, *z) <= *radius),
+                ))
+            }
 
             Expr::InHashset {
                 expr,
@@ -2596,6 +2638,26 @@ impl Default for ExprEvaluator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The point a GEOMETRY value denotes for 3D spatial functions: a 3D point
+/// as is, a 2D point with z = 0, anything else (NULL, polygons, …) None.
+pub(crate) fn point3d_of(v: &Value) -> Option<crate::types::Point3D> {
+    use crate::types::Geometry;
+    match v {
+        Value::Spatial(g) => match &**g {
+            Geometry::Point3D(p) => Some(*p),
+            Geometry::Point(p) => Some(crate::types::Point3D::new(p.x, p.y, 0.0)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Euclidean distance from `p` to (x, y, z).
+pub(crate) fn euclid3(p: &crate::types::Point3D, x: f64, y: f64, z: f64) -> f64 {
+    let (dx, dy, dz) = (p.x - x, p.y - y, p.z - z);
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 #[cfg(test)]

@@ -1818,33 +1818,15 @@ impl Parser {
                                 self.error("POINT3D() requires exactly 3 arguments (x, y, z)")
                             );
                         }
-                        let x = match &args[0] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => {
-                                return Err(
-                                    self.error("POINT3D() arguments must be numeric literals")
-                                )
-                            }
-                        };
-                        let y = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => {
-                                return Err(
-                                    self.error("POINT3D() arguments must be numeric literals")
-                                )
-                            }
-                        };
-                        let z = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => {
-                                return Err(
-                                    self.error("POINT3D() arguments must be numeric literals")
-                                )
-                            }
-                        };
+                        let x = Self::eval_num(&args[0]).map_err(|_| {
+                            self.error("POINT3D() arguments must be numeric literals")
+                        })?;
+                        let y = Self::eval_num(&args[1]).map_err(|_| {
+                            self.error("POINT3D() arguments must be numeric literals")
+                        })?;
+                        let z = Self::eval_num(&args[2]).map_err(|_| {
+                            self.error("POINT3D() arguments must be numeric literals")
+                        })?;
                         use crate::types::{Geometry as G3, Point3D};
                         Ok(Expr::Literal(Value::spatial(G3::Point3D(Point3D::new(
                             x, y, z,
@@ -2003,29 +1985,17 @@ impl Parser {
                             }
                         };
 
-                        let min_x = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_WITHIN() min_x must be a number")),
-                        };
+                        let min_x = Self::eval_num(&args[1])
+                            .map_err(|_| self.error("ST_WITHIN() min_x must be a number"))?;
 
-                        let min_y = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_WITHIN() min_y must be a number")),
-                        };
+                        let min_y = Self::eval_num(&args[2])
+                            .map_err(|_| self.error("ST_WITHIN() min_y must be a number"))?;
 
-                        let max_x = match &args[3] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_WITHIN() max_x must be a number")),
-                        };
+                        let max_x = Self::eval_num(&args[3])
+                            .map_err(|_| self.error("ST_WITHIN() max_x must be a number"))?;
 
-                        let max_y = match &args[4] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_WITHIN() max_y must be a number")),
-                        };
+                        let max_y = Self::eval_num(&args[4])
+                            .map_err(|_| self.error("ST_WITHIN() max_y must be a number"))?;
 
                         // 2D ST_WITHIN: the z range is unbounded (±∞) so it does
                         // not filter out any point based on z. Using z∈[0,0] would
@@ -2083,17 +2053,11 @@ impl Parser {
                             }
                         };
 
-                        let x = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_KNN() x must be a number")),
-                        };
+                        let x = Self::eval_num(&args[1])
+                            .map_err(|_| self.error("ST_KNN() x must be a number"))?;
 
-                        let y = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("ST_KNN() y must be a number")),
-                        };
+                        let y = Self::eval_num(&args[2])
+                            .map_err(|_| self.error("ST_KNN() y must be a number"))?;
 
                         let k = match &args[3] {
                             Expr::Literal(Value::Integer(i)) if *i > 0 => *i as usize,
@@ -2119,16 +2083,14 @@ impl Parser {
                                 )
                             }
                         };
-                        let nums: Result<Vec<f64>> =
-                            args[1..]
-                                .iter()
-                                .map(|a| match a {
-                                    Expr::Literal(Value::Float(f)) => Ok(*f),
-                                    Expr::Literal(Value::Integer(i)) => Ok(*i as f64),
-                                    _ => Err(self
-                                        .error("ST_WITHIN_3D() bounds must be numeric literals")),
+                        let nums: Result<Vec<f64>> = args[1..]
+                            .iter()
+                            .map(|a| {
+                                Self::eval_num(a).map_err(|_| {
+                                    self.error("ST_WITHIN_3D() bounds must be numeric literals")
                                 })
-                                .collect();
+                            })
+                            .collect();
                         let nums = nums?;
                         Ok(Expr::StWithin3D {
                             column,
@@ -2152,21 +2114,12 @@ impl Parser {
                                 )
                             }
                         };
-                        let x = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("x must be numeric")),
-                        };
-                        let y = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("y must be numeric")),
-                        };
-                        let z = match &args[3] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("z must be numeric")),
-                        };
+                        let x = Self::eval_num(&args[1])
+                            .map_err(|_| self.error("x must be numeric"))?;
+                        let y = Self::eval_num(&args[2])
+                            .map_err(|_| self.error("y must be numeric"))?;
+                        let z = Self::eval_num(&args[3])
+                            .map_err(|_| self.error("z must be numeric"))?;
                         Ok(Expr::StDistance3D { column, x, y, z })
                     } else if name.to_uppercase() == "ST_KNN_3D" {
                         if args.len() != 5 {
@@ -2182,21 +2135,12 @@ impl Parser {
                                 )
                             }
                         };
-                        let x = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("x must be numeric")),
-                        };
-                        let y = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("y must be numeric")),
-                        };
-                        let z = match &args[3] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("z must be numeric")),
-                        };
+                        let x = Self::eval_num(&args[1])
+                            .map_err(|_| self.error("x must be numeric"))?;
+                        let y = Self::eval_num(&args[2])
+                            .map_err(|_| self.error("y must be numeric"))?;
+                        let z = Self::eval_num(&args[3])
+                            .map_err(|_| self.error("z must be numeric"))?;
                         let k = match &args[4] {
                             Expr::Literal(Value::Integer(i)) if *i > 0 => *i as usize,
                             _ => return Err(self.error("ST_KNN_3D() k must be a positive integer")),
@@ -2216,26 +2160,14 @@ impl Parser {
                                 )
                             }
                         };
-                        let x = match &args[1] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("x must be numeric")),
-                        };
-                        let y = match &args[2] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("y must be numeric")),
-                        };
-                        let z = match &args[3] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("z must be numeric")),
-                        };
-                        let radius = match &args[4] {
-                            Expr::Literal(Value::Float(f)) => *f,
-                            Expr::Literal(Value::Integer(i)) => *i as f64,
-                            _ => return Err(self.error("radius must be numeric")),
-                        };
+                        let x = Self::eval_num(&args[1])
+                            .map_err(|_| self.error("x must be numeric"))?;
+                        let y = Self::eval_num(&args[2])
+                            .map_err(|_| self.error("y must be numeric"))?;
+                        let z = Self::eval_num(&args[3])
+                            .map_err(|_| self.error("z must be numeric"))?;
+                        let radius = Self::eval_num(&args[4])
+                            .map_err(|_| self.error("radius must be numeric"))?;
                         Ok(Expr::StRadius3D {
                             column,
                             x,
