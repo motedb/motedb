@@ -766,6 +766,55 @@ impl FixedSegment {
     }
 }
 
+/// Copy little-endian f32 bytes into an aligned f32 buffer. On little-endian
+/// targets this is a plain memcpy (f32 has no invalid bit patterns and `dst`
+/// is a real `[f32]`, so the byte view is sound); elsewhere it converts.
+#[inline]
+pub fn copy_le_f32(dst: &mut [f32], src: &[u8]) {
+    debug_assert_eq!(dst.len() * 4, src.len());
+    #[cfg(target_endian = "little")]
+    {
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 4) };
+        bytes.copy_from_slice(src);
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for (d, c) in dst.iter_mut().zip(src.chunks_exact(4)) {
+            *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+    }
+}
+
+/// Decoded vector column: `dim` f32 per row (zeros for NULL rows), owned and
+/// therefore 4-byte aligned, so a row can be handed out as `&[f32]` without
+/// a copy. The on-disk payload puts the floats after a null bitmap and a
+/// u16 dim header, i.e. at an unaligned offset — reinterpreting it in place
+/// as `&[f32]` is UB (and aborts under debug assertions).
+#[derive(Clone)]
+pub struct VectorSegment {
+    pub num_rows: usize,
+    pub dim: usize,
+    data: Arc<Vec<f32>>,
+    nulls: Arc<Vec<u8>>,
+}
+
+impl VectorSegment {
+    /// Row `i`'s floats, or None when the cell is NULL.
+    #[inline]
+    pub fn row(&self, i: usize) -> Option<&[f32]> {
+        if i >= self.num_rows || (self.nulls[i / 8] >> (i % 8)) & 1 != 0 {
+            return None;
+        }
+        let start = i * self.dim;
+        self.data.get(start..start + self.dim)
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.data.len() * 4 + self.nulls.len()
+    }
+}
+
 /// Typed view into a text column segment. Zero-copy from mmap when available.
 #[derive(Clone)]
 pub struct TextSegment {
@@ -2151,6 +2200,75 @@ impl ColumnarSSTable {
         }
     }
 
+    /// Bounded byte read at an absolute file offset: resident buffer, then
+    /// mmap, then the cached file handle.
+    fn read_bytes_at(&self, offset: usize, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let end = offset + len;
+        if !self.file_data.is_empty() {
+            return self
+                .file_data
+                .get(offset..end)
+                .map(std::borrow::Cow::Borrowed)
+                .ok_or_else(|| StorageError::InvalidData("read out of bounds".into()));
+        }
+        if let Some(ref mmap) = self.mmap {
+            if end <= mmap.len() {
+                return Ok(std::borrow::Cow::Borrowed(&mmap[offset..end]));
+            }
+        }
+        let mut buf = vec![0u8; len];
+        self.read_raw(offset, &mut buf)?;
+        Ok(std::borrow::Cow::Owned(buf))
+    }
+
+    /// Point-read one row of an UNCOMPRESSED Vector column with two bounded
+    /// reads. `Ok(None)` is NULL. Compressed segments (flag ≠ 0) return
+    /// `Err`: decoding the whole column per row would cost O(column) each
+    /// time, so callers go through the cached full decode instead (see
+    /// `Segment::read_vectors_cached`).
+    ///
+    /// Segment layout (after the flag byte): `[null_bitmap][dim:u16][f32×dim
+    /// per row]`.
+    pub fn read_vector_at(&self, col_idx: usize, row_idx: usize) -> Result<Option<Vec<f32>>> {
+        let entry = self
+            .column_index
+            .get(col_idx)
+            .ok_or_else(|| StorageError::InvalidData("column out of range".into()))?;
+        if row_idx >= self.num_rows {
+            return Ok(None);
+        }
+        let null_bytes = self.num_rows.div_ceil(8);
+        let seg_start = entry.offset as usize;
+        let seg_end = seg_start + entry.size as usize;
+        let flag = self.read_bytes_at(seg_start, 1)?[0];
+        if flag != 0 {
+            return Err(StorageError::InvalidData(
+                "compressed segment — use full-column decode".into(),
+            ));
+        }
+        // Header (null bitmap + dim), then just this row's floats.
+        let data_start = seg_start + 1;
+        let head = self.read_bytes_at(data_start, null_bytes + 2)?;
+        if (head[row_idx / 8] >> (row_idx % 8)) & 1 != 0 {
+            return Ok(None);
+        }
+        let dim = u16::from_le_bytes([head[null_bytes], head[null_bytes + 1]]) as usize;
+        if dim == 0 {
+            return Ok(None);
+        }
+        let row_off = data_start + null_bytes + 2 + row_idx * dim * 4;
+        if row_off + dim * 4 > seg_end {
+            return Ok(None);
+        }
+        let bytes = self.read_bytes_at(row_off, dim * 4)?;
+        Ok(Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        ))
+    }
+
     /// Hint the OS to drop cached pages for this file (Linux: posix_fadvise
     /// DONTNEED). This reduces RSS after heavy column scans. On macOS it's a
     /// no-op (no per-file fadvise), but the OS reclaims pages under pressure.
@@ -2513,6 +2631,44 @@ impl ColumnarSSTable {
 
     /// Read vector data from column segment.
     /// Format: [flag: u8] [null_bitmap] [dim: u16 LE] [f32×dim per row]
+    /// Decode a whole Vector column into an aligned `VectorSegment`
+    /// (`[null_bitmap][dim:u16][f32×dim per row]` → owned f32s).
+    pub fn read_vector_segment(&self, col_idx: usize) -> Result<VectorSegment> {
+        let entry = self
+            .column_index
+            .get(col_idx)
+            .ok_or_else(|| StorageError::InvalidData("column out of range".into()))?;
+        let seg_bytes = self.read_segment_bytes(
+            entry.offset as usize,
+            (entry.offset + entry.size) as usize,
+            col_idx,
+        );
+        let data = seg_bytes.as_ref();
+        let null_bytes = self.num_rows.div_ceil(8);
+        if null_bytes + 2 > data.len() {
+            return Err(StorageError::InvalidData("vector segment too short".into()));
+        }
+        let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes + 1]]) as usize;
+        let stride = dim * 4;
+        let data_start = null_bytes + 2;
+        let n = if stride == 0 {
+            0
+        } else {
+            ((data.len() - data_start) / stride).min(self.num_rows)
+        };
+        let mut floats = vec![0f32; self.num_rows * dim];
+        copy_le_f32(
+            &mut floats[..n * dim],
+            &data[data_start..data_start + n * stride],
+        );
+        Ok(VectorSegment {
+            num_rows: self.num_rows,
+            dim,
+            data: Arc::new(floats),
+            nulls: Arc::new(data[..null_bytes].to_vec()),
+        })
+    }
+
     pub fn read_vectors(&self, col_idx: usize) -> Result<Vec<(RowId, Vec<f32>)>> {
         let entry = &self.column_index[col_idx];
         // Use read_segment_bytes (handles file_data / mmap / seek+read fallbacks
@@ -3468,13 +3624,21 @@ impl ColumnarSSTableBuilder {
             // - read_text_paged can read raw offsets/strings from the file
             //   without Snappy decompression (page-level text cache).
             // Text data doesn't compress well (varied UTF-8), and the page-level
-            // cache needs raw bytes. Vector/Spatial columns are still compressed.
+            // cache needs raw bytes. Spatial columns are still compressed.
             let is_fixed = col_idx < self.column_tags.len() && self.column_tags[col_idx].is_fixed();
             let is_text = col_idx < self.column_tags.len()
                 && matches!(self.column_tags[col_idx], ColumnTypeTag::Text);
+            // Vector columns are always stored raw: f32 embeddings compress by
+            // only ~8% (exponent bytes repeat), while whole-column
+            // compression turns every point read — PK lookups, ORDER BY …
+            // LIMIT, and the ANN re-rank's candidate fetch — into a full
+            // decompression (~400ms for a 300MB segment; p95 of indexed
+            // vector queries went 33ms → 460ms). Raw keeps read_vector_at O(1).
+            let is_vector = col_idx < self.column_tags.len()
+                && matches!(self.column_tags[col_idx], ColumnTypeTag::Vector);
             // 🚀 compact_storage 模式：Fixed/Text 列也尝试 Snappy 压缩。
             // 默认 false（高性能 O(1) 点查），for_edge/robotics/embodied 设 true。
-            let store_uncompressed = (is_fixed || is_text) && !self.compact_storage;
+            let store_uncompressed = ((is_fixed || is_text) && !self.compact_storage) || is_vector;
             let seg_data: Vec<u8> = if store_uncompressed {
                 // Store uncompressed — enables O(1)/page-level reads.
                 let mut out = Vec::with_capacity(1 + seg.len());

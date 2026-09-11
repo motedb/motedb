@@ -1,4 +1,6 @@
-use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTable, FixedSegment, TextSegment};
+use crate::storage::lsm::columnar::{
+    ColumnTypeTag, ColumnarSSTable, FixedSegment, TextSegment, VectorSegment,
+};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,6 +10,11 @@ enum CachedCol {
     #[allow(dead_code)]
     Fixed(FixedSegment),
     Text(TextSegment),
+    Vector(VectorSegment),
+    /// (row_id, geometry) pairs — small (bincode per point), decoded once
+    /// per segment. Point reads of a GEOMETRY column used to decode the
+    /// whole column per row (0.5ms each on a 20K-row table).
+    Spatial(Arc<Vec<(crate::types::RowId, crate::types::Geometry)>>),
 }
 
 /// Max columns cached per segment. Each entry is O(rows) decoded data, so we
@@ -142,6 +149,8 @@ fn cached_col_bytes(c: &CachedCol) -> usize {
     match c {
         CachedCol::Fixed(f) => f.heap_bytes(),
         CachedCol::Text(t) => t.heap_bytes(),
+        CachedCol::Vector(v) => v.heap_bytes(),
+        CachedCol::Spatial(gs) => gs.len() * 32 + 16,
     }
 }
 
@@ -222,6 +231,51 @@ impl Segment {
         self.col_cache
             .lock()
             .insert(col_idx, CachedCol::Text(seg.clone()));
+        Some(seg)
+    }
+
+    /// Read a spatial column through the cross-query col_cache.
+    pub fn read_spatial_cached(
+        &self,
+        col_idx: usize,
+    ) -> Option<Arc<Vec<(crate::types::RowId, crate::types::Geometry)>>> {
+        {
+            let mut cache = self.col_cache.lock();
+            if let Some(CachedCol::Spatial(gs)) = cache.get(col_idx) {
+                return Some(Arc::clone(gs));
+            }
+        }
+        let gs = Arc::new(self.sst.read_spatial(col_idx).ok()?);
+        self.col_cache
+            .lock()
+            .insert(col_idx, CachedCol::Spatial(Arc::clone(&gs)));
+        Some(gs)
+    }
+
+    /// The decoded vector column if it is already in the col_cache (no I/O,
+    /// no decode, no insertion).
+    pub fn cached_vectors(&self, col_idx: usize) -> Option<VectorSegment> {
+        let mut cache = self.col_cache.lock();
+        match cache.get(col_idx) {
+            Some(CachedCol::Vector(v)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    /// Read a vector column as an aligned, decoded `VectorSegment`, using the
+    /// cross-query col_cache (so repeated kNN scans don't re-read and
+    /// re-decode the column; the store's byte budget bounds what stays).
+    pub fn read_vectors_cached(&self, col_idx: usize) -> Option<VectorSegment> {
+        {
+            let mut cache = self.col_cache.lock();
+            if let Some(CachedCol::Vector(v)) = cache.get(col_idx) {
+                return Some(v.clone());
+            }
+        }
+        let seg = self.sst.read_vector_segment(col_idx).ok()?;
+        self.col_cache
+            .lock()
+            .insert(col_idx, CachedCol::Vector(seg.clone()));
         Some(seg)
     }
 
@@ -389,10 +443,57 @@ impl Segment {
                 continue;
             }
 
+            // Vector / Spatial: bounded per-row read. These used to fall
+            // through to the "unknown type" arm below, so every point lookup
+            // and ORDER BY … LIMIT materialization returned NULL for flushed
+            // embeddings while full scans (read_vectors) were correct.
+            if matches!(
+                tag,
+                Some(ColumnTypeTag::Vector) | Some(ColumnTypeTag::Spatial)
+            ) {
+                row.push(self.read_var_value_at(ci, idx));
+                continue;
+            }
+
             // Unknown column type.
             row.push(Value::Null);
         }
         row
+    }
+
+    /// Point-read one Vector or Spatial cell — the variable-width column
+    /// kinds that have no per-column decoded cache (a whole vector column is
+    /// far larger than the handful of rows a point path needs). Any other
+    /// column kind, a NULL cell, or a read failure yields `Value::Null`.
+    pub fn read_var_value_at(&self, ci: usize, row_idx: usize) -> crate::types::Value {
+        use crate::types::Value;
+        match self.sst.column_tags.get(ci).copied() {
+            Some(ColumnTypeTag::Vector) => match self.sst.read_vector_at(ci, row_idx) {
+                Ok(Some(v)) => Value::Vector(crate::types::ArcVec::new(v)),
+                Ok(None) => Value::Null,
+                // Compressed segment: decode the column once into the
+                // budgeted col_cache rather than per row (10 point reads of
+                // a Snappy'd 8MB column cost 20ms otherwise).
+                Err(_) => self
+                    .read_vectors_cached(ci)
+                    .and_then(|vs| {
+                        vs.row(row_idx)
+                            .map(|r| Value::Vector(crate::types::ArcVec::new(r.to_vec())))
+                    })
+                    .unwrap_or(Value::Null),
+            },
+            Some(ColumnTypeTag::Spatial) => {
+                let row_id = (self.sst.row_map.key(row_idx) & 0xFFFF_FFFF) as crate::types::RowId;
+                self.read_spatial_cached(ci)
+                    .and_then(|gs| {
+                        gs.iter()
+                            .find(|(rid, _)| *rid == row_id)
+                            .map(|(_, g)| Value::Spatial(Box::new(g.clone())))
+                    })
+                    .unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        }
     }
 
     /// Read a text value using page-level caching. Reads a small window of

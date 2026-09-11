@@ -997,6 +997,13 @@ impl ColSegmentStore {
                                         fopt.as_ref().and_then(|f| f.get_i64(i)).map(Value::Integer)
                                     }
                                 }
+                            } else if matches!(
+                                seg.sst.column_tags[pc],
+                                ColumnTypeTag::Vector | ColumnTypeTag::Spatial
+                            ) {
+                                // Was decoded as text → NULL: `WHERE … ORDER BY …
+                                // LIMIT k` never returned an embedding.
+                                Some(seg.read_var_value_at(pc, i))
                             } else {
                                 match seg
                                     .read_text_cached(pc)
@@ -1716,10 +1723,9 @@ impl ColSegmentStore {
                 .iter()
                 .map(|&pc| {
                     if pc < seg.sst.column_tags.len()
-                        && !seg.sst.column_tags[pc].is_fixed()
-                        && !matches!(
+                        && matches!(
                             seg.sst.column_tags[pc],
-                            crate::storage::lsm::columnar::ColumnTypeTag::Spatial
+                            crate::storage::lsm::columnar::ColumnTypeTag::Text
                         )
                     {
                         seg.sst.read_text(pc).ok()
@@ -1803,6 +1809,11 @@ impl ColSegmentStore {
                                 }
                                 (_, Some(Some(t)), ColumnType::Text) => {
                                     t.get_str(i).map(|s| Value::Text(s.into()))
+                                }
+                                // Vector / Spatial were decoded as text → NULL:
+                                // `WHERE id > 0` never returned an embedding.
+                                (_, _, ColumnType::Tensor(_)) | (_, _, ColumnType::Spatial) => {
+                                    Some(seg.read_var_value_at(pc, i))
                                 }
                                 _ => Some(Value::Null),
                             }
@@ -1912,7 +1923,8 @@ impl ColSegmentStore {
                                 Value::Text(ArcString(arc))
                             })
                         } else {
-                            Some(Value::Null)
+                            // Vector / Spatial (NULL for anything else).
+                            Some(seg.read_var_value_at(pc, i))
                         };
                         row.push(v.unwrap_or(Value::Null));
                     }
@@ -1957,7 +1969,8 @@ impl ColSegmentStore {
                             Value::Text(ArcString(arc))
                         })
                     } else {
-                        Some(Value::Null)
+                        // Vector / Spatial (NULL for anything else).
+                        Some(seg.read_var_value_at(pc, i))
                     };
                     row.push(v.unwrap_or(Value::Null));
                 }
@@ -3023,7 +3036,12 @@ impl ColSegmentStore {
                     t.get_str(row_idx)
                         .map(|s| Value::Text(ArcString(std::sync::Arc::from(s))))
                 } else {
-                    None
+                    // Vector / Spatial: not pre-decoded (a whole vector column
+                    // is far larger than the K rows we need) — bounded per-row
+                    // read. These used to fall out as NULL, so
+                    // `SELECT emb … ORDER BY id LIMIT k` never returned an
+                    // embedding.
+                    Some(seg.read_var_value_at(ci, row_idx))
                 };
                 row.push(v.unwrap_or(Value::Null));
             }

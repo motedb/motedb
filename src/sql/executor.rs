@@ -10388,6 +10388,9 @@ impl QueryExecutor {
                                     enum Col {
                                         Text(TextSegment),
                                         Fixed(FixedSegment),
+                                        /// Vector / Spatial — no column-level
+                                        /// decode; read per row below.
+                                        PerRow,
                                         None,
                                     }
                                     let mut col_cache: std::collections::HashMap<
@@ -10414,6 +10417,17 @@ impl QueryExecutor {
                                                             Ok(t) => Col::Text(t),
                                                             Err(_) => Col::None,
                                                         }
+                                                    } else if matches!(
+                                                        col_types.get(pc),
+                                                        Some(crate::types::ColumnType::Tensor(_))
+                                                            | Some(
+                                                                crate::types::ColumnType::Spatial
+                                                            )
+                                                    ) {
+                                                        // Was read as a fixed column → error →
+                                                        // NULL: `SELECT emb … ORDER BY id LIMIT k`
+                                                        // never returned an embedding.
+                                                        Col::PerRow
                                                     } else {
                                                         match seg.sst.read_fixed_i64(pc) {
                                                             Ok(f) => Col::Fixed(f),
@@ -10422,6 +10436,7 @@ impl QueryExecutor {
                                                     }
                                                 });
                                             let v = match col {
+                                                Col::PerRow => seg.read_var_value_at(pc, local_row),
                                                 Col::Text(t) => t
                                                     .get_str(local_row)
                                                     .map(|s| Value::Text(s.into()))
