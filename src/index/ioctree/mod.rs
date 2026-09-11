@@ -73,6 +73,12 @@ pub struct IOctreeIndex {
     name: String,
     /// Tier 1: disk-backed leaf storage with LRU cache
     leaf_store: LeafStore,
+    /// Points that don't fit in the tree: coincident points pile up in the
+    /// leaf at min_extent, whose slot holds at most MAX_POINTS_PER_SLOT —
+    /// the old code "force"-inserted there and the points silently vanished
+    /// (1,004 rows moved to one coordinate, 972 never found again). Kept flat
+    /// and merged into every query/delete.
+    pub(crate) overflow: Vec<IndexedPoint3D>,
 }
 
 impl IOctreeIndex {
@@ -112,6 +118,7 @@ impl IOctreeIndex {
             world_bounds,
             name,
             leaf_store,
+            overflow: Vec::new(),
         })
     }
 
@@ -147,13 +154,17 @@ impl IOctreeIndex {
         }
 
         // Direct insert into tree (data goes to LeafStore with bounded LRU cache)
-        self.insert_into_tree(indexed)?;
+        if !self.insert_into_tree(indexed)? {
+            self.overflow.push(indexed);
+        }
         self.size += 1;
         Ok(())
     }
 
-    /// Insert a point directly into the octree structure
-    fn insert_into_tree(&mut self, point: IndexedPoint3D) -> Result<()> {
+    /// Insert a point into the octree structure. Returns false when the point
+    /// had to go to the overflow list (min-extent leaf already full of
+    /// coincident points).
+    fn insert_into_tree(&mut self, point: IndexedPoint3D) -> Result<bool> {
         let bucket_size = self.config.bucket_size;
         let min_extent = self.config.min_extent /*as f64*/;
         tree_insert(
@@ -167,7 +178,12 @@ impl IOctreeIndex {
 
     /// Delete a point by row_id
     pub fn delete(&mut self, row_id: u64) -> bool {
-        let removed = tree_delete(&self.leaf_store, &mut self.root, row_id);
+        let mut removed = tree_delete(&self.leaf_store, &mut self.root, row_id);
+        if !removed {
+            let before = self.overflow.len();
+            self.overflow.retain(|p| p.row_id != row_id);
+            removed = self.overflow.len() < before;
+        }
         if removed {
             self.size = self.size.saturating_sub(1);
         }
@@ -186,27 +202,70 @@ impl IOctreeIndex {
             bbox.max_y, /*as f64*/
             bbox.max_z, /*as f64*/
         ];
-        search::range_search(&self.root, &min, &max, &self.leaf_store)
+        let mut ids = search::range_search(&self.root, &min, &max, &self.leaf_store);
+        ids.extend(
+            self.overflow
+                .iter()
+                .filter(|p| {
+                    let a = p.as_array();
+                    a[0] >= min[0]
+                        && a[0] <= max[0]
+                        && a[1] >= min[1]
+                        && a[1] <= max[1]
+                        && a[2] >= min[2]
+                        && a[2] <= max[2]
+                })
+                .map(|p| p.row_id),
+        );
+        ids
     }
 
-    /// KNN query: find k nearest neighbors
+    /// KNN query: find k nearest neighbors as `(row_id, euclidean distance)`,
+    /// nearest first. The tree walk prunes on squared distances; the square
+    /// root is taken here so callers (the SQL `ST_DISTANCE_3D` fast path,
+    /// `Database::ioctree_knn_search`) get real distances — they used to
+    /// receive the squared value.
     pub fn knn_query(&self, point: &Point3D, k: usize) -> Vec<(u64, f64)> {
-        let query = [
-            point.x, /*as f64*/
-            point.y, /*as f64*/
-            point.z, /*as f64*/
-        ];
-        search::knn_search(&self.root, &query, k, &self.leaf_store)
+        let query = [point.x, point.y, point.z];
+        let results = search::knn_search(&self.root, &query, k, &self.leaf_store);
+        if self.overflow.is_empty() {
+            return results
+                .into_iter()
+                .map(|(id, d2)| (id, d2.sqrt()))
+                .collect();
+        }
+        let mut merged: Vec<(u64, f64)> = results
+            .into_iter()
+            .map(|(id, d2)| (id, d2.sqrt()))
+            .chain(self.overflow.iter().map(|p| {
+                let a = p.as_array();
+                let (dx, dy, dz) = (a[0] - query[0], a[1] - query[1], a[2] - query[2]);
+                (p.row_id, (dx * dx + dy * dy + dz * dz).sqrt())
+            }))
+            .collect();
+        merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.truncate(k);
+        merged
     }
 
-    /// Radius search: find all points within a given radius
+    /// Radius search: all points within `radius` as `(row_id, euclidean
+    /// distance)`, nearest first.
     pub fn radius_search(&self, center: &Point3D, radius: f64) -> Vec<(u64, f64)> {
-        let c = [
-            center.x, /*as f64*/
-            center.y, /*as f64*/
-            center.z, /*as f64*/
-        ];
-        search::radius_search(&self.root, &c, radius /*as f64*/, &self.leaf_store)
+        let c = [center.x, center.y, center.z];
+        let mut results = search::radius_search(&self.root, &c, radius, &self.leaf_store)
+            .into_iter()
+            .map(|(id, d2)| (id, d2.sqrt()))
+            .collect::<Vec<_>>();
+        if !self.overflow.is_empty() {
+            results.extend(self.overflow.iter().filter_map(|p| {
+                let a = p.as_array();
+                let (dx, dy, dz) = (a[0] - c[0], a[1] - c[1], a[2] - c[2]);
+                let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                (d <= radius).then(|| (p.row_id, d))
+            }));
+            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        results
     }
 
     /// Number of indexed points
@@ -280,13 +339,15 @@ impl IOctreeIndex {
 
 // === Free functions for tree operations (avoids borrow checker issues) ===
 
+/// Returns true when the point was placed in the tree, false when it went to
+/// the caller's overflow list.
 fn tree_insert(
     store: &LeafStore,
     octant: &mut Octant,
     point: IndexedPoint3D,
     bucket_size: usize,
     min_extent: f64,
-) -> Result<()> {
+) -> Result<bool> {
     match octant {
         Octant::Leaf {
             center: _,
@@ -302,8 +363,11 @@ fn tree_insert(
                     // Re-insert into the now-split tree
                     return tree_insert(store, octant, point, bucket_size, min_extent);
                 }
-                // Can't split further (at min_extent) — force the insert anyway
-                store.add_point(*leaf_id, point)?;
+                // At min_extent and still full: every point in this leaf is
+                // within a 2×min_extent box, i.e. coincident for practical
+                // purposes. The old code called add_point again and ignored
+                // the second `false` — silently dropping the point.
+                return Ok(false);
             }
             *point_count = store.point_count(*leaf_id)? as u32;
 
@@ -331,11 +395,13 @@ fn tree_insert(
                 )));
             }
             if let Some(ref mut child) = children[code] {
-                tree_insert(store, child, point, bucket_size, min_extent)?;
+                if !tree_insert(store, child, point, bucket_size, min_extent)? {
+                    return Ok(false);
+                }
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn split_leaf(store: &LeafStore, octant: &mut Octant) -> Result<()> {

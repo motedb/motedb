@@ -6,7 +6,8 @@
 //! v1 migration: on load, converts old Vec<IndexedPoint3D> format to v2
 
 use super::leaf_store::LeafStore;
-use super::{IOctreeConfig, IOctreeIndex};
+use super::node::Octant;
+use super::{IOctreeConfig, IOctreeIndex, IndexedPoint3D};
 use crate::types::BoundingBox3D;
 use crate::{Result, StorageError};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -14,6 +15,11 @@ use std::io::{BufReader, BufWriter, Read, Write};
 const MAGIC: u32 = 0x10C7_10EE;
 const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
+/// v3 = v2 + a trailing overflow-points section (coincident points that don't
+/// fit in a min-extent leaf slot; see `IOctreeIndex::overflow`).
+const VERSION_V3: u32 = 3;
+/// Marks the start of the v3 overflow section.
+const OVERFLOW_MARKER: u32 = 0x0BE5_0FF5;
 
 fn io_err(e: std::io::Error) -> StorageError {
     StorageError::Io(e)
@@ -31,7 +37,7 @@ pub fn save(tree: &IOctreeIndex, path: &std::path::Path) -> Result<()> {
     // Header
     writer.write_all(&MAGIC.to_le_bytes()).map_err(io_err)?;
     writer
-        .write_all(&VERSION_V2.to_le_bytes())
+        .write_all(&VERSION_V3.to_le_bytes())
         .map_err(io_err)?;
     writer
         .write_all(&(tree.size as u64).to_le_bytes())
@@ -65,14 +71,30 @@ pub fn save(tree: &IOctreeIndex, path: &std::path::Path) -> Result<()> {
         .map_err(io_err)?;
     writer.write_all(name_bytes).map_err(io_err)?;
 
-    // Tree structure (Octant with leaf handles)
+    // Tree structure (Octant with leaf handles), length-prefixed (v3: the
+    // overflow section follows, so the tree can't be "everything to EOF").
     let tree_bytes = bincode::serialize(&tree.root)
         .map_err(|e| StorageError::InvalidData(format!("Serialize tree: {}", e)))?;
+    writer
+        .write_all(&(tree_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
     writer.write_all(&tree_bytes).map_err(io_err)?;
 
     // CRC32 footer
     let crc = crc32fast::hash(&tree_bytes);
     writer.write_all(&crc.to_le_bytes()).map_err(io_err)?;
+
+    // v3 trailing section: overflow points (empty → marker + 0 length, so the
+    // file format is uniform).
+    writer
+        .write_all(&OVERFLOW_MARKER.to_le_bytes())
+        .map_err(io_err)?;
+    let overflow_bytes = bincode::serialize(&tree.overflow)
+        .map_err(|e| StorageError::InvalidData(format!("Serialize overflow: {}", e)))?;
+    writer
+        .write_all(&(overflow_bytes.len() as u32).to_le_bytes())
+        .map_err(io_err)?;
+    writer.write_all(&overflow_bytes).map_err(io_err)?;
 
     writer.flush().map_err(io_err)?;
     // fsync for crash safety — without this, a power failure after save()
@@ -106,6 +128,7 @@ pub fn load(path: &std::path::Path, _config: IOctreeConfig, _name: String) -> Re
     match version {
         VERSION_V1 => load_v1(&mut reader, path),
         VERSION_V2 => load_v2(&mut reader, path),
+        VERSION_V3 => load_v3(&mut reader, path),
         _ => Err(StorageError::InvalidData(format!(
             "Unsupported i-Octree version {}",
             version
@@ -197,6 +220,7 @@ fn load_v2(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         world_bounds,
         name,
         leaf_store,
+        overflow: Vec::new(),
     })
 }
 
@@ -281,12 +305,104 @@ fn load_v1(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Res
         world_bounds,
         name,
         leaf_store,
+        overflow: Vec::new(),
+    })
+}
+
+/// The LeafStore directory for a saved index: `config.data_dir` may be the
+/// ioctree.bin FILE path (that's what the DB layer passes at create time);
+/// `IOctreeIndex::new` normalizes it to the parent — loaders must too.
+fn leaf_store_dir(config: &IOctreeConfig, path: &std::path::Path) -> std::path::PathBuf {
+    match config.data_dir.as_ref() {
+        Some(p) if p.extension().map(|e| e == "bin").unwrap_or(false) => {
+            p.parent().unwrap_or(p).to_path_buf()
+        }
+        Some(p) => p.clone(),
+        None => path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
+    }
+}
+
+/// v3 layout: `[magic][3][size][config][bounds][name][tree_len][tree][crc]
+/// [OVERFLOW_MARKER][overflow]`. The tree is length-prefixed because the
+/// overflow section follows — v2's "tree = everything to EOF" doesn't work.
+fn load_v3(reader: &mut BufReader<std::fs::File>, path: &std::path::Path) -> Result<IOctreeIndex> {
+    use std::io::Read as _;
+    let mut buf8 = [0u8; 8];
+    let mut buf4 = [0u8; 4];
+    reader.read_exact(&mut buf8).map_err(io_err)?;
+    let size = u64::from_le_bytes(buf8) as usize;
+
+    reader.read_exact(&mut buf4).map_err(io_err)?;
+    let config_len = u32::from_le_bytes(buf4) as usize;
+    let mut config_buf = vec![0u8; config_len];
+    reader.read_exact(&mut config_buf).map_err(io_err)?;
+    let config: IOctreeConfig = bincode::deserialize(&config_buf)
+        .map_err(|e| StorageError::InvalidData(format!("Deserialize config: {}", e)))?;
+
+    let mut bounds = [0f64; 6];
+    for b in bounds.iter_mut() {
+        reader.read_exact(&mut buf8).map_err(io_err)?;
+        *b = f64::from_le_bytes(buf8);
+    }
+    let world_bounds = BoundingBox3D::new(
+        bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5],
+    );
+
+    reader.read_exact(&mut buf4).map_err(io_err)?;
+    let name_len = u32::from_le_bytes(buf4) as usize;
+    let mut name_buf = vec![0u8; name_len];
+    reader.read_exact(&mut name_buf).map_err(io_err)?;
+    let name = String::from_utf8(name_buf)
+        .map_err(|e| StorageError::InvalidData(format!("Invalid name: {}", e)))?;
+
+    reader.read_exact(&mut buf4).map_err(io_err)?;
+    let tree_len = u32::from_le_bytes(buf4) as usize;
+    let mut tree_buf = vec![0u8; tree_len];
+    reader.read_exact(&mut tree_buf).map_err(io_err)?;
+    let root: Octant = bincode::deserialize(&tree_buf)
+        .map_err(|e| StorageError::InvalidData(format!("Deserialize tree: {}", e)))?;
+
+    let mut crc_buf = [0u8; 4];
+    reader.read_exact(&mut crc_buf).map_err(io_err)?;
+    let stored_crc = u32::from_le_bytes(crc_buf);
+    let computed = crc32fast::hash(&tree_buf);
+    if stored_crc != computed {
+        return Err(StorageError::InvalidData(format!(
+            "i-Octree CRC mismatch: stored {stored_crc:#x}, computed {computed:#x}"
+        )));
+    }
+
+    let mut marker = [0u8; 4];
+    reader.read_exact(&mut marker).map_err(io_err)?;
+    if u32::from_le_bytes(marker) != OVERFLOW_MARKER {
+        return Err(StorageError::InvalidData(
+            "i-Octree overflow section marker mismatch".into(),
+        ));
+    }
+    reader.read_exact(&mut buf4).map_err(io_err)?;
+    let overflow_len = u32::from_le_bytes(buf4) as usize;
+    let mut overflow_buf = vec![0u8; overflow_len];
+    reader.read_exact(&mut overflow_buf).map_err(io_err)?;
+    let overflow: Vec<IndexedPoint3D> = bincode::deserialize(&overflow_buf)
+        .map_err(|e| StorageError::InvalidData(format!("Deserialize overflow: {}", e)))?;
+
+    let leaf_store = LeafStore::open(&leaf_store_dir(&config, path), config.cache_capacity())?;
+
+    Ok(IOctreeIndex {
+        root,
+        config,
+        size,
+        world_bounds,
+        name,
+        leaf_store,
+        overflow,
     })
 }
 
 // === v1 legacy types for migration ===
-
-use super::node::IndexedPoint3D;
 
 /// v1 Octant format (with inline Vec<IndexedPoint3D>)
 #[derive(serde::Deserialize)]
