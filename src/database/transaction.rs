@@ -343,6 +343,25 @@ impl MoteDB {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // 5. Vector / text / spatial indexes, per table, now that the rows are
+        // committed. Previously nothing maintained them for transactional
+        // INSERTs (the SQL layer only patched multi-row vector inserts, and did
+        // so *before* commit, so a ROLLBACK left ghost vectors in the index).
+        {
+            use std::collections::HashMap;
+            let mut by_table: HashMap<&str, (Vec<RowId>, Vec<&Row>)> = HashMap::new();
+            for ((table_name, row_id), row_data) in &write_set {
+                let e = by_table.entry(table_name.as_str()).or_default();
+                e.0.push(*row_id);
+                e.1.push(row_data);
+            }
+            for (table_name, (row_ids, rows)) in by_table {
+                if let Ok(schema) = self.table_registry.get_table(table_name) {
+                    self.batch_update_secondary_indexes(table_name, &schema, &row_ids, &rows);
+                }
+            }
+        }
+
         // Skip cache population + timestamp index (they acquire locks that
         // interact with the background threads, causing the test to HUNG
         // during Drop). The data is safely in WAL (durability) and

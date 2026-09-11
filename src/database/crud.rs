@@ -3076,97 +3076,10 @@ impl MoteDB {
             }
         } // end else (columnar SSTable exists → skip column indexes)
 
-        // 7.2 Collect and batch update non-column indexes (vector, text, spatial)
-        for col_def in &schema.columns {
-            let col_name = &col_def.name;
-
-            // 7.2a 批量更新 Vector Index
-            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                if let Some(index_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Vector,
-                ) {
-                    let mut vectors: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(rows.len());
-                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-                        if let Some(crate::types::Value::Vector(arc_vec)) =
-                            row.get(col_def.position)
-                        {
-                            // ArcVec 是 Arc<[f32]> 的包装，to_vec 复制为 Vec<f32>
-                            vectors.push((*row_id, arc_vec.to_vec()));
-                        }
-                    }
-
-                    if !vectors.is_empty() {
-                        if let Err(_e) = self.batch_insert_vectors(&index_name, &vectors) {
-                            debug_log!(
-                                "[batch_insert] Failed to batch update vector index '{}': {}",
-                                index_name,
-                                _e
-                            );
-                            self.index_registry.mark_stale(&index_name);
-                        }
-                    }
-                }
-            }
-
-            // 7.3 批量更新 Text Index
-            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
-                if let Some(index_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Text,
-                ) {
-                    let mut texts: Vec<(RowId, String)> = Vec::with_capacity(rows.len());
-                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-                        if let Some(crate::types::Value::Text(text)) = row.get(col_def.position) {
-                            texts.push((*row_id, text.to_string()));
-                        }
-                    }
-
-                    if !texts.is_empty() {
-                        let texts_ref: Vec<(RowId, &str)> =
-                            texts.iter().map(|(id, s)| (*id, s.as_str())).collect();
-                        if let Err(_e) = self.batch_insert_texts(&index_name, &texts_ref) {
-                            debug_log!(
-                                "[batch_insert] Failed to batch update text index '{}': {}",
-                                index_name,
-                                _e
-                            );
-                            self.index_registry.mark_stale(&index_name);
-                        }
-                    }
-                }
-            }
-
-            // 7.4 i-Octree Index (3D point cloud)
-            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
-                if let Some(octree_name) = self.index_registry.find_by_column(
-                    table_name,
-                    col_name,
-                    crate::database::index_metadata::IndexType::Octree,
-                ) {
-                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
-                        if let Some(crate::types::Value::Spatial(geom)) = row.get(col_def.position)
-                        {
-                            if let Err(_e) = self.insert_ioctree_point(*row_id, &octree_name, geom)
-                            {
-                                debug_log!(
-                                    "[batch_insert] Failed to update ioctree index '{}': {}",
-                                    octree_name,
-                                    _e
-                                );
-                                self.index_registry.mark_stale(&octree_name);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 7.5 Timestamp Index (legacy single-index architecture, handled by batch build)
-            // Note: Timestamp index uses a different architecture (single BTree index)
-            // and is updated during flush via batch building
-        }
+        // 7.2 Non-column indexes (vector, text, spatial) — shared with
+        //     fast_batch_insert so neither path can leave one behind.
+        let row_refs: Vec<&Row> = rows.iter().collect();
+        self.batch_update_secondary_indexes(table_name, &schema, &row_ids, &row_refs);
 
         // 8. Timestamp index maintenance (query visibility before flush)
         for (row_id, row) in row_ids.iter().zip(rows.iter()) {
@@ -3348,12 +3261,113 @@ impl MoteDB {
             );
         }
 
+        // Vector / text / spatial indexes. Like the column indexes above, these
+        // used to be skipped on this path, so bulk-inserted rows never reached
+        // an existing vector index (the SQL layer worked around it by forcing
+        // vector tables through the per-row insert, one WAL fsync per row).
+        let row_refs: Vec<&Row> = store_rows.iter().map(|(_, _, r)| r).collect();
+        self.batch_update_secondary_indexes(table_name, schema, &row_ids, &row_refs);
+
         // Update row count for COUNT(*) fast path.
         if let Some(counter) = self.table_row_count.get(table_name) {
             counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(row_ids)
+    }
+
+    /// Batch-maintain the non-column secondary indexes (vector, text, octree)
+    /// for freshly inserted rows. Failures mark the index stale rather than
+    /// failing the insert — the rows are already durable in the store.
+    pub(crate) fn batch_update_secondary_indexes(
+        &self,
+        table_name: &str,
+        schema: &crate::types::TableSchema,
+        row_ids: &[RowId],
+        rows: &[&Row],
+    ) {
+        for col_def in &schema.columns {
+            let col_name = &col_def.name;
+
+            if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Vector,
+                ) {
+                    let mut vectors: Vec<(RowId, Vec<f32>)> = Vec::with_capacity(rows.len());
+                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                        if let Some(crate::types::Value::Vector(arc_vec)) =
+                            row.get(col_def.position)
+                        {
+                            vectors.push((*row_id, arc_vec.to_vec()));
+                        }
+                    }
+
+                    if !vectors.is_empty() {
+                        if let Err(_e) = self.batch_insert_vectors(&index_name, &vectors) {
+                            debug_log!(
+                                "[batch_insert] Failed to batch update vector index '{}': {}",
+                                index_name,
+                                _e
+                            );
+                            self.index_registry.mark_stale(&index_name);
+                        }
+                    }
+                }
+            }
+
+            if matches!(col_def.col_type, crate::types::ColumnType::Text) {
+                if let Some(index_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Text,
+                ) {
+                    let mut texts: Vec<(RowId, String)> = Vec::with_capacity(rows.len());
+                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                        if let Some(crate::types::Value::Text(text)) = row.get(col_def.position) {
+                            texts.push((*row_id, text.to_string()));
+                        }
+                    }
+
+                    if !texts.is_empty() {
+                        let texts_ref: Vec<(RowId, &str)> =
+                            texts.iter().map(|(id, s)| (*id, s.as_str())).collect();
+                        if let Err(_e) = self.batch_insert_texts(&index_name, &texts_ref) {
+                            debug_log!(
+                                "[batch_insert] Failed to batch update text index '{}': {}",
+                                index_name,
+                                _e
+                            );
+                            self.index_registry.mark_stale(&index_name);
+                        }
+                    }
+                }
+            }
+
+            if matches!(col_def.col_type, crate::types::ColumnType::Spatial) {
+                if let Some(octree_name) = self.index_registry.find_by_column(
+                    table_name,
+                    col_name,
+                    crate::database::index_metadata::IndexType::Octree,
+                ) {
+                    for (row_id, row) in row_ids.iter().zip(rows.iter()) {
+                        if let Some(crate::types::Value::Spatial(geom)) = row.get(col_def.position)
+                        {
+                            if let Err(_e) = self.insert_ioctree_point(*row_id, &octree_name, geom)
+                            {
+                                debug_log!(
+                                    "[batch_insert] Failed to update ioctree index '{}': {}",
+                                    octree_name,
+                                    _e
+                                );
+                                self.index_registry.mark_stale(&octree_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Batch get rows from a table (smart optimization for continuous IDs)

@@ -21006,11 +21006,6 @@ impl QueryExecutor {
             return self.execute_columnar_insert(stmt, &schema, &columns);
         }
 
-        let has_vector_column = schema
-            .columns
-            .iter()
-            .any(|col| matches!(col.col_type, crate::types::ColumnType::Tensor(_)));
-
         // Prepare all rows — resolve expressions to Values, build Row directly
         let mut prepared_rows = Vec::new();
 
@@ -21058,41 +21053,9 @@ impl QueryExecutor {
         let txn_id: Option<u64> = self.current_txn_id();
         let mut last_row_id: Option<u64> = None;
 
-        if has_vector_column && prepared_rows.len() > 1 {
-            // Batch insert path for vector columns
-            let mut vector_batches: std::collections::HashMap<String, Vec<(u64, Vec<f32>)>> =
-                std::collections::HashMap::new();
-
-            for row in &prepared_rows {
-                let row_id = if let Some(tid) = txn_id {
-                    self.db.insert_row_with_txn(&stmt.table, tid, row.clone())?
-                } else {
-                    self.db.insert_row_to_table(&stmt.table, row.clone())?
-                };
-                last_row_id = Some(row_id);
-
-                for (idx, col_def) in schema.columns.iter().enumerate() {
-                    if let crate::types::ColumnType::Tensor(_dim) = col_def.col_type {
-                        if let Some(Value::Vector(vec)) = row.get(idx) {
-                            let index_name = format!("{}_{}", stmt.table, col_def.name);
-                            vector_batches
-                                .entry(index_name)
-                                .or_default()
-                                .push((row_id, vec.to_vec()));
-                        }
-                    }
-                }
-            }
-
-            for (index_name, batch) in vector_batches {
-                match self.db.batch_update_vectors(&index_name, batch) {
-                    Ok(_) => {}
-                    Err(e) if e.to_string().contains("not found") => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        } else if txn_id.is_some() {
-            // Transactional path: must use per-row insert with txn coordinator
+        if txn_id.is_some() {
+            // Transactional path: rows are buffered in the coordinator's
+            // write_set; secondary indexes are maintained at COMMIT.
             for row in prepared_rows {
                 let row_id = self
                     .db
@@ -21100,7 +21063,11 @@ impl QueryExecutor {
                 last_row_id = Some(row_id);
             }
         } else if prepared_rows.len() > 1 {
-            // 🚀 Batch path: single WAL fsync, batched LSM put, batched index updates
+            // 🚀 Batch path: single WAL fsync, batched LSM put, batched index
+            // updates (vector/text/spatial included). Vector tables used to be
+            // forced through the per-row insert here — one group-commit fsync
+            // per row (~260 rows/s under the default preset) plus a redundant
+            // second graph insert per vector.
             let ids = self
                 .db
                 .batch_insert_rows_to_table(&stmt.table, prepared_rows)?;
