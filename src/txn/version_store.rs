@@ -26,6 +26,18 @@ pub struct VersionStore {
 
     /// Maximum number of version chains to keep in memory
     max_entries: usize,
+
+    /// Insert calls since the last eviction scan. The scan is O(len) under
+    /// shard read locks — running it on every insert while over the limit
+    /// made bulk loads O(N²) (a 1M-row load spent minutes inside
+    /// commit_transaction on this scan alone).
+    inserts_since_evict: AtomicU64,
+
+    /// Earliest timestamp at which another eviction scan can make progress
+    /// (0 = scans allowed). Set when a scan finds nothing evictable: every
+    /// chain was inside the recency window, which only changes as the
+    /// timestamp generator advances.
+    evict_cooldown_until: AtomicU64,
 }
 
 /// Version Chain - linked list of versions for a single row
@@ -80,6 +92,8 @@ impl VersionStore {
             versions: DashMap::new(),
             timestamp_gen: Arc::new(AtomicU64::new(1)),
             max_entries,
+            inserts_since_evict: AtomicU64::new(0),
+            evict_cooldown_until: AtomicU64::new(0),
         }
     }
 
@@ -298,15 +312,36 @@ impl VersionStore {
         Ok(())
     }
 
+    /// Recency window: chains modified within this many ticks are never
+    /// evicted (must stay in sync with the scan below).
+    const EVICT_RECENT_WINDOW: u64 = 1000;
+
     /// Evict version chains if the in-memory store exceeds `max_entries`.
     ///
     /// Strategy: remove entries where the version chain has a single committed
     /// version that is not recently modified (commit_ts older than 1000 ticks).
     /// This avoids evicting hot data while bounding memory. Evicted rows fall
     /// back to the normal LSM read path.
+    ///
+    /// Cost control: the scan walks the whole map shard-by-shard under read
+    /// locks, so it is amortized (at most one scan per max_entries/4 inserts)
+    /// and skipped entirely while a previous scan found nothing evictable
+    /// (nothing can become evictable until the timestamp generator advances
+    /// past the oldest "recent" chain).
     fn evict_if_needed(&self) {
         let len = self.versions.len();
         if len <= self.max_entries {
+            return;
+        }
+
+        let interval = (self.max_entries as u64 / 4).max(1);
+        let tick = self.inserts_since_evict.fetch_add(1, Ordering::Relaxed);
+        if tick % interval != 0 {
+            return;
+        }
+
+        let current_ts = self.timestamp_gen.load(Ordering::Acquire);
+        if current_ts < self.evict_cooldown_until.load(Ordering::Relaxed) {
             return;
         }
 
@@ -316,10 +351,10 @@ impl VersionStore {
             return;
         }
 
-        let current_ts = self.timestamp_gen.load(Ordering::Acquire);
-        let recent_threshold = current_ts.saturating_sub(1000);
+        let recent_threshold = current_ts.saturating_sub(Self::EVICT_RECENT_WINDOW);
 
-        let mut candidates = Vec::with_capacity(to_remove);
+        let mut candidates = Vec::with_capacity(to_remove.min(4096));
+        let mut oldest_recent = u64::MAX;
 
         for entry in self.versions.iter() {
             if candidates.len() >= to_remove {
@@ -346,6 +381,7 @@ impl VersionStore {
                 let begin_ts = version.begin_ts;
                 // Skip recently modified rows
                 if begin_ts > recent_threshold {
+                    oldest_recent = oldest_recent.min(begin_ts);
                     continue;
                 }
                 // If end_ts is 0, the row is still the current live version but
@@ -356,6 +392,19 @@ impl VersionStore {
                 // Empty chain — safe to remove
                 candidates.push(*entry.key());
             }
+        }
+
+        if candidates.is_empty() {
+            // Nothing evictable — every chain is inside the recency window.
+            // The oldest of them ages out at begin_ts + WINDOW + 1; rescanning
+            // before that is a pure O(len) waste.
+            if oldest_recent != u64::MAX {
+                self.evict_cooldown_until.store(
+                    oldest_recent.saturating_add(Self::EVICT_RECENT_WINDOW + 1),
+                    Ordering::Relaxed,
+                );
+            }
+            return;
         }
 
         // Remove candidates from the DashMap

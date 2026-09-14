@@ -190,16 +190,33 @@ fn interactive_mode(db_path: Option<PathBuf>) -> Result<()> {
             // 执行 SQL
             let sql = multiline_sql.trim_end_matches(';').trim();
 
-            // ✅ 使用流式 API 并物化
-            let result = (|| -> Result<_> {
-                let mut lexer = Lexer::new(sql);
-                let tokens = lexer.tokenize()?;
-                let mut parser = Parser::new(tokens);
-                let statement = parser.parse()?;
-                let executor = QueryExecutor::new(db.clone());
-                let streaming_result = executor.execute_streaming(statement)?;
-                streaming_result.materialize()
-            })();
+            // 🔑 CHECKPOINT/VACUUM are DB operations, not parser statements —
+            // the api::Database facade intercepts them; this shell talks to
+            // the core MoteDB + QueryExecutor, so intercept here (they used
+            // to be hard parse errors in the shell).
+            // 🔑 `sql` still carries its ';' (the trim above runs before the
+            // appended ' ' is removed) — strip it for the keyword match.
+            let result = match sql
+                .trim_matches(|c: char| c.is_whitespace() || c == ';')
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "CHECKPOINT" => db.checkpoint().map(|_| sql::QueryResult::Definition {
+                    message: "checkpoint complete".to_string(),
+                }),
+                "VACUUM" => db.vacuum().map(|_| sql::QueryResult::Definition {
+                    message: "vacuum complete".to_string(),
+                }),
+                _ => (|| -> Result<_> {
+                    let mut lexer = Lexer::new(sql);
+                    let tokens = lexer.tokenize()?;
+                    let mut parser = Parser::new(tokens);
+                    let statement = parser.parse()?;
+                    let executor = QueryExecutor::new(db.clone());
+                    let streaming_result = executor.execute_streaming(statement)?;
+                    streaming_result.materialize()
+                })(),
+            };
 
             match result {
                 Ok(result) => {

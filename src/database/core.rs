@@ -362,6 +362,16 @@ impl MoteDB {
     ///    fixes the orphan-dir hygiene bug: `create(tempdir.path())` used to
     ///    create a sibling `{tempdir}.mote` that TempDir never cleaned up.
     /// 3. Otherwise → legacy sibling `{stem}.mote`.
+    /// Public wrapper for the api layer's shared-handle registry.
+    pub fn resolve_create_path_public(path: &Path) -> PathBuf {
+        Self::resolve_create_path(path)
+    }
+
+    /// Public wrapper for the api layer's shared-handle registry.
+    pub fn resolve_open_path_public(path: &Path) -> PathBuf {
+        Self::resolve_open_path(path)
+    }
+
     fn resolve_create_path(path: &Path) -> PathBuf {
         if path.extension().and_then(|e| e.to_str()) == Some("mote") || path.is_dir() {
             path.to_path_buf()

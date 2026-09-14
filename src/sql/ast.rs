@@ -132,6 +132,9 @@ pub enum SelectColumn {
 pub struct OrderByExpr {
     pub expr: Expr,
     pub asc: bool, // true = ASC, false = DESC
+    /// `NULLS FIRST` / `NULLS LAST`. `None` = dialect default (the engine's
+    /// SQLite-like convention: NULLs sort FIRST ascending, LAST descending).
+    pub nulls_first: Option<bool>,
 }
 
 /// INSERT statement
@@ -231,11 +234,17 @@ pub enum DataType {
 #[derive(Debug, Clone)]
 pub struct CreateIndexStmt {
     pub index_name: String,
+    /// `CREATE INDEX IF NOT EXISTS …` — a no-op (with a notice) when the
+    /// index already exists instead of an error. Idempotent migrations.
+    pub if_not_exists: bool,
     pub table: String,
     pub column: String,
     pub index_type: IndexType,
     /// Distance metric for vector indexes ("l2" or "cosine")
     pub metric: Option<String>,
+    /// Text-index tokenizer: None = default whitespace, Some((name, param))
+    /// e.g. ("ngram", Some(2)) — `USING TOKENIZER ngram(2)`.
+    pub tokenizer: Option<(String, Option<usize>)>,
 }
 
 #[derive(Debug, Clone)]

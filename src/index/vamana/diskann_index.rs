@@ -87,6 +87,15 @@ impl VectorStorage {
         self.vectors.get(row_id)
     }
 
+    /// 🔥 Build mode: pin the full quantized set in RAM (see SQ8Vectors).
+    fn pin_all(&self) -> Result<()> {
+        self.vectors.pin_all()
+    }
+
+    fn unpin_all(&self) {
+        self.vectors.unpin_all();
+    }
+
     /// 🚀 预加载 quantized 向量到 LRU cache（触发 mmap page fault）。
     /// 用于 greedy_search 两阶段访存优化：先批量预加载，再串行算距离，
     /// 让 distance 第二次调 get_quantized 时 cache 命中（无 page fault stall）。
@@ -386,7 +395,14 @@ impl DiskANNIndex {
         //   - 10万节点 > 4000 → 分层构建 O(N log L)，预期50-100秒
         //   - < 4000节点 → 批量并行构建
         let _graph_start = Instant::now();
-        self.batch_build_graph(&ids)?;
+        // 🔥 Pin the whole quantized set in RAM for the build: the graph
+        // construction re-reads each node's quantized vector O(search list)
+        // times and the bounded LRU thrashes on that pattern (measured
+        // 2.48 ms/row at 40K — the dominant build cost).
+        self.vectors.pin_all()?;
+        let graph = self.batch_build_graph(&ids);
+        self.vectors.unpin_all();
+        graph?;
         debug_log!("[DiskANN] Graph built in {:?}", _graph_start.elapsed());
 
         // 4. 🚀 Flush to disk (会自动清理slack边)

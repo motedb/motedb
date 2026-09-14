@@ -44,57 +44,79 @@ impl MoteDB {
         // 1. Get table schema
         let schema = self.table_registry.get_table(table_name)?;
 
-        // 1.5 Check primary key uniqueness for non-AUTO_INCREMENT tables
-        if !schema.is_primary_key_auto_increment() {
+        // 1.5 Check primary key uniqueness for non-AUTO_INCREMENT tables.
+        // 🔑 AUTO_INCREMENT tables check too when the caller supplies an
+        // explicit PK value — NULL (or omitted) means auto-assign and is
+        // exempt. The old gate let `INSERT INTO t (id, …) VALUES (1, …)`
+        // duplicate an existing id silently.
+        if !schema.is_primary_key_auto_increment()
+            || row
+                .get(
+                    schema
+                        .primary_key()
+                        .and_then(|n| schema.get_column(n))
+                        .map(|c| c.position)
+                        .unwrap_or(usize::MAX),
+                )
+                .map(|v| !matches!(v, Value::Null))
+                .unwrap_or(false)
+        {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     if let Some(pk_value) = row.get(pk_col.position) {
-                        // NULL primary key is invalid per SQL standard
+                        // NULL primary key is invalid per SQL standard —
+                        // except AUTO_INCREMENT, where it means auto-assign.
                         if matches!(pk_value, Value::Null) {
-                            return Err(StorageError::InvalidData(format!(
-                                "NULL primary key is not allowed for table '{}'",
-                                table_name
-                            )));
-                        }
-                        let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
-
-                        // Atomic check-and-insert: eliminates TOCTOU race between
-                        // the uniqueness check and the actual row insert.
-                        // On cache hit (duplicate), insert_if_absent returns Err immediately.
-                        // On cache miss, falls through to slow path below.
-                        if let Some(lookup) = self.pk_lookup.get(table_name) {
-                            match lookup
-                                .insert_if_absent(pk_key.clone(), 0 /* placeholder row_id */)
-                            {
-                                Ok(()) => {
-                                    // Successfully reserved — will update with real row_id below
-                                }
-                                Err(_) => {
-                                    return Err(StorageError::InvalidData(format!(
-                                        "Duplicate primary key {:?} for table '{}'",
-                                        pk_value, table_name
-                                    )));
-                                }
+                            if schema.is_primary_key_auto_increment() {
+                                // fall through to the auto-assign path below
+                            } else {
+                                return Err(StorageError::InvalidData(format!(
+                                    "NULL primary key is not allowed for table '{}'",
+                                    table_name
+                                )));
                             }
                         } else {
-                            // No PK cache yet — fall back to slow path
-                            match self.query_by_column(table_name, pk_name, pk_value) {
-                                Ok(found) if !found.is_empty() => {
-                                    let mut has_live = false;
-                                    for &rid in &found {
-                                        if self.get_table_row(table_name, rid)?.is_some() {
-                                            has_live = true;
-                                            break;
-                                        }
+                            let pk_key = crate::database::pk_cache::PkKey::from_value(pk_value);
+
+                            // Atomic check-and-insert: eliminates TOCTOU race between
+                            // the uniqueness check and the actual row insert.
+                            // On cache hit (duplicate), insert_if_absent returns Err immediately.
+                            // On cache miss, falls through to slow path below.
+                            if let Some(lookup) = self.pk_lookup.get(table_name) {
+                                match lookup.insert_if_absent(
+                                    pk_key.clone(),
+                                    0, /* placeholder row_id */
+                                ) {
+                                    Ok(()) => {
+                                        // Successfully reserved — will update with real row_id below
                                     }
-                                    if has_live {
+                                    Err(_) => {
                                         return Err(StorageError::InvalidData(format!(
                                             "Duplicate primary key {:?} for table '{}'",
                                             pk_value, table_name
                                         )));
                                     }
                                 }
-                                _ => {}
+                            } else {
+                                // No PK cache yet — fall back to slow path
+                                match self.query_by_column(table_name, pk_name, pk_value) {
+                                    Ok(found) if !found.is_empty() => {
+                                        let mut has_live = false;
+                                        for &rid in &found {
+                                            if self.get_table_row(table_name, rid)?.is_some() {
+                                                has_live = true;
+                                                break;
+                                            }
+                                        }
+                                        if has_live {
+                                            return Err(StorageError::InvalidData(format!(
+                                                "Duplicate primary key {:?} for table '{}'",
+                                                pk_value, table_name
+                                            )));
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -192,13 +214,28 @@ impl MoteDB {
                 // without checking, allowing duplicate PKs).
                 let pk_val = Value::Integer(explicit);
                 let pk_key = crate::database::pk_cache::PkKey::from_value(&pk_val);
+                // 🔑 Check BOTH the PK cache AND storage: auto-assigned rows
+                // are not registered in the pk cache, and query_by_column
+                // needs a column index — the cache-only/index-only checks both
+                // missed collisions (duplicate PKs accepted). AUTO_INCREMENT
+                // ids ARE row ids, so a direct row fetch is O(1) and exact.
+                let mut collides = false;
                 if let Some(lookup) = self.pk_lookup.get(table_name) {
-                    if lookup.get_pk(&pk_key).is_some() {
-                        return Err(StorageError::InvalidData(format!(
-                            "Duplicate primary key {} for table '{}'",
-                            explicit, table_name
-                        )));
-                    }
+                    collides = lookup.get_pk(&pk_key).is_some();
+                }
+                if !collides {
+                    let rid = if explicit >= 0 {
+                        explicit as RowId
+                    } else {
+                        0x8000_0000u64 | (explicit as u64 & 0x7FFF_FFFF)
+                    };
+                    collides = self.get_table_row(table_name, rid)?.is_some();
+                }
+                if collides {
+                    return Err(StorageError::InvalidData(format!(
+                        "Duplicate primary key {} for table '{}'",
+                        explicit, table_name
+                    )));
                 }
 
                 // Use it, but advance the counter past it so the next auto
@@ -832,6 +869,15 @@ impl MoteDB {
                     {
                         new_row[i] = crate::types::Value::Integer(*f as i64);
                     }
+                }
+            }
+            // 🔑 Symmetric promotion: Integer → Float for FLOAT columns.
+            // `UPDATE t SET x = 55` on a FLOAT column evaluates the literal as
+            // Integer(55); storing that bit pattern into the f64 column
+            // produced 0.0 (INSERT coerces, UPDATE didn't).
+            if matches!(ct, crate::types::ColumnType::Float) {
+                if let Some(crate::types::Value::Integer(v)) = new_row.get(i) {
+                    new_row[i] = crate::types::Value::Float(*v as f64);
                 }
             }
         }
@@ -2705,15 +2751,36 @@ impl MoteDB {
                 }
             }
         };
-        if !schema.is_primary_key_auto_increment() {
+        // 🔑 AUTO_INCREMENT tables DO check uniqueness when the caller
+        // supplies an explicit PK value (`INSERT INTO t (id, …) VALUES (1, …)`).
+        // The old blanket `!is_auto_increment` gate let duplicates through —
+        // two rows claimed the same PK and the counter kept ticking past it.
+        // NULL at the PK position means "auto-assign" (column omitted or
+        // explicit NULL) and is exempt here.
+        if !schema.is_primary_key_auto_increment()
+            || rows.iter().any(|row| {
+                schema
+                    .primary_key()
+                    .and_then(|n| schema.get_column(n))
+                    .and_then(|c| row.get(c.position))
+                    .map(|v| !matches!(v, Value::Null))
+                    .unwrap_or(false)
+            })
+        {
             if let Some(pk_name) = schema.primary_key() {
                 if let Some(pk_col) = schema.get_column(pk_name) {
                     let mut batch_pks: HashSet<crate::database::pk_cache::PkKey> =
                         HashSet::with_capacity(rows.len());
                     for (idx, row) in rows.iter().enumerate() {
                         if let Some(pk_value) = row.get(pk_col.position) {
-                            // NULL primary key is invalid per SQL standard
+                            // NULL primary key is invalid per SQL standard —
+                            // EXCEPT on AUTO_INCREMENT tables, where NULL means
+                            // "auto-assign" (and the column may simply have been
+                            // omitted).
                             if matches!(pk_value, Value::Null) {
+                                if schema.is_primary_key_auto_increment() {
+                                    continue;
+                                }
                                 rollback_reserved(&reserved_pks);
                                 return Err(StorageError::InvalidData(format!(
                                     "Batch row {}: NULL primary key is not allowed for table '{}'",
@@ -2841,8 +2908,25 @@ impl MoteDB {
                     .value()
                     .clone()
             };
-            for _ in 0..rows.len() {
-                let id = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pk_col = schema.primary_key().and_then(|n| schema.get_column(n));
+            for row in rows.iter() {
+                // 🔑 An explicit non-NULL PK value IS the row id (and must
+                // advance the counter past it — a later auto-assign must not
+                // collide with it).
+                let explicit = pk_col
+                    .and_then(|c| row.get(c.position))
+                    .and_then(|v| match v {
+                        Value::Integer(i) => Some(*i),
+                        _ => None,
+                    });
+                let id = match explicit {
+                    Some(v) if v >= 0 => {
+                        counter
+                            .fetch_max(v.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+                        v
+                    }
+                    _ => counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                };
                 if !(0..=i64::MAX - 1000).contains(&id) {
                     return Err(StorageError::AutoIncrementOverflow(table_name.to_string()));
                 }

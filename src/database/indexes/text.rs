@@ -18,13 +18,45 @@ impl MoteDB {
     /// db.create_text_index("articles_content")?;
     /// ```
     pub fn create_text_index(&self, name: &str) -> Result<()> {
+        self.create_text_index_with_tokenizer(name, None)
+    }
+
+    /// Create a text index with an explicit tokenizer
+    /// (`USING TOKENIZER ngram(2)` / `whitespace`). The tokenizer is part of
+    /// the index identity — it must be the same at every open.
+    pub fn create_text_index_with_tokenizer(
+        &self,
+        name: &str,
+        tokenizer: Option<(String, Option<usize>)>,
+    ) -> Result<()> {
+        use crate::index::tokenizers::{NgramTokenizer, Tokenizer as _, WhitespaceTokenizer};
+
         ensure_open!(self);
         // 🎯 统一路径：{db}.mote/indexes/text_{name}/
         let indexes_dir = self.path.join("indexes");
         std::fs::create_dir_all(&indexes_dir)?;
         let index_path = indexes_dir.join(format!("text_{}", name));
 
-        let index = TextFTSIndex::new(index_path)?;
+        let index = match tokenizer.as_ref().map(|(n, p)| (n.as_str(), *p)) {
+            None => TextFTSIndex::new(index_path)?,
+            Some(("whitespace", _)) => TextFTSIndex::with_config(
+                index_path,
+                std::sync::Arc::new(WhitespaceTokenizer::default()),
+                true,
+                4,
+            )?,
+            Some(("ngram", Some(n))) if (1..=16).contains(&n) => TextFTSIndex::with_config(
+                index_path,
+                std::sync::Arc::new(NgramTokenizer::new(n)),
+                false, // n-gram positions are not meaningful for phrases
+                4,
+            )?,
+            Some((other, _)) => {
+                return Err(StorageError::InvalidData(format!(
+                    "Unknown tokenizer '{other}' (whitespace | ngram(n))"
+                )));
+            }
+        };
         let index_arc = Arc::new(RwLock::new(index));
         self.text_indexes
             .insert(name.to_string(), index_arc.clone());

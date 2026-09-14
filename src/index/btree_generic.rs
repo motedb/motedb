@@ -2151,6 +2151,29 @@ impl<K: BTreeKey> GenericBTree<K> {
                 .len()
         };
 
+        // 🔑 Read every on-disk overflow page into memory BEFORE the
+        // rewrite below. The rewrite starts right after the superblock and
+        // moves forward through the file — it can overwrite the OLD
+        // positions of overflow pages, so copying them afterwards (as this
+        // flush used to do) read back freshly-written B+Tree bytes as
+        // overflow data and corrupted every large value ("Invalid overflow
+        // data_len …" / "Overflow page N not found in page table" after the
+        // next open).
+        use std::os::unix::fs::FileExt;
+        let mut overflow_pages: Vec<(u64, [u8; PAGE_SIZE])> =
+            Vec::with_capacity(overflow_ids.len());
+        {
+            let file = self.storage_file.read();
+            for overflow_id in &overflow_ids {
+                let idx = *overflow_id as usize;
+                if idx >= page_offsets_snapshot.len() || page_offsets_snapshot[idx] == 0 {
+                    continue; // not on disk yet
+                }
+                let mut page_buf = [0u8; PAGE_SIZE];
+                file.read_exact_at(&mut page_buf, page_offsets_snapshot[idx])?;
+                overflow_pages.push((*overflow_id, page_buf));
+            }
+        }
         // Rewrite all pages sequentially after superblock
         let mut file = self.storage_file.write();
 
@@ -2182,32 +2205,18 @@ impl<K: BTreeKey> GenericBTree<K> {
             cache.put(page_id, Arc::new(RwLock::new(working)));
         }
 
-        // Copy overflow pages to their new positions in the compacted file.
+        // Write the pre-read overflow pages at their new positions.
         // Overflow pages are PAGE_SIZE bytes with format [next_page_id:8][data_len:4][data...].
-        for overflow_id in &overflow_ids {
-            let old_offset = {
-                let idx = *overflow_id as usize;
-                if idx >= page_offsets_snapshot.len() || page_offsets_snapshot[idx] == 0 {
-                    continue; // not on disk yet
-                }
-                page_offsets_snapshot[idx]
-            };
-
-            // Read overflow page from its old position and rewrite at new offset
-            use std::os::unix::fs::FileExt;
-            let mut page_buf = vec![0u8; PAGE_SIZE];
-            file.read_exact_at(&mut page_buf, old_offset)?;
+        for (overflow_id, page_buf) in overflow_pages {
             file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&page_buf)?;
-
-            let idx = *overflow_id as usize;
+            file.write_all(page_buf.as_slice())?;
+            let idx = overflow_id as usize;
             if idx >= new_offsets.len() {
                 new_offsets.resize(idx + 1, 0);
             }
             new_offsets[idx] = offset;
             offset += PAGE_SIZE as u64;
         }
-
         // Truncate file
         file.set_len(offset)?;
         drop(file);

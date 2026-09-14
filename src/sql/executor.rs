@@ -1038,8 +1038,6 @@ impl StreamingQueryResult {
     }
 
     /// 🔧 应用 ORDER BY（静态方法，在 materialize() 中调用）
-    /// A resolved ORDER BY key: either a projected column index or a
-    /// per-row precomputed expression value.
     fn apply_order_by(
         rows: &mut [Vec<Value>],
         columns: &[String],
@@ -1054,7 +1052,8 @@ impl StreamingQueryResult {
         // expression keys were dropped → arbitrary order (or a NotImplemented
         // error when every key was an expression).
         let evaluator = ExprEvaluator::new();
-        let mut specs: Vec<(OrderByKey, bool)> = Vec::with_capacity(order_clauses.len());
+        let mut specs: Vec<(OrderByKey, bool, Option<bool>)> =
+            Vec::with_capacity(order_clauses.len());
         for clause in order_clauses {
             let key = match order_by_projected_index(&clause.expr, columns) {
                 Some(idx) => OrderByKey::Col(idx),
@@ -1080,14 +1079,14 @@ impl StreamingQueryResult {
                     OrderByKey::Keys(keys)
                 }
             };
-            specs.push((key, clause.asc));
+            specs.push((key, clause.asc, clause.nulls_first));
         }
 
         // Sort via index permutation: expression keys read from precomputed
         // vectors, column keys from the rows themselves.
         let mut perm: Vec<usize> = (0..rows.len()).collect();
         perm.sort_by(|&a, &b| {
-            for (key, asc) in &specs {
+            for (key, asc, nulls_first) in &specs {
                 let (va, vb) = match key {
                     OrderByKey::Col(idx) => {
                         let va = rows.get(a).and_then(|r| r.get(*idx));
@@ -1101,7 +1100,30 @@ impl StreamingQueryResult {
                     _ => continue,
                 };
 
-                let cmp = match (va, vb) {
+                // 🔑 NULL placement and value ordering are INDEPENDENT:
+                // NULLS FIRST/LAST (explicit, or the dialect default
+                // NULLs-first-ASC / NULLs-last-DESC) fixes where NULLs sit;
+                // ASC/DESC orders only the non-NULL values.
+                let nulls_first_effective = nulls_first.unwrap_or(*asc);
+                let rank = |v: &Value| -> i8 {
+                    if matches!(v, Value::Null) {
+                        if nulls_first_effective {
+                            0
+                        } else {
+                            2
+                        }
+                    } else {
+                        1
+                    }
+                };
+                let (ra, rb) = (rank(va), rank(vb));
+                if ra != rb {
+                    return ra.cmp(&rb);
+                }
+                if matches!(va, Value::Null) {
+                    continue; // both NULL → next key
+                }
+                let value_cmp = match (va, vb) {
                     (Value::Float(a), Value::Float(b)) => {
                         if a.is_nan() && b.is_nan() {
                             Ordering::Equal
@@ -1113,15 +1135,11 @@ impl StreamingQueryResult {
                             a.partial_cmp(b).unwrap_or(Ordering::Equal)
                         }
                     }
-                    (Value::Null, Value::Null) => Ordering::Equal,
-                    (Value::Null, _) => Ordering::Less,
-                    (_, Value::Null) => Ordering::Greater,
                     // Delegate to Value::partial_cmp for all other type pairs,
                     // including cross-type (Integer/Float), Timestamp, etc.
                     (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                 };
-
-                let final_cmp = if *asc { cmp } else { cmp.reverse() };
+                let final_cmp = if *asc { value_cmp } else { value_cmp.reverse() };
 
                 if final_cmp != Ordering::Equal {
                     return final_cmp;
@@ -1877,6 +1895,12 @@ thread_local! {
     static SPATIAL_KNN_MEMO: std::cell::RefCell<
         std::collections::HashMap<String, Arc<std::collections::HashSet<u64>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Per-statement memo of MATCH(col, 'query') row-id sets. Same idea as
+    /// SPATIAL_KNN_MEMO: the predicate is a set-membership test resolved by
+    /// the text index, not a per-row computation.
+    static TEXT_MATCH_MEMO: std::cell::RefCell<
+        std::collections::HashMap<String, Arc<std::collections::HashSet<u64>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Determine if a CASE WHEN condition value is "true".
@@ -1889,6 +1913,18 @@ fn case_cond_matched(v: &Value) -> bool {
         Value::Float(f) => *f != 0.0,
         _ => false,
     }
+}
+
+/// True when any ORDER BY clause carries an explicit NULLS preference that
+/// DIFFERS from the engine's dialect default (NULLs first on ASC, last on
+/// DESC). Fast paths whose sorters only understand (idx, asc) decline such
+/// queries so the materialized path (apply_order_by, which honors the
+/// flag) handles them.
+fn order_by_has_nondefault_nulls(order_by: Option<&[OrderByExpr]>) -> bool {
+    order_by.is_some_and(|obs| {
+        obs.iter()
+            .any(|ob| ob.nulls_first.is_some_and(|nf| nf != ob.asc))
+    })
 }
 
 /// Compare two values for ORDER BY in the GROUP BY result path.
@@ -2174,6 +2210,7 @@ impl QueryExecutor {
     pub fn execute_streaming_ref(&self, stmt: &Statement) -> Result<StreamingQueryResult> {
         let max_rows = self.db.max_result_rows;
         SPATIAL_KNN_MEMO.with(|m| m.borrow_mut().clear());
+        TEXT_MATCH_MEMO.with(|m| m.borrow_mut().clear());
 
         // NOTE: We intentionally do NOT clear segment col_cache here. The cache
         // is bounded to 16 entries per segment (BoundedColCache), so it can't
@@ -2306,24 +2343,29 @@ impl QueryExecutor {
                     },
                 }
             }
-            Statement::Savepoint(name) => StreamingQueryResult::Definition {
-                message: self
-                    .execute_savepoint(&name)
-                    .map(|_| format!("SAVEPOINT {name} created"))
-                    .unwrap_or_else(|e| format!("SAVEPOINT failed: {e}")),
-            },
-            Statement::RollbackToSavepoint(name) => StreamingQueryResult::Definition {
-                message: self
-                    .execute_rollback_to_savepoint(&name)
-                    .map(|_| format!("rolled back to SAVEPOINT {name}"))
-                    .unwrap_or_else(|e| format!("ROLLBACK TO failed: {e}")),
-            },
-            Statement::ReleaseSavepoint(name) => StreamingQueryResult::Definition {
-                message: self
-                    .execute_release_savepoint(&name)
-                    .map(|_| format!("SAVEPOINT {name} released"))
-                    .unwrap_or_else(|e| format!("RELEASE failed: {e}")),
-            },
+            // 🔑 Errors must PROPAGATE — the old branches folded them into a
+            // success message ("SAVEPOINT failed: …"), so an external client
+            // (Python binding, CLI) saw a silent no-op: a SAVEPOINT without an
+            // active transaction "succeeded", and the later ROLLBACK TO also
+            // "succeeded" while the UPDATE stayed committed.
+            Statement::Savepoint(name) => {
+                self.execute_savepoint(&name)?;
+                StreamingQueryResult::Definition {
+                    message: format!("SAVEPOINT {name} created"),
+                }
+            }
+            Statement::RollbackToSavepoint(name) => {
+                self.execute_rollback_to_savepoint(&name)?;
+                StreamingQueryResult::Definition {
+                    message: format!("rolled back to SAVEPOINT {name}"),
+                }
+            }
+            Statement::ReleaseSavepoint(name) => {
+                self.execute_release_savepoint(&name)?;
+                StreamingQueryResult::Definition {
+                    message: format!("SAVEPOINT {name} released"),
+                }
+            }
             Statement::BeginTransaction => {
                 // 🚨 Reject nested transactions (see execute_begin_transaction).
                 if self.current_txn_id().is_some() {
@@ -5474,6 +5516,48 @@ impl QueryExecutor {
                 }
             }
         }
+        // 🔑 Explicit NULLS FIRST/LAST that differs from the dialect default
+        // must be sorted by apply_order_by (the only comparator honoring the
+        // flag). Run the general path and POST-SORT its result — internal
+        // routing may still pick a fast sorter that ignores the flag, so the
+        // authoritative sort happens here, once, at the boundary.
+        if order_by_has_nondefault_nulls(stmt.order_by.as_deref()) {
+            // materialize_as_streaming returns SelectStreaming with
+            // order_by=None (internal fast paths already "sorted" with the
+            // flag-ignoring comparator). Force the final result through
+            // apply_order_by — the only comparator that honors NULLS
+            // FIRST/LAST — at this boundary, regardless of internal routing.
+            // 🔑 Strip LIMIT/OFFSET for the inner run: fast-path top-k
+            // sorters ignore the NULLS flag and would pre-truncate to the
+            // WRONG rows (measured: `… NULLS LAST LIMIT 2` returned the two
+            // NULLs). Sort the full row set authoritatively, then truncate.
+            let mut inner_stmt = stmt.clone();
+            let off = inner_stmt.offset.take();
+            let lim = inner_stmt.limit.take();
+            let inner = self.materialize_as_streaming(&inner_stmt)?;
+            let QueryResult::Select {
+                columns: mut cols,
+                rows: mut rows,
+            } = inner.materialize()?
+            else {
+                unreachable!("materialize_as_streaming always yields Select");
+            };
+            if let Some(ob) = &stmt.order_by {
+                StreamingQueryResult::apply_order_by(&mut rows, &cols, ob)?;
+            }
+            if let Some(off) = off {
+                let off = off.min(rows.len());
+                rows.drain(..off);
+            }
+            if let Some(lim) = lim {
+                rows.truncate(lim);
+            }
+            cols.shrink_to_fit();
+            return Ok(StreamingQueryResult::SelectReady {
+                columns: cols,
+                rows,
+            });
+        }
         // 🔑 Window functions: route to specialized executor.
         let has_window = stmt.columns.iter().any(|c| {
             matches!(
@@ -5699,6 +5783,10 @@ impl QueryExecutor {
             || stmt.order_by.is_some()
             || stmt.distinct)
             && !Self::contains_parameter_stmt(stmt)
+            // LATEST BY needs apply_latest_by on the materialized path; the
+            // columnar fast paths below silently ignored the clause and
+            // returned every row.
+            && stmt.latest_by.is_none()
         {
             if let Some(TableRef::Table {
                 name: table_name, ..
@@ -5871,6 +5959,26 @@ impl QueryExecutor {
 
         // Aggregate queries (COUNT, SUM, etc.) — try fast paths
         if self.has_aggregates(&stmt.columns) {
+            // 🚀 `SELECT COUNT(*) WHERE MATCH(...)` — count the index
+            // postings directly (the pipeline below materializes every
+            // matching row just to count it).
+            if let Some(result) = self.try_text_match_count(stmt)? {
+                return Ok(match result {
+                    QueryResult::Select { columns, rows } => {
+                        StreamingQueryResult::SelectStreaming {
+                            columns,
+                            rows: Box::new(rows.into_iter().map(Ok)),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                            max_result_rows: None,
+                            size_hint: None,
+                        }
+                    }
+                    other => unreachable!("count fast path returns Select, got {other:?}"),
+                });
+            }
             // 🔑 TimeSeries FIRST: every fast path below (count, columnar
             // pushdown, column index) reads LSM/ColSegmentStore, which hold
             // no TS data — with a WHERE they returned 0. ts_simple_aggregate
@@ -6189,6 +6297,7 @@ impl QueryExecutor {
                     new_ob.push(OrderByExpr {
                         expr: resolved_expr,
                         asc: o.asc,
+                        nulls_first: o.nulls_first,
                     });
                 }
                 Some(new_ob)
@@ -6263,14 +6372,14 @@ impl QueryExecutor {
         }
     }
 
-    /// Does `expr` contain an ST_KNN_3D predicate? Unlike the other spatial
-    /// functions it is a *set* predicate that needs the octree index and the
-    /// row id, so the positional (schema-indexed row) evaluators cannot
-    /// answer it; paths built on them must yield to the materialized path,
-    /// whose evaluator resolves it through the index (memoized per statement).
+    /// Does `expr` contain an ST_KNN_3D or MATCH predicate? Both are *set*
+    /// predicates that need their index and the row id, so the positional
+    /// (schema-indexed row) evaluators cannot answer them; paths built on
+    /// them must yield to the materialized path, whose evaluator resolves
+    /// them through the index (memoized per statement).
     fn expr_contains_st_knn(expr: &Expr) -> bool {
         match expr {
-            Expr::StKnn3D { .. } => true,
+            Expr::StKnn3D { .. } | Expr::Match { .. } => true,
             Expr::BinaryOp { left, right, .. } => {
                 Self::expr_contains_st_knn(left) || Self::expr_contains_st_knn(right)
             }
@@ -9176,11 +9285,49 @@ impl QueryExecutor {
     ) -> Result<StreamingQueryResult> {
         let schema = self.db.get_table_schema(table)?;
 
+        // LATEST BY is applied by the materialized path; both the TimeSeries
+        // branch below and the ColSegmentStore fast path would silently
+        // ignore the clause and return every row.
+        if stmt.latest_by.is_some() {
+            return self.materialize_as_streaming(stmt);
+        }
+
         // 🔑 TimeSeries tables: authoritative data lives in the
         // ColumnarStore. scan_table_rows_streaming routes them there
         // (Materialized branch); the ColSegmentStore/LSM paths below hold
         // no data for them and would return empty results.
         if schema.table_type == crate::types::TableType::TimeSeries {
+            // 🚀 `ORDER BY <ts_col> [DESC] LIMIT k`: bounded top-k over the
+            // decoded ts column in the ColumnarStore instead of the full
+            // materialize+sort below (~366 ms → tens of ms at 1M rows).
+            if stmt.where_clause.is_none()
+                && stmt.limit.is_some()
+                && !stmt.distinct
+                && stmt.group_by.is_none()
+                && stmt.having.is_none()
+                && stmt.order_by.as_ref().is_some_and(|ob| ob.len() == 1)
+            {
+                let key = &stmt.order_by.as_ref().unwrap()[0];
+                if let crate::sql::ast::Expr::Column(cn) = &key.expr {
+                    let bare = cn.rsplit('.').next().unwrap_or(cn);
+                    if Some(bare) == schema.timeseries_column.as_deref() {
+                        if let Some(QueryResult::Select { columns, rows }) =
+                            self.try_ts_order_limit(stmt, table, &schema, key.asc)?
+                        {
+                            return Ok(StreamingQueryResult::SelectStreaming {
+                                columns,
+                                rows: Box::new(rows.into_iter().map(Ok)),
+                                order_by: None,
+                                limit: None,
+                                offset: None,
+                                distinct: false,
+                                max_result_rows: None,
+                                size_hint: None,
+                            });
+                        }
+                    }
+                }
+            }
             let iter = self.db.scan_table_rows_streaming(table)?;
             let schema2 = self.db.get_table_schema(table)?;
             let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -9219,19 +9366,28 @@ impl QueryExecutor {
                 full_rows = kept;
             }
             if let Some(ob) = &stmt.order_by {
-                let mut specs: Vec<(usize, bool)> = Vec::new();
-                for o in ob {
-                    if let Expr::Column(cn) = &o.expr {
-                        if let Some(p) = schema2.get_column_position(cn) {
-                            specs.push((p, o.asc));
-                            continue;
+                if order_by_has_nondefault_nulls(Some(ob)) {
+                    // 🔑 apply_order_by is the only comparator honoring the
+                    // explicit NULLS FIRST/LAST flag; sort by schema column
+                    // names here (full_rows are schema-ordered).
+                    let columns: Vec<String> =
+                        schema2.columns.iter().map(|c| c.name.clone()).collect();
+                    StreamingQueryResult::apply_order_by(&mut full_rows, &columns, ob)?;
+                } else {
+                    let mut specs: Vec<(usize, bool)> = Vec::new();
+                    for o in ob {
+                        if let Expr::Column(cn) = &o.expr {
+                            if let Some(p) = schema2.get_column_position(cn) {
+                                specs.push((p, o.asc));
+                                continue;
+                            }
                         }
+                        specs.clear();
+                        break;
                     }
-                    specs.clear();
-                    break;
-                }
-                if specs.len() == ob.len() {
-                    StreamingQueryResult::sort_rows(&mut full_rows, &specs);
+                    if specs.len() == ob.len() {
+                        StreamingQueryResult::sort_rows(&mut full_rows, &specs);
+                    }
                 }
             }
             if let Some(off) = stmt.offset {
@@ -12173,6 +12329,38 @@ impl QueryExecutor {
     ) -> Result<Value> {
         let fname = name.to_lowercase();
         match fname.as_str() {
+            // TIME_BUCKET(interval, ts) — floor to a fixed window boundary.
+            // The SqlRow evaluator has the same logic; this mirror serves the
+            // positional (schema-indexed) projection paths.
+            "time_bucket" => {
+                if args.len() != 2 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "TIME_BUCKET() takes 2 arguments (interval, timestamp)".to_string(),
+                    ));
+                }
+                let interval =
+                    match Self::eval_expr_on_row(&args[0], row, schema)? {
+                        Value::Text(t) => t.to_string(),
+                        _ => return Err(MoteDBError::TypeError(
+                            "TIME_BUCKET() first argument must be a text interval like '5m', '1h'"
+                                .to_string(),
+                        )),
+                    };
+                let micros_per = Self::parse_time_bucket_interval_us(&interval)?;
+                let micros = match Self::eval_expr_on_row(&args[1], row, schema)? {
+                    Value::Timestamp(t) => t.as_micros(),
+                    Value::Integer(i) => i,
+                    v => {
+                        return Err(MoteDBError::TypeError(format!(
+                            "TIME_BUCKET() second argument must be a timestamp, got {v:?}"
+                        )))
+                    }
+                };
+                let floored = (micros / micros_per) * micros_per;
+                Ok(Value::Timestamp(crate::types::Timestamp::from_micros(
+                    floored,
+                )))
+            }
             "concat" => {
                 let mut result = String::new();
                 for arg in args {
@@ -12542,6 +12730,44 @@ impl QueryExecutor {
         }
     }
 
+    /// Parse a TIME_BUCKET interval literal ('10s'/'5m'/'1h'/'2d') to micros.
+    /// Shared by the SqlRow (eval_expr_simple / positional) evaluators.
+    fn parse_time_bucket_interval_us(interval: &str) -> Result<i64> {
+        let micros_per: i64 = match interval {
+            s if s.ends_with('s') => s
+                .trim_end_matches('s')
+                .parse::<i64>()
+                .map(|v| v * 1_000_000)
+                .map_err(|_| MoteDBError::TypeError("TIME_BUCKET() bad interval".into()))?,
+            s if s.ends_with('m') => s
+                .trim_end_matches('m')
+                .parse::<i64>()
+                .map(|v| v * 60_000_000)
+                .map_err(|_| MoteDBError::TypeError("TIME_BUCKET() bad interval".into()))?,
+            s if s.ends_with('h') => s
+                .trim_end_matches('h')
+                .parse::<i64>()
+                .map(|v| v * 3_600_000_000)
+                .map_err(|_| MoteDBError::TypeError("TIME_BUCKET() bad interval".into()))?,
+            s if s.ends_with('d') => s
+                .trim_end_matches('d')
+                .parse::<i64>()
+                .map(|v| v * 86_400_000_000)
+                .map_err(|_| MoteDBError::TypeError("TIME_BUCKET() bad interval".into()))?,
+            _ => {
+                return Err(MoteDBError::TypeError(
+                    "TIME_BUCKET() interval must end with s/m/h/d".to_string(),
+                ))
+            }
+        };
+        if micros_per <= 0 {
+            return Err(MoteDBError::InvalidArgument(
+                "TIME_BUCKET() interval must be positive".to_string(),
+            ));
+        }
+        Ok(micros_per)
+    }
+
     fn eval_expr_simple(expr: &Expr, row: &SqlRow) -> Result<Value> {
         match expr {
             Expr::BinaryOp { left, op, right } => {
@@ -12633,18 +12859,23 @@ impl QueryExecutor {
             Expr::Match { column, query, .. } => {
                 let has_score = row.keys().any(|k| k.starts_with("__text_score_"));
                 if has_score {
-                    Ok(Value::Bool(true))
-                } else {
-                    // Fallback: naive text scan when no FTS index
-                    match row.get(column) {
-                        Some(Value::Text(text)) => {
-                            let text_lower = text.to_lowercase();
-                            let query_lower = query.to_lowercase();
-                            let terms: Vec<&str> = query_lower.split_whitespace().collect();
-                            Ok(Value::Bool(terms.iter().all(|t| text_lower.contains(t))))
-                        }
-                        _ => Ok(Value::Bool(false)),
+                    return Ok(Value::Bool(true));
+                }
+                // Static evaluator (no executor access): same OR-over-tokens
+                // semantics as the index's default tokenizer. The old
+                // fallback was an AND-of-substrings check — a different set
+                // than the index for multi-term queries.
+                use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
+                match row.get(column) {
+                    Some(Value::Text(text)) => {
+                        let tok = WhitespaceTokenizer::default();
+                        let q: Vec<String> =
+                            tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
+                        Ok(Value::Bool(
+                            tok.tokenize(text).iter().any(|t| q.contains(&t.text)),
+                        ))
                     }
+                    _ => Ok(Value::Bool(false)),
                 }
             }
             Expr::FunctionCall { name, args, .. } => {
@@ -13285,7 +13516,9 @@ impl QueryExecutor {
                 );
                 handled && args.iter().all(Self::can_eval_positional)
             }
-            Expr::Match { .. } => true,
+            // MATCH is a set predicate resolved by the executor (text index
+            // + row id); positional rows can carry neither.
+            Expr::Match { .. } => false,
             Expr::Case { whens, else_expr } => {
                 whens
                     .iter()
@@ -13475,6 +13708,7 @@ impl QueryExecutor {
                 .map(|ob| crate::sql::ast::OrderByExpr {
                     expr: sub(&ob.expr).unwrap_or_else(|_| ob.expr.clone()),
                     asc: ob.asc,
+                    nulls_first: ob.nulls_first,
                 })
                 .collect::<Vec<_>>()
         });
@@ -13863,21 +14097,9 @@ impl QueryExecutor {
             Expr::FunctionCall { name, args, .. } => {
                 Self::eval_function_positional(name, args, row, schema)
             }
-            Expr::Match { column, query, .. } => {
-                let pos = schema.get_column_position(column);
-                match pos {
-                    Some(p) => match row.get(p) {
-                        Some(Value::Text(text)) => {
-                            let text_lower = text.to_lowercase();
-                            let query_lower = query.to_lowercase();
-                            let terms: Vec<&str> = query_lower.split_whitespace().collect();
-                            Ok(Value::Bool(terms.iter().all(|t| text_lower.contains(t))))
-                        }
-                        _ => Ok(Value::Bool(false)),
-                    },
-                    None => Ok(Value::Bool(false)),
-                }
-            }
+            Expr::Match { .. } => Err(MoteDBError::Query(
+                "MATCH must be evaluated by executor".into(),
+            )),
             Expr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     let cond_val = Self::eval_expr_on_row(cond, row, schema)?;
@@ -13951,7 +14173,7 @@ impl QueryExecutor {
     }
 
     /// Generate a human-readable column name for an expression (e.g., "SUM(amount)", "COUNT(*)")
-    fn expr_to_column_name(expr: &Expr) -> String {
+    pub(crate) fn expr_to_column_name(expr: &Expr) -> String {
         match expr {
             Expr::Column(name) => name.clone(),
             Expr::Literal(v) => format!("{:?}", v),
@@ -14172,6 +14394,59 @@ impl QueryExecutor {
 
     /// Internal SELECT execution (takes &SelectStmt to allow reuse in subqueries)
     fn execute_select_internal(&self, stmt: &SelectStmt) -> Result<QueryResult> {
+        // 🚀 LATEST BY on a TimeSeries table: fold per-group max-ts directly
+        // in the ColumnarStore (decodes only the needed columns). The general
+        // path materialized every row as a HashMap SqlRow first (~1.5 s at
+        // 1M rows). WHERE / ORDER BY / LIMIT shapes keep the general path.
+        if stmt.latest_by.is_some()
+            && stmt.where_clause.is_none()
+            && stmt.order_by.is_none()
+            && stmt.limit.is_none()
+            && !stmt.distinct
+            && stmt.group_by.is_none()
+            && stmt.having.is_none()
+        {
+            if let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() {
+                if let Ok(schema) = self.db.get_table_schema(name) {
+                    if schema.table_type == crate::types::TableType::TimeSeries {
+                        if let Some(result) = self.try_ts_latest_by(stmt, name, &schema)? {
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 🚀 ORDER BY <ts_col> [DESC] LIMIT k on a TimeSeries table: bounded
+        // top-k heap over the decoded ts column in the ColumnarStore (the
+        // general path materialized + sorted every row, ~366 ms at 1M).
+        if stmt.latest_by.is_none()
+            && stmt.where_clause.is_none()
+            && stmt.limit.is_some()
+            && !stmt.distinct
+            && stmt.group_by.is_none()
+            && stmt.having.is_none()
+            && stmt.order_by.as_ref().is_some_and(|ob| ob.len() == 1)
+        {
+            if let Some(TableRef::Table { name, .. }) = stmt.from.as_ref() {
+                if let Ok(schema) = self.db.get_table_schema(name) {
+                    if schema.table_type == crate::types::TableType::TimeSeries {
+                        let key = &stmt.order_by.as_ref().unwrap()[0];
+                        if let crate::sql::ast::Expr::Column(cn) = &key.expr {
+                            let bare = cn.rsplit('.').next().unwrap_or(cn);
+                            if Some(bare) == schema.timeseries_column.as_deref() {
+                                if let Some(result) =
+                                    self.try_ts_order_limit(stmt, name, &schema, key.asc)?
+                                {
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 🚀 Substitute bind parameters before executing
         let resolved_stmt;
         let stmt = if Self::contains_parameter_stmt(stmt) {
@@ -14240,9 +14515,13 @@ impl QueryExecutor {
                         .iter()
                         .all(|c| matches!(c, SelectColumn::Expr(Expr::FunctionCall { .. }, _)));
                 if still_subq && aggregate_only {
-                    return Err(MoteDBError::Query(
-                        "aggregate queries with a correlated-subquery WHERE are not yet supported; rewrite as a join or use a non-aggregate SELECT".into(),
-                    ));
+                    // 🚀 Route to the materialized path instead of erroring:
+                    // it evaluates correlated subqueries per row
+                    // (bind_outer_columns + eval_correlated_expr) before
+                    // apply_group_by folds the aggregates. The aggregate
+                    // FAST paths all carry their own expr_contains_subquery
+                    // guards; any that doesn't is a bug to fix, not a reason
+                    // to reject the query.
                 }
                 resolved_subq_stmt = cloned;
                 &resolved_subq_stmt as &SelectStmt
@@ -14345,6 +14624,13 @@ impl QueryExecutor {
             on_condition,
         } = from
         {
+            // 🚀 Multi-way first: 3+ table left-deep chains (and JOIN +
+            // GROUP BY/aggregate shapes) run successive hash joins here;
+            // the nested-loop general path took minutes for bounded
+            // three-way joins.
+            if let Some(result) = self.try_multi_way_inner_join(stmt)? {
+                return Ok(result);
+            }
             if let (
                 TableRef::Table {
                     name: ltable,
@@ -14410,6 +14696,7 @@ impl QueryExecutor {
             } = from
             {
                 if self.db.has_col_segment_store(table_name)
+                    && stmt.latest_by.is_none()
                     && !self.has_only_count_aggregate(&stmt.columns)
                     // Don't route spatial/text/vector queries to the columnar
                     // scan — they need the index pushdown paths below
@@ -14453,6 +14740,7 @@ impl QueryExecutor {
             } = from
             {
                 if self.db.has_col_segment_store(table_name)
+                    && stmt.latest_by.is_none()
                     && !self.has_only_count_aggregate(&stmt.columns)
                 {
                     let stream = self.execute_full_scan_streaming(stmt, table_name)?;
@@ -14690,6 +14978,15 @@ impl QueryExecutor {
             }
         }
 
+        // 🚀 `SELECT COUNT(*) WHERE MATCH(...)` — count the index postings
+        // directly (the aggregate pipeline materializes every matching row
+        // just to count it).
+        if self.has_aggregates(&stmt.columns) {
+            if let Some(result) = self.try_text_match_count(stmt)? {
+                return Ok(result);
+            }
+        }
+
         // 🚀 FAST PATH 1a: Streaming aggregate (no GROUP BY) — zero HashMap, zero SqlRow.
         // Handles: SELECT COUNT(*), SUM(x), AVG(y), MIN(z), MAX(w) FROM t [WHERE ...]
         // Accumulates directly into inline counters — O(1) memory, no grouping overhead.
@@ -14734,7 +15031,12 @@ impl QueryExecutor {
 
         // 🚀 FAST PATH 1c: Positional ORDER BY / DISTINCT — skip HashMap conversion entirely.
         // Works directly on Vec<Value> rows for simple single-table ORDER BY / DISTINCT queries.
-        if (stmt.order_by.is_some() || stmt.distinct) && stmt.group_by.is_none() {
+        // LATEST BY must go through the materialized path (apply_latest_by):
+        // this fast path returned rows from the empty LSM read instead.
+        if (stmt.order_by.is_some() || stmt.distinct)
+            && stmt.group_by.is_none()
+            && stmt.latest_by.is_none()
+        {
             if let TableRef::Table {
                 name: table_name, ..
             } = from
@@ -15233,22 +15535,45 @@ impl QueryExecutor {
             } else {
                 // Apply WHERE clause in memory
                 if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
-                    // Fast path: Only evaluate the point query condition
+                    // Fast path: Only evaluate the point query condition.
+                    // 🔑 Resolution must be DETERMINISTIC: exact key → bare
+                    // key → UNIQUE ".{col}" suffix. The old HashMap-iteration
+                    // fallback bound `WHERE i.id = 1` randomly to i.id or o.id
+                    // on join rows (same query returned 0/1/2 across runs).
+                    let bare = col_name.rsplit('.').next().unwrap_or(&col_name).to_string();
+                    let suffix = format!(".{}", bare);
                     all_sql_rows
                         .into_iter()
                         .filter(|(_, row)| {
-                            // 尝试直接匹配
+                            // 尝试直接匹配（含限定名）
                             if let Some(row_value) = row.get(&col_name) {
                                 return row_value == &target_value;
                             }
-
-                            // 尝试匹配带表前缀的列名 (e.g., "users.id")
-                            for (key, row_value) in row.iter() {
-                                if key.ends_with(&format!(".{}", col_name)) || key == &col_name {
+                            if col_name != bare {
+                                if let Some(row_value) = row.get(&bare) {
                                     return row_value == &target_value;
                                 }
+                                // 唯一的 ".{bare}" 后缀键才匹配；二义 = 不匹配
+                                let mut hits = row
+                                    .keys()
+                                    .filter(|k| k.ends_with(&suffix))
+                                    .collect::<Vec<_>>();
+                                hits.dedup();
+                                if hits.len() == 1 {
+                                    return row.get(hits[0]) == Some(&target_value);
+                                }
+                                return false;
                             }
 
+                            // 尝试匹配带表前缀的列名 (e.g., "users.id")
+                            let mut hits = row
+                                .keys()
+                                .filter(|k| k.ends_with(&suffix))
+                                .collect::<Vec<_>>();
+                            hits.dedup();
+                            if hits.len() == 1 {
+                                return row.get(hits[0]) == Some(&target_value);
+                            }
                             false
                         })
                         .collect()
@@ -16122,7 +16447,10 @@ impl QueryExecutor {
             // 🔑 Don't early-terminate when WHERE is present — finalize_join_result
             // applies WHERE after the join, so we need all matching rows first,
             // THEN take LIMIT. Early-break before WHERE gives too few results.
-            let has_where = stmt.where_clause.is_some();
+            // 🔑 Same for ORDER BY (DESC especially: the top rows come LAST in
+            // scan order) and OFFSET (LIMIT+OFFSET rows needed after sorting).
+            let has_where =
+                stmt.where_clause.is_some() || stmt.order_by.is_some() || stmt.offset.is_some();
             let lncol = lschema.columns.len();
             let rncol = rschema.columns.len();
             let mut joined: Vec<Vec<Value>> = Vec::with_capacity(lrows.len().min(limit));
@@ -16289,6 +16617,560 @@ impl QueryExecutor {
             lprefix,
             rprefix,
         )?))
+    }
+
+    /// Flatten a left-deep INNER-equi-join FROM chain into the base table
+    /// plus its join steps. Returns None for non-Inner joins, right-nested
+    /// joins, or a bare table.
+    fn flatten_left_deep_inner(
+        from: &TableRef,
+    ) -> Option<(
+        (String, Option<String>),
+        Vec<(String, Option<String>, Expr)>,
+    )> {
+        match from {
+            TableRef::Table { name, alias } => Some(((name.clone(), alias.clone()), vec![])),
+            TableRef::Join {
+                left,
+                right,
+                join_type: JoinType::Inner,
+                on_condition,
+            } => {
+                let (mut base, mut steps) = Self::flatten_left_deep_inner(left)?;
+                match right.as_ref() {
+                    TableRef::Table { name, alias } => {
+                        steps.push((name.clone(), alias.clone(), on_condition.clone()));
+                        Some((base, steps))
+                    }
+                    _ => None, // right side must be a plain table (left-deep)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// 🚀 Multi-way INNER equi-join (3+ tables). Flattens a left-deep FROM
+    /// chain into successive hash joins over concatenated positional rows.
+    /// The general path nested-loop evaluated every candidate row pair — a
+    /// bounded 10K-row three-way join ran MINUTES. Also covers JOIN +
+    /// simple GROUP BY/aggregate shapes (COUNT/SUM/AVG/MIN/MAX on plain
+    /// columns, plain-column keys), which previously materialized every
+    /// joined row as a HashMap SqlRow (~340 ms for 200K × 5K).
+    /// 2-table chains keep try_positional_inner_join (PK-index path).
+    fn try_multi_way_inner_join(&self, stmt: &SelectStmt) -> Result<Option<QueryResult>> {
+        use crate::sql::ast::SelectColumn;
+        use std::collections::HashMap;
+
+        if stmt.distinct || stmt.having.is_some() || stmt.latest_by.is_some() {
+            return Ok(None);
+        }
+        let from = match stmt.from.as_ref() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let ((btable, balias), steps) = match Self::flatten_left_deep_inner(from) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        // 2-table chains with GROUP BY / aggregates also land here: the
+        // existing 2-table fast path only handles plain projections, and the
+        // general path materializes every joined row as a HashMap SqlRow
+        // (~340 ms at 200K × 5K). Plain-projection 2-table chains keep the
+        // existing path (PK-index nested loop).
+        if steps.len() < 2 && stmt.group_by.is_none() && !self.has_aggregates(&stmt.columns) {
+            return Ok(None);
+        }
+
+        // ---- accumulate the join product as concatenated positional rows
+        let bschema = match self.db.get_table_schema(&btable) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let bprefix = balias.unwrap_or_else(|| btable.clone());
+        let mut acc_rows: Vec<Vec<Value>> = self
+            .scan_table_rows_fast(&btable, &bschema)?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        // Qualified column names + types of the accumulated product.
+        let mut acc_cols: Vec<String> = Vec::with_capacity(64);
+        let mut acc_types: Vec<ColumnType> = Vec::with_capacity(64);
+        let mut acc_prefixes: Vec<String> = vec![bprefix.clone()];
+        for c in &bschema.columns {
+            acc_cols.push(format!("{}.{}", bprefix, c.name));
+            acc_types.push(c.col_type.clone());
+        }
+        // Resolve a column reference against the accumulated product: exact
+        // qualified match first, then a UNIQUE bare-suffix match.
+        fn acc_resolve_in(cols: &[String], name: &str) -> Option<usize> {
+            if let Some(p) = cols.iter().position(|c| c == name) {
+                return Some(p);
+            }
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            let mut hit = None;
+            for (i, c) in cols.iter().enumerate() {
+                if c.rsplit('.').next().unwrap_or(c) == bare {
+                    if hit.is_some() {
+                        return None; // ambiguous bare name
+                    }
+                    hit = Some(i);
+                }
+            }
+            hit
+        }
+        // (acc_cols mutates per step — resolve via the free fn with the live slice)
+
+        for (jtable, jalias, on) in &steps {
+            let jschema = match self.db.get_table_schema(jtable) {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            };
+            let jprefix = jalias.clone().unwrap_or_else(|| jtable.clone());
+            // Equi pair from ON: exactly one side must resolve against the
+            // NEW table, the other against the accumulated product.
+            let (lcol, rcol) = match self.extract_equi_join_columns(on) {
+                Some(p) => p,
+                None => return Ok(None), // non-equi ON → general path
+            };
+            let jresolve = |name: &str| -> Option<usize> {
+                if let Some((p, bare)) = name.split_once('.') {
+                    if p != jprefix {
+                        return None;
+                    }
+                    return jschema.get_column_position(bare);
+                }
+                jschema.get_column_position(name)
+            };
+            let (acc_pos, j_pos) = match (acc_resolve_in(&acc_cols, &lcol), jresolve(&lcol)) {
+                (Some(a), None) => match jresolve(&rcol) {
+                    Some(j) => (a, j),
+                    None => return Ok(None),
+                },
+                (None, Some(j)) => match acc_resolve_in(&acc_cols, &rcol) {
+                    Some(a) => (a, j),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None), // ambiguous / unresolved
+            };
+            let _ = j_pos;
+
+            let jrows = self.scan_table_rows_fast(jtable, &jschema)?;
+            // Build the hash side on the NEW table (probe accumulated rows).
+            let mut hash: HashMap<&Value, Vec<usize>> = HashMap::with_capacity(jrows.len());
+            for (ri, (_, rrow)) in jrows.iter().enumerate() {
+                if let Some(v) = rrow.get(j_pos) {
+                    hash.entry(v).or_default().push(ri);
+                }
+            }
+            let jncol = jschema.columns.len();
+            let mut next: Vec<Vec<Value>> = Vec::with_capacity(acc_rows.len());
+            for arow in &acc_rows {
+                let Some(key) = arow.get(acc_pos) else {
+                    continue;
+                };
+                // 🔑 NULL join keys never match (SQL: NULL = NULL is UNKNOWN).
+                if matches!(key, Value::Null) {
+                    continue;
+                }
+                if let Some(matches) = hash.get(key) {
+                    for &ri in matches {
+                        let mut combined = arow.clone();
+                        combined.extend(jrows[ri].1.iter().cloned());
+                        next.push(combined);
+                    }
+                }
+            }
+            acc_rows = next;
+            for c in &jschema.columns {
+                acc_cols.push(format!("{}.{}", jprefix, c.name));
+                acc_types.push(c.col_type.clone());
+            }
+            acc_prefixes.push(jprefix);
+            if acc_rows.is_empty() {
+                break;
+            }
+        }
+        let _ = &acc_prefixes;
+
+        // ---- synthetic schema over the joined product (qualified names)
+        let acc_schema: TableSchema = {
+            let mut s: TableSchema = (*bschema).clone();
+            s.columns.clear();
+            for (i, (name, ct)) in acc_cols.iter().zip(acc_types.iter()).enumerate() {
+                let mut cd = crate::types::ColumnDef::new(name.clone(), ct.clone(), i);
+                cd.position = i;
+                s.columns.push(cd);
+            }
+            s.rebuild_column_map();
+            s
+        };
+
+        // ---- WHERE on the joined product
+        let filtered: Vec<Vec<Value>> = if let Some(ref wc) = stmt.where_clause {
+            acc_rows
+                .into_iter()
+                .filter(|row| {
+                    matches!(
+                        Self::eval_expr_on_row(wc, row, &acc_schema),
+                        Ok(Value::Bool(true))
+                    )
+                })
+                .collect()
+        } else {
+            acc_rows
+        };
+
+        // ---- aggregate / GROUP BY variant
+        if stmt.group_by.is_some() || self.has_aggregates(&stmt.columns) {
+            // Keys: plain columns; aggregates: plain-column COUNT/SUM/AVG/MIN/MAX.
+            let group_pos: Option<Vec<usize>> = match &stmt.group_by {
+                None => Some(vec![]),
+                Some(items) => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        match acc_resolve_in(&acc_cols, it) {
+                            Some(p) => v.push(p),
+                            None => return Ok(None),
+                        }
+                    }
+                    Some(v)
+                }
+            };
+            let group_pos = match group_pos {
+                Some(g) => g,
+                None => return Ok(None),
+            };
+            struct Agg {
+                func: String,
+                pos: Option<usize>,
+            }
+            let mut aggs: Vec<Agg> = Vec::new();
+            let mut out_names: Vec<String> = Vec::new();
+            let mut key_out_pos: Vec<(usize, usize)> = Vec::new(); // (group idx, out idx)
+            for sc in &stmt.columns {
+                match sc {
+                    SelectColumn::Expr(e, alias) => {
+                        // Resolve the aggregate MANUALLY against the joined
+                        // product: try_parse_aggregate strips table qualifiers
+                        // before lookup, but the acc columns ARE qualified
+                        // ("o.amt") — SUM(o.amt) resolved to no column and
+                        // returned NULL.
+                        let Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct,
+                            ..
+                        } = e
+                        else {
+                            return Ok(None);
+                        };
+                        let func = name.to_uppercase();
+                        if *distinct
+                            || !matches!(func.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                        {
+                            return Ok(None);
+                        }
+                        let pos = match args.first() {
+                            None => None,                              // COUNT()
+                            Some(Expr::Column(c)) if c == "*" => None, // COUNT(*)
+                            Some(Expr::Column(c)) => match acc_resolve_in(&acc_cols, c) {
+                                Some(p) => Some(p),
+                                None => return Ok(None),
+                            },
+                            _ => return Ok(None),
+                        };
+                        aggs.push(Agg { func, pos });
+                        out_names.push(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| Self::expr_to_column_name(e)),
+                        );
+                    }
+                    SelectColumn::Column(c) => {
+                        let Some(p) = acc_resolve_in(&acc_cols, c) else {
+                            return Ok(None);
+                        };
+                        let Some(gi) = group_pos.iter().position(|&g| g == p) else {
+                            return Ok(None); // bare column must be a group key
+                        };
+                        key_out_pos.push((gi, out_names.len()));
+                        out_names.push(c.clone());
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            if aggs.is_empty() {
+                return Ok(None);
+            }
+            #[derive(Clone)]
+            struct Acc {
+                count: u64,
+                nn: Vec<u64>,
+                sum: Vec<f64>,
+                minv: Vec<Option<f64>>,
+                maxv: Vec<Option<f64>>,
+            }
+            let k = aggs.len();
+            let new_acc = |k: usize| Acc {
+                count: 0,
+                nn: vec![0; k],
+                sum: vec![0.0; k],
+                minv: vec![None; k],
+                maxv: vec![None; k],
+            };
+            let mut groups: HashMap<Vec<Value>, Acc> = HashMap::with_capacity(256);
+            let mut order_keys: Vec<Vec<Value>> = Vec::with_capacity(256);
+            for row in &filtered {
+                let key: Vec<Value> = group_pos
+                    .iter()
+                    .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
+                    .collect();
+                if !groups.contains_key(&key) {
+                    order_keys.push(key.clone());
+                    groups.insert(key.clone(), new_acc(k));
+                }
+                let acc = groups.get_mut(&key).expect("group just ensured");
+                acc.count += 1;
+                for (i, a) in aggs.iter().enumerate() {
+                    let Some(p) = a.pos else { continue };
+                    match row.get(p) {
+                        Some(Value::Integer(x)) => {
+                            acc.nn[i] += 1;
+                            acc.sum[i] += *x as f64;
+                            acc.minv[i] =
+                                Some(acc.minv[i].map_or(*x as f64, |m: f64| m.min(*x as f64)));
+                            acc.maxv[i] =
+                                Some(acc.maxv[i].map_or(*x as f64, |m: f64| m.max(*x as f64)));
+                        }
+                        Some(Value::Float(x)) => {
+                            acc.nn[i] += 1;
+                            acc.sum[i] += *x;
+                            acc.minv[i] = Some(acc.minv[i].map_or(*x, |m: f64| m.min(*x)));
+                            acc.maxv[i] = Some(acc.maxv[i].map_or(*x, |m: f64| m.max(*x)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let finish = |acc: &Acc| -> Vec<Value> {
+                aggs.iter()
+                    .enumerate()
+                    .map(|(i, a)| match a.func.as_str() {
+                        "COUNT" => Value::Integer(if a.pos.is_none() {
+                            acc.count as i64
+                        } else {
+                            acc.nn[i] as i64
+                        }),
+                        "SUM" => {
+                            if acc.nn[i] > 0 {
+                                Value::Float(acc.sum[i])
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        "AVG" => {
+                            if acc.nn[i] > 0 {
+                                Value::Float(acc.sum[i] / acc.nn[i] as f64)
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        "MIN" => acc.minv[i].map(Value::Float).unwrap_or(Value::Null),
+                        _ => acc.maxv[i].map(Value::Float).unwrap_or(Value::Null),
+                    })
+                    .collect()
+            };
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(order_keys.len());
+            // 🔑 SQL standard: an ungrouped aggregate over an EMPTY set
+            // returns ONE row (COUNT → 0, SUM/AVG/MIN/MAX → NULL). An empty
+            // join product used to return zero rows.
+            if order_keys.is_empty() && group_pos.is_empty() {
+                let vals = finish(&new_acc(k));
+                let mut row = vec![Value::Null; out_names.len()];
+                let mut vi = 0;
+                for (oi, sc) in stmt.columns.iter().enumerate() {
+                    if matches!(sc, SelectColumn::Expr(_, _)) {
+                        row[oi] = vals[vi].clone();
+                        vi += 1;
+                    }
+                }
+                rows.push(row);
+            }
+            for key in order_keys {
+                let acc = groups.remove(&key).unwrap_or_else(|| new_acc(k));
+                let mut row = vec![Value::Null; out_names.len()];
+                for (gi, oi) in &key_out_pos {
+                    row[*oi] = key[*gi].clone();
+                }
+                let vals = finish(&acc);
+                let mut vi = 0;
+                for (oi, sc) in stmt.columns.iter().enumerate() {
+                    if matches!(sc, SelectColumn::Expr(_, _)) {
+                        row[oi] = vals[vi].clone();
+                        vi += 1;
+                    }
+                }
+                rows.push(row);
+            }
+            // ORDER BY on plain output columns or an aggregate that appears
+            // in the SELECT list (matched by canonical name, e.g.
+            // `ORDER BY COUNT(*) DESC`).
+            if let Some(ref ob) = stmt.order_by {
+                let mut specs: Vec<(usize, bool)> = Vec::new();
+                for oe in ob {
+                    let name = match &oe.expr {
+                        Expr::Column(cn) => cn.clone(),
+                        other => Self::expr_to_column_name(other),
+                    };
+                    let bare = name.rsplit('.').next().unwrap_or(&name);
+                    // Match the output name, or the canonical name of the
+                    // SELECT expression at that output position (the output
+                    // may be aliased: `COUNT(*) AS n … ORDER BY COUNT(*)`).
+                    let Some(p) = out_names
+                        .iter()
+                        .position(|n| n == &name || n.rsplit('.').next().unwrap_or(n) == bare)
+                        .or_else(|| {
+                            stmt.columns.iter().position(|sc| match sc {
+                                SelectColumn::Expr(e, _) => Self::expr_to_column_name(e) == name,
+                                _ => false,
+                            })
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    specs.push((p, oe.asc));
+                }
+                if !specs.is_empty() {
+                    rows.sort_by(|a, b| {
+                        for &(i, asc) in &specs {
+                            let c = a[i].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal);
+                            let c = if asc { c } else { c.reverse() };
+                            if c != std::cmp::Ordering::Equal {
+                                return c;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+            }
+            let offset = stmt.offset.unwrap_or(0);
+            if offset > 0 {
+                rows.drain(..offset.min(rows.len()));
+            }
+            if let Some(l) = stmt.limit {
+                rows.truncate(l);
+            }
+            return Ok(Some(QueryResult::Select {
+                columns: out_names,
+                rows,
+            }));
+        }
+
+        // ---- projection variant (no aggregates)
+        let (column_names, projected): (Vec<String>, Vec<Vec<Value>>) = if stmt.columns.len() == 1
+            && matches!(stmt.columns[0], SelectColumn::Star)
+        {
+            (
+                acc_cols
+                    .iter()
+                    .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+                    .collect(),
+                filtered,
+            )
+        } else {
+            let mut idxs: Vec<usize> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for sc in &stmt.columns {
+                match sc {
+                    SelectColumn::Star => {
+                        for (i, n) in acc_cols.iter().enumerate() {
+                            idxs.push(i);
+                            names.push(n.clone());
+                        }
+                    }
+                    SelectColumn::Column(c) => {
+                        let bare = c.rsplit('.').next().unwrap_or(c);
+                        let p = acc_cols
+                            .iter()
+                            .enumerate()
+                            .find(|(i, n)| {
+                                !claimed.contains(i)
+                                    && (*n == c || n.rsplit('.').next() == Some(bare))
+                            })
+                            .map(|(i, _)| i);
+                        let Some(p) = p else { return Ok(None) };
+                        claimed.insert(p);
+                        idxs.push(p);
+                        names.push(c.clone());
+                    }
+                    SelectColumn::ColumnWithAlias(c, a) => {
+                        let bare = c.rsplit('.').next().unwrap_or(c);
+                        let p = acc_cols
+                            .iter()
+                            .enumerate()
+                            .find(|(i, n)| {
+                                !claimed.contains(i)
+                                    && (*n == c || n.rsplit('.').next() == Some(bare))
+                            })
+                            .map(|(i, _)| i);
+                        let Some(p) = p else { return Ok(None) };
+                        claimed.insert(p);
+                        idxs.push(p);
+                        names.push(a.clone());
+                    }
+                    SelectColumn::Expr(_, _) => return Ok(None), // expressions → general path
+                }
+            }
+            (
+                names,
+                filtered
+                    .into_iter()
+                    .map(|r| idxs.iter().map(|&i| r[i].clone()).collect())
+                    .collect(),
+            )
+        };
+
+        // ORDER BY on projected output columns, then LIMIT/OFFSET.
+        let mut rows = projected;
+        if let Some(ref ob) = stmt.order_by {
+            let mut specs: Vec<(usize, bool)> = Vec::new();
+            for oe in ob {
+                let Expr::Column(cn) = &oe.expr else {
+                    return Ok(None);
+                };
+                let Some(p) = column_names.iter().position(|n| {
+                    n == cn
+                        || n.rsplit('.').next().unwrap_or(n) == cn.rsplit('.').next().unwrap_or(cn)
+                }) else {
+                    return Ok(None);
+                };
+                specs.push((p, oe.asc));
+            }
+            if !specs.is_empty() {
+                rows.sort_by(|a, b| {
+                    for &(i, asc) in &specs {
+                        let c = a[i].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal);
+                        let c = if asc { c } else { c.reverse() };
+                        if c != std::cmp::Ordering::Equal {
+                            return c;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+        }
+        let offset = stmt.offset.unwrap_or(0);
+        if offset > 0 {
+            rows.drain(..offset.min(rows.len()));
+        }
+        if let Some(l) = stmt.limit {
+            rows.truncate(l);
+        }
+        Ok(Some(QueryResult::Select {
+            columns: column_names,
+            rows,
+        }))
     }
 
     /// INNER JOIN: only rows that match condition in both tables
@@ -17599,60 +18481,71 @@ impl QueryExecutor {
             }
 
             Expr::Match { column, query, .. } => {
-                // 🚀 Fast path: use pre-computed score if available (from text search fast path)
-                let score_key = format!("__text_score_{}__", column);
-                if let Some(Value::Float(score)) = row.get(&score_key) {
-                    return Ok(Value::Float(*score));
+                let has_score = row.keys().any(|k| k.starts_with("__text_score_"));
+                if has_score {
+                    return Ok(Value::Bool(true));
                 }
-
-                // Get row_id from the row
-                let row_id_opt = row.get("__row_id__").and_then(|v| match v {
-                    Value::Integer(i) => Some(*i as u64),
-                    _ => None,
-                });
-
-                // 🔧 Get table name from row
-                let table_name_opt = row.get("__table__").and_then(|v| match v {
-                    Value::Text(s) => Some(s.as_str()),
-                    _ => None,
-                });
-
-                // Try index-based match if metadata is available
-                if let (Some(row_id), Some(table_name)) = (row_id_opt, table_name_opt) {
-                    let index_name = self.db.index_registry.find_by_column(
-                        table_name,
-                        column,
-                        crate::database::index_metadata::IndexType::Text,
-                    );
-                    if let Some(index_name) = index_name {
-                        if let Some(index_ref) = self.db.text_indexes.get(&index_name) {
-                            let results = index_ref.value().read().search_ranked(query, 1000)?;
-                            let score = results
-                                .iter()
-                                .find(|(doc_id, _)| *doc_id == row_id)
-                                .map(|(_, score)| *score)
-                                .unwrap_or(0.0);
-                            return Ok(Value::Float(score as f64));
+                // Set-membership via the text index, resolved once per
+                // statement (this arm runs per row under aggregates and
+                // compound predicates). The old fallback was an
+                // AND-of-substrings scan, so `MATCH(c, 'a b')` matched a
+                // DIFFERENT set than the index path's OR-over-tokens.
+                // Rows without __table__/__row_id__ (LSM-sourced materialized
+                // rows) fall back to the same token-OR scan the static
+                // evaluator uses — returning false here made index-less
+                // tables match nothing.
+                let (table_name, row_id) = match (
+                    row.get("__table__").and_then(|v| match v {
+                        Value::Text(s) => Some(s.as_str()),
+                        _ => None,
+                    }),
+                    row.get("__row_id__").and_then(|v| match v {
+                        Value::Integer(i) => Some(*i as u64),
+                        _ => None,
+                    }),
+                ) {
+                    (Some(t), Some(r)) => (t, r),
+                    _ => {
+                        use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
+                        match row.get(column) {
+                            Some(Value::Text(text)) => {
+                                let tok = WhitespaceTokenizer::default();
+                                let q: Vec<String> =
+                                    tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
+                                return Ok(Value::Bool(
+                                    tok.tokenize(text).iter().any(|t| q.contains(&t.text)),
+                                ));
+                            }
+                            _ => return Ok(Value::Bool(false)),
                         }
                     }
-                }
-
-                // Fallback: naive text scan when no FTS index
-                let text_val = row
-                    .get(column)
-                    .or_else(|| table_name_opt.and_then(|t| row.get(&format!("{}.{}", t, column))));
-                match text_val {
-                    Some(Value::Text(text)) => {
-                        let text_lower = text.to_lowercase();
-                        let query_lower = query.to_lowercase();
-                        let terms: Vec<&str> = query_lower.split_whitespace().collect();
-                        let matched = terms.iter().all(|t| text_lower.contains(t));
-                        Ok(Value::Bool(matched))
+                };
+                let index_name = self.db.index_registry.find_by_column(
+                    table_name,
+                    column,
+                    crate::database::index_metadata::IndexType::Text,
+                );
+                let memo_key = format!("{table_name}|{column}|{query}");
+                let hit = TEXT_MATCH_MEMO.with(|m| m.borrow().get(&memo_key).cloned());
+                let set = match hit {
+                    Some(set) => set,
+                    None => {
+                        let set: Arc<std::collections::HashSet<u64>> = Arc::new(
+                            self.text_match_row_ids(
+                                table_name,
+                                column,
+                                query,
+                                index_name.as_deref(),
+                            )?
+                            .into_iter()
+                            .collect(),
+                        );
+                        TEXT_MATCH_MEMO.with(|m| m.borrow_mut().insert(memo_key, Arc::clone(&set)));
+                        set
                     }
-                    _ => Ok(Value::Bool(false)),
-                }
+                };
+                Ok(Value::Bool(set.contains(&row_id)))
             }
-
             Expr::KnnSearch {
                 column,
                 query_vector,
@@ -17944,19 +18837,32 @@ impl QueryExecutor {
     ) -> Result<Vec<Vec<Value>>> {
         use std::collections::HashMap;
 
-        // Find timestamp column (must exist in schema)
-        let timestamp_col = schema
+        // Recency column: the first TIMESTAMP column. Tables without one
+        // (e.g. `ts INT`) fall back to ROW ORDER — the last inserted row per
+        // group is "latest" (the old fast-path behavior returned every row,
+        // and the strict error rejected `ts INT` tables outright).
+        let timestamp_col_name = schema
             .columns
             .iter()
             .find(|c| c.col_type == ColumnType::Timestamp)
-            .ok_or_else(|| {
-                MoteDBError::Query("LATEST BY requires a TIMESTAMP column in the table".to_string())
-            })?;
-
-        let timestamp_col_name = &timestamp_col.name;
+            .map(|c| c.name.clone());
 
         // Build grouping key -> (max_timestamp, projected_row) map
         // Use Vec<Value> keys to avoid per-row String allocation from to_string()/format!()
+        // Materialized rows key columns by QUALIFIED names ("t.col"); accept
+        // both spellings (a bare-only lookup made LATEST BY fail with
+        // 'Column not found' on the materialized path).
+        let lookup = |row: &SqlRow, name: &str| -> Option<Value> {
+            row.get(name).cloned().or_else(|| {
+                if !name.contains('.') {
+                    row.iter()
+                        .find(|(k, _)| k.rsplit('.').next() == Some(name))
+                        .map(|(_, v)| v.clone())
+                } else {
+                    None
+                }
+            })
+        };
         let mut groups: HashMap<Vec<Value>, (i64, Vec<Value>)> = HashMap::new();
 
         for (i, (_, full_row)) in filtered_rows.iter().enumerate() {
@@ -17964,28 +18870,26 @@ impl QueryExecutor {
             let group_key: Result<Vec<Value>> = latest_by_cols
                 .iter()
                 .map(|col_name| {
-                    full_row
-                        .get(col_name)
+                    lookup(full_row, col_name)
                         .ok_or_else(|| MoteDBError::ColumnNotFound(col_name.clone()))
-                        .cloned()
                 })
                 .collect();
             let group_key = group_key?;
 
             // Extract timestamp
-            let timestamp = full_row
-                .get(timestamp_col_name)
-                .ok_or_else(|| MoteDBError::ColumnNotFound(timestamp_col_name.clone()))?;
-
-            let ts_value = match timestamp {
-                Value::Timestamp(ts) => ts.as_micros(),
-                Value::Integer(i) => *i,
-                _ => {
-                    return Err(MoteDBError::Query(format!(
-                        "Timestamp column '{}' must be TIMESTAMP or INTEGER type",
-                        timestamp_col_name
-                    )))
-                }
+            // With no TIMESTAMP column the recency key is the row id
+            // (insertion order).
+            let ts_value = match timestamp_col_name.as_ref() {
+                Some(col_name) => match lookup(full_row, col_name) {
+                    Some(Value::Timestamp(ts)) => ts.as_micros(),
+                    Some(Value::Integer(i)) => i,
+                    _ => {
+                        return Err(MoteDBError::Query(format!(
+                            "Timestamp column '{col_name}' must be TIMESTAMP or INTEGER type"
+                        )))
+                    }
+                },
+                None => filtered_rows[i].0 as i64,
             };
 
             // Update group if this is a newer record
@@ -18028,23 +18932,40 @@ impl QueryExecutor {
         use std::collections::HashMap;
 
         // Pre-resolve group column names to their actual keys in the SqlRow HashMap.
+        // A name that matches no row key may be a SELECT alias or a SELECT
+        // expression's canonical name (`GROUP BY b` / `GROUP BY
+        // TIME_BUCKET('5s', ts)`); those are computed per row below.
+        let mut alias_exprs: Vec<Option<&Expr>> = Vec::with_capacity(group_by_cols.len());
         let resolved_col_names: Vec<String> = if !rows.is_empty() {
             let first_row = &rows[0].1;
             group_by_cols
                 .iter()
                 .map(|col_name| {
                     if first_row.contains_key(col_name) {
-                        col_name.clone()
-                    } else {
-                        first_row
-                            .keys()
-                            .find(|key| {
-                                key.ends_with(&format!(".{}", col_name))
-                                    || key.as_str() == col_name.as_str()
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| col_name.clone())
+                        alias_exprs.push(None);
+                        return col_name.clone();
                     }
+                    if let Some(key) = first_row.keys().find(|key| {
+                        key.ends_with(&format!(".{}", col_name))
+                            || key.as_str() == col_name.as_str()
+                    }) {
+                        alias_exprs.push(None);
+                        return key.clone();
+                    }
+                    let expr = columns.iter().find_map(|c| match c {
+                        SelectColumn::Expr(e, Some(a)) if a == col_name => Some(e),
+                        // `GROUP BY <full expression text>` must also find the
+                        // expression when the SELECT item carries an alias.
+                        SelectColumn::Expr(e, alias)
+                            if alias.is_none()
+                                || alias.is_some() && &Self::expr_to_column_name(e) == col_name =>
+                        {
+                            Some(e)
+                        }
+                        _ => None,
+                    });
+                    alias_exprs.push(expr);
+                    col_name.clone()
                 })
                 .collect()
         } else {
@@ -18058,10 +18979,13 @@ impl QueryExecutor {
         for (_, row) in rows {
             let group_key: Result<Vec<Value>> = resolved_col_names
                 .iter()
-                .map(|col_name| {
-                    row.get(col_name)
+                .zip(alias_exprs.iter())
+                .map(|(col_name, expr)| match expr {
+                    Some(e) => self.evaluator.eval(e, row),
+                    None => row
+                        .get(col_name)
                         .cloned()
-                        .ok_or_else(|| MoteDBError::ColumnNotFound(col_name.clone()))
+                        .ok_or_else(|| MoteDBError::ColumnNotFound(col_name.clone())),
                 })
                 .collect();
             let group_key = group_key?;
@@ -18469,7 +19393,16 @@ impl QueryExecutor {
                             Ok(Value::text(parts.join(&sep)))
                         }
                     }
-                    _ => Err(MoteDBError::UnknownFunction(name.clone())),
+                    // Non-aggregate function in a GROUP BY SELECT list
+                    // (e.g. the group-key expression `TIME_BUCKET('5s', ts)`
+                    // itself): evaluate it as a scalar on the group's
+                    // representative row — every row in the group shares the
+                    // key, so the first row gives the right value. Empty
+                    // group → NULL.
+                    _ => match rows.first() {
+                        Some(row) => self.evaluator.eval(expr, row),
+                        None => Ok(Value::Null),
+                    },
                 }
             }
             // 🆕 Compound expressions that wrap an aggregate (e.g.
@@ -19227,6 +20160,15 @@ impl QueryExecutor {
         {
             return Ok(None);
         }
+        // 🔑 Correlated subqueries → the materialized path's per-row
+        // evaluation (silent 0 here otherwise — see the positional path).
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
+        {
+            return Ok(None);
+        }
         // 🆕 HAVING requires post-aggregation filtering that this streaming
         // path doesn't apply — fall back to the materialized path.
         if stmt.having.is_some() {
@@ -19570,6 +20512,16 @@ impl QueryExecutor {
             .where_clause
             .as_ref()
             .is_some_and(Self::expr_contains_st_knn)
+        {
+            return Ok(None);
+        }
+        // 🔑 Correlated subqueries need per-row execution by the MATERIALIZED
+        // path; positional evaluation treats the Err as "no match" —
+        // `COUNT(*) WHERE EXISTS(…correlated…)` silently returned 0.
+        if stmt
+            .where_clause
+            .as_ref()
+            .is_some_and(Self::expr_contains_subquery)
         {
             return Ok(None);
         }
@@ -20930,6 +21882,11 @@ impl QueryExecutor {
         if stmt.group_by.is_some() {
             return Ok(None);
         } // GROUP BY handles its own path
+          // 🔑 Explicit NULLS FIRST/LAST that differs from the dialect default
+          // needs apply_order_by's comparator — decline to the materialized path.
+        if order_by_has_nondefault_nulls(stmt.order_by.as_deref()) {
+            return Ok(None);
+        }
 
         // Resolve SELECT columns to (display_name, schema_position)
         let mut resolved_cols = Vec::new();
@@ -21650,23 +22607,27 @@ impl QueryExecutor {
             }
         }
 
-        // 🚀 PK fast path: skip full table scan for WHERE pk = value
-        // 🔑 Skip PK fast path when in a transaction — the row may exist only
-        // in the write_set (uncommitted INSERT), and resolve_pk_row_ids reads
-        // storage (wouldn't find it). The scan path merges write_set + storage.
-        if !self.is_in_transaction() {
-            if let Some(ref where_clause) = stmt.where_clause {
-                if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
-                    let is_pk = schema
-                        .primary_key()
-                        .map(|pk| pk == col_name)
-                        .unwrap_or(false);
+        // 🚀 PK fast path: skip full table scan for WHERE pk = value.
+        // 🔑 Valid inside transactions too: execute_update_pk checks the txn
+        // write_set/tombstones per row and folds in matching uncommitted
+        // INSERTs, so read-your-writes is preserved. The old blanket
+        // in-txn bail forced every statement through a full-table scan
+        // (~70ms each at 100K rows — 2K updates took 2+ minutes).
+        if let Some(ref where_clause) = stmt.where_clause {
+            if let Some((col_name, target_value)) = self.try_extract_point_query(where_clause) {
+                let is_pk = schema
+                    .primary_key()
+                    .map(|pk| pk == col_name)
+                    .unwrap_or(false);
 
-                    if is_pk {
-                        return self.execute_update_pk(&stmt, &schema, &target_value);
-                    }
+                if is_pk {
+                    return self.execute_update_pk(&stmt, &schema, &target_value);
+                }
 
-                    // Column index fast path: use index to find matching rows
+                // Column index fast path: use index to find matching rows.
+                // 🔑 Still txn-gated: the index reads storage only, so rows
+                // INSERTed in this txn would be missed.
+                if !self.is_in_transaction() {
                     if let Some(index_name) = self.db.index_registry.find_by_column(
                         &stmt.table,
                         &col_name,
@@ -21819,121 +22780,7 @@ impl QueryExecutor {
             if !should_update {
                 continue;
             }
-            let mut new_row = row.clone();
-            for (col_name, expr) in &stmt.assignments {
-                if let Some(cd) = schema.get_column(col_name) {
-                    let new_val = if let Expr::Literal(v) = expr {
-                        v.clone()
-                    } else if Self::expr_contains_subquery(expr) {
-                        let materialized = self.materialize_subqueries(expr)?;
-                        if let Expr::Literal(v) = materialized {
-                            v
-                        } else {
-                            Self::eval_expr_on_row(&materialized, &row, &schema)
-                                .unwrap_or(Value::Null)
-                        }
-                    } else {
-                        Self::eval_expr_on_row(expr, &row, &schema)?
-                    };
-                    while new_row.len() <= cd.position {
-                        new_row.push(Value::Null);
-                    }
-                    new_row[cd.position] = new_val;
-                }
-            }
-            // 🔑 Update the write_set entry (not storage — the row isn't committed yet).
-            if let Some(tid) = self.current_txn_id() {
-                // 🔑 Integer PK changed on a buffered row: relocate the
-                // write_set entry to the new PK-derived row_id. PK point
-                // queries assume row_id == Integer PK — a content-only update
-                // left the row under the OLD row_id, making `WHERE pk = <new>`
-                // permanently miss it (and `WHERE pk = <old>` return a row
-                // whose content claims otherwise).
-                let mut relocated = false;
-                let pk_pos = schema
-                    .primary_key()
-                    .and_then(|n| schema.get_column(n))
-                    .map(|c| c.position);
-                if let Some(pos) = pk_pos {
-                    if let (Some(Value::Integer(old_pk)), Some(Value::Integer(new_pk))) =
-                        (row.get(pos), new_row.get(pos))
-                    {
-                        if old_pk != new_pk {
-                            // New PK must be free. Integer PK 的 row_id 恒等于
-                            // PK 值 —— 直接点查（query_by_column 在无列索引时
-                            // 报错，错误被吞后检查形同虚设）。
-                            let target_rid = if *new_pk >= 0 {
-                                *new_pk as RowId
-                            } else {
-                                0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
-                            };
-                            if target_rid != *ws_row_id
-                                && self
-                                    .db
-                                    .get_table_row(&stmt.table, target_rid)
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                            {
-                                return Err(StorageError::InvalidData(format!(
-                                    "Duplicate primary key {:?} for table '{}'",
-                                    Value::Integer(*new_pk),
-                                    stmt.table
-                                )));
-                            }
-                            // ... and other buffered rows in this txn.
-                            let ws_now = self.txn_write_set_rows(&stmt.table);
-                            for (other_rid, other_row) in &ws_now {
-                                if other_rid != ws_row_id
-                                    && other_row.get(pos) == Some(&Value::Integer(*new_pk))
-                                {
-                                    return Err(StorageError::InvalidData(format!(
-                                        "Duplicate primary key {:?} for table '{}'",
-                                        Value::Integer(*new_pk),
-                                        stmt.table
-                                    )));
-                                }
-                            }
-                            let new_rid = if *new_pk >= 0 {
-                                *new_pk as RowId
-                            } else {
-                                0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
-                            };
-                            relocated = self
-                                .db
-                                .txn_coordinator
-                                .relocate_write_set_row(
-                                    tid,
-                                    &stmt.table,
-                                    *ws_row_id,
-                                    new_rid,
-                                    new_row.clone(),
-                                )
-                                .unwrap_or(false);
-                        }
-                    }
-                }
-                if !relocated {
-                    // 🔑 Savepoint rollback must restore the pre-update value:
-                    // buffer updates previously recorded no delta at all, so
-                    // ROLLBACK TO SAVEPOINT silently kept the new value.
-                    // Savepoint-only (never the storage-replayed undo_log).
-                    let _ = self.db.txn_coordinator.record_savepoint_delta(
-                        tid,
-                        crate::txn::coordinator::DeltaOperation::Update(
-                            *ws_row_id,
-                            stmt.table.clone(),
-                            std::sync::Arc::new(row.clone()),
-                        ),
-                    );
-                    let _ = self.db.txn_coordinator.update_write_set_row(
-                        tid,
-                        &stmt.table,
-                        *ws_row_id,
-                        new_row,
-                    );
-                }
-            }
+            self.apply_update_to_write_set_row(&stmt, &schema, *ws_row_id, &row)?;
             affected_rows += 1;
         }
 
@@ -22245,20 +23092,161 @@ impl QueryExecutor {
         }
     }
 
+    /// Apply an UPDATE's assignments to one write_set (uncommitted INSERT)
+    /// row: evaluates SET expressions against the ORIGINAL row, relocates the
+    /// buffered entry when the integer PK changes (rejecting duplicates), and
+    /// records the savepoint delta. Storage is not touched — the row isn't
+    /// committed yet. Shared by the scan path's write_set loop and the
+    /// transaction-aware PK fast path.
+    fn apply_update_to_write_set_row(
+        &self,
+        stmt: &UpdateStmt,
+        schema: &crate::types::TableSchema,
+        ws_row_id: RowId,
+        row: &Row,
+    ) -> Result<()> {
+        let mut new_row = row.clone();
+        for (col_name, expr) in &stmt.assignments {
+            if let Some(cd) = schema.get_column(col_name) {
+                let new_val = if let Expr::Literal(v) = expr {
+                    v.clone()
+                } else if Self::expr_contains_subquery(expr) {
+                    let materialized = self.materialize_subqueries(expr)?;
+                    if let Expr::Literal(v) = materialized {
+                        v
+                    } else {
+                        Self::eval_expr_on_row(&materialized, row, schema).unwrap_or(Value::Null)
+                    }
+                } else {
+                    Self::eval_expr_on_row(expr, row, schema)?
+                };
+                while new_row.len() <= cd.position {
+                    new_row.push(Value::Null);
+                }
+                new_row[cd.position] = new_val;
+            }
+        }
+        // 🔑 Update the write_set entry (not storage — the row isn't committed yet).
+        if let Some(tid) = self.current_txn_id() {
+            // 🔑 Integer PK changed on a buffered row: relocate the
+            // write_set entry to the new PK-derived row_id. PK point
+            // queries assume row_id == Integer PK — a content-only update
+            // left the row under the OLD row_id, making `WHERE pk = <new>`
+            // permanently miss it (and `WHERE pk = <old>` return a row
+            // whose content claims otherwise).
+            let mut relocated = false;
+            let pk_pos = schema
+                .primary_key()
+                .and_then(|n| schema.get_column(n))
+                .map(|c| c.position);
+            if let Some(pos) = pk_pos {
+                if let (Some(Value::Integer(old_pk)), Some(Value::Integer(new_pk))) =
+                    (row.get(pos), new_row.get(pos))
+                {
+                    if old_pk != new_pk {
+                        // New PK must be free. Integer PK 的 row_id 恒等于
+                        // PK 值 —— 直接点查（query_by_column 在无列索引时
+                        // 报错，错误被吞后检查形同虚设）。
+                        let target_rid = if *new_pk >= 0 {
+                            *new_pk as RowId
+                        } else {
+                            0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
+                        };
+                        if target_rid != ws_row_id
+                            && self
+                                .db
+                                .get_table_row(&stmt.table, target_rid)
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        {
+                            return Err(StorageError::InvalidData(format!(
+                                "Duplicate primary key {:?} for table '{}'",
+                                Value::Integer(*new_pk),
+                                stmt.table
+                            )));
+                        }
+                        // ... and other buffered rows in this txn.
+                        let ws_now = self.txn_write_set_rows(&stmt.table);
+                        for (other_rid, other_row) in &ws_now {
+                            if other_rid != &ws_row_id
+                                && other_row.get(pos) == Some(&Value::Integer(*new_pk))
+                            {
+                                return Err(StorageError::InvalidData(format!(
+                                    "Duplicate primary key {:?} for table '{}'",
+                                    Value::Integer(*new_pk),
+                                    stmt.table
+                                )));
+                            }
+                        }
+                        let new_rid = if *new_pk >= 0 {
+                            *new_pk as RowId
+                        } else {
+                            0x8000_0000u64 | (*new_pk as u64 & 0x7FFF_FFFF)
+                        };
+                        relocated = self
+                            .db
+                            .txn_coordinator
+                            .relocate_write_set_row(
+                                tid,
+                                &stmt.table,
+                                ws_row_id,
+                                new_rid,
+                                new_row.clone(),
+                            )
+                            .unwrap_or(false);
+                    }
+                }
+            }
+            if !relocated {
+                // 🔑 Savepoint rollback must restore the pre-update value:
+                // buffer updates previously recorded no delta at all, so
+                // ROLLBACK TO SAVEPOINT silently kept the new value.
+                // Savepoint-only (never the storage-replayed undo_log).
+                let _ = self.db.txn_coordinator.record_savepoint_delta(
+                    tid,
+                    crate::txn::coordinator::DeltaOperation::Update(
+                        ws_row_id,
+                        stmt.table.clone(),
+                        std::sync::Arc::new(row.clone()),
+                    ),
+                );
+                let _ = self.db.txn_coordinator.update_write_set_row(
+                    tid,
+                    &stmt.table,
+                    ws_row_id,
+                    new_row,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn execute_update_pk(
         &self,
         stmt: &UpdateStmt,
         schema: &crate::types::TableSchema,
         target_value: &Value,
     ) -> Result<QueryResult> {
+        // Note: no early return on empty row_ids — inside a transaction the
+        // target row may exist ONLY in the write_set (uncommitted INSERT),
+        // which the write_set pass below matches on the PK column.
         let row_ids = self.resolve_pk_row_ids(&stmt.table, schema, target_value)?;
-        if row_ids.is_empty() {
-            return Ok(QueryResult::Modification { affected_rows: 0 });
-        }
 
         let mut affected_rows = 0;
+        let in_txn = self.is_in_transaction();
 
         for row_id in row_ids {
+            // 🔑 Transaction visibility: a row DELETEd in this txn must not
+            // be resurrected; a row still buffered in the write_set is
+            // updated in the buffer by the write_set pass below (updating
+            // storage here would materialize an uncommitted INSERT).
+            if in_txn {
+                match self.txn_lookup_row(&stmt.table, row_id) {
+                    Some(_) => continue, // tombstone or buffered row
+                    None => {}
+                }
+            }
             let row = match self.db.get_table_row(&stmt.table, row_id)? {
                 Some(r) => r,
                 None => continue,
@@ -22324,6 +23312,25 @@ impl QueryExecutor {
             self.db
                 .update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, schema)?;
             affected_rows += 1;
+        }
+
+        // 🔑 Uncommitted INSERTs of this txn are invisible to
+        // resolve_pk_row_ids (storage + pk cache). Match them directly on
+        // the PK column — O(buffered rows), not O(table).
+        if in_txn {
+            let pk_pos = schema
+                .primary_key()
+                .and_then(|n| schema.get_column(n))
+                .map(|c| c.position);
+            if let Some(pos) = pk_pos {
+                for (ws_row_id, ws_row) in self.txn_write_set_rows(&stmt.table) {
+                    if ws_row.get(pos) != Some(target_value) {
+                        continue;
+                    }
+                    self.apply_update_to_write_set_row(stmt, schema, ws_row_id, &ws_row)?;
+                    affected_rows += 1;
+                }
+            }
         }
 
         Ok(QueryResult::Modification { affected_rows })
@@ -22615,6 +23622,13 @@ impl QueryExecutor {
 
     /// Execute CREATE INDEX statement
     fn execute_create_index(&self, stmt: CreateIndexStmt) -> Result<QueryResult> {
+        // 🆕 IF NOT EXISTS: no-op (with a notice) when the index is already
+        // registered — the standard idempotent-migration shape.
+        if stmt.if_not_exists && self.db.index_registry.get(&stmt.index_name).is_some() {
+            return Ok(QueryResult::Definition {
+                message: format!("Index '{}' already exists, skipped", stmt.index_name),
+            });
+        }
         // Get table schema to find column type
         let schema = self.db.get_table_schema(&stmt.table)?;
         let column = schema
@@ -22698,7 +23712,8 @@ impl QueryExecutor {
         match index_type {
             IndexType::Text => {
                 // 1️⃣ Create empty text index
-                self.db.create_text_index(&index_name)?;
+                self.db
+                    .create_text_index_with_tokenizer(&index_name, stmt.tokenizer.clone())?;
 
                 // 2️⃣ 🚀 Columnar fast path: bulk build from TextSegment
                 let column_pos = schema
@@ -23495,16 +24510,18 @@ impl QueryExecutor {
                     // Pattern 1: Column = Literal
                     if let (Expr::Column(col), Expr::Literal(val)) = (left.as_ref(), right.as_ref())
                     {
-                        // 注意: 列名可能没有表前缀 (例如 "id"),但 SqlRow 中的键有前缀 ("users.id")
-                        // 我们返回不带前缀的列名,在过滤时需要匹配任何表前缀
-                        let bare = Self::strip_qualifier(col).to_string();
-                        return Some((bare, val.clone()));
+                        // 🔑 Return the FULL (possibly qualified) name — the
+                        // old strip_qualifier here made `WHERE i.id = 1` over
+                        // a join bind to a RANDOM one of i.id/o.id (the
+                        // fallback below iterates a HashMap). Consumers do
+                        // exact-lookup first and only fall back to a UNIQUE
+                        // bare-suffix match.
+                        return Some((col.clone(), val.clone()));
                     }
                     // Pattern 2: Literal = Column (reversed)
                     if let (Expr::Literal(val), Expr::Column(col)) = (left.as_ref(), right.as_ref())
                     {
-                        let bare = Self::strip_qualifier(col).to_string();
-                        return Some((bare, val.clone()));
+                        return Some((col.clone(), val.clone()));
                     }
                 }
                 None
@@ -23612,44 +24629,111 @@ impl QueryExecutor {
     ///
     /// Detects WHERE MATCH(col) AGAINST('query') and uses the text index directly
     /// instead of scanning all rows and calling search_ranked() per row.
+    /// 🚀 `SELECT COUNT(*) FROM t WHERE MATCH(col, q)` — answer straight
+    /// from the text index postings. The general aggregate pipeline
+    /// materializes every matching row just to count it (~93 ms at 100K
+    /// docs); the postings count is index-only. Also covers `COUNT(col)`
+    /// on the MATCHED column (NULL text never matches, so the sets are
+    /// identical) and bare `COUNT()`.
+    fn try_text_match_count(&self, stmt: &SelectStmt) -> Result<Option<QueryResult>> {
+        if stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.order_by.is_some()
+            || stmt.latest_by.is_some()
+        {
+            return Ok(None);
+        }
+        // Exactly one SELECT column: a plain (non-DISTINCT) COUNT.
+        let (count_expr, count_arg) = match stmt.columns.as_slice() {
+            [SelectColumn::Expr(
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    distinct: false,
+                    ..
+                },
+                _,
+            )] if name.eq_ignore_ascii_case("COUNT") => {
+                let arg = match args.as_slice() {
+                    [] => None,                            // COUNT()
+                    [Expr::Column(c)] if c == "*" => None, // COUNT(*)
+                    [Expr::Column(c)] => Some(c.clone()),  // COUNT(col)
+                    _ => return Ok(None),
+                };
+                (0, arg)
+            }
+            _ => return Ok(None),
+        };
+        let _ = count_expr;
+        let table = match stmt.from.as_ref() {
+            Some(TableRef::Table { name, .. }) => name.clone(),
+            _ => return Ok(None),
+        };
+        // WHERE must be a single bare MATCH (compound predicates need the
+        // general pipeline's row filtering).
+        let (column, query) = match stmt.where_clause.as_ref() {
+            Some(Expr::Match {
+                column,
+                query,
+                phrase: false,
+            }) => (column.clone(), query.clone()),
+            _ => return Ok(None),
+        };
+        // COUNT(col): only valid when counting the MATCHED column — a
+        // different column could be NULL on matched rows.
+        if let Some(c) = &count_arg {
+            if *c != column {
+                return Ok(None);
+            }
+        }
+        let index_name = match self.db.index_registry.find_by_column(
+            &table,
+            &column,
+            crate::database::index_metadata::IndexType::Text,
+        ) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        if !self.db.text_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
+        let ids = self.db.text_search(&index_name, &query)?;
+        let col_name = match &stmt.columns[0] {
+            SelectColumn::Expr(e, Some(alias)) => alias.clone(),
+            SelectColumn::Expr(e, None) => Self::expr_to_column_name(e),
+            _ => "COUNT(*)".to_string(),
+        };
+        Ok(Some(QueryResult::Select {
+            columns: vec![col_name],
+            rows: vec![vec![Value::Integer(ids.len() as i64)]],
+        }))
+    }
+
     fn try_text_search_fast_path(
         &self,
         stmt: &SelectStmt,
         where_clause: &Expr,
         table_name: &str,
     ) -> Result<Option<QueryResult>> {
-        // Extract MATCH expression from WHERE clause
+        // Only a bare MATCH: the AND extractor below used to silently DROP
+        // the other side of the AND (`MATCH(c, q) AND cat = 'a'` returned
+        // rows with cat ≠ 'a'). Compound predicates go through the
+        // materialized path, whose evaluator resolves MATCH as a set.
+        // Aggregates / GROUP BY / DISTINCT need the general pipeline too.
+        if self.has_aggregates(&stmt.columns)
+            || stmt.group_by.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+        {
+            return Ok(None);
+        }
         let (column, query, phrase) = match where_clause {
             Expr::Match {
                 column,
                 query,
                 phrase,
             } => (column.clone(), query.clone(), *phrase),
-            // Handle AND: MATCH(...) AND other_conditions — only if MATCH is the dominant filter
-            Expr::BinaryOp {
-                left,
-                op: BinaryOperator::And,
-                right,
-            } => {
-                // Try both sides for a MATCH expression
-                if let Expr::Match {
-                    column,
-                    query,
-                    phrase,
-                } = left.as_ref()
-                {
-                    (column.clone(), query.clone(), *phrase)
-                } else if let Expr::Match {
-                    column,
-                    query,
-                    phrase,
-                } = right.as_ref()
-                {
-                    (column.clone(), query.clone(), *phrase)
-                } else {
-                    return Ok(None);
-                }
-            }
             _ => return Ok(None),
         };
 
@@ -23667,8 +24751,11 @@ impl QueryExecutor {
             return Ok(None);
         }
 
-        // Determine limit (use LIMIT from query, or default to top 1000 for scoring)
-        let limit = stmt.limit.unwrap_or(1000);
+        // With LIMIT n (+ OFFSET) the ranked search needs top n+offset. With
+        // no LIMIT the FULL match set is returned (unranked) — the old
+        // `unwrap_or(1000)` silently truncated un-LIMITed queries at 1000
+        // rows.
+        let offset = stmt.offset.unwrap_or(0);
 
         // Phrase search or ranked search depending on query type
         // 🚀 Carry (row_id, score) through — don't discard BM25 scores and
@@ -23678,10 +24765,38 @@ impl QueryExecutor {
                 Ok(r) => r,
                 Err(_) => return Ok(None),
             };
-            ids.into_iter().take(limit).map(|id| (id, 1.0)).collect()
-        } else {
-            match self.db.text_search_ranked(&index_name, &query, limit) {
+            let ids: Vec<u64> = match stmt.limit {
+                Some(l) => ids.into_iter().take(l + offset).collect(),
+                None => ids,
+            };
+            ids.into_iter().map(|id| (id, 1.0)).collect()
+        } else if let Some(l) = stmt.limit {
+            // Ranked top-(limit + offset); offset is skipped below.
+            match self.db.text_search_ranked(&index_name, &query, l + offset) {
                 Ok(r) => r,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            // No LIMIT: every matching row. The ranked search is a top-k
+            // heap (usize::MAX would allocate for it), so the default is the
+            // unranked id set with zero scores — EXCEPT when the SELECT list
+            // asks for scores (`MATCH(..) AS s` / `BM25_SCORE(col, q)`):
+            // rank over the full match count then.
+            let wants_scores = stmt.columns.iter().any(|c| match c {
+                SelectColumn::Expr(Expr::Match { .. }, _) => true,
+                SelectColumn::Expr(Expr::FunctionCall { name, .. }, _) => {
+                    name.eq_ignore_ascii_case("BM25_SCORE")
+                }
+                _ => false,
+            });
+            match self.db.text_search(&index_name, &query) {
+                Ok(ids) if wants_scores => {
+                    match self.db.text_search_ranked(&index_name, &query, ids.len()) {
+                        Ok(r) => r,
+                        Err(_) => ids.into_iter().map(|id| (id, 0.0)).collect(),
+                    }
+                }
+                Ok(ids) => ids.into_iter().map(|id| (id, 0.0)).collect(),
                 Err(_) => return Ok(None),
             }
         };
@@ -23726,24 +24841,68 @@ impl QueryExecutor {
         }
 
         let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(scored_results.len());
-        for (row_id, _score) in &scored_results {
+        let emit: Vec<&(u64, f32)> = scored_results
+            .iter()
+            .skip(offset)
+            .take(stmt.limit.unwrap_or(usize::MAX))
+            .collect();
+        for (row_id, _score) in emit {
             if let Some(row) = row_lookup.get(row_id) {
-                let mut projected = Self::project_row_direct(row, &stmt.columns, &columns, &schema);
-                // Append MATCH-expr scores for SELECT columns that are
-                // `MATCH(col) AGAINST(...) AS score`.
-                let mut appended_match_score = false;
+                // Per-column projection: expression columns (MATCH /
+                // BM25_SCORE) are not positionally evaluable — the old
+                // all-or-nothing project_row_direct turned ONE such column
+                // into a NULL-filled row (`SELECT id, MATCH(..) AS s` lost
+                // the id too). Plain columns are read directly; score
+                // columns are filled right below.
+                let mut projected: Vec<Value> = Vec::with_capacity(stmt.columns.len());
+                for sel_col in &stmt.columns {
+                    let v = match sel_col {
+                        SelectColumn::Column(name) | SelectColumn::ColumnWithAlias(name, _) => {
+                            let lookup = if name.contains('.') {
+                                name.rsplit('.').next().unwrap_or(name)
+                            } else {
+                                name.as_str()
+                            };
+                            schema
+                                .get_column_position(lookup)
+                                .and_then(|pos| row.get(pos).cloned())
+                                .unwrap_or(Value::Null)
+                        }
+                        _ => Value::Null,
+                    };
+                    projected.push(v);
+                }
+                // Score-bearing SELECT columns: `MATCH(col) AGAINST(...) AS
+                // score` and the documented `BM25_SCORE(col, 'query')` —
+                // both take this row's BM25 score from the search that drove
+                // the fast path.
                 for (ci, sel_col) in stmt.columns.iter().enumerate() {
-                    if let SelectColumn::Expr(Expr::Match { column: mc, .. }, _) = sel_col {
-                        if mc == &column {
+                    match sel_col {
+                        SelectColumn::Expr(Expr::Match { column: mc, .. }, _) if mc == &column => {
                             projected[ci] = score_map
                                 .get(row_id)
                                 .map(|s| Value::Float(*s))
                                 .unwrap_or(Value::Float(0.0));
-                            appended_match_score = true;
                         }
+                        SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _)
+                            if name.eq_ignore_ascii_case("BM25_SCORE") =>
+                        {
+                            // BM25_SCORE(col, query): match either the driving
+                            // column+query, or a constant 0 (row filtered out).
+                            let col_matches = args.first().and_then(|a| match a {
+                                Expr::Column(c) => Some(c == &column),
+                                _ => None,
+                            });
+                            if col_matches == Some(true) {
+                                projected[ci] = score_map
+                                    .get(row_id)
+                                    .map(|s| Value::Float(*s))
+                                    .unwrap_or(Value::Float(0.0));
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                let _ = appended_match_score;
                 result_rows.push(projected);
             }
         }
@@ -24328,15 +25487,21 @@ impl QueryExecutor {
     }
 
     /// Helper: Compare two values
+    ///
+    /// Delegates to `Value::partial_cmp`, which handles every cross-type pair
+    /// (Timestamp vs Integer/Float/Text-ISO, exact int-vs-float, …). The old
+    /// hand-rolled match only knew Integer/Float/Text — `(Timestamp, Integer)`
+    /// fell to `None` → `unwrap_or(false)`, so a materialized-path WHERE like
+    /// `ts >= 1700000899000000` silently matched ZERO rows (BETWEEN survived
+    /// only because it takes the evaluator path).
     fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
-        match (left, right) {
-            (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
-            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
-            (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-            (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
-            _ => None,
+        // SQL three-valued logic: comparing against NULL is UNKNOWN → no
+        // match. (`Value::partial_cmp` would order Null below everything,
+        // turning `col >= NULL` into "true for every row".)
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return None;
         }
+        left.partial_cmp(right)
     }
 
     // 🚀 P0 FIX: Primary Key Point Query optimization
@@ -24864,6 +26029,69 @@ impl QueryExecutor {
         Ok(exact)
     }
 
+    /// All row ids whose indexed text matches `query` (the index's
+    /// OR-over-tokens semantics). Without an index, an exact scan using the
+    /// default tokenizer's semantics.
+    fn text_match_row_ids(
+        &self,
+        table: &str,
+        column: &str,
+        query: &str,
+        index_name: Option<&str>,
+    ) -> Result<Vec<u64>> {
+        if let Some(index_name) = index_name {
+            if self.db.text_indexes.contains_key(index_name) {
+                return Ok(self.db.text_search(index_name, query)?);
+            }
+        }
+        use crate::index::tokenizers::{Tokenizer as _, WhitespaceTokenizer};
+        let schema = self.db.get_table_schema(table)?;
+        let col_pos = schema.get_column_position(column).unwrap_or(0);
+        let tok = WhitespaceTokenizer::default();
+        let q_tokens: Vec<String> = tok.tokenize(query).iter().map(|t| t.text.clone()).collect();
+        let mut ids = Vec::new();
+        let mut matches = |id: u64, text: &str| {
+            if tok
+                .tokenize(text)
+                .iter()
+                .any(|t| q_tokens.contains(&t.text))
+            {
+                ids.push(id);
+            }
+        };
+        if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
+            // 🔑 Hold the flush lock for the same consistency reason as
+            // brute_force_vector_knn: buffered rows must not migrate into a
+            // new segment between the segment snapshot and the buffer read.
+            let _flush_guard = store.flush_lock();
+            for seg in store.segments_snapshot() {
+                if col_pos >= seg.sst.column_tags.len() {
+                    continue;
+                }
+                if let Ok(ts) = seg.sst.read_text(col_pos) {
+                    for i in 0..seg.sst.num_rows {
+                        if let Some(text) = ts.get_str(i) {
+                            matches(seg.sst.row_map.key(i) & 0xFFFF_FFFF, text);
+                        }
+                    }
+                }
+            }
+            for (row_id, v) in store.buffered_column_values(col_pos) {
+                if let crate::types::Value::Text(t) = v {
+                    matches(row_id, &t);
+                }
+            }
+        } else {
+            for item in self.db.scan_table_rows_streaming(table)? {
+                let (row_id, row) = item?;
+                if let Some(crate::types::Value::Text(t)) = row.get(col_pos) {
+                    matches(row_id, t);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// The k nearest row ids to (x, y, z): via the i-Octree index when
     /// present, otherwise an exact scan of the geometry column (segments +
     /// write buffer).
@@ -24899,6 +26127,9 @@ impl QueryExecutor {
             }
         };
         if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
+            // 🔑 Hold the flush lock so the auto-flush thread can't move
+            // buffered rows into a new segment between the two views below.
+            let _flush_guard = store.flush_lock();
             for seg in store.segments_snapshot() {
                 if col_pos >= seg.sst.column_tags.len() {
                     continue;
@@ -24940,9 +26171,14 @@ impl QueryExecutor {
         let qdim = query.len();
 
         if let Ok(store) = self.db.get_or_create_col_segment_store(table, &[]) {
-            // 🔑 No flush_buffer(): segments hold committed data. The buffer
-            // (if non-empty) is checked separately below. Skipping the flush
-            // mutex saves I/O on every brute-force query.
+            // 🔑 Consistent read: hold the flush lock across the segment
+            // snapshot AND the buffered-rows read. Without it, the auto-flush
+            // thread could move buffered rows into a new segment between the
+            // two views and the query silently missed them (flaky
+            // `ORDER BY emb <-> ?` returning fewer rows than exist).
+            // 🔑 No flush_buffer() here (this lock IS flush's lock — calling
+            // it would deadlock): the buffer (if non-empty) is read below.
+            let _flush_guard = store.flush_lock();
             let segs = store.segments_snapshot();
             // 🔑 Load full keys only if not already loaded (idempotent). Needed
             // so row_map.key(i) returns accurate values for small segments.
@@ -24999,7 +26235,30 @@ impl QueryExecutor {
             // + cache + trim everything on every query.
             let mut cached_total: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
             let mut scratch: Vec<f32> = vec![0.0; qdim];
-            for seg in &segs {
+            // 🔑 Version dedup, newest wins: an UPDATE leaves the old vector in
+            // an older segment (its tombstone is not visible here) and the new
+            // one in the write buffer — both used to be offered, so a single
+            // id could appear TWICE in top-k. Scan newest source first (write
+            // buffer), then segments newest→oldest, and keep only the first
+            // occurrence of each row key.
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let offer_new = |seen: &mut std::collections::HashSet<u64>,
+                             heap: &mut std::collections::BinaryHeap<(OrderedF32, u64)>,
+                             key: u64,
+                             row_vec: &[f32]| {
+                if !seen.insert(key) {
+                    return;
+                }
+                offer(heap, key, row_vec);
+            };
+            for (key, v) in store.buffered_column_values(col_pos) {
+                if let crate::types::Value::Vector(rv) = v {
+                    if rv.len() == qdim {
+                        offer_new(&mut seen, &mut heap, key, &rv.0);
+                    }
+                }
+            }
+            for seg in segs.iter().rev() {
                 if col_pos >= seg.sst.column_tags.len() {
                     continue;
                 }
@@ -25027,7 +26286,11 @@ impl QueryExecutor {
                         if seg.sst.row_map.is_deleted(i) {
                             continue;
                         }
-                        offer(&mut heap, seg.sst.row_map.key(i), row_vec);
+                        let key = seg.sst.row_map.key(i);
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        offer(&mut heap, key, row_vec);
                     }
                     continue;
                 }
@@ -25057,7 +26320,11 @@ impl QueryExecutor {
                         break;
                     };
                     crate::storage::lsm::columnar::copy_le_f32(&mut scratch, bytes);
-                    offer(&mut heap, seg.sst.row_map.key(i), &scratch);
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    offer(&mut heap, key, &scratch);
                 }
             }
             // Safety net for the budget (other columns' caches may have grown
@@ -25065,34 +26332,6 @@ impl QueryExecutor {
             // only trims when it creates the store, so this path had no budget
             // choke point before.
             store.trim_col_cache_to_budget();
-            // Also scan the write buffer for unflushed vectors (correctness —
-            // brute force is used when no index exists, so buffered rows must
-            // be visible). The original implementation omitted this "for
-            // brevity", making rows inserted after the last flush invisible
-            // to vector ORDER BY (found via the Python bindings' smoke test:
-            // a nearer flushed row lost to a farther buffered one because the
-            // buffered row wasn't even a candidate — and vice versa when the
-            // buffer held the nearer row).
-            for (key, v) in store.buffered_column_values(col_pos) {
-                if let crate::types::Value::Vector(rv) = v {
-                    if rv.len() == qdim {
-                        let dist = if cosine {
-                            crate::distance::cosine::cosine_distance(query, &rv.0)
-                        } else {
-                            crate::distance::euclidean::euclidean_distance_squared(query, &rv.0)
-                        };
-                        let cand = (OrderedF32(dist), key);
-                        if heap.len() < k {
-                            heap.push(cand);
-                        } else if let Some(&(worst, _)) = heap.peek() {
-                            if cand.0 < worst {
-                                heap.pop();
-                                heap.push(cand);
-                            }
-                        }
-                    }
-                }
-            }
             let mut results: Vec<(RowId, f32)> =
                 heap.into_iter().map(|(d, id)| (id, d.0)).collect();
             // Ascending distance; ties broken by key for deterministic output
@@ -25393,6 +26632,147 @@ impl QueryExecutor {
 
     // ==================== Columnar Store Routing ====================
 
+    /// `ORDER BY <ts_col> [DESC] LIMIT k` on a TimeSeries table via the
+    /// ColumnarStore top-k (`topk_by_ts`). Returns Ok(None) for unsupported
+    /// shapes (OFFSET with expressions, expression projections).
+    fn try_ts_order_limit(
+        &self,
+        stmt: &SelectStmt,
+        table: &str,
+        schema: &crate::types::TableSchema,
+        asc: bool,
+    ) -> Result<Option<QueryResult>> {
+        use crate::sql::ast::SelectColumn;
+        let k = stmt
+            .limit
+            .unwrap_or(0)
+            .saturating_add(stmt.offset.unwrap_or(0));
+        if k == 0 {
+            return Ok(None);
+        }
+        let needed: Vec<String> =
+            if stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star) {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                let mut v = Vec::with_capacity(stmt.columns.len());
+                for sc in &stmt.columns {
+                    match sc {
+                        SelectColumn::Column(c) | SelectColumn::ColumnWithAlias(c, _) => {
+                            v.push(c.clone())
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                v
+            };
+        let rows = self.db.columnar_store.topk_by_ts(table, k, !asc, &needed)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let columns: Vec<String> =
+            if stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star) {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                needed
+            };
+        let out: Vec<Vec<Value>> = rows
+            .into_iter()
+            .map(|sql_row| {
+                columns
+                    .iter()
+                    .map(|c| {
+                        sql_row
+                            .get(c)
+                            .or_else(|| {
+                                let bare = c.rsplit('.').next().unwrap_or(c);
+                                sql_row
+                                    .keys()
+                                    .find(|k| k.rsplit('.').next() == Some(bare))
+                                    .map(|k| &sql_row[k])
+                            })
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(Some(QueryResult::Select { columns, rows: out }))
+    }
+
+    /// `LATEST BY <col>` on a TimeSeries table via the ColumnarStore fold
+    /// (`latest_by_group`): per-group max-ts row, only the needed columns
+    /// decoded. Returns Ok(None) for unsupported shapes (multi-key LATEST BY,
+    /// unresolvable projections) so the general path handles them.
+    fn try_ts_latest_by(
+        &self,
+        stmt: &SelectStmt,
+        table: &str,
+        schema: &crate::types::TableSchema,
+    ) -> Result<Option<QueryResult>> {
+        use crate::sql::ast::SelectColumn;
+        let lb = stmt.latest_by.as_deref().unwrap_or_default();
+        if lb.len() != 1 {
+            return Ok(None);
+        }
+        let group_col = lb[0].rsplit('.').next().unwrap_or(&lb[0]).to_string();
+        if schema.get_column_position(&group_col).is_none() {
+            return Ok(None);
+        }
+        // Requested columns: explicit list or the full schema for SELECT *.
+        let needed: Vec<String> =
+            if stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star) {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                let mut v = Vec::with_capacity(stmt.columns.len());
+                for sc in &stmt.columns {
+                    match sc {
+                        SelectColumn::Column(c) | SelectColumn::ColumnWithAlias(c, _) => {
+                            v.push(c.clone());
+                        }
+                        _ => return Ok(None), // expressions in LATEST BY output → general path
+                    }
+                }
+                v
+            };
+        let rows = self
+            .db
+            .columnar_store
+            .latest_by_group(table, &group_col, &needed)?;
+        if rows.is_empty() {
+            // Fall through so the general path produces the canonical
+            // empty-result shape (columns still resolve).
+            return Ok(None);
+        }
+        let columns: Vec<String> =
+            if stmt.columns.len() == 1 && matches!(stmt.columns[0], SelectColumn::Star) {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                needed
+            };
+        let out: Vec<Vec<Value>> = rows
+            .into_iter()
+            .map(|sql_row| {
+                columns
+                    .iter()
+                    .map(|c| {
+                        sql_row
+                            .get(c)
+                            .or_else(|| {
+                                let bare = c.rsplit('.').next().unwrap_or(c);
+                                sql_row
+                                    .keys()
+                                    .find(|k| k.rsplit('.').next() == Some(bare))
+                                    .map(|k| &sql_row[k])
+                            })
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(Some(QueryResult::Select { columns, rows: out }))
+    }
+
     /// Try to serve a SELECT from the columnar store for TimeSeries tables.
     /// Returns Ok(Some(result)) if handled, Ok(None) if it should fall through to LSM.
     /// Simple (non-GROUP-BY) aggregates over a TimeSeries table, computed
@@ -25406,7 +26786,8 @@ impl QueryExecutor {
     ) -> Result<Option<StreamingQueryResult>> {
         use crate::sql::ast::SelectColumn;
 
-        // GROUP BY: single grouping column (the common TS analytics shape).
+        // GROUP BY: single grouping column (the common TS analytics shape),
+        // or a TIME_BUCKET(interval, ts) key selected by alias/expression.
         let group_pos: Option<usize> = match &stmt.group_by {
             None => None,
             Some(cols) if cols.len() == 1 => schema.get_column_position(&cols[0]),
@@ -25414,6 +26795,9 @@ impl QueryExecutor {
         };
 
         // Output columns: [group_col?] + aggregate calls.
+        // `bucket_key`: a TIME_BUCKET(interval, ts) SELECT item serving as the
+        // GROUP BY key (by alias or canonical name). (out_name, interval_us)
+        let mut bucket_key: Option<(String, i64)> = None;
         let mut aggs: Vec<(String, Option<usize>)> = Vec::new();
         for sc in &stmt.columns {
             match sc {
@@ -25427,6 +26811,44 @@ impl QueryExecutor {
                         (Some(gp), Some(p)) if gp == p => continue,
                         _ => return Ok(None),
                     }
+                }
+                SelectColumn::Expr(expr, alias) if matches!(expr, Expr::FunctionCall { name, .. } if name.eq_ignore_ascii_case("TIME_BUCKET")) =>
+                {
+                    if bucket_key.is_some() {
+                        return Ok(None); // one bucket key per query
+                    }
+                    let items = match &stmt.group_by {
+                        Some(items) if items.len() == 1 => items,
+                        _ => return Ok(None),
+                    };
+                    let out_name = alias
+                        .clone()
+                        .unwrap_or_else(|| Self::expr_to_column_name(expr));
+                    if items[0] != out_name {
+                        return Ok(None); // GROUP BY must reference this item
+                    }
+                    let (args, _) = match expr {
+                        Expr::FunctionCall { args, .. } => (args, ()),
+                        _ => return Ok(None),
+                    };
+                    if args.len() != 2 {
+                        return Ok(None);
+                    }
+                    let interval = match &args[0] {
+                        Expr::Literal(Value::Text(s)) => s.to_string(),
+                        _ => return Ok(None),
+                    };
+                    let interval_us = match Self::parse_time_bucket_interval_us(&interval) {
+                        Ok(us) => us,
+                        Err(_) => return Ok(None),
+                    };
+                    // Bucket key must be the time-series column.
+                    match &args[1] {
+                        Expr::Column(c)
+                            if Some(c.as_str()) == schema.timeseries_column.as_deref() => {}
+                        _ => return Ok(None),
+                    }
+                    bucket_key = Some((out_name, interval_us));
                 }
                 SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _) => {
                     let fname = name.to_lowercase();
@@ -25457,6 +26879,92 @@ impl QueryExecutor {
         }
         // With GROUP BY there must be at least one aggregate; without GROUP BY
         // the aggregate-only shape is handled below. (Covered by aggs check.)
+
+        // 🚀 Time-range pushdown (pure time predicates only): fold over
+        // time-pruned segments directly in the ColumnarStore — zero row
+        // materialization. The scan below full-scans and materializes EVERY
+        // row as a HashMap SqlRow even for a 1-hour window (~450 ms at 1M
+        // rows); the fold decodes only the segments and columns it needs.
+        // A missing WHERE means the full range — still a win (only the
+        // aggregate columns are decoded).
+        if let Some(ts_name) = schema.timeseries_column.clone() {
+            let pure = stmt
+                .where_clause
+                .as_ref()
+                .is_none_or(|w| Self::is_pure_time_predicate(w, &ts_name));
+            // Grouped results must lead with the group column so folded rows
+            // (key first, then aggregates) line up with build_select_columns.
+            let group_leads = stmt.group_by.is_none() || {
+                let first_is_group = matches!(&stmt.columns.first(), Some(SelectColumn::Column(c))
+                    if group_pos.is_some_and(|gp| schema.get_column_position(c) == Some(gp)));
+                let first_is_bucket = bucket_key.is_some()
+                    && matches!(&stmt.columns.first(), Some(SelectColumn::Expr(_, _)));
+                first_is_group || first_is_bucket
+            };
+            let range = match &stmt.where_clause {
+                None => Some((i64::MIN, i64::MAX)),
+                Some(_) => self.extract_time_range(&stmt.where_clause, &ts_name),
+            };
+            let pure = pure && std::env::var("MOTE_DISABLE_AGG_PUSHDOWN").is_err();
+            if pure && group_leads {
+                if let Some((start, end)) = range {
+                    let group_spec = match (&stmt.group_by, bucket_key.as_ref(), group_pos) {
+                        (None, _, _) => crate::storage::columnar::RangeGroup::None,
+                        (Some(_), Some((_, interval_us)), _) => {
+                            crate::storage::columnar::RangeGroup::ByTimeBucket {
+                                ts_col: ts_name.clone(),
+                                interval_us: *interval_us,
+                            }
+                        }
+                        (Some(items), None, Some(gp)) if items.len() == 1 => {
+                            crate::storage::columnar::RangeGroup::ByColumn(
+                                schema.columns[gp].name.clone(),
+                            )
+                        }
+                        // GROUP BY present but unresolvable here → the old
+                        // path would silently treat it as ungrouped; bail so
+                        // the general executor handles it.
+                        _ => return Ok(None),
+                    };
+                    let specs: Vec<crate::storage::columnar::RangeAggSpec> = aggs
+                        .iter()
+                        .map(|(f, pos)| {
+                            let func = match f.as_str() {
+                                "count" if pos.is_none() => {
+                                    crate::storage::columnar::RangeAggFunc::CountStar
+                                }
+                                "count" => crate::storage::columnar::RangeAggFunc::Count,
+                                "sum" => crate::storage::columnar::RangeAggFunc::Sum,
+                                "avg" => crate::storage::columnar::RangeAggFunc::Avg,
+                                "min" => crate::storage::columnar::RangeAggFunc::Min,
+                                _ => crate::storage::columnar::RangeAggFunc::Max,
+                            };
+                            crate::storage::columnar::RangeAggSpec {
+                                func,
+                                col: pos.map(|p| schema.columns[p].name.clone()),
+                            }
+                        })
+                        .collect();
+                    let folded = self
+                        .db
+                        .columnar_store
+                        .aggregate_time_range(table, start, end, group_spec, &specs)?;
+                    let columns: Vec<String> = self.build_select_columns(&stmt.columns, schema)?;
+                    let rows: Vec<Vec<Value>> = folded
+                        .into_iter()
+                        .map(|(key, vals)| match key {
+                            Some(k) => {
+                                let mut r = vec![k];
+                                r.extend(vals);
+                                r
+                            }
+                            None => vals,
+                        })
+                        .collect();
+                    return Ok(Some(StreamingQueryResult::SelectReady { columns, rows }));
+                }
+            }
+        }
 
         // Full scan (TS → ColumnarStore) + WHERE filter, grouped when needed.
         struct Acc {
@@ -25699,6 +27207,51 @@ impl QueryExecutor {
             columns: output_columns,
             rows,
         }))
+    }
+
+    /// True when the WHERE clause consists ONLY of time-range predicates on
+    /// `ts_col` (comparisons vs literals, inclusive BETWEEN, and ANDs
+    /// thereof). When pure, the columnar aggregate pushdown can replace the
+    /// per-row WHERE filter entirely — the store already selects rows inside
+    /// the extracted range.
+    fn is_pure_time_predicate(expr: &Expr, ts_col: &str) -> bool {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                Self::is_pure_time_predicate(left, ts_col)
+                    && Self::is_pure_time_predicate(right, ts_col)
+            }
+            Expr::BinaryOp { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOperator::Ge
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Lt
+                ) =>
+            {
+                let (c, _) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(l)) => (c, l),
+                    (Expr::Literal(l), Expr::Column(c)) => (c, l),
+                    _ => return false,
+                };
+                c == ts_col || c.rsplit('.').next() == Some(ts_col)
+            }
+            Expr::Between {
+                expr,
+                negated: false,
+                low,
+                high,
+            } => {
+                matches!(expr.as_ref(), Expr::Column(c) if c == ts_col)
+                    && matches!(low.as_ref(), Expr::Literal(_))
+                    && matches!(high.as_ref(), Expr::Literal(_))
+            }
+            _ => false,
+        }
     }
 
     /// Extract time range from WHERE clause.

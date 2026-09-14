@@ -217,10 +217,14 @@ impl Parser {
             None
         };
 
-        // GROUP BY clause (optional)
+        // GROUP BY clause (optional). Items may be column names, SELECT
+        // aliases, or full expressions (`GROUP BY sid, TIME_BUCKET('5s', ts)`)
+        // — non-column items are stored under the expression's canonical name
+        // (same form the SELECT list uses), which the executor resolves back
+        // to the projected expression.
         let group_by = if self.match_token(TokenType::Group) {
             self.expect(TokenType::By)?;
-            Some(self.parse_column_list()?)
+            Some(self.parse_group_by_items()?)
         } else {
             None
         };
@@ -421,7 +425,12 @@ impl Parser {
                     }
                     true
                 };
-                ords.push(crate::sql::ast::OrderByExpr { expr, asc });
+                let nulls_first = self.parse_nulls_preference()?;
+                ords.push(crate::sql::ast::OrderByExpr {
+                    expr,
+                    asc,
+                    nulls_first,
+                });
                 if matches!(self.current().token_type, TokenType::Comma) {
                     self.advance();
                 } else {
@@ -490,6 +499,29 @@ impl Parser {
         Ok(columns)
     }
 
+    /// Parse a GROUP BY item: a (possibly qualified) column name, or a full
+    /// expression stored under its canonical name.
+    fn parse_group_by_items(&mut self) -> Result<Vec<String>> {
+        let mut items = Vec::new();
+        loop {
+            // A bare column is `ident` or `ident.ident`; an expression item
+            // starts as `ident(` (function call) or any non-identifier token.
+            let is_function = matches!(self.current().token_type, TokenType::Identifier(_))
+                && matches!(self.peek_token_type(), TokenType::LParen);
+            let item = if is_function {
+                let expr = self.parse_expr(0)?;
+                crate::sql::executor::QueryExecutor::expr_to_column_name(&expr)
+            } else {
+                self.parse_qualified_column_name()?
+            };
+            items.push(item);
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
     /// Parse a column reference that may be table-qualified: `name` or `tbl.name`.
     /// Used by GROUP BY / ORDER BY column lists where bare identifiers
     /// (`parse_identifier`) would stop at the dot.
@@ -547,6 +579,28 @@ impl Parser {
         Ok(columns)
     }
 
+    /// Parse optional `NULLS FIRST` / `NULLS LAST` after ASC/DESC.
+    fn parse_nulls_preference(&mut self) -> Result<Option<bool>> {
+        // NULLS / FIRST / LAST are plain identifiers (not registered keywords)
+        if let TokenType::Identifier(id) = &self.current().token_type {
+            if id.eq_ignore_ascii_case("NULLS") {
+                self.advance();
+                match &self.current().token_type {
+                    TokenType::Identifier(f) if f.eq_ignore_ascii_case("FIRST") => {
+                        self.advance();
+                        return Ok(Some(true));
+                    }
+                    TokenType::Identifier(l) if l.eq_ignore_ascii_case("LAST") => {
+                        self.advance();
+                        return Ok(Some(false));
+                    }
+                    _ => return Err(self.error("Expected FIRST or LAST after NULLS")),
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn parse_order_by(&mut self) -> Result<Vec<OrderByExpr>> {
         let mut order_by = Vec::new();
 
@@ -558,8 +612,13 @@ impl Parser {
                 self.match_token(TokenType::Asc); // Optional
                 true
             };
+            let nulls_first = self.parse_nulls_preference()?;
 
-            order_by.push(OrderByExpr { expr, asc });
+            order_by.push(OrderByExpr {
+                expr,
+                asc,
+                nulls_first,
+            });
 
             if !self.match_token(TokenType::Comma) {
                 break;
@@ -1121,7 +1180,8 @@ impl Parser {
 
     fn parse_create_index(&mut self) -> Result<CreateIndexStmt> {
         // Parse optional index type: TEXT/VECTOR/SPATIAL/TIMESTAMP
-        let index_type = match &self.current().token_type {
+        let mut tokenizer: Option<(String, Option<usize>)> = None;
+        let mut index_type = match &self.current().token_type {
             TokenType::Text => {
                 self.advance();
                 IndexType::Text
@@ -1157,6 +1217,27 @@ impl Parser {
         };
 
         self.expect(TokenType::Index)?;
+        // 🆕 Optional IF NOT EXISTS (idempotent migrations). IF/EXISTS are
+        // plain identifiers here (same shape as parse_create_table).
+        let mut if_not_exists = false;
+        if let TokenType::Identifier(id) = &self.current().token_type {
+            if id.eq_ignore_ascii_case("IF") {
+                self.advance();
+                self.expect(TokenType::Not)?;
+                // EXISTS is a registered keyword token (parse_create_table
+                // handles the Identifier case; indexes hit the keyword).
+                match self.current().token_type {
+                    TokenType::Identifier(ref e) if e.eq_ignore_ascii_case("EXISTS") => {
+                        self.advance();
+                    }
+                    TokenType::Exists => {
+                        self.advance();
+                    }
+                    _ => return Err(self.error("Expected EXISTS after IF NOT")),
+                }
+                if_not_exists = true;
+            }
+        }
         let index_name = self.parse_identifier()?;
         self.expect(TokenType::On)?;
         let table = self.parse_identifier()?;
@@ -1167,6 +1248,39 @@ impl Parser {
         // 🆕 Parse optional USING clause: USING COLUMN|BTREE|...
         let final_index_type = if self.current().token_type == TokenType::Using {
             self.advance(); // consume USING
+
+            // `USING TOKENIZER ngram(2)` / `whitespace` — text-index
+            // tokenizer (docs/09-text-index.md). Must run before the generic
+            // Identifier arm below, which would reject TOKENIZER as an index
+            // type.
+            if let TokenType::Identifier(ref id) = self.current().token_type {
+                if id.to_uppercase() == "TOKENIZER" {
+                    self.advance();
+                    let name = match &self.current().token_type {
+                        TokenType::Identifier(id) => id.to_lowercase(),
+                        _ => {
+                            return Err(MoteDBError::ParseError(
+                                "Expected tokenizer name after TOKENIZER".to_string(),
+                            ))
+                        }
+                    };
+                    self.advance();
+                    let mut param = None;
+                    if self.match_token(TokenType::LParen) {
+                        param = Some(self.parse_i64()? as usize);
+                        self.expect(TokenType::RParen)?;
+                    }
+                    return Ok(CreateIndexStmt {
+                        index_name,
+                        if_not_exists,
+                        table,
+                        column,
+                        index_type: IndexType::Text,
+                        metric: None,
+                        tokenizer: Some((name, param)),
+                    });
+                }
+            }
 
             // Clone the identifier to avoid borrow issues
             let token_type = self.current().token_type.clone();
@@ -1262,10 +1376,12 @@ impl Parser {
 
         Ok(CreateIndexStmt {
             index_name,
+            if_not_exists,
             table,
             column,
             index_type: final_index_type,
             metric,
+            tokenizer,
         })
     }
 

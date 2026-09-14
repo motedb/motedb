@@ -68,6 +68,13 @@ pub struct SQ8Vectors {
     /// entries (append-only layout), so liveness between flushes rides on
     /// this overlay; flush() filters them out of the rebuilt sidecar.
     tombstones: Arc<Mutex<HashSet<RowId>>>,
+
+    /// 🔥 BUILD MODE: the complete quantized set pinned in RAM. A full
+    /// graph build visits each of the N nodes' quantized vector O(search
+    /// list) times; the bounded LRU thrashes at that access pattern
+    /// (re-reads + write-lock churn per miss). Pinned entries are immutable
+    /// snapshots — any mutation (insert/delete) drops the pin.
+    pinned: Arc<RwLock<Option<HashMap<RowId, Arc<QuantizedVector>>>>>,
 }
 
 impl SQ8Vectors {
@@ -120,6 +127,7 @@ impl SQ8Vectors {
             write_file: Arc::new(RwLock::new(write_file)),
             file_path,
             tombstones: Arc::new(Mutex::new(HashSet::new())),
+            pinned: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -216,6 +224,7 @@ impl SQ8Vectors {
             write_file: Arc::new(RwLock::new(write_file)),
             file_path,
             tombstones: Arc::new(Mutex::new(HashSet::new())),
+            pinned: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -316,6 +325,21 @@ impl SQ8Vectors {
             }
         }
 
+        // 🔥 Build mode: dequantize from the PINNED quantized snapshot —
+        // pure compute, no file read and no LRU write-lock churn. The
+        // graph build's robust_prune fetches decompressed vectors per
+        // candidate PAIR through this function; the bounded LRU thrashed
+        // on that pattern (the dominant build cost after the mmap reads
+        // were fixed).
+        {
+            let guard = self.pinned.read();
+            if let Some(map) = guard.as_ref() {
+                if let Some(q) = map.get(&row_id) {
+                    return Some(Arc::new(self.quantizer.dequantize(q)));
+                }
+            }
+        }
+
         let offset = self.lookup_offset(row_id)?;
         let qvec = self.read_quantized(offset).ok()?;
         let vec = self.quantizer.dequantize(&qvec);
@@ -358,7 +382,34 @@ impl SQ8Vectors {
     }
 
     /// Get quantized vector (no decompression)
+    /// 🔥 Pin every quantized vector in RAM (build mode). Sequential pass
+    /// over the mmap; ~N×(dim+8) bytes (e.g. 86MB for 220K×384). Subsequent
+    /// `get_quantized` hits skip the LRU and the re-read entirely.
+    pub fn pin_all(&self) -> Result<()> {
+        let offsets = self.offsets.read().clone();
+        let mut map: HashMap<RowId, Arc<QuantizedVector>> = HashMap::with_capacity(offsets.len());
+        for (id, off) in offsets {
+            if let Ok(q) = self.read_quantized(off) {
+                map.insert(id, Arc::new(q));
+            }
+        }
+        *self.pinned.write() = Some(map);
+        Ok(())
+    }
+
+    /// Drop the pinned set (returns the memory).
+    pub fn unpin_all(&self) {
+        *self.pinned.write() = None;
+    }
+
     pub fn get_quantized(&self, row_id: RowId) -> Option<Arc<QuantizedVector>> {
+        // 🔥 Build mode: the pinned map is authoritative and immutable.
+        {
+            let guard = self.pinned.read();
+            if let Some(map) = guard.as_ref() {
+                return map.get(&row_id).cloned();
+            }
+        }
         // 🔑 PERF: read-lock fast path (peek, no LRU touch). The greedy_search
         // loop calls this hundreds of times per KNN query — every call taking
         // a write lock serializes all concurrent searches.
@@ -402,6 +453,8 @@ impl SQ8Vectors {
         let qvec = self.quantizer.quantize(&vector)?;
         let offset = self.append_quantized(row_id, &qvec)?;
 
+        // Pinned snapshots are stale the moment anything mutates.
+        *self.pinned.write() = None;
         // Update the authoritative offset map; a re-inserted (previously
         // deleted) id comes back to life
         self.offsets.write().insert(row_id, offset);
@@ -499,6 +552,7 @@ impl SQ8Vectors {
             return Ok(false);
         }
 
+        *self.pinned.write() = None; // stale snapshot
         self.offsets.write().remove(&row_id);
         self.tombstones.lock().insert(row_id);
         *self.count.write() -= 1;

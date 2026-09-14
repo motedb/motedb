@@ -96,10 +96,14 @@ fn test_double_open_rejected_and_lock_released() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join("t.mote");
     let db = Database::create(&p).unwrap();
-    assert!(
-        Database::open(&p).is_err(),
-        "second open while held must fail"
-    );
+    // 🔑 In-process reopens ATTACH to the same engine (multi-connection
+    // support); the old "second open must fail" flock behavior only holds
+    // CROSS-PROCESS now.
+    let second = Database::open(&p).expect("in-process second open attaches to the shared engine");
     drop(db);
-    assert!(Database::open(&p).is_ok(), "reopen after drop must succeed");
+    drop(second);
+    assert!(
+        Database::open(&p).is_ok(),
+        "reopen after all handles dropped must succeed"
+    );
 }

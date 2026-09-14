@@ -114,6 +114,71 @@ pub struct Database {
     stmt_cache_cap: usize,
     /// Reused QueryExecutor — avoids per-call allocation of pattern_cache, optimizer state
     query_executor: crate::sql::QueryExecutor,
+    /// Registry key of this connection (shared-handle bookkeeping). Empty
+    /// for engines that bypassed the registry (direct MoteDB construction).
+    reg_key: Option<std::path::PathBuf>,
+}
+
+/// 🔑 In-process shared-handle registry: canonical db dir ->
+/// (engine Weak, live-connection counter). flock() locks are per
+/// open-file-description, so a second open() in the same process used to
+/// fail with "already open by another process"; multi-connection
+/// in-process use (threads, agents) attaches to the SAME engine instead.
+fn connection_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<
+        std::path::PathBuf,
+        (std::sync::Weak<MoteDB>, std::sync::atomic::AtomicUsize),
+    >,
+> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                std::path::PathBuf,
+                (std::sync::Weak<MoteDB>, std::sync::atomic::AtomicUsize),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Attach-or-open: returns (engine, registry key).
+fn open_engine_shared(
+    db_path: std::path::PathBuf,
+    open: impl FnOnce(&std::path::Path) -> Result<MoteDB>,
+) -> Result<(Arc<MoteDB>, std::path::PathBuf)> {
+    // 🔑 Key stability across create→open: at create() time the target
+    // directory does not exist yet, so canonicalize fails and would leave
+    // an un-normalized key — the later open() canonicalizes successfully
+    // (incl. symlink resolution like /tmp → /private/tmp) and MISSES the
+    // registry, hitting the flock. Normalize the PARENT (which exists) and
+    // re-join the leaf instead.
+    let key = std::fs::canonicalize(&db_path).unwrap_or_else(|_| {
+        match (db_path.parent(), db_path.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                std::fs::canonicalize(parent)
+                    .unwrap_or_else(|_| parent.to_path_buf())
+                    .join(name)
+            }
+            _ => db_path.clone(),
+        }
+    });
+    let mut reg = connection_registry().lock().unwrap();
+    if let Some((weak, live)) = reg.get(&key) {
+        if let Some(arc) = weak.upgrade() {
+            live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return Ok((arc, key));
+        }
+    }
+    reg.retain(|_, (w, _)| w.upgrade().is_some());
+    let engine = Arc::new(open(&db_path)?);
+    reg.insert(
+        key.clone(),
+        (
+            Arc::downgrade(&engine),
+            std::sync::atomic::AtomicUsize::new(1),
+        ),
+    );
+    Ok((engine, key))
 }
 
 impl Database {
@@ -132,13 +197,15 @@ impl Database {
     /// let db = Database::create("data.mote")?;
     /// ```
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let inner = Arc::new(MoteDB::create(path)?);
+        let db_path = MoteDB::resolve_create_path_public(path.as_ref());
+        let (inner, reg_key) = open_engine_shared(db_path, |p| MoteDB::create(p))?;
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
             stmt_cache: Arc::new(dashmap::DashMap::new()),
             stmt_cache_cap: 256,
             query_executor,
+            reg_key: Some(reg_key),
         })
     }
 
@@ -155,13 +222,16 @@ impl Database {
     /// let db = Database::create_with_config("data.mote", config)?;
     /// ```
     pub fn create_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
-        let inner = Arc::new(MoteDB::create_with_config(path, config)?);
+        let db_path = MoteDB::resolve_create_path_public(path.as_ref());
+        let (inner, reg_key) =
+            open_engine_shared(db_path, |p| MoteDB::create_with_config(p, config.clone()))?;
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
             stmt_cache: Arc::new(dashmap::DashMap::new()),
             stmt_cache_cap: 256,
             query_executor,
+            reg_key: Some(reg_key),
         })
     }
 
@@ -172,13 +242,18 @@ impl Database {
     /// let db = Database::open("data.mote")?;
     /// ```
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let inner = Arc::new(MoteDB::open(path)?);
+        // 🔑 Shared handle: in-process reopens of the same directory attach
+        // to the SAME engine (flock is per-file-description — a second
+        // plain open used to fail with "already open by another process").
+        let db_path = MoteDB::resolve_open_path_public(path.as_ref());
+        let (inner, reg_key) = open_engine_shared(db_path, |p| MoteDB::open(p))?;
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
             stmt_cache: Arc::new(dashmap::DashMap::new()),
             stmt_cache_cap: 256,
             query_executor,
+            reg_key: Some(reg_key),
         })
     }
 
@@ -190,13 +265,16 @@ impl Database {
     /// let db = Database::open_with_config("data.mote", config)?;
     /// ```
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: DBConfig) -> Result<Self> {
-        let inner = Arc::new(MoteDB::open_with_config(path, config)?);
+        let db_path = MoteDB::resolve_open_path_public(path.as_ref());
+        let (inner, reg_key) =
+            open_engine_shared(db_path, |p| MoteDB::open_with_config(p, config.clone()))?;
         let query_executor = crate::sql::QueryExecutor::new(inner.clone());
         Ok(Self {
             inner,
             stmt_cache: Arc::new(dashmap::DashMap::new()),
             stmt_cache_cap: 256,
             query_executor,
+            reg_key: Some(reg_key),
         })
     }
 
@@ -308,6 +386,36 @@ impl Database {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Ok(());
+        }
+
+        // 🔑 Shared-handle etiquette: other connections may still hold this
+        // engine (the executor's own Arc makes strong_count unreliable).
+        // The registry's live-connection counter is authoritative: the LAST
+        // connection performs the real shutdown; earlier closes detach.
+        if let Some(key) = &self.reg_key {
+            let last = {
+                let reg = connection_registry().lock().unwrap();
+                match reg.get(key) {
+                    Some((weak, live)) => {
+                        let remains = live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        if remains <= 1 {
+                            // detach the registry entry so a later open
+                            // starts a fresh engine after shutdown
+                            let _ = weak;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => true,
+                }
+            };
+            if last {
+                let mut reg = connection_registry().lock().unwrap();
+                reg.remove(key);
+            } else {
+                return Ok(());
+            }
         }
 
         // 🔑 Rollback any active transaction before closing. Without this,

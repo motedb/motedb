@@ -135,6 +135,14 @@ pub fn values_to_row_by_columns(
                 (ColumnType::Timestamp, Value::Integer(ts)) => {
                     Value::Timestamp(crate::types::Timestamp::from_micros(*ts))
                 }
+                // 🔑 ISO text → Timestamp. The schema-order INSERT path gets
+                // this via a different route; the column-list path stored the
+                // raw Text into the Timestamp column, which encoded as 0
+                // (`INSERT INTO t (id, ts) VALUES (1, '2024-01-15 10:30:00')`
+                // read back ts=0).
+                (ColumnType::Timestamp, Value::Text(s)) => crate::types::Timestamp::parse_iso(s)
+                    .map(Value::Timestamp)
+                    .unwrap_or_else(|| Value::Text(s.clone())),
                 (ColumnType::Float, Value::Integer(i)) => Value::Float(*i as f64),
                 // 🚨 Float to Integer: convert whole-number floats (prevents
                 // f64 bit-pattern corruption). Fractional floats fall through

@@ -510,7 +510,16 @@ impl TransactionCoordinator {
         // Phase 3: Truncate savepoints (re-acquire after dropping write_set/read_set)
         {
             let mut savepoints = ctx.savepoints.write();
-            savepoints.truncate(position);
+            // 🔑 SQL standard: ROLLBACK TO keeps the TARGET savepoint alive
+            // (only savepoints created AFTER it are destroyed) — `RELEASE sp`
+            // after `ROLLBACK TO sp` must work, and the surviving savepoint
+            // must accumulate only NEW deltas (the old ones were just undone;
+            // replaying them on a second ROLLBACK TO would double-restore).
+            savepoints.truncate(position + 1);
+            if let Some(sp) = savepoints.last_mut() {
+                sp.write_deltas.clear();
+                sp.read_deltas.clear();
+            }
         }
 
         debug_log!(

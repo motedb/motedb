@@ -656,23 +656,25 @@ impl TextFTSIndex {
         let deleted_term_docs = self.deleted_term_docs.read();
 
         // Get posting lists for all query terms
+        let num_tokens = tokens.len();
         let mut results: Option<Vec<DocumentId>> = None;
 
         for token in tokens {
             if let Some(term_id) = self.dictionary.get(&token.text) {
-                // Priority: pending > B-Tree disk
-                let posting = if let Some(pend) = pending.get(&term_id) {
-                    pend.clone()
-                } else {
-                    // Load from B-Tree disk with sharding support
-                    if let Some(p) = self.load_posting_list_sharded(term_id, &btree)? {
-                        p
-                    } else {
-                        continue;
-                    }
+                // Pending UNION disk — a partial flush (e.g. the 2K-doc
+                // auto-flush inside a bulk backfill) splits a term's posting
+                // across both, and taking whichever comes first hid every
+                // earlier document.
+                let pairs = match self.term_pairs_merged(term_id, &pending, &btree) {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
                 };
-
-                let mut doc_ids = posting.doc_ids();
+                let Some(pairs) = pairs else {
+                    continue;
+                };
+                let mut doc_ids: Vec<DocId> = pairs.into_iter().map(|(d, _)| d as DocId).collect();
+                doc_ids.sort_unstable();
+                doc_ids.dedup();
 
                 // Filter out deleted documents
                 doc_ids.retain(|id| !deleted.contains(id));
@@ -680,16 +682,25 @@ impl TextFTSIndex {
                 // Filter out deleted (term_id, doc_id) pairs
                 doc_ids.retain(|id| !deleted_term_docs.contains(&(term_id, *id)));
 
-                if let Some(ref mut current) = results {
-                    // AND operation (intersection)
-                    current.retain(|id| doc_ids.contains(id));
-                } else {
-                    results = Some(doc_ids);
+                // Union (OR) — the same semantics as search_ranked / the
+                // no-index fallback. This used to INTERSECT, so an unranked
+                // multi-term query (no LIMIT) returned a different set than
+                // the ranked path for the same query.
+                match &mut results {
+                    Some(current) => {
+                        current.extend(doc_ids);
+                    }
+                    None => results = Some(doc_ids),
                 }
             }
         }
 
-        Ok(results.unwrap_or_default())
+        let mut ids = results.unwrap_or_default();
+        if num_tokens > 1 {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        Ok(ids)
     }
 
     /// Search for documents containing an exact phrase (consecutive token positions).
@@ -794,6 +805,61 @@ impl TextFTSIndex {
         Ok(result)
     }
 
+    /// Doc→tf pairs for one term: the pending buffer UNION the on-disk
+    /// posting (cache or B+Tree), pending winning on doc conflicts.
+    /// The three search paths used to return whichever source they found
+    /// FIRST — after a partial flush (e.g. the 2K-doc auto-flush in the
+    /// middle of a bulk backfill) a term living in both sources exposed only
+    /// its pending half, hiding every earlier document (a 20K-doc backfill
+    /// matched exactly the second 10K).
+    fn term_pairs_merged<'g>(
+        &self,
+        term_id: TermId,
+        pending: &std::collections::HashMap<TermId, PostingList>,
+        btree: &'g parking_lot::RwLockReadGuard<'g, GenericBTree<u32>>,
+    ) -> Result<Option<Vec<(u32, u16)>>> {
+        let mut merged: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+        let mut any = false;
+        if let Some(pend) = pending.get(&term_id) {
+            for (doc, tf) in pend.iter_doc_tf() {
+                merged.insert(doc, tf);
+            }
+            any = true;
+        }
+        // Disk (through the posting cache — it memoizes B+Tree reads only).
+        // The cache guard must be DROPPED before re-acquiring write() below:
+        // a temporary guard in an `if let` condition lives for the whole
+        // if/else, and parking_lot is not reentrant — every merged lookup on
+        // a cache miss self-deadlocked.
+        let cached = self.posting_cache.write().get(&term_id).cloned();
+        let disk = if let Some(cached) = cached {
+            Some(cached)
+        } else {
+            match self.load_posting_list_sharded(term_id, &btree)? {
+                Some(p) => {
+                    self.posting_cache.write().put(term_id, p.clone());
+                    Some(p)
+                }
+                None => None,
+            }
+        };
+        if let Some(p) = disk {
+            for (doc, tf) in p.iter_doc_tf_cached_ref() {
+                merged.entry(doc).or_insert(tf);
+            }
+            any = true;
+        }
+        if !any {
+            return Ok(None);
+        }
+        // WAND cursors binary-search doc ids — the merged pairs must be
+        // sorted (a HashMap's iteration order silently broke multi-term
+        // ranking).
+        let mut pairs: Vec<(u32, u16)> = merged.into_iter().collect();
+        pairs.sort_unstable();
+        Ok(Some(pairs))
+    }
+
     /// 🚀 Fast single-term search: score all docs for one term, return top-K.
     /// O(N) but with minimal overhead — no WAND, no cursor merge, no Vec cloning.
     /// ~10x faster than WAND for single-term queries (the common case).
@@ -810,7 +876,9 @@ impl TextFTSIndex {
 
         let term_id = match self.dictionary.get(token) {
             Some(id) => id,
-            None => return Ok(Vec::new()),
+            None => {
+                return Ok(Vec::new());
+            }
         };
 
         let doc_lengths = self.get_doc_lengths_cached()?;
@@ -823,36 +891,19 @@ impl TextFTSIndex {
         let b = self.bm25_config.b;
         let total_docs = self.total_docs as f32;
 
-        // Load posting list (cache > pending > disk).
-        // For cached posting lists, use the cached decoded pairs directly.
+        // Pending UNION disk (see term_pairs_merged) — the old
+        // first-source-wins chain hid documents that lived in the other half
+        // after a partial flush.
         let pairs: Vec<(u32, u16)>;
         let df: u64;
         {
             let pending = self.pending_posting_lists.read();
-            if let Some(pend) = pending.get(&term_id) {
-                pairs = pend.iter_doc_tf();
-                df = pend.doc_count();
-            } else {
-                drop(pending);
-                // Check decoded-pair cache first (avoids posting list clone).
-                let pair_cache_key = term_id;
-                let mut pc = self.posting_cache.write();
-                if let Some(cached_pl) = pc.get(&pair_cache_key) {
-                    pairs = cached_pl.iter_doc_tf_cached_ref();
-                    df = cached_pl.doc_count();
-                } else {
-                    drop(pc);
-                    let btree = self.btree.read();
-                    if let Some(p) = self.load_posting_list_sharded(term_id, &btree)? {
-                        let pl_clone = p.clone();
-                        self.posting_cache.write().put(term_id, p);
-                        pairs = pl_clone.iter_doc_tf_cached_ref();
-                        df = pl_clone.doc_count();
-                    } else {
-                        return Ok(Vec::new());
-                    }
-                }
-            }
+            let btree = self.btree.read();
+            let merged = self
+                .term_pairs_merged(term_id, &pending, &btree)?
+                .unwrap_or_default();
+            pairs = merged;
+            df = pairs.len() as u64;
         }
 
         if df == 0 {
@@ -882,7 +933,14 @@ impl TextFTSIndex {
                     continue;
                 }
             }
-            let dl = doc_lengths.get(&doc_id).copied().unwrap_or(1) as f32;
+            // get_doc_lengths_cached returns ENCODED fieldnorm bytes
+            // (FieldNormTable::encode), not lengths — the raw byte was used as
+            // dl here, so every document scored as if it were ~100× the
+            // average length and BM25 length normalization was effectively
+            // disabled (single-term rankings diverged from reference BM25;
+            // overlap@10 as low as 2/10). The WAND path already decodes.
+            let fieldnorm = doc_lengths.get(&doc_id).copied().unwrap_or(0);
+            let dl = FieldNormTable::decode(fieldnorm, avg_dl).max(1.0);
             let norm = 1.0 - b + b * (dl / avg_dl);
             let score = idf * (tf as f32 * (k1 + 1.0)) / (tf as f32 + k1 * norm);
             scored.push((doc_id, score));
@@ -956,30 +1014,26 @@ impl TextFTSIndex {
                 }
             };
 
-            // Load posting list (cache > pending > disk)
-            let posting = if let Some(pend) = pending.get(&term_id) {
-                pend.clone()
-            } else if let Some(cached) = self.posting_cache.write().get(&term_id).cloned() {
-                // 🚀 Cache hit — skip disk I/O entirely.
-                cached
-            } else if let Some(p) = self.load_posting_list_sharded(term_id, &btree)? {
-                // Cache miss — load from disk, then cache for future queries.
-                self.posting_cache.write().put(term_id, p.clone());
-                p
-            } else {
+            // Pending UNION disk (see term_pairs_merged) — same
+            // partial-visibility fix as the other search paths.
+            let pairs_all = match self.term_pairs_merged(term_id, &pending, &btree) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+            let Some(pairs_all) = pairs_all else {
                 continue;
             };
-
-            let df = posting.doc_count() as f32;
+            let df = pairs_all.len() as f32;
             if df == 0.0 {
                 continue;
             }
+            // Compute max possible BM25 score for this term (upper bound)
+            let max_tf = pairs_all.iter().map(|&(_, tf)| tf).max().unwrap_or(0);
             // BM25 IDF: non-negative variant (Lucene-compatible). The +1 ensures
             // terms appearing in every document still get a small positive weight.
             let idf = ((total_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
 
             // Compute max possible BM25 score for this term (upper bound)
-            let max_tf = posting.max_tf();
             let upper_bound = {
                 let tf = max_tf as f32;
                 // Use dl=1 as the minimum possible doc length for a tighter bound
@@ -987,9 +1041,9 @@ impl TextFTSIndex {
                 idf * (tf * (k1 + 1.0)) / (tf + k1 * min_norm)
             };
 
-            // Collect non-deleted doc_ids with their TFs (using cached iterator).
+            // Collect non-deleted doc_ids with their TFs.
             // 🚀 Fast path: skip all deletion checks when sets are empty.
-            let pairs = posting.iter_doc_tf_cached_ref();
+            let pairs = pairs_all;
             let deleted_empty = deleted.is_empty();
             let deleted_td_empty = deleted_term_docs.is_empty();
             let entries: Vec<(u32, u16)> = if deleted_empty && deleted_td_empty {
@@ -1358,13 +1412,16 @@ impl TextFTSIndex {
 
         {
             let mut doc_lens = self.pending_doc_lengths.write();
-            doc_lens.clear();
-            doc_lens.shrink_to_fit(); // 释放capacity
         }
 
         let _t4_elapsed = t4.elapsed();
 
-        // 5. Write doc_lengths (batched - only every N flushes to reduce I/O)
+        // 5. Write doc_lengths — flush_doc_lengths_if_needed DRAINS the
+        // pending map into the incremental file. An earlier `clear()` here
+        // ran before it, so every auto-flush permanently destroyed the
+        // accumulated lengths: after the first mid-backfill flush, BM25
+        // scored every document with the same constant length (dl=1) and
+        // ranking degraded to length-blind.
         let t5 = Instant::now();
         self.flush_doc_lengths_if_needed(false)?;
         let _t5_elapsed = t5.elapsed();
@@ -1506,10 +1563,13 @@ impl TextFTSIndex {
                     if end > buffer.len() {
                         break;
                     }
-                    if let Ok(block) =
-                        bincode::deserialize::<HashMap<DocId, u32>>(&buffer[start..end])
-                    {
-                        all_lengths.extend(block);
+                    // The writer serialized a DocLengthMap struct (same as
+                    // the main file), not a bare HashMap — deserializing the
+                    // wrong type failed on EVERY block and was silently
+                    // swallowed, losing all flushed doc lengths (BM25 then
+                    // scored every doc with the same constant length).
+                    if let Ok(map) = bincode::deserialize::<DocLengthMap>(&buffer[start..end]) {
+                        all_lengths.extend(map.lengths);
                     }
                     cursor.set_position(end as u64);
                 }

@@ -88,17 +88,39 @@ fn uncorrelated_exists() {
 
 #[test]
 fn aggregate_with_correlated_exists_errors_loudly() {
+    // 🔁 Now SUPPORTED (routed to the materialized path): must be CORRECT,
+    // not erroring. The old test asserted the honest-gap error; the gap was
+    // closed by guarding the aggregate fast paths (they silently returned
+    // 0 on subquery-containing WHERE clauses).
     let (db, _d) = setup();
-    let r = db.execute("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.a)");
-    match r {
-        Err(e) => assert!(
-            e.to_string().contains("not yet supported"),
-            "expected the honest-gap error, got: {e}"
-        ),
-        Ok(res) => {
-            let m = res.materialize().unwrap();
-            let n = m.select_rows().map(|(_, r)| r.len()).unwrap_or(0);
-            panic!("aggregate+correlated-EXISTS must error (or be correct), silently returned {n} rows");
+    let res = db
+        .execute("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.a)")
+        .expect("aggregate + correlated EXISTS is supported");
+    let m = res.materialize().unwrap();
+    let n_row = m
+        .select_rows()
+        .map(|(_, r)| r[0].clone())
+        .unwrap_or_default();
+    let truth = db
+        .execute("SELECT COUNT(*) FROM t WHERE a IN (SELECT t_id FROM u)")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let _ = truth;
+    // Cross-check against the equivalent IN form (same setup data).
+    let in_count = rows(
+        &db,
+        "SELECT COUNT(*) FROM t WHERE a IN (SELECT t_id FROM u)",
+    );
+    assert_eq!(
+        m.select_rows().map(|(_, r)| r.len()).unwrap_or(0),
+        1,
+        "aggregate returns one row"
+    );
+    match (&n_row[0], &in_count[0][0]) {
+        (motedb::types::Value::Integer(a), motedb::types::Value::Integer(b)) => {
+            assert_eq!(a, b, "COUNT(EXISTS) must equal the equivalent IN count")
         }
+        other => panic!("type mismatch {other:?}"),
     }
 }

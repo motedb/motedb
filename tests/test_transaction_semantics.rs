@@ -301,3 +301,177 @@ fn full_rollback_no_phantom_rows() {
         Vec::<i64>::new()
     );
 }
+
+#[test]
+fn in_txn_pk_point_update_fast_path_semantics() {
+    // The PK fast path used to be blanket-disabled inside transactions, so
+    // every `UPDATE … WHERE id = N` did a full-table scan (~70ms at 100K
+    // rows). Re-enabled, it must stay read-your-writes correct: storage
+    // rows, rows updated twice, buffered INSERTs, PK relocations, and
+    // txn-DELETEd rows must all behave exactly like the old scan path.
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    for s in (0..300).step_by(50) {
+        let vals: Vec<String> = (s..s + 50).map(|i| format!("({i}, {i})")).collect();
+        db.execute(&format!("INSERT INTO t VALUES {}", vals.join(",")))
+            .unwrap();
+    }
+
+    let tx = db.begin_transaction().unwrap();
+    // 1. Storage rows: repeated point updates in one txn (the benchmark shape).
+    for round in 1..=2 {
+        for i in 0..300 {
+            db.execute(&format!(
+                "UPDATE t SET v = {} WHERE id = {}",
+                i * 10 + round,
+                i
+            ))
+            .unwrap();
+        }
+    }
+    // 2. Buffered INSERT visible to a later point UPDATE in the same txn.
+    db.execute("INSERT INTO t VALUES (1000, 1000)").unwrap();
+    db.execute("UPDATE t SET v = -1 WHERE id = 1000").unwrap();
+    // 3. PK change on a buffered row via the point path.
+    db.execute("INSERT INTO t VALUES (2000, 2000)").unwrap();
+    db.execute("UPDATE t SET id = 2001, v = -2 WHERE id = 2000")
+        .unwrap();
+    // 4. DELETE then UPDATE of the deleted PK: must affect 0 rows.
+    db.execute("DELETE FROM t WHERE id = 299").unwrap();
+    db.execute("UPDATE t SET v = -3 WHERE id = 299").unwrap();
+    db.commit_transaction(tx).unwrap();
+
+    let q = ints(&rows(db.execute("SELECT v FROM t WHERE id = 0").unwrap()));
+    assert_eq!(q, vec![2], "second round of point updates must win");
+    let q = ints(&rows(db.execute("SELECT v FROM t WHERE id = 298").unwrap()));
+    assert_eq!(q, vec![2982]);
+    // deleted PK: gone; its neighbor untouched
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT id FROM t WHERE id = 299").unwrap()
+        )),
+        Vec::<i64>::new(),
+        "UPDATE after in-txn DELETE must not resurrect the row"
+    );
+    // buffered insert + update
+    let q = ints(&rows(
+        db.execute("SELECT v FROM t WHERE id = 1000").unwrap(),
+    ));
+    assert_eq!(q, vec![-1], "point UPDATE must reach the buffered INSERT");
+    // relocated buffered row
+    let q = ints(&rows(
+        db.execute("SELECT v FROM t WHERE id = 2001").unwrap(),
+    ));
+    assert_eq!(
+        q,
+        vec![-2],
+        "relocated buffered row must live under its new PK"
+    );
+    assert_eq!(
+        ints(&rows(
+            db.execute("SELECT id FROM t WHERE id = 2000").unwrap()
+        )),
+        Vec::<i64>::new(),
+        "old PK must not match after relocation"
+    );
+    // total row count: 300 - 1 deleted + 2 buffered inserts (2000 relocated, not added)
+    let n = ints(&rows(db.execute("SELECT COUNT(*) FROM t").unwrap()));
+    assert_eq!(n, vec![301]);
+}
+
+#[test]
+fn sql_savepoint_errors_propagate_and_survive_rollback_to() {
+    // Two bugs found by the external-integration E2E:
+    // 1. The streaming entry folded SAVEPOINT/ROLLBACK TO errors into a
+    //    success message — a SAVEPOINT without an active transaction was a
+    //    silent no-op, and the later ROLLBACK TO "succeeded" while the
+    //    UPDATE stayed committed.
+    // 2. ROLLBACK TO destroyed the target savepoint; SQL keeps it alive
+    //    (RELEASE / a second ROLLBACK TO must work).
+    let dir = TempDir::new().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO s VALUES (1, 10)").unwrap();
+
+    // 1. SAVEPOINT without a transaction must be a LOUD error.
+    assert!(db.execute("SAVEPOINT orphan").is_err());
+
+    // 2. Full cycle inside a transaction.
+    db.execute("BEGIN").unwrap();
+    db.execute("SAVEPOINT sp1").unwrap();
+    db.execute("UPDATE s SET v = 99 WHERE id = 1").unwrap();
+    db.execute("ROLLBACK TO sp1").unwrap();
+    let q = ints(&rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()));
+    assert_eq!(q, vec![10], "rollback to savepoint restores the value");
+
+    // 3. The target savepoint SURVIVES: a second ROLLBACK TO undoes new
+    //    writes only, and RELEASE succeeds.
+    db.execute("UPDATE s SET v = 42 WHERE id = 1").unwrap();
+    db.execute("ROLLBACK TO sp1").unwrap();
+    let q = ints(&rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()));
+    assert_eq!(q, vec![10], "second rollback to the same savepoint");
+    db.execute("UPDATE s SET v = 42 WHERE id = 1").unwrap();
+    db.execute("RELEASE sp1").unwrap();
+    db.execute("COMMIT").unwrap();
+    let q = ints(&rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()));
+    assert_eq!(q, vec![42], "release keeps the changes");
+
+    // 4. Nested savepoints: rolling back to the outer one undoes both
+    //    (restoring the value AS OF the outer savepoint — 42 here).
+    db.execute("BEGIN").unwrap();
+    db.execute("SAVEPOINT a").unwrap();
+    db.execute("UPDATE s SET v = 1 WHERE id = 1").unwrap();
+    db.execute("SAVEPOINT b").unwrap();
+    db.execute("UPDATE s SET v = 2 WHERE id = 1").unwrap();
+    db.execute("ROLLBACK TO a").unwrap();
+    db.execute("COMMIT").unwrap();
+    let q = ints(&rows(db.execute("SELECT v FROM s WHERE id = 1").unwrap()));
+    assert_eq!(q, vec![42], "outer savepoint rollback undoes nested writes");
+}
+
+/// 🔒 In-process multi-connection: the second open used to fail on flock
+/// ("already open by another process"). Connections now attach to the SAME
+/// engine via the api-layer registry; the LAST close performs shutdown.
+#[test]
+fn in_process_multi_connection_shared_engine() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.checkpoint().unwrap();
+        db.close().unwrap();
+    }
+    let c1 = Database::open(dir.path()).unwrap();
+    let c2 = Database::open(dir.path()).unwrap();
+    let c3 = Database::open_with_config(dir.path(), motedb::DBConfig::for_testing()).unwrap();
+
+    // Cross-connection visibility (shared engine).
+    c1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let q = ints(&rows(c2.execute("SELECT COUNT(*) FROM t").unwrap()));
+    assert_eq!(q, vec![2]);
+
+    // Rollback on one connection is visible to the others.
+    let tx = c1.begin_transaction().unwrap();
+    c1.execute("UPDATE t SET v = 99 WHERE id = 1").unwrap();
+    c1.rollback_transaction(tx).unwrap();
+    let q = ints(&rows(c3.execute("SELECT v FROM t WHERE id = 1").unwrap()));
+    assert_eq!(q, vec![10]);
+
+    // Non-last closes detach only.
+    c1.close().unwrap();
+    c2.close().unwrap();
+    let q = ints(&rows(c3.execute("SELECT COUNT(*) FROM t").unwrap()));
+    assert_eq!(q, vec![2]);
+
+    // Last close fully shuts down; reopen starts fresh.
+    c3.close().unwrap();
+    let c4 = Database::open(dir.path()).unwrap();
+    let q = ints(&rows(c4.execute("SELECT COUNT(*) FROM t").unwrap()));
+    assert_eq!(q, vec![2]);
+    c4.close().unwrap();
+}
