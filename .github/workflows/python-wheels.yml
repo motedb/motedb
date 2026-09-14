@@ -39,8 +39,45 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: bindings/python/dist/*.whl
 
-  publish:
+  # 🔑 Import + functional smoke on NATIVE runners. The two Linux-fatal
+  # packaging bugs shipped because nothing ever imported the wheel:
+  #   1. build.rs passed macOS's `-undefined dynamic_lookup` to Linux ldd
+  #      (link failure — the wheel could not even be built),
+  #   2. the default jemalloc feature uses initial-exec TLS, which a
+  #      dlopen()ed extension cannot place in glibc's static TLS block
+  #      (`import motedb` died instantly).
+  # Cross-compiled targets (linux/aarch64 on x86_64) can't import-test
+  # natively; the native pairs below cover each OS + the linker/TLS class
+  # of failure per libc.
+  smoke:
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            wheel-pattern: "*x86_64*"
+          - os: macos-latest
+            wheel-pattern: "*arm64*"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Install built wheel
+        run: pip install dist/${{ matrix.wheel-pattern }}.whl
+      - name: Import + version smoke
+        run: python -c "import motedb; print('motedb', motedb.__version__)"
+      - name: Functional E2E smoke (11 suites, small data)
+        run: python bindings/python/e2e/e2e_workload.py --root /tmp/e2e
+
+  publish:
+    needs: [build, smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi

@@ -1,0 +1,36 @@
+# MoteDB end-to-end test image: builds the CLI binary + Python wheel from
+# source in a clean Linux environment, then runs the external-integration
+# workload (bindings/python/e2e/e2e_workload.py).
+#
+#   docker build -f scripts/Dockerfile.e2e -t motedb-e2e .
+#   docker run --rm motedb-e2e
+#
+# (arm64 native on Apple silicon; no emulation involved.)
+FROM rust:latest
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv zip less \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Source only — keep build context lean (no target/).
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY examples ./examples
+COPY bindings/python ./bindings/python
+COPY bindings/python/e2e/e2e_workload.py /opt/e2e_workload.py
+
+# Build the CLI binary and the Python wheel (maturin via pip into a venv).
+RUN cargo build --release --bin motedb-cli \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir maturin \
+    && cd bindings/python && /opt/venv/bin/maturin build --release \
+    && /opt/venv/bin/pip install --no-cache-dir target/wheels/motedb_python-*.whl \
+    && cp target/release/motedb-cli /usr/local/bin/motedb-cli \
+    && motedb-cli --version
+
+# Fresh workdir; the workload creates its own databases.
+WORKDIR /data
+ENV MOTE_CLI=/usr/local/bin/motedb-cli
+CMD ["/opt/venv/bin/python3", "/opt/e2e_workload.py"]

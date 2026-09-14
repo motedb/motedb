@@ -177,3 +177,40 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features jemalloc
+
+  # ── External-integration E2E: Python wheel + motedb-cli ──────────────────
+  # Catches the class of bug the in-process cargo tests structurally miss:
+  # packaging/linker (Linux `-undefined dynamic_lookup`), dlopen TLS
+  # (jemalloc initial-exec), flush-race visibility through the binding, and
+  # CLI/SQL entry-point drift (CHECKPOINT parsed in one client but not the
+  # other). Mirrors scripts/docker_e2e.sh without the container.
+  e2e:
+    name: e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build CLI binary
+        run: cargo build --release --bin motedb-cli
+      - name: Build + install Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          args: --release
+      - name: Install wheel
+        run: pip install bindings/python/target/wheels/*.whl
+      - name: Run E2E workload (11 suites)
+        env:
+          MOTE_CLI: ${{ github.workspace }}/target/release/motedb-cli
+        run: python bindings/python/e2e/e2e_workload.py --root /tmp/e2e

@@ -12,5 +12,16 @@ name = "motedb"
 crate-type = ["cdylib"]
 
 [dependencies]
-motedb-core = { path = "../..", package = "motedb" }
+# 🔑 default-features = false: the default `jemalloc` feature uses
+# initial-exec TLS, which dlopen()ed Python extensions cannot place in
+# glibc's static TLS block — `import motedb` died with "cannot allocate
+# memory in static TLS block" on Linux. macOS survives (Mach-O TLS), so
+# keep the defaults there; Linux builds get the system allocator.
+motedb-core = { path = "../..", package = "motedb", default-features = false, features = [
+    "tokenizer-jieba",
+    "rayon",
+] }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+motedb-core = { path = "../..", package = "motedb", features = ["jemalloc"] }

@@ -233,8 +233,8 @@ impl PyDatabase {
     /// Execute a statement. SELECT returns a list of row dicts;
     /// INSERT/UPDATE/DELETE returns the affected-row count; DDL returns None.
     #[pyo3(signature = (sql, params=None))]
-    fn execute(&self, sql: &str, params: Option<Bound<'_, PyAny>>) -> PyResult<PyObject> {
-        let result = self.run(sql, params)?;
+    fn execute(&self, py: Python<'_>, sql: &str, params: Option<Bound<'_, PyAny>>) -> PyResult<PyObject> {
+        let result = self.run(py, sql, params)?;
         Python::with_gil(|py| -> PyResult<PyObject> {
             use pyo3::types::PyAnyMethods as _;
             match result {
@@ -260,8 +260,8 @@ impl PyDatabase {
     /// Execute a SELECT and return (columns, list-of-row-tuples).
     /// For large results this is materially cheaper than dicts.
     #[pyo3(signature = (sql, params=None))]
-    fn query(&self, sql: &str, params: Option<Bound<'_, PyAny>>) -> PyResult<PyObject> {
-        let result = self.run(sql, params)?;
+    fn query(&self, py: Python<'_>, sql: &str, params: Option<Bound<'_, PyAny>>) -> PyResult<PyObject> {
+        let result = self.run(py, sql, params)?;
         Python::with_gil(|py| -> PyResult<PyObject> {
             use pyo3::types::PyAnyMethods as _;
             match result {
@@ -296,7 +296,7 @@ impl PyDatabase {
     /// whole batch. `params` is a list of per-row parameter lists.
     /// Returns the affected-row count.
     #[pyo3(signature = (sql, params))]
-    fn executemany(&self, sql: &str, params: Bound<'_, PyAny>) -> PyResult<usize> {
+    fn executemany(&self, py: Python<'_>, sql: &str, params: Bound<'_, PyAny>) -> PyResult<usize> {
         use pyo3::types::PyAnyMethods as _;
         let list = params
             .extract::<Vec<Bound<'_, PyAny>>>()
@@ -312,8 +312,8 @@ impl PyDatabase {
             }
             batch.push(converted);
         }
-        self.db
-            .execute_prepared_many(sql, batch)
+        // 🔑 GIL released for the Rust-side batch execution (see run()).
+        py.allow_threads(move || self.db.execute_prepared_many(sql, batch))
             .map(|n| n as usize)
             .map_err(py_err)
     }
@@ -372,11 +372,16 @@ impl PyDatabase {
 impl PyDatabase {
     fn run(
         &self,
+        py: Python<'_>,
         sql: &str,
         params: Option<Bound<'_, PyAny>>,
     ) -> PyResult<motedb_core::QueryResult> {
+        // 🔑 Release the GIL for the whole Rust-side execution (params are
+        // converted to Rust values first; the result converts back after).
+        // Holding it serialized all DB calls across threads — a tight reader
+        // loop starved a concurrent writer down to ~66 rows/s (vs 322 solo).
         let streaming = match params {
-            None => self.db.execute(sql).map_err(py_err)?,
+            None => py.allow_threads(|| self.db.execute(sql)).map_err(py_err)?,
             Some(p) => {
                 use pyo3::types::PyAnyMethods as _;
                 let list = p
@@ -384,7 +389,8 @@ impl PyDatabase {
                     .map_err(|_| PyValueError::new_err("params must be a list"))?;
                 let vals: Vec<MValue> =
                     list.iter().map(py_to_mote).collect::<PyResult<Vec<_>>>()?;
-                self.db.execute_prepared(sql, vals).map_err(py_err)?
+                py.allow_threads(move || self.db.execute_prepared(sql, vals))
+                    .map_err(py_err)?
             }
         };
         streaming.materialize().map_err(py_err)

@@ -154,3 +154,401 @@ edit phase of the 20K eval went 25.9s → 8.1s.
 | kNN k=100 @ 20K points | 46.6 ms (GEOMETRY point read decoded the whole column per row) | 0.37 ms (decoded spatial column cached in col_cache) |
 
 Regression tests: `tests/test_spatial_sql_semantics.rs`.
+
+# Full-text search accuracy (BM25)
+
+`python3 text_eval.py [--n 20000] [--nq 30]` — 20K real all-nli sentences,
+reference = from-scratch BM25 in numpy with the engine's exact parameters
+(whitespace tokenizer, k1=1.5, b=0.75, Lucene idf; a second reference mirrors
+the 1-byte fieldnorm quantization the on-disk format applies to doc lengths).
+
+| check | result |
+|---|---|
+| MATCH set vs reference OR-set (rare/mid/common terms + pairs) | precision 1.0000, recall 1.0000 |
+| ranked top-10, best-score coverage | 1.0029 (≈1.0; >1 = a quantization-boundary doc outranks its exact score) |
+| ranked order consistency / boundary | 28/30, 19/30 (1-byte fieldnorm ties — same design as Lucene) |
+| case-insensitivity, unknown terms | correct |
+| MATCH AND cat='a' | 0 violations |
+| COUNT / SUM over MATCH | correct |
+| 1000 deletes + 1000 updates | ghosts 0, 1000/1000 moved docs findable, precision/recall 1.0 |
+| +5,000 multi-row inserts | immediately searchable |
+| checkpoint + reopen | index intact |
+| Chinese, `USING TOKENIZER ngram(2)` | precision/recall 1.0 |
+| indexed vs no-index MATCH | 0/20 divergent |
+
+## What the first run found (and what was fixed)
+
+| | before | after |
+|---|---|---|
+| BM25 doc lengths after a bulk backfill | **destroyed** by the first auto-flush (flush() cleared the pending-length map before the writer ran) → every doc scored with the same constant length, ranking length-blind | lengths persisted; ranking matches reference |
+| multi-term postings, partial flush | returned the FIRST of {pending, disk} — a term split across both hid every earlier doc (20K backfill matched only the second 10K) | pending ∪ disk merged (WAND cursors re-sorted) |
+| unranked multi-term (no LIMIT) | INTERSECTED postings (≠ ranked path's union) | union + dedup |
+| no LIMIT at all | silently capped at 1000 rows | full set |
+| `MATCH(c, q) AND cat='a'` | AND side dropped → rows violating cat | compound predicates evaluated; fast path restricted to bare MATCH |
+| `COUNT(*) WHERE MATCH` | one row per match | correct count |
+| MATCH without an index | AND-of-substrings (different set than the index) | token-OR scan, same set |
+| `USING TOKENIZER ngram(2)` | parse error | supported (whitespace/ngram(n); ngram is why CJK works) |
+
+# Time-series search accuracy
+
+`python3 ts_eval.py [--n 200000]` — 64 sensors × 3,125 s at 1 Hz + jitter,
+2% late out-of-order rows, reference in numpy. 200,000 rows:
+
+| check | result |
+|---|---|
+| range COUNT (6 windows, incl./excl. edges) | 6/6 exact |
+| COUNT/SUM/AVG/MIN/MAX over a range | exact to 1e-6 |
+| GROUP BY sid × 5 aggregates | 64/64 groups exact |
+| ORDER BY ts DESC LIMIT 10 | exact |
+| LATEST BY sid | exact (was silently ignored — returned every row) |
+| 4,000 late out-of-order rows | all visible |
+| `DELETE WHERE ts < cutoff` | kept exact, **leaked 0** (was 34,432: write-buffer rows never GC'd + straddling-segment prefixes; GC now flushes the buffer first and rewrites straddling segments row-level) |
+| checkpoint + reopen | count intact |
+
+Range-query latency ~80–140 ms at 200K rows (multi-segment scan); DELETE
+0.2 s. `TIME_BUCKET('5s'|'1m'|'1h'|'1d', ts)` downsampling works in SELECT
+and GROUP BY (by alias or full expression); `BM25_SCORE(col, query)` in the
+SELECT list returns real BM25 scores on MATCH queries (with or without
+LIMIT; no-LIMIT score queries rank over the full match set).
+
+Regression tests: `tests/test_text_ts_search_semantics.rs`.
+
+# Overall performance (all modalities, one run)
+
+`python3 perf_overall.py [--ts-rows 1000000]` — loads a single database with
+all four modalities and measures load throughput + query latency (avg/p50/p95
+over warmed runs). Loads run under `preset="edge"`, queries after close +
+reopen under `preset="general"`. Reference (Apple silicon, 2026-09, release
+wheel): 1M time-series rows, 190K×384 vectors (under the 200K exact-scan
+threshold), 100K text docs, 200K 3D points — 516 MB on disk.
+
+| workload | before | after (this round) |
+|---|---|---|
+| load time-series (autocommit multi-row VALUES) | 201K rows/s | 214K rows/s |
+| load vector 384-d (txn executemany, 20K-row commits) | 17.8K rows/s | 24.9K rows/s |
+| load text / CREATE TEXT INDEX | 266K rows/s / 3.2 s | 355K rows/s / 2.1 s |
+| load spatial / CREATE OCTREE INDEX | 70K rows/s / 1.0 s | 105K rows/s / 0.5 s |
+| PK point lookup | 2 µs | 1–2 µs |
+| full-scan aggregate (100K) | 0.14 ms | 0.11 ms |
+| PK range COUNT 10K span | 18 ms | 13 ms |
+| vector exact KNN-10, 190K×384 | 79 ms | 49 ms (numpy brute force: 29 ms) |
+| spatial KNN-10 / radius-50 / box-100 (200K pts) | 0.38 / 0.43 / 0.81 ms | 0.37 / 0.40 / 0.70 ms |
+| text MATCH ranked top-10 / two terms (100K docs) | 3.4 / 0.15 ms | 3.0 / 0.13 ms |
+| text COUNT(*) WHERE MATCH | 93 ms | **0.05 ms** (index postings) |
+| ts range COUNT over 1 h window (1M rows) | 445 ms | **20 ms** (segment-pruned fold) |
+| ts range AVG/MIN/MAX 1 h | 444 ms | 28 ms |
+| ts TIME_BUCKET('60s') 6 h | 1.45 s | **215 ms** |
+| ts GROUP BY sid, 6 h window | 513 ms | 202 ms |
+| in-txn UPDATE ×2000 (`WHERE id = N`) | 17 rows/s | **253 rows/s** (= autocommit parity) |
+| DELETE ts < max−1h (purges 770K rows) | 79 ms | 100 ms, kept count exact |
+| close + reopen | 0.2 / 0.4 s | 0.24 / 0.11 s; first octree query 8.5 ms |
+
+What was fixed in this round (regression-tested in
+`tests/test_text_ts_search_semantics.rs` + `test_transaction_semantics.rs`):
+
+- **In-transaction UPDATE lost the PK fast path** — the whole path was
+  blanket-disabled inside transactions (a buffered INSERT is invisible to
+  storage-only resolution), so every `UPDATE … WHERE id = N` full-scanned
+  (~72 ms/statement at 100K rows). `execute_update_pk` is now
+  transaction-aware (txn tombstones skipped, buffered rows updated in the
+  write_set, matching uncommitted INSERTs folded in) — 15×, with
+  read-your-writes semantics covered by tests.
+- **No time-range pushdown on TIMESERIES aggregates/GROUP BY** — every
+  aggregate full-materialized all rows. `ts_simple_aggregate` now routes
+  pure time-range predicates (comparisons / BETWEEN / AND, or no WHERE) to
+  `ColumnarStore::aggregate_time_range`: segment time pruning + per-column
+  fold, zero row materialization, COUNT/SUM/AVG/MIN/MAX ± GROUP BY column or
+  TIME_BUCKET bucket. 1 h window at 1M rows: 445 → 20 ms.
+- **Stale segment time bounds after a partial DELETE** (correctness, found
+  by the pushdown): `purge_straddling_rows` wrote placeholder (MAX, MIN)
+  timestamps into the rewritten segment's metadata, so any time-pruned read
+  — plain ranged SELECT included — silently skipped it (kept rows
+  invisible); only full-range scans masked it. Bounds are now recomputed
+  from the surviving rows.
+- **`COUNT(*) WHERE MATCH` materialized every matching row** just to count
+  it (93 ms at 100K docs). A dedicated fast path counts the index postings
+  directly (0.05 ms); `COUNT(col)` on the matched column and bare `COUNT()`
+  included, compound predicates still take the general pipeline.
+- (previous round) MVCC `VersionStore::evict_if_needed` was O(N) per insert
+  past `max_entries` — quadratic bulk writes; now amortized and
+  cooldown-gated. And `compile_simple_comparison` had no Timestamp arm, so
+  `ts >= <micros>` in a materialized GROUP BY silently matched zero rows;
+  comparisons now go through `Value::partial_cmp`.
+
+Remaining known hot spots (measured, not yet fixed):
+
+- **LATEST BY sid** full-materializes (~1.5 s at 1M rows) — could walk
+  time-ordered segments newest-first instead.
+- **ORDER BY ts DESC LIMIT k** (~366 ms at 1M) — no top-k over the
+  columnar store yet; the B+Tree-style "read segments in reverse" trick
+  applies.
+- Autocommit UPDATE (~250 rows/s) pays one group-commit fsync per row;
+  multi-row `UPDATE … WHERE id IN (…)` avoids it.
+- **2-table JOIN with GROUP BY / measure filter** misses the equi-join
+  fast path and materializes (~300–350 ms for 200K × 5K); plain
+  `try_positional_inner_join` handles only simple projections.
+- **3+ table JOINs** degrade to nested-loop per-row evaluation — a
+  bounded 10K-row three-way join ran minutes; rewrite as chained 2-way
+  joins (or wait for a multi-way hash join).
+- Correlated subqueries inside aggregate WHERE are rejected with an
+  explicit error (`rewrite as a join`), not silently wrong.
+- One open `Database` per path per process (a second connection errors
+  with "already open by another process"); in-process concurrency is
+  threads over a single handle, not multiple connections.
+
+Core-SQL reference (200K orders × 5K customers, release wheel): point
+filter p50 0.02 ms; range filter 0.8 ms; ORDER BY … LIMIT 20 → 6 ms;
+LIKE '%…%' 3.6 ms; scalar/IN subquery 24/13 ms; 2-way JOIN+aggregate
+~340 ms; 5,000 point UPDATEs in one txn 257 rows/s (= autocommit parity);
+20K-row INSERT txn 0.06 s; rollback restores UPDATE and DELETE.
+
+# End-to-end (external integration, incl. Docker/Linux)
+
+`bindings/python/e2e/e2e_workload.py` drives the database the way an
+embedding application does — Python wheel + `motedb-cli` binary against real
+files, across process boundaries:
+
+| suite | checks |
+|---|---|
+| multimodal | vector KNN, text MATCH, spatial KNN, ts range/TIME_BUCKET (SELECT + WHERE), flush-race stress (20x insert+query) |
+| persistence | checkpoint + reopen: rows, text index, index growth |
+| txn | read-your-writes, rollback (UPDATE + buffered INSERT), commit durability |
+| crash | real `kill -9` mid-ingest: every ACKed write survives, no holes |
+| cli | piped SQL through `motedb-cli`, reopen, `doctor` exit code |
+
+`bash scripts/docker_e2e.sh` builds the CLI + wheel from source inside a
+clean Linux container (uses the local rust image + cargo cache — no network)
+and runs the same workload on Debian/Python 3.13/x86_64.
+
+Integration bugs found by the E2E runs (all fixed):
+
+1. **Linux wheel build was broken twice over**: `bindings/python/build.rs`
+   unconditionally passed macOS's `-undefined dynamic_lookup` to the linker
+   (fatal on Linux with the new lld default), and the default `jemalloc`
+   feature uses initial-exec TLS, which a dlopen()ed extension cannot place
+   in glibc's static TLS block (`import motedb` died instantly). build.rs is
+   now macOS-gated; the Python crate builds without jemalloc on non-macOS.
+2. **Flush-race visibility bug (flaky, platform-independent)**: the
+   brute-force vector KNN / spatial KNN fallback / no-index MATCH scans
+   snapshotted segments and then read buffered rows WITHOUT a lock; the
+   200 ms auto-flush thread could move buffered rows into a new segment
+   between the two views — the row appeared in NEITHER (observed as
+   `ORDER BY emb <-> ?` returning 0 rows ~1 run in 3 under emulation).
+   All three scans now hold the store's flush lock across the snapshot +
+   buffered read. NOTE: containers building from a mounted checkout MUST
+   set `CARGO_TARGET_DIR` outside the checkout — a Linux build writing the
+   host's `target/` corrupts macOS rlibs (mixed-arch archive members).
+
+# Broader functional E2E (round 2)
+
+The suite grew to 11 (sql_types / aggregates / edits / errors / params /
+invariant bank-soak added). Round 2 found five more real bugs, all fixed
+with regression tests (`test_transaction_semantics::sql_savepoint_*`,
+engine unit coverage via the E2E assertions):
+
+1. **SAVEPOINT/ROLLBACK TO/RELEASE errors were swallowed into success
+   messages** in the streaming entry — a SAVEPOINT without an active
+   transaction was a silent no-op and the later ROLLBACK TO "succeeded"
+   while the UPDATE stayed committed. Errors now propagate.
+2. **ROLLBACK TO destroyed the target savepoint** — SQL keeps it alive
+   (RELEASE / a second ROLLBACK TO must work; its already-undone deltas are
+   cleared so they don't replay twice).
+3. **`UPDATE … SET float_col = 55` stored 0.0** — UPDATE coercion had
+   Float→Integer but not Integer→Float; INSERT paths already coerced.
+4. **AUTO_INCREMENT tables accepted explicit duplicate ids** — the PK
+   uniqueness check was gated off entirely for auto-inc tables, and the
+   explicit-id check only consulted the PK cache, which auto-assigned rows
+   never populate. Explicit ids are now checked against cache AND storage
+   (O(1) row fetch — auto-inc ids ARE row ids) and advance the counter.
+5. **`INSERT INTO t (id, ts) VALUES (1, '2024-01-15 10:30:00')` stored
+   ts=0** — the column-list row builder lacked the ISO-text→Timestamp
+   coercion the schema-order path has.
+
+Also verified (dialect, documented not changed): ORDER BY expression sorts
+NULLs FIRST ascending — SQLite semantics, not PostgreSQL's NULLS LAST.
+
+# P0 fixes (round 3)
+
+Three product-level gaps from the assessment, closed:
+
+1. **CLI `CHECKPOINT`/`VACUUM`** — the shell hand-parsed SQL and these are
+   DB operations (intercepted in the api facade, never in the parser), so
+   they were hard parse errors in the shell while working from every other
+   client. The shell now intercepts them around the executor call (also
+   fixed: the statement's trailing `;` survived the old trim order, which
+   is why the first attempt at the interception didn't match).
+2. **`CREATE INDEX IF NOT EXISTS`** — parsed (typed and untyped forms),
+   short-circuits to a notice when the index exists; plain duplicates
+   still error. The idempotent-migration staple.
+3. **CI gaps** — `python-wheels.yml` now installs and imports the built
+   wheel on native runners and runs the 11-suite E2E workload before
+   `publish` (the two Linux-fatal packaging bugs would both have been
+   caught by this); `ci.yml` gained a push-level `e2e` job (ubuntu +
+   macos: maturin wheel + CLI binary + full workload) so the
+   external-integration class of regression is caught per push, not per
+   release.
+
+# P1 round: JOIN execution + time-series read paths (round 4)
+
+1. **Multi-way INNER equi-joins** (3+ tables, left-deep chains) now run as
+   successive hash joins over concatenated positional rows
+   (`try_multi_way_inner_join`) instead of the general path's per-row
+   nested-loop evaluation — a bounded 10K-row three-way join used to run
+   MINUTES; it is now ~70 ms, and a 4-way join ~98 ms (200K × 5K × 20K
+   data). Falls back cleanly for non-equi ON conditions.
+2. **JOIN + GROUP BY/aggregate shapes** (2+ tables, COUNT/SUM/AVG/MIN/MAX
+   on plain columns, plain-column keys, ORDER BY on output or a SELECT-list
+   aggregate) fold directly over the join product: 2-table join+aggregate
+   344 → 48 ms; join+filter+top-N 332 → 45 ms.
+3. **`LATEST BY`** on a TimeSeries table folds per-group max-ts directly in
+   the ColumnarStore (`latest_by_group`, only the needed columns decoded):
+   1.5 s → 205 ms at 1M rows, per-group latest-ts exact.
+4. **`ORDER BY <ts_col> [DESC] LIMIT k`**: bounded top-k heap over the
+   decoded ts column (`topk_by_ts`): 366 ms → 43 ms at 1M rows, both
+   directions order-exact.
+
+**P0 correctness find on the way (pre-existing, not introduced by this
+round): the Gorilla timestamp codec silently corrupted data.** The 32-bit
+delta-of-delta bucket's encoder prefix was one bit short of the decoder's
+expectation, and delta-of-deltas beyond ±2^31 were truncated outright — any
+flush/merge batch whose sorted timestamps contained a jump beyond ±2047
+after irregular deltas (typical: out-of-order inserts) corrupted every
+later row of the segment on disk. Reproduced as: 200K-row time-series
+insert + 4K out-of-order rows + DELETE → 3,488 live rows silently lost
+(2000-row batches lost 8192). Fixed (32-bit prefix aligned, 64-bit bucket
+added), regression-tested at unit level (`test_timestamp_dod_bucket_
+roundtrips`, `test_timestamps_out_of_order_flush_batch_roundtrip`), and
+`ts_eval.py` is green again (DELETE leak 0, reopen exact). Any database
+written by an older build whose workload had out-of-order timestamp
+inserts should be re-validated (`motedb doctor`, row counts vs source).
+
+# Integration round 5: multi-table differential fuzzing (vs SQLite)
+
+New harness: `cargo run --release --example join_differential_fuzz -- [rounds]`
+— randomized 3-table schemas (NULL-rich join keys) plus a fixed battery:
+2/3/4-way equi-joins, LEFT/mixed/self/reversed-ON joins, JOIN+GROUP BY/
+HAVING/ORDER-BY-aggregate/LIMIT+OFFSET, empty-set aggregates, non-equi ON
+conditions, UPDATE/DELETE interleaved between comparisons. 100 rounds =
+8,800 checks vs SQLite in-memory.
+
+Found (both fixed, regression-tested in `test_text_ts_search_semantics.rs`):
+
+1. **Nondeterministic column binding on JOIN WHERE** — `try_extract_point_query`
+   stripped the table qualifier from `WHERE i.id = 1`, and the fallback
+   matched the FIRST key ending in `.id` while iterating a HashMap — with
+   `i.id`/`o.id` both present the query bound to a random one and returned
+   0, 1 or 2 rows across identical runs (same process included: 9/24/17
+   split over 50 runs). Now: the qualified name is preserved, resolution is
+   exact-key → bare-key → UNIQUE suffix (ambiguous = no match).
+2. **Premature LIMIT truncation on `ORDER BY … DESC … OFFSET` joins** — the
+   2-table fast path early-stopped the driver scan at LIMIT before the DESC
+   sort, so `ORDER BY o.id DESC LIMIT 5 OFFSET 3` returned wrong/short
+   results. Early-stop now requires no WHERE, no ORDER BY and no OFFSET.
+
+Known benign divergence (calibrated in the harness): AVG differs from
+SQLite by ≤1 in the last printed decimal — SQLite's AVG is a running mean,
+MoteDB's is sum/count (accumulation-order float semantics, both correct);
+compared with a 1.1% numeric tolerance while integers/text stay exact.
+
+Also confirmed still open (documented): `SELECT … WHERE EXISTS(correlated)`
+with aggregates is an explicit unsupported error, not silent wrongness.
+
+# Competitive-gap round 6: build throughput, rerank verification, multi-connection
+
+Three items from the product-gap list, closed and measured:
+
+1. **DiskANN build throughput: 72.7 min → 10.5 min (7x) at 220K×384.**
+   Two fixes compound: (a) the SQ8 read path now serves the whole quantized
+   set from a RAM "pin" during builds (`pin_all`/`unpin_all` around the
+   graph construction — the bounded LRU thrashed on the build's
+   O(search-list)-per-node access pattern; `get()` falls back to pure-compute
+   dequantization from the pin, removing file reads AND LRU write-lock
+   churn); pins are dropped on any mutation for staleness safety. The
+   earlier mmap zero-copy reads had already taken 19.8 → 2.5 ms/row; the
+   pin takes it to ~2.1-2.9 ms/row. Remaining cost is the sequential
+   per-node incremental build loop (parallelizing it changes graph-quality
+   semantics — tracked as the next lever).
+2. **Full-precision rerank verified end-to-end at 220K through SQL**:
+   `ORDER BY emb <-> ? LIMIT k` over-fetches 2k+16 candidates from the
+   graph and re-ranks exactly against the table's f32 vectors — recall@1
+   **1.0000** (was 0.99 index-level), recall@10 **0.9915** (was 0.9850),
+   self-query 1.0000, stable across reopen and +5K incremental inserts.
+3. **In-process multi-connection**: the second `Database::open()` on the
+   same directory used to fail on flock ("already open by another
+   process"). The api layer now keeps a canonical-path registry of live
+   engines and attaches new connections to the SAME Arc<MoteDB> (flock is
+   per open-file-description — same-process opens never conflict now);
+   `close()` detaches, and only the LAST connection shuts down (a live-
+   connection counter, not Arc::strong_count — the executor's own Arc made
+   that unreliable). Verified: 5 concurrent Python connections (1 writer +
+   4 readers, 62K+ aggregate queries) with zero errors; cross-connection
+   read-your-writes and rollback visibility exact. Regression test in
+   `test_transaction_semantics::in_process_multi_connection_shared_engine`.
+
+# Round 7 sweep: multi-connection edges + isolation semantics
+
+Found and fixed one bug in the new shared-handle registry:
+
+- **Registry key instability create→open**: at `create()` time the target
+  directory doesn't exist, so `canonicalize` fell back to the raw path while
+  a later `open()` canonicalized successfully (including macOS `/tmp` →
+  `/private/tmp` symlink resolution) — different keys, no attach, flock
+  error. Keys now normalize the PARENT directory and re-join the leaf.
+  Verified: create-then-open while open attaches; relative vs absolute
+  path spellings attach to the same engine; cross-process flock still
+  blocks (CLI vs a live Python handle) and releases on close.
+
+Documented semantics (known limitation, not a regression): **transactions
+are NOT isolated across connections.** The engine's transactions are
+write-through (UPDATEs hit storage + undo log; buffered INSERTs surface via
+shared bookkeeping), so a second connection sees another connection's
+uncommitted writes and rollbacks propagate. Single-connection workflows
+(all existing tests, the bank-soak invariant suite) are unaffected; for
+multi-connection coordination treat writes as immediately visible, or
+serialize writers on one connection. True cross-connection MVCC snapshot
+visibility is a storage-layer project (tracked below).
+
+Regression sweep after the fixes: E2E 11 suites ALL PASS; differential
+fuzzers 7,129 + 1,320 checks, 0 divergences (the one phase2 hit is the
+documented aggregate+correlated-subquery error).
+
+# Round 7 sweep — additional findings
+
+Edge sweep beyond the registry fix:
+
+- **TEXT hard cap: 65,534 bytes** (columnar segment format uses a 16-bit
+  length prefix). 65,534 round-trips intact; 65,535+ fails with a clear
+  validation error. For long-document / agent-memory workloads this is a
+  real product constraint — chunk at the application layer or wait for a
+  large-object path (storage-format change, tracked).
+- Verified clean (no action): 120-column wide tables; nested BEGIN is a
+  loud error; DROP + re-CREATE of the same table name; quoted reserved
+  words as table/column names (`SELECT "from" FROM "select"`).
+- One test asserting the OLD single-connection semantics
+  (`test_double_open_rejected_and_lock_released`) was updated: in-process
+  reopens now attach by design; cross-process flock still blocks (verified
+  CLI-vs-Python). Drop-without-close also works (the registry's Weak goes
+  dead, next open starts fresh).
+
+# Round 8: closing three known gaps
+
+1. **Aggregate + correlated subquery — now WORKS** (was an explicit
+   unsupported error): `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT … WHERE
+   u.x = t.y)` routes to the materialized path's per-row evaluation. The
+   fix was guarding the two positional aggregate fast paths (they treated
+   the subquery eval error as "no match" — silent 0). Differential fuzzer
+   phase2: 21 checks, **0 divergences** (was the 1 known error-divergence);
+   cross-checked against the equivalent IN form. Regression tests in
+   `test_exists_subquery` (updated from "must error" to "must be correct")
+   and `test_text_ts_search_semantics::aggregate_with_correlated_subquery_where`.
+2. **Python GIL released for the whole Rust-side execution** (execute /
+   query / executemany): the binding held the GIL for every DB call,
+   serializing all threads — a concurrent workload (1 writer + 4 readers)
+   ran the writer at 64 rows/s. Now 163 rows/s (2.5×; remaining gap vs the
+   269 rows/s solo baseline is genuine CPU contention from the readers).
+3. **`ORDER BY … NULLS FIRST/LAST`** supported (SQL-standard syntax;
+   parser + AST + a NULL/value-independent comparator in apply_order_by).
+   Non-default placements bypass every fast sorter via a boundary
+   authoritative re-sort (with LIMIT/OFFSET stripped for the inner run so
+   flag-ignoring top-k paths cannot pre-truncate). Default dialect
+   unchanged: NULLs first on ASC, last on DESC.
