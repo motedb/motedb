@@ -28,3 +28,4 @@ pub mod write_buffer;
 
 pub use config::ColumnarConfig;
 pub use store::ColumnarStore;
+pub use store::{RangeAggFunc, RangeAggSpec, RangeGroup};

@@ -472,6 +472,16 @@ impl ColSegmentStore {
         Ok(())
     }
 
+    /// Serialize a consistent (segments + write buffer) read against
+    /// `flush_buffer`/merges. A read path that snapshots segments and then
+    /// reads buffered rows MUST hold this guard for both steps: the
+    /// auto-flush thread moves buffered rows into a NEW segment, and a race
+    /// with that migration leaves the row in neither view (observed as a
+    /// flaky `ORDER BY emb <-> ? LIMIT k` returning 0 rows under load).
+    pub fn flush_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.flush_merge_lock.lock()
+    }
+
     /// Flush the buffer to a new delta segment on disk. Does NOT read old segments.
     /// O(this batch). Writes the file (no fsync — durability via WAL/manifest).
     pub fn flush_buffer(&self) -> Result<()> {

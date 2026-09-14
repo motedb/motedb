@@ -151,6 +151,35 @@ impl SegmentManager {
         Ok(())
     }
 
+    /// Remove one segment by path: drop its metadata, reader cache entry and
+    /// file. Used by row-level GC after rewriting a segment that straddled a
+    /// DELETE cutoff.
+    pub fn drop_segment(&self, path: &Path) -> Result<()> {
+        let removed = {
+            let mut segments = self.segments.write();
+            let before = segments.len();
+            segments.retain(|s| s.path != path);
+            before != segments.len()
+        };
+        self.reader_cache.write().remove(path);
+        if removed && path.exists() {
+            std::fs::remove_file(path).map_err(StorageError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Segments whose time range straddles `cutoff` (min < cutoff <= max):
+    /// fully-expired segments are already gone, these keep expired prefix
+    /// rows that only a row-level rewrite can remove.
+    pub fn straddling_segments(&self, cutoff_ts: i64) -> Vec<Arc<SegmentMetadata>> {
+        self.segments
+            .read()
+            .iter()
+            .filter(|s| s.min_timestamp < cutoff_ts && s.max_timestamp >= cutoff_ts)
+            .cloned()
+            .collect()
+    }
+
     /// Return segments whose time range overlaps [start_ts, end_ts].
     /// Uses binary search on sorted segment list for O(log n + k).
     pub fn prune_by_time(&self, start_ts: i64, end_ts: i64) -> Vec<Arc<SegmentMetadata>> {

@@ -226,12 +226,27 @@ fn encode_dod(writer: &mut BitWriter, dod: i64) {
             writer.write_bit(true);
             writer.write_bit(false);
             writer.write_bits(zigzag_encode(dod), 12);
-        } else {
-            // 32-bit value: prefix 1111
+        } else if abs <= 2147483647 {
+            // 32-bit value: after the top "1", "1110" — the decoder reads 5
+            // bits total ("11110") to distinguish 32-bit from 64-bit.
             writer.write_bit(true);
             writer.write_bit(true);
             writer.write_bit(true);
+            writer.write_bit(false);
             writer.write_bits(zigzag_encode(dod), 32);
+        } else {
+            // 🔑 64-bit value: after the top "1", "1111" — decoder reads
+            // "11111". Out-of-order timestamp batches produce |dod| beyond
+            // ±2^31 (a +2.6e9 delta jump after small irregular ones was
+            // observed); the old code fell into the 32-bit bucket, whose
+            // prefix was one bit SHORT of the decoder's expectation, AND
+            // truncated the 33+ bit zigzag — every later row in the segment
+            // decoded to garbage.
+            writer.write_bit(true);
+            writer.write_bit(true);
+            writer.write_bit(true);
+            writer.write_bit(true);
+            writer.write_bits(zigzag_encode(dod), 64);
         }
     }
 }
@@ -251,9 +266,12 @@ fn decode_dod(reader: &mut BitReader) -> i64 {
     } else if !reader.read_bit() {
         // 12-bit
         zigzag_decode(reader.read_bits(12))
-    } else {
-        // 32-bit
+    } else if !reader.read_bit() {
+        // 32-bit (prefix 11110)
         zigzag_decode(reader.read_bits(32))
+    } else {
+        // 🔑 64-bit (prefix 11111) — see encode_dod
+        zigzag_decode(reader.read_bits(64))
     }
 }
 
@@ -494,6 +512,69 @@ fn read_varint(data: &[u8]) -> (u64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 🔒 Delta-of-delta bucket round-trips, INCLUDING the huge-delta cases.
+    // The 32-bit bucket's prefix was one bit short of the decoder's
+    // expectation and |dod| > 2^31 was truncated outright — any flush batch
+    // whose sorted timestamps produced a delta-of-delta beyond ±2047
+    // (typical: out-of-order inserts followed by a large time jump)
+    // corrupted every later row of the segment on disk.
+    #[test]
+    fn test_timestamp_dod_bucket_roundtrips() {
+        let base: i64 = 1_700_000_000_000_000;
+        let dods: &[i64] = &[
+            0,
+            1,
+            -1,
+            63,
+            -63,
+            64,
+            -64,
+            255,
+            -255,
+            256,
+            -256,
+            2047,
+            -2047,
+            2048,
+            -2048,
+            1_000_000,
+            -1_000_000,
+            2_147_483_647,
+            -2_147_483_647,
+            2_147_483_648,
+            -2_147_483_648,
+            3_000_000_000,
+            -3_000_000_000,
+        ];
+        for &dod in dods {
+            let vals = vec![base, base + 1000, base + 2000 + dod];
+            let enc = encode_timestamps(&vals);
+            let dec = decode_timestamps(&enc, vals.len());
+            assert_eq!(dec, vals, "dod={dod}");
+        }
+    }
+
+    /// A realistic out-of-order flush batch: 3488 ascending values, then a
+    /// +2.59e9 jump (the observed corruption trigger), then irregular rows.
+    #[test]
+    fn test_timestamps_out_of_order_flush_batch_roundtrip() {
+        let base: i64 = 1_700_000_000_000_000;
+        let mut vals: Vec<i64> = (0..3488i64)
+            .map(|i| base + 3_069_000_000 + i * 15_800 + (i * 7919) % 200_000)
+            .collect();
+        let mut seed: i64 = 42;
+        for _ in 0..608 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            vals.push(base + ((seed >> 33) as i64).rem_euclid(3_125_000_000));
+        }
+        vals.sort_unstable();
+        let enc = encode_timestamps(&vals);
+        let dec = decode_timestamps(&enc, vals.len());
+        assert_eq!(dec, vals);
+    }
 
     // --- BitWriter / BitReader round-trip ---
 

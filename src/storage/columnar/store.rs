@@ -27,6 +27,37 @@ pub struct ColumnarIngestResult {
     pub segments_created: usize,
 }
 
+/// Aggregate function for [`ColumnarStore::aggregate_time_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeAggFunc {
+    CountStar,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// One aggregate to compute: `COUNT(*)` carries `col: None`.
+#[derive(Debug, Clone)]
+pub struct RangeAggSpec {
+    pub func: RangeAggFunc,
+    pub col: Option<String>,
+}
+
+/// Grouping for [`ColumnarStore::aggregate_time_range`].
+#[derive(Debug, Clone)]
+pub enum RangeGroup {
+    None,
+    /// GROUP BY <column>
+    ByColumn(String),
+    /// GROUP BY TIME_BUCKET(interval, ts) — bucket = floor(ts / interval).
+    ByTimeBucket {
+        ts_col: String,
+        interval_us: i64,
+    },
+}
+
 /// The top-level columnar store coordinator.
 pub struct ColumnarStore {
     base_dir: PathBuf,
@@ -39,6 +70,14 @@ pub struct ColumnarStore {
     table_registry: Arc<TableRegistry>,
     /// WAL for crash recovery (set after construction via set_wal).
     wal: RwLock<Option<Arc<WALManager>>>,
+
+    /// 🔑 Serializes "take buffer → write segment → register" against
+    /// readers that snapshot segments AND read the buffer. Without it, the
+    /// auto-flush thread (200 ms tick) could move buffered rows into a new
+    /// segment between a reader's two views — the rows were in NEITHER, so
+    /// ranged reads silently dropped them (observed as flaky COUNT/SELECT
+    /// gaps after an out-of-order insert batch).
+    flush_lock: parking_lot::Mutex<()>,
 }
 
 impl ColumnarStore {
@@ -61,6 +100,7 @@ impl ColumnarStore {
             next_segment_id: Arc::new(AtomicU64::new(0)),
             table_registry,
             wal: RwLock::new(None),
+            flush_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -244,6 +284,12 @@ impl ColumnarStore {
             table_id
         );
 
+        let ts_col_idx_of = |schema: &TableSchema| -> Option<usize> {
+            schema
+                .timeseries_column
+                .as_ref()
+                .and_then(|n| schema.columns.iter().position(|c| &c.name == n))
+        };
         // Read all columns from each segment + row_id column
         let column_count = schema.columns.len() as u16;
         let mut merged_columns: Vec<ColumnBuffer> = schema
@@ -559,6 +605,11 @@ impl ColumnarStore {
 
     /// Flush a batch to a segment file.
     fn flush_batch(&self, batch: &mut BufferedBatch) -> Result<()> {
+        // Serialize against readers holding `flush_lock` (see field docs).
+        // Every caller releases the buffer mutex before calling, so taking
+        // the lock here cannot deadlock (parking_lot is non-reentrant, but
+        // no path holds this lock while calling flush_batch).
+        let _flush_guard = self.flush_lock.lock();
         let table_id = batch.table_id;
         let dir = self.base_dir.join(table_id.to_string());
         std::fs::create_dir_all(&dir).map_err(StorageError::Io)?;
@@ -730,6 +781,175 @@ impl ColumnarStore {
         }
 
         Ok(())
+    }
+
+    /// Build a typed ColumnBuffer from decoded values (NULLs preserved).
+    fn buffer_from_values(ct: &ColumnType, vals: &[Option<Value>]) -> ColumnBuffer {
+        let to_i = |v: Option<&Value>| -> Option<i64> {
+            v.and_then(|v| match v {
+                Value::Integer(i) => Some(*i),
+                Value::Timestamp(t) => Some(t.as_micros()),
+                Value::Bool(b) => Some(*b as i64),
+                _ => None,
+            })
+        };
+        match ct {
+            ColumnType::Timestamp => {
+                ColumnBuffer::Timestamp(vals.iter().map(|v| to_i(v.as_ref())).collect())
+            }
+            ColumnType::Integer => {
+                ColumnBuffer::Integer(vals.iter().map(|v| to_i(v.as_ref())).collect())
+            }
+            ColumnType::Float => ColumnBuffer::Float(
+                vals.iter()
+                    .map(|v| {
+                        v.as_ref().and_then(|v| match v {
+                            Value::Float(f) => Some(*f),
+                            _ => None,
+                        })
+                    })
+                    .collect(),
+            ),
+            ColumnType::Boolean => ColumnBuffer::Bool(
+                vals.iter()
+                    .map(|v| {
+                        v.as_ref().and_then(|v| match v {
+                            Value::Bool(b) => Some(*b),
+                            _ => None,
+                        })
+                    })
+                    .collect(),
+            ),
+            ColumnType::Text => ColumnBuffer::Text(
+                vals.iter()
+                    .map(|v| {
+                        v.as_ref().and_then(|v| match v {
+                            Value::Text(t) => Some(t.as_str().to_string()),
+                            _ => None,
+                        })
+                    })
+                    .collect(),
+            ),
+            _ => ColumnBuffer::Other(
+                vals.iter()
+                    .map(|v| v.clone().unwrap_or(Value::Null))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Row-level purge for segments straddling a DELETE cutoff: decode each
+    /// column, drop rows with ts < cutoff, re-encode into a fresh segment and
+    /// drop the old file. Whole-segment GC alone left every expired prefix of
+    /// a straddling segment fully visible (34,432 rows leaked at 200K).
+    /// Returns the number of rows purged.
+    fn purge_straddling_rows(&self, table_id: u32, cutoff_ts: i64) -> Result<usize> {
+        let schema = match self.schemas.get(&table_id) {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        let col_types: Vec<ColumnType> =
+            schema.columns.iter().map(|c| c.col_type.clone()).collect();
+        let ts_idx = match self.find_timestamp_column(table_id) {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+        let manager = match self.managers.get(&table_id) {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+
+        let mut purged = 0usize;
+        for meta in manager.straddling_segments(cutoff_ts) {
+            let reader = crate::storage::columnar::segment::SegmentReader::open(&meta.path)?;
+            let n = meta.row_count as usize;
+
+            // Decode the timestamp column and build the survival mask.
+            let ts_block = reader.read_column(ts_idx as u16)?;
+            let ts_vals = self.decode_single_column(&ts_block, &col_types[ts_idx], n)?;
+            let keep: Vec<bool> = ts_vals
+                .iter()
+                .map(|v| match v {
+                    Value::Timestamp(t) => t.as_micros() >= cutoff_ts,
+                    Value::Integer(i) => *i >= cutoff_ts,
+                    _ => false,
+                })
+                .collect();
+            let survivors = keep.iter().filter(|k| **k).count();
+            if survivors == n {
+                continue; // nothing expired in this segment after all
+            }
+            purged += n - survivors;
+
+            // 🔑 Recompute the batch's time bounds from the SURVIVING rows.
+            // flush_batch writes batch.min/max_timestamp verbatim into the
+            // segment metadata used by prune_by_time — the placeholder
+            // (MAX, MIN) made every time-pruned query skip the rewritten
+            // segment, so kept rows went invisible to ranged SELECT and
+            // aggregate after a partial DELETE (a full-range scan masked it).
+            let mut batch_min_ts = i64::MAX;
+            let mut batch_max_ts = i64::MIN;
+            for (v, k) in ts_vals.iter().zip(keep.iter()) {
+                if !*k {
+                    continue;
+                }
+                let m = match v {
+                    Value::Timestamp(t) => t.as_micros(),
+                    Value::Integer(i) => *i,
+                    _ => continue,
+                };
+                batch_min_ts = batch_min_ts.min(m);
+                batch_max_ts = batch_max_ts.max(m);
+            }
+
+            // Decode every column, filter, re-encode into a fresh batch.
+            let mut columns: Vec<ColumnBuffer> = Vec::with_capacity(col_types.len());
+            for (ci, ct) in col_types.iter().enumerate() {
+                let block = reader.read_column(ci as u16)?;
+                let vals = self.decode_single_column(&block, ct, n)?;
+                let filtered: Vec<Option<Value>> = vals
+                    .into_iter()
+                    .zip(keep.iter())
+                    .filter(|(_, k)| **k)
+                    .map(|(v, _)| Some(v))
+                    .collect();
+                columns.push(Self::buffer_from_values(ct, &filtered));
+            }
+            // 🔑 Preserve the ORIGINAL row_ids. The old code fabricated
+            // 1..survivors for every rewritten segment — colliding both with
+            // other rewritten segments and with real rows elsewhere, which
+            // made multi-segment DELETEs drop live rows (dedup keyed by
+            // composite key saw the fakes as duplicates of real rows).
+            let row_ids: Vec<RowId> = {
+                let row_id_col_id = meta.column_count; // stored just past schema cols
+                match reader.read_column(row_id_col_id) {
+                    Ok(block) => {
+                        let all = gorilla::decode_integers(&block.data, n);
+                        all.into_iter()
+                            .zip(keep.iter())
+                            .filter(|(_, k)| **k)
+                            .map(|(id, _)| id as RowId)
+                            .collect()
+                    }
+                    Err(_) => (0..survivors).map(|i| i as RowId + 1).collect(),
+                }
+            };
+            let mut batch = BufferedBatch {
+                table_id,
+                columns,
+                row_count: survivors,
+                row_ids,
+                min_timestamp: batch_min_ts,
+                max_timestamp: batch_max_ts,
+            };
+            if survivors == 0 {
+                manager.drop_segment(&meta.path)?;
+                continue;
+            }
+            self.flush_batch(&mut batch)?;
+            manager.drop_segment(&meta.path)?;
+        }
+        Ok(purged)
     }
 
     /// Query with column conditions for segment-level pruning.
@@ -1056,6 +1276,10 @@ impl ColumnarStore {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        // 🔑 Hold the flush lock across the segment snapshot AND the buffer
+        // read below — closes the take→register visibility window.
+        let _flush_guard = self.flush_lock.lock();
+
         // Segment pruning
         let segments = manager.prune_by_time(start_ts, end_ts);
         let mut results = Vec::new();
@@ -1183,6 +1407,750 @@ impl ColumnarStore {
         }
 
         Ok(results)
+    }
+
+    /// `LATEST BY <group_col>`: the row with the maximum timestamp per group,
+    /// computed as a fold over ALL segments + the write buffer WITHOUT
+    /// materializing every row (only group/ts/requested columns are decoded).
+    /// The executor path built a HashMap SqlRow per row (~1.5 s at 1M rows).
+    /// Ties on ts resolve to the LATER-inserted row (buffer last, `>=`
+    /// updates in segment order).
+    pub fn latest_by_group(
+        &self,
+        table_name: &str,
+        group_col: &str,
+        needed: &[String],
+    ) -> Result<Vec<SqlRow>> {
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
+            .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
+        let schema = self
+            .schemas
+            .get(&table_id)
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?
+            .clone();
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
+        })?;
+        let ts_col = schema.timeseries_column.clone().ok_or_else(|| {
+            StorageError::Columnar(format!("Table '{}' is not a time-series table", table_name))
+        })?;
+        let idx = |name: &str| -> Result<usize> {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .ok_or_else(|| StorageError::ColumnNotFound(name.to_string()))
+        };
+        let ts_idx = idx(&ts_col)?;
+        let group_idx = idx(group_col)?;
+        let needed_idx: Vec<usize> = needed.iter().map(|n| idx(n)).collect::<Result<_>>()?;
+
+        let mut wanted: Vec<usize> = Vec::with_capacity(needed_idx.len() + 2);
+        wanted.extend_from_slice(&needed_idx);
+        wanted.push(group_idx);
+        wanted.push(ts_idx);
+        wanted.sort_unstable();
+        wanted.dedup();
+        let wanted_ids: Vec<u16> = wanted.iter().map(|&i| i as u16).collect();
+
+        // 🔑 Consistent read across segments + buffer (see flush_lock docs).
+        let _flush_guard = self.flush_lock.lock();
+
+        // group key (debug form) -> (ts micros, decoded row snapshot)
+        let mut best: std::collections::HashMap<String, (i64, Vec<Value>)> =
+            std::collections::HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+
+        for segment in manager.prune_by_time(i64::MIN, i64::MAX) {
+            let blocks = manager.read_columns(&segment, &wanted_ids)?;
+            let ts_block = match blocks.iter().find(|b| b.column_id == ts_idx as u16) {
+                Some(b) => b,
+                None => continue,
+            };
+            let ts_micros = if ts_block.encoding == ColumnEncoding::GorillaTimestamp {
+                gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize)
+            } else {
+                Vec::new()
+            };
+            let schema_blocks: Vec<&ColumnBlock> = blocks
+                .iter()
+                .filter(|b| b.column_id < segment.column_count)
+                .collect();
+            let decoded =
+                self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
+            let ts_of = |i: usize| -> Option<i64> {
+                if ts_block.encoding == ColumnEncoding::GorillaTimestamp {
+                    ts_micros.get(i).copied()
+                } else {
+                    match decoded.get(i).and_then(|r| r.get(ts_idx)) {
+                        Some(Value::Timestamp(t)) => Some(t.as_micros()),
+                        Some(Value::Integer(v)) => Some(*v),
+                        _ => None,
+                    }
+                }
+            };
+            for i in 0..(segment.row_count as usize) {
+                let Some(ts) = ts_of(i) else { continue };
+                let key = decoded
+                    .get(i)
+                    .and_then(|r| r.get(group_idx))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let kstr = format!("{:?}", key);
+                match best.get_mut(&kstr) {
+                    Some((max_ts, _)) if ts < *max_ts => {}
+                    entry => {
+                        if entry.is_none() {
+                            order.push(kstr.clone());
+                            best.insert(kstr.clone(), (ts, Vec::new()));
+                        }
+                        // >= : later segment wins ties (insertion order)
+                        let snap: Vec<Value> = wanted
+                            .iter()
+                            .map(|&ci| {
+                                decoded
+                                    .get(i)
+                                    .and_then(|r| r.get(ci))
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect();
+                        if let Some(e) = best.get_mut(&kstr) {
+                            *e = (ts, snap);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write buffer last (newest inserts win ties).
+        if let Some(buffer_entry) = self.buffers.get(&table_id) {
+            let buffer = buffer_entry.lock().unwrap();
+            if buffer.timestamp_range().is_some() {
+                let column_ids: Vec<(u16, String)> = wanted
+                    .iter()
+                    .map(|&i| (i as u16, schema.columns[i].name.clone()))
+                    .collect();
+                for (_rid, sql_row) in
+                    buffer.snapshot_rows(i64::MIN, i64::MAX, &schema, &column_ids)
+                {
+                    let ts = match sql_row.get(&ts_col) {
+                        Some(Value::Timestamp(t)) => t.as_micros(),
+                        Some(Value::Integer(v)) => *v,
+                        _ => continue,
+                    };
+                    let key = sql_row.get(group_col).cloned().unwrap_or(Value::Null);
+                    let kstr = format!("{:?}", key);
+                    let better = match best.get(&kstr) {
+                        Some((max_ts, _)) => ts >= *max_ts,
+                        None => {
+                            order.push(kstr.clone());
+                            true
+                        }
+                    };
+                    if better {
+                        let snap: Vec<Value> = wanted
+                            .iter()
+                            .map(|&ci| {
+                                sql_row
+                                    .get(&schema.columns[ci].name)
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect();
+                        best.insert(kstr, (ts, snap));
+                    }
+                }
+            }
+        }
+
+        // Assemble SqlRows keyed by column NAME over the requested columns.
+        let mut out = Vec::with_capacity(order.len());
+        for kstr in order {
+            if let Some((_, snap)) = best.remove(&kstr) {
+                let mut row = SqlRow::new();
+                for (j, &ci) in wanted.iter().enumerate() {
+                    row.insert(schema.columns[ci].name.clone(), snap[j].clone());
+                }
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Top-k rows by timestamp (`ORDER BY ts [DESC] LIMIT k`): a bounded
+    /// heap over ONLY the decoded ts column, then the k survivors' requested
+    /// columns are decoded. The general path materialized + sorted every row
+    /// (~366 ms at 1M rows). Ties break by later scan position (newer row).
+    pub fn topk_by_ts(
+        &self,
+        table_name: &str,
+        k: usize,
+        desc: bool,
+        needed: &[String],
+    ) -> Result<Vec<SqlRow>> {
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
+            .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
+        let schema = self
+            .schemas
+            .get(&table_id)
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?
+            .clone();
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
+        })?;
+        let ts_col = schema.timeseries_column.clone().ok_or_else(|| {
+            StorageError::Columnar(format!("Table '{}' is not a time-series table", table_name))
+        })?;
+        let ts_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == ts_col)
+            .ok_or_else(|| StorageError::ColumnNotFound(ts_col.clone()))?;
+
+        // 🔑 Consistent read across segments + buffer (see flush_lock docs).
+        let _flush_guard = self.flush_lock.lock();
+
+        // Pass 1: find the k-th largest key with a bounded i64 min-heap over
+        // ONLY the ts column (a per-row HashMap for survivor bookkeeping made
+        // the first version SLOWER than the full sort it replaced).
+        let segments = manager.prune_by_time(i64::MIN, i64::MAX);
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<i64>> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        for segment in segments.iter() {
+            // 🔑 Segment-level pruning from the zone-map metadata: a segment
+            // whose BEST possible key can't beat the current threshold can't
+            // contribute a top-k row at all — skip decoding it entirely.
+            // (Without this, ASC top-k decoded every segment's full ts
+            // column twice; the sort-keys-as-negatives make the "best" end
+            // min_ts for ASC and max_ts for DESC.)
+            let best_key = if desc {
+                segment.max_timestamp
+            } else {
+                segment.min_timestamp.wrapping_neg()
+            };
+            if heap.len() >= k {
+                if let Some(&std::cmp::Reverse(min)) = heap.peek() {
+                    if best_key <= min {
+                        continue;
+                    }
+                }
+            }
+            let blocks = manager.read_columns(segment, &[ts_idx as u16])?;
+            let Some(ts_block) = blocks.iter().find(|b| b.column_id == ts_idx as u16) else {
+                continue;
+            };
+            if ts_block.encoding != ColumnEncoding::GorillaTimestamp {
+                continue; // non-gorilla ts: caller falls back to the general path
+            }
+            let ts_micros = gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+            for &ts in ts_micros.iter() {
+                let key = if desc { ts } else { ts.wrapping_neg() };
+                if heap.len() < k {
+                    heap.push(std::cmp::Reverse(key));
+                } else if let Some(&std::cmp::Reverse(min)) = heap.peek() {
+                    if key > min {
+                        heap.pop();
+                        heap.push(std::cmp::Reverse(key));
+                    }
+                }
+            }
+        }
+        let Some(std::cmp::Reverse(threshold)) = heap.peek().copied() else {
+            return Ok(Vec::new());
+        };
+        // Pass 2a: segment rows above the threshold (ts > threshold are
+        // guaranteed in; ts == threshold admitted while budget remains).
+        let mut wanted_rows: Vec<(usize, usize, i64)> = Vec::with_capacity(k);
+        let mut budget = k;
+        for (seg_ord, segment) in segments.iter().enumerate() {
+            if budget == 0 {
+                break;
+            }
+            if !segment.is_timestamp_sorted {
+                // unsorted segment: full ts decode + threshold filter
+                let blocks = manager.read_columns(segment, &[ts_idx as u16])?;
+                let Some(ts_block) = blocks.iter().find(|b| b.column_id == ts_idx as u16) else {
+                    continue;
+                };
+                if ts_block.encoding != ColumnEncoding::GorillaTimestamp {
+                    continue;
+                }
+                let ts_micros =
+                    gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+                for (i, &ts) in ts_micros.iter().enumerate() {
+                    let key = if desc { ts } else { ts.wrapping_neg() };
+                    if key > threshold || (key == threshold && wanted_rows.len() < budget) {
+                        wanted_rows.push((seg_ord, i, ts));
+                    }
+                }
+                continue;
+            }
+            // 🔑 Sorted segment: binary-search the key boundary instead of
+            // decoding every timestamp. Threshold ties need the block edge,
+            // so fetch the ts block range [start, end) from the segment.
+            let blocks = manager.read_columns(segment, &[ts_idx as u16])?;
+            let Some(ts_block) = blocks.iter().find(|b| b.column_id == ts_idx as u16) else {
+                continue;
+            };
+            if ts_block.encoding != ColumnEncoding::GorillaTimestamp {
+                continue;
+            }
+            let all_ts = gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+            // scan from the qualifying end (DESC: largest ts first = tail;
+            // ASC-key = -ts so largest key = smallest ts = head).
+            let range: Box<dyn Iterator<Item = (usize, i64)>> = if desc {
+                Box::new(all_ts.iter().enumerate().rev().map(|(i, &t)| (i, t)))
+            } else {
+                let mut end = all_ts.len();
+                for (i, &t) in all_ts.iter().enumerate() {
+                    if t.wrapping_neg() < threshold {
+                        end = i + 1; // include the boundary row (key == threshold)
+                        break;
+                    }
+                }
+                Box::new(all_ts.iter().take(end).copied().enumerate())
+            };
+            for (i, ts) in range {
+                let key = if desc { ts } else { ts.wrapping_neg() };
+                if key > threshold {
+                    wanted_rows.push((seg_ord, i, ts));
+                    if wanted_rows.len() >= budget {
+                        break;
+                    }
+                } else if key == threshold && wanted_rows.len() < budget {
+                    wanted_rows.push((seg_ord, i, ts));
+                } else if key < threshold {
+                    break;
+                }
+            }
+        }
+        // Pass 2b: write-buffer rows (newest — same threshold rule).
+        let mut buffer_rows: Vec<(i64, SqlRow)> = Vec::new();
+        if let Some(buffer_entry) = self.buffers.get(&table_id) {
+            let buffer = buffer_entry.lock().unwrap();
+            if buffer.timestamp_range().is_some() {
+                let column_ids: Vec<(u16, String)> =
+                    std::iter::once((ts_idx as u16, ts_col.clone()))
+                        .chain(needed.iter().filter_map(|n| {
+                            schema
+                                .columns
+                                .iter()
+                                .position(|c| &c.name == n)
+                                .map(|p| (p as u16, n.clone()))
+                        }))
+                        .collect();
+                for (_rid, mut sql_row) in
+                    buffer.snapshot_rows(i64::MIN, i64::MAX, &schema, &column_ids)
+                {
+                    let ts = match sql_row.remove(&ts_col) {
+                        Some(Value::Timestamp(t)) => t.as_micros(),
+                        Some(Value::Integer(v)) => v,
+                        _ => continue,
+                    };
+                    buffer_rows.push((ts, sql_row));
+                }
+            }
+        }
+        let mut wanted_buf: Vec<usize> = Vec::new();
+        for (bi, (ts, _)) in buffer_rows.iter().enumerate() {
+            let key = if desc { *ts } else { i64::MIN ^ *ts };
+            if key > threshold
+                || (key == threshold && wanted_rows.len() + wanted_buf.len() < budget)
+            {
+                wanted_buf.push(bi);
+            }
+        }
+
+        // Pass 2: decode the survivors' rows (per involved segment).
+        let idx = |name: &str| -> Result<usize> {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .ok_or_else(|| StorageError::ColumnNotFound(name.to_string()))
+        };
+        let needed_idx: Vec<usize> = needed.iter().map(|n| idx(n)).collect::<Result<_>>()?;
+        let mut all_ids: Vec<u16> = needed_idx.iter().map(|&i| i as u16).collect();
+        all_ids.push(ts_idx as u16);
+        all_ids.sort_unstable();
+        all_ids.dedup();
+
+        // Trim to exactly k (threshold ties may over-admit) BEFORE decoding.
+        let mut seg_row: Vec<(i64, i64, SqlRow)> = Vec::new(); // (ts, seq, row)
+        let mut next_seq_for_ties: i64 = 0;
+        let mut wanted_rows: Vec<(usize, usize, i64)> = {
+            let mut w = std::mem::take(&mut wanted_rows);
+            // prefer larger keys first when trimming (sort desc by key)
+            w.sort_by(|a, b| {
+                let ka = if desc { a.2 } else { i64::MIN ^ a.2 };
+                let kb = if desc { b.2 } else { i64::MIN ^ b.2 };
+                kb.cmp(&ka)
+            });
+            w.truncate(budget);
+            w
+        };
+        for (seg_ord, row_idx, _ts) in wanted_rows.drain(..) {
+            let segment = &segments[seg_ord];
+            let blocks = manager.read_columns(segment, &all_ids)?;
+            let schema_blocks: Vec<&ColumnBlock> = blocks
+                .iter()
+                .filter(|b| b.column_id < segment.column_count)
+                .collect();
+            let decoded =
+                self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
+            let Some(row) = decoded.get(row_idx) else {
+                continue;
+            };
+            let ts = match row.get(ts_idx) {
+                Some(Value::Timestamp(t)) => t.as_micros(),
+                Some(Value::Integer(v)) => *v,
+                _ => 0,
+            };
+            let mut sql_row = SqlRow::new();
+            for &ci in &needed_idx {
+                sql_row.insert(
+                    schema.columns[ci].name.clone(),
+                    row.get(ci).cloned().unwrap_or(Value::Null),
+                );
+            }
+            next_seq_for_ties += 1;
+            seg_row.push((ts, next_seq_for_ties, sql_row));
+        }
+        for bi in wanted_buf {
+            let (bts, sql_row) = buffer_rows.swap_remove(bi);
+            next_seq_for_ties += 1;
+            seg_row.push((bts, next_seq_for_ties, sql_row));
+        }
+        // Sort: DESC by ts (ties by seq); ASC inverts.
+        seg_row.sort_by(|a, b| {
+            let c = b.0.cmp(&a.0).then(b.1.cmp(&a.1));
+            if desc {
+                c
+            } else {
+                c.reverse()
+            }
+        });
+        seg_row.truncate(k);
+        Ok(seg_row.into_iter().map(|(_, _, r)| r).collect())
+    }
+
+    /// Fold aggregates (optionally grouped) over a time range WITHOUT
+    /// materializing rows: segments are pruned by time, only the needed
+    /// columns are decoded, and accumulators fold per matching row. This is
+    /// the aggregate analogue of `query_time_range`'s pruning — the executor
+    /// used to full-scan (materializing every row as a HashMap SqlRow) even
+    /// for a 1-hour window over 1M rows (~450 ms); the fold reads only the
+    /// segments the window touches.
+    ///
+    /// Semantics mirror the executor's ts_simple_aggregate: COUNT → Integer;
+    /// SUM/AVG/MIN/MAX → Float (NULL when no non-null input); ungrouped
+    /// aggregates over an empty range still return one row (SQL standard).
+    pub fn aggregate_time_range(
+        &self,
+        table_name: &str,
+        start_ts: i64,
+        end_ts: i64,
+        group: RangeGroup,
+        aggs: &[RangeAggSpec],
+    ) -> Result<Vec<(Option<Value>, Vec<Value>)>> {
+        let table_id = self
+            .table_registry
+            .get_table_id(table_name)
+            .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
+        let schema = self
+            .schemas
+            .get(&table_id)
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_string()))?
+            .clone();
+        let manager = self.managers.get(&table_id).ok_or_else(|| {
+            StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
+        })?;
+
+        let ts_col = schema.timeseries_column.clone().ok_or_else(|| {
+            StorageError::Columnar(format!("Table '{}' is not a time-series table", table_name))
+        })?;
+
+        // Resolve every referenced column to a schema index up front.
+        let col_idx = |name: &str| -> Result<usize> {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .ok_or_else(|| StorageError::ColumnNotFound(name.to_string()))
+        };
+        let ts_idx = col_idx(&ts_col)?;
+        let mut needed: Vec<usize> = Vec::new();
+        for a in aggs {
+            if let Some(c) = &a.col {
+                needed.push(col_idx(c)?);
+            }
+        }
+        let group_col_idx = match &group {
+            RangeGroup::ByColumn(c) => Some(col_idx(c)?),
+            RangeGroup::ByTimeBucket { ts_col, .. } => {
+                if ts_col != &schema.timeseries_column.as_deref().unwrap_or("") {
+                    return Err(StorageError::Columnar(
+                        "TIME_BUCKET group key must be the time-series column".into(),
+                    ));
+                }
+                None
+            }
+            RangeGroup::None => None,
+        };
+        if let Some(g) = group_col_idx {
+            needed.push(g);
+        }
+
+        // Per-group, per-agg accumulators (same shape as the executor's fold).
+        #[derive(Default, Clone)]
+        struct Acc {
+            count: u64,   // rows seen (COUNT(*))
+            nn: Vec<u64>, // non-null values per agg
+            sum: Vec<f64>,
+            minv: Vec<Option<f64>>,
+            maxv: Vec<Option<f64>>,
+        }
+        let k = aggs.len();
+        let new_acc = |k: usize| Acc {
+            count: 0,
+            nn: vec![0; k],
+            sum: vec![0.0; k],
+            minv: vec![None; k],
+            maxv: vec![None; k],
+        };
+        // Group key: Value::Null-safe debug form (same trick the executor
+        // uses — Value is not Ord/Hash).
+        let mut groups: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+        let mut group_order: Vec<(String, Value)> = Vec::new();
+        let mut total = new_acc(k);
+
+        // (group-key-or-total, per-column values, ts micros) fold helper.
+        macro_rules! fold_row {
+            ($key_expr:expr, $get:expr, $ts_micros:expr) => {{
+                let bucket_key: Option<Value> = match (&group, $key_expr) {
+                    (RangeGroup::None, _) => None,
+                    (RangeGroup::ByColumn(_), g) => Some(g),
+                    (RangeGroup::ByTimeBucket { interval_us, .. }, _) => {
+                        Some(Value::Timestamp(crate::types::Timestamp::from_micros(
+                            ($ts_micros / interval_us) * interval_us,
+                        )))
+                    }
+                };
+                let acc: &mut Acc = match &bucket_key {
+                    None => &mut total,
+                    Some(key) => {
+                        let kstr = format!("{:?}", key);
+                        if !groups.contains_key(&kstr) {
+                            group_order.push((kstr.clone(), key.clone()));
+                            groups.insert(kstr.clone(), new_acc(k));
+                        }
+                        groups
+                            .get_mut(&kstr)
+                            .expect("group accumulator just ensured")
+                    }
+                };
+                acc.count += 1;
+                for (i, spec) in aggs.iter().enumerate() {
+                    if let RangeAggFunc::CountStar = spec.func {
+                        continue; // covered by acc.count
+                    }
+                    let c = match &spec.col {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let v = $get(c);
+                    match v {
+                        Some(Value::Integer(x)) => {
+                            acc.nn[i] += 1;
+                            acc.sum[i] += *x as f64;
+                            acc.minv[i] = Some(acc.minv[i].map_or(*x as f64, |m| m.min(*x as f64)));
+                            acc.maxv[i] = Some(acc.maxv[i].map_or(*x as f64, |m| m.max(*x as f64)));
+                        }
+                        Some(Value::Float(x)) => {
+                            acc.nn[i] += 1;
+                            acc.sum[i] += *x;
+                            acc.minv[i] = Some(acc.minv[i].map_or(*x, |m| m.min(*x)));
+                            acc.maxv[i] = Some(acc.maxv[i].map_or(*x, |m| m.max(*x)));
+                        }
+                        Some(Value::Timestamp(t)) => {
+                            let x = t.as_micros() as f64;
+                            acc.nn[i] += 1;
+                            acc.sum[i] += x;
+                            acc.minv[i] = Some(acc.minv[i].map_or(x, |m| m.min(x)));
+                            acc.maxv[i] = Some(acc.maxv[i].map_or(x, |m| m.max(x)));
+                        }
+                        _ => {}
+                    }
+                }
+            }};
+        }
+
+        let finish = |acc: &Acc| -> Vec<Value> {
+            aggs.iter()
+                .enumerate()
+                .map(|(i, spec)| match spec.func {
+                    RangeAggFunc::CountStar => Value::Integer(acc.count as i64),
+                    RangeAggFunc::Count => Value::Integer(acc.nn[i] as i64),
+                    RangeAggFunc::Sum => {
+                        if acc.nn[i] > 0 {
+                            Value::Float(acc.sum[i])
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    RangeAggFunc::Avg => {
+                        if acc.nn[i] > 0 {
+                            Value::Float(acc.sum[i] / acc.nn[i] as f64)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    RangeAggFunc::Min => acc.minv[i].map(Value::Float).unwrap_or(Value::Null),
+                    RangeAggFunc::Max => acc.maxv[i].map(Value::Float).unwrap_or(Value::Null),
+                })
+                .collect()
+        };
+
+        // 🔑 Consistent read across segments + buffer (see flush_lock docs).
+        let _flush_guard = self.flush_lock.lock();
+
+        // ---- segments (pruned by time)
+        let mut needed_ids: Vec<u16> = needed.iter().map(|&i| i as u16).collect();
+        needed_ids.push(ts_idx as u16);
+        needed_ids.sort_unstable();
+        needed_ids.dedup();
+        for segment in manager.prune_by_time(start_ts, end_ts) {
+            let blocks = manager.read_columns(&segment, &needed_ids)?;
+            let ts_block = match blocks.iter().find(|b| b.column_id == ts_idx as u16) {
+                Some(b) => b,
+                None => continue,
+            };
+            let matching: Vec<usize> = if ts_block.encoding == ColumnEncoding::GorillaTimestamp {
+                let ts_micros =
+                    gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize);
+                if segment.is_timestamp_sorted {
+                    let start = ts_micros
+                        .iter()
+                        .position(|&m| m >= start_ts)
+                        .unwrap_or(ts_micros.len());
+                    let end = ts_micros
+                        .iter()
+                        .rposition(|&m| m <= end_ts)
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    if start >= end {
+                        continue;
+                    }
+                    (start..end)
+                        .filter(|&i| ts_micros[i] >= start_ts && ts_micros[i] <= end_ts)
+                        .collect()
+                } else {
+                    ts_micros
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &m)| m >= start_ts && m <= end_ts)
+                        .map(|(i, _)| i)
+                        .collect()
+                }
+            } else {
+                (0..segment.row_count as usize).collect()
+            };
+            if matching.is_empty() {
+                continue;
+            }
+            // Decode only needed columns (row-major Values).
+            let schema_blocks: Vec<&ColumnBlock> = blocks
+                .iter()
+                .filter(|b| b.column_id < segment.column_count)
+                .collect();
+            let decoded =
+                self.decode_columns(&schema_blocks, &schema, segment.row_count as usize)?;
+            let ts_micros = if ts_block.encoding == ColumnEncoding::GorillaTimestamp {
+                gorilla::decode_timestamps(&ts_block.data, segment.row_count as usize)
+            } else {
+                Vec::new()
+            };
+            for row_idx in matching {
+                if row_idx >= decoded.len() {
+                    break;
+                }
+                let get = |name: &str| -> Option<&Value> {
+                    let ci = col_idx(name).ok()?;
+                    decoded.get(row_idx).and_then(|r| r.get(ci))
+                };
+                // Timestamp micros: from the gorilla block when available,
+                // else from the decoded value (non-gorilla ts encoding).
+                let ts_micros_row = if ts_block.encoding == ColumnEncoding::GorillaTimestamp {
+                    match ts_micros.get(row_idx) {
+                        Some(m) => *m,
+                        None => continue,
+                    }
+                } else {
+                    match decoded.get(row_idx).and_then(|r| r.get(ts_idx)) {
+                        Some(Value::Timestamp(t)) => t.as_micros(),
+                        Some(Value::Integer(i)) => *i,
+                        _ => continue,
+                    }
+                };
+                // group key for ByColumn
+                let gcol = match &group {
+                    RangeGroup::ByColumn(c) => decoded
+                        .get(row_idx)
+                        .and_then(|r| r.get(col_idx(c).ok()?))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                fold_row!(gcol, |name: &str| get(name), ts_micros_row);
+            }
+        }
+
+        // ---- active write buffer (unflushed rows in range)
+        if let Some(buffer_entry) = self.buffers.get(&table_id) {
+            let buffer = buffer_entry.lock().unwrap();
+            if let Some((buf_min, buf_max)) = buffer.timestamp_range() {
+                if buf_max >= start_ts && buf_min <= end_ts {
+                    let column_ids: Vec<(u16, String)> = needed
+                        .iter()
+                        .chain(std::iter::once(&ts_idx))
+                        .map(|&i| (i as u16, schema.columns[i].name.clone()))
+                        .collect();
+                    let buf_rows = buffer.snapshot_rows(start_ts, end_ts, &schema, &column_ids);
+                    for (_rid, sql_row) in buf_rows {
+                        let gcol = match &group {
+                            RangeGroup::ByColumn(c) => {
+                                sql_row.get(c).cloned().unwrap_or(Value::Null)
+                            }
+                            _ => Value::Null,
+                        };
+                        let ts_micros_row = match sql_row.get(&ts_col) {
+                            Some(Value::Timestamp(t)) => t.as_micros(),
+                            Some(Value::Integer(i)) => *i,
+                            _ => continue,
+                        };
+                        let get_buf = |name: &str| -> Option<&Value> { sql_row.get(name) };
+                        fold_row!(gcol, |name: &str| get_buf(name), ts_micros_row);
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<(Option<Value>, Vec<Value>)> = Vec::new();
+        match &group {
+            RangeGroup::None => out.push((None, finish(&total))),
+            _ => {
+                for (kstr, key) in group_order {
+                    let acc = groups.remove(&kstr).unwrap_or_else(|| new_acc(k));
+                    out.push((Some(key), finish(&acc)));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Decode column blocks into rows.
@@ -1359,11 +2327,27 @@ impl ColumnarStore {
             .get_table_id(table_name)
             .map_err(|_| StorageError::TableNotFound(table_name.to_string()))?;
 
+        // Flush the write buffer FIRST: rows still buffered are invisible to
+        // segment GC, so `DELETE WHERE ts < cutoff` left every not-yet
+        // flushed expired row fully visible (a 200K-row eval leaked 34,432
+        // of ~100K expired rows).
+        if let Some(buffer) = self.buffers.get(&table_id) {
+            let mut buffer = buffer.lock().unwrap();
+            if let Some(mut batch) = buffer.take() {
+                drop(buffer);
+                self.flush_batch(&mut batch)?;
+            }
+        }
+
         let manager = self.managers.get(&table_id).ok_or_else(|| {
             StorageError::Columnar(format!("No segment manager for table '{}'", table_name))
         })?;
 
-        manager.delete_expired(cutoff_ts)
+        let dropped = manager.delete_expired(cutoff_ts)?;
+        // Whole-segment GC leaves the expired PREFIX of segments straddling
+        // the cutoff; rewrite those row-level.
+        self.purge_straddling_rows(table_id, cutoff_ts)?;
+        Ok(dropped)
     }
 
     /// Drop all data for a table (used by DROP TABLE).
