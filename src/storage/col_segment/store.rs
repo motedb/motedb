@@ -141,22 +141,24 @@ fn decode_buffered_value(
             Value::Bool(raw[off] != 0)
         }
         Some(ColumnTypeTag::Text) => {
-            // Text rows are variable-length: [u16 len][bytes], concatenated.
-            // Walk to the row_idx-th entry.
+            // Text rows are variable-length: [u32 len][bytes], concatenated
+            // (builder format; NULL rows carry len 0 — callers consult the
+            // null flags / caller context for NULLness).
             let mut pos = 0usize;
             let mut r = 0usize;
-            while pos + 2 <= raw.len() {
-                let len = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
-                pos += 2;
+            while pos + 4 <= raw.len() {
+                let len = u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]])
+                    as usize;
+                pos += 4;
                 if r == row_idx {
-                    if len == 0xFFFF || pos + len > raw.len() {
+                    if pos + len > raw.len() {
                         return Value::Null;
                     }
                     return Value::Text(ArcString(std::sync::Arc::from(
                         std::str::from_utf8(&raw[pos..pos + len]).unwrap_or(""),
                     )));
                 }
-                pos += if len == 0xFFFF { 0 } else { len };
+                pos += len;
                 r += 1;
             }
             Value::Null
@@ -4038,6 +4040,9 @@ impl ColSegmentStore {
                                     Some(ColumnType::Boolean) => {
                                         ph.push(vec![0u8]);
                                     }
+                                    // Text: [u32 len] (0 = NULL-width placeholder)
+                                    Some(ColumnType::Text) => ph.push(0u32.to_le_bytes().to_vec()),
+                                    // Vector/Spatial: [u16 dim/len] sentinel
                                     _ => ph.push(0xFFFFu16.to_le_bytes().to_vec()),
                                 }
                                 pn.push(true);
@@ -4085,13 +4090,12 @@ impl ColSegmentStore {
                         } else if let Some(t) = text_cols.get(ci).and_then(|x| x.as_ref()) {
                             match t.get_str(i) {
                                 Some(s) => {
-                                    let len = s.len().min(65535) as u16;
-                                    buf.extend_from_slice(&len.to_le_bytes());
-                                    buf.extend_from_slice(&s.as_bytes()[..len as usize]);
+                                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                                    buf.extend_from_slice(s.as_bytes());
                                     row_nulls.push(false);
                                 }
                                 None => {
-                                    buf.extend_from_slice(&0u16.to_le_bytes());
+                                    buf.extend_from_slice(&0u32.to_le_bytes());
                                     row_nulls.push(true);
                                 }
                             }
@@ -4139,11 +4143,11 @@ impl ColSegmentStore {
                                         vec![if *bv { 1u8 } else { 0u8 }]
                                     }
                                     crate::types::Value::Text(ts) => {
-                                        // [len:u16][bytes] (matches add_values Text encoding)
+                                        // [len:u32][bytes] (matches the builder's
+                                        // Text encoding — u32 since the 64KB lift)
                                         let bytes = ts.as_bytes();
-                                        let len = bytes.len().min(65535) as u16;
-                                        let mut b = len.to_le_bytes().to_vec();
-                                        b.extend_from_slice(&bytes[..len as usize]);
+                                        let mut b = (bytes.len() as u32).to_le_bytes().to_vec();
+                                        b.extend_from_slice(bytes);
                                         b
                                     }
                                     _ => Vec::new(),
@@ -4167,12 +4171,16 @@ impl ColSegmentStore {
                                 Some(ColumnType::Boolean) => {
                                     buf.push(0u8);
                                 }
-                                // Text/Vector/Spatial rows in the raw buffer
-                                // are prefixed by a u16 length. NULL = 0xFFFF
-                                // sentinel (matches add_values' Text NULL
-                                // encoding). Without these 2 bytes the finish()
-                                // path would see pos+2 > raw.len() and truncate
-                                // the column, corrupting subsequent rows.
+                                // Text rows in the raw buffer are prefixed by
+                                // a u32 length (NULL = 0; null_flags is
+                                // authoritative). Without these 4 bytes the
+                                // finish() path would see pos+4 > raw.len()
+                                // and truncate the column. Vector/Spatial keep
+                                // their own u16-dim/len prefixes (appended below
+                                // via their default encoders).
+                                Some(ColumnType::Text) => {
+                                    buf.extend_from_slice(&0u32.to_le_bytes());
+                                }
                                 _ => {
                                     buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
                                 }

@@ -911,3 +911,55 @@ fn order_by_nulls_first_last() {
     let r = vs("SELECT id, v FROM t ORDER BY v NULLS LAST LIMIT 2");
     assert_eq!(r, vec![Some(10), Some(30)]);
 }
+
+/// 🔒 Large TEXT: the builder's in-memory u16 length prefix capped values at
+/// 65,534 bytes even though the on-disk text layout (u32 offsets) supports
+/// 4 GiB. The prefix is now u32 — values up to megabytes round-trip through
+/// checkpoint/reopen AND segment merges.
+#[test]
+fn large_text_roundtrip_and_merge() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create_with_config(dir.path(), DBConfig::for_testing()).unwrap();
+    db.execute("CREATE TABLE big (id INT PRIMARY KEY, t TEXT)")
+        .unwrap();
+    let sizes: [usize; 5] = [1, 65_534, 65_535, 300_000, 1_500_000];
+    for (i, n) in sizes.iter().enumerate() {
+        let s = "x".repeat(*n);
+        db.execute(&format!(
+            "INSERT INTO big (id, t) VALUES ({}, '{}')",
+            i + 1,
+            s
+        ))
+        .unwrap();
+    }
+    let check = |db: &Database, tag: &str| {
+        for (i, n) in sizes.iter().enumerate() {
+            let r = scalar(
+                &db,
+                &format!("SELECT LENGTH(t) FROM big WHERE id = {}", i + 1),
+            );
+            assert_eq!(r, Value::Integer(*n as i64), "{tag}: id={} want {n}", i + 1);
+        }
+    };
+    check(&db, "in-memory");
+    db.checkpoint().unwrap();
+    db.close().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    check(&db, "after-reopen");
+    // Trip a segment merge, then re-verify (merge re-encodes text columns).
+    for i in 0..40 {
+        db.execute(&format!(
+            "INSERT INTO big (id, t) VALUES ({}, 's')",
+            1000 + i
+        ))
+        .unwrap();
+    }
+    let _ = db
+        .execute("SELECT COUNT(*) FROM big")
+        .unwrap()
+        .materialize();
+    db.checkpoint().unwrap();
+    db.close().unwrap();
+    let db = Database::open(dir.path()).unwrap();
+    check(&db, "after-merge");
+}

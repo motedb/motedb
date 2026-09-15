@@ -454,14 +454,14 @@ impl TableSchema {
                 (ColumnType::Float, crate::types::Value::Integer(_)) => true, // Allow integer to float conversion
                 (ColumnType::Boolean, crate::types::Value::Bool(_)) => true,
                 (ColumnType::Text, crate::types::Value::Text(t)) => {
-                    // 🔑 The columnar TEXT encoding reserves 0xFFFF for NULL,
-                    // capping values at 65,534 bytes. The read path has always
-                    // enforced this; rejecting at WRITE time (here) makes the
-                    // error immediate and honest instead of a row that stores
-                    // but can never be read back.
-                    if t.as_str().len() > 65_534 {
+                    // 🔑 The columnar TEXT layout (u32 offsets on disk, u32
+                    // length prefix in the builder) supports values up to
+                    // u32::MAX; the old 65,534 cap was the u16-prefix legacy.
+                    // Keep a sane upper bound to reject accidental garbage
+                    // (e.g. wrong variable) before allocating row bytes.
+                    if t.as_str().len() > u32::MAX as usize {
                         return Err(format!(
-                            "Column '{}': TEXT value of {} bytes exceeds the columnar maximum of 65534 bytes",
+                            "Column '{}': TEXT value of {} bytes exceeds the u32 offset limit",
                             col.name,
                             t.as_str().len()
                         ));

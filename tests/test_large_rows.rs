@@ -97,24 +97,31 @@ fn test_large_rows_crash_reopen() {
 
 #[test]
 fn test_oversized_text_rejected_at_write() {
-    // 65,534 is the columnar TEXT ceiling (0xFFFF reserved for NULL).
-    // Oversized values are rejected at INSERT time — previously they stored
-    // fine but could never be read back (read path error).
+    // 🔁 The 65,534 ceiling (u16 prefix legacy) is LIFTED — the builder
+    // prefix is u32 and the on-disk layout was always u32-offset. Values of
+    // megabytes now store AND read back; the write-time check only rejects
+    // beyond-u32 garbage. Keep a round-trip check at the old boundary.
     let dir = TempDir::new().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
     let ok = format!("INSERT INTO t VALUES (1, '{}')", "x".repeat(65_534));
-    let too_big = format!("INSERT INTO t VALUES (2, '{}')", "x".repeat(65_535));
+    let also_ok = format!("INSERT INTO t VALUES (2, '{}')", "x".repeat(65_535));
+    let big_ok = format!("INSERT INTO t VALUES (3, '{}')", "x".repeat(400_000));
     assert!(db.execute(&ok).is_ok(), "65,534 bytes must be accepted");
-    let err = match db.execute(&too_big) {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("oversized TEXT must be rejected at write"),
-    };
     assert!(
-        err.contains("65534"),
-        "oversized TEXT must be rejected at write: {err}"
+        db.execute(&also_ok).is_ok(),
+        "65,535 bytes now accepted (u32 prefix)"
     );
+    assert!(db.execute(&big_ok).is_ok(), "400K bytes accepted");
+    let r = db
+        .execute("SELECT LENGTH(body) FROM t WHERE id = 3")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    if let motedb::QueryResult::Select { rows, .. } = r {
+        assert!(matches!(rows[0][0], motedb::types::Value::Integer(v) if v == 400_000));
+    }
 }
 
 #[test]

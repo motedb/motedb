@@ -376,23 +376,24 @@ fn test_oversized_text_is_rejected() {
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, s TEXT)")
         .unwrap();
 
-    // A value just under the limit (65534 bytes) stores and round-trips fine.
+    // 🔁 The 65,534 ceiling is lifted (u32 builder prefix; the on-disk
+    // u32-offset layout always supported more). Values of 100K now store
+    // AND read back intact — no truncation, no partial rows.
     let near_max = "a".repeat(65534);
     db.execute(&format!("INSERT INTO t VALUES (1, '{}')", near_max))
         .unwrap();
     let r = row(db.execute("SELECT length(s) FROM t WHERE id = 1").unwrap());
     assert_eq!(r[0], Value::Integer(65534));
 
-    // A value over the limit must error, not silently truncate.
-    let too_big = "b".repeat(100_000);
-    let result = db.execute(&format!("INSERT INTO t VALUES (2, '{}')", too_big));
-    assert!(
-        result.is_err(),
-        "oversized text should be rejected, not truncated"
+    let big = "b".repeat(100_000);
+    db.execute(&format!("INSERT INTO t VALUES (2, '{}')", big))
+        .unwrap();
+    let r = row(db.execute("SELECT length(s) FROM t WHERE id = 2").unwrap());
+    assert_eq!(
+        r[0],
+        Value::Integer(100_000),
+        "100K text round-trips intact"
     );
-    // Confirm no partial row was written.
-    let r = row(db.execute("SELECT COUNT(*) FROM t").unwrap());
-    assert_eq!(r[0], Value::Integer(1));
 }
 
 #[test]

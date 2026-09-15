@@ -2883,38 +2883,25 @@ impl ColumnarSSTableBuilder {
                     buf.extend_from_slice(&ts.to_le_bytes());
                 }
                 ColumnTypeTag::Text => {
-                    // 🔑 Distinguish NULL from empty string. Both were written as
-                    // len=0, so empty strings round-tripped as NULL (the v0.5.0
-                    // empty-string bug). Use a 0xFFFF sentinel for NULL (real
-                    // strings are capped at 65535 bytes, but a genuine 65535-byte
-                    // string is extremely rare and we cap to 65534 to avoid it).
-                    match value {
-                        Value::Null => {
-                            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
-                        }
-                        Value::Text(t) => {
-                            let s = t.as_str();
-                            // 🔑 The columnar Text format uses a u16 length prefix
-                            // (0xFFFF is reserved as the NULL sentinel), so the
-                            // maximum storable text value is 65534 bytes. The
-                            // previous code silently truncated larger values via
-                            // `.min(65534)`, causing data loss with no error. Fail
-                            // loudly instead — callers should chunk or use a
-                            // different layout for very large text.
-                            if s.len() > 65534 {
-                                return Err(StorageError::InvalidData(format!(
-                                    "Text value of {} bytes exceeds the columnar maximum of 65534 bytes (0xFFFF is reserved for NULL)",
-                                    s.len()
-                                )));
-                            }
-                            let len = s.len() as u16;
-                            buf.extend_from_slice(&len.to_le_bytes());
-                            buf.extend_from_slice(s.as_bytes());
-                        }
-                        _ => {
-                            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
-                        }
+                    // 🔑 Builder in-memory format: [len: u32 LE][bytes] per
+                    // value (NULL/empty → len 0; NULLness is tracked
+                    // authoritatively in null_flags). This prefix NEVER hits
+                    // disk — finish() converts to the SST text layout
+                    // ([null_bitmap][u32 offsets][strings]). The old u16
+                    // prefix capped in-memory text at 65,534 bytes even
+                    // though the on-disk format (u32 offsets) supports 4 GiB.
+                    let s = match value {
+                        Value::Text(t) => t.as_str(),
+                        _ => "",
+                    };
+                    if s.len() > u32::MAX as usize {
+                        return Err(StorageError::InvalidData(format!(
+                            "Text value of {} bytes exceeds the u32 length prefix",
+                            s.len()
+                        )));
                     }
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(s.as_bytes());
                 }
                 ColumnTypeTag::Vector => {
                     // Vector column: [dim:u16][f32×dim] per row (matches
@@ -3103,18 +3090,14 @@ impl ColumnarSSTableBuilder {
                         Value::Null => String::new(),
                         _ => String::new(),
                     };
-                    // Store length-prefixed: [len: u16 LE] [bytes]. The u16 prefix
-                    // caps text at 65535 bytes; previously larger values were
-                    // silently truncated (len capped, full bytes written → decode
-                    // mismatch). Fail loudly instead.
-                    if s.len() > 65535 {
+                    // Builder format: [len: u32 LE][bytes] (see add_values).
+                    if s.len() > u32::MAX as usize {
                         return Err(StorageError::InvalidData(format!(
-                            "Text value of {} bytes exceeds the columnar maximum of 65535 bytes",
+                            "Text value of {} bytes exceeds the u32 length prefix",
                             s.len()
                         )));
                     }
-                    let len = s.len() as u16;
-                    buf.extend_from_slice(&len.to_le_bytes());
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     buf.extend_from_slice(s.as_bytes());
                 }
                 ColumnTypeTag::Vector => {
@@ -3303,17 +3286,20 @@ impl ColumnarSSTableBuilder {
                         row.push(Value::Bool(buf.get(i).copied().unwrap_or(0) != 0));
                     }
                     ColumnTypeTag::Text => {
-                        // Text layout: each row = [u16 len][bytes], concatenated.
-                        // 0xFFFF len = NULL sentinel.
+                        // Builder layout: each row = [u32 len][bytes],
+                        // concatenated (NULL = len 0 + null_flags).
                         let buf = &self.column_buffers[ci];
+                        let is_null = self.null_flags.get(ci).and_then(|f| f.get(i)) == Some(&true);
                         let mut p = 0usize;
                         let mut r = 0usize;
                         let mut found = None;
-                        while p + 2 <= buf.len() {
-                            let len = u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
-                            p += 2;
+                        while p + 4 <= buf.len() {
+                            let len =
+                                u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]])
+                                    as usize;
+                            p += 4;
                             if r == i {
-                                if len == 0xFFFF {
+                                if is_null {
                                     found = Some(Value::Null);
                                 } else if p + len <= buf.len() {
                                     found = Some(Value::text(
@@ -3324,7 +3310,7 @@ impl ColumnarSSTableBuilder {
                                 }
                                 break;
                             }
-                            p += if len == 0xFFFF { 0 } else { len };
+                            p += len;
                             r += 1;
                         }
                         row.push(found.unwrap_or(Value::Null));
@@ -3474,11 +3460,11 @@ impl ColumnarSSTableBuilder {
                 seg.extend_from_slice(raw);
             } else if matches!(tag, ColumnTypeTag::Text) {
                 // Text segment: [null_bitmap] [offsets] [string_data]
-                // Raw buffer format: [(len: u16 LE, bytes)] repeated.
-                // Use the authoritative null_flags (tracked at add_values time)
-                // rather than the 0xFFFF in-band sentinel, so NULLs are preserved
-                // regardless of how the raw bytes were encoded (dedup re-add,
-                // raw merge, etc.).
+                // Raw buffer format: [(len: u32 LE, bytes)] repeated (the
+                // builder's in-memory layout). NULLness is authoritative in
+                // null_flags (tracked at add_values/add_row time), so NULL
+                // rows carry len 0 with no bytes — preserved regardless of
+                // how the raw bytes were produced (dedup re-add, raw merge).
                 let mut nulls = vec![0u8; null_bytes];
                 let mut offsets = Vec::with_capacity((num_rows + 1) * 4);
                 let mut str_data = Vec::new();
@@ -3487,21 +3473,19 @@ impl ColumnarSSTableBuilder {
 
                 let mut pos = 0usize;
                 for row_idx in 0..num_rows {
-                    if pos + 2 > raw.len() {
+                    if pos + 4 > raw.len() {
                         break;
                     }
-                    let len = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
-                    pos += 2;
-                    let is_null =
-                        null_flags.get(row_idx).copied().unwrap_or(false) || len == 0xFFFF; // also catch legacy sentinel bytes
+                    let len =
+                        u32::from_le_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]])
+                            as usize;
+                    pos += 4;
+                    let is_null = null_flags.get(row_idx).copied().unwrap_or(false);
                     if is_null {
                         nulls[row_idx / 8] |= 1 << (row_idx % 8);
                         offsets.push(current_offset);
-                        // NULL rows have no string data; skip their bytes (len
-                        // is 0xFFFF sentinel or 0 for an empty-but-flagged NULL).
-                        if len != 0xFFFF {
-                            pos += len;
-                        }
+                        // NULL rows carry len 0 (no bytes to skip).
+                        pos += len;
                         continue;
                     }
                     offsets.push(current_offset);
