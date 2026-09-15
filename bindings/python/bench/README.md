@@ -667,3 +667,68 @@ inside a txn survives ROLLBACK with data rolled back (MySQL-style
 non-transactional DDL); TS duplicate (ts) rows are kept, not deduped;
 MIN/MAX aggregates still use partial_cmp (NaN-in-MIN/MAX semantics
 deferred).
+
+# Round 11: performance regression + competitor benchmark
+
+## Regression check (no regressions)
+
+1. **Round-9 ↔ Round-10 A/B (interleaved, 3 rounds each, 100K×384
+   table, p50):** vector knn 6.25 vs 6.25 ms, ORDER BY LIMIT 0.361 vs
+   0.360 ms, TS range count 2.62 vs 2.64 ms, PK point 0.003 ms both —
+   Round 10's correctness fixes (NaN-aware comparators, tombstone
+   claiming, escape prefixes) cost nothing measurable. In-run numpy
+   brute-force control confirmed machine stability.
+2. **DiskANN build** (40K×384, general preset): 0.81 ms/row
+   (vs 0.95 after the R9 stripe-lock fix, 2.48 sequential, ~19.8
+   pre-campaign), recall@1 = recall@10 = 1.0000, reopen-stable.
+3. **perf_overall.py full run** came back with some numbers worse than
+   the recorded history (vector exact 48.7 → 76 ms, LATEST BY ~258 ms
+   vs 205 ms) — but the run coincided with other load on the machine
+   (its numpy brute-force control was +27% too). Under quiet load the
+   A/B above shows parity; treat perf_overall absolute numbers as
+   load-sensitive. Post-campaign highlights vs the pre-campaign
+   baseline JSON: LATEST BY 1538 → 258 ms, top-k ORDER BY 366 → 442 ms
+   at 1M rows under load (both dominated by ambient load; see A/B for
+   like-for-like), UPDATE-in-txn 253 → 265 rows/s.
+
+## Competitor benchmark (compete_bench.py)
+
+Same dataset everywhere: 100K rows × (int PK, ts, device, val,
+~80B text, 384-d f32 vector). Each engine in its own subprocess;
+batched loads (driver never materializes the full row list);
+DuckDB loaded via 1000-row multi-VALUES (executemany is its slowest
+path, noted separately). p50 latencies:
+
+| workload (p50)            | MoteDB  | SQLite 3.51 | DuckDB 1.4.5 | FAISS Flat |
+|---------------------------|---------|-------------|--------------|------------|
+| bulk load rows/s (w/ vec) | 42,106  | 59,556      | 7,407 (multi-VALUES; 2,877 via executemany) | n/a (in-RAM) |
+| text/FTS index build      | 3.31 s  | 0.14 s (FTS5) | n/a (LIKE only) | n/a |
+| PK point lookup           | 17 µs   | **6 µs**    | 73 µs        | n/a |
+| range COUNT+AVG (10%)     | 5.2 ms  | 0.38 ms     | **0.29 ms**  | n/a |
+| GROUP BY device           | 1.53 ms | 51.5 ms     | **0.60 ms** | n/a |
+| top-k ORDER BY LIMIT 10   | **0.36 ms** | 37.9 ms | 0.74 ms      | n/a |
+| equi-JOIN + GROUP BY      | 138 ms  | 10.5 ms     | **1.2 ms**   | n/a |
+| exact vector knn@10       | 6.1 ms  | 16.0 ms (fetch-all + numpy) | 67.6 ms (array_distance) | **2.8 ms** |
+| text two-term search      | 0.009 ms | 0.013 ms (FTS5 MATCH) | 0.22 ms (LIKE) | n/a |
+| DB size on disk           | 351.5 MB | 212.6 MB | 489.7 MB | 153.6 MB (raw f32, no durability) |
+| query-phase RSS delta     | 1.35 GB (incl. mmap'd segments + decoded col caches + jemalloc retention) | ~0 | ~0 | 670 MB (holds the index in RAM) |
+
+Takeaways:
+* **MoteDB's edge**: top-k ordered scans (2× DuckDB, 105× SQLite),
+  exact vector search inside SQL (11× DuckDB's array_distance, 2.6×
+  fetch-all+numpy), FTS on par with SQLite FTS5, GROUP BY 34× faster
+  than SQLite — all in ONE durable embedded engine (the only one of
+  the four doing SQL + FTS + vector + spatial + TS natively).
+* **Honest gaps**: PK point lookup 3× behind SQLite's B-tree (17 µs —
+  still sub-frame); un-indexed range aggregation 13-18× behind
+  (SQLite uses its (ts, device) index; a regular-table secondary
+  index path is the improvement item); equi-JOIN 138 ms vs DuckDB's
+  1.2 ms — the multi-way join work targeted TS-shaped queries, this
+  100K-probe × 64-build + GROUP BY shape hits a slow path (top
+  optimization candidate); disk footprint 1.65× SQLite (f32 vectors +
+  LSM segment duplication — SQ8 quantized storage only kicks in with
+  a vector index); load throughput mid-pack.
+* FAISS queries faster (2.8 ms) but is RAM-only with no SQL,
+  durability, or multi-modal story; MoteDB is within 2.2× of a
+  dedicated SIMD ANN library while providing the full database
+  around it, and switches to DiskANN (sublinear) past 200K rows.
