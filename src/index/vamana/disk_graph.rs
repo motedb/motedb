@@ -38,6 +38,12 @@ struct Tail {
     buf: Vec<u8>,
 }
 
+const NODE_LOCK_STRIPES: usize = 256;
+
+fn new_node_locks() -> Vec<Mutex<()>> {
+    (0..NODE_LOCK_STRIPES).map(|_| Mutex::new(())).collect()
+}
+
 /// Disk-based graph with bounded memory
 pub struct DiskGraph {
     max_degree: usize,
@@ -83,6 +89,14 @@ pub struct DiskGraph {
     /// Serializes flush with set_neighbors to prevent stale node_count
     /// in sidecar index (flush acquires exclusively, set_neighbors shared)
     flush_lock: Arc<Mutex<()>>,
+
+    /// Per-node mutation stripes. Concurrent graph builds read-modify-write
+    /// neighbor lists (`neighbors()` → clone → `set_neighbors()`); without
+    /// serialization one thread's list replace silently drops another's
+    /// concurrent backlink (lost update → unreachable nodes). Striped by node
+    /// id hash. Lock order: node stripe BEFORE `set_neighbors`'s flush_lock;
+    /// never hold two stripes at once.
+    node_locks: Arc<Vec<Mutex<()>>>,
 
     /// Nodes deleted since the last flush. graph.bin is append-only, so the
     /// deleted node's record (and its sidecar entry) physically remain until
@@ -152,6 +166,7 @@ impl DiskGraph {
             })),
             dirty: Arc::new(RwLock::new(false)),
             flush_lock: Arc::new(Mutex::new(())),
+            node_locks: Arc::new(new_node_locks()),
             tombstones: Arc::new(Mutex::new(HashSet::new())),
             file_path,
         })
@@ -290,6 +305,7 @@ impl DiskGraph {
             })),
             dirty: Arc::new(RwLock::new(false)),
             flush_lock: Arc::new(Mutex::new(())),
+            node_locks: Arc::new(new_node_locks()),
             tombstones: Arc::new(Mutex::new(HashSet::new())),
             file_path,
         })
@@ -598,6 +614,17 @@ impl DiskGraph {
         *self.dirty.write() = true;
 
         Ok(())
+    }
+
+    /// Run `f` holding this node's mutation stripe. Callers that mutate a
+    /// node's edge list (including via `set_neighbors`) MUST hold the stripe
+    /// for the whole read-modify-write, or concurrent builders lose edges.
+    /// The closure must not acquire another node's stripe (deadlock).
+    pub fn with_node_lock<R>(&self, node_id: RowId, f: impl FnOnce() -> R) -> R {
+        let locks = Arc::clone(&self.node_locks);
+        let stripe = (node_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) % locks.len();
+        let _guard = locks[stripe].lock();
+        f()
     }
 
     /// Remove node

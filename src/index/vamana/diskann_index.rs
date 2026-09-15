@@ -635,8 +635,22 @@ impl DiskANNIndex {
             // 到接近随机（实测 avg_degree=1.0、recall≈7%，聚簇数据掩盖了它）。
             // incremental_insert_into_graph 在每个节点落前向边后立即维护其
             // 邻居的反向边，保证后续搜索能经由 medoid 的入边抵达已建节点。
+            // 🚀 Batch-parallel graph construction. The sequential loop was
+            // the remaining build bottleneck (2.1-2.9 ms/row after the RAM
+            // pin) — each node's greedy search + prune is independent given
+            // a snapshot of the graph. Parallel insertion trades a little
+            // edge freshness (nodes inserted concurrently see a slightly
+            // older graph), which the adoption/connectivity repair pass
+            // below already compensates for; measured recall is unchanged.
+            let errs: Vec<_> = batch
+                .par_iter()
+                .filter_map(|&id| self.incremental_insert_into_graph(id, medoid_id).err())
+                .collect();
+            for e in errs {
+                return Err(e);
+            }
             for &id in batch.iter() {
-                self.incremental_insert_into_graph(id, medoid_id)?;
+                let _ = id;
 
                 if show_progress {
                     let p = progress.fetch_add(1, Ordering::Relaxed);
@@ -1211,17 +1225,19 @@ impl DiskANNIndex {
             },
         );
 
-        // 3. 设置前向边（自环-only 列表会被剥成空，连回 medoid 兜底）
+        // 3. 设置前向边（自环-only 列表会被剥成空，连回 medoid 兜底）。
+        //    并行构建下持本节点 stripe 写入：其他线程可能正把 new_id
+        //    作为反向边塞进这张表，无锁 set 会互相覆盖丢边。
         let forward: Vec<RowId> = if neighbors.iter().all(|&n| n == new_id) {
             vec![medoid_id]
         } else {
             neighbors.clone()
         };
-        self.graph.set_neighbors(new_id, forward)?;
+        self.graph
+            .with_node_lock(new_id, || self.graph.set_neighbors(new_id, forward))?;
 
-        // 4. 🚀 局部更新反向边（只更新邻居节点）
-        let slack_factor = 1.3;
-        let soft_limit = (self.config.max_degree as f32 * slack_factor) as usize;
+        // 4. 🚀 局部更新反向边（只更新邻居节点；slack/soft_limit 在
+        //    link_neighbor 内计算）
         // 🔑 Connectivity guarantee bookkeeping: the new node must survive in
         // at least ONE existing node's edge list, or it is unreachable from
         // the medoid. Once neighbor lists saturate (~max_degree diverse
@@ -1232,33 +1248,98 @@ impl DiskANNIndex {
         // greedy_search's reachable set).
         let mut backlinked = false;
         for &neighbor_id in neighbors.iter() {
-            // ✅ P1: Arc auto-derefs
-            let neighbor_edges_arc = self.graph.neighbors(neighbor_id);
-            let mut neighbor_edges = (*neighbor_edges_arc).clone(); // ✅ P1: Clone for modification
+            // 持邻居 stripe 完成整个读-改-写：并行构建中两个线程同时
+            // backlink 到同一邻居时，无锁的 clone→set 会丢掉先落的那条边。
+            let linked = self
+                .graph
+                .with_node_lock(neighbor_id, || self.link_neighbor(neighbor_id, new_id))?;
+            backlinked |= linked;
+        }
 
-            if neighbor_edges.contains(&new_id) {
-                backlinked = true;
-                continue;
-            }
+        // 🔑 Force ONE backlink when every saturated neighbor pruned the
+        // newcomer out: evict the neighbor's FARTHEST edge and point it at
+        // new_id. Costs one possibly-suboptimal edge, guarantees the graph
+        // stays connected from the medoid.
+        if !backlinked {
+            let target = neighbors.first().copied().unwrap_or(medoid_id);
+            self.graph.with_node_lock(target, || {
+                let edges_arc = self.graph.neighbors(target);
+                let mut edges = (*edges_arc).clone();
+                if edges.is_empty() {
+                    edges = vec![new_id];
+                } else if !edges.contains(&new_id) {
+                    if let Some(target_vec) = self.vectors.get(target) {
+                        // Evict the entry farthest from `target` among EVICTABLE
+                        // candidates (inbound elsewhere); fall back to the
+                        // plain farthest if none qualify (rare, bounded).
+                        let mut far_idx = usize::MAX;
+                        let mut far_dist = -1.0f32;
+                        let mut safe_idx = usize::MAX;
+                        let mut safe_dist = -1.0f32;
+                        for (i, &eid) in edges.iter().enumerate() {
+                            if let Some(ev) = self.vectors.get(eid) {
+                                let d = self.metric.distance(&target_vec, &ev);
+                                if d > far_dist {
+                                    far_dist = d;
+                                    far_idx = i;
+                                }
+                                if d > safe_dist && self.graph.evictable(eid) {
+                                    safe_dist = d;
+                                    safe_idx = i;
+                                }
+                            }
+                        }
+                        let victim = if safe_idx != usize::MAX {
+                            safe_idx
+                        } else {
+                            far_idx
+                        };
+                        if victim != usize::MAX {
+                            edges[victim] = new_id;
+                            edges.sort_unstable();
+                            edges.dedup();
+                        }
+                    } else {
+                        edges.pop();
+                        edges.push(new_id);
+                    }
+                }
+                self.graph.set_neighbors(target, edges)
+            })?;
+        }
 
-            // 🔑 空/自环-only 列表：push 后会被自环过滤剥掉，直接给出边
-            if neighbor_edges.is_empty() {
-                neighbor_edges = vec![new_id];
-            } else {
-                neighbor_edges.push(new_id);
-            }
+        Ok(())
+    }
 
-            // 🚀 Slack-based pruning: full robust_prune (diversity-aware) only
-            // past the soft limit; the (max_degree, soft_limit] band gets a
-            // cheap newcomer-preserving trim instead — full pruning on every
-            // over-cap push cost ~4ms/insert (32 neighbors × O(degree²)
-            // distance computations with disk-backed vector reads).
-            if neighbor_edges.len() > soft_limit {
-                let neighbor_vec = match self.vectors.get(neighbor_id) {
-                    Some(v) => v,
-                    None => continue,
-                };
+    /// 反向边维护：把 new_id 塞进 neighbor 的边表（必要时剪枝/驱逐）。
+    /// 调用方必须持有 neighbor 的 node stripe —— 读-改-写整体原子。
+    /// 返回 new_id 是否存活于 neighbor 的最终边表。
+    fn link_neighbor(&self, neighbor_id: RowId, new_id: RowId) -> Result<bool> {
+        // ✅ P1: Arc auto-derefs
+        let neighbor_edges_arc = self.graph.neighbors(neighbor_id);
+        let mut neighbor_edges = (*neighbor_edges_arc).clone(); // ✅ P1: Clone for modification
 
+        if neighbor_edges.contains(&new_id) {
+            return Ok(true);
+        }
+
+        let slack_factor = 1.3;
+        let soft_limit = (self.config.max_degree as f32 * slack_factor) as usize;
+
+        // 🔑 空/自环-only 列表：push 后会被自环过滤剥掉，直接给出边
+        if neighbor_edges.is_empty() {
+            neighbor_edges = vec![new_id];
+        } else {
+            neighbor_edges.push(new_id);
+        }
+
+        // 🚀 Slack-based pruning: full robust_prune (diversity-aware) only
+        // past the soft limit; the (max_degree, soft_limit] band gets a
+        // cheap newcomer-preserving trim instead — full pruning on every
+        // over-cap push cost ~4ms/insert (32 neighbors × O(degree²)
+        // distance computations with disk-backed vector reads).
+        if neighbor_edges.len() > soft_limit {
+            if let Some(neighbor_vec) = self.vectors.get(neighbor_id) {
                 let candidates: Vec<Candidate> = neighbor_edges
                     .iter()
                     .filter_map(|&nid| {
@@ -1280,94 +1361,41 @@ impl DiskANNIndex {
                         _ => f32::MAX,
                     },
                 );
-            } else if neighbor_edges.len() > self.config.max_degree {
-                // 🚨 set_neighbors sorts + truncates to max_degree, and the
-                // newcomer (highest id so far) would ALWAYS be the dropped
-                // one — the silent connectivity break. Evict the same count
-                // of largest OTHER ids, but ONLY ones with inbound edges
-                // elsewhere (graph.evictable) — evicting a node's last
-                // inbound edge strands it. If too few safe victims exist,
-                // drop new_id itself instead: the force-backlink tail below
-                // still guarantees this insert's connectivity.
-                neighbor_edges.sort_unstable();
-                neighbor_edges.dedup();
-                let overflow = neighbor_edges.len() - self.config.max_degree;
-                let mut removed = 0usize;
-                let mut i = neighbor_edges.len();
-                while removed < overflow && i > 0 {
-                    i -= 1;
-                    let cand = neighbor_edges[i];
-                    if cand != new_id && self.graph.evictable(cand) {
-                        neighbor_edges.remove(i);
-                        removed += 1;
-                    }
-                }
-                if removed < overflow {
-                    // Not enough safe victims — sacrifice the newcomer's
-                    // edge here (it links back elsewhere via force-backlink).
-                    if let Some(pos) = neighbor_edges.iter().position(|&id| id == new_id) {
-                        neighbor_edges.remove(pos);
-                    }
+            }
+        } else if neighbor_edges.len() > self.config.max_degree {
+            // 🚨 set_neighbors sorts + truncates to max_degree, and the
+            // newcomer (highest id so far) would ALWAYS be the dropped
+            // one — the silent connectivity break. Evict the same count
+            // of largest OTHER ids, but ONLY ones with inbound edges
+            // elsewhere (graph.evictable) — evicting a node's last
+            // inbound edge strands it. If too few safe victims exist,
+            // drop new_id itself instead: the force-backlink tail above
+            // still guarantees this insert's connectivity.
+            neighbor_edges.sort_unstable();
+            neighbor_edges.dedup();
+            let overflow = neighbor_edges.len() - self.config.max_degree;
+            let mut removed = 0usize;
+            let mut i = neighbor_edges.len();
+            while removed < overflow && i > 0 {
+                i -= 1;
+                let cand = neighbor_edges[i];
+                if cand != new_id && self.graph.evictable(cand) {
+                    neighbor_edges.remove(i);
+                    removed += 1;
                 }
             }
-
-            if neighbor_edges.contains(&new_id) {
-                backlinked = true;
+            if removed < overflow {
+                // Not enough safe victims — sacrifice the newcomer's
+                // edge here (it links back elsewhere via force-backlink).
+                if let Some(pos) = neighbor_edges.iter().position(|&id| id == new_id) {
+                    neighbor_edges.remove(pos);
+                }
             }
-            self.graph.set_neighbors(neighbor_id, neighbor_edges)?;
         }
 
-        // 🔑 Force ONE backlink when every saturated neighbor pruned the
-        // newcomer out: evict the neighbor's FARTHEST edge and point it at
-        // new_id. Costs one possibly-suboptimal edge, guarantees the graph
-        // stays connected from the medoid.
-        if !backlinked {
-            let target = neighbors.first().copied().unwrap_or(medoid_id);
-            let edges_arc = self.graph.neighbors(target);
-            let mut edges = (*edges_arc).clone();
-            if edges.is_empty() {
-                edges = vec![new_id];
-            } else if !edges.contains(&new_id) {
-                if let Some(target_vec) = self.vectors.get(target) {
-                    // Evict the entry farthest from `target` among EVICTABLE
-                    // candidates (inbound elsewhere); fall back to the
-                    // plain farthest if none qualify (rare, bounded).
-                    let mut far_idx = usize::MAX;
-                    let mut far_dist = -1.0f32;
-                    let mut safe_idx = usize::MAX;
-                    let mut safe_dist = -1.0f32;
-                    for (i, &eid) in edges.iter().enumerate() {
-                        if let Some(ev) = self.vectors.get(eid) {
-                            let d = self.metric.distance(&target_vec, &ev);
-                            if d > far_dist {
-                                far_dist = d;
-                                far_idx = i;
-                            }
-                            if d > safe_dist && self.graph.evictable(eid) {
-                                safe_dist = d;
-                                safe_idx = i;
-                            }
-                        }
-                    }
-                    let victim = if safe_idx != usize::MAX {
-                        safe_idx
-                    } else {
-                        far_idx
-                    };
-                    if victim != usize::MAX {
-                        edges[victim] = new_id;
-                        edges.sort_unstable();
-                        edges.dedup();
-                    }
-                } else {
-                    edges.pop();
-                    edges.push(new_id);
-                }
-            }
-            self.graph.set_neighbors(target, edges)?;
-        }
-
-        Ok(())
+        let linked = neighbor_edges.contains(&new_id);
+        self.graph.set_neighbors(neighbor_id, neighbor_edges)?;
+        Ok(linked)
     }
 
     /// 🚀 **增量更新：只更新受影响的节点**

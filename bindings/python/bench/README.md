@@ -552,3 +552,42 @@ Edge sweep beyond the registry fix:
    authoritative re-sort (with LIMIT/OFFSET stripped for the inner run so
    flag-ignoring top-k paths cannot pre-truncate). Default dialect
    unchanged: NULLs first on ASC, last on DESC.
+
+# Round 9: TEXT 64KB cap lifted + parallel graph build
+
+1. **Large TEXT: the 65,534-byte cap is gone.** The cap lived in the
+   col-segment builder's IN-MEMORY format ([u16 len][bytes] per value,
+   0xFFFF reserved for NULL) — even though the on-disk text layout
+   ([null_bitmap][u32 offsets][strings]) always supported 4 GiB. The
+   builder prefix is now u32 (NULL = len 0 + authoritative null_flags),
+   converted at all 7 encode/decode sites (add_values, add_row, finish(),
+   in-memory rebuild decode, merge re-encode ×2, raw-slice NULL
+   placeholders ×2 — including the placeholder WIDTH for Text columns)
+   plus the write-time schema validation. Verified end-to-end: 1B → 3MB
+   values round-trip through checkpoint/reopen AND segment merges
+   (regression `large_text_roundtrip_and_merge`); 2MB via the Python
+   binding. Two tests asserting the old rejection were updated to assert
+   round-trip instead. Spatial columns keep their u16 bincode prefix
+   (geometries are small) — noted.
+2. **DiskANN graph build: batch-parallel construction (race-fixed).** The
+   per-node incremental loop (greedy search + prune + reverse edges) now
+   runs under rayon `par_iter` per 5000-node batch. The first version
+   had a lost-update race: the reverse-edge maintenance is a
+   read-clone-modify-write of OTHER nodes' edge lists, so two concurrent
+   inserts backlinking into the same node silently dropped one edge —
+   `transactional_insert_indexed_at_commit_not_before` failed ~1 run in
+   3 (a committed row's top-1 flipped). Fixed with per-node mutation
+   stripes in DiskGraph (`with_node_lock`, 256 stripes, lock order
+   node-stripe → flush_lock): every mutation site in
+   `incremental_insert_into_graph` now holds the node's stripe for the
+   whole read-modify-write (forward-edge set, per-neighbor backlink via
+   the extracted `link_neighbor`, and the force-backlink tail). Stress:
+   20/20 clean on the previously flaky test. Re-measured at 40K×384
+   (general preset, SQL top-k): single-thread 1.51 ms/row → parallel
+   0.95 ms/row (**1.6×**), recall@1 = recall@10 = 1.0000, reopen-stable.
+   Note: a tiny `for_testing`-config harness showed no parallel gain
+   even without locks — the mutation phase (globally serialized by
+   flush_lock + inbound map inside `set_neighbors`) dominates there;
+   the search-dominated general preset is the representative case.
+   Combined with the RAM pin this takes the 220K build from 72.7 min
+   (pre-campaign) to ~7.5 min extrapolated.
