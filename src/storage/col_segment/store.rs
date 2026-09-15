@@ -6,6 +6,7 @@ use crate::types::{ArcString, ColumnType, Value};
 use crate::Result;
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -622,15 +623,50 @@ impl ColSegmentStore {
             Some(ct) => ct,
             None => return Vec::new(),
         };
-        let mut out = Vec::with_capacity(buf.num_rows);
-        for i in 0..buf.num_rows {
-            if buf.deleted.get(i) == Some(&true) {
-                continue;
-            }
+        // 🔑 Last occurrence wins (the same rule `get` applies with rposition):
+        // the buffer can hold several entries for one key — UPDATE appends a
+        // newer version while the INSERT's original still sits unflushed, and
+        // DELETE appends a tombstone. Per-row emission returned BOTH the stale
+        // first version (top-k dedup then kept the OLD vector after an
+        // UPDATE) and pre-delete versions (deleted row ghosted to the top of
+        // `ORDER BY emb <-> ?`).
+        let n = buf.num_rows;
+        let mut last_live: HashMap<u64, Option<usize>> = HashMap::with_capacity(n);
+        for i in (0..n).rev() {
             let key = buf.keys.get(i).copied().unwrap_or(0);
-            out.push((key, decode_buffered_value(&buf, col_idx, i, ct)));
+            if let std::collections::hash_map::Entry::Vacant(e) = last_live.entry(key) {
+                let deleted = buf.deleted.get(i).copied().unwrap_or(false);
+                e.insert(if deleted { None } else { Some(i) });
+            }
+        }
+        let mut out = Vec::with_capacity(last_live.len());
+        for i in 0..n {
+            let key = buf.keys.get(i).copied().unwrap_or(0);
+            if last_live.get(&key) == Some(&Some(i)) {
+                out.push((key, decode_buffered_value(&buf, col_idx, i, ct)));
+            }
         }
         out
+    }
+
+    /// Keys whose FINAL buffer state is a tombstone (same last-occurrence
+    /// rule as `get`/`buffered_column_values`). Callers that iterate
+    /// segments newest→oldest must treat these keys as seen/deleted, or the
+    /// older segments' live versions resurrect the deleted rows.
+    pub fn buffered_tombstone_keys(&self) -> Vec<u64> {
+        let buf = self.write_buf.lock();
+        let n = buf.num_rows;
+        let mut last: HashMap<u64, bool> = HashMap::with_capacity(n);
+        for i in (0..n).rev() {
+            let key = buf.keys.get(i).copied().unwrap_or(0);
+            if let std::collections::hash_map::Entry::Vacant(e) = last.entry(key) {
+                e.insert(buf.deleted.get(i).copied().unwrap_or(false));
+            }
+        }
+        last.into_iter()
+            .filter(|(_, d)| *d)
+            .map(|(k, _)| k)
+            .collect()
     }
 
     /// Point lookup: newest segment first, return first hit.

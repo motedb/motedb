@@ -26243,11 +26243,34 @@ impl QueryExecutor {
                     }
                 }
             }
+            // 🔑 Buffered tombstones claim their keys BEFORE any segment is
+            // walked: a DELETE whose tombstone still sits in the write buffer
+            // must suppress the row's live versions in every older segment.
+            // Without this the ghost row entered the heap and the row fetch
+            // afterwards dropped it — the query returned fewer rows than LIMIT.
+            for key in store.buffered_tombstone_keys() {
+                seen.insert(key);
+            }
             for seg in segs.iter().rev() {
+                let n = seg.sst.num_rows;
+                // 🔑 Seed tombstones even when this segment's VECTOR column is
+                // unusable for scoring. A tombstone-only segment stores NULL
+                // placeholders → the vector column's dim header is 0 (≠ qdim),
+                // and the old `continue` skipped the WHOLE segment — its
+                // tombstones never claimed their keys, so older segments'
+                // live versions resurrected the deleted row (ghost in top-k,
+                // dropped by the row fetch → fewer rows than LIMIT).
+                let seed_tombstones = |seen: &mut std::collections::HashSet<u64>| {
+                    for i in 0..n {
+                        if seg.sst.row_map.is_deleted(i) {
+                            seen.insert(seg.sst.row_map.key(i));
+                        }
+                    }
+                };
                 if col_pos >= seg.sst.column_tags.len() {
+                    seed_tombstones(&mut seen);
                     continue;
                 }
-                let n = seg.sst.num_rows;
                 let seg_bytes = n * qdim * 4;
                 let cached = match seg.cached_vectors(col_pos) {
                     Some(vs) => Some(vs),
@@ -26262,16 +26285,25 @@ impl QueryExecutor {
                 };
                 if let Some(vs) = cached {
                     if vs.dim != qdim {
+                        seed_tombstones(&mut seen);
                         continue;
                     }
                     for i in 0..n {
+                        let key = seg.sst.row_map.key(i);
+                        // 🔑 Tombstone check MUST precede the null/vector
+                        // decode: a tombstone row carries NULL placeholders,
+                        // so vs.row(i) bails before the deleted flag is ever
+                        // consulted. Tombstones claim their key (segments are
+                        // walked newest→oldest; the tombstone is the row's
+                        // FINAL state) so older segments' live versions can't
+                        // resurrect it — the ghost-in-top-k bug.
+                        if seg.sst.row_map.is_deleted(i) {
+                            seen.insert(key);
+                            continue;
+                        }
                         let Some(row_vec) = vs.row(i) else {
                             continue;
                         };
-                        if seg.sst.row_map.is_deleted(i) {
-                            continue;
-                        }
-                        let key = seg.sst.row_map.key(i);
                         if !seen.insert(key) {
                             continue;
                         }
@@ -26288,16 +26320,25 @@ impl QueryExecutor {
                 let data = seg_bytes.as_ref();
                 let null_bytes = n.div_ceil(8);
                 if null_bytes + 2 > data.len() {
+                    seed_tombstones(&mut seen);
                     continue;
                 }
                 let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes + 1]]) as usize;
                 if dim != qdim {
+                    seed_tombstones(&mut seen);
                     continue;
                 }
                 let stride = dim * 4;
                 let data_start = null_bytes + 2;
                 for i in 0..n {
-                    if (data[i / 8] >> (i % 8)) & 1 != 0 || seg.sst.row_map.is_deleted(i) {
+                    let key = seg.sst.row_map.key(i);
+                    // Same as the cached branch: tombstone (NULL placeholder
+                    // row) claims its key BEFORE the null check can skip it.
+                    if seg.sst.row_map.is_deleted(i) {
+                        seen.insert(key);
+                        continue;
+                    }
+                    if (data[i / 8] >> (i % 8)) & 1 != 0 {
                         continue;
                     }
                     let base = data_start + i * stride;
