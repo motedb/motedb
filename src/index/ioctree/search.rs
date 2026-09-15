@@ -237,8 +237,16 @@ impl PartialOrd for OrderedF32 {
 
 impl Ord for OrderedF32 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // NaN = +∞ contract (see executor::nan_aware_cmp): a NaN threshold
+        // must be evictable by any real distance, never beat one.
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => self
+                .0
+                .partial_cmp(&other.0)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        }
     }
 }

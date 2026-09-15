@@ -90,7 +90,54 @@ impl PartialOrd for OrderedF32 {
 }
 impl Ord for OrderedF32 {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal),
+        }
+    }
+}
+
+/// Total order for floats where NaN sorts AFTER every real value (and equals
+/// itself) — the contract `OrderedF32` always documented but never implemented:
+/// `partial_cmp().unwrap_or(Equal)` made NaN compare "equal" to everything,
+/// so a NaN distance could beat an exact 0.0 match in top-k.
+#[inline]
+pub(crate) fn nan_aware_cmp(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// Total order for ORDER BY keys: NULLs first (matches every existing sort
+/// site), NaN after all real values (Postgres ASC semantics). Plain
+/// `partial_cmp().unwrap_or(Equal)` treats a NaN key as "equal to everything",
+/// which made its sorted position arbitrary — measured as `ORDER BY emb <->
+/// ? LIMIT 1` returning the NaN-distance row over an exact 0.0 match.
+/// ONLY for sort keys; WHERE/filter comparisons keep three-valued logic
+/// (any comparison against NaN is false) and must not use this.
+#[inline]
+fn order_by_cmp(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Float(x), Value::Float(y)) => nan_aware_cmp(*x, *y),
+        // Cross-numeric pairs (Float vs Integer) coerce inside Value's
+        // partial_cmp; only intercept when a NaN is actually involved.
+        (a, b) => {
+            let a_nan = matches!(a, Value::Float(f) if f.is_nan());
+            let b_nan = matches!(b, Value::Float(f) if f.is_nan());
+            if a_nan || b_nan {
+                nan_aware_cmp(f64::NAN, if b_nan { f64::NAN } else { 0.0 })
+            } else {
+                a.partial_cmp(b).unwrap_or(Ordering::Equal)
+            }
+        }
     }
 }
 
@@ -961,24 +1008,7 @@ impl StreamingQueryResult {
 
     #[inline]
     fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        match (a, b) {
-            (Value::Float(a), Value::Float(b)) => {
-                if a.is_nan() && b.is_nan() {
-                    Ordering::Equal
-                } else if a.is_nan() {
-                    Ordering::Greater
-                } else if b.is_nan() {
-                    Ordering::Less
-                } else {
-                    a.partial_cmp(b).unwrap_or(Ordering::Equal)
-                }
-            }
-            (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::Null, _) => Ordering::Less,
-            (_, Value::Null) => Ordering::Greater,
-            (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        }
+        order_by_cmp(a, b)
     }
 
     fn compare_rows(a: &[Value], b: &[Value], sort_specs: &[(usize, bool)]) -> std::cmp::Ordering {
@@ -1123,22 +1153,9 @@ impl StreamingQueryResult {
                 if matches!(va, Value::Null) {
                     continue; // both NULL → next key
                 }
-                let value_cmp = match (va, vb) {
-                    (Value::Float(a), Value::Float(b)) => {
-                        if a.is_nan() && b.is_nan() {
-                            Ordering::Equal
-                        } else if a.is_nan() {
-                            Ordering::Greater
-                        } else if b.is_nan() {
-                            Ordering::Less
-                        } else {
-                            a.partial_cmp(b).unwrap_or(Ordering::Equal)
-                        }
-                    }
-                    // Delegate to Value::partial_cmp for all other type pairs,
-                    // including cross-type (Integer/Float), Timestamp, etc.
-                    (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                };
+                // order_by_cmp: NULLs first, NaN after reals (Postgres ASC),
+                // everything else via Value::partial_cmp.
+                let value_cmp = order_by_cmp(va, vb);
                 let final_cmp = if *asc { value_cmp } else { value_cmp.reverse() };
 
                 if final_cmp != Ordering::Equal {
@@ -1220,12 +1237,7 @@ impl StreamingQueryResult {
                 if idx >= a.len() || idx >= b.len() {
                     continue;
                 }
-                let cmp = match (&a[idx], &b[idx]) {
-                    (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                    (Value::Null, _) => std::cmp::Ordering::Less,
-                    (_, Value::Null) => std::cmp::Ordering::Greater,
-                    (x, y) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-                };
+                let cmp = order_by_cmp(&a[idx], &b[idx]);
                 let cmp = if asc { cmp } else { cmp.reverse() };
                 if cmp != std::cmp::Ordering::Equal {
                     return cmp;
@@ -1858,12 +1870,7 @@ impl PartialOrd for SortKey {
 }
 impl Ord for SortKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (&self.0, &other.0) {
-            (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::Null, _) => Ordering::Less,
-            (_, Value::Null) => Ordering::Greater,
-            (a, b) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-        }
+        order_by_cmp(&self.0, &other.0)
     }
 }
 
@@ -2388,9 +2395,10 @@ impl QueryExecutor {
                         message: format!("Transaction {} committed", txn_id),
                     }
                 } else {
-                    StreamingQueryResult::Definition {
-                        message: "No active transaction".to_string(),
-                    }
+                    // 🔑 SQLite-compatible error (see execute_commit_transaction)
+                    return Err(MoteDBError::InvalidArgument(
+                        "cannot COMMIT - no transaction is active".to_string(),
+                    ));
                 }
             }
             Statement::RollbackTransaction => {
@@ -2449,9 +2457,10 @@ impl QueryExecutor {
                         message: format!("Transaction {} rolled back", txn_id),
                     }
                 } else {
-                    StreamingQueryResult::Definition {
-                        message: "No active transaction".to_string(),
-                    }
+                    // 🔑 SQLite-compatible error (see execute_rollback_transaction)
+                    return Err(MoteDBError::InvalidArgument(
+                        "cannot ROLLBACK - no transaction is active".to_string(),
+                    ));
                 }
             }
         };
@@ -2796,7 +2805,7 @@ impl QueryExecutor {
             rows.sort_by(|a, b| {
                 for obe in order_by {
                     let (av, bv) = self.resolve_order_key(&obe.expr, &col_names, a, b);
-                    let ord = av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = order_by_cmp(&av, &bv);
                     let ord = if obe.asc { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
@@ -5245,12 +5254,7 @@ impl QueryExecutor {
                     for &(pos, asc) in &sort_plan {
                         let av = a.get(pos).cloned().unwrap_or(Value::Null);
                         let bv = b.get(pos).cloned().unwrap_or(Value::Null);
-                        let cmp = match (&av, &bv) {
-                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                            (Value::Null, _) => std::cmp::Ordering::Less,
-                            (_, Value::Null) => std::cmp::Ordering::Greater,
-                            _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
-                        };
+                        let cmp = order_by_cmp(&av, &bv);
                         if cmp != std::cmp::Ordering::Equal {
                             return if asc { cmp } else { cmp.reverse() };
                         }
@@ -5328,12 +5332,7 @@ impl QueryExecutor {
                     for &(col, asc) in &order_keys {
                         let av = rows[a].get(col).cloned().unwrap_or(Value::Null);
                         let bv = rows[b].get(col).cloned().unwrap_or(Value::Null);
-                        let cmp = match (&av, &bv) {
-                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                            (Value::Null, _) => std::cmp::Ordering::Less,
-                            (_, Value::Null) => std::cmp::Ordering::Greater,
-                            _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
-                        };
+                        let cmp = order_by_cmp(&av, &bv);
                         if cmp != std::cmp::Ordering::Equal {
                             return if asc { cmp } else { cmp.reverse() };
                         }
@@ -7295,23 +7294,7 @@ impl QueryExecutor {
                         if col_idx >= a.len() || col_idx >= b.len() {
                             continue;
                         }
-                        let ord = match (&a[col_idx], &b[col_idx]) {
-                            (Value::Float(fa), Value::Float(fb)) => {
-                                if fa.is_nan() && fb.is_nan() {
-                                    std::cmp::Ordering::Equal
-                                } else if fa.is_nan() {
-                                    std::cmp::Ordering::Greater
-                                } else if fb.is_nan() {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    fa.partial_cmp(fb).unwrap_or(std::cmp::Ordering::Equal)
-                                }
-                            }
-                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                            (Value::Null, _) => std::cmp::Ordering::Less,
-                            (_, Value::Null) => std::cmp::Ordering::Greater,
-                            (va, vb) => va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal),
-                        };
+                        let ord = order_by_cmp(&a[col_idx], &b[col_idx]);
                         let final_ord = if asc { ord } else { ord.reverse() };
                         if final_ord != std::cmp::Ordering::Equal {
                             return final_ord;
@@ -11097,12 +11080,7 @@ impl QueryExecutor {
                     for (i, (_, asc)) in sort_plan.iter().enumerate() {
                         let av = &ka[i];
                         let bv = &kb[i];
-                        let cmp = match (matches!(av, Value::Null), matches!(bv, Value::Null)) {
-                            (true, true) => std::cmp::Ordering::Equal,
-                            (true, false) => std::cmp::Ordering::Less,
-                            (false, true) => std::cmp::Ordering::Greater,
-                            _ => av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal),
-                        };
+                        let cmp = order_by_cmp(av, bv);
                         if cmp != std::cmp::Ordering::Equal {
                             return if *asc { cmp } else { cmp.reverse() };
                         }
@@ -13185,25 +13163,7 @@ impl QueryExecutor {
                         if col_idx >= a.len() || col_idx >= b.len() {
                             continue;
                         }
-                        let va = &a[col_idx];
-                        let vb = &b[col_idx];
-                        let ord = match (va, vb) {
-                            (Value::Float(fa), Value::Float(fb)) => {
-                                if fa.is_nan() && fb.is_nan() {
-                                    std::cmp::Ordering::Equal
-                                } else if fa.is_nan() {
-                                    std::cmp::Ordering::Greater
-                                } else if fb.is_nan() {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    fa.partial_cmp(fb).unwrap_or(std::cmp::Ordering::Equal)
-                                }
-                            }
-                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                            (Value::Null, _) => std::cmp::Ordering::Less,
-                            (_, Value::Null) => std::cmp::Ordering::Greater,
-                            _ => va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal),
-                        };
+                        let ord = order_by_cmp(&a[col_idx], &b[col_idx]);
                         let final_ord = if asc { ord } else { ord.reverse() };
                         if final_ord != std::cmp::Ordering::Equal {
                             return final_ord;
@@ -16357,12 +16317,7 @@ impl QueryExecutor {
                         for &(idx, asc) in &sort_specs {
                             let av = a.get(idx).cloned().unwrap_or(Value::Null);
                             let bv = b.get(idx).cloned().unwrap_or(Value::Null);
-                            let cmp = match (matches!(av, Value::Null), matches!(bv, Value::Null)) {
-                                (true, true) => std::cmp::Ordering::Equal,
-                                (true, false) => std::cmp::Ordering::Less,
-                                (false, true) => std::cmp::Ordering::Greater,
-                                _ => av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal),
-                            };
+                            let cmp = order_by_cmp(&av, &bv);
                             if cmp != std::cmp::Ordering::Equal {
                                 return if asc { cmp } else { cmp.reverse() };
                             }
@@ -17043,7 +16998,7 @@ impl QueryExecutor {
                 if !specs.is_empty() {
                     rows.sort_by(|a, b| {
                         for &(i, asc) in &specs {
-                            let c = a[i].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal);
+                            let c = order_by_cmp(&a[i], &b[i]);
                             let c = if asc { c } else { c.reverse() };
                             if c != std::cmp::Ordering::Equal {
                                 return c;
@@ -17150,7 +17105,7 @@ impl QueryExecutor {
             if !specs.is_empty() {
                 rows.sort_by(|a, b| {
                     for &(i, asc) in &specs {
-                        let c = a[i].partial_cmp(&b[i]).unwrap_or(std::cmp::Ordering::Equal);
+                        let c = order_by_cmp(&a[i], &b[i]);
                         let c = if asc { c } else { c.reverse() };
                         if c != std::cmp::Ordering::Equal {
                             return c;
@@ -22016,7 +21971,7 @@ impl QueryExecutor {
                     let cmp = a
                         .get(col_idx)
                         .and_then(|va| b.get(col_idx).map(|vb| (va, vb)))
-                        .map(|(va, vb)| va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(va, vb)| order_by_cmp(va, vb))
                         .unwrap_or(std::cmp::Ordering::Equal);
                     if cmp != std::cmp::Ordering::Equal {
                         return if asc { cmp } else { cmp.reverse() };
@@ -22031,7 +21986,7 @@ impl QueryExecutor {
                     let cmp = a
                         .get(col_idx)
                         .and_then(|va| b.get(col_idx).map(|vb| (va, vb)))
-                        .map(|(va, vb)| va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(va, vb)| order_by_cmp(va, vb))
                         .unwrap_or(std::cmp::Ordering::Equal);
                     if cmp != std::cmp::Ordering::Equal {
                         return if asc { cmp } else { cmp.reverse() };
@@ -22048,7 +22003,7 @@ impl QueryExecutor {
                         let cmp = a
                             .get(col_idx)
                             .and_then(|va| b.get(col_idx).map(|vb| (va, vb)))
-                            .map(|(va, vb)| va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|(va, vb)| order_by_cmp(va, vb))
                             .unwrap_or(std::cmp::Ordering::Equal);
                         if cmp != std::cmp::Ordering::Equal {
                             return if asc { cmp } else { cmp.reverse() };
@@ -23945,6 +23900,15 @@ impl QueryExecutor {
     fn execute_drop_table(&self, stmt: DropTableStmt) -> Result<QueryResult> {
         let table_name = &stmt.table;
 
+        // 🔑 DDL is not transactional: a DROP that ran mid-transaction stayed
+        // dropped after ROLLBACK — the table and its data were silently lost.
+        // Reject instead of letting ROLLBACK promise an undo it can't deliver.
+        if self.current_txn_id().is_some() {
+            return Err(MoteDBError::InvalidArgument(
+                "DROP TABLE cannot run inside a transaction (DDL is not rollback-able); COMMIT or ROLLBACK first".into(),
+            ));
+        }
+
         // Verify table exists (or skip if IF EXISTS)
         let schema = match self.db.get_table_schema(table_name) {
             Ok(s) => s,
@@ -24063,6 +24027,14 @@ impl QueryExecutor {
     fn execute_drop_index(&self, stmt: DropIndexStmt) -> Result<QueryResult> {
         use crate::database::index_metadata::IndexType;
 
+        // Same guard as DROP TABLE: index files are removed immediately and
+        // cannot be resurrected by ROLLBACK.
+        if self.current_txn_id().is_some() {
+            return Err(MoteDBError::InvalidArgument(
+                "DROP INDEX cannot run inside a transaction (DDL is not rollback-able); COMMIT or ROLLBACK first".into(),
+            ));
+        }
+
         // Look up index metadata to know which collection to remove from
         let meta = self
             .db
@@ -24104,6 +24076,14 @@ impl QueryExecutor {
     /// 🆕 Execute ALTER TABLE statement
     fn execute_alter_table(&self, stmt: AlterTableStmt) -> Result<QueryResult> {
         use super::ast::AlterTableAction;
+
+        // Same guard as DROP TABLE: ALTER rewrites schema/segment files in
+        // place and cannot be undone by ROLLBACK.
+        if self.current_txn_id().is_some() {
+            return Err(MoteDBError::InvalidArgument(
+                "ALTER TABLE cannot run inside a transaction (DDL is not rollback-able); COMMIT or ROLLBACK first".into(),
+            ));
+        }
 
         match stmt.action {
             AlterTableAction::SetAutoIncrement(new_value) => {
@@ -24317,9 +24297,12 @@ impl QueryExecutor {
                 message: format!("Transaction {} committed", txn_id),
             })
         } else {
-            Ok(QueryResult::Definition {
-                message: "No active transaction".to_string(),
-            })
+            // 🔑 SQLite-compatible: error instead of silently succeeding —
+            // a stray COMMIT (double-commit, lost BEGIN to an earlier error)
+            // used to look like the data was committed.
+            Err(MoteDBError::InvalidArgument(
+                "cannot COMMIT - no transaction is active".into(),
+            ))
         }
     }
 
@@ -24333,9 +24316,11 @@ impl QueryExecutor {
                 message: format!("Transaction {} rolled back", txn_id),
             })
         } else {
-            Ok(QueryResult::Definition {
-                message: "No active transaction".to_string(),
-            })
+            // Stray ROLLBACK is usually an error-recovery path — keep it an
+            // error (matching COMMIT) so double-rollback bugs surface.
+            Err(MoteDBError::InvalidArgument(
+                "cannot ROLLBACK - no transaction is active".into(),
+            ))
         }
     }
     // Helper methods
@@ -26151,7 +26136,7 @@ impl QueryExecutor {
                 }
             }
         }
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        dists.sort_by(|a, b| nan_aware_cmp(a.0, b.0));
         Ok(dists.into_iter().take(k).map(|(_, id)| id).collect())
     }
 
@@ -26320,7 +26305,6 @@ impl QueryExecutor {
                         break;
                     };
                     crate::storage::lsm::columnar::copy_le_f32(&mut scratch, bytes);
-                    let key = seg.sst.row_map.key(i);
                     if !seen.insert(key) {
                         continue;
                     }
@@ -26335,12 +26319,11 @@ impl QueryExecutor {
             let mut results: Vec<(RowId, f32)> =
                 heap.into_iter().map(|(d, id)| (id, d.0)).collect();
             // Ascending distance; ties broken by key for deterministic output
-            // (BinaryHeap's into_iter order is unspecified).
-            results.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.0.cmp(&b.0))
-            });
+            // (BinaryHeap's into_iter order is unspecified). NaN-aware: a
+            // NaN distance (NaN in a stored vector) must sort AFTER real
+            // distances — plain partial_cmp made it "equal" to everything so
+            // the row-id tiebreak could put it above an exact 0.0 match.
+            results.sort_by(|a, b| nan_aware_cmp(a.1 as f64, b.1 as f64).then(a.0.cmp(&b.0)));
             return Ok(results);
         }
         Ok(Vec::new())
@@ -27178,12 +27161,7 @@ impl QueryExecutor {
                     rows.sort_by(|a, b| {
                         let va = a.get(idx).unwrap_or(&Value::Null);
                         let vb = b.get(idx).unwrap_or(&Value::Null);
-                        let cmp = match (va, vb) {
-                            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                            (Value::Null, _) => std::cmp::Ordering::Less,
-                            (_, Value::Null) => std::cmp::Ordering::Greater,
-                            _ => va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal),
-                        };
+                        let cmp = order_by_cmp(va, vb);
                         if ascending {
                             cmp
                         } else {
