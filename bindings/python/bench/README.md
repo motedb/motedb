@@ -591,3 +591,79 @@ Edge sweep beyond the registry fix:
    the search-dominated general preset is the representative case.
    Combined with the RAM pin this takes the 220K build from 72.7 min
    (pre-campaign) to ~7.5 min extrapolated.
+
+# Round 10: adversarial probes — NaN ordering, txn/DDL semantics, vector
+# top-k visibility, spatial 64KB truncation
+
+Adversarial probe batteries (extreme values / constraints / txns /
+three-valued logic / spatial / TS / vector-column lifecycle) found six
+real bugs; all fixed with regression tests
+(`test_txn_ddl_and_nan_ordering.rs`, `test_vector_visibility.rs`,
+`test_spatial_large_geometry.rs`).
+
+1. **NaN sort keys beat real values.** Every ORDER BY comparator used
+   `partial_cmp().unwrap_or(Equal)`, which makes NaN compare "equal" to
+   everything — its sorted position was arbitrary (measured:
+   `ORDER BY emb <-> ? LIMIT 1` returned the NaN-distance row over an
+   exact 0.0 match). `OrderedF32`'s documented "NaN = +∞" contract was
+   never actually implemented either. Fixed with a shared
+   `order_by_cmp` (NULLs first, NaN after all reals — Postgres ASC
+   semantics) across all 10+ sort sites plus the vector top-k heap and
+   final ranking; WHERE filters keep three-valued logic (NaN compares
+   false), verified NOT IN/IN/NOT LIKE against SQLite semantics.
+2. **Stray COMMIT/ROLLBACK silently succeeded** ("No active
+   transaction" as a SUCCESS result) — a double-commit looked like
+   committed data. Now errors, SQLite-style ("cannot COMMIT - no
+   transaction is active"), in both the QueryResult and streaming
+   dispatch paths.
+3. **DROP TABLE inside a transaction permanently lost the table on
+   ROLLBACK** — DDL executed immediately and rollback silently didn't
+   restore it (verified: table+data gone). DDL is not transactional, so
+   destructive DDL (DROP TABLE/DROP INDEX/ALTER) now errors while a
+   transaction is active instead of promising an undo it can't deliver.
+   CREATE TABLE in a txn keeps working (empty schema escapes, data
+   honors the txn — verified).
+4. **Vector top-k visibility holes (three states, one fast path).**
+   `ORDER BY emb <-> ?` columnar scans mishandled versioned rows:
+   (a) duplicate keys in the write buffer resolved FIRST-wins, so an
+   UPDATE's new vector lost to the INSERT's original until a flush
+   happened; (b) a buffered DELETE tombstone was skipped silently, so
+   older segments' live versions resurrected the deleted row (ghost at
+   the top of top-k); (c) once the tombstone flushed into its own
+   segment, the segment was skipped wholesale because its NULL
+   placeholder vector column has dim 0 ≠ query dim — the ghost came
+   back. In the SQL layer the ghost was then dropped by the row fetch,
+   so users saw EITHER a deleted row or FEWER rows than LIMIT
+   (nondeterministic on flush timing). Fixes:
+   `buffered_column_values` now resolves last-occurrence-wins (same
+   rule as `get`), and tombstones claim their keys in the fast path's
+   `seen` set — from the buffer (new `buffered_tombstone_keys`) and
+   from every segment branch (including dim-mismatch/undecodable
+   segments). Verified across UPDATE→DELETE→checkpoint→reopen
+   sequences under both for_testing and general (background threads).
+5. **Spatial values > 64KB silently became NULL after reopen.** The
+   spatial column format was [len:u16][bincode(Geometry)] and the
+   writer TRUNCATED at 65,535 bytes; the mangled payload then failed
+   deserialization and read back NULL (70K-point LineString vanished;
+   300-point was fine). The prefix is now escape-encoded (u16 normally,
+   0xFFFF + u32 for large payloads) at all four encode/decode sites —
+   backward compatible, since every valid pre-escape row had
+   len < 0xFFFF. 200K-point geometries round-trip through
+   checkpoint+reopen.
+6. **Python binding: LineString/Polygon inserts always failed.** The
+   `points` dict value extracted as `Vec<(f64, f64)>`, which pyo3 only
+   accepts for real tuples — the natural `[[x, y], ...]` list shape
+   errored ("requires a non-empty 'points' list"). Now accepts both
+   lists and tuples, with per-point arity validation.
+
+Also probed clean: i64 min/max + overflow literals, INT+overflow
+promotes to float, TEXT with NUL bytes, PK duplicate/NULL and NOT NULL
+enforcement, executemany atomicity (mid-batch PK error → nothing
+lands), nested BEGIN rejected, three-valued logic (NOT IN with NULL,
+NOT (x=1), IS NULL, LIKE NULL/NOT LIKE), TS out-of-order inserts and
+duplicate timestamps (kept, ordered correctly), vector
+UPDATE→DELETE→re-INSERT consistency. Noted, not changed: CREATE TABLE
+inside a txn survives ROLLBACK with data rolled back (MySQL-style
+non-transactional DDL); TS duplicate (ts) rows are kept, not deduped;
+MIN/MAX aggregates still use partial_cmp (NaN-in-MIN/MAX semantics
+deferred).

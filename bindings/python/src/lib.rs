@@ -125,10 +125,21 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
                     }
                 }
                 "LineString" | "Polygon" => {
-                    let pts = dict
+                    // 🔑 Python users pass [[x, y], ...] lists; pyo3's
+                    // Vec<(f64, f64)> extraction only accepts real tuples, so
+                    // every list-of-lists insert failed with "requires a
+                    // non-empty 'points' list". Accept BOTH shapes.
+                    let pts_raw = dict
                         .get("points")
-                        .and_then(|v| v.extract::<Vec<(f64, f64)>>().ok());
-                    let pts = match pts {
+                        .and_then(|v| v.extract::<Vec<(f64, f64)>>().ok())
+                        .map(|tuples| {
+                            tuples.into_iter().map(|(x, y)| vec![x, y]).collect::<Vec<_>>()
+                        })
+                        .or_else(|| {
+                            dict.get("points")
+                                .and_then(|v| v.extract::<Vec<Vec<f64>>>().ok())
+                        });
+                    let pts = match pts_raw {
                         Some(p) if !p.is_empty() => p,
                         _ => {
                             return Err(PyValueError::new_err(format!(
@@ -136,11 +147,20 @@ fn py_to_mote(v: &Bound<'_, PyAny>) -> PyResult<MValue> {
                             )))
                         }
                     };
-                    let pts: Vec<Point> = pts.into_iter().map(|(x, y)| Point::new(x, y)).collect();
+                    let mut parsed: Vec<Point> = Vec::with_capacity(pts.len());
+                    for pair in &pts {
+                        if pair.len() != 2 {
+                            return Err(PyValueError::new_err(format!(
+                                "{t} geometry points must be [x, y] pairs (got {} values)",
+                                pair.len()
+                            )));
+                        }
+                        parsed.push(Point::new(pair[0], pair[1]));
+                    }
                     if t == "LineString" {
-                        Geometry::LineString(pts)
+                        Geometry::LineString(parsed)
                     } else {
-                        Geometry::Polygon(pts)
+                        Geometry::Polygon(parsed)
                     }
                 }
                 other => {

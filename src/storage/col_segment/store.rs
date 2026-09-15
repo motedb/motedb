@@ -4148,15 +4148,20 @@ impl ColSegmentStore {
                                 row_nulls.push(true);
                             }
                         } else if ci < spatial_cols.len() && !spatial_cols[ci].is_empty() {
-                            // Spatial: re-encode [len:u16][bincode(Geometry)] (NULL → len=0).
+                            // Spatial: re-encode [escape len-prefix][bincode(Geometry)]
+                            // (NULL → len=0). Same escape scheme as the builder
+                            // (0xFFFF → u32 follows) so merges don't re-truncate
+                            // large geometries back to NULL.
                             if let Some(ref g) = spatial_cols[ci][i] {
                                 let bytes = bincode::serialize(g).unwrap_or_default();
-                                let len = bytes.len().min(65535) as u16;
-                                buf.extend_from_slice(&len.to_le_bytes());
-                                buf.extend_from_slice(&bytes[..len as usize]);
+                                crate::storage::lsm::columnar::ColumnarSSTable::spatial_prefix_write(
+                                    &mut buf,
+                                    bytes.len(),
+                                );
+                                buf.extend_from_slice(&bytes);
                                 row_nulls.push(false);
                             } else {
-                                buf.extend_from_slice(&0u16.to_le_bytes());
+                                crate::storage::lsm::columnar::ColumnarSSTable::spatial_prefix_write(&mut buf, 0);
                                 row_nulls.push(true);
                             }
                         } else {

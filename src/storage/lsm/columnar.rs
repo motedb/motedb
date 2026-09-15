@@ -2525,6 +2525,40 @@ impl ColumnarSSTable {
 
     /// Read spatial geometries from column segment.
     /// Format: [null_bitmap][len: u16 LE][bincode(Geometry)] per row (variable-length)
+    /// Write a spatial value's escape-encoded length prefix:
+    /// `u16 LE` normally; `0xFFFF` + `u32 LE` for lengths ≥ 65535.
+    /// Backward compatible with pre-escape segments — the old writer
+    /// TRUNCATED at 65535 (those rows already failed bincode deserialization
+    /// and read back NULL), so a 0xFFFF prefix in old data was always a
+    /// corrupt row; treating it as the escape turns nothing valid into NULL.
+    pub fn spatial_prefix_write(buf: &mut Vec<u8>, len: usize) {
+        if len < 0xFFFF {
+            buf.extend_from_slice(&(len as u16).to_le_bytes());
+        } else {
+            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            buf.extend_from_slice(&(len as u32).to_le_bytes());
+        }
+    }
+
+    /// Read an escape-encoded spatial length prefix at `pos`.
+    /// Returns `(payload_len, prefix_width)`, or None when truncated.
+    pub fn spatial_prefix_read(data: &[u8], pos: usize) -> Option<(usize, usize)> {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let l0 = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        if l0 == 0xFFFF {
+            if pos + 6 > data.len() {
+                return None;
+            }
+            let l = u32::from_le_bytes([data[pos + 2], data[pos + 3], data[pos + 4], data[pos + 5]])
+                as usize;
+            Some((l, 6))
+        } else {
+            Some((l0, 2))
+        }
+    }
+
     pub fn read_spatial(&self, col_idx: usize) -> Result<Vec<(RowId, crate::types::Geometry)>> {
         let entry = &self.column_index[col_idx];
         let seg_start = entry.offset as usize;
@@ -2543,20 +2577,18 @@ impl ColumnarSSTable {
         for i in 0..self.num_rows {
             if (data[i / 8] >> (i % 8)) & 1 != 0 {
                 // Null — skip to next row (read len to skip its bytes).
-                if pos + 2 <= data.len() {
-                    let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                    pos += 2 + len;
+                if let Some((len, width)) = Self::spatial_prefix_read(data, pos) {
+                    pos += width + len;
                 }
                 continue;
             }
             if self.row_map.is_deleted(i) {
                 continue;
             }
-            if pos + 2 > data.len() {
+            let Some((len, width)) = Self::spatial_prefix_read(data, pos) else {
                 break;
-            }
-            let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
+            };
+            pos += width;
             if len == 0 || pos + len > data.len() {
                 continue;
             }
@@ -2926,16 +2958,18 @@ impl ColumnarSSTableBuilder {
                     }
                 }
                 ColumnTypeTag::Spatial => {
-                    // Spatial column: [len:u16][bincode(Geometry)] per row
-                    // (matches read_spatial). NULL writes len=0.
+                    // Spatial column: [len-prefix][bincode(Geometry)] per row
+                    // (matches read_spatial). NULL writes len=0. The prefix is
+                    // escape-encoded (0xFFFF → u32 follows) so geometries
+                    // beyond 64KB no longer truncate to NULL — a 70K-point
+                    // LineString read back None after checkpoint+reopen.
                     match value {
                         Value::Spatial(g) => {
                             let bytes = bincode::serialize(&**g).unwrap_or_default();
-                            let len = bytes.len().min(65535) as u16;
-                            buf.extend_from_slice(&len.to_le_bytes());
-                            buf.extend_from_slice(&bytes[..len as usize]);
+                            ColumnarSSTable::spatial_prefix_write(buf, bytes.len());
+                            buf.extend_from_slice(&bytes);
                         }
-                        _ => buf.extend_from_slice(&0u16.to_le_bytes()),
+                        _ => ColumnarSSTable::spatial_prefix_write(buf, 0),
                     }
                 }
             }
@@ -3352,14 +3386,18 @@ impl ColumnarSSTableBuilder {
                         row.push(found.unwrap_or(Value::Null));
                     }
                     ColumnTypeTag::Spatial => {
-                        // Spatial layout: [len:u16][bincode(Geometry)] per row.
+                        // Spatial layout: [escape len-prefix][bincode(Geometry)] per row.
                         let buf = &self.column_buffers[ci];
                         let mut p = 0usize;
                         let mut r = 0usize;
                         let mut found = None;
                         while p + 2 <= buf.len() {
-                            let len = u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
-                            p += 2;
+                            let Some((len, width)) = ColumnarSSTable::spatial_prefix_read(buf, p)
+                            else {
+                                found = Some(Value::Null);
+                                break;
+                            };
+                            p += width;
                             if r == i {
                                 if len == 0 || p + len > buf.len() {
                                     found = Some(Value::Null);
