@@ -446,9 +446,9 @@ pub struct DBConfig {
     ///    queries) — skipped when the segment file exceeds the budget.
     /// Larger = faster point/indexed reads on big tables, more RSS; smaller =
     /// hard memory ceiling, oversized tables fall back to seek+read (3-5x
-    /// slower point reads depending on OS page cache). None = 256MB.
+    /// slower point reads depending on OS page cache). None = 64MB.
     ///
-    /// - for_general: 256MB (default)
+    /// - for_general: 64MB (default)
     /// - for_edge: 16MB
     /// - for_robotics: 8MB
     pub col_cache_budget_mb: Option<usize>,
@@ -506,7 +506,7 @@ impl Default for DBConfig {
             query_timeout_secs: Some(30), // 30-second timeout by default
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
-            col_cache_budget_mb: None, // 256MB default (store: DEFAULT_COL_CACHE_BUDGET_BYTES)
+            col_cache_budget_mb: None, // 64MB default (store: DEFAULT_COL_CACHE_BUDGET_BYTES)
         }
     }
 }

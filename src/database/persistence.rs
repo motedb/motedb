@@ -534,6 +534,20 @@ impl MoteDB {
                     e
                 );
             }
+            // 🔑 Durability + disk-reclamation point: force_compact_all retires
+            // the superseded segment ids into pending_gc but DEFERS the physical
+            // file deletion to sync_manifest. Without this call, a checkpoint
+            // that compacts 20 segments leaves all 20 old files on disk alongside
+            // the merged one — the table occupies 2× its data size until the next
+            // reopen happens to sweep them (measured: 322MB vs 161MB after
+            // checkpoint on a 100K×384 table).
+            if let Err(e) = store.sync_manifest() {
+                debug_log!(
+                    "[Flush] ColSegmentStore manifest sync failed for {}: {:?}",
+                    table_name,
+                    e
+                );
+            }
             // Release pages after compaction (old segments are dropped, their
             // mmap pages should be returned to the OS).
             store.release_query_memory();

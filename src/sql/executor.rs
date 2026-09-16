@@ -3170,6 +3170,32 @@ impl QueryExecutor {
                     } else {
                         return Ok(None);
                     }
+                } else if let Some(comparisons) =
+                    Self::parse_where_comparisons(wc, &schema)
+                {
+                    // 🚀 COUNT(*) over a multi-term AND predicate: fused
+                    // single-pass scan over raw column bytes. The old path
+                    // returned None here → the materialized fallback decoded
+                    // full-width rows (including VECTOR columns) just to count
+                    // them (~180MB retained, ~25ms on a 100K×384 table).
+                    let supported = |pos: usize| {
+                        matches!(
+                            schema.col_types().get(pos),
+                            Some(
+                                ColumnType::Integer
+                                    | ColumnType::Float
+                                    | ColumnType::Timestamp
+                                    | ColumnType::Text
+                                    | ColumnType::Boolean
+                            )
+                        )
+                    };
+                    if comparisons.len() <= 8 && comparisons.iter().all(|(c, _, _)| supported(*c)) {
+                        let res = store.aggregate_multi_filtered(&comparisons, &[]);
+                        count = res.rows;
+                    } else {
+                        return Ok(None);
+                    }
                 } else {
                     return Ok(None);
                 }
@@ -3674,7 +3700,15 @@ impl QueryExecutor {
                                 let mut row: Vec<Value> = Vec::new();
                                 for a in &aggs {
                                     match a.func.as_str() {
-                                        "COUNT" => row.push(Value::Integer(stats.count)),
+                                        // COUNT(*) counts matching rows;
+                                        // COUNT(col) counts non-NULL values.
+                                        "COUNT" => row.push(Value::Integer(
+                                            if a.col.is_none() {
+                                                stats.count + stats.null_count
+                                            } else {
+                                                stats.count
+                                            },
+                                        )),
                                         // 🔑 Empty set: SUM/MIN/MAX/AVG → NULL.
                                         // SUM of an empty set is NULL (per SQL).
                                         "SUM" => {
@@ -4075,6 +4109,129 @@ impl QueryExecutor {
                                 row.push(Value::Float(maxs[ai]));
                             } else {
                                 row.push(Value::Integer(maxs[ai] as i64));
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                return Ok(Some(StreamingQueryResult::SelectReady {
+                    columns,
+                    rows: vec![row],
+                }));
+            }
+        }
+
+        // 🚀 Fused multi-predicate single-pass aggregate: when every predicate
+        // column is a scalar type and every aggregate fits the numeric/raw-byte
+        // accumulators, fold COUNT/SUM/AVG/MIN/MAX directly over column bytes
+        // with zero per-row Value materialization. The path below this one
+        // materializes every row passing the FIRST predicate as
+        // Vec<(u64, Vec<Value>)> (String allocs for TEXT filters) before
+        // post-filtering — on the 100K×384 competitor dataset that was
+        // ~180MB retained and 5-25ms; this path is sub-millisecond and flat.
+        {
+            let scalar_pred = |pos: usize| {
+                matches!(
+                    schema.col_types().get(pos),
+                    Some(
+                        ColumnType::Integer
+                            | ColumnType::Float
+                            | ColumnType::Timestamp
+                            | ColumnType::Text
+                            | ColumnType::Boolean
+                    )
+                )
+            };
+            let numeric_agg = |pos: usize| {
+                matches!(
+                    schema.col_types().get(pos),
+                    Some(
+                        ColumnType::Integer
+                            | ColumnType::Float
+                            | ColumnType::Timestamp
+                    )
+                )
+            };
+            let preds_ok = comparisons.len() <= 8
+                && comparisons.iter().all(|(c, _, _)| scalar_pred(*c));
+            let aggs_ok = aggs.iter().all(|a| match (a.func.as_str(), a.col) {
+                ("COUNT", None) => true,
+                // COUNT(col): any scalar column (TEXT counts via the raw text
+                // decoder's null bitmap; Bool via its 1-byte decoder).
+                ("COUNT", Some(c)) => scalar_pred(c),
+                ("SUM" | "AVG" | "MIN" | "MAX", Some(c)) => numeric_agg(c),
+                _ => false,
+            });
+            if preds_ok && aggs_ok {
+                // Distinct aggregate target columns (index-aligned with
+                // res.per_col).
+                let mut agg_cols: Vec<usize> = Vec::new();
+                for a in &aggs {
+                    if let Some(c) = a.col {
+                        if !agg_cols.contains(&c) {
+                            agg_cols.push(c);
+                        }
+                    }
+                }
+                let res = store.aggregate_multi_filtered(&comparisons, &agg_cols);
+                let agg_res = |a: &AggInfo| -> Option<&crate::storage::col_segment::AggregateResult> {
+                    a.col
+                        .and_then(|c| agg_cols.iter().position(|&x| x == c))
+                        .map(|i| &res.per_col[i])
+                };
+                let columns: Vec<String> = self
+                    .build_select_columns(&stmt.columns, schema)
+                    .unwrap_or_default();
+                let mut row: Vec<Value> = Vec::with_capacity(aggs.len());
+                for a in &aggs {
+                    match a.func.as_str() {
+                        "COUNT" => {
+                            // COUNT(*) counts all matching rows; COUNT(col)
+                            // counts non-NULL values.
+                            let n = match a.col {
+                                None => res.rows,
+                                Some(_) => agg_res(a).map(|r| r.count).unwrap_or(0),
+                            };
+                            row.push(Value::Integer(n));
+                        }
+                        "SUM" => {
+                            let r = agg_res(a).unwrap();
+                            if r.count == 0 {
+                                row.push(Value::Null);
+                            } else if r.has_float {
+                                row.push(Value::Float(r.float_sum.total()));
+                            } else {
+                                row.push(Value::Integer(r.int_sum));
+                            }
+                        }
+                        "AVG" => {
+                            let r = agg_res(a).unwrap();
+                            if r.count == 0 {
+                                row.push(Value::Null);
+                            } else if r.has_float {
+                                row.push(Value::Float(r.float_sum.total() / r.count as f64));
+                            } else {
+                                row.push(Value::Float(r.int_sum as f64 / r.count as f64));
+                            }
+                        }
+                        "MIN" => {
+                            let r = agg_res(a).unwrap();
+                            if r.count == 0 {
+                                row.push(Value::Null);
+                            } else if r.has_float {
+                                row.push(Value::Float(r.min_float));
+                            } else {
+                                row.push(Value::Integer(r.min_int));
+                            }
+                        }
+                        "MAX" => {
+                            let r = agg_res(a).unwrap();
+                            if r.count == 0 {
+                                row.push(Value::Null);
+                            } else if r.has_float {
+                                row.push(Value::Float(r.max_float));
+                            } else {
+                                row.push(Value::Integer(r.max_int));
                             }
                         }
                         _ => return Ok(None),
@@ -9074,6 +9231,21 @@ impl QueryExecutor {
         table: &str,
         schema: &TableSchema,
     ) -> Result<Vec<(u64, Vec<Value>)>> {
+        self.scan_table_rows_fast_projected(table, schema, None)
+    }
+
+    /// Projected variant of [`Self::scan_table_rows_fast`]: when `project` is
+    /// given (ascending schema positions), returned rows contain ONLY those
+    /// columns. Used by the join fast paths so a query referencing 2 of 6
+    /// columns never decodes the other 4 — on a table with a 384-dim VECTOR
+    /// column that difference is ~153MB of Value::Tensor allocations and the
+    /// dominant share of join latency. `None` = all columns (legacy behavior).
+    fn scan_table_rows_fast_projected(
+        &self,
+        table: &str,
+        schema: &TableSchema,
+        project: Option<&[usize]>,
+    ) -> Result<Vec<(u64, Vec<Value>)>> {
         // 🔑 Read-your-writes: when inside a transaction, merge the write_set
         // and filter undo_log deletes so JOINs and subqueries see uncommitted
         // writes. Covers JOIN (try_positional_inner_join) and IN/scalar
@@ -9083,24 +9255,45 @@ impl QueryExecutor {
         let in_txn =
             self.is_in_transaction() && (!txn_writes.is_empty() || !txn_deletes.is_empty());
 
+        // Projection of the full-width txn write_set rows.
+        let project_writes = |rows: Vec<(u64, Vec<Value>)>| -> Vec<(u64, Vec<Value>)> {
+            match project {
+                None => rows,
+                Some(positions) => rows
+                    .into_iter()
+                    .map(|(rid, row)| {
+                        let pr: Vec<Value> = positions
+                            .iter()
+                            .map(|&p| row.get(p).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        (rid, pr)
+                    })
+                    .collect(),
+            }
+        };
+
         if in_txn && !self.db.has_col_segment_store(table) {
             // Txn-only table (no committed data): just return the write_set rows
             // (filtered for deletes — though a fresh INSERT can't be in deletes).
-            return Ok(txn_writes);
+            return Ok(project_writes(txn_writes));
         }
         let mut scanned: Vec<(u64, Vec<Value>)> = if self.db.has_col_segment_store(table) {
             let store = self
                 .db
                 .get_or_create_col_segment_store(table, schema.col_types())?;
             let _ = store.flush_buffer();
-            // Use projected scan with ALL columns (full row needed for JOIN output).
             let ncols = schema.columns.len();
-            let project_cols: Vec<usize> = (0..ncols).collect();
+            let project_cols: Vec<usize> = match project {
+                Some(p) if p.len() < ncols => p.to_vec(),
+                _ => (0..ncols).collect(),
+            };
             store.scan_projected_filtered(None, &project_cols, &|_| true)
         } else {
-            self.db
+            let full: Vec<(u64, Vec<Value>)> = self
+                .db
                 .scan_table_rows_streaming(table)?
-                .collect::<Result<_>>()?
+                .collect::<Result<_>>()?;
+            project_writes(full)
         };
         if in_txn {
             // Filter out rows the transaction has deleted.
@@ -9110,7 +9303,7 @@ impl QueryExecutor {
             let ws_ids: std::collections::HashSet<u64> =
                 txn_writes.iter().map(|(rid, _)| *rid).collect();
             scanned.retain(|(rid, _)| !ws_ids.contains(rid));
-            scanned.extend(txn_writes);
+            scanned.extend(project_writes(txn_writes));
         }
         Ok(scanned)
     }
@@ -16636,14 +16829,84 @@ impl QueryExecutor {
             return Ok(None);
         }
 
+        // ---- column pruning: collect every column referenced anywhere in the
+        // statement (SELECT exprs, WHERE, GROUP BY, ORDER BY, each ON) and scan
+        // each table projected to just those columns. The un-pruned path
+        // materialized full-width rows of BOTH tables — on the 100K-row
+        // competitor table that decoded 153MB of VECTOR Values for a query
+        // referencing only `device`/`zone` (138 ms, +300MB RSS).
+        let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut prune_ok = true;
+        {
+            fn collect_into(
+                e: &Expr,
+                needed: &mut std::collections::HashSet<String>,
+                prune_ok: &mut bool,
+            ) {
+                let mut names = Vec::new();
+                if QueryExecutor::collect_column_names_strict(e, &mut names) {
+                    for n in names {
+                        let bare = n.rsplit('.').next().unwrap_or(&n);
+                        needed.insert(bare.to_string());
+                    }
+                } else {
+                    *prune_ok = false;
+                }
+            }
+            if let Some(ref wc) = stmt.where_clause {
+                collect_into(wc, &mut needed, &mut prune_ok);
+            }
+            if let Some(gb) = &stmt.group_by {
+                for g in gb {
+                    needed.insert(g.rsplit('.').next().unwrap_or(g).to_string());
+                }
+            }
+            if let Some(ob) = &stmt.order_by {
+                for item in ob {
+                    collect_into(&item.expr, &mut needed, &mut prune_ok);
+                }
+            }
+            for sc in &stmt.columns {
+                match sc {
+                    SelectColumn::Column(c) | SelectColumn::ColumnWithAlias(c, _) => {
+                        needed.insert(c.rsplit('.').next().unwrap_or(c).to_string());
+                    }
+                    SelectColumn::Expr(e, _) => collect_into(e, &mut needed, &mut prune_ok),
+                    SelectColumn::Star => prune_ok = false,
+                }
+            }
+            for (_, _, on) in &steps {
+                match self.extract_equi_join_columns(on) {
+                    Some((l, r)) => {
+                        needed.insert(l.rsplit('.').next().unwrap_or(&l).to_string());
+                        needed.insert(r.rsplit('.').next().unwrap_or(&r).to_string());
+                    }
+                    None => prune_ok = false,
+                }
+            }
+        }
+        let prune = prune_ok && !needed.is_empty();
+
         // ---- accumulate the join product as concatenated positional rows
         let bschema = match self.db.get_table_schema(&btable) {
             Ok(s) => s,
             Err(_) => return Ok(None),
         };
         let bprefix = balias.unwrap_or_else(|| btable.clone());
+        // Positions of base-table columns kept in the product (all if no prune).
+        let bproj: Vec<usize> = if prune {
+            bschema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| needed.contains(c.name.as_str()))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            (0..bschema.columns.len()).collect()
+        };
         let mut acc_rows: Vec<Vec<Value>> = self
-            .scan_table_rows_fast(&btable, &bschema)?
+            .scan_table_rows_fast_projected(&btable, &bschema, Some(&bproj))?
             .into_iter()
             .map(|(_, r)| r)
             .collect();
@@ -16651,7 +16914,8 @@ impl QueryExecutor {
         let mut acc_cols: Vec<String> = Vec::with_capacity(64);
         let mut acc_types: Vec<ColumnType> = Vec::with_capacity(64);
         let mut acc_prefixes: Vec<String> = vec![bprefix.clone()];
-        for c in &bschema.columns {
+        for &p in &bproj {
+            let c = &bschema.columns[p];
             acc_cols.push(format!("{}.{}", bprefix, c.name));
             acc_types.push(c.col_type.clone());
         }
@@ -16709,15 +16973,30 @@ impl QueryExecutor {
             };
             let _ = j_pos;
 
-            let jrows = self.scan_table_rows_fast(jtable, &jschema)?;
+            // Projected scan of the joined table (see the pruning block above).
+            let jproj: Vec<usize> = if prune {
+                jschema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| needed.contains(c.name.as_str()))
+                    .map(|(i, _)| i)
+                    .collect()
+            } else {
+                (0..jschema.columns.len()).collect()
+            };
+            // The ON column's position within the PROJECTED row.
+            let Some(j_idx) = jproj.iter().position(|&p| p == j_pos) else {
+                return Ok(None);
+            };
+            let jrows = self.scan_table_rows_fast_projected(jtable, &jschema, Some(&jproj))?;
             // Build the hash side on the NEW table (probe accumulated rows).
             let mut hash: HashMap<&Value, Vec<usize>> = HashMap::with_capacity(jrows.len());
             for (ri, (_, rrow)) in jrows.iter().enumerate() {
-                if let Some(v) = rrow.get(j_pos) {
+                if let Some(v) = rrow.get(j_idx) {
                     hash.entry(v).or_default().push(ri);
                 }
             }
-            let jncol = jschema.columns.len();
             let mut next: Vec<Vec<Value>> = Vec::with_capacity(acc_rows.len());
             for arow in &acc_rows {
                 let Some(key) = arow.get(acc_pos) else {
@@ -16736,7 +17015,8 @@ impl QueryExecutor {
                 }
             }
             acc_rows = next;
-            for c in &jschema.columns {
+            for &p in &jproj {
+                let c = &jschema.columns[p];
                 acc_cols.push(format!("{}.{}", jprefix, c.name));
                 acc_types.push(c.col_type.clone());
             }
@@ -16762,15 +17042,41 @@ impl QueryExecutor {
 
         // ---- WHERE on the joined product
         let filtered: Vec<Vec<Value>> = if let Some(ref wc) = stmt.where_clause {
-            acc_rows
-                .into_iter()
-                .filter(|row| {
-                    matches!(
-                        Self::eval_expr_on_row(wc, row, &acc_schema),
-                        Ok(Value::Bool(true))
-                    )
+            // 🚀 Simple-comparison AND chains filter positionally (no per-row
+            // expression interpretation). acc_schema's columns are qualified
+            // ("e.device"), so prefixed references resolve exactly; bare
+            // references only parse when unambiguous in the synthetic schema.
+            // 🚨 Boolean columns/literals are excluded: the interpreter path
+            // coerces `flag = 1` per SQL bool/int semantics, positional
+            // Value equality does not.
+            let comps = Self::parse_where_comparisons(wc, &acc_schema).filter(|comps| {
+                comps.iter().all(|(p, _, t)| {
+                    let boolish_col =
+                        matches!(acc_types.get(*p), Some(ColumnType::Boolean));
+                    let boolish_target = matches!(t, Value::Bool(_));
+                    !boolish_col && !boolish_target
                 })
-                .collect()
+            });
+            if let Some(comps) = comps {
+                acc_rows
+                    .into_iter()
+                    .filter(|row| {
+                        comps
+                            .iter()
+                            .all(|(p, op, t)| apply_op_value(op, row.get(*p), t))
+                    })
+                    .collect()
+            } else {
+                acc_rows
+                    .into_iter()
+                    .filter(|row| {
+                        matches!(
+                            Self::eval_expr_on_row(wc, row, &acc_schema),
+                            Ok(Value::Bool(true))
+                        )
+                    })
+                    .collect()
+            }
         } else {
             acc_rows
         };
@@ -16903,7 +17209,12 @@ impl QueryExecutor {
                             acc.minv[i] = Some(acc.minv[i].map_or(*x, |m: f64| m.min(*x)));
                             acc.maxv[i] = Some(acc.maxv[i].map_or(*x, |m: f64| m.max(*x)));
                         }
-                        _ => {}
+                        // COUNT(col) counts every NON-NULL value — including
+                        // TEXT/TIMESTAMP/BOOL, which carry no numeric fold.
+                        Some(Value::Null) | None => {}
+                        Some(_) => {
+                            acc.nn[i] += 1;
+                        }
                     }
                 }
             }
@@ -19533,6 +19844,61 @@ impl QueryExecutor {
             }
         }
         false
+    }
+
+    /// Strict variant of [`Self::collect_column_names`]: returns false when the
+    /// tree contains an Expr variant it does not know how to walk, so callers
+    /// relying on the collected set for column PRUNING can detect that a
+    /// referenced column might be missed and disable pruning (a pruned column
+    /// referenced by a WHERE would otherwise silently evaluate to no-match).
+    fn collect_column_names_strict(expr: &Expr, out: &mut Vec<String>) -> bool {
+        match expr {
+            Expr::Column(name) => {
+                out.push(name.clone());
+                true
+            }
+            Expr::Literal(_) => true,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_column_names_strict(left, out)
+                    && Self::collect_column_names_strict(right, out)
+            }
+            Expr::UnaryOp { expr, .. } => Self::collect_column_names_strict(expr, out),
+            Expr::FunctionCall { args, .. } => args
+                .iter()
+                .all(|a| Self::collect_column_names_strict(a, out)),
+            Expr::IsNull { expr, .. } => Self::collect_column_names_strict(expr, out),
+            Expr::In { expr, list, .. } => {
+                Self::collect_column_names_strict(expr, out)
+                    && list
+                        .iter()
+                        .all(|e| Self::collect_column_names_strict(e, out))
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                ..
+            } => {
+                Self::collect_column_names_strict(expr, out)
+                    && Self::collect_column_names_strict(low, out)
+                    && Self::collect_column_names_strict(high, out)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                Self::collect_column_names_strict(expr, out)
+                    && Self::collect_column_names_strict(pattern, out)
+            }
+            Expr::Case { whens, else_expr } => {
+                let mut ok = whens.iter().all(|(cond, val)| {
+                    Self::collect_column_names_strict(cond, out)
+                        && Self::collect_column_names_strict(val, out)
+                });
+                if let Some(e) = else_expr {
+                    ok &= Self::collect_column_names_strict(e, out);
+                }
+                ok
+            }
+            _ => false,
+        }
     }
 
     /// Recursively collect column names from an expression tree.
@@ -26213,7 +26579,10 @@ impl QueryExecutor {
             //     one reusable aligned scratch buffer: no large allocation,
             //     nothing left in the cache (a >8MB segment is read lazily,
             //     338MB per query for 220K×384 rows, exactly as before).
-            let budget = store.col_cache_budget();
+            // Decoded VECTOR columns have their own (larger) budget: the top-k
+            // hot path re-scans the full column per query and streaming costs
+            // ~13× more than a cached decode.
+            let budget = store.vector_cache_budget();
             // Bytes already held by this table's col_caches (all columns); new
             // vector columns are cached only while the cumulative total stays
             // within budget, so a table of many small segments doesn't decode

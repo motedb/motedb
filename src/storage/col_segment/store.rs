@@ -1,7 +1,9 @@
 use super::manifest::Manifest;
 use super::merge::MergeCursor;
 use super::segment::Segment;
-use crate::storage::lsm::columnar::{ColumnTypeTag, ColumnarSSTableBuilder};
+use crate::storage::lsm::columnar::{
+    ColumnTypeTag, ColumnarSSTableBuilder, FixedSegment, TextSegment,
+};
 use crate::types::{ArcString, ColumnType, Value};
 use crate::Result;
 use arc_swap::ArcSwap;
@@ -32,7 +34,12 @@ pub struct AggregateResult {
 /// When `count == 0`, the min/max fields hold their sentinels (i64::MAX/MIN or
 /// ±∞) so callers can map an empty set to NULL rather than 0.
 pub struct AggStats {
+    /// NON-NULL aggregate values seen (SQL COUNT(col) semantics). For
+    /// COUNT(*) use `count + null_count` (matching rows).
     pub count: i64,
+    /// Matching rows whose aggregate value is NULL (or whose column is absent
+    /// from a segment) — COUNT(*) = count + null_count.
+    pub null_count: i64,
     pub is_int: bool,
     pub sum_i: i64,
     pub min_i: i64,
@@ -40,6 +47,17 @@ pub struct AggStats {
     pub sum_f: crate::types::CompSum,
     pub min_f: f64,
     pub max_f: f64,
+}
+
+/// Result of a multi-predicate fused aggregate scan (all predicates ANDed).
+/// Produced by [`ColSegmentStore::aggregate_multi_filtered`].
+#[derive(Default, Clone)]
+pub struct MultiAggResult {
+    /// Rows matching ALL predicates — COUNT(*) over the filtered set.
+    pub rows: i64,
+    /// One entry per requested aggregate column (index-aligned with the
+    /// caller's `agg_cols` slice).
+    pub per_col: Vec<AggregateResult>,
 }
 
 // ── Comparison helpers for count_filtered (zero-allocation) ──────────
@@ -261,13 +279,27 @@ pub struct ColSegmentStore {
     /// col_caches; the next scan re-decodes. Atomic so set_() can be called
     /// after construction (same pattern as compact_storage).
     col_cache_budget_bytes: std::sync::atomic::AtomicUsize,
+    /// Separate budget for decoded VECTOR columns (see
+    /// DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES).
+    vector_cache_budget_bytes: std::sync::atomic::AtomicUsize,
 }
 
-/// Default col_cache budget: 256MB per table. Also caps the eager
-/// single-segment file_data preload (pointer-read fast path) — segments
-/// larger than the budget stay on the lazy seek+read path, trading point-read
-/// speed (3-5x slower once the OS page cache misses) for flat RSS.
-pub const DEFAULT_COL_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// Default col_cache budget: 64MB per table. Caching decoded columns beyond
+/// this duplicates data the OS page cache already holds for the segment files
+/// (scans then stream via seek+read against hot pages). The old 256MB default
+/// let a single 100K×384 vector column pin ~154MB of decoded heap per table —
+/// query-phase RSS tracked data size, which is exactly what an embedded
+/// engine must not do. Tunable via set_col_cache_budget for scan-heavy
+/// workloads that prefer repeat-query speed over RSS.
+pub const DEFAULT_COL_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Separate per-table budget for decoded VECTOR columns. The vector top-k
+/// path re-scans the whole column per query: a cached 100K×384 column
+/// answers in ~6ms while streaming it from disk costs ~80ms — a 13× gap on
+/// the engine's headline number. Text/fixed decodes stream cheaply (µs-level
+/// per column chunk) and stay under the 64MB general budget, so only this
+/// cache legitimately wants data-scale headroom.
+pub const DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Clear col_cache after this many point queries to bound memory. At 2M rows,
 /// one col_cache fill is ~88MB (5 columns). Clearing every 4096 queries keeps
@@ -312,6 +344,9 @@ impl ColSegmentStore {
             compact_storage: std::sync::atomic::AtomicBool::new(false),
             col_cache_budget_bytes: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_COL_CACHE_BUDGET_BYTES,
+            ),
+            vector_cache_budget_bytes: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES,
             ),
             overlap_possible: std::sync::atomic::AtomicBool::new(false),
             pending_gc: Mutex::new(Vec::new()),
@@ -599,14 +634,16 @@ impl ColSegmentStore {
         } else if segs.len() == 1 {
             // 🚀 Single segment (post-compaction): eagerly load file_data
             // so point queries use pure pointer reads instead of seek+read.
-            // Memory cost: the WHOLE segment file after full compaction
-            // (97MB at 1.6M rows — the old "~18MB, bounded" assumption broke
-            // at scale). Cap the eager load by the col-cache budget; oversized
-            // segments stay lazy so RSS does not track data size.
+            // 🚨 MEMORY: the eager-load cap must stay at the same 8MiB
+            // threshold ColumnarSSTable::open uses. Loading "within the
+            // col-cache budget" (256MB) pulled the ENTIRE merged segment into
+            // heap on the first query after a bulk-load checkpoint — a
+            // 100K×384 table kept ~165MB resident forever from ONE
+            // COUNT(*) (query-phase RSS was dominated by exactly this).
+            // Oversized segments stay lazy (fence + seek+read): bounded RSS,
+            // point lookups cost two extra syscalls.
             let seg = &segs[0];
-            let _ = seg
-                .sst
-                .ensure_file_data_loaded_within(self.col_cache_budget());
+            let _ = seg.sst.ensure_file_data_loaded_within(8 * 1024 * 1024);
         }
         Ok(())
     }
@@ -2180,6 +2217,13 @@ impl ColSegmentStore {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Current decoded-VECTOR cache budget in bytes (separate from the general
+    /// col_cache budget — see DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES).
+    pub fn vector_cache_budget(&self) -> usize {
+        self.vector_cache_budget_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Diagnostic: one line per segment with resident heap bytes.
     #[doc(hidden)]
     pub fn debug_memory_stats(&self) -> String {
@@ -2218,19 +2262,27 @@ impl ColSegmentStore {
     /// budget, nothing cleared). Cost: one atomic load + N short Mutex locks
     /// (N = segment count), ~ns per segment.
     pub fn trim_col_cache_to_budget(&self) -> usize {
-        let budget = self.col_cache_budget();
+        // Split accounting: decoded VECTOR columns answer vector top-k from
+        // RAM (~6ms vs ~80ms streamed) and get their own larger budget;
+        // text/fixed decodes are cheap to re-stream and stay under the
+        // general budget.
+        let general_budget = self.col_cache_budget();
+        let vector_budget = self.vector_cache_budget();
         let segs = self.segs();
-        let mut total = 0usize;
+        let mut vec_total = 0usize;
+        let mut other_total = 0usize;
         for seg in segs.iter() {
-            total += seg.cached_col_bytes();
+            let (v, o) = seg.cached_bytes_split();
+            vec_total += v;
+            other_total += o;
         }
-        if total <= budget {
+        if vec_total <= vector_budget && other_total <= general_budget {
             return 0;
         }
         for seg in segs.iter() {
             seg.clear_cache();
         }
-        total
+        vec_total + other_total
     }
 
     /// Clear segment col_cache WITHOUT releasing mmap pages. Use this between
@@ -2762,6 +2814,252 @@ impl ColSegmentStore {
         result
     }
 
+    /// Single-pass aggregate over a multi-term AND predicate, folding COUNT /
+    /// SUM / AVG / MIN / MAX accumulators directly over raw column bytes.
+    ///
+    /// This is the multi-predicate generalization of `aggregate_filtered`
+    /// (which only accepts one comparison). It exists because the executor's
+    /// alternative for `WHERE ts >= a AND ts <= b AND device = 'x'` was to
+    /// materialize every row passing the FIRST predicate as
+    /// `Vec<(u64, Vec<Value>)>` (String allocs for text, one Vec per row) and
+    /// then post-filter — ~180MB retained and 5-25ms on a 100K×384 table,
+    /// versus sub-millisecond and zero allocation here.
+    ///
+    /// Unsupported leaf shapes (spatial/vector columns, missing columns in a
+    /// segment) evaluate the predicate as false — the executor only routes
+    /// supported column types here and falls back for anything exotic.
+    pub fn aggregate_multi_filtered(
+        &self,
+        comparisons: &[(usize, crate::sql::ast::BinaryOperator, Value)],
+        agg_cols: &[usize],
+    ) -> MultiAggResult {
+        use crate::sql::ast::BinaryOperator;
+        let _ = self.flush_buffer();
+        let need_dedup = self.may_have_duplicate_keys();
+        let segs = self.segments_snapshot();
+        let mut seen: std::collections::HashSet<u64> = if need_dedup {
+            std::collections::HashSet::with_capacity(
+                segs.iter().map(|s| s.sst.num_rows).sum(),
+            )
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Pre-resolve each predicate's target into the typed forms the row
+        // loop needs (mirrors aggregate_filtered's coercion rules: an integer
+        // literal also serves as an f64 target for FLOAT columns).
+        struct PredTarget {
+            target_i: Option<i64>,
+            target_f: Option<f64>,
+            target_s: Option<String>,
+        }
+        let pred_targets: Vec<PredTarget> = comparisons
+            .iter()
+            .map(|(_, _, t)| PredTarget {
+                target_i: if let Value::Integer(v) = t { Some(*v) } else { None },
+                target_f: match t {
+                    Value::Float(v) => Some(*v),
+                    Value::Integer(v) => Some(*v as f64),
+                    _ => None,
+                },
+                target_s: if let Value::Text(s) = t {
+                    Some(s.as_str().to_string())
+                } else {
+                    None
+                },
+            })
+            .collect();
+
+        let mut result = MultiAggResult {
+            rows: 0,
+            per_col: agg_cols.iter().map(|_| AggregateResult::default()).collect(),
+        };
+
+        for seg in segs.iter().rev() {
+            let n = seg.sst.num_rows;
+            if need_dedup {
+                let _ = seg.sst.load_full_keys();
+            }
+            // Decode each DISTINCT predicate column once per segment.
+            let mut preds: Vec<(usize, BinaryOperator, Option<FixedSegment>, Option<TextSegment>)> =
+                Vec::with_capacity(comparisons.len());
+            for (col, op, _) in comparisons.iter() {
+                if *col < seg.sst.column_tags.len() {
+                    if seg.sst.column_tags[*col].is_fixed() {
+                        preds.push((*col, op.clone(), seg.read_fixed_cached(*col), None));
+                    } else if matches!(seg.sst.column_tags[*col], ColumnTypeTag::Text) {
+                        preds.push((*col, op.clone(), None, seg.read_text_cached(*col)));
+                    } else {
+                        preds.push((*col, op.clone(), None, None));
+                    }
+                } else {
+                    preds.push((*col, op.clone(), None, None));
+                }
+            }
+            // Decode each aggregate column once per segment. The tag drives
+            // the fold: Bool columns are 1 byte wide — get_i64/get_f64 would
+            // stride 8 bytes and read past the column.
+            let mut aggs: Vec<(Option<FixedSegment>, Option<TextSegment>, ColumnTypeTag)> =
+                agg_cols
+                    .iter()
+                    .map(|&ac| {
+                        if ac < seg.sst.column_tags.len() {
+                            let tag = seg.sst.column_tags[ac];
+                            if tag.is_fixed() {
+                                (seg.read_fixed_cached(ac), None, tag)
+                            } else if matches!(tag, ColumnTypeTag::Text) {
+                                (None, seg.read_text_cached(ac), ColumnTypeTag::Text)
+                            } else {
+                                (None, None, ColumnTypeTag::Text)
+                            }
+                        } else {
+                            (None, None, ColumnTypeTag::Text)
+                        }
+                    })
+                    .collect();
+
+            let has_deletions = seg.sst.row_map.has_any_deleted();
+
+            // Evaluate ALL predicates for one row (AND semantics; NULL or
+            // unsupported leaves are false — SQL three-valued AND).
+            let row_passes = |i: usize| -> bool {
+                for (pi, (col, op, fixed, text)) in preds.iter().enumerate() {
+                    let pt = &pred_targets[pi];
+                    let ok = if let Some(ref f) = fixed {
+                        match seg.sst.column_tags[*col] {
+                            ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                                if pt.target_i.is_some() {
+                                    cmp_opt(f.get_i64(i), pt.target_i, op)
+                                } else if pt.target_f.is_some() {
+                                    cmp_opt_f64(f.get_i64(i).map(|x| x as f64), pt.target_f, op)
+                                } else {
+                                    false
+                                }
+                            }
+                            ColumnTypeTag::Float => cmp_opt_f64(f.get_f64(i), pt.target_f, op),
+                            ColumnTypeTag::Bool => {
+                                let tb = pt.target_i.map(|v| v != 0);
+                                cmp_opt(f.get_bool(i), tb, op)
+                            }
+                            _ => false,
+                        }
+                    } else if let Some(ref t) = text {
+                        if matches!(op, BinaryOperator::Eq) {
+                            pt.target_s
+                                .as_deref()
+                                .map(|ts| t.eq_bytes(i, ts.as_bytes()))
+                                .unwrap_or(false)
+                        } else {
+                            cmp_str(t.get_str(i), pt.target_s.as_deref(), op)
+                        }
+                    } else {
+                        false
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                true
+            };
+
+            let fold_row = |i: usize, result: &mut MultiAggResult| {
+                if !row_passes(i) {
+                    return;
+                }
+                result.rows += 1;
+                for (ai, (fixed, text, tag)) in aggs.iter().enumerate() {
+                    let r = &mut result.per_col[ai];
+                    if let Some(ref af) = fixed {
+                        match tag {
+                            ColumnTypeTag::Float => {
+                                match af.get_f64(i) {
+                                    Some(v) => {
+                                        r.count += 1;
+                                        r.float_sum.add(v);
+                                        r.has_float = true;
+                                        if r.count == 1 {
+                                            r.min_float = v;
+                                            r.max_float = v;
+                                        } else {
+                                            r.min_float = r.min_float.min(v);
+                                            r.max_float = r.max_float.max(v);
+                                        }
+                                    }
+                                    None => r.null_count += 1,
+                                }
+                            }
+                            ColumnTypeTag::Integer | ColumnTypeTag::Timestamp => {
+                                match af.get_i64(i) {
+                                    Some(v) => {
+                                        r.count += 1;
+                                        // checked_add with float promotion on
+                                        // overflow (same contract as
+                                        // aggregate_filtered).
+                                        if r.has_float {
+                                            r.float_sum.add(v as f64);
+                                        } else if let Some(s) = r.int_sum.checked_add(v) {
+                                            r.int_sum = s;
+                                        } else {
+                                            r.has_float = true;
+                                            r.float_sum =
+                                                crate::types::CompSum::from_value(r.int_sum as f64);
+                                            r.float_sum.add(v as f64);
+                                        }
+                                        if r.count == 1 {
+                                            r.min_int = v;
+                                            r.max_int = v;
+                                        } else {
+                                            r.min_int = r.min_int.min(v);
+                                            r.max_int = r.max_int.max(v);
+                                        }
+                                    }
+                                    None => r.null_count += 1,
+                                }
+                            }
+                            // Bool: count-only via the 1-byte decoder (an 8-byte
+                            // stride would read past the column).
+                            _ => match af.get_bool(i) {
+                                Some(_) => r.count += 1,
+                                None => r.null_count += 1,
+                            },
+                        }
+                    } else if let Some(ref at) = text {
+                        if at.is_null(i) {
+                            r.null_count += 1;
+                        } else {
+                            r.count += 1;
+                        }
+                    } else {
+                        // Column absent from this segment (ALTER ADD) or an
+                        // unsupported tag: value is NULL for these rows.
+                        r.null_count += 1;
+                    }
+                }
+            };
+
+            if need_dedup {
+                for i in (0..n).rev() {
+                    let key = seg.sst.row_map.key(i);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    fold_row(i, &mut result);
+                }
+            } else {
+                for i in 0..n {
+                    if has_deletions && seg.sst.row_map.is_deleted(i) {
+                        continue;
+                    }
+                    fold_row(i, &mut result);
+                }
+            }
+        }
+        result
+    }
+
     pub fn count_live_rows(&self) -> usize {
         // Fast path: single segment, no buffer, no deletions → just return num_rows.
         // This covers the common case (fresh insert, no UPDATE/DELETE history).
@@ -2932,7 +3230,11 @@ impl ColSegmentStore {
             Some(std::collections::HashSet::new())
         };
         let is_int = matches!(agg_type, ColumnType::Integer);
+        // 🔑 Flush buffered writes so they're visible to this scan (matches
+        // aggregate_filtered; without it, unflushed INSERTs were invisible).
+        let _ = self.flush_buffer();
         let mut count = 0i64;
+        let mut null_count = 0i64;
         let mut sum_i = 0i64;
         let mut min_i = i64::MAX;
         let mut max_i = i64::MIN;
@@ -2956,13 +3258,19 @@ impl ColSegmentStore {
                         continue;
                     }
                     if tseg.get_str(i) == Some(filter_val) {
-                        count += 1;
+                        // 🔑 count tracks NON-NULL aggregate values (COUNT(col)
+                        // semantics; it previously counted every matching row,
+                        // inflating COUNT(col) and AVG denominators when the
+                        // agg column held NULLs). COUNT(*) = count + null_count.
+                        let mut folded = false;
                         if let Some(ref f) = fagg {
                             if is_int {
                                 // 🔑 Integer column: read as i64. Previously
                                 // this called get_f64 first, reinterpreting the
                                 // integer's bytes as a garbage float.
                                 if let Some(v) = f.get_i64(i) {
+                                    count += 1;
+                                    folded = true;
                                     sum_i = sum_i.saturating_add(v);
                                     if v < min_i {
                                         min_i = v;
@@ -2972,6 +3280,8 @@ impl ColSegmentStore {
                                     }
                                 }
                             } else if let Some(v) = f.get_f64(i) {
+                                count += 1;
+                                folded = true;
                                 sum_f.add(v);
                                 if v < min_f {
                                     min_f = v;
@@ -2981,12 +3291,16 @@ impl ColSegmentStore {
                                 }
                             }
                         }
+                        if !folded {
+                            null_count += 1;
+                        }
                     }
                 }
             }
         }
         AggStats {
             count,
+            null_count,
             is_int,
             sum_i,
             min_i,

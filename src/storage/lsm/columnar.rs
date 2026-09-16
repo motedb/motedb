@@ -1837,6 +1837,12 @@ impl ColumnarSSTable {
     /// the single-segment pointer-read fast path is affordable; oversized
     /// segments stay on the lazy seek+read path (bounded RSS, slightly
     /// slower scans). Returns true when file_data is resident after the call.
+    /// Whether the whole-file in-heap buffer is resident (diagnostics and
+    /// tests: the memory contract is that segments >8MiB stay lazy).
+    pub fn file_data_resident(&self) -> bool {
+        !self.file_data.is_empty()
+    }
+
     pub fn ensure_file_data_loaded_within(&self, max_bytes: usize) -> bool {
         if !self.file_data.is_empty() {
             return true;

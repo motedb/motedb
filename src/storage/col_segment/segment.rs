@@ -142,6 +142,12 @@ impl BoundedColCache {
     fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Read-only view of the cache entries (for the store's split budget
+    /// accounting).
+    fn entries(&self) -> impl Iterator<Item = &(usize, CachedCol)> {
+        self.entries.iter()
+    }
 }
 
 /// Decoded heap bytes of a cached column chunk.
@@ -193,6 +199,25 @@ impl Segment {
     /// tiny text_page_cache). Used by the store to enforce a total budget.
     pub fn cached_col_bytes(&self) -> usize {
         self.col_cache.lock().bytes()
+    }
+
+    /// (vector_bytes, other_bytes) split of the col_cache. The store enforces
+    /// SEPARATE budgets: decoded VECTOR columns are the vector top-k hot path
+    /// (streaming a 153MB column costs ~80ms/query vs ~6ms cached) and get a
+    /// larger budget; text/fixed decodes stream cheaply and stay tight.
+    pub fn cached_bytes_split(&self) -> (usize, usize) {
+        let cache = self.col_cache.lock();
+        let mut vec_b = 0usize;
+        let mut other_b = 0usize;
+        for (_, c) in cache.entries() {
+            let b = cached_col_bytes(c);
+            if matches!(c, CachedCol::Vector(_)) {
+                vec_b += b;
+            } else {
+                other_b += b;
+            }
+        }
+        (vec_b, other_b)
     }
 
     /// Diagnostic: (col_cache, file_data, keys_data, fence) heap bytes.
@@ -603,8 +628,12 @@ impl Segment {
                         if len == 0 {
                             return Some(String::new());
                         }
-                        // Sanity check: cap string length to prevent capacity overflow.
-                        if len > 65536 {
+                        // Sanity check against CORRUPTION, not length: a value
+                        // can never be longer than its whole column region.
+                        // (The old `len > 65536 → None` guard rejected every
+                        // legitimate >64KB TEXT on the point-query path — the
+                        // value silently became NULL after a flush.)
+                        if len > entry.size as usize {
                             return None;
                         }
                         let mut str_buf = vec![0u8; len];
@@ -651,8 +680,9 @@ impl Segment {
         if len == 0 {
             return Some(String::new());
         }
-        // Sanity check: cap string length to prevent capacity overflow.
-        if len > 65536 {
+        // Sanity check against CORRUPTION, not length (see the matched guard
+        // above): cap at the column region size, not an arbitrary 64KB.
+        if len > entry.size as usize {
             return None;
         }
         let str_pos = strings_region + start;

@@ -17,4 +17,6 @@ mod store;
 pub use manifest::{Manifest, ManifestState};
 pub use merge::MergeCursor;
 pub use segment::Segment;
-pub use store::{ColSegmentStore, DEFAULT_COL_CACHE_BUDGET_BYTES};
+pub use store::{
+    AggregateResult, ColSegmentStore, MultiAggResult, DEFAULT_COL_CACHE_BUDGET_BYTES,
+};
