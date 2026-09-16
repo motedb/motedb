@@ -866,3 +866,46 @@ Also verified empirically:
 - **Edge latencies** (100K rows): PK point 15µs, fused range agg 0.75ms.
 - **Footprint**: CLI 7MB, Python wheel 5MB, loaded .so 8MB — no edge
   storage concern.
+
+# Round 12c: full functional E2E (wheel + CLI) — 4 bugs found & fixed
+
+Comprehensive functional pass over the current engine (Python wheel E2E 51
+checks, CLI E2E 17 checks — both suites saved under `bindings/python/tests/`),
+plus Rust differential regressions (`tests/test_round12c_e2e_bugs.rs`).
+Coverage: SQL surface (types/expressions/order/group/having/join/subquery),
+vector (exact-knn vs numpy, param-vs-literal, streamed-vs-cached, UPDATE/
+DELETE visibility), FTS (match/BM25/update/delete), spatial (ST_WITHIN /
+ST_DISTANCE / 20K-point geometry reopen), timeseries (range agg, LATEST BY),
+transactions (read-own-write/rollback/DDL-in-txn/stray-COMMIT), the Round-12
+paths (fused aggregates, join pruning, checkpoint disk reclaim, long TEXT,
+vector budget API), edge preset E2E, crash recovery, CLI shell/doctor/error
+handling/persistence.
+
+Bugs found by the pass (all fixed + regression-tested):
+
+1. **Boolean literals in multi-predicate WHERE matched nothing** —
+   `flag = TRUE AND id < 20` returned 0 rows: the fused aggregate path
+   left the integer target empty for `Value::Bool` literals (single-
+   predicate paths coerced correctly).
+2. **`ORDER BY x LIMIT k` disagreed with unlimited ORDER BY on NULLs** —
+   the top-k heap path coerced NULL floats to NaN (total-order MAXIMUM):
+   ASC top-k DROPPED null rows while DESC ranked them FIRST. NULL now
+   orders as the smallest value engine-wide (NULLs first ASC / last DESC),
+   in both `top_k_row_indices_typed` and `top_k_from_indices_typed` (which
+   previously SKIPPED null rows outright).
+3. **Zero-argument `BM25_SCORE()` returned NULL for every row** — the FTS
+   projection only filled the score when the call had a matching first
+   ARGUMENT; the documented `SELECT id, BM25_SCORE() … WHERE MATCH(col,
+   'q')` shape (used by the Round-11 benchmark!) silently lost scores.
+   Only latencies were ever asserted there, never the values.
+4. **`LATEST BY` silently dropped by two WHERE fast paths** —
+   `try_columnar_select` (TS columnar pushdown) and FAST PATH 1d
+   (`try_positional_where`) served `… WHERE sensor='s1' LATEST BY sensor`
+   without any latest-per-group fold and returned EVERY matching row.
+   Both now decline; the streaming entry routes all LATEST BY shapes to
+   the materialized path whose tail applies `apply_latest_by`.
+
+Note: `LATEST BY <col>` groups BY that column and keeps each group's
+max-timestamp row (`LATEST BY sensor` = latest per sensor). `LATEST BY ts`
+groups by ts itself — all rows back — by design
+(test_timeseries_semantics asserts this).

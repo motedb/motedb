@@ -2864,7 +2864,15 @@ impl ColSegmentStore {
         let pred_targets: Vec<PredTarget> = comparisons
             .iter()
             .map(|(_, _, t)| PredTarget {
-                target_i: if let Value::Integer(v) = t { Some(*v) } else { None },
+                // 🔑 Boolean literals coerce to 0/1 (SQL `flag = TRUE`): the
+                // Bool-column branch maps target_i back through `!= 0`. A Bool
+                // literal previously left target_i None and matched NOTHING
+                // (`flag = TRUE AND id < 10` counted 0 rows).
+                target_i: match t {
+                    Value::Integer(v) => Some(*v),
+                    Value::Bool(b) => Some(*b as i64),
+                    _ => None,
+                },
                 target_f: match t {
                     Value::Float(v) => Some(*v),
                     Value::Integer(v) => Some(*v as f64),
@@ -3527,11 +3535,28 @@ impl ColSegmentStore {
                         if has_deletions && seg.sst.row_map.is_deleted(i) {
                             continue;
                         }
-                        let v = fseg.get_f64(i).unwrap_or(f64::NAN);
-                        let ord_key = if desc {
-                            u64::MAX - to_ord(v)
-                        } else {
-                            to_ord(v)
+                        // 🔑 NULL sorts as the SMALLEST value (engine-wide
+                        // order_by_cmp semantics: NULLs first ASC / last DESC).
+                        // It was previously coerced to NaN — the total-order
+                        // MAXIMUM — so ASC top-k DROPPED null rows while DESC
+                        // ranked them FIRST: `ORDER BY x LIMIT k` disagreed
+                        // with the unlimited ORDER BY. ord 0 sits below every
+                        // finite to_ord key (−inf maps to 0x..01).
+                        let ord_key = match fseg.get_f64(i) {
+                            Some(v) => {
+                                if desc {
+                                    u64::MAX - to_ord(v)
+                                } else {
+                                    to_ord(v)
+                                }
+                            }
+                            None => {
+                                if desc {
+                                    u64::MAX
+                                } else {
+                                    u64::MIN
+                                }
+                            }
                         };
                         push_capped(&mut heap, ord_key, sidx, i);
                     }
@@ -3609,8 +3634,9 @@ impl ColSegmentStore {
     /// WHERE text-eq via scan_row_indices_eq). Groups indices by segment so the
     /// sort column is decoded ONCE per segment (critical in compact mode where
     /// each read_fixed_* is a full-column zstd decompression), then keeps a
-    /// bounded heap of the K best keys. Null sort keys are skipped, matching
-    /// top_k_row_indices_typed's per-row fallback semantics.
+    /// bounded heap of the K best keys. NULL sort keys order as the smallest
+    /// value (NULLs first ASC / last DESC), matching
+    /// top_k_row_indices_typed's semantics.
     pub fn top_k_from_indices_typed(
         &self,
         order_col: usize,
@@ -3651,24 +3677,33 @@ impl ColSegmentStore {
             if let Some(fseg) = seg.read_fixed_cached(order_col) {
                 if is_float {
                     for &i in rows {
-                        if let Some(v) = fseg.get_f64(i) {
-                            let bits = v.to_bits();
-                            let ord = if bits & (1u64 << 63) != 0 {
-                                !bits
-                            } else {
-                                bits ^ (1u64 << 63)
-                            };
-                            push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
-                        }
+                        // 🔑 NULL = smallest (NULLs first ASC / last DESC) —
+                        // matches top_k_row_indices_typed. It was previously
+                        // SKIPPED, so `WHERE … ORDER BY x LIMIT k` dropped
+                        // null rows the unlimited ORDER BY kept.
+                        let ord = match fseg.get_f64(i) {
+                            Some(v) => {
+                                let bits = v.to_bits();
+                                if bits & (1u64 << 63) != 0 {
+                                    !bits
+                                } else {
+                                    bits ^ (1u64 << 63)
+                                }
+                            }
+                            None => u64::MIN,
+                        };
+                        push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
                     }
                 } else {
                     for &i in rows {
-                        if let Some(v) = fseg.get_i64(i) {
+                        // NULL = smallest (same semantics as the float arm).
+                        let ord = match fseg.get_i64(i) {
                             // Order-preserving i64 → u64 (sign-flip), no f64
                             // roundtrip so |v| > 2^53 keeps exact ordering.
-                            let ord = (v as u64) ^ (1u64 << 63);
-                            push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
-                        }
+                            Some(v) => (v as u64) ^ (1u64 << 63),
+                            None => u64::MIN,
+                        };
+                        push_capped(if desc { u64::MAX - ord } else { ord }, *seg_idx, i);
                     }
                 }
             }

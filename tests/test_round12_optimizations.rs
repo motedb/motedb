@@ -308,6 +308,46 @@ fn fused_range_aggregation_matches_expected() {
     assert_eq!(one_i64(&rows, 1), src.iter().filter(|r| r.val.is_some()).count() as i64);
 }
 
+/// Boolean literals in a MULTI-predicate WHERE must coerce like the
+/// single-predicate path (`flag = TRUE AND id < k`). A Bool literal left the
+/// integer target empty and matched nothing (found by the Round-12c E2E).
+#[test]
+fn fused_aggregation_boolean_literal_predicate() {
+    let dir = TempDir::new().unwrap();
+    let db = Database::create_with_config(dir.path(), DBConfig::for_testing()).unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, flag BOOLEAN, n INT)")
+        .unwrap();
+    let batch: Vec<Vec<Value>> = (0..50i64)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::Bool(i % 2 == 0),
+                Value::Integer(i),
+            ]
+        })
+        .collect();
+    db.execute_prepared_many("INSERT INTO b (id, flag, n) VALUES (?, ?, ?)", batch)
+        .unwrap();
+    db.checkpoint().unwrap();
+
+    let rows = db
+        .query("SELECT COUNT(*), SUM(n) FROM b WHERE flag = TRUE AND id < 20")
+        .unwrap();
+    assert_eq!(one_i64(&rows, 0), 10, "flag=TRUE AND id<20");
+    assert_eq!(one_i64(&rows, 1), (0..20i64).step_by(2).sum::<i64>());
+
+    let rows = db
+        .query("SELECT COUNT(*) FROM b WHERE flag = FALSE AND id < 20")
+        .unwrap();
+    assert_eq!(one_i64(&rows, 0), 10);
+
+    // Integer literal against the BOOLEAN column (same coercion family).
+    let rows = db
+        .query("SELECT COUNT(*) FROM b WHERE flag = 0 AND id < 20")
+        .unwrap();
+    assert_eq!(one_i64(&rows, 0), 10);
+}
+
 /// UPDATE + DELETE visibility through the fused aggregate path (segments hold
 /// superseded versions; newest-wins + tombstones must apply).
 #[test]

@@ -5672,6 +5672,17 @@ impl QueryExecutor {
                 }
             }
         }
+        // 🔑 LATEST BY must reach the materialized path's apply_latest_by
+        // fold. Multiple streaming branches serve the plain-SELECT shape
+        // (columnar pushdown, optimizer plan scans) and silently DROP the
+        // clause — `… WHERE sensor='s1' LATEST BY sensor` returned every
+        // matching row instead of the newest (found by the Round-12c E2E).
+        // materialize_as_streaming → execute_select_internal applies the
+        // fold (and its bare-TS fast path try_ts_latest_by folds directly
+        // in the ColumnarStore).
+        if stmt.latest_by.is_some() {
+            return self.materialize_as_streaming(stmt);
+        }
         // 🔑 Explicit NULLS FIRST/LAST that differs from the dialect default
         // must be sorted by apply_order_by (the only comparator honoring the
         // flag). Run the general path and POST-SORT its result — internal
@@ -15212,9 +15223,13 @@ impl QueryExecutor {
         // 🔑 Must NOT trigger for aggregate queries (COUNT/SUM/...): those need
         // the aggregate path (try_apply_group_by_positional above), otherwise
         // COUNT(DISTINCT col) WHERE ... evaluates per-row and returns NULLs.
+        // 🔑 Nor for LATEST BY (same rule as 1c above): this path has no
+        // latest-per-group fold — it returned every matching row for
+        // `… WHERE sensor='s1' LATEST BY sensor` (Round-12c E2E).
         if stmt.where_clause.is_some()
             && stmt.group_by.is_none()
             && stmt.order_by.is_none()
+            && stmt.latest_by.is_none()
             && !stmt.distinct
             && !self.has_aggregates(&stmt.columns)
         {
@@ -25238,12 +25253,21 @@ impl QueryExecutor {
                         SelectColumn::Expr(Expr::FunctionCall { name, args, .. }, _)
                             if name.eq_ignore_ascii_case("BM25_SCORE") =>
                         {
-                            // BM25_SCORE(col, query): match either the driving
-                            // column+query, or a constant 0 (row filtered out).
-                            let col_matches = args.first().and_then(|a| match a {
-                                Expr::Column(c) => Some(c == &column),
-                                _ => None,
-                            });
+                            // BM25_SCORE() [zero-arg — the shape paired with
+                            // `WHERE MATCH(col, 'q')`] is the score of the
+                            // driving MATCH itself. It previously required a
+                            // matching first ARGUMENT, so the zero-arg form
+                            // silently projected NULL for every row.
+                            // BM25_SCORE(col, query): fill only when the
+                            // argument column IS the driving column.
+                            let col_matches = if args.is_empty() {
+                                Some(true)
+                            } else {
+                                args.first().and_then(|a| match a {
+                                    Expr::Column(c) => Some(c == &column),
+                                    _ => None,
+                                })
+                            };
                             if col_matches == Some(true) {
                                 projected[ci] = score_map
                                     .get(row_id)
@@ -27513,6 +27537,14 @@ impl QueryExecutor {
         stmt: &SelectStmt,
         schema: &TableSchema,
     ) -> Result<Option<QueryResult>> {
+        // 🚨 LATEST BY must reach the materialized path (apply_latest_by): this
+        // pushdown has no latest-per-group fold, so it silently returned EVERY
+        // row for `… WHERE … LATEST BY ts` (found by the Round-12c E2E; both
+        // the streaming router's TS branch and execute_select_internal's TS
+        // intercept route through here).
+        if stmt.latest_by.is_some() {
+            return Ok(None);
+        }
         // Only handle simple FROM table (no JOINs, subqueries)
         let table_name = match stmt.from.as_ref() {
             Some(TableRef::Table { name, .. }) => name.clone(),

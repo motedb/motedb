@@ -306,6 +306,17 @@ impl PyDatabase {
         })
     }
 
+    /// Per-table budget (bytes) for decoded VECTOR columns — edge presets cap
+    /// this so vector top-k cannot exceed the device's memory ceiling.
+    fn set_vector_cache_budget(&self, table: &str, bytes: usize) -> PyResult<()> {
+        self.db.set_vector_cache_budget(table, bytes).map_err(py_err)
+    }
+
+    /// Current per-table decoded-VECTOR cache budget (bytes).
+    fn vector_cache_budget_bytes(&self, table: &str) -> PyResult<usize> {
+        self.db.vector_cache_budget_bytes(table).map_err(py_err)
+    }
+
     /// Begin a transaction; returns its id (pass to commit/rollback).
     fn begin(&self) -> PyResult<u64> {
         self.db.begin_transaction().map_err(py_err)
