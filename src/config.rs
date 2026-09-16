@@ -452,6 +452,18 @@ pub struct DBConfig {
     /// - for_edge: 16MB
     /// - for_robotics: 8MB
     pub col_cache_budget_mb: Option<usize>,
+
+    /// Per-table budget (MB) for decoded VECTOR columns ONLY. Kept separate
+    /// from `col_cache_budget_mb` because the vector top-k hot path re-scans
+    /// the whole column per query: a cached decode answers in ~6ms where
+    /// streaming costs ~13× more. None = 256MB.
+    ///
+    /// - for_general: 256MB (default)
+    /// - for_edge: 32MB (vectors are secondary on IoT/sensor nodes)
+    /// - for_robotics: 32MB ("occasional image embeddings")
+    /// - for_embodied: 64MB (vector KNN is a primary workload; ~43K×384
+    ///   rows stay cached, larger tables stream from the OS page cache)
+    pub vector_cache_budget_mb: Option<usize>,
 }
 
 /// Auto-checkpoint trigger configuration
@@ -507,6 +519,7 @@ impl Default for DBConfig {
             auto_checkpoint: Some(AutoCheckpointConfig::default()), // ✅ 默认启用自动 checkpoint
             columnar_config: crate::storage::columnar::config::ColumnarConfig::default(),
             col_cache_budget_mb: None, // 64MB default (store: DEFAULT_COL_CACHE_BUDGET_BYTES)
+            vector_cache_budget_mb: None, // 256MB default (DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES)
         }
     }
 }
@@ -563,6 +576,7 @@ impl DBConfig {
             },
             row_cache_size: Some(200),     // was 500 — cut cache memory
             col_cache_budget_mb: Some(16), // 16MB decoded-column budget per table
+            vector_cache_budget_mb: Some(32), // vectors secondary on sensor nodes
             max_result_rows: Some(50_000),
             compact_storage: true, // 紧凑模式：zstd 压缩 segment（省 ~40% 磁盘）
             pk_lookup_capacity: 5_000, // was 10_000 — halve PK cache
@@ -616,6 +630,7 @@ impl DBConfig {
             max_result_rows: Some(100_000),
             compact_storage: true,        // 紧凑模式：zstd 压缩
             col_cache_budget_mb: Some(8), // 8MB decoded-column budget per table
+            vector_cache_budget_mb: Some(32), // "occasional image embeddings"
             pk_lookup_capacity: 10_000,   // ~0.8MB per table for robotics
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 8 * 1024 * 1024, // 8MB
@@ -661,6 +676,10 @@ impl DBConfig {
             max_result_rows: Some(10_000),
             compact_storage: true,         // 紧凑模式：zstd 压缩
             col_cache_budget_mb: Some(16), // 16MB decoded-column budget per table
+            // Vector KNN is a PRIMARY workload here, but the preset targets
+            // ~80MB peaks on Jetson/Pi-class devices — 64MB keeps ~43K×384
+            // rows hot, larger columns stream.
+            vector_cache_budget_mb: Some(64),
             pk_lookup_capacity: 5_000,
             auto_checkpoint: Some(AutoCheckpointConfig {
                 max_wal_size_bytes: 4 * 1024 * 1024, // 4MB

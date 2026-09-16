@@ -582,6 +582,27 @@ impl Database {
         Ok(self.inner.fast_row_count(table_name).unwrap_or(0) as usize)
     }
 
+    /// Per-table budget for decoded VECTOR columns (see DBConfig
+    /// `vector_cache_budget_mb`; presets cap this for edge devices). Exposed
+    /// for memory-constrained deployments to tune at runtime.
+    pub fn set_vector_cache_budget(&self, table_name: &str, bytes: usize) -> Result<()> {
+        let schema = self.inner.get_table_schema(table_name)?;
+        let store = self
+            .inner
+            .get_or_create_col_segment_store(table_name, schema.col_types())?;
+        store.set_vector_cache_budget(bytes);
+        Ok(())
+    }
+
+    /// Current per-table decoded-VECTOR cache budget in bytes.
+    pub fn vector_cache_budget_bytes(&self, table_name: &str) -> Result<usize> {
+        let schema = self.inner.get_table_schema(table_name)?;
+        let store = self
+            .inner
+            .get_or_create_col_segment_store(table_name, schema.col_types())?;
+        Ok(store.vector_cache_budget())
+    }
+
     pub fn execute(&self, sql: &str) -> Result<StreamingQueryResult> {
         use crate::sql::{Lexer, Parser};
 

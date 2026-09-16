@@ -830,3 +830,39 @@ NULLs/text-ranges/coercions/empty sets/UPDATE+DELETE visibility/
 in-txn read-your-writes, projected join+group-by vs Rust-computed
 expectations incl. NULL join keys, 3-table chains, COUNT(text_col)),
 plus the full `cargo test --release -p motedb` suite (EXIT=0).
+
+# Round 12b: edge-intelligence audit (edge / robotics / embodied presets)
+
+Audited the Round-12 memory work against the embedded presets and found
+three edge-specific issues, all fixed and regression-tested
+(`tests/test_round12b_edge.rs`):
+
+1. **Vector cache budget ignored the presets** — the new 256MB
+   vector-column cache was a fixed constant, so `for_embodied` (which
+   promises "~80MB peak" and makes vector KNN a PRIMARY workload) could
+   balloon past edge memory ceilings. Now a `vector_cache_budget_mb`
+   config: general 256MB (default), embodied 64MB, edge/robotics 32MB,
+   runtime-tunable via `Database.set_vector_cache_budget(table, bytes)`.
+2. **Oversized-column streaming read whole-column** — when the vector
+   column exceeds the (now smaller) budget, the top-k path materialized
+   the entire column per query: 153MB read buffer on a 100K×384 table,
+   +292MB peak RSS with allocator retention — OOM-class on a 256MB
+   device. Vector columns are always stored raw (flag=0), so the scan
+   now streams ~8MB chunks; measured query-phase RSS delta went
+   **+292MB → +4MB** with knn latency unchanged-to-better (25.6ms p50
+   under ambient load). Streamed results are bit-identical to the cached
+   path (differential test incl. UPDATE/DELETE visibility).
+3. **Cold reopen loaded every segment's full key array** —
+   `max_row_id()` (next_row_id recovery) was O(N) with a full-keys load
+   per segment. Keys are stored sorted (the binary-search invariant), so
+   it now reads ONE 8-byte key per segment: edge-preset reopen on a
+   100K-row DB **378ms → ~45ms**.
+
+Also verified empirically:
+- **Crash recovery**: kill -9 mid-load (50K rows, edge preset) → reopen
+  shows all checkpointed rows, appending works, no duplicates.
+- **Edge disk**: edge preset's zstd compact storage lands the 100K×384
+  dataset at **156.6MB** (vs 186.5MB general, 212.6MB SQLite).
+- **Edge latencies** (100K rows): PK point 15µs, fused range agg 0.75ms.
+- **Footprint**: CLI 7MB, Python wheel 5MB, loaded .so 8MB — no edge
+  storage concern.

@@ -26589,6 +26589,9 @@ impl QueryExecutor {
             // + cache + trim everything on every query.
             let mut cached_total: usize = segs.iter().map(|s| s.cached_col_bytes()).sum();
             let mut scratch: Vec<f32> = vec![0.0; qdim];
+            // Reusable chunk buffer for the edge-bounded streaming path below
+            // (bounded at ~8MB, shared across segments).
+            let mut chunk_buf: Vec<u8> = Vec::new();
             // 🔑 Version dedup, newest wins: an UPDATE leaves the old vector in
             // an older segment (its tombstone is not visible here) and the new
             // one in the write buffer — both used to be offered, so a single
@@ -26680,45 +26683,71 @@ impl QueryExecutor {
                     }
                     continue;
                 }
+                // 🚀 Edge-bounded streaming: vector columns are ALWAYS stored
+                // raw (flag=0, [flag][null_bitmap][dim:u16][f32×dim]), so the
+                // scan can proceed in ~8MB chunks instead of materializing
+                // the whole column. The old one-shot read allocated a
+                // data-size buffer per query (153MB on a 100K×384 table;
+                // +290MB peak RSS with allocator retention) — OOM-class on a
+                // 256MB edge device running the embodied/robotics presets.
                 let entry = &seg.sst.column_index[col_pos];
-                let seg_bytes = seg.sst.read_segment_bytes(
-                    entry.offset as usize,
-                    (entry.offset + entry.size) as usize,
-                    col_pos,
-                );
-                let data = seg_bytes.as_ref();
+                let col_start = entry.offset as usize;
                 let null_bytes = n.div_ceil(8);
-                if null_bytes + 2 > data.len() {
+                let mut head = vec![0u8; null_bytes + 2];
+                if seg
+                    .sst
+                    .read_bytes_at(col_start + 1, null_bytes + 2)
+                    .map(|h| head.copy_from_slice(&h))
+                    .is_err()
+                {
                     seed_tombstones(&mut seen);
                     continue;
                 }
-                let dim = u16::from_le_bytes([data[null_bytes], data[null_bytes + 1]]) as usize;
+                let dim = u16::from_le_bytes([head[null_bytes], head[null_bytes + 1]]) as usize;
                 if dim != qdim {
                     seed_tombstones(&mut seen);
                     continue;
                 }
                 let stride = dim * 4;
-                let data_start = null_bytes + 2;
-                for i in 0..n {
-                    let key = seg.sst.row_map.key(i);
-                    // Same as the cached branch: tombstone (NULL placeholder
-                    // row) claims its key BEFORE the null check can skip it.
-                    if seg.sst.row_map.is_deleted(i) {
-                        seen.insert(key);
-                        continue;
+                let data_base = col_start + 1 + null_bytes + 2;
+                const KNN_STREAM_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+                let rows_per_chunk = (KNN_STREAM_CHUNK_BYTES / stride.max(1)).max(1);
+                for cstart in (0..n).step_by(rows_per_chunk) {
+                    let cend = (cstart + rows_per_chunk).min(n);
+                    let need = (cend - cstart) * stride;
+                    if chunk_buf.len() < need {
+                        chunk_buf.resize(need, 0);
                     }
-                    if (data[i / 8] >> (i % 8)) & 1 != 0 {
-                        continue;
-                    }
-                    let base = data_start + i * stride;
-                    let Some(bytes) = data.get(base..base + stride) else {
+                    let ok = seg
+                        .sst
+                        .read_bytes_at(data_base + cstart * stride, need)
+                        .map(|b| chunk_buf[..need].copy_from_slice(&b))
+                        .is_ok();
+                    if !ok {
                         break;
-                    };
-                    crate::storage::lsm::columnar::copy_le_f32(&mut scratch, bytes);
-                    if !seen.insert(key) {
-                        continue;
                     }
-                    offer(&mut heap, key, &scratch);
+                    for i in cstart..cend {
+                        let key = seg.sst.row_map.key(i);
+                        // Same as the cached branch: tombstone (NULL
+                        // placeholder row) claims its key BEFORE the null
+                        // check can skip it.
+                        if seg.sst.row_map.is_deleted(i) {
+                            seen.insert(key);
+                            continue;
+                        }
+                        if (head[i / 8] >> (i % 8)) & 1 != 0 {
+                            continue;
+                        }
+                        let base = (i - cstart) * stride;
+                        crate::storage::lsm::columnar::copy_le_f32(
+                            &mut scratch,
+                            &chunk_buf[base..base + stride],
+                        );
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        offer(&mut heap, key, &scratch);
+                    }
                 }
             }
             // Safety net for the budget (other columns' caches may have grown

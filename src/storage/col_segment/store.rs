@@ -2211,6 +2211,14 @@ impl ColSegmentStore {
             .store(bytes.max(1024 * 1024), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the decoded-VECTOR cache budget (see
+    /// DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES). Edge presets shrink this so a
+    /// vector top-k cannot balloon RSS past the device's memory ceiling.
+    pub fn set_vector_cache_budget(&self, bytes: usize) {
+        self.vector_cache_budget_bytes
+            .store(bytes.max(1024 * 1024), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Current col_cache budget in bytes.
     pub fn col_cache_budget(&self) -> usize {
         self.col_cache_budget_bytes
@@ -4052,16 +4060,18 @@ impl ColSegmentStore {
     /// Return the maximum row_id (key & 0xFFFFFFFF) across all segments + buffer.
     /// Used on reopen to initialize next_row_id so new INSERTs don't reuse a
     /// row_id from a previous session (which would collide with existing data).
+    /// 🔑 Keys are stored sorted per segment, so this reads ONE 8-byte key per
+    /// segment (`last_key_hint`) instead of loading every segment's full keys
+    /// array — the O(N) load dominated cold-boot time on large tables
+    /// (378ms reopen on a 100K-row edge-preset DB).
     pub fn max_row_id(&self) -> u64 {
         let mut max = 0u64;
         for (key, _) in self.write_buf.lock().latest_entries() {
             max = max.max(key & 0xFFFFFFFF);
         }
         for seg in self.segs().iter() {
-            let _ = seg.sst.load_full_keys();
-            for i in 0..seg.sst.num_rows {
-                let key = seg.sst.row_map.key(i);
-                max = max.max(key & 0xFFFFFFFF);
+            if let Some(k) = seg.sst.last_key_hint() {
+                max = max.max(k & 0xFFFFFFFF);
             }
         }
         max

@@ -2052,6 +2052,13 @@ impl MoteDB {
                 .map(|mb| mb.saturating_mul(1024 * 1024))
                 .unwrap_or(crate::storage::col_segment::DEFAULT_COL_CACHE_BUDGET_BYTES),
         );
+        // 解码 VECTOR 列的独立预算（edge/robotics/embodied preset 会调小，
+        // 否则向量 top-k 可把 RSS 顶破边缘设备的内存上限）。
+        store.set_vector_cache_budget(
+            self.vector_cache_budget_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or(crate::storage::col_segment::DEFAULT_VECTOR_COL_CACHE_BUDGET_BYTES),
+        );
         // Race-safe publish: winner inserts, loser reuses the winner's store.
         use dashmap::mapref::entry::Entry;
         let store = match self.col_segment_stores.entry(table_name.to_string()) {

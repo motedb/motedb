@@ -413,6 +413,14 @@ impl RowMap {
         self.keys_data.is_some()
     }
 
+    /// Key by index when the full keys array is resident (None otherwise —
+    /// unlike `key()`, never falls back to the inaccurate fence estimate).
+    pub fn key_opt(&self, row_idx: usize) -> Option<u64> {
+        let data = self.keys_data.as_ref()?;
+        let s = data.slice(row_idx * 8, 8);
+        Some(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+    }
+
     /// Get the file offset where the full keys array starts.
     pub fn keys_file_offset(&self) -> u64 {
         self.keys_file_offset
@@ -1914,6 +1922,25 @@ impl ColumnarSSTable {
         Ok(())
     }
 
+    /// The segment's LARGEST composite key without loading the full keys
+    /// array. Keys are stored sorted (the binary-search invariant every point
+    /// lookup already relies on), so the last 8 bytes of the keys region are
+    /// the maximum — one tiny read instead of an O(N) load. Used by reopen's
+    /// next_row_id recovery: full-key loading there was the dominant cost of
+    /// cold-boot on large tables (378ms on a 100K-row edge DB).
+    pub fn last_key_hint(&self) -> Option<u64> {
+        if self.num_rows == 0 {
+            return None;
+        }
+        if let Some(k) = self.row_map.key_opt(self.num_rows - 1) {
+            return Some(k);
+        }
+        let mut buf = [0u8; 8];
+        let off = self.row_map.keys_file_offset as usize + (self.num_rows - 1) * 8;
+        self.read_raw(off, &mut buf).ok()?;
+        Some(u64::from_le_bytes(buf))
+    }
+
     /// Find a row by composite key using the sparse fence index.
     /// 1. Binary search fence_keys (in-memory) → find block [start, end)
     /// 2. Read that block's keys from disk (≤16KB)
@@ -2208,7 +2235,7 @@ impl ColumnarSSTable {
 
     /// Bounded byte read at an absolute file offset: resident buffer, then
     /// mmap, then the cached file handle.
-    fn read_bytes_at(&self, offset: usize, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+    pub fn read_bytes_at(&self, offset: usize, len: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
         let end = offset + len;
         if !self.file_data.is_empty() {
             return self
