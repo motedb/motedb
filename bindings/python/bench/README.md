@@ -732,3 +732,101 @@ Takeaways:
   durability, or multi-modal story; MoteDB is within 2.2× of a
   dedicated SIMD ANN library while providing the full database
   around it, and switches to DiskANN (sublinear) past 200K rows.
+
+# Round 12: fix the four competitor gaps (disk / RSS / range agg / JOIN)
+
+Round 11's table left four honest gaps. Round 12 root-caused each with
+targeted probes (per-stage RSS via vmmap footprint, per-file disk listings,
+query-shape bisection) and fixed all four, plus three latent correctness
+bugs the differential tests exposed along the way.
+
+## Root causes → fixes
+
+1. **Disk 2× duplication (351.5 MB)**: `checkpoint()` ran
+   `force_compact_all()` (merging 20 segments into one) but never called
+   `sync_manifest()` — the 20 superseded segment files stayed on disk until
+   the NEXT reopen happened to sweep them. Fix: checkpoint syncs the
+   manifest + physically deletes retired files. Verified by a stage probe:
+   post-checkpoint (zero queries) 322.4 MB → **161.2 MB, 1 segment**.
+2. **Query-phase RSS 1.35 GB** had three contributors, all fixed:
+   - `prepare_for_query` eagerly loaded the WHOLE merged segment into heap
+     within the 256 MB col-cache budget (165 MB resident from ONE
+     `SELECT COUNT(*)`). Fix: eager load capped at the same 8 MiB open-time
+     threshold; bigger segments stay lazy (fence + seek+read).
+   - Multi-term-AND aggregates fell back to full-table materialization
+     (100K full-width rows incl. a 384-dim VECTOR column ≈ +180 MB).
+     Fixed by (3) below.
+   - The equi-JOIN fast path scanned BOTH tables full-width (+294 MB,
+     138 ms). Fixed by (4) below.
+   - Decoded-column cache split into two budgets: 64 MB general
+     (text/fixed decodes re-stream cheaply) + 256 MB vector-only (a cached
+     100K×384 column answers knn in ~6 ms vs ~80 ms streamed — the split
+     keeps that headline number without letting scan caches track data
+     size).
+3. **Range COUNT+AVG 5.2 ms → 0.79 ms**: `WHERE ts>=? AND ts<=? AND device=?`
+     either fell to the materialized path (COUNT(*)-only shape returned
+     `None` outright) or materialized every row passing the FIRST predicate
+     before post-filtering. New `ColSegmentStore::aggregate_multi_filtered`
+     evaluates the full AND over raw column bytes (typed i64/f64/bool/text
+     decoders, per-column pre-decode once per segment) and folds
+     count/sum/min/max in the same pass — zero per-row Value allocation.
+4. **equi-JOIN + GROUP BY 138 ms → 18.9 ms**: the multi-way hash join now
+   projects each table to the columns actually referenced anywhere in the
+   statement (SELECT/WHERE/ON/GROUP BY/ORDER BY via a strict expression
+   walker; anything un-walkable or `SELECT *` disables pruning). The bench
+   query touches 2 of 9 columns — the 153 MB VECTOR column is never
+   decoded. Simple AND predicates also filter positionally instead of
+   per-row expression interpretation.
+
+## Latent bugs fixed en route (found by the differential tests)
+
+- `COUNT(col)` in the text-equality aggregate fast path counted NULL rows
+  (and used the row count as the AVG denominator).
+- TEXT values > 64 KB read back as NULL on the point-query path: the
+  page-cache "sanity cap" rejected `len > 65536` outright; now bounded by
+  the column region size (a real corruption bound). 120 KB strings survive
+  flush → merge → checkpoint → reopen.
+- `COUNT(text_col)` inside the join path ignored non-numeric non-NULL
+  values.
+- `count_sum_min_max_text_filter` never flushed the write buffer (recent
+  INSERTs were invisible to it).
+
+## Rerun (same dataset as Round 11)
+
+MoteDB and SQLite rerun together under identical (moderate) ambient load;
+DuckDB/FAISS columns are Round 11 values (engine code unchanged).
+Query-phase RSS now measured as a driver-freed delta, matching the
+SQLite/DuckDB methodology.
+
+| workload (p50)            | MoteDB R11 → R12 | SQLite (same run) | DuckDB (R11) |
+|---------------------------|------------------|-------------------|--------------|
+| range COUNT+AVG (10%)     | 5.2 → **0.79 ms** | 0.47 ms          | 0.29 ms |
+| equi-JOIN + GROUP BY      | 138 → **18.9 ms** | 11.9 ms          | 1.2 ms |
+| GROUP BY device           | 1.53 → 2.1 ms*   | 75.4 ms          | 0.60 ms |
+| top-k ORDER BY LIMIT 10   | 0.36 → 0.53 ms*  | 53.6 ms          | 0.74 ms |
+| exact vector knn@10       | 6.1 → 7.9 ms*    | 22.4 ms (numpy)  | 67.6 ms |
+| PK point lookup           | 17 → 21 µs*      | 7 µs             | 73 µs |
+| DB size on disk           | 351.5 → **186.5 MB** | 212.6 MB      | 489.7 MB |
+| query-phase RSS delta     | 1.35 GB → **44 MB** | ~0             | ~0 |
+
+\* slightly worse than R11's quiet-machine numbers; the whole batch ran
+with a foreign benchmark pinning ~4 cores (SQLite's own numbers are ~2×
+its R11 values in the same run — the relative picture is what holds).
+
+Takeaways: disk now BEATS SQLite (186.5 vs 212.6 MB) with the same f32
+vector payload; query-phase RSS is same order as SQLite's (44 MB vs ~0,
+and 15× below FAISS's in-RAM index); the range-agg gap closed from 13× to
+1.7× vs SQLite (DuckDB's zone maps keep it ahead); JOIN closed from 13×
+to 1.6× vs SQLite but remains the top optimization candidate vs DuckDB
+(the remaining cost is the projected scan materializing one Vec<Value>
+per row — a raw-bytes group accumulation over the join column would take
+it to low single-digit ms). The first-query compaction stall is also gone
+(checkpoint leaves one segment; prepare_for_query has nothing to merge).
+
+Regression coverage: `tests/test_round12_optimizations.rs` — 9
+differential tests (checkpoint file reclamation + reopen integrity,
+fused multi-predicate aggregates vs source-computed expectations across
+NULLs/text-ranges/coercions/empty sets/UPDATE+DELETE visibility/
+in-txn read-your-writes, projected join+group-by vs Rust-computed
+expectations incl. NULL join keys, 3-table chains, COUNT(text_col)),
+plus the full `cargo test --release -p motedb` suite (EXIT=0).

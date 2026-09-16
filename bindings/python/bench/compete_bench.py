@@ -136,11 +136,18 @@ def bench_mote(tmp):
     db.checkpoint(); db.close()
     cand = path if path.endswith(".mote") else path + ".mote"
     R["db_mb"] = du_mb(cand) if os.path.exists(cand) else du_mb(path)
+    # Free the driver-side corpus so the query-phase RSS delta is comparable
+    # with SQLite/DuckDB (which subtract their base): MoteDB used to report an
+    # ABSOLUTE peak that included ~350MB of Python-held source arrays.
+    del ts, dev, val, notes, emb
+    import gc as _gc
+    _gc.collect()
+    base = RSS.now_mb()
     with RSS() as rss2:
         db = motedb.Database(path)
         q_vec()
         R["q_vector_knn10"]  # ensure loaded
-        R["query_peak_rss_mb"] = rss2.mb()
+        R["query_peak_rss_mb"] = round(rss2.mb() - base, 1)
         R["q_point_reopen"] = lat(lambda: db.query("SELECT val FROM ev WHERE id = ?", params=[int(rng.integers(0, N))]), 200)
     db.close()
 
