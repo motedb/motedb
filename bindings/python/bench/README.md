@@ -989,3 +989,28 @@ Round 13 收口时留下的 30K 大表 campaign 缺口: 旧 harness 的无 LIMIT
 `GROUP BY UPPER(a)` 等函数形式此前已支持 (TIME_BUCKET 同路径)。
 多列 IN `(a,b) IN ((…))` 仍不支持 (明确报 parse error, 非静默错误) — 记录为
 特性缺口。
+
+### Round 13b 后性能复核 (无回退)
+
+Round 13/13b 改动多在 executor 热路径, 用 compete_bench 同批跑 mote+sqlite
+(sqlite 作负载控制) 对照 R12 表:
+
+| workload (p50) | R12 | R13b | sqlite 同批 (R12→现在) |
+|---|---|---|---|
+| range COUNT+AVG | 0.79 ms | 0.758 ms | 0.47 → 0.39 |
+| equi-JOIN + GROUP BY | 18.9 ms | 16.68 ms | 11.9 → 10.9 |
+| GROUP BY device | 2.1 ms | 1.57 ms | 75.4 → 58.1 |
+| top-k ORDER LIMIT 10 | 0.53 ms | 0.457 ms | 53.6 → 45.7 |
+| vector knn@10 | 7.9 ms | 6.5 ms | 22.4 → 18.4 |
+| PK 点查 | 21 µs | 18 µs | 7 → 7 |
+| DB size | 186.5 MB | 186.5 MB | — |
+
+全部持平或更好。`query_peak_rss_mb` 三次复跑 24.8 / 63.5 / 92.4 MB — 该
+指标 (reopen 后首个 knn 的解码峰值, jemalloc 保留时序) 本身高方差, R12 的
+44 在同一分布内, 不构成回退信号 (knn 延迟与磁盘大小完全稳定)。
+
+改动路径专项延迟 (@100K 行): IN 子查询 (重写为变异可见扫描) 0.72 ms;
+LATEST BY 100 组 @50K 13.3 ms (物化路径结构未变); 新能力 GROUP BY 表达式
+`id % 100` 73.6 ms — 走物化 SqlRow 路径 (对照组普通列 GROUP BY 1.39 ms
+走融合快路径), 与 SQLite 自身的 group-by 形状 (~58-60 ms) 同量级; 这是新
+功能的首版成本而非回退, 位置化表达式求值记为后续优化项。
