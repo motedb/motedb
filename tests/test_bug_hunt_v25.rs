@@ -521,11 +521,18 @@ fn concat_with_null_returns_null() {
     let (db, _dir) = new_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, s TEXT)");
     exec(&db, "INSERT INTO t VALUES (1, 'hello'), (2, NULL)");
-    let r = rows(&db, "SELECT concat(s, 'x') FROM t WHERE id = 2");
+    // 🔑 CONCAT 跳过 NULL 参数 (SQLite concat()/PG CONCAT 语义,
+    // Round-13b 差分对齐); NULL 传播用 `||`。
+    let r = rows(&db, "SELECT concat(s, 'x'), s || 'x' FROM t WHERE id = 2");
     assert!(
-        matches!(r[0][0], Value::Null),
-        "concat with NULL should propagate NULL, got {:?}",
+        matches!(&r[0][0], Value::Text(t) if t.as_str() == "x"),
+        "concat with NULL should skip it, got {:?}",
         r[0][0]
+    );
+    assert!(
+        matches!(r[0][1], Value::Null),
+        "|| with NULL should propagate NULL, got {:?}",
+        r[0][1]
     );
 }
 

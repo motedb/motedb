@@ -152,7 +152,8 @@ fn test_length_unicode() {
 }
 
 // ============================================================
-// M1: concat NULL propagates
+// M1: concat skips NULL args (SQLite concat()/PostgreSQL CONCAT semantics;
+// `||` is the NULL-propagating form). Round-13b differential fuzz 对齐。
 // ============================================================
 
 #[test]
@@ -168,8 +169,9 @@ fn test_concat_null_propagates() {
     let r = rows(&db, "SELECT CONCAT(a, b) AS result FROM t WHERE id = 2");
     assert_eq!(r.len(), 1);
     assert!(
-        matches!(r[0][0], Value::Null),
-        "CONCAT with NULL should return NULL"
+        matches!(&r[0][0], Value::Text(s) if s.as_str() == "hello"),
+        "CONCAT with NULL arg should skip it: got {:?}",
+        r[0][0]
     );
 }
 

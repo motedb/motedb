@@ -504,15 +504,45 @@ impl Parser {
     fn parse_group_by_items(&mut self) -> Result<Vec<String>> {
         let mut items = Vec::new();
         loop {
-            // A bare column is `ident` or `ident.ident`; an expression item
-            // starts as `ident(` (function call) or any non-identifier token.
+            // 🔑 三种形态: ①函数调用 (TIME_BUCKET('5s', ts)) ②plain 列
+            // (ident / ident.ident) ③一般表达式 (b % 3, UPPER(a), …)。
+            // 全部统一转 canonical name — executor 的 apply_group_by 按
+            // canonical name 匹配 SELECT 表达式 (`GROUP BY b % 3` 对上
+            // SELECT `b % 3 AS m`)。此前表达式项直接 parse 失败
+            // ("Multiple statements", % 把语句截断)。
             let is_function = matches!(self.current().token_type, TokenType::Identifier(_))
                 && matches!(self.peek_token_type(), TokenType::LParen);
             let item = if is_function {
                 let expr = self.parse_expr(0)?;
                 crate::sql::executor::QueryExecutor::expr_to_column_name(&expr)
             } else {
-                self.parse_qualified_column_name()?
+                // 尝试 plain 列名; 若后面还有表达式 token (运算符/字面量),
+                // 回退重解析为完整表达式。
+                let save = self.position;
+                if let Ok(name) = self.parse_qualified_column_name() {
+                    let expr_next = matches!(
+                        self.current().token_type,
+                        TokenType::Percent
+                            | TokenType::Plus
+                            | TokenType::Minus
+                            | TokenType::Star
+                            | TokenType::Slash
+                            | TokenType::Integer
+                            | TokenType::Float
+                            | TokenType::String(_)
+                            | TokenType::LParen
+                    );
+                    if !expr_next {
+                        items.push(name);
+                        if !self.match_token(TokenType::Comma) {
+                            break;
+                        }
+                        continue;
+                    }
+                    self.position = save; // 回溯, 按完整表达式重解析
+                }
+                let expr = self.parse_expr(0)?;
+                crate::sql::executor::QueryExecutor::expr_to_column_name(&expr)
             };
             items.push(item);
             if !self.match_token(TokenType::Comma) {

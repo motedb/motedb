@@ -221,9 +221,44 @@ def run_seed(SEED):
         return ("SELECT id, val FROM items WHERE val > "
                 "(SELECT AVG(val) FROM items) ORDER BY id ASC LIMIT 20"), True
 
+    def q_case_when():
+        return ("SELECT id, CASE WHEN qty > 60 THEN 'hi' WHEN qty > 20 THEN 'mid' ELSE 'lo' END AS g "
+                "FROM items WHERE id %% 4 = %d ORDER BY id ASC LIMIT 60" % rng.randint(0, 3)), True
+
+    def q_strfunc():
+        e = rng.choice(["cat || '-' || cat", "CONCAT(cat, '!')", "REPLACE(cat, 'a', '_')",
+                        "INSTR(cat, 'a')", "UPPER(cat) || LOWER(note)"])
+        return ("SELECT id, %s AS e FROM items WHERE id %% 5 = %d ORDER BY id ASC LIMIT 60"
+                % (e, rng.randint(0, 4))), True
+
+    def q_self_join():
+        return ("SELECT i.id, t2.id FROM items i JOIN tags t ON i.id = t.item_id "
+                "JOIN tags t2 ON t2.item_id = i.id AND t2.tag = t.tag "
+                "WHERE i.id <= 40 ORDER BY i.id ASC, t2.id ASC LIMIT 60"), True
+
+    def q_group_alias():
+        g = rng.choice(["grp", "cat"])
+        agg = rng.choice(["COUNT(*)", "SUM(qty)", "AVG(val)"])
+        return ("SELECT %s AS k, %s AS v FROM items WHERE id %% 3 = %d GROUP BY k ORDER BY v DESC, k ASC LIMIT 20"
+                % (g, agg, rng.randint(0, 2))), True
+
+    def q_group_expr():
+        return ("SELECT id % 5 AS m, COUNT(*) FROM items WHERE qty IS NOT NULL "
+                "GROUP BY id % 5 ORDER BY m ASC"), True
+
+    def q_order_expr():
+        return ("SELECT id FROM items WHERE id <= 60 ORDER BY ABS(COALESCE(val, 0)) %s, id ASC LIMIT 20"
+                % rng.choice(["ASC", "DESC"])), True
+
+    def q_limit_zero():
+        return ("SELECT id FROM items WHERE qty %s %d ORDER BY id ASC LIMIT 0"
+                % (rng.choice(["<", ">"]), rng.choice(INTS))), True
+
     GENS = [q_filter_order, q_filter_order, q_filter_order, q_distinct, q_agg_flat,
             q_group, q_group, q_expr, q_join_inner, q_join_inner, q_join_group,
-            q_join_left, q_join_three, q_in_sub, q_scalar_sub]
+            q_join_left, q_join_three, q_in_sub, q_scalar_sub,
+            q_case_when, q_strfunc, q_self_join, q_group_alias, q_group_expr,
+            q_order_expr, q_limit_zero]
 
     QUERIES = []
     for _ in range(NQ):

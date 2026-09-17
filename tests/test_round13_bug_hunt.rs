@@ -356,3 +356,62 @@ fn spatial_order_by_distance_operator_sorts() {
     let r = rows(&db, "SELECT id FROM poi ORDER BY loc <-> ST_POINT(50.0, 50.0) ASC LIMIT 3");
     assert_eq!(r, vec![vec![i(6)], vec![i(2)], vec![i(3)]]);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Round 13b — 扩展形状差分 (SQLite 语义对齐)
+#[test]
+fn group_by_alias_and_expression() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("r13b1.mote")).unwrap());
+    ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b INT)");
+    for i in 1..=20i64 {
+        ex(&db, &format!("INSERT INTO t VALUES ({}, 'x{}', {})", i, i % 3, i * 2));
+    }
+    // GROUP BY 列别名: SELECT a AS k … GROUP BY k
+    let r = rows(&db, "SELECT a AS k, COUNT(*) FROM t GROUP BY k ORDER BY k ASC");
+    assert_eq!(
+        r,
+        vec![
+            vec![motedb::types::Value::text("x0".into()), i(6)],
+            vec![motedb::types::Value::text("x1".into()), i(7)],
+            vec![motedb::types::Value::text("x2".into()), i(7)],
+        ]
+    );
+    // GROUP BY 表达式: b % 3 (此前 parse error: % 截断语句)
+    let r = rows(&db, "SELECT b % 3 AS m, COUNT(*) FROM t GROUP BY b % 3 ORDER BY m ASC");
+    assert_eq!(
+        r,
+        vec![vec![i(0), i(6)], vec![i(1), i(7)], vec![i(2), i(7)]]
+    );
+    // GROUP BY 表达式别名形式
+    let r2 = rows(&db, "SELECT b % 3 AS m, COUNT(*) FROM t GROUP BY m ORDER BY m ASC");
+    assert_eq!(r, r2);
+}
+
+#[test]
+fn instr_returns_one_based_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("r13b2.mote")).unwrap());
+    ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, a TEXT)");
+    ex(&db, "INSERT INTO t VALUES (1, 'x1'), (2, 'x2')");
+    // 此前: 列上下文静默 NULL / 字面量 "Unknown function"
+    let r = rows(&db, "SELECT INSTR(a, '1'), INSTR('abc', 'b'), INSTR('abc', 'z'), INSTR(a, NULL) FROM t WHERE id = 1");
+    assert_eq!(r[0], vec![i(2), i(2), i(0), Value::Null]);
+}
+
+#[test]
+fn concat_skips_null_arguments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("r13b3.mote")).unwrap());
+    ex(&db, "CREATE TABLE t (id INT PRIMARY KEY, a TEXT, b TEXT)");
+    ex(&db, "INSERT INTO t VALUES (1, 'hello', 'world')");
+    ex(&db, "INSERT INTO t VALUES (2, 'hello', NULL)");
+    // CONCAT 跳过 NULL (SQLite concat()/PG CONCAT); || 保持传播
+    let r = rows(&db, "SELECT CONCAT(a, b), a || b FROM t ORDER BY id ASC");
+    assert_eq!(r[0], vec![
+        motedb::types::Value::text("helloworld".into()),
+        motedb::types::Value::text("helloworld".into()),
+    ]);
+    assert_eq!(r[1][0], motedb::types::Value::text("hello".into()));
+    assert!(matches!(r[1][1], Value::Null));
+}

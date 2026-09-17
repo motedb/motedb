@@ -1054,9 +1054,10 @@ impl ExprEvaluator {
             // 🆕 String manipulation functions
             "concat" => {
                 // CONCAT(str1, str2, ...) - concatenate strings.
-                // NULL propagates: any NULL argument yields NULL (standard SQL
-                // / MySQL CONCAT semantics). Use CONCAT_WS or COALESCE to skip
-                // NULLs.
+                // 🔑 NULL 参数被跳过而非传播 — SQLite concat() 与 PostgreSQL
+                // CONCAT 的语义 (differential fuzz 对 SQLite: CONCAT(NULL,'!')
+                // = '!' 而非 NULL)。要 NULL 传播用 `||`; CONCAT_WS/COALESCE
+                // 不变。全 NULL 参数 → 空串 (同 SQLite/PG)。
                 let mut result = String::with_capacity(args.len() * 20);
                 for arg in args {
                     let val = self.eval(arg, row)?;
@@ -1074,7 +1075,7 @@ impl ExprEvaluator {
                         // value_to_concat_string (GROUP_CONCAT). Previously
                         // CONCAT used "true"/"false", inconsistent with `||`.
                         Value::Bool(b) => result.push_str(if b { "1" } else { "0" }),
-                        Value::Null => return Ok(Value::Null),
+                        Value::Null => continue, // 跳过 NULL 参数
                         _ => {
                             use std::fmt::Write;
                             let _ = write!(result, "{:?}", val);
@@ -1194,6 +1195,42 @@ impl ExprEvaluator {
                 Ok(Value::text(text.trim_end().to_string()))
             }
 
+            "instr" => {
+                // 🔑 INSTR(haystack, needle) — needle 首次出现的 1-based
+                // 位置, 未命中 0, 任一为 NULL → NULL (SQLite 语义)。
+                // 此前未实现: 列上下文静默返回 NULL、字面量上下文报
+                // Unknown function (differential fuzz)。
+                if args.len() != 2 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "instr() takes 2 arguments (haystack, needle)".to_string(),
+                    ));
+                }
+                let hay = match self.eval(&args[0], row)? {
+                    Value::Text(s) => s,
+                    Value::Null => return Ok(Value::Null),
+                    _ => {
+                        return Err(MoteDBError::TypeError(
+                            "instr() first argument must be text".to_string(),
+                        ))
+                    }
+                };
+                let needle = match self.eval(&args[1], row)? {
+                    Value::Text(s) => s,
+                    Value::Null => return Ok(Value::Null),
+                    _ => {
+                        return Err(MoteDBError::TypeError(
+                            "instr() second argument must be text".to_string(),
+                        ))
+                    }
+                };
+                if needle.is_empty() {
+                    return Ok(Value::Integer(1)); // SQLite: 空串命中位置 1
+                }
+                Ok(Value::Integer(match hay.find(needle.as_str()) {
+                    Some(byte_pos) => hay[..byte_pos].chars().count() as i64 + 1,
+                    None => 0,
+                }))
+            }
             "replace" => {
                 // REPLACE(text, from, to) - replace all occurrences
                 if args.len() != 3 {

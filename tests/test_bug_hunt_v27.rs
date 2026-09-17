@@ -570,10 +570,12 @@ fn concat_multiple_args() {
 #[test]
 fn concat_with_one_null_returns_null() {
     let (db, _dir) = new_db();
+    // 🔑 CONCAT 跳过 NULL 参数 (SQLite concat()/PG CONCAT; Round-13b 对齐)
     let r = rows(&db, "SELECT CONCAT('a', NULL, 'b')");
     assert!(
-        matches!(r[0][0], Value::Null),
-        "CONCAT with any NULL arg should be NULL"
+        matches!(&r[0][0], Value::Text(s) if s.as_str() == "ab"),
+        "CONCAT should skip NULL args, got {:?}",
+        r[0][0]
     );
 }
 

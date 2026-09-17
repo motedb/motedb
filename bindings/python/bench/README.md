@@ -924,9 +924,9 @@ Round 12c 的 E2E 还能挖出 4 个正确性 bug, 说明手工用例已到边�
   (投影外列) + LIMIT/OFFSET、INNER/LEFT/三表 JOIN、IN 子查询、标量子查询、
   表达式投影 (UPPER/ROUND/COALESCE/算术等)。campaign 量: 20 seed × 400 查询
   × 5 相位全绿; 入库版固定 4 seed × 250 查询 (~1 分钟)。
-  (30K 行大表 campaign 因无 LIMIT 三表 JOIN 经 Python 边界的行数过大而未跑完
-  — 列存多段路径已由 checkpoint 相位覆盖; 大表专用 harness (限 LIMIT + 服务端
-  聚合) 记为后续项。)
+  (Round 13b 已补大表专用有界 harness — 见下; 30K×3 seed 的完整 campaign 因
+  SQLite oracle 侧的等值 JOIN 太慢未跑完, 多段+重开一致性以 6-8K 入库版为准,
+  更大规模留待预物化期望结果的方案。)
 - **`tests/test_feature_selfcheck.py`** (tier-2): MoteDB 特有功能对照 Python
   暴力计算 — 向量 KNN (L2/cosine, 含变异可见性)、LATEST BY (+ORDER BY)、
   MATCH/BM25 (需 TEXT INDEX)、空间 ST_WITHIN / `loc <-> ST_POINT` top-k、
@@ -961,3 +961,31 @@ Round 12c 的 E2E 还能挖出 4 个正确性 bug, 说明手工用例已到边�
   (by design); DELETE 仅支持 `ts < value` 形式谓词。
 - AVG/SUM 浮点与 SQLite 有 ±1e-6 knife-edge 差异 (SQLite 用 Kahan 求和) —
   harness 以 2e-6 容差对齐, 属求和顺序噪声非正确性问题。
+
+## Round 13b — 大表有界差分 + 形状扩展
+
+Round 13 收口时留下的 30K 大表 campaign 缺口: 旧 harness 的无 LIMIT 三表 JOIN
+把数百万行拉过 Python 边界跑不完。本轮重设计并继续扩展:
+
+- **`tests/test_fuzz_bigtable.py`** (新入库): 全部查询要么服务端聚合
+  (GROUP BY / COUNT / AVG — 返回少量行) 要么严格 LIMIT ≤ 50; 数据分 3 批
+  插入、每批 checkpoint — 强制 ColSegmentStore **多段合并**路径 (400 行
+  harness 只打单段); 末尾 **REOPEN 相位** (close → reopen → 全查询复跑,
+  对照关闭前结果) 作为持久化层一致性 oracle。30K×3 seed campaign 跑通。
+- **形状扩展** (test_fuzz_differential.py +7 类生成器): CASE WHEN、字符串
+  函数 (|| / CONCAT / REPLACE / INSTR / UPPER||LOWER)、自 join、GROUP BY
+  别名 (k)、GROUP BY 表达式 (id % 5)、ORDER BY 表达式、LIMIT 0。
+
+### 挖出并修复的 4 个缺口 (SQLite/PG 语义对齐)
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `GROUP BY b % 3` parse error ("Multiple statements") | parse_group_by_items 只收列名/函数调用, `%` 直接截断语句 | 项级回溯: 先试列名, 后跟运算符/字面量则回溯按完整表达式重解析 → canonical name |
+| 2 | `SELECT a AS k … GROUP BY k` 报 "Aggregate function COUNT not yet implemented" | apply_group_by 的别名匹配只认 Expr 别名, 漏 ColumnWithAlias → 分组键解析失败 | 列别名先映射回底层列名再解析 |
+| 3 | `SELECT b % 3 … GROUP BY b % 3` 报 "must be in GROUP BY" | 非聚合 FunctionCall 组键有"代表行求值"分支, BinaryOp 没有 | BinaryOp/UnaryOp/CASE 纯非聚合表达式同走代表行求值 (SQLite 语义) |
+| 4 | `CONCAT(NULL, '!')` 返回 NULL (SQLite/PG 返回 '!'); INSTR 未实现 (列上静默 NULL) | CONCAT 按 \|\| 语义传播 NULL; INSTR 缺失 (两条快路径的名字列表里有 concat 各一处) | CONCAT 三处统一跳过 NULL 参数 (\|\| 保持传播); INSTR(hay, needle) 1-based、未命中 0、NULL→NULL |
+
+回归: test_round13_bug_hunt.rs 新增 3 例 (13/13) + 入库 harness 含新形状。
+`GROUP BY UPPER(a)` 等函数形式此前已支持 (TIME_BUCKET 同路径)。
+多列 IN `(a,b) IN ((…))` 仍不支持 (明确报 parse error, 非静默错误) — 记录为
+特性缺口。

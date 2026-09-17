@@ -12619,7 +12619,9 @@ impl QueryExecutor {
                         }
                         // 🔑 Bool → "1"/"0" (consistent with || and CONCAT).
                         Value::Bool(b) => result.push_str(if b { "1" } else { "0" }),
-                        Value::Null => return Ok(Value::Null), /* NULL propagates */
+                        // 🔑 NULL 跳过 (SQLite concat()/PG CONCAT 语义,
+                        // 与 evaluator 的 CONCAT 一致; NULL 传播用 ||)。
+                        Value::Null => continue,
                         other => result.push_str(&format!("{:?}", other)),
                     }
                 }
@@ -13139,7 +13141,8 @@ impl QueryExecutor {
                                 }
                                 // 🔑 Bool → "1"/"0" (consistent with || and CONCAT).
                                 Value::Bool(b) => result.push_str(if b { "1" } else { "0" }),
-                                Value::Null => return Ok(Value::Null), /* NULL propagates */
+                                // 🔑 NULL 跳过 (与 evaluator CONCAT 一致)。
+                                Value::Null => continue,
                                 other => result.push_str(&format!("{:?}", other)),
                             }
                         }
@@ -19426,6 +19429,16 @@ impl QueryExecutor {
             group_by_cols
                 .iter()
                 .map(|col_name| {
+                    // 🔑 列别名: `SELECT a AS k … GROUP BY k` — 把别名映射回
+                    // 底层列名 (ColumnWithAlias 此前不匹配任何分支 → 分组键
+                    // 解析失败, 后续 COUNT 求值报 not-implemented)。
+                    let underlying = columns.iter().find_map(|c| match c {
+                        SelectColumn::ColumnWithAlias(n, a) if a == col_name => {
+                            Some(n.clone())
+                        }
+                        _ => None,
+                    });
+                    let col_name: &String = underlying.as_ref().unwrap_or(col_name);
                     if first_row.contains_key(col_name) {
                         alias_exprs.push(None);
                         return col_name.clone();
@@ -19899,6 +19912,16 @@ impl QueryExecutor {
                 if Self::is_aggregate_expr(expr) =>
             {
                 self.eval_aggregate_compound(expr, rows)
+            }
+            // 🆕 纯非聚合表达式 (`b % 3`, `-b`, `CASE WHEN b > 0 …`):
+            // 与 FunctionCall 的组键表达式同待遇 — 在组的代表行上求值
+            // (组内每行共享组键, `SELECT b % 3 … GROUP BY b % 3` 合法,
+            // SQLite 语义; 此前直接报 "must be in GROUP BY")。
+            Expr::BinaryOp { .. } | Expr::UnaryOp { .. } | Expr::Case { .. } => {
+                match rows.first() {
+                    Some(row) => self.evaluator.eval(expr, row),
+                    None => Ok(Value::Null),
+                }
             }
             _ => {
                 // Non-aggregate expression in GROUP BY context

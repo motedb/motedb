@@ -117,21 +117,25 @@ fn test_sum_case_conditional() {
 
 #[test]
 fn test_groupby_case_bucket() {
-    // GROUP BY a CASE expression is not supported (parser expects a column
-    // name). Use a pre-computed bucket column instead. This test documents
-    // that GROUP BY <expression> errors (missing feature, not a wrong result).
+    // 🔑 GROUP BY <表达式> 已支持 (Round-13b: parser 项级回溯 + apply_group_by
+    // canonical-name 匹配 + 非聚合表达式代表行求值)。此测试曾记录
+    // "errors (missing feature)" — 现在断言正确结果。
     let (db, _d) = db();
     db.execute("CREATE TABLE t(id INT PRIMARY KEY, v INT)")
         .unwrap();
     db.execute("INSERT INTO t VALUES (1,5),(2,15),(3,25),(4,35)")
         .unwrap();
-    let res = db.execute(
+    let r = q(
+        &db,
         "SELECT CASE WHEN v < 20 THEN 'low' ELSE 'high' END AS bucket, COUNT(*) \
          FROM t GROUP BY CASE WHEN v < 20 THEN 'low' ELSE 'high' END ORDER BY bucket",
     );
-    assert!(
-        res.is_err(),
-        "GROUP BY <expression> is unsupported (should error)"
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::text("high".to_string()), Value::Integer(2)],
+            vec![Value::text("low".to_string()), Value::Integer(2)],
+        ]
     );
 }
 

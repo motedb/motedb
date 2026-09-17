@@ -449,19 +449,20 @@ fn test_concat_skips_null() {
     let (db, _d) = db();
     db.execute("CREATE TABLE t (a TEXT, b TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES ('hello', NULL)").unwrap();
-    // CONCAT propagates NULL: any NULL argument yields NULL (standard SQL /
-    // MySQL CONCAT semantics). Use COALESCE to skip NULLs.
+    // 🔑 CONCAT 跳过 NULL 参数 (SQLite concat()/PG CONCAT 语义,
+    // Round-13b 差分对齐); NULL 传播用 || / COALESCE 自理。
     let r = q(&db, "SELECT concat('a', NULL, 'b')");
-    assert_eq!(r[0][0], Value::Null);
+    assert_eq!(r[0][0], Value::text("ab".to_string()));
     let r = q(&db, "SELECT concat(a, b) FROM t");
-    assert_eq!(r[0][0], Value::Null);
+    assert_eq!(r[0][0], Value::text("hello".to_string()));
 }
 
 #[test]
 fn test_concat_all_null() {
     let (db, _d) = db();
+    // 全 NULL → 空串 (SQLite/PG concat 同)
     let r = q(&db, "SELECT concat(NULL, NULL)");
-    assert_eq!(r[0][0], Value::Null);
+    assert_eq!(r[0][0], Value::text("".to_string()));
 }
 
 #[test]
