@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "motedb"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "motedb-python"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "motedb",
  "pyo3",
