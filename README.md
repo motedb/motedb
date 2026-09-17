@@ -209,16 +209,17 @@ EXISTS]` / `DROP INDEX`, `ALTER TABLE` (`ADD COLUMN`, `AUTO_INCREMENT = N`),
 `INSERT`, `UPDATE`, `DELETE`, `SELECT` with:
 
 - `WHERE`, `JOIN` (INNER / LEFT / RIGHT / FULL), subqueries in `WHERE`
-- `GROUP BY` (single- and multi-column), `HAVING`, `ORDER BY`, `LIMIT/OFFSET`
+- `GROUP BY` (columns, expressions like `id % 5`, and SELECT aliases), `HAVING` (incl. aggregate aliases), `ORDER BY` (multi-key, expressions, non-projected columns, `NULLS FIRST/LAST`), `LIMIT/OFFSET`
 - `DISTINCT` (rows) and `COUNT(DISTINCT col)` aggregates
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`
 - `UNION` / `UNION ALL`
 - `CASE WHEN ... THEN ... ELSE ... END`
 - `WITH` / Common Table Expressions (non-recursive; `WITH name [(cols)] AS
   (SELECT ...), ... <main query>`)
+- Scalar functions: `UPPER`/`LOWER`/`LENGTH`/`TRIM`/`SUBSTR`/`REPLACE`/`CONCAT` (skips NULL args, SQLite/Postgres semantics; `||` propagates NULL)/`INSTR`/`COALESCE`/`ROUND` (binary-exact decimal rounding)/`ABS`/arithmetic
 - Multimodal predicates: `MATCH(col) AGAINST('q')` (BM25 ranked FTS),
-  vector `<->`/`<~>` ordering (DiskANN ANN), `ST_WITHIN`, `ST_DISTANCE`,
-  `ST_KNN`
+  vector `<->`/`<~>` ordering (DiskANN ANN), geometry `loc <-> ST_POINT(x, y)`
+  distance ordering, `ST_WITHIN`, `ST_DISTANCE`, `ST_KNN`
 - Transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, read-your-writes
   visibility inside a transaction
 
