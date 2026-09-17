@@ -909,3 +909,55 @@ Note: `LATEST BY <col>` groups BY that column and keeps each group's
 max-timestamp row (`LATEST BY sensor` = latest per sensor). `LATEST BY ts`
 groups by ts itself — all rows back — by design
 (test_timeseries_semantics asserts this).
+
+## Round 13 — Bug 清除计划: differential fuzz campaign
+
+Round 12c 的 E2E 还能挖出 4 个正确性 bug, 说明手工用例已到边际收益。
+本轮改为系统化差分测试, 两个 harness 入库为常驻回归门槛:
+
+- **`tests/test_fuzz_differential.py`** (tier-1): SQLite(oracle) × MoteDB 三路
+  对拍 — 同一批随机 SQL 分别在 ①SQLite ②MoteDB-LSM(未 checkpoint)
+  ③MoteDB-列存(checkpoint 后) 执行, 外加随机变异 (UPDATE/DELETE/INSERT)
+  后复跑 + 同状态跨相位自洽 (SELF_DIVERGE, 专抓快速路径/列存路径静默分歧)。
+  查询语法覆盖: 多层 WHERE (AND/OR/NOT/IN/BETWEEN/LIKE/IS NULL/NULL 比较)、
+  聚合 (COUNT/SUM/AVG/MIN/MAX/DISTINCT)、GROUP BY+HAVING、ORDER BY 多键
+  (投影外列) + LIMIT/OFFSET、INNER/LEFT/三表 JOIN、IN 子查询、标量子查询、
+  表达式投影 (UPPER/ROUND/COALESCE/算术等)。campaign 量: 20 seed × 400 查询
+  × 5 相位全绿; 入库版固定 4 seed × 250 查询 (~1 分钟)。
+  (30K 行大表 campaign 因无 LIMIT 三表 JOIN 经 Python 边界的行数过大而未跑完
+  — 列存多段路径已由 checkpoint 相位覆盖; 大表专用 harness (限 LIMIT + 服务端
+  聚合) 记为后续项。)
+- **`tests/test_feature_selfcheck.py`** (tier-2): MoteDB 特有功能对照 Python
+  暴力计算 — 向量 KNN (L2/cosine, 含变异可见性)、LATEST BY (+ORDER BY)、
+  MATCH/BM25 (需 TEXT INDEX)、空间 ST_WITHIN / `loc <-> ST_POINT` top-k、
+  TIMESERIES 删插、事务回滚。8 seed 全绿。
+
+### 挖出并修复的 12 个 bug
+
+| # | 症状 (fuzz 发现) | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `JOIN … WHERE a.v <> 10` 多返回恰好等于 NULL 行数的行 | `apply_op_value` 的 `Ne => v != target` 在 v=Null 时为 true, 丢了三值逻辑 (SQL: NULL <> x = UNKNOWN) | NULL 操作数一律不匹配 (executor.rs) |
+| 2 | `JOIN … ORDER BY a.id, b.id DESC` 第二排序键失效 | 投影排序的 bare-name 回退把未投影的 `b.id` 误匹配到输出列 `a.id`; 三处同类 (join 投影排序 / join 聚合排序 / finalize_join_result) | 限定名精确匹配 + 裸名唯一命中, 否则回落通用路径; finalize 在投影前于 combined 全列行上解析 |
+| 3 | `WHERE NOT (g < NULL OR …)` 返回全部行 | `eval_expr_on_row` 的 AND/OR 是二值逻辑 (`is_truthy(a) \|\| is_truthy(b)`), NULL 被压成 FALSE, NOT 一翻全过 | Kleene 三值 AND/OR (FALSE 主导/TRUE 主导/其余 NULL) |
+| 4 | `ROUND(48.05, 1)` = 48.1 (SQLite/MySQL 均为 48.0) | `(f*10^d).round()/10^d` 被乘法浮点误差污染 (48.05 的 f64 真值是 48.0499…) | 精确十进制字符串展开 + half-away-from-zero 舍入 (`round_f64_half_away`) |
+| 5 | 变异后 `IN (SELECT …)` 返回已删行 (SQLite 返回 0 行) | `build_in_hashset_from_columnar` 直读列存 SSTable 投影, 绕过 LSM 墓碑/写集合并层 — 冻结在旧快照 | 改用与 JOIN 相同的变异可见扫描 `scan_table_rows_fast_projected` |
+| 6 | `… WHERE id = 100` (非 AUTO_INCREMENT PK, 无索引) 硬报 "Column index not found" | `try_optimize_primary_key_point_query` 假设 PK 自动带列索引 (对非 AUTO_INCREMENT 不成立); `execute_range_query_streaming` 同类 | 无索引 → decline/回落全扫, 语义不变 |
+| 7 | `SELECT MIN(cat) WHERE grp > NULL` 返回 '' (应为 NULL) | `build_comparison_predicate` 用 Value::partial_cmp 的 NULL-最小全序做过滤 → `grp > NULL` 匹配全部行; `v < 100` 也会匹配 NULL 值行 | target 或行值为 NULL 一律不匹配 |
+| 8 | JOIN `ORDER BY i.id, t.id LIMIT 27` 最后一行与无 LIMIT 版本不一致 | join hash 探针的 "LIMIT 提前终止" PERF 优化在 ORDER BY 存在时仍先截断后排序 | ORDER BY 存在时禁止早停 |
+| 9 | `LATEST BY sensor ORDER BY sensor` 返回 2 行 s2 + 0 行 s1 | 物化路径先排序后 apply_latest_by, 后者按索引把 filtered_rows(原始序) 与投影行配对 — 排序置换后错位; 且 HashMap into_values 输出乱序 | 排序置换记录 + filtered_rows 同步重排; apply_latest_by 改两遍法按输入顺序稳定输出 |
+| 10 | `ORDER BY loc <-> ST_POINT(x, y)` 原样返回插入序 | GEOMETRY 距离排序无下推 (VECTOR 有), 列存扫描的投影排序静默跳过求不出键的表达式 | 新 `order_by_needs_full_rows` 路由: 表达式键引用投影外列 → 物化全行排序 (VECTOR 距离键仍走列存 top-k) |
+| 11 | 同上 — 物化路径报 "Unknown function: ST_POINT" | 通用求值器不实现 ST_POINT | evaluator 新增 ST_POINT(x, y[, z]) → Spatial Point/Point3D |
+| 12 | 同上 — 报 "Left operand is not a vector" | `BinaryOperator::L2Distance` 求值只认 Tensor/Vector | Spatial 点对走欧氏距离分支 |
+
+回归覆盖: `tests/test_round13_bug_hunt.rs` 10 例 (Rust) + 两个入库 harness。
+
+### 顺带发现 (非 bug, 记录)
+
+- Python 绑定参数计数宽松: 传 `[vec]` 以外的形状 (如裸 vec 被拆成 N 个标量)
+  不报错, 静默绑定第一个值 — 用法 footgun, 文档已注明 params 必须是 list。
+- 无 TEXT INDEX 时 MATCH 过滤可用但 BM25_SCORE() 为 NULL (分数图仅索引路径
+  填充) — 文档化: BM25_SCORE 需先 `CREATE TEXT INDEX`。
+- TIMESERIES 行不可变: UPDATE 报错提示用 "DELETE (时间范围) + 重插" 替代
+  (by design); DELETE 仅支持 `ts < value` 形式谓词。
+- AVG/SUM 浮点与 SQLite 有 ±1e-6 knife-edge 差异 (SQLite 用 Kahan 求和) —
+  harness 以 2e-6 容差对齐, 属求和顺序噪声非正确性问题。

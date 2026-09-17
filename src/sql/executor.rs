@@ -210,6 +210,13 @@ fn apply_op_value(
         Some(v) => v,
         None => return false,
     };
+    // 🔑 SQL 三值逻辑: NULL 与任何值比较 (含 <>) 结果为 UNKNOWN → 过滤。
+    // 此前 `Ne => v != target` 在 v=Null 时为 true，JOIN/WHERE 快过滤把
+    // `col <> x` 的 NULL 行也算进来 (differential fuzz: JOIN+WHERE qty <> 10
+    // 多返回恰好等于 NULL 行数)。
+    if matches!(v, Value::Null) {
+        return false;
+    }
     match op {
         BinaryOperator::Eq => v == target,
         BinaryOperator::Ne => v != target,
@@ -3518,31 +3525,42 @@ impl QueryExecutor {
         target: Value,
     ) -> Box<dyn Fn(Option<&Value>) -> bool> {
         use crate::sql::ast::BinaryOperator;
+        // 🔑 SQL 三值逻辑: 与 NULL 的任何比较 (= <> < > <= >=) 都是
+        // UNKNOWN → 不匹配。Value::partial_cmp 的 NULL-最小全序是
+        // ORDER BY 语义，直接用于过滤会让 `grp > NULL` 匹配全部行、
+        // `v < 100` 匹配 NULL 值行 (differential fuzz: MIN(cat) WHERE
+        // grp > NULL 返回 '' 而非 NULL)。
+        if matches!(target, Value::Null) {
+            return Box::new(|_| false);
+        }
+        fn non_null<'a>(fv: Option<&'a Value>) -> Option<&'a Value> {
+            fv.filter(|v| !matches!(v, Value::Null))
+        }
         match op {
-            BinaryOperator::Eq => Box::new(move |fv: Option<&Value>| fv == Some(&target)),
+            BinaryOperator::Eq => Box::new(move |fv: Option<&Value>| non_null(fv) == Some(&target)),
             BinaryOperator::Ne => {
                 // NULL != target is NULL (not true), so NULLs don't match.
-                Box::new(move |fv: Option<&Value>| match fv {
+                Box::new(move |fv: Option<&Value>| match non_null(fv) {
                     Some(v) => v != &target,
                     None => false,
                 })
             }
-            BinaryOperator::Lt => Box::new(move |fv: Option<&Value>| match fv {
+            BinaryOperator::Lt => Box::new(move |fv: Option<&Value>| match non_null(fv) {
                 Some(v) => v.partial_cmp(&target) == Some(std::cmp::Ordering::Less),
                 None => false,
             }),
-            BinaryOperator::Gt => Box::new(move |fv: Option<&Value>| match fv {
+            BinaryOperator::Gt => Box::new(move |fv: Option<&Value>| match non_null(fv) {
                 Some(v) => v.partial_cmp(&target) == Some(std::cmp::Ordering::Greater),
                 None => false,
             }),
-            BinaryOperator::Le => Box::new(move |fv: Option<&Value>| match fv {
+            BinaryOperator::Le => Box::new(move |fv: Option<&Value>| match non_null(fv) {
                 Some(v) => matches!(
                     v.partial_cmp(&target),
                     Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
                 ),
                 None => false,
             }),
-            BinaryOperator::Ge => Box::new(move |fv: Option<&Value>| match fv {
+            BinaryOperator::Ge => Box::new(move |fv: Option<&Value>| match non_null(fv) {
                 Some(v) => matches!(
                     v.partial_cmp(&target),
                     Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
@@ -5766,6 +5784,25 @@ impl QueryExecutor {
             }
         };
 
+        // 🔑 ORDER BY 表达式键引用 SELECT 输出之外的列时, 流式扫描的投影
+        // 排序 (try_sort_projected/apply_order_by) 求不出键值, 只能静默跳过
+        // → 返回任意序 (differential fuzz: ORDER BY loc <-> ST_POINT(...)
+        // 原样返回插入序)。统一路由到物化路径 — 物化排序可在 full_row 上
+        // 求值任意键; VECTOR 距离键除外 (列存 top-k / 向量下推接管)。
+        // 🔑 必须放在 resolve_subqueries_stmt 之后: ORDER BY 里的标量子查询
+        // (ABS(v - (SELECT AVG(v) …))) 先物化成字面量, 物化路径的排序键
+        // 求值不认 Subquery 节点 (test_bug_hunt_v92::test_subquery_in_order_by)。
+        if let Some(ref ob) = stmt.order_by {
+            let schema = match stmt.from.as_ref() {
+                Some(crate::sql::ast::TableRef::Table { name, .. }) => {
+                    self.db.get_table_schema(name).ok()
+                }
+                _ => None,
+            };
+            if Self::order_by_needs_full_rows(ob, &stmt.columns, schema.as_deref()) {
+                return self.materialize_as_streaming(stmt);
+            }
+        }
         // Validate bare SELECT column references against the table schema.
         // A column that doesn't exist is a query error (not a silent value
         // from another column). Applies before any fast-path routing so all
@@ -6997,7 +7034,15 @@ impl QueryExecutor {
             });
         }
 
-        // Fallback: use column index
+        // Fallback: use column index — but only when one actually exists.
+        // 🔑 非 AUTO_INCREMENT 的 PRIMARY KEY 不自动建列索引，此前的裸
+        // query_by_column() 直接报 "Column index not found" 硬错误
+        // (differential fuzz: SELECT COUNT(DISTINCT c) … WHERE id = 100)。
+        // 无索引 → 回落全扫描路径，语义仍正确。
+        let index_name = format!("{}.{}", table, column);
+        if !self.db.column_indexes.contains_key(&index_name) {
+            return self.execute_full_scan_streaming(stmt, table);
+        }
         let row_ids = self.db.query_by_column(table, column, value)?;
 
         if row_ids.is_empty() {
@@ -7198,6 +7243,13 @@ impl QueryExecutor {
         }
 
         // 🔧 路径2：非主键列使用列索引 + batch_get (with row cache)
+        // 🔑 无列索引时回落全扫 — 非索引列不保证有索引，裸调用会硬报
+        // "Column index not found" (differential fuzz: WHERE id = 100 的
+        // 聚合查询在非 AUTO_INCREMENT PK 上报错)。
+        let index_name = format!("{}.{}", table, column);
+        if !self.db.column_indexes.contains_key(&index_name) {
+            return self.execute_full_scan_streaming(stmt, table);
+        }
         let row_ids = self.db.query_by_column_between(
             table,
             column,
@@ -12304,6 +12356,15 @@ impl QueryExecutor {
         }
     }
 
+    /// 🔑 三值逻辑的 true/false 判定: NULL → None (UNKNOWN)。
+    /// eval_expr_on_row 的 Kleene AND/OR 语义需要区分 UNKNOWN 与 FALSE。
+    fn truth3(v: &Value) -> Option<bool> {
+        match v {
+            Value::Null => None,
+            other => Some(Self::is_truthy(other)),
+        }
+    }
+
     /// 🔑 Coerce Bool/Int for comparison and arithmetic: TRUE→1, FALSE→0.
     /// Applied when one side is Bool and the other is Integer/Float (or both
     /// are Bool). This makes `1 = TRUE`, `flag = 1` (BOOLEAN col vs INT lit),
@@ -13111,7 +13172,7 @@ impl QueryExecutor {
                                 _ => {
                                     let f = i as f64;
                                     Ok(Value::Float(match fname.as_str() {
-                                        "round" => f.round(),
+                                        "round" => crate::sql::evaluator::round_f64_half_away(f, 0),
                                         "floor" => f.floor(),
                                         "ceil" => f.ceil(),
                                         "log" | "log10" => f.log10(),
@@ -13124,7 +13185,7 @@ impl QueryExecutor {
                             },
                             Value::Float(f) => match fname.as_str() {
                                 "abs" => Ok(Value::Float(f.abs())),
-                                "round" => Ok(Value::Float(f.round())),
+                                "round" => Ok(Value::Float(crate::sql::evaluator::round_f64_half_away(f, 0))),
                                 "floor" => Ok(Value::Float(f.floor())),
                                 "ceil" => Ok(Value::Float(f.ceil())),
                                 "log" | "log10" => Ok(Value::Float(f.log10())),
@@ -14073,10 +14134,29 @@ impl QueryExecutor {
                         }
                     }
                     BinaryOperator::And => {
-                        Ok(Value::Bool(Self::is_truthy(&lv) && Self::is_truthy(&rv)))
+                        // 🔑 Kleene 三值逻辑: FALSE AND 任何 = FALSE,
+                        // TRUE AND TRUE = TRUE, 其余 (含 NULL) = NULL。
+                        // 此前 is_truthy && is_truthy 是二值的 — NULL AND/0R
+                        // 被压成 FALSE, 套上 NOT 后全部行错误通过
+                        // (differential fuzz: WHERE NOT((g < NULL) OR ...) 返回全部行)。
+                        let lb = Self::truth3(&lv);
+                        let rb = Self::truth3(&rv);
+                        Ok(match (lb, rb) {
+                            (Some(false), _) | (_, Some(false)) => Value::Bool(false),
+                            (Some(true), Some(true)) => Value::Bool(true),
+                            _ => Value::Null,
+                        })
                     }
                     BinaryOperator::Or => {
-                        Ok(Value::Bool(Self::is_truthy(&lv) || Self::is_truthy(&rv)))
+                        // 🔑 Kleene 三值逻辑: TRUE OR 任何 = TRUE,
+                        // FALSE OR FALSE = FALSE, 其余 (含 NULL) = NULL。
+                        let lb = Self::truth3(&lv);
+                        let rb = Self::truth3(&rv);
+                        Ok(match (lb, rb) {
+                            (Some(true), _) | (_, Some(true)) => Value::Bool(true),
+                            (Some(false), Some(false)) => Value::Bool(false),
+                            _ => Value::Null,
+                        })
                     }
                     BinaryOperator::Add => Self::positional_add(&lv, &rv),
                     BinaryOperator::Sub => Self::positional_sub(&lv, &rv),
@@ -14866,6 +14946,14 @@ impl QueryExecutor {
                     // scan — they need the index pushdown paths below
                     // (FAST PATH 0a/0b/-1/-1b).
                     && stmt.where_clause.as_ref().is_none_or(|w| !Self::expr_needs_materialized_path(w))
+                    // 🔑 ORDER BY 表达式键引用投影外列 (如 GEOMETRY 的
+                    // `loc <-> ST_POINT(...)`) 时列存扫描的投影排序无法
+                    // 求键 → 静默乱序。放行到通用 SqlRow 路径 (full_row
+                    // 键求值); VECTOR 距离键仍由列存 top-k 接管。
+                    && stmt.order_by.as_ref().is_none_or(|ob| {
+                        let schema = self.db.get_table_schema(table_name).ok();
+                        !Self::order_by_needs_full_rows(ob, &stmt.columns, schema.as_deref())
+                    })
                 {
                     // 🔑 PERF: PK point query fast path — `WHERE pk = literal`
                     // should use binary search in the segment's row_map (O(log N)),
@@ -15913,6 +16001,8 @@ impl QueryExecutor {
 
         // Order by (with alias resolution)
         let mut sorted_rows = projected_rows;
+        // 排序产生的行置换 (排序后位置 → 原始索引); 未排序时为 None
+        let mut permutation: Option<Vec<usize>> = None;
         if let Some(ref order_by) = stmt.order_by {
             // Build alias map: alias -> projected column index
             let mut alias_map = std::collections::HashMap::new();
@@ -15927,11 +16017,17 @@ impl QueryExecutor {
                 }
             }
 
-            // Create temporary rows with full data for sorting
-            let mut rows_with_keys: Vec<(Vec<Value>, Vec<Value>)> = sorted_rows
+            // Create temporary rows with full data for sorting.
+            // 🔑 携带原始索引: LATEST BY 在排序之后应用, 但 apply_latest_by
+            // 按索引把 filtered_rows (原始顺序) 与投影行配对 — 排序置换后
+            // 两者错位, 会把 A 行的分组键/timestamp 配到 B 行的投影值
+            // (differential fuzz: LATEST BY sensor ORDER BY sensor 返回
+            // 2 行 s2 + 0 行 s1)。置换记录让 filtered_rows 同步重排。
+            let mut rows_with_keys: Vec<(Vec<Value>, Vec<Value>, usize)> = sorted_rows
                 .into_iter()
                 .zip(filtered_rows.iter())
-                .map(|(proj_row, (_, full_row))| {
+                .enumerate()
+                .map(|(orig_idx, (proj_row, (_, full_row)))| {
                     // Compute sort keys
                     let sort_keys: Result<Vec<Value>> = order_by
                         .iter()
@@ -16011,7 +16107,7 @@ impl QueryExecutor {
                         })
                         .collect();
 
-                    sort_keys.map(|keys| (keys, proj_row))
+                    sort_keys.map(|keys| (keys, proj_row, orig_idx))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -16028,14 +16124,22 @@ impl QueryExecutor {
                 std::cmp::Ordering::Equal
             });
 
-            sorted_rows = rows_with_keys.into_iter().map(|(_, row)| row).collect();
+            let (sorted_proj, sort_perm): (Vec<Vec<Value>>, Vec<usize>) =
+                rows_with_keys.into_iter().map(|(_, row, i)| (row, i)).unzip();
+            sorted_rows = sorted_proj;
+            permutation = Some(sort_perm);
         }
 
         // Apply LATEST BY (time-series deduplication)
         let final_sorted_rows = if let Some(ref latest_by_cols) = stmt.latest_by {
+            // 🔑 filtered_rows 按排序置换同步重排, 与投影行保持索引对齐。
+            let aligned_filtered: Vec<(u64, SqlRow)> = match &permutation {
+                Some(perm) => perm.iter().map(|&i| filtered_rows[i].clone()).collect(),
+                None => filtered_rows.clone(),
+            };
             self.apply_latest_by(
                 sorted_rows,
-                &filtered_rows,
+                &aligned_filtered,
                 latest_by_cols,
                 &combined_schema,
             )?
@@ -16400,6 +16504,57 @@ impl QueryExecutor {
             joined
         };
 
+        // 🔑 ORDER BY 先于投影在 combined 全列行上解析: joined 行携带两表
+        // 全列 (combined_cols 含 "b.id" 等未投影列)。旧实现投影后才按输出
+        // 列名匹配, `ORDER BY a.id, b.id DESC` 的 b.id (未投影) 被裸名
+        // "id" 误匹配到 a.id — 第二排序键失效 (differential fuzz)。
+        // 限定名精确匹配 combined_cols; 裸名只允许唯一命中; 两者都失败的
+        // 键留给投影后按输出名 (别名) 二次解析。
+        let mut combined_specs: Vec<(usize, bool)> = Vec::new();
+        let mut unresolved_ob: Vec<&crate::sql::ast::OrderByExpr> = Vec::new();
+        if let Some(ref order_by) = stmt.order_by {
+            for ob in order_by {
+                let resolved = match &ob.expr {
+                    crate::sql::ast::Expr::Column(cn) => {
+                        if cn.contains('.') {
+                            combined_cols.iter().position(|c| c == cn)
+                        } else {
+                            let hits: Vec<usize> = combined_cols
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.rsplit('.').next().unwrap_or(c) == cn)
+                                .map(|(i, _)| i)
+                                .collect();
+                            if hits.len() == 1 {
+                                Some(hits[0])
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                match resolved {
+                    Some(i) => combined_specs.push((i, ob.asc)),
+                    None => unresolved_ob.push(ob),
+                }
+            }
+        }
+        let mut filtered_joined = filtered_joined;
+        if !combined_specs.is_empty() {
+            filtered_joined.sort_by(|a, b| {
+                for &(idx, asc) in &combined_specs {
+                    let av = a.get(idx).cloned().unwrap_or(Value::Null);
+                    let bv = b.get(idx).cloned().unwrap_or(Value::Null);
+                    let cmp = order_by_cmp(&av, &bv);
+                    if cmp != std::cmp::Ordering::Equal {
+                        return if asc { cmp } else { cmp.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
         // Resolve output columns.
         let (column_names, projected_rows) = if stmt.columns.len() == 1
             && matches!(stmt.columns[0], SelectColumn::Star)
@@ -16498,42 +16653,50 @@ impl QueryExecutor {
             (out_names, proj)
         };
 
-        // Apply ORDER BY if present.
-        let final_rows = if let Some(ref order_by) = stmt.order_by {
-            if order_by.is_empty() {
-                projected_rows
-            } else {
-                let sort_specs: Vec<(usize, bool)> = order_by
-                    .iter()
-                    .filter_map(|ob| {
-                        if let crate::sql::ast::Expr::Column(cn) = &ob.expr {
-                            let bare = cn.rsplit('.').next().unwrap_or(cn);
-                            column_names
-                                .iter()
-                                .position(|c| c == bare || c == cn)
-                                .map(|idx| (idx, ob.asc))
+        // 投影后二次解析: 只处理 combined 行上没命中的键 (别名/输出名)。
+        // 限定名精确匹配输出列; 裸名唯一命中; 未命中则跳过 (旧行为)。
+        let final_rows = if !unresolved_ob.is_empty() {
+            let sort_specs: Vec<(usize, bool)> = unresolved_ob
+                .iter()
+                .filter_map(|ob| {
+                    if let crate::sql::ast::Expr::Column(cn) = &ob.expr {
+                        if cn.contains('.') {
+                            column_names.iter().position(|c| c == cn)
                         } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if sort_specs.is_empty() {
-                    projected_rows
-                } else {
-                    let mut rows = projected_rows;
-                    rows.sort_by(|a, b| {
-                        for &(idx, asc) in &sort_specs {
-                            let av = a.get(idx).cloned().unwrap_or(Value::Null);
-                            let bv = b.get(idx).cloned().unwrap_or(Value::Null);
-                            let cmp = order_by_cmp(&av, &bv);
-                            if cmp != std::cmp::Ordering::Equal {
-                                return if asc { cmp } else { cmp.reverse() };
+                            let hits: Vec<usize> = column_names
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.rsplit('.').next().unwrap_or(c) == cn)
+                                .map(|(i, _)| i)
+                                .collect();
+                            if hits.len() == 1 {
+                                Some(hits[0])
+                            } else {
+                                None
                             }
                         }
-                        std::cmp::Ordering::Equal
-                    });
-                    rows
-                }
+                        .map(|idx| (idx, ob.asc))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if sort_specs.is_empty() {
+                projected_rows
+            } else {
+                let mut rows = projected_rows;
+                rows.sort_by(|a, b| {
+                    for &(idx, asc) in &sort_specs {
+                        let av = a.get(idx).cloned().unwrap_or(Value::Null);
+                        let bv = b.get(idx).cloned().unwrap_or(Value::Null);
+                        let cmp = order_by_cmp(&av, &bv);
+                        if cmp != std::cmp::Ordering::Equal {
+                            return if asc { cmp } else { cmp.reverse() };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                rows
             }
         } else {
             projected_rows
@@ -16735,18 +16898,22 @@ impl QueryExecutor {
         // 🔑 PERF: early-terminate when LIMIT is set — avoids probing all N
         // left rows when only K matches are needed. For LIMIT 100 on a 20K-row
         // table this cuts the probe loop from 20K to ~100 iterations.
+        // 🔑 但 ORDER BY 存在时禁止早停: join 输出必须先收集全量再排序,
+        // 截断 27 行再排序会让 LIMIT 边界取到错误的行 (differential fuzz:
+        // ORDER BY i.id, t.id LIMIT 27 的最后一行与无 LIMIT 版本不一致)。
         let limit = stmt.limit.unwrap_or(usize::MAX);
+        let early_break_ok = stmt.where_clause.is_none() && stmt.order_by.is_none();
         let has_where = stmt.where_clause.is_some();
         let lncol = lschema.columns.len();
         let mut joined: Vec<Vec<Value>> = Vec::with_capacity(lrows.len().min(limit));
         for (_, lrow) in &lrows {
-            if !has_where && joined.len() >= limit {
+            if early_break_ok && joined.len() >= limit {
                 break;
             }
             if let Some(k) = lrow.get(lcol_pos).and_then(to_key) {
                 if let Some(matches) = hash.get(&k) {
                     for &ri in matches {
-                        if !has_where && joined.len() >= limit {
+                        if early_break_ok && joined.len() >= limit {
                             break;
                         }
                         let rrow = &rrows[ri].1;
@@ -17307,16 +17474,26 @@ impl QueryExecutor {
                     // Match the output name, or the canonical name of the
                     // SELECT expression at that output position (the output
                     // may be aliased: `COUNT(*) AS n … ORDER BY COUNT(*)`).
-                    let Some(p) = out_names
-                        .iter()
-                        .position(|n| n == &name || n.rsplit('.').next().unwrap_or(n) == bare)
-                        .or_else(|| {
-                            stmt.columns.iter().position(|sc| match sc {
-                                SelectColumn::Expr(e, _) => Self::expr_to_column_name(e) == name,
-                                _ => false,
-                            })
+                    // 🔑 限定名必须精确匹配; 裸名只允许唯一命中 (否则排序键
+                    // 有歧义 → 回落通用路径)。bare-name 回退曾让
+                    // `ORDER BY t.grp` 误匹配输出列 `i.grp` (differential fuzz)。
+                    let out_match = if name.contains('.') {
+                        out_names.iter().position(|n| n == &name)
+                    } else {
+                        let hits: Vec<usize> = out_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| n.rsplit('.').next().unwrap_or(n) == bare)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if hits.len() == 1 { Some(hits[0]) } else { None }
+                    };
+                    let Some(p) = out_match.or_else(|| {
+                        stmt.columns.iter().position(|sc| match sc {
+                            SelectColumn::Expr(e, _) => Self::expr_to_column_name(e) == name,
+                            _ => false,
                         })
-                    else {
+                    }) else {
                         return Ok(None);
                     };
                     specs.push((p, oe.asc));
@@ -17412,22 +17589,34 @@ impl QueryExecutor {
             )
         };
 
-        // ORDER BY on projected output columns, then LIMIT/OFFSET.
-        let mut rows = projected;
-        if let Some(ref ob) = stmt.order_by {
-            let mut specs: Vec<(usize, bool)> = Vec::new();
-            for oe in ob {
-                let Expr::Column(cn) = &oe.expr else {
-                    return Ok(None);
-                };
-                let Some(p) = column_names.iter().position(|n| {
-                    n == cn
-                        || n.rsplit('.').next().unwrap_or(n) == cn.rsplit('.').next().unwrap_or(cn)
-                }) else {
-                    return Ok(None);
-                };
-                specs.push((p, oe.asc));
-            }
+            // ORDER BY on projected output columns, then LIMIT/OFFSET.
+            let mut rows = projected;
+            if let Some(ref ob) = stmt.order_by {
+                let mut specs: Vec<(usize, bool)> = Vec::new();
+                for oe in ob {
+                    let Expr::Column(cn) = &oe.expr else {
+                        return Ok(None);
+                    };
+                    // 🔑 限定名必须精确匹配输出列; 裸名只允许唯一命中。
+                    // 此前 bare-name 回退让 `ORDER BY b.id` 误匹配输出列
+                    // `a.id` (同为裸名 "id")，第二排序键实际排的是 a.id —
+                    // 方向丢失、次序不稳定 (differential fuzz 抓出)。
+                    let p = if cn.contains('.') {
+                        column_names.iter().position(|n| n == cn)
+                    } else {
+                        let hits: Vec<usize> = column_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| n.rsplit('.').next().unwrap_or(n) == cn)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if hits.len() == 1 { Some(hits[0]) } else { None }
+                    };
+                    let Some(p) = p else {
+                        return Ok(None);
+                    };
+                    specs.push((p, oe.asc));
+                }
             if !specs.is_empty() {
                 rows.sort_by(|a, b| {
                     for &(i, asc) in &specs {
@@ -18243,6 +18432,13 @@ impl QueryExecutor {
             .where_clause
             .as_ref()
             .and_then(|clause| Self::compile_where(clause, &schema));
+        // 🔑 WHERE 存在但编译失败 (嵌套子查询/表达式谓词等非
+        // col-op-literal 形状) 时必须 decline — 继续执行会静默丢掉
+        // WHERE, IN 集合变成全表 (test_bug_hunt_v76::test_nested_subquery:
+        // v > (SELECT MIN(v) …) 的内层过滤被丢, 返回 {1,2,3} 而非 {2,3})。
+        if subquery_stmt.where_clause.is_some() && compiled_where.is_none() {
+            return None;
+        }
         let mut where_positions = Vec::new();
         if let Some(ref cw) = compiled_where {
             cw.collect_positions(&mut where_positions);
@@ -18332,14 +18528,19 @@ impl QueryExecutor {
     fn build_in_hashset_from_columnar(
         &self,
         table_name: &str,
-        col_types: &[crate::types::ColumnType],
+        _col_types: &[crate::types::ColumnType],
         inner_col_pos: usize,
         compiled_where: Option<&CompiledWhere>,
         where_positions: &[usize],
         where_pos_to_idx: &[Option<usize>],
     ) -> Option<(std::collections::HashSet<Value>, bool)> {
-        // Ensure all buffered rows are in the SSTable before scanning.
-        self.db.finalize_columnar_buffer(table_name);
+        // 🔑 旧实现直接读 columnar SSTable 投影
+        // (scan_columnar_sstable_projection)，绕过 LSM 墓碑/写集合并层 —
+        // DELETE/UPDATE 之后 IN (SELECT …) 仍返回已删行 (differential fuzz:
+        // DELETE red 后 IN 命中全部旧行, SQLite 返回 0 行)。改用与 JOIN
+        // 投影扫描相同的变异可见路径 (scan_table_rows_fast_projected)，
+        // 快慢路径共享同一数据视图。
+        let schema = self.db.get_table_schema(table_name).ok()?;
 
         // Collect distinct column positions we need to materialize:
         // the inner SELECT column + every column referenced by WHERE.
@@ -18348,24 +18549,21 @@ impl QueryExecutor {
         needed.sort_unstable();
         needed.dedup();
 
-        let mut iter = self
-            .db
-            .scan_columnar_sstable_projection(table_name, col_types, &needed)
+        let rows = self
+            .scan_table_rows_fast_projected(table_name, &schema, Some(&needed))
             .ok()?;
 
         // Map from schema column position → index within `needed` (and thus
-        // within the iterator's row, since projection preserves order).
+        // within the projected row, since projection preserves order).
         let proj_idx_of =
             |col_pos: usize| -> Option<usize> { needed.iter().position(|&c| c == col_pos) };
         let inner_proj = proj_idx_of(inner_col_pos)?;
 
-        let has_where = compiled_where.is_some();
-        let cap = if has_where { 1024 } else { 16384 };
-        let mut set = std::collections::HashSet::with_capacity(cap);
+        let mut set = std::collections::HashSet::with_capacity(rows.len().max(1024));
         let mut where_buf: Vec<Value> = Vec::with_capacity(where_positions.len().max(1));
         let mut has_null = false;
 
-        for row in iter.by_ref() {
+        for (_rid, row) in rows {
             if let Some(cw) = compiled_where {
                 where_buf.clear();
                 let mut ok = true;
@@ -19144,7 +19342,7 @@ impl QueryExecutor {
                 }
             })
         };
-        let mut groups: HashMap<Vec<Value>, (i64, Vec<Value>)> = HashMap::new();
+        let mut groups: HashMap<Vec<Value>, (i64, usize)> = HashMap::new();
 
         for (i, (_, full_row)) in filtered_rows.iter().enumerate() {
             // Extract grouping key as Vec<Value> — zero String allocation
@@ -19173,21 +19371,27 @@ impl QueryExecutor {
                 None => filtered_rows[i].0 as i64,
             };
 
-            // Update group if this is a newer record
-            let projected_row = projected_rows[i].clone();
-            groups
-                .entry(group_key)
-                .and_modify(|(max_ts, row)| {
-                    if ts_value > *max_ts {
-                        *max_ts = ts_value;
-                        *row = projected_row.clone();
-                    }
-                })
-                .or_insert((ts_value, projected_row));
+            // Track the newest row's INDEX per group (ties keep the first seen,
+            // matching the old `ts_value > *max_ts` semantics).
+            match groups.get(&group_key) {
+                Some((max_ts, _)) if ts_value <= *max_ts => {}
+                _ => {
+                    groups.insert(group_key, (ts_value, i));
+                }
+            }
         }
 
-        // Extract all latest records
-        Ok(groups.into_values().map(|(_, row)| row).collect())
+        // 🔑 按输入顺序输出每组胜者 (两遍法): 调用方传入的 projected_rows
+        // 可能已经 ORDER BY 排序 — 旧实现 HashMap::into_values 的迭代序
+        // 会把排序打乱 (LATEST BY sensor ORDER BY sensor 输出乱序/逆序)。
+        let winners: std::collections::HashSet<usize> =
+            groups.values().map(|(_, i)| *i).collect();
+        Ok(projected_rows
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| winners.contains(i))
+            .map(|(_, row)| row)
+            .collect())
     }
 
     /// Apply GROUP BY aggregation
@@ -19866,6 +20070,71 @@ impl QueryExecutor {
     /// relying on the collected set for column PRUNING can detect that a
     /// referenced column might be missed and disable pruning (a pruned column
     /// referenced by a WHERE would otherwise silently evaluate to no-match).
+    /// ORDER BY 表达式键是否引用了 SELECT 输出之外的列 → 需要物化全行排序。
+    /// 列名/字面量键不算 (各路径的投影列/别名/序号解析自行处理)。
+    /// 距离键 (<->/<=>) 的左列是 VECTOR 时豁免 — 列存 top-k / 向量下推接管;
+    /// GEOMETRY 列 (loc <-> ST_POINT(...)) 或 schema 未知时保守物化。
+    fn order_by_needs_full_rows(
+        order_by: &[crate::sql::ast::OrderByExpr],
+        columns: &[SelectColumn],
+        schema: Option<&TableSchema>,
+    ) -> bool {
+        let mut out_names: Vec<String> = Vec::new();
+        for c in columns {
+            match c {
+                SelectColumn::Star => return false, // SELECT *: 所有列都可用
+                SelectColumn::Column(n) => {
+                    out_names.push(n.clone());
+                    out_names.push(n.rsplit('.').next().unwrap_or(n).to_string());
+                }
+                SelectColumn::ColumnWithAlias(n, a) => {
+                    out_names.push(a.clone());
+                    out_names.push(n.clone());
+                    out_names.push(n.rsplit('.').next().unwrap_or(n).to_string());
+                }
+                SelectColumn::Expr(_, Some(a)) => out_names.push(a.clone()),
+                SelectColumn::Expr(_, None) => {}
+            }
+        }
+        for oe in order_by {
+            if matches!(&oe.expr, Expr::Column(_) | Expr::Literal(_)) {
+                continue;
+            }
+            // 向量距离键: 左列是 VECTOR → 列存 top-k / 向量下推处理
+            if let Expr::BinaryOp { left, op, .. } = &oe.expr {
+                if matches!(
+                    op,
+                    crate::sql::ast::BinaryOperator::L2Distance
+                        | crate::sql::ast::BinaryOperator::CosineDistance
+                ) {
+                    if let (Expr::Column(cname), Some(schema)) = (left.as_ref(), schema) {
+                        let bare = cname.rsplit('.').next().unwrap_or(cname);
+                        if let Some(col) = schema.columns.iter().find(|c| c.name == bare) {
+                            if matches!(col.col_type, crate::types::ColumnType::Tensor(_)) {
+                                continue; // 向量列 → 下推接管
+                            }
+                        }
+                    }
+                }
+            }
+            // 其余表达式: 引用的列必须全部在输出里, 否则投影排序求不出键。
+            let mut refs: Vec<String> = Vec::new();
+            if !Self::collect_column_names_strict(&oe.expr, &mut refs) {
+                return true; // 未知形状 → 保守物化
+            }
+            for r in refs {
+                let bare = r.rsplit('.').next().unwrap_or(&r);
+                let hit = out_names.iter().any(|n| {
+                    n == &r || n == bare || n.rsplit('.').next().unwrap_or(n) == bare
+                });
+                if !hit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn collect_column_names_strict(expr: &Expr, out: &mut Vec<String>) -> bool {
         match expr {
             Expr::Column(name) => {
@@ -26115,8 +26384,15 @@ impl QueryExecutor {
             }
         }
 
-        // 🔧 Non-AUTO_INCREMENT primary key: Use column index to lookup row_id
-        // The primary key column has an auto-created index at table creation
+        // 🔧 Non-AUTO_INCREMENT primary key: resolve value → row_id via
+        // column index IF one exists. 非 AUTO_INCREMENT PK 并不自动建列索引 —
+        // 此前裸 query_by_column 直接硬报 "Column index not found"
+        // (differential fuzz: SELECT COUNT(DISTINCT …), MAX(…) WHERE id = 100
+        // 报错)。无索引 → decline 走通用扫描路径，语义仍正确。
+        let index_name = format!("{}.{}", table_name, col_name);
+        if !self.db.column_indexes.contains_key(&index_name) {
+            return Ok(None);
+        }
         let row_ids = self
             .db
             .query_by_column(table_name, &col_name, &target_value)?;

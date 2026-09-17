@@ -1377,8 +1377,12 @@ impl ExprEvaluator {
 
                 match val {
                     Value::Float(f) => {
-                        let multiplier = 10_f64.powi(decimals);
-                        Ok(Value::Float((f * multiplier).round() / multiplier))
+                        // 🔑 对 f64 的真实二进制值做精确十进制 half-away-from-zero
+                        // 舍入 (与 SQLite/MySQL 一致)。旧的 (f*10^d).round()/10^d
+                        // 被乘法自身的浮点误差污染: 48.05*10 恰好落到 480.5 →
+                        // 48.1, 而 48.05 的 f64 真值是 48.04999… → 应为 48.0
+                        // (differential fuzz 对 SQLite 抓出)。
+                        Ok(Value::Float(round_f64_half_away(f, decimals)))
                     }
                     Value::Integer(i) => {
                         // 🔑 Bug fix: decimals was ignored for Integer input.
@@ -1660,6 +1664,54 @@ impl ExprEvaluator {
             }
 
             // E-SQL Spatial Functions
+            // 🔑 ST_POINT(x, y[, z]) — 构造几何点。此前只在 parser 的
+            // 特定上下文可用, 通用求值器不认识 → `loc <-> ST_POINT(...)`
+            // 的 ORDER BY 键求值报 "Unknown function" (differential fuzz)。
+            "st_point" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(MoteDBError::InvalidArgument(
+                        "ST_POINT() takes 2 or 3 arguments".to_string(),
+                    ));
+                }
+                let x = match self.eval(&args[0], row)? {
+                    Value::Float(f) => f,
+                    Value::Integer(i) => i as f64,
+                    Value::Null => return Ok(Value::Null),
+                    _ => {
+                        return Err(MoteDBError::TypeError(
+                            "ST_POINT() coordinates must be numeric".to_string(),
+                        ))
+                    }
+                };
+                let y = match self.eval(&args[1], row)? {
+                    Value::Float(f) => f,
+                    Value::Integer(i) => i as f64,
+                    Value::Null => return Ok(Value::Null),
+                    _ => {
+                        return Err(MoteDBError::TypeError(
+                            "ST_POINT() coordinates must be numeric".to_string(),
+                        ))
+                    }
+                };
+                if args.len() == 3 {
+                    let z = match self.eval(&args[2], row)? {
+                        Value::Float(f) => f,
+                        Value::Integer(i) => i as f64,
+                        Value::Null => return Ok(Value::Null),
+                        _ => {
+                            return Err(MoteDBError::TypeError(
+                                "ST_POINT() coordinates must be numeric".to_string(),
+                            ))
+                        }
+                    };
+                    return Ok(Value::Spatial(Box::new(crate::types::Geometry::Point3D(
+                        crate::types::Point3D::new(x, y, z),
+                    ))));
+                }
+                Ok(Value::Spatial(Box::new(crate::types::Geometry::Point(
+                    crate::types::Point::new(x, y),
+                ))))
+            }
             "st_distance" => {
                 if args.len() != 2 {
                     return Err(MoteDBError::InvalidArgument(
@@ -2357,6 +2409,17 @@ impl ExprEvaluator {
 
     /// L2 Distance (Euclidean): <->
     fn l2_distance(&self, left: Value, right: Value) -> Result<Value> {
+        // 🔑 GEOMETRY 点之间的欧氏距离: `loc <-> ST_POINT(x, y)`。
+        // Spatial 操作数不走向量切片 (differential fuzz: 此前直接报
+        // "Left operand is not a vector")。
+        if matches!(left, Value::Spatial(_)) || matches!(right, Value::Spatial(_)) {
+            let p1 = point3d_of(&left)
+                .ok_or_else(|| MoteDBError::TypeError("not a point geometry".into()))?;
+            let p2 = point3d_of(&right)
+                .ok_or_else(|| MoteDBError::TypeError("not a point geometry".into()))?;
+            let (dx, dy, dz) = (p1.x - p2.x, p1.y - p2.y, p1.z - p2.z);
+            return Ok(Value::Float((dx * dx + dy * dy + dz * dz).sqrt()));
+        }
         let (v1, v2) = self.extract_vector_slices(&left, &right)?;
 
         if v1.len() != v2.len() {
@@ -2658,6 +2721,68 @@ pub(crate) fn point3d_of(v: &Value) -> Option<crate::types::Point3D> {
 pub(crate) fn euclid3(p: &crate::types::Point3D, x: f64, y: f64, z: f64) -> f64 {
     let (dx, dy, dz) = (p.x - x, p.y - y, p.z - z);
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// 🔑 ROUND(x, d): 对 f64 的真实二进制值做精确十进制 half-away-from-zero
+/// 舍入。f64 的十进制展开有限 (≤17 位有效数字)，用 `{:.*}` 打出足够多位的
+/// 精确展开后在字符串上舍入，避开 `(f*10^d).round()` 的乘法浮点误差
+/// (48.05 → f64 真值 48.0499… → 48.0，与 SQLite/MySQL 一致)。
+pub(crate) fn round_f64_half_away(v: f64, decimals: i32) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    if decimals < 0 {
+        // 负数位: 先舍到 10^|d| 的倍数 (对二进制真值精确)，再乘回。
+        let factor = 10_f64.powi(-decimals);
+        return round_f64_half_away(v / factor, 0) * factor;
+    }
+    let decimals = decimals.min(15) as usize;
+    // 展开到 decimals+16 位 — 超过 f64 精度，展开是精确的
+    let s = format!("{:.*}", decimals + 16, v);
+    let (neg, rest) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.as_str()),
+    };
+    let (int_part, frac) = match rest.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => return v,
+    };
+    if frac.len() <= decimals {
+        return v; // 已经精确，无需舍入
+    }
+    let round_up = frac.as_bytes()[decimals] >= b'5'; // half → away from zero
+    let kept = &frac[..decimals];
+    let (ri, rf) = if round_up {
+        let mut digits = format!("{}{}", int_part, kept).into_bytes();
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+        let all = String::from_utf8(digits).expect("ascii");
+        let split = all.len() - decimals;
+        let a = all[..split].to_string();
+        let b = all[split..].to_string();
+        (a, b)
+    } else {
+        (int_part.to_string(), kept.to_string())
+    };
+    let out = if decimals > 0 {
+        format!("{}.{}", ri, rf)
+    } else {
+        ri
+    };
+    let mag = out.parse::<f64>().unwrap_or(v);
+    if neg { -mag } else { mag }
 }
 
 #[cfg(test)]
