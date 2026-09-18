@@ -1,0 +1,66 @@
+{
+ "artifact_mb": {
+  "motedb_cli": 7.0,
+  "python_so": 6.5
+ },
+ "open_fresh_rss_mb": 2.3,
+ "load": {
+  "rows_per_s": 62181,
+  "python_conv_s": 0.84,
+  "load_s": 1.61,
+  "driver_arrays_mb": 160.6,
+  "load_peak_rss_delta_mb": 210.9,
+  "disk_wal_pre_cp_mb": 331.8,
+  "checkpoint_s": 0.34,
+  "disk_after_cp_mb": 162.0
+ },
+ "index_fts": {
+  "build_s": 3.37,
+  "rss_delta_mb": 5.5,
+  "disk_mb": 175.9
+ },
+ "query_rss_delta_mb": {
+  "point": 0.0,
+  "range_agg_fused": -0.0,
+  "range_agg_between_80pct": 0.0,
+  "groupby": -0.0,
+  "topk": 0.0,
+  "join": 63.2,
+  "fts_match": -0.0,
+  "vector_knn10": -0.0,
+  "full_scan_project": 1.1
+ },
+ "steady_state_rss_delta_mb": 159.5,
+ "latency_ms": {
+  "point": 0.0,
+  "range_agg_fused": 1.25,
+  "range_agg_between_80pct": 0.78,
+  "groupby": 1.71,
+  "knn10": 6.14
+ },
+ "reopen": {
+  "open_s": 0.019,
+  "rss_delta_mb": -153.7
+ },
+ "crash_recovery": {
+  "reopen_s": 0.012,
+  "rows_visible": 1300,
+  "expected": 1300
+ },
+ "edge_preset": {
+  "load_s": 2.2,
+  "disk_pre_cp_mb": 327.1,
+  "checkpoint_s": 0.34,
+  "disk_mb": 157.3,
+  "knn_first_query_rss_mb": -6.9,
+  "knn_p50_ms": 26.39
+ },
+ "sqlite_ref": {
+  "load_s": 0.04,
+  "load_rss_delta_mb": 0.0,
+  "disk_mb": 12.8,
+  "point_rss": -0.0,
+  "range_agg_rss": -0.0,
+  "groupby_rss": 0.1
+ }
+}

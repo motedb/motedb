@@ -1014,3 +1014,40 @@ LATEST BY 100 组 @50K 13.3 ms (物化路径结构未变); 新能力 GROUP BY �
 `id % 100` 73.6 ms — 走物化 SqlRow 路径 (对照组普通列 GROUP BY 1.39 ms
 走融合快路径), 与 SQLite 自身的 group-by 形状 (~58-60 ms) 同量级; 这是新
 功能的首版成本而非回退, 位置化表达式求值记为后续优化项。
+
+## Round 13c — 资源消耗全面测评 (v0.10.0) + 两个资源黑洞修复
+
+`resource_bench.py` (新入库): 100K 行 × (ts/dev/val/text/384 维向量) 数据集,
+psutil 50ms 峰值采样, 查询内存取 3 窗口中位数 (jemalloc 保留使单采样高方差)。
+
+### 资源画像 (v0.10.0, M-series, 100K×384)
+
+| 维度 | 数值 |
+|---|---|
+| 工件 | CLI 7.0 MB / Python .so 6.5 MB |
+| 空库 open | +2.3 MB RSS |
+| 加载 | 62K rows/s (1.6s); 引擎侧峰值 Δ 211 MB; WAL 332 MB → checkpoint 0.34s → **162 MB** (回收 51%) |
+| FTS 索引构建 | 3.4s, +5.5 MB RSS, +14 MB 盘 |
+| 查询内存 (峰值Δ中位) | 点查/范围聚合/GROUP BY/top-k/FTS/knn 全部 **≈0**; join 63 MB (62 万行物化); 5 万行投影扫描 1.1 MB |
+| steady-state (缓存填满) | +160 MB (64MB 通用 + 向量解码预算) |
+| 重开 | 19 ms; **crash 恢复** (kill -9 → WAL 重放) 12 ms, 1300/1300 行可见 |
+| edge preset | 盘 157 MB (zstd); knn 流式 26 ms (默认 6 ms — 32MB 预算下内存换时间), 首查 RSS Δ ≈ 0 |
+
+SQLite 参照 (同形状无向量列): 盘 12.8 MB / 全查询 RSS ≈ 0 — 磁盘对等比较见
+compete_bench (186.5 vs 212.6 MB, 双方含向量)。
+
+### 测评挖出并修复的两个资源黑洞
+
+1. **join WHERE 无谓词下推** — `a JOIN b ON k WHERE a.id≤N AND b.id≤M` 先
+   物化全表叉积再过滤: 5K×500 自 join 曾 **11.4 s + 5.2 GB RSS** (1.56 亿
+   中间行)。修复: AND 链中 `alias.col op literal` 按表前缀下推进两侧投影
+   扫描 (多路 join + 2 表 hash 路径; OR/NOT/LIKE/IS NULL 等留在 join 后
+   过滤, NULL 三值语义由 apply_op_value 保证)。修复后同查询 **20.2 ms +
+   7.3 MB** (567×/700×)。
+2. **单 BETWEEN 聚合未进融合路径** — `WHERE id BETWEEN a AND b` 的
+   COUNT+AVG 走物化扫描: 88 ms + 312 MB (80% 范围 @100K)。修复:
+   parse_where_comparisons 把 BETWEEN 折叠为 `>= AND <=` 两个比较
+   (NOT BETWEEN 是 OR 语义, 正确回落通用路径)。修复后 **0.78 ms + 0 MB**。
+
+回归: test_round13_bug_hunt.rs 新增 join 下推选择性/NULL/UPDATE 可见性
+回归 (14/14) + fuzz tier-1 6 seed 全绿 (BETWEEN/下推语义对拍 SQLite)。

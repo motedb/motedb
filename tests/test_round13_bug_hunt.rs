@@ -415,3 +415,52 @@ fn concat_skips_null_arguments() {
     assert_eq!(r[1][0], motedb::types::Value::text("hello".into()));
     assert!(matches!(r[1][1], Value::Null));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Round 13c (资源测评挖出): join 单表谓词下推 — 曾先物化全表叉积再过滤
+#[test]
+fn join_where_pushdown_selective_and_null_safe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("pd.mote")).unwrap());
+    ex(&db, "CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
+    ex(&db, "CREATE TABLE b (id INT PRIMARY KEY, g INT, w INT)");
+    for i in 1..=50i64 {
+        let v = if i % 7 == 0 { "NULL" } else { &(i * 2).to_string() };
+        ex(&db, &format!("INSERT INTO a VALUES ({}, {}, {})", i, i % 5, v));
+        ex(&db, &format!("INSERT INTO b VALUES ({}, {}, {})", i, i % 5, i * 3));
+    }
+    // 双侧谓词 + 跨表不等式 + NULL 三值: 下推与后过滤结果一致
+    let sql = "SELECT COUNT(*) FROM a x JOIN b y ON x.g = y.g \
+               WHERE x.id <= 20 AND y.id <= 30 AND x.v IS NOT NULL AND x.v <> 10";
+    let got = rows(&db, sql);
+    // 手工期望: x∈{id≤20, v 非 NULL 且 ≠10}, y∈{id≤30}, g 相等
+    let mut want = 0i64;
+    for xid in 1..=20i64 {
+        if xid % 7 == 0 || xid * 2 == 10 {
+            continue;
+        }
+        let xg = xid % 5;
+        for yid in 1..=30i64 {
+            if yid % 5 == xg {
+                want += 1;
+            }
+        }
+    }
+    assert_eq!(got[0][0], i(want));
+    // UPDATE 后下推谓词立刻可见 (无过期快照)
+    ex(&db, "UPDATE b SET g = 4 WHERE id <= 30");
+    let got = rows(&db, sql);
+    let mut want2 = 0i64;
+    for xid in 1..=20i64 {
+        if xid % 7 == 0 || xid * 2 == 10 {
+            continue;
+        }
+        let xg = xid % 5;
+        for _y in 1..=30i64 {
+            if 4 == xg {
+                want2 += 1;
+            }
+        }
+    }
+    assert_eq!(got[0][0], i(want2));
+}

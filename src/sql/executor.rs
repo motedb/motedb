@@ -3509,6 +3509,45 @@ impl QueryExecutor {
                 out.extend(Self::parse_where_comparisons(right, schema)?);
                 Some(out)
             }
+            Expr::Between {
+                expr,
+                negated: false,
+                low,
+                high,
+            } => {
+                // 🔑 BETWEEN 折叠为两个闭区间比较, 让融合聚合/下推路径
+                // 接管 (资源测评: 单 BETWEEN 的 80% 范围聚合曾走物化路径
+                // 88ms + 312MB, 融合路径 1.2ms + ~0)。NOT BETWEEN 是 OR
+                // 语义, AND 链表达不了 → None 走通用路径。
+                fn literal_or_neg(e: &Expr) -> Option<Value> {
+                    match e {
+                        Expr::Literal(v) => Some(v.clone()),
+                        Expr::UnaryOp {
+                            op: crate::sql::ast::UnaryOperator::Minus,
+                            expr: inner,
+                        } => match inner.as_ref() {
+                            Expr::Literal(Value::Integer(i)) => {
+                                i.checked_neg().map(Value::Integer)
+                            }
+                            Expr::Literal(Value::Float(f)) => Some(Value::Float(-f)),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                let (cn, lv, hv) = match expr.as_ref() {
+                    Expr::Column(cn) => (cn, literal_or_neg(low)?, literal_or_neg(high)?),
+                    _ => return None,
+                };
+                if matches!(lv, Value::Null) || matches!(hv, Value::Null) {
+                    return None;
+                }
+                let col = schema.get_column_position(cn)?;
+                Some(vec![
+                    (col, BinaryOperator::Ge, lv),
+                    (col, BinaryOperator::Le, hv),
+                ])
+            }
             _ => {
                 // Leaf: must be a single comparison.
                 let one = Self::parse_simple_comparison_where(wc, schema)?;
@@ -16858,8 +16897,32 @@ impl QueryExecutor {
         // decodes the join column + output columns (not all columns).
         // The previous code used scan_table_rows_streaming which materialized
         // ALL columns of ALL rows of BOTH tables — 2×N full-row decodes.
-        let lrows: Vec<(u64, Vec<Value>)> = self.scan_table_rows_fast(ltable, &lschema)?;
-        let rrows: Vec<(u64, Vec<Value>)> = self.scan_table_rows_fast(rtable, &rschema)?;
+        // 🔑 单表谓词下推 (同多路 join): 扫描侧过滤, 避免全表叉积后过滤。
+        let all_proj: Vec<usize> = (0..lschema.columns.len()).collect();
+        let push_preds = stmt
+            .where_clause
+            .as_ref()
+            .map(Self::extract_pushdown_preds)
+            .unwrap_or_default();
+        let lpd = Self::map_pushdown_preds(&push_preds, lprefix, &lschema, &all_proj);
+        let lrows: Vec<(u64, Vec<Value>)> = self
+            .scan_table_rows_fast(ltable, &lschema)?
+            .into_iter()
+            .filter(|(_, row)| {
+                lpd.iter()
+                    .all(|(p, op, t)| apply_op_value(op, row.get(*p), t))
+            })
+            .collect();
+        let r_all_proj: Vec<usize> = (0..rschema.columns.len()).collect();
+        let rpd = Self::map_pushdown_preds(&push_preds, rprefix, &rschema, &r_all_proj);
+        let rrows: Vec<(u64, Vec<Value>)> = self
+            .scan_table_rows_fast(rtable, &rschema)?
+            .into_iter()
+            .filter(|(_, row)| {
+                rpd.iter()
+                    .all(|(p, op, t)| apply_op_value(op, row.get(*p), t))
+            })
+            .collect();
 
         // Build hash table on the smaller side (right) keyed by join column value.
         use std::collections::HashMap;
@@ -16990,6 +17053,72 @@ impl QueryExecutor {
     /// columns, plain-column keys), which previously materialized every
     /// joined row as a HashMap SqlRow (~340 ms for 200K × 5K).
     /// 2-table chains keep try_positional_inner_join (PK-index path).
+    /// WHERE 中可下推的单表谓词: AND 链里的 `alias.col op literal`。
+    /// 返回 (限定前缀, 裸列名, op, literal)。OR/NOT/LIKE/IN/BETWEEN/表达式/
+    /// bare 列名歧义形状不返回 — 留给 join 后过滤, 语义不变。
+    /// 🔑 背景: join 快路径曾先物化全表叉积再过滤 (5K×500 自 join
+    /// 11.4s + GB 级 RSS, 资源测评挖出)。
+    fn extract_pushdown_preds(
+        wc: &Expr,
+    ) -> Vec<(String, String, crate::sql::ast::BinaryOperator, Value)> {
+        use crate::sql::ast::BinaryOperator;
+        type Out = Vec<(String, String, BinaryOperator, Value)>;
+        fn walk(e: &Expr, out: &mut Out) {
+            match e {
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::And,
+                    right,
+                } => {
+                    walk(left, out);
+                    walk(right, out);
+                }
+                Expr::BinaryOp { left, op, right } => {
+                    let ok_op = matches!(
+                        op,
+                        BinaryOperator::Eq
+                            | BinaryOperator::Ne
+                            | BinaryOperator::Lt
+                            | BinaryOperator::Gt
+                            | BinaryOperator::Le
+                            | BinaryOperator::Ge
+                    );
+                    if let (Expr::Column(c), Expr::Literal(v), true) =
+                        (left.as_ref(), right.as_ref(), ok_op)
+                    {
+                        if let Some((p, bare)) = c.split_once('.') {
+                            out.push((p.to_string(), bare.to_string(), op.clone(), v.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(wc, &mut out);
+        out
+    }
+
+    /// 把 `alias.col op literal` 谓词映射到投影行的列下标。
+    /// 列必须在投影内 (needed-collection 已保证 WHERE 列入选); 不在则丢弃该谓词
+    /// (留在 join 后过滤)。
+    fn map_pushdown_preds(
+        preds: &[(String, String, crate::sql::ast::BinaryOperator, Value)],
+        prefix: &str,
+        schema: &TableSchema,
+        proj: &[usize],
+    ) -> Vec<(usize, crate::sql::ast::BinaryOperator, Value)> {
+        preds
+            .iter()
+            .filter(|(p, _, _, _)| p == prefix)
+            .filter_map(|(_, bare, op, lit)| {
+                let spos = schema.get_column_position(bare)?;
+                let pidx = proj.iter().position(|&x| x == spos)?;
+                Some((pidx, op.clone(), lit.clone()))
+            })
+            .collect()
+    }
+
     fn try_multi_way_inner_join(&self, stmt: &SelectStmt) -> Result<Option<QueryResult>> {
         use crate::sql::ast::SelectColumn;
         use std::collections::HashMap;
@@ -17090,10 +17219,23 @@ impl QueryExecutor {
         } else {
             (0..bschema.columns.len()).collect()
         };
+        // 🔑 单表谓词下推: WHERE `alias.col op literal` 在扫描侧过滤,
+        // 避免 join 先物化全表叉积再过滤 (资源测评: 5K×500 自 join
+        // 曾 11.4s + GB 级 RSS)。
+        let push_preds = stmt
+            .where_clause
+            .as_ref()
+            .map(Self::extract_pushdown_preds)
+            .unwrap_or_default();
+        let bpd = Self::map_pushdown_preds(&push_preds, &bprefix, &bschema, &bproj);
         let mut acc_rows: Vec<Vec<Value>> = self
             .scan_table_rows_fast_projected(&btable, &bschema, Some(&bproj))?
             .into_iter()
             .map(|(_, r)| r)
+            .filter(|row| {
+                bpd.iter()
+                    .all(|(p, op, t)| apply_op_value(op, row.get(*p), t))
+            })
             .collect();
         // Qualified column names + types of the accumulated product.
         let mut acc_cols: Vec<String> = Vec::with_capacity(64);
@@ -17174,7 +17316,16 @@ impl QueryExecutor {
             let Some(j_idx) = jproj.iter().position(|&p| p == j_pos) else {
                 return Ok(None);
             };
-            let jrows = self.scan_table_rows_fast_projected(jtable, &jschema, Some(&jproj))?;
+            let jpd = Self::map_pushdown_preds(&push_preds, jprefix.as_str(), &jschema, &jproj);
+            let jrows: Vec<(u64, Vec<Value>)> = self
+                .scan_table_rows_fast_projected(jtable, &jschema, Some(&jproj))?
+                .into_iter()
+                .filter(|(_, row)| {
+                    // 🔑 该表的单表谓词下推 (见上方 bpd 注释)
+                    jpd.iter()
+                        .all(|(p, op, t)| apply_op_value(op, row.get(*p), t))
+                })
+                .collect();
             // Build the hash side on the NEW table (probe accumulated rows).
             let mut hash: HashMap<&Value, Vec<usize>> = HashMap::with_capacity(jrows.len());
             for (ri, (_, rrow)) in jrows.iter().enumerate() {
