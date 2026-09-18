@@ -15490,6 +15490,12 @@ impl QueryExecutor {
         let storage_limit = self.calculate_storage_limit(stmt);
 
         // Priority: Range query > Point query > Full scan
+        // 🔑 通用 join 路径的 WHERE 单表谓词 (见 execute_from_with_limit)
+        let push_preds: Vec<(String, String, crate::sql::ast::BinaryOperator, Value)> = stmt
+            .where_clause
+            .as_ref()
+            .map(Self::extract_pushdown_preds)
+            .unwrap_or_default();
         let (all_sql_rows, combined_schema) = if let Some(ref where_clause) = stmt.where_clause {
             // Try range query first (dual-bound: col > X AND col < Y)
             if let Some((col_name, lower_value, lower_op, upper_value, upper_op)) =
@@ -15649,10 +15655,10 @@ impl QueryExecutor {
                         } // row_ids non-empty or pipeline inactive
                     } else {
                         // No index, use table scan
-                        self.execute_from_with_limit(from, storage_limit)?
+                        self.execute_from_with_limit(from, storage_limit, &push_preds)?
                     }
                 } else {
-                    self.execute_from_with_limit(from, storage_limit)?
+                    self.execute_from_with_limit(from, storage_limit, &push_preds)?
                 }
             }
             // Try point query
@@ -15786,11 +15792,11 @@ impl QueryExecutor {
                 }
             } else {
                 // Not a simple point/range query
-                self.execute_from_with_limit(from, storage_limit)?
+                self.execute_from_with_limit(from, storage_limit, &[])?
             }
         } else {
             // No WHERE clause - use standard scan with limit
-            self.execute_from_with_limit(from, storage_limit)?
+            self.execute_from_with_limit(from, storage_limit, &[])?
         };
 
         // 🎯 Filter rows (WHERE clause) - Apply remaining conditions
@@ -16350,7 +16356,16 @@ impl QueryExecutor {
     /// Execute FROM clause - handles single table or JOINs
     /// Returns all rows with combined schema
     fn execute_from(&self, table_ref: &TableRef) -> FromScanResult {
-        self.execute_from_with_limit(table_ref, None)
+        self.execute_from_with_limit(table_ref, None, &[])
+    }
+
+    /// execute_from + WHERE 单表谓词下推 (通用 join 路径的扫描预过滤)。
+    fn execute_from_push(
+        &self,
+        table_ref: &TableRef,
+        push: &[(String, String, crate::sql::ast::BinaryOperator, Value)],
+    ) -> FromScanResult {
+        self.execute_from_with_limit(table_ref, None, push)
     }
 
     /// 🚀 P0 OPTIMIZATION: Execute FROM clause with limit passed to storage layer
@@ -16358,6 +16373,7 @@ impl QueryExecutor {
         &self,
         table_ref: &TableRef,
         limit: Option<usize>,
+        push: &[(String, String, crate::sql::ast::BinaryOperator, Value)],
     ) -> FromScanResult {
         match table_ref {
             TableRef::Table { name, alias } => {
@@ -16468,13 +16484,61 @@ impl QueryExecutor {
                 join_type,
                 on_condition,
             } => {
-                // Recursive: evaluate left and right
-                let (left_rows, left_schema) = self.execute_from(left)?;
-                let (right_rows, right_schema) = self.execute_from(right)?;
+                // Recursive: evaluate left and right (谓词继续向下传)
+                let (left_rows, left_schema) = self.execute_from_push(left, push)?;
+                let (right_rows, right_schema) = self.execute_from_push(right, push)?;
 
                 // Combine schemas
                 let mut combined_schema = (*left_schema).clone();
                 combined_schema.columns.extend(right_schema.columns.clone());
+
+                // 🔑 通用 join 路径的单表谓词预过滤: WHERE `alias.col op literal`
+                // 在进 join 前按表前缀过滤两侧 SqlRow (INNER: 显然等价;
+                // LEFT/RIGHT/FULL: b 侧谓词把不满足的 b 行提前剔除后, 对应
+                // a 行得到 NULL 填充, 而 NULL 填充行在原 WHERE 的同一 b 列
+                // 谓词下也是 UNKNOWN → 被过滤 — 结果一致。IS NULL 等非
+                // col-op-literal 形状不推, 留给 join 后 WHERE。
+                let _push: Vec<(String, String, crate::sql::ast::BinaryOperator, Value)> =
+                    push.to_vec();
+                let schema_row_get = |schema: &TableSchema, prefix: &str, bare: &str,
+                                      row: &SqlRow|
+                 -> Option<Value> {
+                    let q = format!("{}.{}", prefix, bare);
+                    if let Some(v) = row.get(&q) {
+                        return Some(v.clone());
+                    }
+                    // bare 回退: schema 列名匹配 (前缀或裸)
+                    schema
+                        .columns
+                        .iter()
+                        .find(|c| c.name == q || c.name.ends_with(&format!(".{}", bare)))
+                        .and_then(|c| row.get(&c.name).cloned())
+                };
+                let filter_rows = |rows: Vec<(u64, SqlRow)>,
+                                   schema: &TableSchema,
+                                   prefix: &str|
+                 -> Vec<(u64, SqlRow)> {
+                    if _push.is_empty() {
+                        return rows;
+                    }
+                    rows.into_iter()
+                        .filter(|(_, row)| {
+                            _push.iter().all(|(p, bare, op, lit)| {
+                                if p != prefix {
+                                    return true;
+                                }
+                                let v = schema_row_get(schema, prefix, bare, row);
+                                apply_op_value(op, v.as_ref(), lit)
+                            })
+                        })
+                        .collect()
+                };
+                let left_alias = Self::table_ref_alias(left);
+                let right_alias = Self::table_ref_alias(right);
+                let left_rows =
+                    filter_rows(left_rows, &left_schema, &left_alias);
+                let right_rows =
+                    filter_rows(right_rows, &right_schema, &right_alias);
 
                 // Perform JOIN based on type
                 let joined_rows = match join_type {
@@ -17053,6 +17117,17 @@ impl QueryExecutor {
     /// columns, plain-column keys), which previously materialized every
     /// joined row as a HashMap SqlRow (~340 ms for 200K × 5K).
     /// 2-table chains keep try_positional_inner_join (PK-index path).
+    /// TableRef 的有效前缀 (alias 或表名); 复合形状返回空串 → 不下推。
+    fn table_ref_alias(tr: &crate::sql::ast::TableRef) -> String {
+        use crate::sql::ast::TableRef;
+        match tr {
+            TableRef::Table { name, alias } => {
+                alias.clone().unwrap_or_else(|| name.clone())
+            }
+            _ => String::new(),
+        }
+    }
+
     /// WHERE 中可下推的单表谓词: AND 链里的 `alias.col op literal`。
     /// 返回 (限定前缀, 裸列名, op, literal)。OR/NOT/LIKE/IN/BETWEEN/表达式/
     /// bare 列名歧义形状不返回 — 留给 join 后过滤, 语义不变。
@@ -17272,9 +17347,53 @@ impl QueryExecutor {
                 Err(_) => return Ok(None),
             };
             let jprefix = jalias.clone().unwrap_or_else(|| jtable.clone());
+            // 🔑 ON 合取拆分: `ON a.k = b.k AND b.x < N` → (等值对叶, 残余条件)。
+            // 此前带 AND 的 ON 直接 decline → 通用嵌套循环每候选行建 SqlRow,
+            // 100K×64-dev 的三表链 20min+ 跑不完 (资源测评)。残余里只引用
+            // 新表的 `col op literal` 预过滤扫描; 其余在 probe 循环对合并行
+            // 用 eval_expr_on_row 求值 (语义与通用路径 eval(on) 一致)。
+            let (on_equi, on_residual): (Expr, Vec<Expr>) = {
+                use crate::sql::ast::BinaryOperator;
+                let mut leaves: Vec<Expr> = Vec::new();
+                fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {
+                    if let Expr::BinaryOp {
+                        left,
+                        op: crate::sql::ast::BinaryOperator::And,
+                        right,
+                    } = e
+                    {
+                        flatten_and(left, out);
+                        flatten_and(right, out);
+                    } else {
+                        out.push(e.clone());
+                    }
+                }
+                flatten_and(on, &mut leaves);
+                let _ = BinaryOperator::And;
+                let mut equi: Option<Expr> = None;
+                let mut residual: Vec<Expr> = Vec::new();
+                for leaf in leaves {
+                    if equi.is_none()
+                        && self.extract_equi_join_columns(&leaf).is_some()
+                    {
+                        equi = Some(leaf);
+                    } else {
+                        residual.push(leaf);
+                    }
+                }
+                match equi {
+                    Some(e) => (e, residual),
+                    // 无等值对: 若原 ON 不是合取则保持原语义; 合取但无对 → 通用路径
+                    None => (on.clone(), Vec::new()),
+                }
+            };
+            let has_on_equi = self.extract_equi_join_columns(&on_equi).is_some();
+            if !has_on_equi {
+                return Ok(None); // non-equi ON → general path
+            }
             // Equi pair from ON: exactly one side must resolve against the
             // NEW table, the other against the accumulated product.
-            let (lcol, rcol) = match self.extract_equi_join_columns(on) {
+            let (lcol, rcol) = match self.extract_equi_join_columns(&on_equi) {
                 Some(p) => p,
                 None => return Ok(None), // non-equi ON → general path
             };
@@ -17316,16 +17435,86 @@ impl QueryExecutor {
             let Some(j_idx) = jproj.iter().position(|&p| p == j_pos) else {
                 return Ok(None);
             };
+            // 🔑 ON 残余里只引用新表的 `col op literal` → 投影位映射后预过滤扫描
+            let on_jpd: Vec<(usize, crate::sql::ast::BinaryOperator, Value)> = {
+                use crate::sql::ast::{BinaryOperator, Expr};
+                let mut raw: Vec<(usize, BinaryOperator, Value)> = Vec::new();
+                for e in &on_residual {
+                    if let Expr::BinaryOp { left, op, right } = e {
+                        let ok_op = matches!(
+                            op,
+                            BinaryOperator::Eq
+                                | BinaryOperator::Ne
+                                | BinaryOperator::Lt
+                                | BinaryOperator::Gt
+                                | BinaryOperator::Le
+                                | BinaryOperator::Ge
+                        );
+                        if let (Expr::Column(cn), Expr::Literal(v), true) =
+                            (left.as_ref(), right.as_ref(), ok_op)
+                        {
+                            if let Some((p, bare)) = cn.split_once('.') {
+                                if p == jprefix {
+                                    if let Some(pos) = jschema.get_column_position(bare) {
+                                        raw.push((pos, op.clone(), v.clone()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                raw.into_iter()
+                    .filter_map(|(spos, op, v)| {
+                        let pidx = jproj.iter().position(|&x| x == spos)?;
+                        Some((pidx, op, v))
+                    })
+                    .collect()
+            };
             let jpd = Self::map_pushdown_preds(&push_preds, jprefix.as_str(), &jschema, &jproj);
             let jrows: Vec<(u64, Vec<Value>)> = self
                 .scan_table_rows_fast_projected(jtable, &jschema, Some(&jproj))?
                 .into_iter()
                 .filter(|(_, row)| {
-                    // 🔑 该表的单表谓词下推 (见上方 bpd 注释)
+                    // 🔑 该表的单表谓词下推 (WHERE) + ON 残余单表谓词
                     jpd.iter()
+                        .chain(on_jpd.iter())
                         .all(|(p, op, t)| apply_op_value(op, row.get(*p), t))
                 })
                 .collect();
+            // 🔑 合并行合成 schema (acc 限定列 + 本步 j 限定列) — ON 残余求值用
+            let step_schema: TableSchema = if on_residual.is_empty() {
+                (*jschema).clone()
+            } else {
+                let mut sc = (*jschema).clone();
+                sc.columns = acc_cols
+                    .iter()
+                    .zip(acc_types.iter())
+                    .enumerate()
+                    .map(|(i, (n, t))| crate::types::ColumnDef {
+                        name: n.clone(),
+                        col_type: t.clone(),
+                        position: i,
+                        nullable: true,
+                        auto_increment: false,
+                        auto_increment_start: None,
+                        default_value: None,
+                    })
+                    .collect();
+                for (pi, &p) in jproj.iter().enumerate() {
+                    let c = &jschema.columns[p];
+                    sc.columns.push(crate::types::ColumnDef {
+                        name: format!("{}.{}", jprefix, c.name),
+                        col_type: c.col_type.clone(),
+                        position: acc_cols.len() + pi,
+                        nullable: true,
+                        auto_increment: false,
+                        auto_increment_start: None,
+                        default_value: None,
+                    });
+                }
+                sc.rebuild_column_map();
+                sc
+            };
             // Build the hash side on the NEW table (probe accumulated rows).
             let mut hash: HashMap<&Value, Vec<usize>> = HashMap::with_capacity(jrows.len());
             for (ri, (_, rrow)) in jrows.iter().enumerate() {
@@ -17346,6 +17535,18 @@ impl QueryExecutor {
                     for &ri in matches {
                         let mut combined = arow.clone();
                         combined.extend(jrows[ri].1.iter().cloned());
+                        // 🔑 ON 残余条件 (非等值部分) 对合并行求值 — 与通用
+                        // 路径 eval(on_condition, combined) 同语义。
+                        if !on_residual.is_empty()
+                            && !on_residual.iter().all(|e| {
+                                matches!(
+                                    Self::eval_expr_on_row(e, &combined, &step_schema),
+                                    Ok(Value::Bool(true))
+                                )
+                            })
+                        {
+                            continue;
+                        }
                         next.push(combined);
                     }
                 }
@@ -17806,10 +18007,69 @@ impl QueryExecutor {
         right_rows: &[(u64, SqlRow)],
         on_condition: &Expr,
     ) -> Result<Vec<(u64, SqlRow)>> {
-        // Try to detect equi-join (col1 = col2) for Hash Join optimization
-        if let Some((left_col, right_col)) = self.extract_equi_join_columns(on_condition) {
-            // 🚀 Use Hash Join (O(N + M))
-            return self.hash_join_inner(left_rows, right_rows, &left_col, &right_col);
+        // 🔑 ON 合取: 双侧单表残余预过滤后等值走 hash (同 left_join)。
+        let (on_equi, on_residual) = Self::split_on_conjunction(on_condition);
+        if self.extract_equi_join_columns(&on_equi).is_some() && !on_residual.is_empty() {
+            // 内连接: 双侧残余都可预过滤
+            let mut left_preds = Vec::new();
+            let mut right_preds = Vec::new();
+            let mut all_consumed = true;
+            // SqlRow 的键即限定列名 — 用首行键集判定残余归属
+            let lkeys = left_rows.first().map(|(_, r)| r.clone());
+            let rkeys = right_rows.first().map(|(_, r)| r.clone());
+            for r in &on_residual {
+                if let Some((cn, op, v)) = Self::residual_single_table_pred(r) {
+                    if lkeys.as_ref().map_or(false, |k| k.contains_key(&cn)) {
+                        left_preds.push((cn, op, v));
+                        continue;
+                    }
+                    if rkeys.as_ref().map_or(false, |k| k.contains_key(&cn)) {
+                        right_preds.push((cn, op, v));
+                        continue;
+                    }
+                }
+                all_consumed = false;
+                break;
+            }
+            if all_consumed {
+                let lf: Vec<(u64, SqlRow)> = if left_preds.is_empty() {
+                    left_rows.to_vec()
+                } else {
+                    left_rows
+                        .iter()
+                        .filter(|(_, row)| {
+                            left_preds.iter().all(|(k, op, lit)| {
+                                apply_op_value(op, row.get(k), lit)
+                            })
+                        })
+                        .cloned()
+                        .collect()
+                };
+                let rf: Vec<(u64, SqlRow)> = if right_preds.is_empty() {
+                    right_rows.to_vec()
+                } else {
+                    right_rows
+                        .iter()
+                        .filter(|(_, row)| {
+                            right_preds.iter().all(|(k, op, lit)| {
+                                apply_op_value(op, row.get(k), lit)
+                            })
+                        })
+                        .cloned()
+                        .collect()
+                };
+                let (lc, rc) = self.extract_equi_join_columns(&on_equi).unwrap();
+                return self.hash_join_inner(&lf, &rf, &lc, &rc);
+            }
+        }
+        // Try to detect equi-join (col1 = col2) for Hash Join optimization.
+        // 🔑 仅当残余为空 (纯等值 ON) — 带未消耗残余时 hash 会丢掉残余条件
+        // (自 join `t2.tag = t.tag` 全部误匹配, fuzz 抓出)。
+        if on_residual.is_empty() {
+            if let Some((left_col, right_col)) = self.extract_equi_join_columns(&on_equi) {
+                // 🚀 Use Hash Join (O(N + M))
+                return self.hash_join_inner(left_rows, right_rows, &left_col, &right_col);
+            }
         }
 
         // Fallback: Nested Loop Join (O(N × M))
@@ -18013,6 +18273,82 @@ impl QueryExecutor {
     }
 
     /// LEFT JOIN: all rows from left, matched rows from right (NULL if no match)
+
+    /// ON 合取拆分: (等值叶, 残余叶)。无合取或无等值叶 → (原式, []) 由调用方
+    /// 自行判断 (extract_equi 失败 → 嵌套循环)。
+    fn split_on_conjunction(on: &Expr) -> (Expr, Vec<Expr>) {
+        fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {
+            if let Expr::BinaryOp {
+                left,
+                op: crate::sql::ast::BinaryOperator::And,
+                right,
+            } = e
+            {
+                flatten_and(left, out);
+                flatten_and(right, out);
+            } else {
+                out.push(e.clone());
+            }
+        }
+        let mut leaves = Vec::new();
+        flatten_and(on, &mut leaves);
+        let mut equi: Option<Expr> = None;
+        let mut residual: Vec<Expr> = Vec::new();
+        for leaf in leaves {
+            if equi.is_none()
+                && QueryExecutor::static_extract_equi_ok(&leaf)
+            {
+                equi = Some(leaf);
+            } else {
+                residual.push(leaf);
+            }
+        }
+        match equi {
+            Some(e) => (e, residual),
+            None => (on.clone(), Vec::new()),
+        }
+    }
+
+    /// 残余叶 → (`限定列` op literal), 不做 schema 判定 (调用方判归属)。
+    fn residual_single_table_pred(
+        e: &Expr,
+    ) -> Option<(String, crate::sql::ast::BinaryOperator, Value)> {
+        use crate::sql::ast::BinaryOperator;
+        if let Expr::BinaryOp { left, op, right } = e {
+            let ok_op = matches!(op, BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt
+                | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge);
+            if let (Expr::Column(cn), Expr::Literal(v), true) = (left.as_ref(), right.as_ref(), ok_op) {
+                return Some((cn.clone(), op.clone(), v.clone()));
+            }
+        }
+        None
+    }
+
+    fn static_extract_equi_ok(e: &Expr) -> bool {
+        // 轻量判定: BinaryOp{Column, cmp, Column}
+        matches!(e, Expr::BinaryOp { left, op, right }
+            if matches!(op,
+                crate::sql::ast::BinaryOperator::Eq
+                | crate::sql::ast::BinaryOperator::Ne)
+            && matches!(left.as_ref(), Expr::Column(_))
+            && matches!(right.as_ref(), Expr::Column(_)))
+    }
+
+    /// 残余叶是否为 `schema 列 op literal` 的单表谓词 (限定名)。
+    fn residual_single_table(e: &Expr, schema: &TableSchema) -> Option<(String, crate::sql::ast::BinaryOperator, Value)> {
+        use crate::sql::ast::BinaryOperator;
+        if let Expr::BinaryOp { left, op, right } = e {
+            let ok_op = matches!(op, BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt
+                | BinaryOperator::Gt | BinaryOperator::Le | BinaryOperator::Ge);
+            if let (Expr::Column(cn), Expr::Literal(v), true) = (left.as_ref(), right.as_ref(), ok_op) {
+                if schema.columns.iter().any(|c| c.name == *cn) {
+                    return Some((cn.clone(), op.clone(), v.clone()));
+                }
+            }
+        }
+        None
+    }
+
     fn left_join(
         &self,
         left_rows: &[(u64, SqlRow)],
@@ -18027,15 +18363,49 @@ impl QueryExecutor {
             .map(|col| (col.name.clone(), Value::Null))
             .collect();
 
-        // Try hash join optimization for equi-join
-        if let Some((left_col, right_col)) = self.extract_equi_join_columns(on_condition) {
-            return self.hash_join_left(
-                left_rows,
-                right_rows,
-                &left_col,
-                &right_col,
-                &null_right_row,
-            );
+        // 🔑 ON 合取: 拆等值叶 + 残余。右表单表残余 (`b.id <= N`) 预过滤
+        // 右侧后等价消耗 — 等值对直接走 hash (此前带 AND 的 ON 整体落
+        // 嵌套循环, LEFT JOIN 反连接 @100K 20min+ 跑不完)。跨表/表达式
+        // 残余 → 保持嵌套循环逐候选 eval (正确性优先)。
+        let (on_equi, on_residual) = Self::split_on_conjunction(on_condition);
+        if self.extract_equi_join_columns(&on_equi).is_some() && !on_residual.is_empty() {
+            let mut right_f: Vec<(u64, SqlRow)> = Vec::with_capacity(right_rows.len());
+            let mut all_consumed = true;
+            let mut right_preds: Vec<(String, crate::sql::ast::BinaryOperator, Value)> = Vec::new();
+            for r in &on_residual {
+                match Self::residual_single_table(r, right_schema) {
+                    Some(p) => right_preds.push(p),
+                    None => {
+                        all_consumed = false;
+                        break;
+                    }
+                }
+            }
+            if all_consumed && !right_preds.is_empty() {
+                for (rid, row) in right_rows {
+                    let keep = right_preds.iter().all(|(k, op, lit)| {
+                        apply_op_value(op, row.get(k), lit)
+                    });
+                    if keep {
+                        right_f.push((*rid, row.clone()));
+                    }
+                }
+                let (lc, rc) = self.extract_equi_join_columns(&on_equi).unwrap();
+                return self.hash_join_left(left_rows, &right_f, &lc, &rc, &null_right_row);
+            }
+        }
+        // Try hash join optimization for equi-join.
+        // 🔑 仅当残余为空 (纯等值 ON) — 否则 hash 丢残余条件。
+        if on_residual.is_empty() {
+            if let Some((left_col, right_col)) = self.extract_equi_join_columns(&on_equi) {
+                return self.hash_join_left(
+                    left_rows,
+                    right_rows,
+                    &left_col,
+                    &right_col,
+                    &null_right_row,
+                );
+            }
         }
 
         // Fallback: nested loop
@@ -23452,6 +23822,8 @@ impl QueryExecutor {
         };
 
         let mut affected_rows = 0;
+        // 🔑 批量 UPDATE 收集器 (语句级一次 WAL 栅栏)
+        let mut pending_updates: Vec<(crate::types::RowId, Vec<Value>, Vec<Value>)> = Vec::new();
 
         // 🔥 WHERE 编译一次（列位置预解析）：旧路径每行每个列引用都做
         // get_column_position 字符串线性查找
@@ -23542,10 +23914,21 @@ impl QueryExecutor {
                 }
             }
 
+            // 🔑 收集后批量提交: WAL 全部 deferred, 语句级一次组提交栅栏。
+            // 此前逐行各等一次 fsync (~3.2ms/行) — UPDATE 10% 行 @100K 曾
+            // 40s (资源测评挖出)。语义: 校验/求值失败的行使整条语句在写入
+            // 前失败 (比旧的"写一半再报错"更接近原子)。
+            pending_updates.push((row_id, row.clone(), new_row));
+        }
+        if pending_updates.len() == 1 {
+            let (rid, old_row, new_row) = pending_updates.into_iter().next().unwrap();
             self.db
-                .update_row_in_table_with_schema(&stmt.table, row_id, row, new_row, &schema)?;
-
+                .update_row_in_table_with_schema(&stmt.table, rid, old_row, new_row, &schema)?;
             affected_rows += 1;
+        } else if !pending_updates.is_empty() {
+            affected_rows += self
+                .db
+                .update_rows_batch_with_schema(&stmt.table, pending_updates, &schema)? as usize;
         }
 
         // 🔑 Process write_set rows (uncommitted INSERTs in this txn).
@@ -23700,6 +24083,7 @@ impl QueryExecutor {
             Vec::new()
         };
 
+        let mut pending_deletes: Vec<(crate::types::RowId, Vec<Value>)> = Vec::new();
         for result in row_iter {
             let (row_id, row) = result?;
             let sql_row = row_to_sql_row(&row, &schema)?;
@@ -23732,8 +24116,15 @@ impl QueryExecutor {
             }
 
             // Delete row - 底层已实现增量索引维护，传入 old_row 避免重复加载
-            self.db.delete_row_from_table(&stmt.table, row_id, row)?;
+            // 🔑 批量 DELETE 收集器 (语句级一次 WAL 栅栏, 同 UPDATE)
+            pending_deletes.push((row_id, row));
+        }
+        if pending_deletes.len() == 1 {
+            let (rid, old_row) = pending_deletes.into_iter().next().unwrap();
+            self.db.delete_row_from_table(&stmt.table, rid, old_row)?;
             affected_rows += 1;
+        } else if !pending_deletes.is_empty() {
+            affected_rows += self.db.delete_rows_batch(&stmt.table, pending_deletes)? as usize;
         }
 
         // 🔑 Process write_set rows (uncommitted INSERTs in this txn).

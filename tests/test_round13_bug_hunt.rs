@@ -464,3 +464,36 @@ fn join_where_pushdown_selective_and_null_safe() {
     }
     assert_eq!(got[0][0], i(want2));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Round 13c-2: ON 合取的残余条件不得被 hash 快路径丢弃
+#[test]
+fn join_on_conjunction_residual_evaluated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(MoteDB::create(tmp.path().join("onc.mote")).unwrap());
+    ex(&db, "CREATE TABLE items (id INT PRIMARY KEY, cat TEXT)");
+    ex(&db, "CREATE TABLE tags (id INT PRIMARY KEY, item_id INT, tag TEXT)");
+    for (i, c) in [(1, "a"), (2, "b")] {
+        ex(&db, &format!("INSERT INTO items VALUES ({}, '{}')", i, c));
+    }
+    for (id, iid, tag) in [(1, 1, "red"), (2, 2, "blue"), (3, 2, "red")] {
+        ex(
+            &db,
+            &format!("INSERT INTO tags VALUES ({}, {}, '{}')", id, iid, tag),
+        );
+    }
+    // 自 join: ON2 残余 `t2.tag = t.tag` (跨表) — 曾被 hash 快路径丢弃,
+    // 4 个组合全匹配 (fuzz: q_self_join 大面积 WRONG)
+    let r = rows(
+        &db,
+        "SELECT i.id, t2.id FROM items i JOIN tags t ON i.id = t.item_id \
+         JOIN tags t2 ON t2.item_id = i.id AND t2.tag = t.tag ORDER BY i.id ASC, t2.id ASC",
+    );
+    assert_eq!(
+        r,
+        vec![vec![i(1), i(1)], vec![i(2), i(2)], vec![i(2), i(3)]]
+    );
+    // 单表残余仍走预过滤 hash (快路径覆盖): red tags = id1(item1) + id3(item2) → 2
+    let r = rows(&db, "SELECT COUNT(*) FROM items a JOIN tags b ON a.id = b.item_id AND b.tag = 'red'");
+    assert_eq!(r[0][0], i(2));
+}

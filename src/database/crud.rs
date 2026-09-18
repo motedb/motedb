@@ -839,8 +839,45 @@ impl MoteDB {
         table_name: &str,
         row_id: RowId,
         old_row: &Row,
+        new_row: Row,
+        schema: &crate::types::TableSchema,
+    ) -> Result<()> {
+        self.update_row_with_schema_impl(table_name, row_id, old_row, new_row, schema, false)
+    }
+
+    /// 🔑 批量 UPDATE: 逐行落缓冲/墓碑/缓存, WAL 全部 deferred 入队,
+    /// 语句级一次 wal_group_barrier —— 此前逐行各等一次组提交 fsync
+    /// (~3.2ms/行; UPDATE 10% 行 @100K 曾 40s)。
+    pub fn update_rows_batch_with_schema(
+        &self,
+        table_name: &str,
+        updates: Vec<(RowId, Row, Row)>,
+        schema: &crate::types::TableSchema,
+    ) -> Result<u64> {
+        let mut n = 0u64;
+        for (row_id, old_row, new_row) in updates {
+            self.update_row_with_schema_impl(
+                table_name,
+                row_id,
+                &old_row,
+                new_row,
+                schema,
+                true,
+            )?;
+            n += 1;
+        }
+        self.wal.wal_group_barrier();
+        Ok(n)
+    }
+
+    fn update_row_with_schema_impl(
+        &self,
+        table_name: &str,
+        row_id: RowId,
+        old_row: &Row,
         mut new_row: Row,
         schema: &crate::types::TableSchema,
+        defer_wal: bool,
     ) -> Result<()> {
         ensure_open!(self);
         // 🔑 Coerce Float→Integer for whole-number overflow promotion.
@@ -937,8 +974,19 @@ impl MoteDB {
         self.increment_pending_updates();
 
         // 6. Write to WAL first (durability) — raw bytes
-        self.wal
-            .log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
+        if defer_wal {
+            self.wal.log_update_raw_ref_deferred(
+                table_name,
+                partition,
+                row_id,
+                &raw_old,
+                &raw_new,
+                0,
+            )?;
+        } else {
+            self.wal
+                .log_update_raw_ref(table_name, partition, row_id, &raw_old, &raw_new, 0)?;
+        }
 
         // 6. Write to columnar buffer (primary storage) + WAL (durability)
         let timestamp = self
@@ -1335,6 +1383,27 @@ impl MoteDB {
         row_id: RowId,
         old_row: Row,
     ) -> Result<()> {
+        self.delete_row_impl(table_name, row_id, old_row, false)
+    }
+
+    /// 🔑 批量 DELETE: WAL deferred + 语句级栅栏 (同 UPDATE 批量化)。
+    pub fn delete_rows_batch(&self, table_name: &str, deletes: Vec<(RowId, Row)>) -> Result<u64> {
+        let mut n = 0u64;
+        for (row_id, old_row) in deletes {
+            self.delete_row_impl(table_name, row_id, old_row, true)?;
+            n += 1;
+        }
+        self.wal.wal_group_barrier();
+        Ok(n)
+    }
+
+    fn delete_row_impl(
+        &self,
+        table_name: &str,
+        row_id: RowId,
+        old_row: Row,
+        defer_wal: bool,
+    ) -> Result<()> {
         ensure_open!(self);
         // 1. Get schema (old_row is now passed in to avoid re-loading)
         let schema = self.table_registry.get_table(table_name)?;
@@ -1360,8 +1429,19 @@ impl MoteDB {
                 .map_err(|e| StorageError::Serialization(format!("Row encode failed: {}", e)))
         })?;
         self.increment_pending_updates();
-        self.wal
-            .log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
+        if defer_wal {
+            self.wal.log_delete_raw_deferred(
+                table_name,
+                partition,
+                composite_key,
+                raw_old,
+                timestamp,
+                0,
+            )?;
+        } else {
+            self.wal
+                .log_delete_raw(table_name, partition, composite_key, raw_old, timestamp, 0)?;
+        }
 
         // 🚀 Columnar tombstone is the source of truth. LSM delete removed.
         // Columnar tombstone below marks the row deleted in all reads.

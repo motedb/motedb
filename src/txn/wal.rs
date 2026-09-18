@@ -2049,6 +2049,103 @@ impl WALManager {
     /// Recover from crash (returns records per partition)
     /// Flush all pending group-commit entries to disk.
     /// Called before `recover()` so in-flight records are visible on disk.
+    /// 🔑 批量语句用: 入队 UPDATE WAL 记录但不等待 fsync — 调用方在
+    /// 语句末尾 wal_group_barrier() 一次等待。此前 UPDATE 逐行各等一次
+    /// 组提交 fsync (~3.2ms/行): UPDATE 10% 行 @100K 曾 40s (资源测评)。
+    pub fn log_update_raw_ref_deferred(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_old: &[u8],
+        raw_new: &[u8],
+        txn_id: TransactionId,
+    ) -> Result<()> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
+        let record = WALRecord::UpdateRaw {
+            table_name: table_name.to_string(),
+            row_id,
+            partition,
+            raw_old: raw_old.to_vec(),
+            raw_new: raw_new.to_vec(),
+            txn_id,
+        };
+        if let Some(ref gc) = self.group_commit {
+            // dummy done: gc 线程会 set 它, 无人等待 — 正常。
+            let dummy = Arc::new((PlMutex::new(None), PlCondvar::new()));
+            gc.state.queue.lock().push(GroupCommitEntry {
+                partition,
+                record,
+                done: dummy,
+            });
+            gc.state.wakeup.notify_all();
+            return Ok(());
+        }
+        // direct path (Periodic/NoSync): append 不 per-write sync (原语义)
+        let entry = self
+            .partitions
+            .get(&partition)
+            .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
+        let mut wal = entry.value().lock();
+        wal.append(record)?;
+        Ok(())
+    }
+
+    /// 🔑 组提交栅栏: 等队列排空 — gc 线程取走的批次已 fsync 后才清空
+    /// 队列语义 (batch→flush_partition_groups→signal dones), 队列空即
+    /// 本批已持久化。给 in-flight 批次留 2ms 窗口。
+    pub fn wal_group_barrier(&self) {
+        if let Some(ref gc) = self.group_commit {
+            let deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            while std::time::Instant::now() < deadline {
+                gc.state.wakeup.notify_all();
+                if gc.state.queue.lock().is_empty() {
+                    std::thread::sleep(Duration::from_millis(2));
+                    return;
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+    }
+
+    /// 🔑 批量 DELETE 用: 入队不等待 (见 log_update_raw_ref_deferred)。
+    pub fn log_delete_raw_deferred(
+        &self,
+        table_name: &str,
+        partition: PartitionId,
+        row_id: RowId,
+        raw_old: Vec<u8>,
+        timestamp: u64,
+        txn_id: TransactionId,
+    ) -> Result<()> {
+        self.periodic_new_writes.store(true, Ordering::Relaxed);
+        let record = WALRecord::DeleteRaw {
+            table_name: table_name.to_string(),
+            row_id,
+            partition,
+            raw_old,
+            timestamp,
+            txn_id,
+        };
+        if let Some(ref gc) = self.group_commit {
+            let dummy = Arc::new((PlMutex::new(None), PlCondvar::new()));
+            gc.state.queue.lock().push(GroupCommitEntry {
+                partition,
+                record,
+                done: dummy,
+            });
+            gc.state.wakeup.notify_all();
+            return Ok(());
+        }
+        let entry = self
+            .partitions
+            .get(&partition)
+            .ok_or_else(|| StorageError::Transaction("Invalid partition ID".to_string()))?;
+        let mut wal = entry.value().lock();
+        wal.append(record)?;
+        Ok(())
+    }
+
     pub fn flush_group_commit_queue(&self) {
         if let Some(ref gc) = self.group_commit {
             // 🔑 Do NOT stop the background thread here. The previous code set

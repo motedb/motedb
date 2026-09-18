@@ -1051,3 +1051,25 @@ compete_bench (186.5 vs 212.6 MB, 双方含向量)。
 
 回归: test_round13_bug_hunt.rs 新增 join 下推选择性/NULL/UPDATE 可见性
 回归 (14/14) + fuzz tier-1 6 seed 全绿 (BETWEEN/下推语义对拍 SQLite)。
+
+## Round 13d — 规模热点扫描: 四个资源黑洞全部修复
+
+100K 行 × (id/ts/dev/cat/val/note/32 维向量) 热点扫描 (38 形状), 时间
+>100ms 或 RSS >100MB 标红。聚合/排序/分页/标量函数/LIKE/IN/子查询/投影/
+knn/FTS 全部正常 (最高 count-distinct 50ms、全表投影 86ms)。四个黑洞:
+
+| # | 形状 | 修复前 | 修复 | 修复后 |
+|---|---|---|---|---|
+| 1 | 三表 join 计数 (ON 带 `b.id<=N` 合取) | **20min+ 跑不完** | ON 合取拆分: 等值对走 hash, 新表单表残余预过滤扫描, 跨表残余 probe 循环对合并行求值 (多路 join 接受合取 ON, 不再 decline 到通用嵌套循环) | **201 ms** |
+| 2 | LEFT JOIN 反连接 (`ON … AND b.id<=50 WHERE b.id IS NULL`) | **20min+ 跑不完** | inner/left join 同样拆合取: 右表单表残余预过滤后走 hash; 残余未全部消耗时保持嵌套循环逐候选 eval (残余为空才允许纯等值 hash — 曾丢残余条件, fuzz 抓出) | **376 ms** |
+| 3 | UPDATE 多行 (10% 行 @100K) | **39.4 s** (每行一次组提交 fsync 等待 ~3.2ms) | 语句级批量: 逐行落缓冲/墓碑/缓存, WAL 全部 deferred 入队, 语句末一次 `wal_group_barrier` | **138 ms (285×)** |
+| 4 | DELETE 多行 | 同上 4ms/行 | 同批量模式 | 301 行 1.2s→76ms (16×) |
+
+语义与持久化验证:
+- ON 残余跨表条件 (`t2.tag = t.tag` 自 join) 曾被 hash 快路径丢弃 — 修复 +
+  Rust 回归 (test_round13_bug_hunt 15/15) + fuzz 8 seed 全绿 (自 join 生成器
+  覆盖此形状)
+- 批量变异 crash 恢复: 5000 行表批量 UPDATE×2 + DELETE + 子进程再变异后
+  kill -9 → 重开 WAL 重放零丢失 (5/11 倍数残留 0、全部变异可见)
+- UPDATE 语句语义变化: 校验/求值失败的行现在使整条语句写入前失败 (旧的
+  "写一半再报错" 更接近原子, 但非事务内仍非原子 — 与 SQLite 相同)
