@@ -25,3 +25,4 @@ fuzz/coverage/
 
 # Python bindings build artifacts
 bindings/python/target/
+.zcode/plans/
